@@ -1,0 +1,6 @@
+# Editor / OS / agent scratch. Component-specific ignores (build output, flash
+# images, device logs, dev certs) live in each component's own .gitignore.
+/.vscode
+/.idea
+/.claude
+.DS_Store
