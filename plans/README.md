@@ -1,0 +1,115 @@
+# StarPlayer — Plans
+
+Design and implementation plans for the whole project: the reusable Rust engine
+(`crates/`), the applications built on it (`apps/`), and the archaeology of the original
+1990s DOS sources it revives (`STARPLAY/`, read-only).
+
+```
+plans/
+├── README.md                  # this file — unified status index
+├── 00-scoping-overview.md     # the approved scoping plan (2026-08-28) — historical record
+├── product/                   # foundation docs: vision, architecture, roadmap, accuracy
+├── reference/                 # archaeology of the original DOS player
+├── engine/                    # M<n>-* engine plans          (+ complete/)
+└── apps/                      # A<n>-* application plans     (+ complete/)
+```
+
+- **`plans/product/`** — the foundation documents and the source of truth for direction.
+  [`01-technical-architecture.md`](product/01-technical-architecture.md) is the
+  authoritative engine design; a change that contradicts it needs an amendment there in
+  the same commit. [`03-accuracy-policy.md`](product/03-accuracy-policy.md) is the
+  authority on what "accurate" means per format and records **every** deliberate
+  deviation from the original — a deviation that is not written down there is a defect,
+  not a decision.
+- **`plans/reference/`** — what the original actually did.
+  [`original-s3mlib-analysis.md`](reference/original-s3mlib-analysis.md) is the
+  *specification* for MOD/S3M/MTM effect semantics;
+  [`original-star-ui.md`](reference/original-star-ui.md) is the design reference for the
+  TUI homage. Both were reconstructed from sources that are **gutted** — most of the
+  engine and front-end sit inside TASM `comment %` blocks, so the tree does not assemble
+  and the shipped `STAR.EXE` is itself a crippled build — but the text is complete.
+- **`plans/engine/`** — a master plan per milestone, `M<n>-master-plan.md`, plus per-task
+  work plans, `M<n>-task-<ID>-<name>.md`. Written so an agent with no access to prior
+  conversation history can pick up a master plan and dispatch its task files as written;
+  each task file states its dependencies, what it can run concurrently with, and the
+  model tier it is intended for.
+- **`plans/apps/`** — application milestone plans, `A<n>-master-plan.md`.
+- **`complete/`** under `engine/` and `apps/` — a plan moves there once its deliverable
+  has landed on `main` and only owner-acceptance work remains. **Files directly under an
+  area are, at a glance, the outstanding work.**
+
+Task files record *how*; the `product/` documents record *what and why*.
+
+## Status
+
+Nothing is implemented yet. The repository currently holds the original DOS sources, this
+plan set, and `AGENTS.md`.
+
+### Engine
+
+| Milestone | Status | Master plan | Notes |
+|---|---|---|---|
+| M0 Foundations + WASM spike | **Not started** — next | [M0](engine/M0-master-plan.md) | 4 task files ready: [A1](engine/M0-task-A1-workspace-skeleton.md) workspace/CI, [A2](engine/M0-task-A2-core-types.md) core types, [A3](engine/M0-task-A3-minimal-mixer-and-determinism.md) mixer + determinism test, [A4](engine/M0-task-A4-audioworklet-spike.md) AudioWorklet sine wave. Exit: **sound from a browser tab** |
+| M1 S3M in the browser | Not started | [M1](engine/M1-master-plan.md) | 7 task files ready, B1–B7. [B4](engine/M1-task-B4-s3m-effects.md) is the accuracy core and the largest single task. Exit: **a real `.s3m` plays in a browser** |
+| M2 MOD + MTM native, accuracy machinery | Not started | [M2](engine/M2-master-plan.md) | 8 task files ready, C1–C8. [C8](engine/M2-task-C8-dos-reference-harness.md) is **deferred** with an explicit trigger |
+| M3 Native surfaces | Not started | [M3](engine/M3-master-plan.md) | cpal host, CLI, offline renderer, telemetry split |
+| M4 Generalise to a synthesis engine | Not started | [M4](engine/M4-master-plan.md) | Where `Instrument` is extracted; MIDI in, SMF, keyboard, source mux |
+| M5 XM support | Not started | [M5](engine/M5-master-plan.md) | Envelopes, key-off/fadeout, linear frequency |
+| M6 IT support | Not started | [M6](engine/M6-master-plan.md) | NNA/DCT/DCA, voice stealing, resonant filter. The hardest format |
+| M7 DSP graph | **Pull-driven** | [M7](engine/M7-master-plan.md) | Per-channel inserts, master bus, SIMD |
+| M8 Embedded proof | **Pull-driven** | [M8](engine/M8-master-plan.md) | esp32 RISC-V from flash under embassy |
+| M9 Plugin surfaces | **Pull-driven** | [M9](engine/M9-master-plan.md) | CLAP instrument, then effect hosting |
+| M10 Alternative synths | **Pull-driven, open-ended** | [M10](engine/M10-master-plan.md) | Wavetable, FM, SoundFont, SID; sample-enhancement API |
+| M11 Instrument library | **Pull-driven, open-ended** | [M11](engine/M11-master-plan.md) | A library of tracker modules' instruments, playable from MIDI. Shares `InstrumentBank` with M10's SoundFont support |
+
+### Applications
+
+| Milestone | Status | Master plan | Notes |
+|---|---|---|---|
+| Web player | Not started | delivered by [M0-A4](engine/M0-task-A4-audioworklet-spike.md) + [M1-B7](engine/M1-task-B7-web-player.md) | The primary UI and the first deliverable |
+| A1 TUI STAR.EXE homage | **Pull-driven** | [A1](apps/A1-master-plan.md) | The nostalgic one. Second consumer of the telemetry API |
+| A2 Desktop shells | **Pull-driven** | [A2](apps/A2-master-plan.md) | Ask whether it is needed at all first |
+| A3 Mobile shells | **Pull-driven** | [A3](apps/A3-master-plan.md) | Lowest priority; the responsive web player covers most of it |
+
+**Critical path**: M0 → M1. Everything else is either proving what those two built (M2,
+M3) or extending it (M4 onward).
+
+## Locked-in decisions
+
+Made by the project owner during scoping (2026-08-28); do not re-litigate in derived
+plans. Full statements in [`product/00-vision.md`](product/00-vision.md).
+
+1. **First audible deliverable is the WASM AudioWorklet web player**, not a CLI. The
+   browser is the hardest host; proving it first de-risks everything after it.
+2. **Semantic fidelity, modern mixing.** Replicate the original's per-tick effect
+   behaviour; render with a modern mixer. Emulating the 8-bit mono SoundBlaster mixer as
+   a "retro mode" is explicitly not scoped.
+3. **Canonical behaviour is the fidelity reference, deviations documented.** The assembly
+   is the primary specification, but where it deviates from ST3/ProTracker through an
+   outright defect, implement the canonical behaviour and record it in
+   [`product/03-accuracy-policy.md`](product/03-accuracy-policy.md) §3 (seven such
+   deviations, D1–D7, are already identified).
+4. **MOD and MTM get native effect processors.** The original converted them to S3M in
+   memory; that is why its MOD playback was inaccurate. Its conversion tables are
+   replicated as MOD/MTM *semantics*, not as a lowering step.
+5. **DOS reference capture is deferred** — read the assembly as the spec; reconstruct a
+   buildable DOS reference only if the port hits an ambiguity the source cannot settle.
+6. **`no_std` + `alloc` from day one**, CI-enforced on a bare-metal target.
+7. **Licence deferred.** The repo stays private; no licence files or SPDX headers yet.
+
+## How to use these documents
+
+1. Read [`product/00-vision.md`](product/00-vision.md) for what this is, then
+   [`product/01-technical-architecture.md`](product/01-technical-architecture.md) for how
+   it works. Those two answer most questions.
+2. Execute milestones in order via their master plans and task files. Start at
+   [M0](engine/M0-master-plan.md).
+3. Before writing any MOD/S3M/MTM effect code, read
+   [`reference/original-s3mlib-analysis.md`](reference/original-s3mlib-analysis.md) §4
+   and [`product/03-accuracy-policy.md`](product/03-accuracy-policy.md). The first is the
+   specification; the second lists the seven places we deliberately do not follow it.
+4. When a design decision changes, update the foundation document in `product/` — it is
+   the source of truth. When implementation discovers a new deviation from the original,
+   add it to the accuracy policy **in the same commit as the code**.
+5. `STARPLAY/` is a read-only historical reference and must never be modified. Derived
+   artefacts (such as the deferred DOS reference reconstruction) live elsewhere.
