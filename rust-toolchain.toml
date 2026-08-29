@@ -1,0 +1,7 @@
+[toolchain]
+channel = "1.97"
+components = ["clippy", "rustfmt"]
+targets = [
+    "wasm32-unknown-unknown",
+    "riscv32imc-unknown-none-elf",
+]

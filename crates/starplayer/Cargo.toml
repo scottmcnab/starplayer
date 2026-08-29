@@ -1,0 +1,99 @@
+[package]
+name = "starplayer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Real-time, event-driven tracked-music engine (MOD / S3M / MTM)."
+
+[dependencies]
+starplayer-core = { workspace = true }
+starplayer-rt = { workspace = true }
+starplayer-dsp = { workspace = true }
+starplayer-mixer = { workspace = true }
+starplayer-model = { workspace = true }
+starplayer-engine = { workspace = true }
+starplayer-mod = { workspace = true, optional = true }
+starplayer-s3m = { workspace = true, optional = true }
+starplayer-mtm = { workspace = true, optional = true }
+starplayer-xm = { workspace = true, optional = true }
+starplayer-it = { workspace = true, optional = true }
+starplayer-midi = { workspace = true, optional = true }
+starplayer-telemetry = { workspace = true, optional = true }
+
+# The feature set of plans/product/01-technical-architecture.md section 11.1. Every
+# feature is owned by exactly one crate below and forwarded from here.
+#
+# Hard invariant (AGENTS.md design goal 4): no default feature, here or in any crate
+# reachable from here, transitively enables `std`. `xtask ci --job no-std-purity`
+# enforces it by compiling this crate's default feature set for a bare-metal target.
+[features]
+default = ["s3m", "mod", "mtm", "float-mix", "linear-interp"]
+
+std = [
+    "starplayer-core/std",
+    "starplayer-rt/std",
+    "starplayer-dsp/std",
+    "starplayer-mixer/std",
+    "starplayer-model/std",
+    "starplayer-engine/std",
+    "starplayer-mod?/std",
+    "starplayer-s3m?/std",
+    "starplayer-mtm?/std",
+    "starplayer-xm?/std",
+    "starplayer-it?/std",
+    "starplayer-midi?/std",
+    "starplayer-telemetry?/std",
+]
+alloc = [
+    "starplayer-core/alloc",
+    "starplayer-rt/alloc",
+    "starplayer-dsp/alloc",
+    "starplayer-mixer/alloc",
+    "starplayer-model/alloc",
+    "starplayer-engine/alloc",
+    "starplayer-mod?/alloc",
+    "starplayer-s3m?/alloc",
+    "starplayer-mtm?/alloc",
+    "starplayer-xm?/alloc",
+    "starplayer-it?/alloc",
+    "starplayer-midi?/alloc",
+    "starplayer-telemetry?/alloc",
+]
+simd = ["starplayer-dsp/simd", "starplayer-mixer/simd", "starplayer-engine/simd"]
+
+# Both mix paths may be enabled at once.
+float-mix = ["starplayer-dsp/float-mix", "starplayer-mixer/float-mix", "starplayer-engine/float-mix"]
+fixed-mix = ["starplayer-dsp/fixed-mix", "starplayer-mixer/fixed-mix", "starplayer-engine/fixed-mix"]
+linear-interp = ["starplayer-dsp/linear-interp", "starplayer-mixer/linear-interp", "starplayer-engine/linear-interp"]
+
+telemetry = ["dep:starplayer-telemetry", "starplayer-engine/telemetry"]
+trace = ["starplayer-engine/trace"]
+
+quirks-starplayer = [
+    "starplayer-mod?/quirks-starplayer",
+    "starplayer-s3m?/quirks-starplayer",
+    "starplayer-mtm?/quirks-starplayer",
+    "starplayer-xm?/quirks-starplayer",
+    "starplayer-it?/quirks-starplayer",
+]
+serde = [
+    "starplayer-core/serde",
+    "starplayer-model/serde",
+    "starplayer-engine/serde",
+    "starplayer-mod?/serde",
+    "starplayer-s3m?/serde",
+    "starplayer-mtm?/serde",
+    "starplayer-xm?/serde",
+    "starplayer-it?/serde",
+    "starplayer-midi?/serde",
+    "starplayer-telemetry?/serde",
+]
+
+mod = ["dep:starplayer-mod"]
+s3m = ["dep:starplayer-s3m"]
+mtm = ["dep:starplayer-mtm"]
+xm = ["dep:starplayer-xm"]
+it = ["dep:starplayer-it"]
+
+midi = ["dep:starplayer-midi"]
+smf = ["midi", "starplayer-midi/smf"]

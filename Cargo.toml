@@ -1,0 +1,46 @@
+# StarPlayer — virtual workspace root.
+#
+# Deliberately has no `[package]`: every crate lives under `crates/`, `apps/` or
+# `xtask/`. There is no `license` field anywhere in this workspace — licensing is
+# deferred (see plans/product/00-vision.md decision 7).
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+    "apps/*",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+# Every external version is pinned once here; members write `{ workspace = true }`.
+# Internal path dependencies are listed so the dependency graph is declared in one
+# place and a crate can be moved without touching every sibling manifest.
+[workspace.dependencies]
+starplayer = { path = "crates/starplayer" }
+starplayer-core = { path = "crates/starplayer-core" }
+starplayer-rt = { path = "crates/starplayer-rt" }
+starplayer-dsp = { path = "crates/starplayer-dsp" }
+starplayer-mixer = { path = "crates/starplayer-mixer" }
+starplayer-model = { path = "crates/starplayer-model" }
+starplayer-engine = { path = "crates/starplayer-engine" }
+starplayer-mod = { path = "crates/starplayer-mod" }
+starplayer-s3m = { path = "crates/starplayer-s3m" }
+starplayer-mtm = { path = "crates/starplayer-mtm" }
+starplayer-xm = { path = "crates/starplayer-xm" }
+starplayer-it = { path = "crates/starplayer-it" }
+starplayer-midi = { path = "crates/starplayer-midi" }
+starplayer-telemetry = { path = "crates/starplayer-telemetry" }
+starplayer-host-cpal = { path = "crates/starplayer-host-cpal" }
+starplayer-host-wasm = { path = "crates/starplayer-host-wasm" }
+starplayer-offline = { path = "crates/starplayer-offline" }
+starplayer-testkit = { path = "crates/starplayer-testkit" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

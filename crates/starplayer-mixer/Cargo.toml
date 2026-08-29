@@ -1,0 +1,18 @@
+[package]
+name = "starplayer-mixer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+starplayer-core = { workspace = true }
+starplayer-dsp = { workspace = true }
+
+[features]
+default = []
+std = ["starplayer-core/std", "starplayer-dsp/std"]
+alloc = ["starplayer-core/alloc", "starplayer-dsp/alloc"]
+simd = ["starplayer-dsp/simd"]
+float-mix = ["starplayer-dsp/float-mix"]
+fixed-mix = ["starplayer-dsp/fixed-mix"]
+linear-interp = ["starplayer-dsp/linear-interp"]

@@ -1,0 +1,16 @@
+[package]
+name = "starplayer-midi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+starplayer-core = { workspace = true }
+
+[features]
+default = []
+std = ["starplayer-core/std"]
+alloc = ["starplayer-core/alloc"]
+serde = ["starplayer-core/serde"]
+# Standard MIDI File parsing on top of the byte codec.
+smf = []

@@ -1,0 +1,27 @@
+[package]
+name = "starplayer-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+starplayer-core = { workspace = true }
+starplayer-rt = { workspace = true }
+starplayer-dsp = { workspace = true }
+starplayer-mixer = { workspace = true }
+starplayer-model = { workspace = true }
+
+[features]
+default = []
+std = ["starplayer-core/std", "starplayer-rt/std", "starplayer-dsp/std", "starplayer-mixer/std", "starplayer-model/std"]
+alloc = ["starplayer-core/alloc", "starplayer-rt/alloc", "starplayer-dsp/alloc", "starplayer-mixer/alloc", "starplayer-model/alloc"]
+simd = ["starplayer-dsp/simd", "starplayer-mixer/simd"]
+float-mix = ["starplayer-dsp/float-mix", "starplayer-mixer/float-mix"]
+fixed-mix = ["starplayer-dsp/fixed-mix", "starplayer-mixer/fixed-mix"]
+linear-interp = ["starplayer-dsp/linear-interp", "starplayer-mixer/linear-interp"]
+serde = ["starplayer-core/serde", "starplayer-model/serde"]
+# Publishes the telemetry snapshots; the snapshot *types* live in
+# `starplayer-telemetry`, which the engine deliberately does not depend on.
+telemetry = []
+# Per-tick state trace. Test and debug only, never on in a shipping default.
+trace = []

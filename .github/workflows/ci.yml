@@ -1,0 +1,68 @@
+# Every job here is a single `cargo xtask ci --job <job>` invocation, and
+# `cargo xtask ci` runs exactly this set locally. There is one definition of the CI
+# matrix — xtask/src/main.rs — so local verification and CI cannot drift apart.
+#
+# The toolchain, including the wasm32 and riscv32 targets, comes from
+# rust-toolchain.toml; `rustup show` installs it.
+
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host-tests:
+    name: host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job host-tests
+
+  wasm-build:
+    name: wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job wasm-build
+
+  no-std-check:
+    name: no_std check (bare metal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job no-std-check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job clippy
+
+  no-std-purity:
+    name: no-std purity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job no-std-purity

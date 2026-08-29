@@ -1,0 +1,18 @@
+[package]
+name = "starplayer-dsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+starplayer-core = { workspace = true }
+
+[features]
+default = []
+std = ["starplayer-core/std"]
+alloc = ["starplayer-core/alloc"]
+simd = []
+# Both mix paths may be enabled at once; the caller picks per render.
+float-mix = []
+fixed-mix = []
+linear-interp = []

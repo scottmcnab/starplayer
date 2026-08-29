@@ -1,0 +1,4 @@
+# wasm-bindgen / wasm-pack output and the bundled web build.
+/pkg
+/dist
+/node_modules

@@ -1,0 +1,18 @@
+[package]
+name = "starplayer-mtm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+starplayer-engine = { workspace = true }
+starplayer-model = { workspace = true }
+
+[features]
+default = []
+std = ["starplayer-engine/std", "starplayer-model/std"]
+alloc = ["starplayer-engine/alloc", "starplayer-model/alloc"]
+serde = ["starplayer-engine/serde", "starplayer-model/serde"]
+# Reproduce the original DOS player's quirks instead of the canonical
+# behaviour. See plans/product/03-accuracy-policy.md section 2.
+quirks-starplayer = []

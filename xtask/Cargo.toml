@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# xtask deliberately has no dependencies: it must build with nothing but the pinned
+# toolchain, on a machine that has never seen crates.io. Argument parsing is by hand.
+[dependencies]
