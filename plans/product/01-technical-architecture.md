@@ -566,7 +566,7 @@ future tracker editor render from. The original's `ChannelData` deliberately car
 
 **`SharedArrayBuffer` is the default; `postMessage` is a real fallback, not a second-class
 one.** Both were built and exercised in
-[M0-task-A4](../engine/M0-task-A4-audioworklet-spike.md), and the page reports which is
+[M0-task-A4](../engine/complete/M0-task-A4-audioworklet-spike.md), and the page reports which is
 live rather than assuming.
 
 *What was tested.* A Rust sine oscillator rendered in wasm inside an AudioWorklet, with
