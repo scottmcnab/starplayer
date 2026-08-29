@@ -33,7 +33,7 @@ how a project spends a month and produces silence.
 | [B2](M1-task-B2-s3m-loader.md) | S3M parsing: header, parapointers, patterns, samples, panning | B1 | B3, B5 |
 | [B3](complete/M1-task-B3-engine-render-loop.md) ✅ | Render loop, `RowClock`, sources, command queue, channel binding | M0-A3 | B2, B5 |
 | [B4](M1-task-B4-s3m-effects.md) | The ST3 effect processor — the accuracy core | B2, B3 | B5 |
-| [B5](M1-task-B5-mixer-float-stereo.md) | Linear interpolation, stereo, output conversion | M0-A3 | B1, B2, B3 |
+| [B5](complete/M1-task-B5-mixer-float-stereo.md) ✅ | Linear interpolation, stereo, output conversion | M0-A3 | B1, B2, B3 |
 | [B6](M1-task-B6-telemetry-v1.md) | Coherent scalar telemetry snapshot | B3 | B4 |
 | [B7](M1-task-B7-web-player.md) | The web player UI | M0-A4, B6 | — |
 
