@@ -230,3 +230,75 @@ and the `Sxy` family sound correct.
 
 MOD and MTM semantics (M2). Trace diffing and the conformance corpus (M2). XM/IT effects.
 Any effect the original mapped to `S_FX_0`.
+
+## Addendum — the interfaces this task implements (written after B2 and B3 landed)
+
+B2 and B3 are on `main`. This is the concrete surface B4 plugs into; read the source for
+the full doc comments.
+
+**Engine side (`crates/starplayer-engine/src/sequencer.rs`, `channel.rs`)** — implement
+`TrackerProcessor` for the ST3 processor:
+
+```rust
+pub trait TrackerProcessor {
+    fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome;  // tick 0 of a row, once per row (NOT per SEx repeat)
+    fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome;                  // every other tick, incl. first tick of a repeat
+}
+pub struct TickContext<'e> { pub frame: Frame, pub voices: &'e mut VoicePool, pub channels: &'e mut ChannelTable,
+                             pub row_clock: RowClock, pub position: SongPosition, pub tempo_bpm: u16 }
+impl TickContext<'_> { pub const fn outcome(&self) -> TickOutcome; }   // start every tick from this
+#[must_use] pub struct TickOutcome { pub tempo_bpm: u16, pub speed: u8, pub pattern_delay: u8, pub jump: Option<Jump>, pub stop: bool }
+pub struct Jump { pub order: Option<u16>, pub row: Option<u16>, pub within_pattern: bool }
+   // Jump::to_order(x)  Jump::break_to_row(r)  Jump::to_order_row(x, r)  Jump::within_pattern_to_row(r)
+pub struct RowRef<'d> { pub order: u16, pub pattern: u16, pub row: u16, pub bytes: &'d [u8] }
+pub trait PatternData { order_count, order(u16) -> Option<OrderEntry>, channel_count, rows_in_pattern, row_bytes(pattern, row) -> Option<&[u8]> }
+ChannelTable::trigger(channel, voices, tag, region: SampleRegion, params: VoiceParams, offset_frames) -> Option<VoiceId>
+ChannelTable::stop(channel, voices) -> bool;  ChannelTable::is_sounding(channel, voices) -> bool   // the original's _ActiveFlag
+PatternSequencer::new(tempo_model, data: impl PatternData, processor: impl TrackerProcessor, SequencerSettings { sample_rate_hz, first_tick_frame, initial_speed, initial_tempo_bpm, restart_order, end_of_song })
+```
+
+`TickOutcome.speed` is applied to the row clock immediately (so `Axx` shortens or lengthens
+the row in progress — `RowClock::set_speed` states the wrap rule); `pattern_delay` is only
+read on the first tick of a row; the last `jump` requested during a row wins. The
+`DemoProcessor` in `crates/starplayer-engine/src/demo.rs` is a complete worked example of a
+`TrackerProcessor` and `PatternData` pair, and
+`crates/starplayer-engine/tests/sequencer_and_control_plane.rs` shows how to drive the
+sequencer in a test.
+
+**Loader side (`crates/starplayer-s3m/src/pattern.rs`, `header.rs`)** — the native cell:
+
+```rust
+pub struct S3mCell { pub note: u8 /*255 none, 254 cut, else (octave<<4)|semitone*/, pub instrument: u8 /*0 none, else 1-based*/,
+                     pub volume: u8 /*255 none*/, pub command: u8 /*0 none, 1..=26 = A..Z*/, pub info: u8 }
+impl S3mCell { from_bytes(&[u8]) -> Option<S3mCell>; to_bytes; is_empty; octave; semitone_in_octave; linear_semitone; display() -> PatternCell }
+pub const CELL_BYTES: usize = 5;  pub const ROWS: u16 = 64;
+PatternView::new(&Module, PatternId) -> Option<PatternView>;  .cell(row, channel) -> Option<S3mCell>;  .row(row) -> iterator
+```
+
+`Module::blob` holds each pattern as 64 rows × `channels` cells, row-major, 5 bytes each,
+so a `PatternData` impl over `&Module` returns `row_bytes` as the slice
+`blob[pattern.blob_offset + row * channels * 5 ..][.. channels * 5]`. Nothing is clamped in
+a cell: a volume of 200 or a command of 31 reaches the processor as the file spelled it.
+Instrument *n* in a cell is `InstrumentId(n − 1)`; every file slot has an `InstrumentDef`,
+sample-less for empty/Adlib slots.
+
+Header fields: `header().flags.amiga_limits` (generalflags bit 4),
+`header().flags.fast_volume_slides` (bit 6 or `Cwt/v == 0x1300`), `header().initial_speed`,
+`initial_tempo`, `global_volume` (0..64 scaled to `U0F16`), `default_pan` (`I1F15`, nibble
+mapped as `(2n − 15)/15` so 7/8 straddle centre), `S3mFormatExtra::from_header(h)` for the
+raw `tracker_version`, `master_volume` and low `general_flags` byte. Each
+`SampleIndex` carries the full 32-bit `reference_rate_hz` (D7), `default_volume`, loop
+fields; build the mixer's `SampleRegion` from `pcm_offset`/`length_frames`/loop fields —
+`ModuleBuilder` already laid the guard frames out in the layout `SampleData::resolve`
+expects.
+
+**Pitch → `Step`.** `starplayer_core::tables` has `PERIOD_TABLE`, `ST3_PERIOD_SCALE`
+(133808) and `ST3_FREQUENCY_NUMERATOR` (14317056 — *not* 8363 × 1712; see reference
+analysis §6). `hz = 14317056 / period`; `Step::from_ratio(hz, sample_rate)` (Q32.32) is the
+increment the voice needs, recomputed at tick rate only when `DirtyBits::PITCH` is set.
+
+**Where the processor lives.** `crates/starplayer-s3m/src/effects/` (or `processor.rs` +
+`effects.rs`), plus `impl PatternData for` a small wrapper over `&Module`, plus a
+`starplayer_s3m::sequencer_for(module, ...)`-style constructor the facade and B7 call.
+Mixer note: voices ramp in over `RAMP_FRAMES = 64` on trigger and fade on stop
+(M1-B5); that is a mixer property, not something the effect processor compensates for.
