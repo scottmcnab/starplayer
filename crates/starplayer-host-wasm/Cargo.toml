@@ -5,11 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 
 # `cdylib` is what the browser loads; `rlib` keeps the crate usable as a normal Rust
-# dependency so `cargo test --workspace` can exercise the sine table, the command ring
-# and the peak meter on the host without a browser in the loop.
+# dependency so `cargo test --workspace` can exercise the command ring, module loading
+# and a real render on the host without a browser in the loop.
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-starplayer = { workspace = true, features = ["std"] }
+starplayer = { workspace = true, features = ["std", "telemetry"] }
 wasm-bindgen = { workspace = true }

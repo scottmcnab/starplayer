@@ -22,6 +22,22 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+/// Core event, timing and fixed-point types used by hosts.
+pub use starplayer_core as core;
+/// Interpolators used to select an engine instantiation.
+pub use starplayer_dsp as dsp;
+/// The render engine and tracker sequencing surface.
+pub use starplayer_engine as engine;
+/// Mixer paths and host output formats.
+pub use starplayer_mixer as mixer;
+/// Loaded-module and display-only pattern types.
+pub use starplayer_model as model;
+/// Real-time ownership primitives, including the portable [`Arc`](starplayer_rt::Arc).
+pub use starplayer_rt as rt;
+/// Coherent UI snapshots.
+#[cfg(feature = "telemetry")]
+pub use starplayer_telemetry as telemetry;
+
 /// Scream Tracker 3 loading, native pattern access and sequencer construction.
 #[cfg(feature = "s3m")]
 pub use starplayer_s3m as s3m;

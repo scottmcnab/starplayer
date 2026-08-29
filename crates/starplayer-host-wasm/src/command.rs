@@ -1,56 +1,44 @@
-//! The real-time command queue.
+//! Fixed-capacity staging for typed commands decoded from the browser wire protocol.
 //!
-//! `plans/product/01-technical-architecture.md` §8 puts every control-plane change on a
-//! single-producer/single-consumer ring, and §1.2 drains it at the top of the render
-//! loop. This is that ring, at spike scale: one variant, a fixed capacity, no allocation
-//! and no way to panic.
-//!
-//! It is deliberately *not* the cross-thread transport. A wasm instance's linear memory
-//! is not visible to the page unless the module is built with shared memory
-//! (`-C target-feature=+atomics`), which the plain `cargo build` toolchain this project
-//! pins does not do. The page therefore writes into a `SharedArrayBuffer` ring; the
-//! worklet — which runs on the same thread as the wasm instance — drains that ring and
-//! pushes what it found in here. This ring is what `process()` reads, so the shape the
-//! engine sees in M1 is already the shape it will keep: *drain a Rust SPSC ring at the
-//! top of every render pass*. Only the producer moves.
+//! The `SharedArrayBuffer` ring crosses JavaScript realms. Its consumer calls
+//! `enqueue_command`, which decodes each record to the public
+//! `starplayer_core::Command` vocabulary and places it here. The Rust host drains this
+//! queue immediately before `Engine::render`, preserving the engine's control-plane
+//! shape without allocating in `process()`.
 
-/// Ring capacity in commands. A power of two so the wrap is a mask. One quantum is
-/// 2.7 ms at 48 kHz, and no human input device produces 64 events in 2.7 ms, so the ring
-/// overflowing means something upstream is broken rather than merely busy.
+/// Records accepted between render quanta.
 pub const COMMAND_RING_CAPACITY: usize = 64;
 
 const CAPACITY_MASK: usize = COMMAND_RING_CAPACITY - 1;
 
-/// The spike's entire command vocabulary. M1 replaces this with the engine's.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Command {
-    SetFrequency(f32),
+/// The compact values carried across the JavaScript-to-wasm edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WireCommand {
+    pub opcode: u8,
+    pub argument: u16,
+    pub extra: u16,
 }
 
-/// A bounded SPSC queue of [`Command`]s.
-///
-/// `push` is the producer side and `drain` the consumer side; neither allocates and
-/// neither can panic. A full ring drops the oldest-arriving command and counts the drop
-/// rather than blocking, because the alternative in an audio callback is a glitch.
+/// A bounded, allocation-free queue. It is SPSC at the browser boundary: the worklet's
+/// command consumer is the only producer here and `Host::process` the only consumer.
 pub struct CommandRing {
-    slots: [Command; COMMAND_RING_CAPACITY],
+    slots: [WireCommand; COMMAND_RING_CAPACITY],
     write_index: usize,
     read_index: usize,
     dropped: u32,
 }
 
 impl CommandRing {
-    pub fn new() -> Self {
-        Self {
-            slots: [Command::SetFrequency(0.0); COMMAND_RING_CAPACITY],
+    pub const fn new() -> CommandRing {
+        CommandRing {
+            slots: [WireCommand { opcode: 0, argument: 0, extra: 0 }; COMMAND_RING_CAPACITY],
             write_index: 0,
             read_index: 0,
             dropped: 0,
         }
     }
 
-    /// Enqueues one command. Returns `false` — and counts a drop — if the ring is full.
-    pub fn push(&mut self, command: Command) -> bool {
+    pub fn push(&mut self, command: WireCommand) -> bool {
         if self.write_index.wrapping_sub(self.read_index) >= COMMAND_RING_CAPACITY {
             self.dropped = self.dropped.saturating_add(1);
             return false;
@@ -60,8 +48,7 @@ impl CommandRing {
         true
     }
 
-    /// Removes and returns the next command, oldest first.
-    pub fn pop(&mut self) -> Option<Command> {
+    pub fn pop(&mut self) -> Option<WireCommand> {
         if self.read_index == self.write_index {
             return None;
         }
@@ -70,21 +57,11 @@ impl CommandRing {
         Some(command)
     }
 
-    /// Number of commands the ring has had to discard since init. Surfaced to the page:
-    /// a non-zero value is the spike failing, not a curiosity.
-    pub fn dropped(&self) -> u32 {
-        self.dropped
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.read_index == self.write_index
-    }
+    pub const fn dropped(&self) -> u32 { self.dropped }
 }
 
 impl Default for CommandRing {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> CommandRing { CommandRing::new() }
 }
 
 #[cfg(test)]
@@ -92,32 +69,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commands_come_back_out_in_order() {
+    fn typed_records_round_trip_without_allocation() {
         let mut ring = CommandRing::new();
-        assert!(ring.push(Command::SetFrequency(110.0)));
-        assert!(ring.push(Command::SetFrequency(440.0)));
-        assert_eq!(ring.pop(), Some(Command::SetFrequency(110.0)));
-        assert_eq!(ring.pop(), Some(Command::SetFrequency(440.0)));
+        let command = WireCommand { opcode: 3, argument: 17, extra: 2 };
+        assert!(ring.push(command));
+        assert_eq!(ring.pop(), Some(command));
         assert_eq!(ring.pop(), None);
     }
 
     #[test]
-    fn the_ring_wraps_without_losing_anything() {
+    fn overflow_is_visible_and_preserves_queued_records() {
         let mut ring = CommandRing::new();
-        for round in 0..1000u32 {
-            assert!(ring.push(Command::SetFrequency(round as f32)));
-            assert_eq!(ring.pop(), Some(Command::SetFrequency(round as f32)));
+        for index in 0..COMMAND_RING_CAPACITY {
+            assert!(ring.push(WireCommand { opcode: 1, argument: index as u16, extra: 0 }));
         }
-        assert_eq!(ring.dropped(), 0);
-        assert!(ring.is_empty());
-    }
-
-    #[test]
-    fn overflow_is_counted_rather_than_fatal() {
-        let mut ring = CommandRing::new();
-        for index in 0..COMMAND_RING_CAPACITY { assert!(ring.push(Command::SetFrequency(index as f32))); }
-        assert!(!ring.push(Command::SetFrequency(999.0)), "the ring is full");
+        assert!(!ring.push(WireCommand::default()));
         assert_eq!(ring.dropped(), 1);
-        assert_eq!(ring.pop(), Some(Command::SetFrequency(0.0)), "what was already queued survives");
+        assert_eq!(ring.pop().map(|command| command.argument), Some(0));
     }
 }

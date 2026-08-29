@@ -695,6 +695,36 @@ the pre-compiled `WebAssembly.Module` handed over in `processorOptions` already 
 and it is the most likely to need a real user gesture on the `AudioContext`, which the
 Start button provides. Confirm on hardware before M1-B7 ships.
 
+### 9.2 The wire protocol the web player settled on (M1-B7)
+
+A4 carried one command (`SetFrequency`) and one scalar back. B7 kept both transports and
+both shapes and widened them, without changing the decisions above.
+
+**Commands** are fixed three-word records — opcode, argument, extra — in the same SPSC
+ring, covering play, stop, seek order, seek row, master volume and channel mute. The
+worklet decodes each record into a `starplayer_core::Command` and stages it in a
+fixed-capacity queue drained immediately before `Engine::render`, so the JavaScript edge
+never touches the engine's own control ring. On the fallback path the page batches every
+control change made during one animation frame into one message, so "no `postMessage` per
+interaction" holds on both paths.
+
+**Snapshots** cross as a flat `Int32Array`: an 18-word header (sequence, dropped publishes,
+channel count, voices, order, pattern, row, tick, speed, BPM, global volume, warning bits,
+engine frame, pending garbage, module generation, playing, master peak, retired modules)
+then eight words per channel for all 64. The seqlock is the page's; the worklet copies the
+whole block between an odd and an even sequence store. What does **not** cross is
+`EffectDisplay::name` — a `&'static str` has no meaning in another address space, let alone
+another realm. The **whole English name table crosses once**, at start-up, from the
+page-side wasm instance, and the page resolves `(code, param)` against it. The names are
+still `EffectNames`'s, which is the point: no second copy of the table in JavaScript.
+
+**One realm hazard worth recording.** `AudioWorkletGlobalScope` has no `TextDecoder`, and
+wasm-bindgen's glue constructs one unconditionally at the top of its IIFE. The bundle
+therefore dies before `registerProcessor` runs, and the page learns about it only later,
+as "the node name is not defined". `cargo xtask wasm` now concatenates a small UTF-8
+decoder ahead of the glue and fails the build if the glue ever starts wanting to encode as
+well. The Node worklet harness hides Node's own `TextDecoder` so it sees this too.
+
 ---
 
 ## 10. Portability

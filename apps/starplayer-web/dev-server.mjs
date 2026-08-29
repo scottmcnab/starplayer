@@ -1,4 +1,4 @@
-// Development server for the M0-A4 spike. Node's built-in `http` and nothing else — no
+// Development server for the web player. Node's built-in `http` and nothing else — no
 // npm dependencies, so `cargo xtask serve` works on a machine that has never run
 // `npm install`.
 //
@@ -13,7 +13,11 @@
 // still works — it falls back to `postMessage` and says so — which is exactly the
 // comparison this spike exists to make.
 //
-// Usage: node apps/starplayer-web/dev-server.mjs [--port 8080] [--root <dir>]
+// `--no-isolation` omits them deliberately, which is how the graceful-degradation half
+// of the player is exercised: the page detects that `SharedArrayBuffer` is unavailable,
+// says so, and drives the worklet over batched `postMessage` instead.
+//
+// Usage: node apps/starplayer-web/dev-server.mjs [--port 8080] [--root <dir>] [--no-isolation]
 
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
@@ -28,11 +32,12 @@ const CONTENT_TYPES = {
     // `WebAssembly.compileStreaming` refuses anything else, and wasm-bindgen's glue
     // prints a warning and takes a slower path if this is wrong.
     '.wasm': 'application/wasm',
+    '.s3m': 'application/octet-stream',
     '.map': 'application/json; charset=utf-8',
 };
 
 function parseArguments(argv) {
-    const options = { port: 8080, root: 'apps/starplayer-web/dist' };
+    const options = { port: 8080, root: 'apps/starplayer-web/dist', isolate: true };
     for (let index = 0; index < argv.length; index += 1) {
         if (argv[index] === '--port') {
             options.port = Number(argv[index + 1]);
@@ -40,6 +45,8 @@ function parseArguments(argv) {
         } else if (argv[index] === '--root') {
             options.root = argv[index + 1];
             index += 1;
+        } else if (argv[index] === '--no-isolation') {
+            options.isolate = false;
         } else {
             throw new Error(`unexpected argument \`${argv[index]}\``);
         }
@@ -54,10 +61,12 @@ const options = parseArguments(process.argv.slice(2));
 const documentRoot = resolve(options.root);
 
 function applyCommonHeaders(response) {
-    response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-    // Required so the isolated document is allowed to load its own subresources.
-    response.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    if (options.isolate) {
+        response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+        // Required so the isolated document is allowed to load its own subresources.
+        response.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    }
     // A dev server that caches is a dev server that lies about the build you just made.
     response.setHeader('Cache-Control', 'no-store');
 }
@@ -97,7 +106,8 @@ const server = createServer(async (request, response) => {
         }
         const body = await readFile(filePath);
         response.writeHead(200, {
-            'Content-Type': CONTENT_TYPES[extname(filePath)] ?? 'application/octet-stream',
+            // Lower-cased: the packaged modules are `REFLEX.S3M`, not `reflex.s3m`.
+            'Content-Type': CONTENT_TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
             'Content-Length': body.length,
         });
         response.end(request.method === 'HEAD' ? undefined : body);
@@ -115,8 +125,12 @@ const server = createServer(async (request, response) => {
 server.listen(options.port, '127.0.0.1', () => {
     console.log(`starplayer dev server: http://localhost:${options.port}/`);
     console.log(`  document root: ${documentRoot}`);
-    console.log('  Cross-Origin-Opener-Policy: same-origin');
-    console.log('  Cross-Origin-Embedder-Policy: require-corp');
+    if (options.isolate) {
+        console.log('  Cross-Origin-Opener-Policy: same-origin');
+        console.log('  Cross-Origin-Embedder-Policy: require-corp');
+    } else {
+        console.log('  --no-isolation: no COOP/COEP, so the page takes its postMessage fallback');
+    }
     console.log('  press Ctrl-C to stop');
 });
 

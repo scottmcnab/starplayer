@@ -3,99 +3,139 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>StarPlayer — M0-A4 AudioWorklet spike</title>
-<!-- Inline, so the page makes no request the dev server would have to 404. -->
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%99%AA%3C/text%3E%3C/svg%3E">
-<style>
-    :root { color-scheme: dark; }
-    body {
-        margin: 0; padding: 2rem 1.5rem;
-        font: 15px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-        background: #14161a; color: #d8dee9;
-    }
-    main { max-width: 44rem; margin: 0 auto; }
-    h1 { font-size: 1.1rem; letter-spacing: 0.08em; text-transform: uppercase; color: #88c0d0; margin: 0 0 0.25rem; }
-    p.blurb { margin: 0 0 1.5rem; color: #7d8799; }
-    section { border: 1px solid #2a2f38; border-radius: 6px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
-    section h2 { font-size: 0.78rem; letter-spacing: 0.12em; text-transform: uppercase; color: #7d8799; margin: 0 0 0.75rem; }
-    .row { display: flex; gap: 1rem; align-items: baseline; margin: 0.35rem 0; }
-    .label { flex: 0 0 12rem; color: #7d8799; }
-    .value { color: #d8dee9; word-break: break-word; }
-    .value.good { color: #a3be8c; }
-    .value.warn { color: #ebcb8b; }
-    button {
-        font: inherit; padding: 0.5rem 1.25rem; border-radius: 4px;
-        border: 1px solid #4c566a; background: #2e3440; color: #eceff4; cursor: pointer;
-    }
-    button:hover:not(:disabled) { background: #3b4252; }
-    button:disabled { opacity: 0.4; cursor: default; }
-    input[type=range] { flex: 1; min-width: 12rem; accent-color: #88c0d0; }
-    label.checkbox { display: flex; gap: 0.5rem; align-items: center; color: #7d8799; margin-top: 0.75rem; }
-    #peak-track { height: 14px; background: #22262e; border-radius: 3px; overflow: hidden; flex: 1; min-width: 12rem; }
-    #peak-bar { height: 100%; width: 0; background: linear-gradient(90deg, #a3be8c, #ebcb8b 75%, #bf616a); transition: width 60ms linear; }
-    #log { max-height: 12rem; overflow-y: auto; font-size: 13px; color: #7d8799; }
-    #log div { padding: 1px 0; }
-</style>
+<meta name="theme-color" content="#10151d">
+<title>StarPlayer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%9C%A6%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 <main>
-    <h1>StarPlayer — AudioWorklet spike</h1>
-    <p class="blurb">
-        M0-task-A4. A Rust sine wave, rendered in wasm inside an AudioWorklet, with a
-        lock-free command path in and a telemetry path out. No engine yet — this exists so
-        that when the tracker arrives, an audio bug can be told apart from a plumbing bug.
-    </p>
+    <header class="masthead">
+        <div>
+            <p class="eyebrow">real-time tracked music</p>
+            <h1><span>✦</span> StarPlayer</h1>
+            <p class="subtitle">Scream Tracker 3, played by the Rust engine in an AudioWorklet.</p>
+        </div>
+        <div class="transport-chip" id="transport-chip">audio asleep</div>
+    </header>
 
-    <section>
-        <h2>Transport</h2>
-        <div class="row"><span class="label">isolation</span><span class="value" id="isolation">—</span></div>
-        <div class="row"><span class="label">commands (page → audio)</span><span class="value" id="command-transport">—</span></div>
-        <div class="row"><span class="label">telemetry (audio → page)</span><span class="value" id="telemetry-transport">—</span></div>
-        <div class="row"><span class="label">render quantum</span><span class="value" id="quantum">—</span></div>
-        <label class="checkbox">
-            <input type="checkbox" id="force-fallback">
-            force the postMessage fallback (set before pressing Start)
+    <div id="error" class="notice error" role="alert" hidden></div>
+    <div id="message" class="notice" role="status">Choose a fixture or drop an S3M to begin.</div>
+
+    <section class="load-panel" aria-labelledby="load-heading">
+        <div>
+            <p class="section-label" id="load-heading">Load an S3M</p>
+            <div class="load-actions">
+                <button class="primary" id="start-audio">Start audio</button>
+                <label class="button" for="file-picker">Choose file</label>
+                <input id="file-picker" type="file" accept=".s3m,audio/s3m" hidden>
+                <select id="fixture-picker" aria-label="Bundled fixture">
+                    <option value="">Bundled fixture…</option>
+                    <option>ARMANI.S3M</option>
+                    <option>MOVEMENT.S3M</option>
+                    <option>NICETUNE.S3M</option>
+                    <option>PETRI.S3M</option>
+                    <option>REFLEX.S3M</option>
+                </select>
+                <button id="load-fixture">Load fixture</button>
+            </div>
+            <form id="url-form" class="url-form">
+                <input id="url" type="url" inputmode="url" placeholder="https://example.com/song.s3m" aria-label="S3M URL">
+                <button type="submit">Load URL</button>
+            </form>
+        </div>
+        <div id="drop-zone" class="drop-zone" tabindex="0">
+            <strong>Drop .s3m here</strong>
+            <span>The live graph survives a bad file.</span>
+        </div>
+    </section>
+
+    <section class="now-playing" aria-labelledby="now-heading">
+        <div class="song-heading">
+            <p class="section-label" id="now-heading">Now playing</p>
+            <h2 id="title">No module loaded</h2>
+            <p id="module-detail">—</p>
+        </div>
+        <div class="position-grid">
+            <div><span>Order</span><strong id="order">—</strong></div>
+            <div><span>Pattern</span><strong id="pattern">—</strong></div>
+            <div><span>Row</span><strong id="row">—</strong></div>
+            <div><span>Speed</span><strong id="speed">—</strong></div>
+            <div><span>BPM</span><strong id="bpm">—</strong></div>
+        </div>
+    </section>
+
+    <section class="controls" aria-label="Transport controls">
+        <button id="previous" title="Previous order" disabled>◀◀</button>
+        <button id="play" class="primary round" disabled>▶ Play</button>
+        <button id="stop" class="round" disabled>■ Stop</button>
+        <button id="next" title="Next order" disabled>▶▶</button>
+        <label class="seek-label">Order
+            <input id="seek-order" type="number" min="0" value="0" disabled>
+        </label>
+        <label class="volume-label">Volume
+            <input id="volume" type="range" min="0" max="100" value="80" disabled>
+            <output id="volume-value">80%</output>
         </label>
     </section>
 
-    <section>
-        <h2>Control</h2>
-        <div class="row">
-            <button id="start">Start</button>
-            <button id="stop" disabled>Stop</button>
+    <section class="panel" aria-labelledby="channels-heading">
+        <div class="panel-heading">
+            <div>
+                <p class="section-label">Sounding state</p>
+                <h2 id="channels-heading">Channels</h2>
+            </div>
+            <div class="master-meter">
+                <span id="voices">0 voices</span>
+                <span class="vu-track"><span class="vu-fill" id="master-peak"></span></span>
+            </div>
         </div>
-        <div class="row">
-            <span class="label">frequency</span>
-            <input type="range" id="frequency" min="110" max="880" step="0.5" value="440">
-            <span class="value" id="frequency-readout">—</span>
+        <!-- At phone width the table scrolls horizontally. Channel identity, instrument
+             name and English effect are simultaneous facts; collapsing or paginating
+             would hide that relationship, while a deliberate swipe keeps it intact. -->
+        <div class="table-scroll">
+            <table class="channel-table">
+                <thead><tr><th>Ch</th><th>Instrument</th><th>Note</th><th>Vol</th><th>Pan</th><th>VU</th><th>Current effect</th><th></th></tr></thead>
+                <tbody id="channel-body"><tr><td colspan="8" class="empty">Waiting for a module.</td></tr></tbody>
+            </table>
         </div>
-        <div class="row"><span class="label">oscillator is at</span><span class="value" id="actual-frequency">—</span></div>
-        <div class="row"><span class="label">dropped commands</span><span class="value" id="dropped">—</span></div>
-        <div class="row"><span class="label">ring back-pressure</span><span class="value" id="back-pressure">—</span></div>
     </section>
 
-    <section>
-        <h2>Telemetry</h2>
-        <div class="row">
-            <span class="label">peak</span>
-            <span id="peak-track"><span id="peak-bar"></span></span>
+    <section class="panel" aria-labelledby="pattern-heading">
+        <div class="panel-heading">
+            <div>
+                <p class="section-label">Windowed display</p>
+                <h2 id="pattern-heading">Pattern</h2>
+            </div>
+            <span>the highlighted row is sounding</span>
         </div>
-        <div class="row"><span class="label">peak level</span><span class="value" id="peak-readout">—</span></div>
-        <div class="row"><span class="label">quanta rendered</span><span class="value" id="quanta">—</span></div>
-        <div class="row"><span class="label">wasm memory</span><span class="value" id="memory">—</span></div>
-        <div class="row"><span class="label">memory growth check</span><span class="value" id="memory-verdict">—</span></div>
+        <div class="table-scroll pattern-scroll">
+            <table class="pattern-table" id="pattern-table"><tbody><tr><td class="empty">No pattern data.</td></tr></tbody></table>
+        </div>
     </section>
 
-    <section>
-        <h2>Log</h2>
-        <div id="log"></div>
+    <section class="lower-grid">
+        <article class="panel">
+            <div class="panel-heading"><h2>Instruments</h2><span id="instrument-count">0</span></div>
+            <ol id="instrument-list" class="instrument-list"><li class="empty">No module loaded.</li></ol>
+        </article>
+        <article class="panel diagnostics">
+            <div class="panel-heading"><h2>Engine</h2><span id="health">idle</span></div>
+            <dl>
+                <div><dt>Commands</dt><dd id="command-transport">—</dd></div>
+                <div><dt>Telemetry</dt><dd id="telemetry-transport">—</dd></div>
+                <div><dt>Render quantum</dt><dd id="quantum">—</dd></div>
+                <div><dt>Wasm memory</dt><dd id="memory">—</dd></div>
+                <div><dt title="Loading a module allocates on the worklet instance; that growth happens in a message task, outside process(). Only growth during playback is a defect.">Measured</dt><dd>across playback, not across loads</dd></div>
+                <div><dt>Dropped</dt><dd id="dropped">0</dd></div>
+                <div><dt>Retired modules</dt><dd id="retired">0</dd></div>
+            </dl>
+            <label class="fallback"><input id="force-fallback" type="checkbox"> Test postMessage fallback</label>
+        </article>
     </section>
 </main>
 
-<!-- Classic scripts, in order: the protocol first, then the page. `ring.js` is also
-     concatenated into the worklet bundle, which is why it is a plain script rather than
-     a module — a worklet cannot import one. -->
 <script src="ring.js"></script>
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

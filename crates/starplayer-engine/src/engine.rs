@@ -394,12 +394,17 @@ where
             }
 
             let end = offset.saturating_add(span);
-            let pcm: &[i16] = match &self.module {
-                Some(module) => module.pcm(),
-                None => &self.pcm,
-            };
-            if let Some(window) = self.accumulator.get_mut(offset..end) {
-                self.voices.accumulate::<Path, Interp>(pcm, window);
+            // A stopped transport freezes the entire musical state, including sample
+            // cursors. Advancing voices under silence would make Play resume halfway
+            // through a one-shot even though the source clock had not moved.
+            if self.playing {
+                let pcm: &[i16] = match &self.module {
+                    Some(module) => module.pcm(),
+                    None => &self.pcm,
+                };
+                if let Some(window) = self.accumulator.get_mut(offset..end) {
+                    self.voices.accumulate::<Path, Interp>(pcm, window);
+                }
             }
 
             self.frame = self.frame.saturating_add(span as u64);

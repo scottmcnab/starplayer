@@ -4,5 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 starplayer = { workspace = true, features = ["std"] }
+wasm-bindgen = { workspace = true }

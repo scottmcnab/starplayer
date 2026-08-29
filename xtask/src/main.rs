@@ -173,6 +173,7 @@ fn job_host_tests() -> bool {
 fn job_wasm_build() -> bool {
     cargo(&["build", "--target", WASM_TARGET, "-p", "starplayer"])
         && cargo(&["build", "--target", WASM_TARGET, "-p", "starplayer-host-wasm"])
+        && cargo(&["build", "--target", WASM_TARGET, "-p", "starplayer-web"])
 }
 
 /// Each `no_std` crate must compile for a bare-metal target with its features stripped
@@ -392,11 +393,18 @@ fn cargo(arguments: &[&str]) -> bool {
 const WEB_SOURCE_DIRECTORY: &str = "apps/starplayer-web/www";
 const WEB_OUTPUT_DIRECTORY: &str = "apps/starplayer-web/dist";
 const DEV_SERVER_SCRIPT: &str = "apps/starplayer-web/dev-server.mjs";
+const FIXTURE_SOURCE_DIRECTORY: &str = "crates/starplayer-s3m/tests/fixtures";
+/// Where those fixtures are served from, relative to the document root.
+const PACKAGED_MODULE_DIRECTORY: &str = "modules";
 
 /// The crate compiled to wasm, and the file names `wasm-bindgen` derives from it.
 const WASM_CRATE: &str = "starplayer-host-wasm";
 const WASM_ARTIFACT: &str = "starplayer_host_wasm.wasm";
 const BINDGEN_GLUE: &str = "starplayer_host_wasm.js";
+
+/// The page-side loader is a second wasm instance, generated as an ES module.
+const PAGE_WASM_CRATE: &str = "starplayer-web";
+const PAGE_WASM_ARTIFACT: &str = "starplayer_web.wasm";
 
 /// The single file `AudioWorklet.addModule()` is pointed at.
 const WORKLET_BUNDLE: &str = "starplayer-worklet.js";
@@ -405,9 +413,13 @@ const WORKLET_BUNDLE: &str = "starplayer-worklet.js";
 /// matters: `ring.js` installs the protocol the processor then uses.
 const WORKLET_BUNDLE_PARTS: &[&str] = &["ring.js", "worklet-processor.js"];
 
+/// Bundled *ahead* of the wasm-bindgen glue, because the glue constructs a `TextDecoder`
+/// at the top of its IIFE and `AudioWorkletGlobalScope` does not have one.
+const WORKLET_BUNDLE_PRELUDE: &str = "worklet-prelude.js";
+
 /// Sources that exist only to be bundled and are never loaded on their own. `ring.js` is
 /// not among them: the page loads it too, because the protocol has two ends.
-const WORKLET_ONLY_SOURCES: &[&str] = &["worklet-processor.js"];
+const WORKLET_ONLY_SOURCES: &[&str] = &["worklet-processor.js", "worklet-prelude.js"];
 
 const DEFAULT_SERVE_PORT: u16 = 8080;
 
@@ -452,7 +464,11 @@ fn run_wasm(arguments: &[String]) -> bool {
     if !check_bindgen_version(&root) {
         return false;
     }
-    if !cargo(&["build", "--release", "--target", WASM_TARGET, "-p", WASM_CRATE]) {
+    if !cargo(&[
+        "build", "--release", "--target", WASM_TARGET,
+        "-p", WASM_CRATE,
+        "-p", PAGE_WASM_CRATE,
+    ]) {
         return false;
     }
 
@@ -492,7 +508,13 @@ fn run_wasm(arguments: &[String]) -> bool {
     if !build_worklet_bundle(&root, &output_directory) {
         return false;
     }
+    if !build_page_loader(&root, &output_directory) {
+        return false;
+    }
     if !copy_web_sources(&root, &output_directory) {
+        return false;
+    }
+    if !copy_fixture_modules(&root, &output_directory) {
         return false;
     }
     if !report_output(&output_directory) {
@@ -506,6 +528,30 @@ fn run_wasm(arguments: &[String]) -> bool {
     }
     println!("     run `cargo xtask serve` and open http://localhost:{DEFAULT_SERVE_PORT}/");
     true
+}
+
+/// Generate the independent main-thread loader instance. Keeping this separate from the
+/// worklet means malformed-file validation and PatternCell display decoding never run in
+/// the live render instance.
+fn build_page_loader(root: &Path, output_directory: &Path) -> bool {
+    let wasm_artifact = root.join("target").join(WASM_TARGET).join("release").join(PAGE_WASM_ARTIFACT);
+    println!("     wasm-bindgen --target web {}", wasm_artifact.display());
+    match Command::new("wasm-bindgen")
+        .args(["--target", "web", "--no-typescript", "--out-dir"])
+        .arg(output_directory)
+        .arg(&wasm_artifact)
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("     page-side wasm-bindgen exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("     page-side wasm-bindgen failed to start: {error}");
+            false
+        }
+    }
 }
 
 /// Assemble the one file the worklet is allowed to load.
@@ -529,12 +575,26 @@ fn run_wasm(arguments: &[String]) -> bool {
 ///    off makes that unreachable by construction rather than by luck, and the assertion
 ///    below turns a future wasm-bindgen that changes the shape of this code into a build
 ///    failure instead of a silent runtime one.
+///
+/// 3. **A `TextDecoder`.** The glue constructs one at the top of its IIFE, unconditionally,
+///    and the worklet realm has none — so without `worklet-prelude.js` in front of it the
+///    bundle throws before `registerProcessor` runs, and the page only finds out later,
+///    when `new AudioWorkletNode(...)` reports an undefined processor name. The prelude
+///    supplies a decoder and nothing else; the check below fails the build rather than the
+///    browser if a future glue starts wanting to encode as well.
 fn build_worklet_bundle(root: &Path, output_directory: &Path) -> bool {
     let glue_path = output_directory.join(BINDGEN_GLUE);
     let Ok(glue) = std::fs::read_to_string(&glue_path) else {
         eprintln!("xtask wasm: `{}` was not produced", glue_path.display());
         return false;
     };
+
+    if glue.contains("TextEncoder") {
+        eprintln!("xtask wasm: the wasm-bindgen glue now uses `TextEncoder`, which");
+        eprintln!("            `AudioWorkletGlobalScope` does not have. Extend");
+        eprintln!("            `{WORKLET_BUNDLE_PRELUDE}` with an encoder before shipping this.");
+        return false;
+    }
 
     const SCRIPT_SNIFF: &str = "if (typeof document !== 'undefined' && document.currentScript !== null) {";
     if !glue.contains(SCRIPT_SNIFF) {
@@ -555,6 +615,13 @@ fn build_worklet_bundle(root: &Path, output_directory: &Path) -> bool {
     bundle.push_str("// wasm-bindgen `--target no-modules` glue, then the ring protocol, then the\n");
     bundle.push_str("// AudioWorklet processor, concatenated because a worklet can load exactly one file\n");
     bundle.push_str("// and cannot fetch or import anything once it is running.\n\n");
+    let prelude_path = root.join(WEB_SOURCE_DIRECTORY).join(WORKLET_BUNDLE_PRELUDE);
+    let Ok(prelude) = std::fs::read_to_string(&prelude_path) else {
+        eprintln!("xtask wasm: cannot read `{}`", prelude_path.display());
+        return false;
+    };
+    bundle.push_str(&prelude);
+    bundle.push_str("\n\n");
     bundle.push_str(&glue);
 
     for part in WORKLET_BUNDLE_PARTS {
@@ -581,7 +648,7 @@ fn build_worklet_bundle(root: &Path, output_directory: &Path) -> bool {
         eprintln!("xtask wasm: cannot remove `{}`: {error}", glue_path.display());
         return false;
     }
-    println!("     bundled {BINDGEN_GLUE} + {} → {WORKLET_BUNDLE}", WORKLET_BUNDLE_PARTS.join(" + "));
+    println!("     bundled {WORKLET_BUNDLE_PRELUDE} + {BINDGEN_GLUE} + {} → {WORKLET_BUNDLE}", WORKLET_BUNDLE_PARTS.join(" + "));
     true
 }
 
@@ -613,6 +680,27 @@ fn copy_web_sources(root: &Path, output_directory: &Path) -> bool {
         }
     }
     all_succeeded
+}
+
+/// Ship the five licensed test modules as one-click smoke fixtures. The source remains
+/// the format crate's corpus; packaging copies it rather than creating a second checked-in
+/// set that could drift.
+fn copy_fixture_modules(root: &Path, output_directory: &Path) -> bool {
+    let source = root.join(FIXTURE_SOURCE_DIRECTORY);
+    let destination = output_directory.join(PACKAGED_MODULE_DIRECTORY);
+    if let Err(error) = std::fs::create_dir_all(&destination) {
+        eprintln!("xtask wasm: cannot create `{}`: {error}", destination.display());
+        return false;
+    }
+    let names = ["ARMANI.S3M", "MOVEMENT.S3M", "NICETUNE.S3M", "PETRI.S3M", "REFLEX.S3M"];
+    for name in names {
+        if let Err(error) = std::fs::copy(source.join(name), destination.join(name)) {
+            eprintln!("xtask wasm: cannot package fixture `{name}`: {error}");
+            return false;
+        }
+    }
+    println!("     packaged {} S3M fixtures", names.len());
+    true
 }
 
 fn report_output(output_directory: &Path) -> bool {

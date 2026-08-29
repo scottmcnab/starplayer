@@ -303,6 +303,7 @@ name = "starplayer-web"
 version = "0.1.0"
 dependencies = [
  "starplayer",
+ "wasm-bindgen",
 ]
 
 [[package]]

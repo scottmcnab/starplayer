@@ -396,6 +396,24 @@ fn stopping_freezes_the_musical_clock_without_stopping_the_output_clock() {
 }
 
 #[test]
+fn stopping_silences_and_freezes_a_sounding_voice() {
+    let (_blob, region) = looping_blob();
+    let mut engine: TestEngine = Engine::new(4);
+    engine.set_pcm(vec![500, -500, 1000, -1000, 500, -500, 1000, -1000]);
+    let params = VoiceParams { step: Step::ONE, volume: U0F16::MAX, ..VoiceParams::SILENT };
+    let voice = engine.voices_mut().allocate(VoiceTag::default(), region, params, 0).expect("a voice");
+    let before = engine.voices().get(voice).map(|state| state.position()).expect("the voice exists");
+    let mut control = engine.take_control().expect("the handle");
+    control.send(Command::Stop).map_err(|_| "queued").expect("the ring has room");
+
+    let mut output = vec![1i16; RENDER_QUANTUM * 2];
+    engine.render(&mut output);
+
+    assert!(output.iter().all(|sample| *sample == 0), "a stopped transport is silent");
+    assert_eq!(engine.voices().get(voice).map(|state| state.position()), Some(before), "the voice resumes from the same sample frame");
+}
+
+#[test]
 fn muting_a_channel_stops_it_starting_voices() {
     let mut engine: TestEngine = Engine::new(8);
     let mut control = engine.take_control().expect("the handle");
