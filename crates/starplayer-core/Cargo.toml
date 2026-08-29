@@ -4,9 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+# `fixed` carries no transitive dependencies at its default feature set and is `no_std`
+# unless `std` is opted into, so it costs nothing on the bare-metal target.
+fixed = { workspace = true }
+bitflags = { workspace = true }
+
 [features]
 default = []
 # `std` is never part of any default feature set (AGENTS.md design goal 4).
-std = []
+std = ["fixed/std"]
 alloc = []
 serde = []

@@ -21,6 +21,11 @@ rust-version = "1.97"
 # Internal path dependencies are listed so the dependency graph is declared in one
 # place and a crate can be moved without touching every sibling manifest.
 [workspace.dependencies]
+# External crates. Both are `no_std` with their default feature sets, which is what
+# keeps design goal 4 (no default feature transitively enables `std`) satisfiable.
+fixed = { version = "1.31", default-features = false }
+bitflags = { version = "2.13", default-features = false }
+
 starplayer = { path = "crates/starplayer" }
 starplayer-core = { path = "crates/starplayer-core" }
 starplayer-rt = { path = "crates/starplayer-rt" }
