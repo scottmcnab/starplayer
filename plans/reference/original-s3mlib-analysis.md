@@ -570,7 +570,11 @@ octave 4 ⇒ 1712 = Amiga 428 × 4. **S3M periods are Amiga periods × 4** — w
 every slide multiplies by 4 and the Amiga clamp is `[113*4, 856*4]`.
 
 **Period → frequency** (`PeriodToPitch`, 3561): `hz = 14317056 / period`
-(`0DA7600h` = 8363 × 1712, the ST3 constant).
+(`0DA7600h`, the ST3 constant). **Note:** `0DA7600h` is 14,317,056, which is *not*
+8363 × 1712 (= 14,317,456) — it is 400 low. `PeriodFromNote` uses `8363 * 16`, which
+*does* give exactly 8363 × 1712 at octave 4, so a C-4 round-trips as 8362.77 Hz rather
+than 8363 Hz. This is ST3's own inconsistency (the constant is ST3's), not a StarPlayer
+defect, and it is reproduced as-is; `starplayer-core::tables` asserts the 400 gap.
 
 **Frequency → mixer step** (`SB_ProcessTracks`, 5795): `HighSpeed = hz / rate`, with the
 fractional part in `LowSpeed` via a 64-bit divide — a Q32.32 step split across two

@@ -128,7 +128,7 @@ is strictly worse than what the 80386 code did: **write field, set dirty bit.**
 
 ```rust
 // (1) Timeline. The only thing carrying a timestamp.
-pub struct TimedEvent { pub frame: u64, pub target: Target, pub event: Event }
+pub struct TimedEvent { pub frame: Frame, pub target: Target, pub event: Event }  // Frame = u64 newtype
 
 pub enum Target { Channel(ChannelId), Voice(VoiceId), Global }
 

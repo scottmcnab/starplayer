@@ -84,7 +84,8 @@ reason.
    hand-written newtypes over `u64`/`i32` with explicit saturating ops are simpler to
    audit. Prefer whichever makes the mixer inner loop obviously correct.
 2. Confirm the exact ST3 constants against the assembly before hard-coding:
-   `8363 * 16 = 133808` and `14317056 = 8363 * 1712`.
+   `8363 * 16 = 133808` and `0DA7600h = 14317056`. (Outcome: 14317056 is **not**
+   8363 × 1712 = 14317456; see reference analysis §6.)
 
 ## Verification
 
