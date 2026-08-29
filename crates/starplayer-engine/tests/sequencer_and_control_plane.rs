@@ -414,18 +414,38 @@ fn stopping_silences_and_freezes_a_sounding_voice() {
 }
 
 #[test]
-fn muting_a_channel_stops_it_starting_voices() {
-    let mut engine: TestEngine = Engine::new(8);
-    let mut control = engine.take_control().expect("the handle");
-    control
-        .send(Command::MuteChannel { channel: starplayer_core::ChannelId(1), muted: true })
-        .map_err(|_| "queued")
-        .expect("the ring has room");
+fn muting_a_channel_silences_its_ringing_voice_and_unmuting_resumes_mid_note() {
+    // Two engines, one voice each on channel 1, rendered in lock-step: one is muted for
+    // the middle quantum, the other never is. The muted quantum must be silent, and after
+    // the unmute the two outputs must be byte-identical — the muted voice kept moving.
+    let (blob, region) = looping_blob();
+    let params = VoiceParams { step: Step::ONE, volume: U0F16::MAX, ..VoiceParams::SILENT };
+    let tag = VoiceTag { channel: 1, ..VoiceTag::default() };
+    let mut muted: TestEngine = Engine::new(8);
+    let mut reference: TestEngine = Engine::new(8);
+    for engine in [&mut muted, &mut reference] {
+        engine.set_pcm(blob.clone());
+        let voice = engine.voices_mut().allocate(tag, region, params, 0).expect("a voice");
+        engine.voices_mut().get_mut(voice).expect("live").settle_gains();
+    }
+    let mut control = muted.take_control().expect("the handle");
+    fn quantum(engine: &mut TestEngine) -> Vec<i16> { let mut output = vec![0i16; RENDER_QUANTUM * 2]; engine.render(&mut output); output }
 
-    let mut output = vec![0i16; RENDER_QUANTUM * 2];
-    engine.render(&mut output);
-    assert!(engine.channels().get(starplayer_core::ChannelId(1)).is_some_and(|lane| lane.muted));
-    assert!(engine.channels().get(starplayer_core::ChannelId(0)).is_some_and(|lane| !lane.muted));
+    let (first_muted, first_reference) = (quantum(&mut muted), quantum(&mut reference));
+    assert_eq!(first_muted, first_reference, "before the mute the two engines agree");
+    assert!(first_reference.iter().any(|sample| *sample != 0), "the reference voice is audible");
+
+    control.send(Command::MuteChannel { channel: starplayer_core::ChannelId(1), muted: true }).map_err(|_| "queued").expect("room");
+    let silent = quantum(&mut muted);
+    let audible = quantum(&mut reference);
+    assert!(silent.iter().all(|sample| *sample == 0), "a muted channel contributes nothing");
+    assert!(audible.iter().any(|sample| *sample != 0));
+    assert!(muted.channels().get(starplayer_core::ChannelId(1)).is_some_and(|lane| lane.muted));
+    assert_eq!(muted.voices().voices_active(), 1, "the muted voice is still alive");
+
+    control.send(Command::MuteChannel { channel: starplayer_core::ChannelId(1), muted: false }).map_err(|_| "queued").expect("room");
+    assert_eq!(quantum(&mut muted), quantum(&mut reference), "after the unmute the voice is exactly where it would have been");
+    assert_eq!(quantum(&mut muted), quantum(&mut reference));
 }
 
 #[test]

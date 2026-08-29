@@ -30,8 +30,10 @@ pub struct Channel {
     /// stolen — the handle is generational, so a stale one resolves to nothing rather than
     /// to somebody else's voice.
     pub foreground: Option<VoiceId>,
-    /// Whether the host has muted this lane. A muted channel still runs its effects — the
-    /// original keeps the whole channel state live — it just does not start voices.
+    /// Whether the host has muted this lane. A muted channel runs exactly as an audible
+    /// one — its effects, its voices, its telemetry — and the engine renders its voices
+    /// into a discard buffer instead of the mix. Unmuting therefore resumes mid-note, and
+    /// the other channels' output is bit-identical either way.
     pub muted: bool,
 }
 
@@ -89,8 +91,9 @@ impl ChannelTable {
 
     /// Start a voice on `channel`, replacing whatever it was sounding.
     ///
-    /// Returns the new voice, or `None` if the channel does not exist, is muted, or the
-    /// pool is full. A full pool is a **normal** outcome — it is where IT's voice-stealing
+    /// Returns the new voice, or `None` if the channel does not exist or the pool is
+    /// full. A muted channel still starts its voice — muting happens in the mixer, so the
+    /// channel's state is what it would have been. A full pool is a **normal** outcome — it is where IT's voice-stealing
     /// heuristic gets to choose a victim in M6; until then the note is simply dropped,
     /// which is what the original does.
     ///
@@ -113,9 +116,6 @@ impl ChannelTable {
         offset_frames: u32,
     ) -> Option<VoiceId> {
         let lane = self.channels.get_mut(channel.0 as usize)?;
-        if lane.muted {
-            return None;
-        }
         if let Some(previous) = lane.foreground.take() {
             voices.release(previous);
         }
@@ -203,15 +203,15 @@ mod tests {
     }
 
     #[test]
-    fn a_muted_channel_starts_nothing() {
+    fn a_muted_channel_still_starts_voices_because_muting_is_the_mixers_job() {
         let (_blob, region) = looping_blob();
         let mut channels = ChannelTable::new(2);
         let mut voices = VoicePool::new(4);
         channels.get_mut(ChannelId(1)).expect("channel 1").muted = true;
 
-        assert!(channels.trigger(ChannelId(1), &mut voices, VoiceTag::default(), region, sounding(), 0).is_none());
-        assert_eq!(voices.voices_active(), 0);
-        assert!(channels.trigger(ChannelId(0), &mut voices, VoiceTag::default(), region, sounding(), 0).is_some());
+        assert!(channels.trigger(ChannelId(1), &mut voices, VoiceTag::default(), region, sounding(), 0).is_some());
+        assert_eq!(voices.voices_active(), 1, "the muted channel's voice exists so unmuting can resume it mid-note");
+        assert!(channels.is_sounding(ChannelId(1), &voices));
     }
 
     #[test]

@@ -323,14 +323,43 @@ impl VoicePool {
     /// summation order — and therefore its exact `f32` result — independent of the host's
     /// block size.
     pub fn accumulate<Path: MixPath, Interp: Interpolate>(&mut self, pcm: &[i16], destination: &mut [Path::Accumulator]) {
+        self.accumulate_masked::<Path, Interp>(pcm, destination, &mut [], |_| false);
+    }
+
+    /// [`VoicePool::accumulate`], with the voices whose `tag.channel` satisfies `is_muted`
+    /// rendered into `discard` instead of `destination`.
+    ///
+    /// This is how a host mutes a channel. The muted voice keeps running exactly as it
+    /// would have — position, loop, ramps, and every parameter write its channel makes —
+    /// so unmuting resumes mid-note, and the output at every other channel is
+    /// bit-identical to an unmuted render. `discard` must be at least as long as
+    /// `destination`; if it is shorter, muted voices are skipped for this call and their
+    /// state does not advance, which is the lesser evil next to a panic on the audio
+    /// thread.
+    pub fn accumulate_masked<Path: MixPath, Interp: Interpolate>(
+        &mut self,
+        pcm: &[i16],
+        destination: &mut [Path::Accumulator],
+        discard: &mut [Path::Accumulator],
+        is_muted: impl Fn(u8) -> bool,
+    ) {
         let mut free_head = self.free_head;
         let mut active_count = self.active_count;
+        let mut discard = discard.get_mut(..destination.len());
 
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if !slot.active {
                 continue;
             }
-            if accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, destination) == VoiceStatus::Finished {
+            let status = if is_muted(slot.voice.tag.channel) {
+                match discard.as_deref_mut() {
+                    Some(discard) => accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, discard),
+                    None => VoiceStatus::Sounding,
+                }
+            } else {
+                accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, destination)
+            };
+            if status == VoiceStatus::Finished {
                 slot.active = false;
                 slot.generation = slot.generation.wrapping_add(1);
                 slot.next_free = free_head;

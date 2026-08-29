@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use starplayer_core::{Command, Frame, U0F16};
+use starplayer_core::{ChannelId, Command, Frame, U0F16};
 use starplayer_dsp::Interpolate;
 use starplayer_mixer::{Limiter, MasterSettings, MixPath, OutputFormat, VoicePool};
 use starplayer_rt::{Consumer, GarbageChannel, garbage_channel};
@@ -170,6 +170,9 @@ where
     module: Option<Module>,
     /// One whole quantum of accumulated frames. Allocated once.
     accumulator: Box<[Path::Accumulator]>,
+    /// Where muted channels' voices render, so their state advances exactly as if they
+    /// were audible. Never read.
+    muted_scratch: Box<[Path::Accumulator]>,
     ring: OutputRing<Out::Sample>,
     sources: SourceMux,
     commands: Consumer<Command<Module>>,
@@ -222,6 +225,7 @@ where
             pcm: Vec::new(),
             module: None,
             accumulator: vec![Path::Accumulator::default(); RENDER_QUANTUM].into_boxed_slice(),
+            muted_scratch: vec![Path::Accumulator::default(); RENDER_QUANTUM].into_boxed_slice(),
             ring: OutputRing::new(RENDER_QUANTUM * Out::CHANNELS),
             sources: SourceMux::new(settings.source_capacity),
             commands: command_consumer,
@@ -403,7 +407,10 @@ where
                     None => &self.pcm,
                 };
                 if let Some(window) = self.accumulator.get_mut(offset..end) {
-                    self.voices.accumulate::<Path, Interp>(pcm, window);
+                    let scratch = self.muted_scratch.get_mut(offset..end).unwrap_or(&mut []);
+                    let channels = &self.channels;
+                    let is_muted = |channel: u8| channels.get(ChannelId(channel as u16)).is_some_and(|lane| lane.muted);
+                    self.voices.accumulate_masked::<Path, Interp>(pcm, window, scratch, is_muted);
                 }
             }
 
