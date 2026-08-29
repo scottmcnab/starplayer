@@ -278,3 +278,26 @@ fn a_reader_polled_faster_than_the_tick_rate_keeps_the_last_snapshot() {
     assert!(reader.has_pending());
     assert_eq!(reader.read().sequence, 2);
 }
+
+/// The channel table is sized by the host — 32 lanes in the web player — but the display
+/// wants the *song's* channels. A 3-channel song in a 32-lane engine reports 3.
+#[test]
+fn the_snapshot_reports_the_songs_channel_count_not_the_tables_lane_count() {
+    let (blob, region) = looping_blob();
+    let mut data = DemoPatternData::new(1, 4, 3);
+    data.set(0, 0, 0, DemoCell::note(48));
+
+    let mut engine: Engine<FixedPath, Linear, StereoI16> =
+        Engine::with_settings(EngineSettings { voice_capacity: 8, channel_count: 32, sample_rate_hz: SAMPLE_RATE_HZ, ..EngineSettings::default() });
+    engine.set_pcm(blob);
+    let mut reader = engine.telemetry_reader().expect("the reader");
+    engine.set_source(Box::new(demo_sequencer(data, region)));
+
+    let mut output = vec![0i16; 2 * StereoI16::CHANNELS];
+    while engine.frame().0 < 2 * FRAMES_PER_TICK_AT_125 {
+        engine.render(&mut output);
+    }
+    let snapshot = reader.read();
+    assert_eq!(snapshot.channel_count, 3, "the song has three channels, whatever the table's capacity");
+    assert_eq!(snapshot.active_channels().len(), 3);
+}

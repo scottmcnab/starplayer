@@ -715,6 +715,9 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         telemetry.set_position(sounding.order, sounding.pattern, sounding.row, self.sounding_tick);
         telemetry.set_timing(self.row_clock.speed, self.tempo_bpm);
         crate::telemetry::capture_channels(telemetry, context.channels, context.voices);
+        // The table has however many lanes the host sized it with; the UI wants the
+        // *song's* channels, which only the pattern data knows.
+        telemetry.set_channel_count(self.data.channel_count().min(context.channels.len().min(u8::MAX as usize) as u8));
         telemetry.publish();
     }
 }
