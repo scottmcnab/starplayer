@@ -302,3 +302,13 @@ increment the voice needs, recomputed at tick rate only when `DirtyBits::PITCH` 
 `starplayer_s3m::sequencer_for(module, ...)`-style constructor the facade and B7 call.
 Mixer note: voices ramp in over `RAMP_FRAMES = 64` on trigger and fade on stop
 (M1-B5); that is a mixer property, not something the effect processor compensates for.
+
+**Telemetry hooks (M1-B6, landed).** `TickContext` now has
+`report_effect(ChannelId, code: u8, param: u8, name: &'static str)`,
+`report_note(ChannelId, Option<Note>, Option<u8> /*instrument*/)` and
+`report_global_volume(U0F16)`. They are no-ops unless the engine is built with
+`feature = "telemetry"`, so call them unconditionally: `report_effect` once per channel per
+row with the name from `starplayer_model::EffectNames::S3M` (this is the original's
+per-channel effect-name display — `_CMDVal`/`_CMDData`), `report_note` when a note or
+instrument is latched, `report_global_volume` on `Vxx`. VU strike is inferred by the
+engine from a new foreground voice or `DirtyBits::VOLUME`; nothing to do for it.
