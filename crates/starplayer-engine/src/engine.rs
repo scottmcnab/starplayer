@@ -1,15 +1,20 @@
-//! The render loop: [`RENDER_QUANTUM`], the [`Engine`], and the zero-advance guard.
+//! The render loop: [`RENDER_QUANTUM`], the [`Engine`], the zero-advance guard, and the
+//! control plane it drains at the top of every quantum.
 
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use starplayer_core::Frame;
+use starplayer_core::{Command, Frame, U0F16};
 use starplayer_dsp::Interpolate;
 use starplayer_mixer::{MixPath, OutputFormat, VoicePool};
+use starplayer_rt::{Consumer, GarbageChannel, garbage_channel};
 
+use crate::channel::ChannelTable;
+use crate::command::{DEFAULT_COMMAND_CAPACITY, DEFAULT_GARBAGE_CAPACITY, EngineHandle, MAX_COMMANDS_PER_QUANTUM, PcmSource};
+use crate::control::ControlClock;
 use crate::ring::OutputRing;
-use crate::source::{EngineContext, EventSource, SilentSource};
+use crate::source::{EngineContext, EventSource, SourceMux, SourceSlot};
 
 /// The engine's internal render granularity, in frames.
 ///
@@ -34,6 +39,12 @@ pub const MAX_ZERO_ADVANCE: u32 = 64;
 /// Events dispatched within one render quantum before the engine stops asking.
 pub const MAX_EVENTS_PER_BLOCK: u32 = 4096;
 
+/// The output rate an [`Engine::new`] assumes, in Hz.
+///
+/// It matters only to the synthesised control clock; the tick clock's rate belongs to the
+/// sequencer, and the mixer works in [`Step`](starplayer_core::Step) rather than Hz.
+pub const DEFAULT_SAMPLE_RATE_HZ: u32 = 44_100;
+
 /// What went wrong that the host should know about but the audio thread must not panic
 /// over.
 ///
@@ -50,104 +61,237 @@ pub struct EngineWarnings {
     /// A source produced more than [`MAX_EVENTS_PER_BLOCK`] events within one render
     /// quantum. The remainder were left for the next quantum.
     pub event_limit_reached: bool,
+    /// A retired module handle could not be returned over the garbage channel and was
+    /// dropped on the audio thread, which may have called `free()` inside the callback.
+    ///
+    /// This means the control side has stopped calling
+    /// [`EngineHandle::collect_all_garbage`], or was never claimed at all. It is a host
+    /// bug, not a module bug.
+    pub retired_module_dropped: bool,
+    /// A command arrived that this milestone does not act on yet — `SeekOrder`,
+    /// `SeekRow`, `SetInterpolator` or `SetTempoModel`. Flagged rather than ignored
+    /// silently, so a host is not left wondering why nothing happened.
+    pub unsupported_command: bool,
 }
 
 impl EngineWarnings {
     /// Whether anything has been flagged.
-    pub const fn any(self) -> bool { self.zero_advance_forced || self.event_limit_reached }
+    pub const fn any(self) -> bool {
+        self.zero_advance_forced || self.event_limit_reached || self.retired_module_dropped || self.unsupported_command
+    }
 
     /// Take the flags and reset them.
     pub fn take(&mut self) -> EngineWarnings { core::mem::take(self) }
 }
 
+/// Everything about an engine that is fixed when it is created.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EngineSettings {
+    /// Voices in the global pool.
+    pub voice_capacity: usize,
+    /// Control lanes. 32 covers S3M; IT's 64 is [`ChannelTable::MAX_CHANNELS`].
+    pub channel_count: usize,
+    /// Output rate, for the synthesised control clock.
+    pub sample_rate_hz: u32,
+    /// How many [`EventSource`]s may be merged at once.
+    pub source_capacity: usize,
+    /// Depth of the command ring.
+    pub command_capacity: usize,
+    /// Depth of the garbage channel.
+    pub garbage_capacity: usize,
+}
+
+impl Default for EngineSettings {
+    fn default() -> EngineSettings {
+        EngineSettings {
+            voice_capacity: 64,
+            channel_count: 32,
+            sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
+            source_capacity: SourceMux::DEFAULT_CAPACITY,
+            command_capacity: DEFAULT_COMMAND_CAPACITY,
+            garbage_capacity: DEFAULT_GARBAGE_CAPACITY,
+        }
+    }
+}
+
 /// The render loop.
 ///
-/// # The three type parameters
+/// # The four type parameters
 ///
-/// All three are monomorphised, so the inner loop contains no `dyn` call and no branch on
-/// configuration:
+/// The first three are monomorphised, so the inner loop contains no `dyn` call and no
+/// branch on configuration:
 ///
 /// * `Path` — [`FloatPath`](starplayer_mixer::FloatPath) or
 ///   [`FixedPath`](starplayer_mixer::FixedPath): how voices accumulate.
 /// * `Interp` — [`Linear`](starplayer_dsp::Linear) or
 ///   [`Nearest`](starplayer_dsp::Nearest): the resampling kernel.
 /// * `Out` — the host's sample format, tied to `Path` by its accumulator type.
+/// * `Module` — the module handle the control plane swaps in, normally
+///   `Arc<Module>`. It defaults to `()` — "no module, play whatever `set_pcm` left" — so
+///   that a test or a spike need not name one.
 ///
-/// Selecting them at run time from [`Command`](starplayer_core::Command) is a `match` at
-/// the top of `render()` over a handful of instantiations, and lands with the command
-/// queue in M1.
+/// Selecting the first three at run time from
+/// [`Command`](starplayer_core::Command) is a `match` over a handful of instantiations at
+/// the point the stream is opened; it is not something `render()` branches on.
+///
+/// # Two clocks
+///
+/// [`Engine::frame`] is the **output** clock: it counts frames handed to the host and never
+/// stops. [`Engine::source_frame`] is the **musical** clock that event sources report
+/// against, and it stops while the engine is paused. They are equal for an engine that has
+/// never been paused, which is every engine in the determinism tests.
 ///
 /// # Real-time safety
 ///
-/// Every allocation happens in [`Engine::new`] and in the off-thread setters. `render()`
-/// allocates nothing, locks nothing, and cannot panic: a source that misbehaves trips the
-/// zero-advance guard, and sample data that does not resolve makes a voice end. See the
-/// `TODO` at the top of [`Engine::render`] for the CI hook that will prove the first of
-/// those rather than asserting it by inspection.
-pub struct Engine<Path, Interp, Out>
+/// Every allocation happens in [`Engine::with_settings`] and in the off-thread setters.
+/// `render()` allocates nothing, locks nothing, and cannot panic: a source that misbehaves
+/// trips the zero-advance guard, a flooded command ring is drained in bounded batches, and
+/// sample data that does not resolve makes a voice end. See the `TODO` at the top of
+/// [`Engine::render`] for the CI hook that will prove the first of those rather than
+/// asserting it by inspection.
+pub struct Engine<Path, Interp, Out, Module = ()>
 where
     Path: MixPath,
     Interp: Interpolate,
     Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Module: PcmSource,
 {
     voices: VoicePool,
-    /// The module's PCM blob.
+    channels: ChannelTable,
+    control: ControlClock,
+    /// The PCM blob used when no module is loaded.
     ///
-    /// **M1-task-B1 replaces this with the `Arc<Module>` the control plane swaps in**, at
-    /// which point retired modules go back over the garbage channel to be dropped off the
-    /// audio thread (architecture §8). A plain `Vec` is enough for M0 because nothing
-    /// swaps it while audio is running.
+    /// A fixture hook, kept from M0 so a test can play a sample without building a whole
+    /// `Module`. Once B1's `Module` exists, a real host only ever goes through
+    /// [`Command::LoadModule`](starplayer_core::Command::LoadModule).
     pcm: Vec<i16>,
+    /// The module the control plane last swapped in. Retiring one sends it down the
+    /// garbage channel; it is never dropped here.
+    module: Option<Module>,
     /// One whole quantum of accumulated frames. Allocated once.
     accumulator: Box<[Path::Accumulator]>,
     ring: OutputRing<Out::Sample>,
-    source: Box<dyn EventSource>,
+    sources: SourceMux,
+    commands: Consumer<Command<Module>>,
+    garbage: GarbageChannel<Module>,
+    /// The control half, held until [`Engine::take_control`] claims it.
+    control_handle: Option<EngineHandle<Module>>,
     frame: Frame,
+    source_frame: Frame,
+    playing: bool,
+    master_volume: U0F16,
     warnings: EngineWarnings,
     interpolator: core::marker::PhantomData<Interp>,
 }
 
-impl<Path, Interp, Out> Engine<Path, Interp, Out>
+impl<Path, Interp, Out, Module> Engine<Path, Interp, Out, Module>
 where
     Path: MixPath,
     Interp: Interpolate,
     Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Module: PcmSource,
 {
-    /// An engine with `voice_capacity` voices, no module loaded and nothing to play.
+    /// An engine with `voice_capacity` voices and everything else at its default.
+    pub fn new(voice_capacity: usize) -> Engine<Path, Interp, Out, Module> {
+        Engine::with_settings(EngineSettings { voice_capacity, ..EngineSettings::default() })
+    }
+
+    /// An engine built to `settings`.
     ///
-    /// This is where **every** allocation the engine performs happens: the voice pool,
-    /// the quantum accumulator and the output ring.
-    pub fn new(voice_capacity: usize) -> Engine<Path, Interp, Out> {
+    /// This is where **every** allocation the engine performs happens: the voice pool, the
+    /// channel table, the quantum accumulator, the output ring, the source slots, the
+    /// command ring and the garbage channel.
+    pub fn with_settings(settings: EngineSettings) -> Engine<Path, Interp, Out, Module> {
+        let (command_producer, command_consumer) = starplayer_rt::channel(settings.command_capacity);
+        let (garbage, collector) = garbage_channel(settings.garbage_capacity);
+
         Engine {
-            voices: VoicePool::new(voice_capacity),
+            voices: VoicePool::new(settings.voice_capacity),
+            channels: ChannelTable::new(settings.channel_count),
+            control: ControlClock::new(settings.sample_rate_hz, Frame::ZERO),
             pcm: Vec::new(),
+            module: None,
             accumulator: vec![Path::Accumulator::default(); RENDER_QUANTUM].into_boxed_slice(),
             ring: OutputRing::new(RENDER_QUANTUM * Out::CHANNELS),
-            source: Box::new(SilentSource),
+            sources: SourceMux::new(settings.source_capacity),
+            commands: command_consumer,
+            garbage,
+            control_handle: Some(EngineHandle::new(command_producer, collector)),
             frame: Frame::ZERO,
+            source_frame: Frame::ZERO,
+            playing: true,
+            master_volume: U0F16::MAX,
             warnings: EngineWarnings::default(),
             interpolator: core::marker::PhantomData,
         }
     }
 
-    /// Install the module's PCM blob. Off the audio thread; M1 makes this a command.
+    /// Claim the control-side handle, once.
+    ///
+    /// It is held by the engine until taken so that [`Engine::new`] stays infallible and a
+    /// host that never wants a control plane never has to think about one — but a host that
+    /// does must take it **before** the engine goes to the audio thread, because it is the
+    /// only way to load a module and the only place retired modules are dropped.
+    pub fn take_control(&mut self) -> Option<EngineHandle<Module>> { self.control_handle.take() }
+
+    /// Install the module's PCM blob directly, bypassing the control plane. Off the audio
+    /// thread, and a fixture hook — see the field's documentation.
     pub fn set_pcm(&mut self, pcm: Vec<i16>) { self.pcm = pcm; }
 
-    /// Install the event source. Off the audio thread; M4 replaces the single source with
-    /// a mux.
-    pub fn set_source(&mut self, source: Box<dyn EventSource>) { self.source = source; }
+    /// The module currently loaded, if any.
+    pub const fn module(&self) -> Option<&Module> { self.module.as_ref() }
+
+    /// Install one event source, replacing everything already there. Off the audio thread.
+    pub fn set_source(&mut self, source: Box<dyn EventSource>) {
+        self.sources.clear();
+        self.control.resume_synthesis(self.source_frame);
+        // The mux was just cleared, so a slot is free unless its capacity is zero.
+        let _ = self.sources.insert(source);
+    }
+
+    /// Add a source alongside whatever is already installed, or hand it back if the mux is
+    /// full. Off the audio thread.
+    pub fn add_source(&mut self, source: Box<dyn EventSource>) -> Result<SourceSlot, Box<dyn EventSource>> {
+        self.sources.insert(source)
+    }
+
+    /// Take a source back out. Off the audio thread.
+    pub fn remove_source(&mut self, slot: SourceSlot) -> Option<Box<dyn EventSource>> { self.sources.remove(slot) }
+
+    /// The merged source set.
+    pub const fn sources(&self) -> &SourceMux { &self.sources }
 
     /// The voice pool, for whoever is binding channels to voices.
-    pub fn voices(&self) -> &VoicePool { &self.voices }
+    pub const fn voices(&self) -> &VoicePool { &self.voices }
 
     /// The voice pool, mutably.
-    pub fn voices_mut(&mut self) -> &mut VoicePool { &mut self.voices }
+    pub const fn voices_mut(&mut self) -> &mut VoicePool { &mut self.voices }
 
-    /// The engine clock: how many frames have been rendered since construction.
-    pub fn frame(&self) -> Frame { self.frame }
+    /// The channel-to-voice bindings.
+    pub const fn channels(&self) -> &ChannelTable { &self.channels }
+
+    /// The channel-to-voice bindings, mutably.
+    pub const fn channels_mut(&mut self) -> &mut ChannelTable { &mut self.channels }
+
+    /// The clock envelopes advance on (architecture §5.4).
+    pub const fn control_clock(&self) -> ControlClock { self.control }
+
+    /// The output clock: how many frames have been rendered since construction.
+    pub const fn frame(&self) -> Frame { self.frame }
+
+    /// The musical clock event sources report against. Equal to [`Engine::frame`] unless
+    /// the engine has been paused.
+    pub const fn source_frame(&self) -> Frame { self.source_frame }
+
+    /// Whether the musical clock is running.
+    pub const fn is_playing(&self) -> bool { self.playing }
+
+    /// The master volume the control plane last set. Applied by the master bus, which
+    /// lands with the DSP graph.
+    pub const fn master_volume(&self) -> U0F16 { self.master_volume }
 
     /// Sticky warnings raised by the render loop.
-    pub fn warnings(&self) -> EngineWarnings { self.warnings }
+    pub const fn warnings(&self) -> EngineWarnings { self.warnings }
 
     /// Read and clear the warnings.
     pub fn take_warnings(&mut self) -> EngineWarnings { self.warnings.take() }
@@ -161,8 +305,8 @@ where
     pub fn render(&mut self, host_output: &mut [Out::Sample]) {
         // TODO(M2-task-C7): wrap this body in `assert_no_alloc` once the allocator hook
         // lands. Until then the no-allocation property is held by inspection: everything
-        // below indexes into buffers allocated in `Engine::new`, and nothing on the path
-        // constructs a collection.
+        // below indexes into buffers allocated in `Engine::with_settings`, and nothing on
+        // the path constructs a collection.
         let mut written = 0usize;
         while written < host_output.len() {
             if self.ring.is_empty() {
@@ -182,6 +326,11 @@ where
     /// Render exactly one [`RENDER_QUANTUM`], splitting voice accumulation at event
     /// boundaries inside it, and leave the converted result in the ring.
     fn render_quantum(&mut self) {
+        // Architecture §1.2 drains the control plane at the top of the render pass. Doing
+        // it once per quantum rather than once per host call is what keeps a command from
+        // landing on a different frame depending on the host's buffer size.
+        self.drain_commands();
+
         for accumulated in self.accumulator.iter_mut() {
             *accumulated = Path::Accumulator::default();
         }
@@ -195,10 +344,7 @@ where
             // Recomputed after every dispatch, never cached across one: a tempo or jump
             // effect changes when the next tick is from inside the tick just processed
             // (architecture §3.1 rule 1).
-            let gap = match self.source.next_event_frame() {
-                Some(next) => self.frame.frames_until(next),
-                None => u64::MAX,
-            };
+            let gap = self.frames_until_next_event();
             let remaining = RENDER_QUANTUM.saturating_sub(offset);
             let mut span = gap.min(remaining as u64) as usize;
             if span == 0 {
@@ -211,20 +357,31 @@ where
             }
 
             let end = offset.saturating_add(span);
+            let pcm: &[i16] = match &self.module {
+                Some(module) => module.pcm(),
+                None => &self.pcm,
+            };
             if let Some(window) = self.accumulator.get_mut(offset..end) {
-                self.voices.accumulate::<Path, Interp>(&self.pcm, window);
+                self.voices.accumulate::<Path, Interp>(pcm, window);
             }
 
             self.frame = self.frame.saturating_add(span as u64);
-            self.source.advance_to(self.frame);
+            if self.playing {
+                self.source_frame = self.source_frame.saturating_add(span as u64);
+                self.sources.advance_to(self.source_frame);
+            }
             offset = end;
         }
 
+        // A voice that ended during the quantum leaves a stale handle behind; clearing it
+        // here is what makes `ChannelTable::is_sounding` — the original's `_ActiveFlag`,
+        // which the tone-portamento decision reads — agree with the pool.
+        self.channels.release_finished(&self.voices);
+
         // ── DSP, on whole quanta only ───────────────────────────────────────────────
-        // Both hooks are no-ops in M0 (task A3 is explicit that no real DSP lands here),
-        // but the call sites exist and take a whole quantum so that the day a per-channel
-        // insert or the master bus arrives, there is no ragged-segment shape for it to
-        // slip into.
+        // Both hooks are no-ops in M1 (the DSP graph is not this task's), but the call
+        // sites exist and take a whole quantum so that the day a per-channel insert or the
+        // master bus arrives, there is no ragged-segment shape for it to slip into.
         Self::process_channel_inserts(&mut self.accumulator);
         Self::process_master_bus(&mut self.accumulator);
 
@@ -232,13 +389,96 @@ where
         self.ring.refill_with(|destination| Out::convert(accumulator, destination));
     }
 
-    /// Dispatch everything due at the current frame, guarded against a source that never
-    /// advances.
+    /// Apply up to [`MAX_COMMANDS_PER_QUANTUM`] queued commands.
+    fn drain_commands(&mut self) {
+        for _ in 0..MAX_COMMANDS_PER_QUANTUM {
+            let Some(command) = self.commands.pop() else { break };
+            self.apply_command(command);
+        }
+    }
+
+    fn apply_command(&mut self, command: Command<Module>) {
+        match command {
+            // The garbage-channel case, and the reason the channel exists: dropping the
+            // last `Arc<Module>` here would call `free()` inside the audio callback.
+            Command::LoadModule(module) => {
+                if let Some(retired) = self.module.replace(module)
+                    && let Err(orphan) = self.garbage.retire(retired)
+                {
+                    // Last resort. The control side has stopped collecting, so there is
+                    // nowhere else for this to go and the alternative — growing a queue —
+                    // is an allocation on the audio thread.
+                    self.warnings.retired_module_dropped = true;
+                    drop(orphan);
+                }
+            }
+            Command::Play => self.playing = true,
+            Command::Stop => self.playing = false,
+            Command::SetMasterVolume(volume) => self.master_volume = volume,
+            Command::MuteChannel { channel, muted } => {
+                if let Some(lane) = self.channels.get_mut(channel) {
+                    lane.muted = muted;
+                }
+            }
+            // Seeking needs the concrete sequencer, which is behind `dyn EventSource`
+            // here; a host that owns one calls `PatternSequencer::seek_order` directly.
+            // Switching path or interpolator at run time is a re-instantiation of the
+            // engine's type parameters, not a field write. Both arrive with transport
+            // control in B6; flagged rather than ignored so the gap is visible.
+            Command::SeekOrder(_) | Command::SeekRow(_) | Command::SetInterpolator(_) | Command::SetTempoModel(_) => {
+                self.warnings.unsupported_command = true;
+            }
+        }
+    }
+
+    /// Frames that may be rendered before something is due. `u64::MAX` when nothing is.
+    fn frames_until_next_event(&self) -> u64 {
+        if !self.playing {
+            return u64::MAX;
+        }
+        let source_gap = match self.sources.next_event_frame() {
+            Some(next) => self.source_frame.frames_until(next),
+            None => u64::MAX,
+        };
+        let control_gap = match self.control.next_synthesised_frame() {
+            Some(next) => self.source_frame.frames_until(next),
+            None => u64::MAX,
+        };
+        source_gap.min(control_gap)
+    }
+
+    /// Dispatch everything due at the current source frame, guarded against a source that
+    /// never advances.
+    ///
+    /// Sources go first and the synthesised control tick second, because a tracker
+    /// sequencer's dispatch *takes the control clock over* — after it has run there is no
+    /// synthesised tick left to take.
     fn dispatch_due_events(&mut self, events_this_quantum: &mut u32) {
+        if !self.playing {
+            return;
+        }
         let mut zero_advance = 0u32;
-        while self.source.next_event_frame().is_some_and(|next| next <= self.frame) {
-            let mut context = EngineContext { frame: self.frame, voices: &mut self.voices };
-            self.source.dispatch(self.frame, &mut context);
+        loop {
+            let source_due = self.sources.next_event_frame().is_some_and(|next| next <= self.source_frame);
+            let control_due = self.control.next_synthesised_frame().is_some_and(|next| next <= self.source_frame);
+            if !source_due && !control_due {
+                break;
+            }
+
+            if source_due {
+                let mut context = EngineContext {
+                    frame: self.source_frame,
+                    voices: &mut self.voices,
+                    channels: &mut self.channels,
+                    control: &mut self.control,
+                };
+                self.sources.dispatch(self.source_frame, &mut context);
+            }
+            // Re-read rather than reusing `control_due`: the dispatch above may have taken
+            // the clock over, in which case there is no synthesised tick to take.
+            if self.control.next_synthesised_frame().is_some_and(|next| next <= self.source_frame) {
+                self.control.tick_synthesised();
+            }
 
             zero_advance = zero_advance.saturating_add(1);
             *events_this_quantum = events_this_quantum.saturating_add(1);

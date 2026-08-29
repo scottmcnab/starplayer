@@ -6,6 +6,19 @@ rust-version.workspace = true
 
 [dependencies]
 starplayer-core = { workspace = true }
+portable-atomic = { workspace = true }
+portable-atomic-util = { workspace = true }
+ringbuf = { workspace = true }
+
+# `riscv32imc-unknown-none-elf` and friends have no atomic compare-and-swap instruction.
+# Plain atomic load/store — all an SPSC ring needs — are provided natively by
+# `portable-atomic` with no features at all, but reference counting an `Arc` needs CAS,
+# so those targets get `portable-atomic/critical-section` (architecture §10). This is a
+# *target* condition rather than a cargo feature deliberately: a feature would have to be
+# on by default to keep the bare-metal CI job green, which would then force the
+# `critical-section` crate onto every desktop and browser build that has real atomics.
+[target.'cfg(not(target_has_atomic = "ptr"))'.dependencies]
+portable-atomic = { workspace = true, features = ["critical-section"] }
 
 [features]
 default = []

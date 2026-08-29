@@ -16,10 +16,15 @@
 //! Samples are compared as **bit patterns**, never with `==` on floats: `==` would accept
 //! `0.0 == -0.0` and reject two identical NaNs, and byte identity is the actual claim.
 
-use starplayer_core::{Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
+use starplayer_core::{ExactFixedPoint, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
 use starplayer_dsp::{Interpolate, Linear, Nearest};
+use starplayer_engine::demo::{
+    DEMO_BREAK_ROW, DEMO_NOTE_CUT, DEMO_ORDER_JUMP, DEMO_PATTERN_DELAY, DEMO_SET_SPEED, DEMO_SET_TEMPO, DemoCell,
+    DemoPatternData, DemoProcessor,
+};
 use starplayer_engine::{
-    Engine, EngineContext, EventSource, MAX_ZERO_ADVANCE, RENDER_QUANTUM, ScriptedAction, ScriptedSource,
+    ControlDriver, Engine, EngineContext, EventSource, MAX_ZERO_ADVANCE, PatternSequencer, RENDER_QUANTUM,
+    ScriptedAction, ScriptedSource, SequencerSettings,
 };
 use starplayer_mixer::{
     FixedPath, FloatPath, LoopSpan, MixPath, MonoI16, OutputFormat, SampleRegion, StereoF32, StereoI16, VoiceTag,
@@ -311,4 +316,134 @@ fn a_source_that_never_advances_is_forced_forward_rather_than_hanging() {
 
     assert!(engine.take_warnings().any());
     assert!(!engine.warnings().any(), "taking the warnings clears them");
+}
+
+// ── the same invariant, with the pattern sequencer driving ───────────────────────────
+//
+// M1-task-B3 adds the sequencer, and with it three new ways for the host's block size to
+// leak into the output: a tick boundary computed from a stale tempo, a row advanced at a
+// quantum boundary instead of a tick boundary, and a voice triggered on the wrong frame.
+// The invariant is therefore restated over a sequencer-driven engine rather than only over
+// a scripted parameter change.
+
+/// A synthetic module that exercises every part of the timing spine inside
+/// `TOTAL_FRAMES`: notes on both channels, a mid-song tempo change, a pattern delay, a
+/// pattern break and a note cut.
+fn synthetic_module() -> DemoPatternData {
+    let mut data = DemoPatternData::new(2, 8, 2);
+
+    // Pattern 0: notes, a tempo change, a pattern delay, and a break to pattern 1 row 2.
+    data.set(0, 0, 0, DemoCell::note(48));
+    data.set(0, 0, 1, DemoCell::note(36));
+    data.set(0, 1, 0, DemoCell::note(55));
+    data.set(0, 2, 0, DemoCell::command(DEMO_SET_TEMPO, 200));
+    data.set(0, 2, 1, DemoCell::note(41));
+    data.set(0, 3, 0, DemoCell::command(DEMO_PATTERN_DELAY, 2));
+    data.set(0, 3, 1, DemoCell::note(60));
+    data.set(0, 4, 0, DemoCell::note(43));
+    data.set(0, 4, 1, DemoCell { note: DEMO_NOTE_CUT, ..DemoCell::EMPTY });
+    data.set(0, 5, 0, DemoCell::command(DEMO_BREAK_ROW, 2));
+
+    // Pattern 1: a speed change, more notes, and a jump back to order 0 so the module
+    // never runs out inside the test.
+    data.set(1, 2, 0, DemoCell::command(DEMO_SET_SPEED, 4));
+    data.set(1, 2, 1, DemoCell::note(48));
+    data.set(1, 3, 0, DemoCell::note(52));
+    data.set(1, 5, 1, DemoCell::note(38));
+    data.set(1, 7, 0, DemoCell::command(DEMO_ORDER_JUMP, 0));
+    data
+}
+
+/// An engine playing `synthetic_module()` through a real [`PatternSequencer`].
+fn build_sequenced_engine<Path, Interp, Out>() -> Engine<Path, Interp, Out>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let (blob, region) = looping_blob();
+    let mut engine: Engine<Path, Interp, Out> = Engine::new(VOICE_CAPACITY);
+    engine.set_pcm(blob);
+
+    let sequencer = PatternSequencer::new(
+        ExactFixedPoint,
+        synthetic_module(),
+        DemoProcessor::new(region, playback_step()),
+        SequencerSettings { sample_rate_hz: 44_100, ..SequencerSettings::default() },
+    );
+    engine.set_source(Box::new(sequencer));
+    engine
+}
+
+fn render_sequenced_at_block_size<Path, Interp, Out>(block_frames: usize) -> Vec<Out::Sample>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let mut engine = build_sequenced_engine::<Path, Interp, Out>();
+    let mut output = vec![Out::Sample::default(); TOTAL_FRAMES * Out::CHANNELS];
+
+    let mut written = 0;
+    while written < output.len() {
+        let end = (written + block_frames * Out::CHANNELS).min(output.len());
+        engine.render(&mut output[written..end]);
+        written = end;
+    }
+    output
+}
+
+fn assert_sequenced_output_is_block_size_independent<Path, Interp, Out>(what: &str)
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: BitPattern + Default,
+{
+    let reference = render_sequenced_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM);
+    let silence = vec![Out::Sample::default(); reference.len()];
+    assert!(first_difference(&reference, &silence).is_some(), "{what}: the module has to actually make sound");
+
+    for block_frames in BLOCK_SIZES {
+        let output = render_sequenced_at_block_size::<Path, Interp, Out>(block_frames);
+        let difference = first_difference(&output, &reference);
+        assert_eq!(difference, None, "{what}: block size {block_frames} changed the output at sample {difference:?}");
+        assert_eq!(byte_image(&output), byte_image(&reference), "{what}: block size {block_frames} is not byte-identical");
+    }
+}
+
+#[test]
+fn sequencer_driven_output_is_byte_identical_at_every_host_block_size() {
+    assert_sequenced_output_is_block_size_independent::<FloatPath, Linear, StereoF32>("sequenced float / linear / stereo f32");
+    assert_sequenced_output_is_block_size_independent::<FixedPath, Linear, StereoI16>("sequenced fixed / linear / stereo i16");
+    assert_sequenced_output_is_block_size_independent::<FixedPath, Nearest, MonoI16>("sequenced fixed / nearest / mono i16");
+}
+
+/// The sequencer really ran: rows were fetched, ticks happened and notes were triggered.
+/// Without this a byte-identical *silence* would pass the test above.
+#[test]
+fn the_synthetic_module_actually_plays() {
+    let (blob, region) = looping_blob();
+    let mut engine: Engine<FixedPath, Linear, StereoI16> = Engine::new(VOICE_CAPACITY);
+    engine.set_pcm(blob);
+
+    let sequencer = PatternSequencer::new(
+        ExactFixedPoint,
+        synthetic_module(),
+        DemoProcessor::new(region, playback_step()),
+        SequencerSettings { sample_rate_hz: 44_100, ..SequencerSettings::default() },
+    );
+    engine.add_source(Box::new(sequencer)).map_err(|_| "slot 0").expect("slot 0");
+
+    let mut output = vec![0i16; TOTAL_FRAMES * 2];
+    engine.render(&mut output);
+
+    assert!(output.iter().any(|sample| *sample != 0), "the module made sound");
+    assert!(engine.voices().voices_active() > 0, "and voices are still running at the end of the render");
+    assert!(!engine.warnings().any(), "a well-formed module raises no warnings");
+    // `TOTAL_FRAMES` is not a whole number of quanta, so the engine has rendered one more
+    // quantum than the host asked for and is holding the remainder in the output ring.
+    let whole_quanta = TOTAL_FRAMES.div_ceil(RENDER_QUANTUM) * RENDER_QUANTUM;
+    assert_eq!(engine.frame(), Frame(whole_quanta as u64));
+    assert_eq!(engine.control_clock().driver(), ControlDriver::Tracker, "the sequencer is the control clock");
 }

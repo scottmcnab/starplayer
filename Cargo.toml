@@ -26,6 +26,24 @@ rust-version = "1.97"
 fixed = { version = "1.31", default-features = false }
 bitflags = { version = "2.13", default-features = false }
 
+# The real-time plumbing's three dependencies, all `no_std` and none enabling `std` at
+# the feature set selected here. See `crates/starplayer-rt/src/lib.rs` for why each one
+# is needed rather than hand-written.
+#
+# `portable-atomic` provides the atomics that `core` does not have on
+# `riscv32imc-unknown-none-elf`, which has no `A` extension at all: plain aligned
+# load/store are provided natively with no feature flags, which is all an SPSC ring
+# needs. Compare-and-swap is *not* available there by default, so the manifest of
+# `starplayer-rt` turns on `critical-section` for exactly those targets.
+portable-atomic = { version = "1.15", default-features = false }
+# `Arc` for targets without CAS, where `alloc::sync::Arc` does not exist.
+portable-atomic-util = { version = "0.2", default-features = false, features = ["alloc"] }
+# The lock-free SPSC ring itself. A wait-free SPSC cannot be written in safe Rust — the
+# producer and the consumer hold disjoint mutable views of one buffer, which the borrow
+# checker cannot express — and every core crate here is `#![forbid(unsafe_code)]`, so the
+# unsafe lives in a well-tested audio-oriented dependency instead of in our tree.
+ringbuf = { version = "0.5", default-features = false, features = ["alloc", "portable-atomic"] }
+
 starplayer = { path = "crates/starplayer" }
 starplayer-core = { path = "crates/starplayer-core" }
 starplayer-rt = { path = "crates/starplayer-rt" }

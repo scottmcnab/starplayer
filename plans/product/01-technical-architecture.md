@@ -56,6 +56,14 @@ pub fn render(&mut self, out: &mut OutputBuffer) {
 
 Note what is *absent*: the DSP graph. See §1.4.
 
+**Two clocks (M1-B3).** `self.frame` above is really two counters. The **output clock**
+counts frames handed to the host and never stops; the **source clock** is what event
+sources report against, and it stops while the transport is paused. They are equal for an
+engine that has never been paused. The split is what makes `Command::Stop` implementable
+at all: sources report *absolute* frames, so freezing the musical clock is the only way to
+pause without replaying every missed tick in a burst on resume — which the zero-advance
+guard would survive but no listener would.
+
 ### 1.3 Tick length is a policy, not a constant
 
 `(rate * 10 / bpm) >> 2` truncates twice. At 44100 Hz and 130 BPM it yields 848 where
@@ -270,6 +278,16 @@ desyncing.
    This is also the decisive argument against pre-materialising a per-block schedule
    internally — that would be running the sequencer with extra steps.
 
+   **How M1-B3 makes this structural rather than documented.** `PatternSequencer` is a
+   three-state machine — `Ready` / `Processing` / `Stopped` — and `next_event_frame()`
+   answers `None` in `Processing`. *While a tick is being processed there is no next
+   boundary*, so a cached one cannot be observed, because it does not exist yet. The
+   boundary is a function of the `#[must_use]` `TickOutcome` the format's effect processor
+   returns, which carries the tempo and speed in effect at the **end** of the tick and is
+   the only argument to the sequencer's single call site of `FrameClock::advance_tick`.
+   `FrameClock` itself has no setter, so the only way to learn where the next tick lands is
+   to commit the clock to it.
+
 2. **Guard zero-advance.** S3M speed 0, `A00`, MOD `E60` self-loops,
    pattern-break-to-self, SMF zero-delta meta events: any of these can make a source
    return the same frame forever and spin the render loop *inside the audio callback*,
@@ -308,7 +326,7 @@ fit comes for free without contaminating the tracker path.
 | `PatternSequencer` | order list → pattern → row → tick; owns tempo/speed and the format's effect processor |
 | `SmfSequencer` | a sorted MIDI-file event list |
 | `ExternalEventQueue` | live MIDI, keyboard, plugin host events |
-| `SourceMux` | merges several sources with the §3.1.3 tie-break — "play a module and jam over it" |
+| `SourceMux` | merges several sources with the §3.1.3 tie-break — "play a module and jam over it". Landed at **M1-B3** rather than M4: it is a hundred lines, and the tie-break rule is only testable once two real sources can collide |
 
 ---
 
@@ -535,6 +553,31 @@ Commands flow in over a single-producer/single-consumer ring. Modules are loaded
 worker thread or task and handed in as `Arc<Module>`; the audio thread swaps the pointer
 and returns the old `Arc` down the garbage channel.
 
+### 8.1 The ring is a dependency, and why (M1-B3)
+
+A wait-free SPSC ring **cannot be written in safe Rust**. Its whole point is that the
+producer and the consumer hold disjoint mutable views of one buffer, disjoint by an
+invariant expressed in two index atomics that the borrow checker cannot see, and `core`
+offers no safe primitive granting interior mutability over an arbitrary `T` shared between
+threads. Every core crate here is `#![forbid(unsafe_code)]`, so the choice was between
+weakening that rule for the single most concurrency-sensitive file in the tree, or taking
+a dependency whose unsafe is audited by more people than this project has.
+
+`starplayer-rt` therefore wraps **`ringbuf`** (`no_std` + `alloc`, capacity fixed at
+construction, wait-free `try_push` / `try_pop`) and re-exports its own `Producer` /
+`Consumer` / `GarbageChannel` shapes, so the dependency stays replaceable. `ringbuf`
+supports `portable-atomic`, which almost nothing else in this space does and which is what
+makes it build for the bare-metal target at all.
+
+Two policies fall out of "fixed capacity", and both are deliberate:
+
+- **A full ring hands the value back** rather than dropping it. For `LoadModule` that means
+  the control thread keeps the module it just spent milliseconds decoding.
+- **A full garbage channel makes the audio thread drop the retired handle inline**, and
+  raise `EngineWarnings::retired_module_dropped`. The alternative is an unbounded queue,
+  which is an allocation on the audio thread. A breach means the host has stopped calling
+  `collect_all_garbage`, so the warning is the useful signal.
+
 ---
 
 ## 9. Telemetry
@@ -624,7 +667,25 @@ Start button provides. Confirm on hardware before M1-B7 ships.
 - Core crates are `#![no_std]` + `alloc`. CI checks `riscv32imc-unknown-none-elf` on
   every commit. **Hard rule: no default feature transitively enables `std`.**
 - `portable-atomic` + `critical-section` for targets lacking CAS — `alloc::sync::Arc`
-  hits this on thumbv6m and Xtensa.
+  hits this on thumbv6m, Xtensa and the CI target `riscv32imc-unknown-none-elf`, which
+  implements neither the `A` extension nor any of `core::sync::atomic`.
+
+  **The arrangement, settled in M1-B3.** `starplayer-rt` re-exports
+  `portable_atomic_util::Arc` as `starplayer_rt::Arc`, and every other crate names *that*
+  one; writing `alloc::sync::Arc` in a `no_std` crate is a portability bug only the
+  bare-metal CI job would catch. Plain atomic load/store — all an SPSC ring needs — are
+  native on those targets with no features at all; only `Arc`'s refcount needs CAS. So
+  `critical-section` is enabled by a **target condition** in the manifest,
+
+  ```toml
+  [target.'cfg(not(target_has_atomic = "ptr"))'.dependencies]
+  portable-atomic = { workspace = true, features = ["critical-section"] }
+  ```
+
+  rather than by a cargo feature. A feature would have to be on by default for the
+  bare-metal job to pass, and would then be on for every desktop and browser build that
+  has real atomics. Embedded users of those targets provide a `critical-section`
+  implementation, which is the standard arrangement there.
 - Loader IO is a minimal `trait ModuleReader { read, seek, len }` with a zero-copy
   `&[u8]` fast path. Loading is **synchronous** over an already-obtained byte source;
   *acquiring* the bytes is async and lives in the platform crates, so the core never
