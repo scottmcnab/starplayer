@@ -11,3 +11,7 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+
+pub mod interpolate;
+
+pub use interpolate::{Interpolate, Linear, Nearest};
