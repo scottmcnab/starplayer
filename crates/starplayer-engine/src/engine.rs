@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use starplayer_core::{Command, Frame, U0F16};
 use starplayer_dsp::Interpolate;
-use starplayer_mixer::{MixPath, OutputFormat, VoicePool};
+use starplayer_mixer::{Limiter, MasterSettings, MixPath, OutputFormat, VoicePool};
 use starplayer_rt::{Consumer, GarbageChannel, garbage_channel};
 
 use crate::channel::ChannelTable;
@@ -180,6 +180,7 @@ where
     source_frame: Frame,
     playing: bool,
     master_volume: U0F16,
+    limiter: Limiter,
     warnings: EngineWarnings,
     interpolator: core::marker::PhantomData<Interp>,
 }
@@ -221,6 +222,7 @@ where
             source_frame: Frame::ZERO,
             playing: true,
             master_volume: U0F16::MAX,
+            limiter: Limiter::SoftKnee,
             warnings: EngineWarnings::default(),
             interpolator: core::marker::PhantomData,
         }
@@ -286,9 +288,16 @@ where
     /// Whether the musical clock is running.
     pub const fn is_playing(&self) -> bool { self.playing }
 
-    /// The master volume the control plane last set. Applied by the master bus, which
-    /// lands with the DSP graph.
+    /// The master volume the control plane last set. Applied by the master bus before
+    /// the limiter, so turning the master down turns the limiting down with it.
     pub const fn master_volume(&self) -> U0F16 { self.master_volume }
+
+    /// How the master bus bounds the signal on the way out. [`Limiter::SoftKnee`] unless
+    /// the host asks for the transparent path.
+    pub const fn limiter(&self) -> Limiter { self.limiter }
+
+    /// Choose the master bus limiter. Takes effect from the next whole quantum.
+    pub fn set_limiter(&mut self, limiter: Limiter) { self.limiter = limiter; }
 
     /// Sticky warnings raised by the render loop.
     pub const fn warnings(&self) -> EngineWarnings { self.warnings }
@@ -379,11 +388,13 @@ where
         self.channels.release_finished(&self.voices);
 
         // ── DSP, on whole quanta only ───────────────────────────────────────────────
-        // Both hooks are no-ops in M1 (the DSP graph is not this task's), but the call
-        // sites exist and take a whole quantum so that the day a per-channel insert or the
-        // master bus arrives, there is no ragged-segment shape for it to slip into.
+        // The per-channel insert hook is a no-op until the DSP graph lands (M7), but the
+        // call site exists and takes a whole quantum so that there is no ragged-segment
+        // shape for it to slip into. The master bus is real from M1-B5: master volume,
+        // then the limiter.
         Self::process_channel_inserts(&mut self.accumulator);
-        Self::process_master_bus(&mut self.accumulator);
+        let master_settings = MasterSettings { volume: self.master_volume, limiter: self.limiter };
+        Self::process_master_bus(&mut self.accumulator, master_settings);
 
         let accumulator = &self.accumulator;
         self.ring.refill_with(|destination| Out::convert(accumulator, destination));
@@ -501,9 +512,9 @@ where
         let _ = quantum;
     }
 
-    /// The master bus. A no-op until the DSP graph lands.
-    fn process_master_bus(quantum: &mut [Path::Accumulator]) {
+    /// The master bus: master volume, then the limiter, on a whole quantum (M1-B5).
+    fn process_master_bus(quantum: &mut [Path::Accumulator], settings: MasterSettings) {
         debug_assert_eq!(quantum.len(), RENDER_QUANTUM, "DSP only ever sees whole quanta");
-        let _ = quantum;
+        Path::master(quantum, settings);
     }
 }

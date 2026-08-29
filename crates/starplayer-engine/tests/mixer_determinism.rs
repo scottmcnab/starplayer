@@ -17,8 +17,7 @@ use starplayer_core::{Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
 use starplayer_dsp::{Interpolate, Linear, Nearest};
 use starplayer_engine::{Engine, RENDER_QUANTUM, ScriptedAction, ScriptedSource};
 use starplayer_mixer::{
-    FixedPath, FloatOut, FloatPath, LoopSpan, MixPath, OutputFormat, RAMP_FRAMES, SampleRegion, StereoF32, StereoI16,
-    VoiceTag, append_guarded_sample,
+    FixedPath, FloatOut, FloatPath, Limiter, LoopSpan, MixPath, OutputFormat, RAMP_FRAMES, SampleRegion, StereoF32, StereoI16, VoiceTag, append_guarded_sample,
 };
 
 // ── the scenario ────────────────────────────────────────────────────────────────────
@@ -301,6 +300,9 @@ fn a_hard_left_voice_is_silent_on_the_right_and_full_on_the_left() {
     let region = append_guarded_sample(&mut blob, &[32_767i16; 64], LoopSpan::new(0, 64));
 
     let mut engine: Engine<FloatPath, Linear, StereoF32> = Engine::new(VOICE_CAPACITY);
+    // This measures the pan law, not the master bus: a full-scale signal through the
+    // soft-knee limiter would read 0.94, so take the transparent path.
+    engine.set_limiter(Limiter::Clamp);
     engine.set_pcm(blob);
     let params = VoiceParams { step: Step::ONE, volume: U0F16::MAX, pan: I1F15::MIN, ..VoiceParams::SILENT };
     let voice = engine.voices_mut().allocate(VoiceTag::default(), region, params, 0).expect("room");
@@ -320,6 +322,7 @@ fn a_hard_left_voice_is_silent_on_the_right_and_full_on_the_left() {
     let mut blob = Vec::new();
     let region = append_guarded_sample(&mut blob, &[32_767i16; 64], LoopSpan::new(0, 64));
     let mut engine: Engine<FloatPath, Linear, StereoF32> = Engine::new(VOICE_CAPACITY);
+    engine.set_limiter(Limiter::Clamp);
     engine.set_pcm(blob);
     let params = VoiceParams { pan: I1F15::MAX, ..params };
     let voice = engine.voices_mut().allocate(VoiceTag::default(), region, params, 0).expect("room");
