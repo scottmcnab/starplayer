@@ -78,7 +78,8 @@ fn print_usage() {
     println!("  ci [--job <job>]   run the CI matrix locally, or a single job of it");
     println!("  goldens            regenerate golden renders (not implemented)");
     println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
-    println!("  serve [--port N]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
+    println!("  serve [--port N] [--host ADDR]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
+    println!("                     --host 0.0.0.0 exposes it to the LAN (plain http there is not a secure context: postMessage fallback)");
     println!();
     println!("ci jobs:");
     for job in JOBS {
@@ -422,6 +423,8 @@ const WORKLET_BUNDLE_PRELUDE: &str = "worklet-prelude.js";
 const WORKLET_ONLY_SOURCES: &[&str] = &["worklet-processor.js", "worklet-prelude.js"];
 
 const DEFAULT_SERVE_PORT: u16 = 8080;
+/// Loopback only, unless `serve --host` says otherwise.
+const DEFAULT_SERVE_HOST: &str = "127.0.0.1";
 
 /// `cargo build` → `wasm-bindgen` → worklet-scope massaging → a servable directory.
 ///
@@ -524,7 +527,7 @@ fn run_wasm(arguments: &[String]) -> bool {
     println!();
     println!("xtask wasm: packaged into {}", output_directory.display());
     if serve_afterwards {
-        return serve(&root, port);
+        return serve(&root, port, DEFAULT_SERVE_HOST);
     }
     println!("     run `cargo xtask serve` and open http://localhost:{DEFAULT_SERVE_PORT}/");
     true
@@ -732,9 +735,18 @@ fn report_output(output_directory: &Path) -> bool {
 /// Serve the packaged build with the COOP/COEP headers `SharedArrayBuffer` requires.
 fn run_serve(arguments: &[String]) -> bool {
     let mut port = DEFAULT_SERVE_PORT;
+    let mut host = DEFAULT_SERVE_HOST.to_string();
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--host" => {
+                let Some(value) = arguments.get(index + 1) else {
+                    eprintln!("xtask serve: `--host` needs a value");
+                    return false;
+                };
+                host = value.clone();
+                index += 2;
+            }
             "--port" => {
                 let Some(value) = arguments.get(index + 1) else {
                     eprintln!("xtask serve: `--port` needs a value");
@@ -753,10 +765,10 @@ fn run_serve(arguments: &[String]) -> bool {
             }
         }
     }
-    serve(&workspace_root(), port)
+    serve(&workspace_root(), port, &host)
 }
 
-fn serve(root: &Path, port: u16) -> bool {
+fn serve(root: &Path, port: u16, host: &str) -> bool {
     let output_directory = root.join(WEB_OUTPUT_DIRECTORY);
     if !output_directory.join("index.html").exists() {
         eprintln!("xtask serve: `{}` is not packaged yet — run `cargo xtask wasm` first", output_directory.display());
@@ -764,10 +776,10 @@ fn serve(root: &Path, port: u16) -> bool {
     }
 
     let script = root.join(DEV_SERVER_SCRIPT);
-    println!("     node {} --port {port}", script.display());
+    println!("     node {} --port {port} --host {host}", script.display());
     match Command::new("node")
         .arg(&script)
-        .args(["--port", &port.to_string(), "--root"])
+        .args(["--port", &port.to_string(), "--host", host, "--root"])
         .arg(&output_directory)
         .status()
     {

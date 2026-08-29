@@ -17,7 +17,12 @@
 // of the player is exercised: the page detects that `SharedArrayBuffer` is unavailable,
 // says so, and drives the worklet over batched `postMessage` instead.
 //
-// Usage: node apps/starplayer-web/dev-server.mjs [--port 8080] [--root <dir>] [--no-isolation]
+// Usage: node apps/starplayer-web/dev-server.mjs [--port 8080] [--host 127.0.0.1] [--root <dir>] [--no-isolation]
+//
+// `--host 0.0.0.0` exposes the server to the LAN (a phone, or another machine). Note that a
+// plain-http LAN origin is not a secure context, so the browser withholds
+// `SharedArrayBuffer` there and the page runs on its `postMessage` fallback — which is a
+// legitimate thing to test, but not the same path as `http://localhost`.
 
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
@@ -37,10 +42,13 @@ const CONTENT_TYPES = {
 };
 
 function parseArguments(argv) {
-    const options = { port: 8080, root: 'apps/starplayer-web/dist', isolate: true };
+    const options = { port: 8080, host: '127.0.0.1', root: 'apps/starplayer-web/dist', isolate: true };
     for (let index = 0; index < argv.length; index += 1) {
         if (argv[index] === '--port') {
             options.port = Number(argv[index + 1]);
+            index += 1;
+        } else if (argv[index] === '--host') {
+            options.host = argv[index + 1];
             index += 1;
         } else if (argv[index] === '--root') {
             options.root = argv[index + 1];
@@ -122,8 +130,11 @@ const server = createServer(async (request, response) => {
     }
 });
 
-server.listen(options.port, '127.0.0.1', () => {
+server.listen(options.port, options.host, () => {
     console.log(`starplayer dev server: http://localhost:${options.port}/`);
+    if (options.host !== '127.0.0.1') {
+        console.log(`  bound to ${options.host} — reachable from the LAN (postMessage fallback there: not a secure context)`);
+    }
     console.log(`  document root: ${documentRoot}`);
     if (options.isolate) {
         console.log('  Cross-Origin-Opener-Policy: same-origin');
