@@ -32,7 +32,7 @@ bug class it guards against (architecture §1.4) can never be introduced.
 | [A1](complete/M0-task-A1-workspace-skeleton.md) ✅ | Workspace, crate stubs, xtask, CI matrix | — | — |
 | [A2](complete/M0-task-A2-core-types.md) ✅ | Fixed-point types, frame clock, `TempoModel` | A1 | A4 |
 | [A3](M0-task-A3-minimal-mixer-and-determinism.md) | One-voice rendering + the block-size determinism test | A2 | A4 |
-| [A4](M0-task-A4-audioworklet-spike.md) | AudioWorklet sine wave in a browser | A1 | A2, A3 |
+| [A4](complete/M0-task-A4-audioworklet-spike.md) ✅ | AudioWorklet sine wave in a browser | A1 | A2, A3 |
 
 A4 can start as soon as A1 lands; it does not need the real engine, only a crate that
 compiles to wasm and fills a buffer.
