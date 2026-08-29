@@ -35,7 +35,7 @@ how a project spends a month and produces silence.
 | [B4](complete/M1-task-B4-s3m-effects.md) ✅ | The ST3 effect processor — the accuracy core | B2, B3 | B5 |
 | [B5](complete/M1-task-B5-mixer-float-stereo.md) ✅ | Linear interpolation, stereo, output conversion | M0-A3 | B1, B2, B3 |
 | [B6](complete/M1-task-B6-telemetry-v1.md) ✅ | Coherent scalar telemetry snapshot | B3 | B4 |
-| [B7](M1-task-B7-web-player.md) | The web player UI | M0-A4, B6 | — |
+| [B7](complete/M1-task-B7-web-player.md) ✅ | The web player UI | M0-A4, B6 | — |
 
 B4 is the largest and most delicate task. It should be handed over on its own branch and
 reviewed effect by effect.
