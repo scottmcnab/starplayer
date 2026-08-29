@@ -45,6 +45,13 @@ starplayer-host-wasm = { path = "crates/starplayer-host-wasm" }
 starplayer-offline = { path = "crates/starplayer-offline" }
 starplayer-testkit = { path = "crates/starplayer-testkit" }
 
+# ── external ────────────────────────────────────────────────────────────────────────
+#
+# `wasm-bindgen` is pinned to an *exact* version on purpose: the generated glue and the
+# `wasm-bindgen` CLI that post-processes it must be the same version, and the CLI is
+# installed outside cargo. `xtask wasm` checks the two agree before it builds.
+wasm-bindgen = "=0.2.127"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

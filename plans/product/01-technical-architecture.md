@@ -562,6 +562,61 @@ This is a **first-class API**, not a debug hook. It is what the web UI, the TUI 
 future tracker editor render from. The original's `ChannelData` deliberately carried
 `_CMDVal`, `_CMDData`, `_VUBarLevel` and `_ActiveFlag` "for host program" — same idea.
 
+### Q1 resolution (M0-A4)
+
+**`SharedArrayBuffer` is the default; `postMessage` is a real fallback, not a second-class
+one.** Both were built and exercised in
+[M0-task-A4](../engine/M0-task-A4-audioworklet-spike.md), and the page reports which is
+live rather than assuming.
+
+*What was tested.* A Rust sine oscillator rendered in wasm inside an AudioWorklet, with
+`SetFrequency` travelling in over a lock-free SPSC ring and a peak level travelling back
+out, under three configurations: cross-origin isolated with both paths on shared memory;
+cross-origin isolated with the `postMessage` fallback forced on; and served **without**
+COOP/COEP, where the page detects the loss and falls back on its own. Each ran 70 s of
+continuous audio. In all three: the render quantum was 128 frames, matching
+`RENDER_QUANTUM`; `memory.buffer.byteLength` was 1 703 936 bytes at start and unchanged
+after 60 s; no commands were dropped; no console errors. Verified headlessly in
+**Chromium 151** (a Playwright-cached build driven over the DevTools protocol), plus a
+Node harness that runs the shipped worklet bundle against an `AudioWorkletGlobalScope`
+stub and measures the rendered pitch by zero crossings. **Firefox and Safari were not
+available on the build machine and have not been run; the owner's audible check is
+against a real browser.**
+
+*Why shared memory wins where it is available.* The two directions fail differently, and
+neither failure is about throughput:
+
+- **Commands (page → audio).** A `postMessage` per slider event is a structured clone and
+  a task hop per event, so the fallback has to coalesce to at most one message per
+  animation frame — which caps the control plane at frame rate and is wrong for anything
+  finer-grained than a slider. The ring takes a write per event with no message at all,
+  and the audio thread drains a bounded batch at the top of every render pass, which is
+  the same `drain_commands()` shape §1.2 already specifies. The ring is where MIDI input
+  and pattern jumps have to arrive in M1; the fallback is not a place they can live.
+- **Telemetry (audio → page).** §9(b)'s scope data is the case that decides it. Peak
+  levels are one float and survive either transport, but a `postMessage` carrying scope
+  waveforms means **allocating on the audio thread**, every post, forever — the exact
+  thing §8 forbids. Shared memory makes the audio thread's side a relaxed store into a
+  block it already owns. So the split in §9 stands: scalar state can ride `postMessage`
+  if it must, scope data cannot.
+
+*The cost of requiring it.* COOP `same-origin` + COEP `require-corp` are a deployment
+constraint, not a code one, and they are contagious: every cross-origin subresource an
+embedder loads then needs CORP or CORS. That is why the fallback exists and why it is
+kept working — a host that cannot set those headers still gets audio, a working slider
+and a working VU meter, and loses only the scope's fidelity. **Neither path may be
+allowed to rot: both are exercised on every check of the web player.**
+
+*Safari (research point 4).* Not tested — no Safari on the build machine. From the
+specifications: Safari 15.2+ implements COOP/COEP and gates `SharedArrayBuffer` on
+cross-origin isolation the same way, so the same code path applies, and the fallback
+covers it if it does not. Two Safari-specific hazards are worth carrying into M1-B7
+rather than assuming away: Safari has historically been the strictest about no `fetch`
+and no dynamic `import` inside worklet scope — which the single concatenated bundle and
+the pre-compiled `WebAssembly.Module` handed over in `processorOptions` already avoid —
+and it is the most likely to need a real user gesture on the `AudioContext`, which the
+Start button provides. Confirm on hardware before M1-B7 ships.
+
 ---
 
 ## 10. Portability
@@ -673,7 +728,7 @@ Recorded rather than guessed. Each has a milestone where it must be settled.
 
 | # | Question | Settle by |
 |---|---|---|
-| Q1 | Does `SharedArrayBuffer` + COOP/COEP work well enough for scope telemetry, or is `postMessage` the practical default? | M0 |
+| Q1 | Does `SharedArrayBuffer` + COOP/COEP work well enough for scope telemetry, or is `postMessage` the practical default? | **Settled in M0-A4 — see §9** |
 | Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | M8 |
 | Q3 | Which voice-stealing heuristic does libopenmpt actually use, exactly? | M6 |
 | Q4 | Does the `Instrument` trait survive contact with a non-sample instrument (FM), or does it need a second tier? | M10 |

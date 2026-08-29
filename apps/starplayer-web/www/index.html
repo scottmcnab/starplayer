@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StarPlayer — M0-A4 AudioWorklet spike</title>
+<!-- Inline, so the page makes no request the dev server would have to 404. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%99%AA%3C/text%3E%3C/svg%3E">
+<style>
+    :root { color-scheme: dark; }
+    body {
+        margin: 0; padding: 2rem 1.5rem;
+        font: 15px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        background: #14161a; color: #d8dee9;
+    }
+    main { max-width: 44rem; margin: 0 auto; }
+    h1 { font-size: 1.1rem; letter-spacing: 0.08em; text-transform: uppercase; color: #88c0d0; margin: 0 0 0.25rem; }
+    p.blurb { margin: 0 0 1.5rem; color: #7d8799; }
+    section { border: 1px solid #2a2f38; border-radius: 6px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
+    section h2 { font-size: 0.78rem; letter-spacing: 0.12em; text-transform: uppercase; color: #7d8799; margin: 0 0 0.75rem; }
+    .row { display: flex; gap: 1rem; align-items: baseline; margin: 0.35rem 0; }
+    .label { flex: 0 0 12rem; color: #7d8799; }
+    .value { color: #d8dee9; word-break: break-word; }
+    .value.good { color: #a3be8c; }
+    .value.warn { color: #ebcb8b; }
+    button {
+        font: inherit; padding: 0.5rem 1.25rem; border-radius: 4px;
+        border: 1px solid #4c566a; background: #2e3440; color: #eceff4; cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: #3b4252; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    input[type=range] { flex: 1; min-width: 12rem; accent-color: #88c0d0; }
+    label.checkbox { display: flex; gap: 0.5rem; align-items: center; color: #7d8799; margin-top: 0.75rem; }
+    #peak-track { height: 14px; background: #22262e; border-radius: 3px; overflow: hidden; flex: 1; min-width: 12rem; }
+    #peak-bar { height: 100%; width: 0; background: linear-gradient(90deg, #a3be8c, #ebcb8b 75%, #bf616a); transition: width 60ms linear; }
+    #log { max-height: 12rem; overflow-y: auto; font-size: 13px; color: #7d8799; }
+    #log div { padding: 1px 0; }
+</style>
+</head>
+<body>
+<main>
+    <h1>StarPlayer — AudioWorklet spike</h1>
+    <p class="blurb">
+        M0-task-A4. A Rust sine wave, rendered in wasm inside an AudioWorklet, with a
+        lock-free command path in and a telemetry path out. No engine yet — this exists so
+        that when the tracker arrives, an audio bug can be told apart from a plumbing bug.
+    </p>
+
+    <section>
+        <h2>Transport</h2>
+        <div class="row"><span class="label">isolation</span><span class="value" id="isolation">—</span></div>
+        <div class="row"><span class="label">commands (page → audio)</span><span class="value" id="command-transport">—</span></div>
+        <div class="row"><span class="label">telemetry (audio → page)</span><span class="value" id="telemetry-transport">—</span></div>
+        <div class="row"><span class="label">render quantum</span><span class="value" id="quantum">—</span></div>
+        <label class="checkbox">
+            <input type="checkbox" id="force-fallback">
+            force the postMessage fallback (set before pressing Start)
+        </label>
+    </section>
+
+    <section>
+        <h2>Control</h2>
+        <div class="row">
+            <button id="start">Start</button>
+            <button id="stop" disabled>Stop</button>
+        </div>
+        <div class="row">
+            <span class="label">frequency</span>
+            <input type="range" id="frequency" min="110" max="880" step="0.5" value="440">
+            <span class="value" id="frequency-readout">—</span>
+        </div>
+        <div class="row"><span class="label">oscillator is at</span><span class="value" id="actual-frequency">—</span></div>
+        <div class="row"><span class="label">dropped commands</span><span class="value" id="dropped">—</span></div>
+        <div class="row"><span class="label">ring back-pressure</span><span class="value" id="back-pressure">—</span></div>
+    </section>
+
+    <section>
+        <h2>Telemetry</h2>
+        <div class="row">
+            <span class="label">peak</span>
+            <span id="peak-track"><span id="peak-bar"></span></span>
+        </div>
+        <div class="row"><span class="label">peak level</span><span class="value" id="peak-readout">—</span></div>
+        <div class="row"><span class="label">quanta rendered</span><span class="value" id="quanta">—</span></div>
+        <div class="row"><span class="label">wasm memory</span><span class="value" id="memory">—</span></div>
+        <div class="row"><span class="label">memory growth check</span><span class="value" id="memory-verdict">—</span></div>
+    </section>
+
+    <section>
+        <h2>Log</h2>
+        <div id="log"></div>
+    </section>
+</main>
+
+<!-- Classic scripts, in order: the protocol first, then the page. `ring.js` is also
+     concatenated into the worklet bundle, which is why it is a plain script rather than
+     a module — a worklet cannot import one. -->
+<script src="ring.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

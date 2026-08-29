@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Bare-metal target used for both the `no_std` check and the no-std purity guard.
@@ -45,7 +46,8 @@ fn main() -> ExitCode {
     let succeeded = match subcommand {
         Some("ci") => run_ci(&arguments[1..]),
         Some("goldens") => not_implemented("goldens", "regenerating golden renders (M1)"),
-        Some("wasm") => not_implemented("wasm", "packaging the web build (M0-A4)"),
+        Some("wasm") => run_wasm(&arguments[1..]),
+        Some("serve") => run_serve(&arguments[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             true
@@ -66,7 +68,8 @@ fn print_usage() {
     println!("subcommands:");
     println!("  ci [--job <job>]   run the CI matrix locally, or a single job of it");
     println!("  goldens            regenerate golden renders (not implemented)");
-    println!("  wasm               package the web build (not implemented)");
+    println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
+    println!("  serve [--port N]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
     println!();
     println!("ci jobs:");
     for job in JOBS {
@@ -354,4 +357,364 @@ fn cargo(arguments: &[&str]) -> bool {
             false
         }
     }
+}
+
+// ── wasm packaging ──────────────────────────────────────────────────────────────────
+
+/// Everything the web build reads from and writes to, relative to the workspace root.
+const WEB_SOURCE_DIRECTORY: &str = "apps/starplayer-web/www";
+const WEB_OUTPUT_DIRECTORY: &str = "apps/starplayer-web/dist";
+const DEV_SERVER_SCRIPT: &str = "apps/starplayer-web/dev-server.mjs";
+
+/// The crate compiled to wasm, and the file names `wasm-bindgen` derives from it.
+const WASM_CRATE: &str = "starplayer-host-wasm";
+const WASM_ARTIFACT: &str = "starplayer_host_wasm.wasm";
+const BINDGEN_GLUE: &str = "starplayer_host_wasm.js";
+
+/// The single file `AudioWorklet.addModule()` is pointed at.
+const WORKLET_BUNDLE: &str = "starplayer-worklet.js";
+
+/// The pieces concatenated into that bundle, after the `wasm-bindgen` glue. Order
+/// matters: `ring.js` installs the protocol the processor then uses.
+const WORKLET_BUNDLE_PARTS: &[&str] = &["ring.js", "worklet-processor.js"];
+
+/// Sources that exist only to be bundled and are never loaded on their own. `ring.js` is
+/// not among them: the page loads it too, because the protocol has two ends.
+const WORKLET_ONLY_SOURCES: &[&str] = &["worklet-processor.js"];
+
+const DEFAULT_SERVE_PORT: u16 = 8080;
+
+/// `cargo build` → `wasm-bindgen` → worklet-scope massaging → a servable directory.
+///
+/// `wasm-pack` would do the first two steps and is deliberately not used: it adds an
+/// npm-package generator this project has no use for, another binary to install, and a
+/// second place where the `wasm-bindgen` version is decided. `cargo build` plus
+/// `wasm-bindgen-cli` is the whole job, and the version pin then lives in exactly one
+/// place — `[workspace.dependencies]` — which this function checks the CLI against.
+fn run_wasm(arguments: &[String]) -> bool {
+    let mut serve_afterwards = false;
+    let mut port = DEFAULT_SERVE_PORT;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--serve" => {
+                serve_afterwards = true;
+                index += 1;
+            }
+            "--port" => {
+                let Some(value) = arguments.get(index + 1) else {
+                    eprintln!("xtask wasm: `--port` needs a value");
+                    return false;
+                };
+                let Ok(parsed) = value.parse::<u16>() else {
+                    eprintln!("xtask wasm: `{value}` is not a port number");
+                    return false;
+                };
+                port = parsed;
+                index += 2;
+            }
+            other => {
+                eprintln!("xtask wasm: unexpected argument `{other}`");
+                return false;
+            }
+        }
+    }
+
+    let root = workspace_root();
+
+    if !check_bindgen_version(&root) {
+        return false;
+    }
+    if !cargo(&["build", "--release", "--target", WASM_TARGET, "-p", WASM_CRATE]) {
+        return false;
+    }
+
+    let output_directory = root.join(WEB_OUTPUT_DIRECTORY);
+    // A stale artefact from an earlier layout is worse than a slow build: the page would
+    // load it and the failure would look like a bug in the new code.
+    if output_directory.exists()
+        && let Err(error) = std::fs::remove_dir_all(&output_directory) {
+        eprintln!("xtask wasm: cannot clear `{}`: {error}", output_directory.display());
+        return false;
+    }
+    if let Err(error) = std::fs::create_dir_all(&output_directory) {
+        eprintln!("xtask wasm: cannot create `{}`: {error}", output_directory.display());
+        return false;
+    }
+
+    let wasm_artifact = root.join("target").join(WASM_TARGET).join("release").join(WASM_ARTIFACT);
+    println!("     wasm-bindgen --target no-modules {}", wasm_artifact.display());
+    let bindgen_succeeded = Command::new("wasm-bindgen")
+        .args(["--target", "no-modules", "--no-typescript", "--out-dir"])
+        .arg(&output_directory)
+        .arg(&wasm_artifact)
+        .status();
+    match bindgen_succeeded {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("     wasm-bindgen exited with {status}");
+            return false;
+        }
+        Err(error) => {
+            eprintln!("     wasm-bindgen failed to start: {error}");
+            eprintln!("     install it with `cargo install wasm-bindgen-cli --version {}`", pinned_bindgen_version(&root).unwrap_or_default());
+            return false;
+        }
+    }
+
+    if !build_worklet_bundle(&root, &output_directory) {
+        return false;
+    }
+    if !copy_web_sources(&root, &output_directory) {
+        return false;
+    }
+    if !report_output(&output_directory) {
+        return false;
+    }
+
+    println!();
+    println!("xtask wasm: packaged into {}", output_directory.display());
+    if serve_afterwards {
+        return serve(&root, port);
+    }
+    println!("     run `cargo xtask serve` and open http://localhost:{DEFAULT_SERVE_PORT}/");
+    true
+}
+
+/// Assemble the one file the worklet is allowed to load.
+///
+/// This is the "worklet-scope massaging" the task calls for, and in wasm-bindgen 0.2.127
+/// it comes to two things:
+///
+/// 1. **Concatenation.** `AudioWorklet.addModule()` takes one URL, and inside
+///    `AudioWorkletGlobalScope` there is no `fetch`, no `importScripts` and no dependable
+///    dynamic `import`. So the glue, the ring protocol and the processor have to arrive
+///    as a single script. `--target no-modules` is what makes this possible at all: it
+///    emits a self-contained IIFE with no `export`, no `import.meta` and no top-level
+///    `await`, all of which `--target web` has and none of which survive concatenation
+///    into a worklet.
+///
+/// 2. **Disarming the script-path sniff.** The glue opens by reading
+///    `document.currentScript` to guess where its `.wasm` sits, so that a bare
+///    `wasm_bindgen()` call can fetch it. The guard already short-circuits in a worklet,
+///    where `document` is undefined — but the branch it protects is the only place the
+///    glue reaches for `location` and `fetch`, neither of which exists there. Forcing it
+///    off makes that unreachable by construction rather than by luck, and the assertion
+///    below turns a future wasm-bindgen that changes the shape of this code into a build
+///    failure instead of a silent runtime one.
+fn build_worklet_bundle(root: &Path, output_directory: &Path) -> bool {
+    let glue_path = output_directory.join(BINDGEN_GLUE);
+    let Ok(glue) = std::fs::read_to_string(&glue_path) else {
+        eprintln!("xtask wasm: `{}` was not produced", glue_path.display());
+        return false;
+    };
+
+    const SCRIPT_SNIFF: &str = "if (typeof document !== 'undefined' && document.currentScript !== null) {";
+    if !glue.contains(SCRIPT_SNIFF) {
+        eprintln!("xtask wasm: the wasm-bindgen glue no longer contains the `document.currentScript`");
+        eprintln!("            sniff this build knows how to disarm. Re-read the generated");
+        eprintln!("            `{BINDGEN_GLUE}` and update `build_worklet_bundle` before shipping it");
+        eprintln!("            into a worklet.");
+        return false;
+    }
+    let glue = glue.replace(
+        SCRIPT_SNIFF,
+        "if (false) { // starplayer: disarmed by `xtask wasm` — worklet scope has no document, location or fetch",
+    );
+
+    let mut bundle = String::new();
+    bundle.push_str("// GENERATED by `cargo xtask wasm` — do not edit.\n");
+    bundle.push_str("//\n");
+    bundle.push_str("// wasm-bindgen `--target no-modules` glue, then the ring protocol, then the\n");
+    bundle.push_str("// AudioWorklet processor, concatenated because a worklet can load exactly one file\n");
+    bundle.push_str("// and cannot fetch or import anything once it is running.\n\n");
+    bundle.push_str(&glue);
+
+    for part in WORKLET_BUNDLE_PARTS {
+        let part_path = root.join(WEB_SOURCE_DIRECTORY).join(part);
+        let Ok(contents) = std::fs::read_to_string(&part_path) else {
+            eprintln!("xtask wasm: cannot read `{}`", part_path.display());
+            return false;
+        };
+        bundle.push_str("\n\n// ── ");
+        bundle.push_str(part);
+        bundle.push_str(" ──────────────────────────────────────────────────────────\n\n");
+        bundle.push_str(&contents);
+    }
+
+    let bundle_path = output_directory.join(WORKLET_BUNDLE);
+    if let Err(error) = std::fs::write(&bundle_path, bundle) {
+        eprintln!("xtask wasm: cannot write `{}`: {error}", bundle_path.display());
+        return false;
+    }
+    // The standalone glue is now dead weight, and leaving it would invite somebody to
+    // load it instead of the bundle. The page never instantiates wasm itself — it
+    // compiles the module and hands it to the worklet.
+    if let Err(error) = std::fs::remove_file(&glue_path) {
+        eprintln!("xtask wasm: cannot remove `{}`: {error}", glue_path.display());
+        return false;
+    }
+    println!("     bundled {BINDGEN_GLUE} + {} → {WORKLET_BUNDLE}", WORKLET_BUNDLE_PARTS.join(" + "));
+    true
+}
+
+/// Copy the hand-written page into the output directory. Flat by design: this is four
+/// files, and a recursive copy would only hide that.
+fn copy_web_sources(root: &Path, output_directory: &Path) -> bool {
+    let source_directory = root.join(WEB_SOURCE_DIRECTORY);
+    let entries = match std::fs::read_dir(&source_directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("xtask wasm: cannot read `{}`: {error}", source_directory.display());
+            return false;
+        }
+    };
+
+    let mut all_succeeded = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name() else { continue };
+        if WORKLET_ONLY_SOURCES.iter().any(|only| std::ffi::OsStr::new(only) == name) {
+            continue;
+        }
+        if let Err(error) = std::fs::copy(&path, output_directory.join(name)) {
+            eprintln!("xtask wasm: cannot copy `{}`: {error}", path.display());
+            all_succeeded = false;
+        }
+    }
+    all_succeeded
+}
+
+fn report_output(output_directory: &Path) -> bool {
+    let entries = match std::fs::read_dir(output_directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("xtask wasm: cannot list `{}`: {error}", output_directory.display());
+            return false;
+        }
+    };
+    let mut listing: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            Some((entry.file_name().to_string_lossy().into_owned(), metadata.len()))
+        })
+        .collect();
+    listing.sort();
+
+    println!();
+    for (name, size) in &listing {
+        println!("     {size:>9}  {name}");
+    }
+    true
+}
+
+// ── dev server ──────────────────────────────────────────────────────────────────────
+
+/// Serve the packaged build with the COOP/COEP headers `SharedArrayBuffer` requires.
+fn run_serve(arguments: &[String]) -> bool {
+    let mut port = DEFAULT_SERVE_PORT;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--port" => {
+                let Some(value) = arguments.get(index + 1) else {
+                    eprintln!("xtask serve: `--port` needs a value");
+                    return false;
+                };
+                let Ok(parsed) = value.parse::<u16>() else {
+                    eprintln!("xtask serve: `{value}` is not a port number");
+                    return false;
+                };
+                port = parsed;
+                index += 2;
+            }
+            other => {
+                eprintln!("xtask serve: unexpected argument `{other}`");
+                return false;
+            }
+        }
+    }
+    serve(&workspace_root(), port)
+}
+
+fn serve(root: &Path, port: u16) -> bool {
+    let output_directory = root.join(WEB_OUTPUT_DIRECTORY);
+    if !output_directory.join("index.html").exists() {
+        eprintln!("xtask serve: `{}` is not packaged yet — run `cargo xtask wasm` first", output_directory.display());
+        return false;
+    }
+
+    let script = root.join(DEV_SERVER_SCRIPT);
+    println!("     node {} --port {port}", script.display());
+    match Command::new("node")
+        .arg(&script)
+        .args(["--port", &port.to_string(), "--root"])
+        .arg(&output_directory)
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("     node exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("     node failed to start: {error} — Node 24 or later is required");
+            false
+        }
+    }
+}
+
+// ── paths and versions ──────────────────────────────────────────────────────────────
+
+/// The workspace root, derived from this crate's own manifest directory rather than from
+/// the current directory, so `cargo xtask` works from anywhere inside the tree.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The exact `wasm-bindgen` version pinned in `[workspace.dependencies]`.
+fn pinned_bindgen_version(root: &Path) -> Option<String> {
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    for line in manifest.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("wasm-bindgen") else { continue };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else { continue };
+        let version = rest.trim().trim_matches('"').trim_start_matches('=').trim();
+        if !version.is_empty() {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
+/// The generated glue and the CLI that produces it must be the same version — a mismatch
+/// is a confusing runtime failure rather than a build error, so it is checked here.
+fn check_bindgen_version(root: &Path) -> bool {
+    let Some(pinned) = pinned_bindgen_version(root) else {
+        eprintln!("xtask wasm: no `wasm-bindgen` pin found in [workspace.dependencies]");
+        return false;
+    };
+
+    let output = match Command::new("wasm-bindgen").arg("--version").output() {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("xtask wasm: `wasm-bindgen` is not on PATH: {error}");
+            eprintln!("            install it with `cargo install wasm-bindgen-cli --version {pinned}`");
+            return false;
+        }
+    };
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let installed = reported.split_whitespace().nth(1).unwrap_or("").trim();
+    if installed != pinned {
+        eprintln!("xtask wasm: wasm-bindgen CLI is {installed}, but the crate is pinned to {pinned}");
+        eprintln!("            the glue and the CLI must match; run");
+        eprintln!("            `cargo install wasm-bindgen-cli --version {pinned}`");
+        return false;
+    }
+    println!("     wasm-bindgen CLI {installed} matches the pinned crate version");
+    true
 }
