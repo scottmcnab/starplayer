@@ -1,0 +1,10 @@
+[package]
+name = "starplayer-archive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+starplayer-model = { workspace = true }
+zip = { workspace = true }
+flate2 = { workspace = true }

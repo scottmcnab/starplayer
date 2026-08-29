@@ -9,4 +9,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 starplayer = { workspace = true, features = ["std"] }
+starplayer-archive = { workspace = true }
 wasm-bindgen = { workspace = true }
+
+[dev-dependencies]
+zip = { workspace = true }

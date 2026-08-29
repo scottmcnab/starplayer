@@ -19,11 +19,12 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, readdir } from 'node:fs/promises';
+import { access, readFile, readdir } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { crc32, deflateRawSync } from 'node:zlib';
 
 const REPOSITORY_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const DEV_SERVER = join(REPOSITORY_ROOT, 'apps/starplayer-web/dev-server.mjs');
@@ -81,6 +82,54 @@ async function freePort() {
 
 function delay(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+// Build the fixture ZIPs independently of starplayer-archive. Only the standard local
+// header, central-directory record and EOCD are needed for these Deflate entries.
+function buildZip(entries) {
+    const localRecords = [];
+    const centralRecords = [];
+    let localOffset = 0;
+    for (const entry of entries) {
+        const name = Buffer.from(entry.name, 'utf8');
+        const bytes = Buffer.from(entry.bytes);
+        const compressed = deflateRawSync(bytes);
+        const checksum = crc32(bytes) >>> 0;
+
+        const localHeader = Buffer.alloc(30);
+        localHeader.writeUInt32LE(0x04034B50, 0);
+        localHeader.writeUInt16LE(20, 4);
+        localHeader.writeUInt16LE(0x0800, 6);
+        localHeader.writeUInt16LE(8, 8);
+        localHeader.writeUInt32LE(checksum, 14);
+        localHeader.writeUInt32LE(compressed.length, 18);
+        localHeader.writeUInt32LE(bytes.length, 22);
+        localHeader.writeUInt16LE(name.length, 26);
+        localRecords.push(localHeader, name, compressed);
+
+        const centralHeader = Buffer.alloc(46);
+        centralHeader.writeUInt32LE(0x02014B50, 0);
+        centralHeader.writeUInt16LE(20, 4);
+        centralHeader.writeUInt16LE(20, 6);
+        centralHeader.writeUInt16LE(0x0800, 8);
+        centralHeader.writeUInt16LE(8, 10);
+        centralHeader.writeUInt32LE(checksum, 16);
+        centralHeader.writeUInt32LE(compressed.length, 20);
+        centralHeader.writeUInt32LE(bytes.length, 24);
+        centralHeader.writeUInt16LE(name.length, 28);
+        centralHeader.writeUInt32LE(localOffset, 42);
+        centralRecords.push(centralHeader, name);
+        localOffset += localHeader.length + name.length + compressed.length;
+    }
+
+    const centralDirectory = Buffer.concat(centralRecords);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054B50, 0);
+    end.writeUInt16LE(entries.length, 8);
+    end.writeUInt16LE(entries.length, 10);
+    end.writeUInt32LE(centralDirectory.length, 12);
+    end.writeUInt32LE(localOffset, 16);
+    return Buffer.concat([...localRecords, centralDirectory, end]);
 }
 
 async function startDevServer(isolate) {
@@ -237,6 +286,8 @@ const READ_STATE = `
         commandTransport: text('command-transport'),
         telemetryTransport: text('telemetry-transport'),
         title: text('title'),
+        moduleDetail: text('module-detail'),
+        message: text('message'),
         order: text('order'),
         row: text('row'),
         speed: text('speed'),
@@ -250,6 +301,7 @@ const READ_STATE = `
         errorText: text('error'),
         instruments: document.querySelectorAll('#instrument-list li').length,
         crossOriginIsolated: globalThis.crossOriginIsolated === true,
+        archivePickerVisible: !document.getElementById('archive-picker').hidden,
     };
 `;
 
@@ -261,12 +313,47 @@ async function loadFixture(page, name) {
     `);
 }
 
+async function loadFile(page, bytes, name, drop = false) {
+    const base64 = Buffer.from(bytes).toString('base64');
+    await page.evaluate(`
+        const bytes = Uint8Array.from(atob(${JSON.stringify(base64)}), (character) => character.charCodeAt(0));
+        const transfer = new DataTransfer();
+        transfer.items.add(new File([bytes], ${JSON.stringify(name)}, { type: 'application/zip' }));
+        if (${drop}) {
+            document.getElementById('drop-zone').dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+        } else {
+            const picker = document.getElementById('file-picker');
+            picker.files = transfer.files;
+            picker.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return true;
+    `);
+}
+
+async function loadUrl(page, bytes) {
+    const base64 = Buffer.from(bytes).toString('base64');
+    await page.evaluate(`
+        const bytes = Uint8Array.from(atob(${JSON.stringify(base64)}), (character) => character.charCodeAt(0));
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
+        document.getElementById('url').value = url;
+        document.getElementById('url-form').requestSubmit();
+        return true;
+    `);
+}
+
 async function run(executable, mode) {
     const isolate = mode !== 'plain';
     const server = await startDevServer(isolate);
     const page = await Page.open(executable, `http://127.0.0.1:${server.port}/`);
     const report = { mode };
     try {
+        const firstModuleBytes = await readFile(join(DIST, 'modules', FIRST_MODULE));
+        const secondModuleBytes = await readFile(join(DIST, 'modules', SECOND_MODULE));
+        const singleModuleZip = buildZip([{ name: FIRST_MODULE, bytes: firstModuleBytes }]);
+        const twoModuleZip = buildZip([
+            { name: FIRST_MODULE, bytes: firstModuleBytes },
+            { name: SECOND_MODULE, bytes: secondModuleBytes },
+        ]);
         await page.waitFor('the page module to attach its listeners', "document.documentElement.dataset.playerReady === 'true'");
         if (mode === 'fallback') {
             await page.evaluate("document.getElementById('force-fallback').checked = true; return true;");
@@ -352,16 +439,58 @@ async function run(executable, mode) {
         assert.notEqual(resumed.row, stopped.row, 'play resumes the row clock');
         report.seekedOrder = resumed.order;
 
-        // ── a second module over the top of the first ───────────────────────────────
-        await loadFixture(page, SECOND_MODULE);
-        await page.waitFor('the second module', `document.getElementById('title').textContent !== ${JSON.stringify(playing.title)}`);
+        // ── a single-module ZIP loads straight through the file picker ──────────────
+        await loadFile(page, singleModuleZip, 'reflex.zip');
+        await page.waitFor('the single ZIP module', "document.getElementById('module-detail').textContent.includes('REFLEX.S3M (from reflex.zip)')");
+        const singleZipState = await page.evaluate(READ_STATE);
+        assert.equal(singleZipState.archivePickerVisible, false, 'a single-module ZIP does not open the picker');
+        assert.equal(singleZipState.chip, 'playing');
+        assert.match(singleZipState.moduleDetail, /REFLEX\.S3M \(from reflex\.zip\)/);
+        report.singleZipLabel = singleZipState.moduleDetail.split(' · ')[0];
+
+        // ── a multi-module ZIP keeps playing until its second entry is chosen ───────
+        const beforePicker = await page.evaluate(READ_STATE);
+        await loadFile(page, twoModuleZip, 'two-modules.zip');
+        await page.waitFor('the archive picker', "document.getElementById('archive-picker').hidden === false");
+        const pickerState = await page.evaluate(READ_STATE);
+        assert.equal(pickerState.title, beforePicker.title, 'opening the picker does not replace the current module');
+        assert.equal(pickerState.chip, 'playing', 'the current module keeps playing behind the picker');
+        const pickerEntries = await page.evaluate("return [...document.getElementById('archive-entries').options].map((option) => option.textContent);");
+        assert.equal(pickerEntries.length, 2);
+        assert.match(pickerEntries[1], /MOVEMENT\.S3M/);
+        await page.waitFor('playback to advance behind the picker', `document.getElementById('row').textContent !== ${JSON.stringify(pickerState.row)}`);
+        await page.evaluate("document.getElementById('archive-cancel').click(); return true;");
+        const afterCancel = await page.evaluate(READ_STATE);
+        assert.equal(afterCancel.archivePickerVisible, false);
+        assert.equal(afterCancel.moduleDetail, beforePicker.moduleDetail, 'Cancel leaves the current module unchanged');
+        await loadFile(page, twoModuleZip, 'two-modules.zip');
+        await page.waitFor('the reopened archive picker', "document.getElementById('archive-picker').hidden === false");
+        await page.evaluate("document.getElementById('archive-entries').selectedIndex = 1; document.getElementById('archive-load').click(); return true;");
+        await page.waitFor('the selected second ZIP module', "document.getElementById('module-detail').textContent.includes('MOVEMENT.S3M (from two-modules.zip)')");
         await page.waitFor('the retired module to be collected', "parseInt(document.getElementById('retired').textContent, 10) >= 1");
         await delay(2000);
         const swapped = await page.evaluate(READ_STATE);
-        assert.equal(swapped.errorShown, false, `the hot swap raised an error: ${swapped.errorText}`);
+        assert.equal(swapped.errorShown, false, `the ZIP hot swap raised an error: ${swapped.errorText}`);
         assert.equal(swapped.health, 'healthy');
+        report.pickerEntries = pickerEntries;
+        report.multiZipLabel = swapped.moduleDetail.split(' · ')[0];
         report.retiredAfterSwap = swapped.retired;
         report.secondTitle = swapped.title;
+
+        // Exercise the same archive front half through drag-and-drop as a third route.
+        await loadFile(page, singleModuleZip, 'dropped.zip', true);
+        await page.waitFor('the dropped ZIP module', "document.getElementById('module-detail').textContent.includes('REFLEX.S3M (from dropped.zip)')");
+        const droppedZip = await page.evaluate(READ_STATE);
+        assert.equal(droppedZip.chip, 'playing');
+        report.droppedZipLabel = droppedZip.moduleDetail.split(' · ')[0];
+
+        // URL loading uses the same byte path; a blob URL gives the harness a local ZIP
+        // URL without writing a test fixture beside the generated distribution.
+        await loadUrl(page, singleModuleZip);
+        await page.waitFor('the ZIP URL module', "document.getElementById('module-detail').textContent.includes('REFLEX.S3M (from blob:')");
+        const urlZip = await page.evaluate(READ_STATE);
+        assert.equal(urlZip.chip, 'playing');
+        report.zipUrlLoaded = true;
 
         // ── a deliberately broken file, dropped on the page ─────────────────────────
         await page.evaluate(`
@@ -375,7 +504,7 @@ async function run(executable, mode) {
         const afterBadFile = await page.evaluate(READ_STATE);
         assert.match(afterBadFile.errorText, /broken\.s3m/, 'the error names the file the user dropped');
         assert.ok(afterBadFile.errorText.length > 20, `the error is a sentence, not a code: ${afterBadFile.errorText}`);
-        assert.equal(afterBadFile.title, swapped.title, 'the good module is still loaded');
+        assert.equal(afterBadFile.title, urlZip.title, 'the good module is still loaded');
         report.badFileError = afterBadFile.errorText;
 
         const beforeSurvival = await page.evaluate(READ_STATE);

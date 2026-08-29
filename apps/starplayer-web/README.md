@@ -42,6 +42,11 @@ B7 uses two wasm instances:
   later worklet message task; `retired_modules_collected()` is the running total the page
   and the tests assert on.
 
+ZIP archives are opened only in the page-thread `starplayer-web` instance, through the
+reusable `starplayer-archive` crate. The page lists and, after any required picker choice,
+extracts an S3M before the existing validation and activation path begins. The worklet is
+therefore still given only module bytes and never receives or inflates an archive.
+
 Commands are typed fixed-size records in an SPSC `SharedArrayBuffer` ring. Without SAB,
 the page batches every control change made during one animation frame into one message.
 Coherent B6 snapshots use an odd/even seqlock over shared memory; the fallback posts a

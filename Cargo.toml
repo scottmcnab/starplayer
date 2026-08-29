@@ -26,6 +26,12 @@ rust-version = "1.97"
 fixed = { version = "1.31", default-features = false }
 bitflags = { version = "2.13", default-features = false }
 
+# Archive decoding stays on the pure-Rust miniz_oxide path for native and wasm builds.
+# Do not use zip's broad `deflate` feature: it also enables compressor and zlib-rs code
+# that the read-only module archive path does not need.
+zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # The real-time plumbing's three dependencies, all `no_std` and none enabling `std` at
 # the feature set selected here. See `crates/starplayer-rt/src/lib.rs` for why each one
 # is needed rather than hand-written.
@@ -60,6 +66,7 @@ starplayer-midi = { path = "crates/starplayer-midi" }
 starplayer-telemetry = { path = "crates/starplayer-telemetry" }
 starplayer-host-cpal = { path = "crates/starplayer-host-cpal" }
 starplayer-host-wasm = { path = "crates/starplayer-host-wasm" }
+starplayer-archive = { path = "crates/starplayer-archive" }
 starplayer-offline = { path = "crates/starplayer-offline" }
 starplayer-testkit = { path = "crates/starplayer-testkit" }
 

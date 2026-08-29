@@ -805,6 +805,7 @@ crates/
   # ── std ─────────────────────────────────────────────────────────────────────
   starplayer-host-cpal  native audio output                       → starplayer, cpal
   starplayer-host-wasm  AudioWorklet glue                → starplayer, wasm-bindgen
+  starplayer-archive    zip (later: lha/rar?) container support   → model, zip
   starplayer-offline    WAV writer, deterministic render, trace dump
   starplayer-testkit    golden compare, libxmp/openmpt diff harness, trace differ
 apps/

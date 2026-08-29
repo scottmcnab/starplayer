@@ -12,6 +12,7 @@ use std::vec::Vec;
 
 use starplayer::model::{EffectNames, Module, NoteCell, PatternId, s3m_command_code};
 use starplayer::s3m::PatternView;
+use starplayer_archive::{ArchiveError, extract, is_zip, list_modules};
 
 const DISPLAY_CELL_BYTES: usize = 5;
 const NOTE_NONE: u8 = 255;
@@ -64,6 +65,20 @@ fn effect_name_records() -> String {
     records
 }
 
+fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
+    let entries = match list_modules(bytes) {
+        Ok(entries) => entries,
+        Err(ArchiveError::NoModules) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let mut records = String::new();
+    for entry in entries.into_iter().filter(|entry| entry.format == starplayer::model::ModuleFormat::S3m) {
+        let safe_name = entry.name.replace(['\t', '\r', '\n'], " ");
+        records.push_str(&format!("{}\t{}\t{}\n", entry.index, safe_name, entry.size));
+    }
+    Ok(records)
+}
+
 fn pattern_window_bytes(pattern: u16, first_row: u16, row_count: u16) -> Vec<u8> {
     with_module(Vec::new(), |module| {
         let Some(view) = PatternView::new(module, PatternId(pattern)) else { return Vec::new() };
@@ -99,6 +114,22 @@ mod exports {
     #[wasm_bindgen]
     pub fn inspect_s3m(bytes: &[u8]) -> Result<(), JsValue> {
         inspect(bytes).map_err(|message| JsValue::from_str(&message))
+    }
+
+    /// Identify ZIP bytes before the page asks the archive decoder to inspect them.
+    #[wasm_bindgen]
+    pub fn is_archive(bytes: &[u8]) -> bool { is_zip(bytes) }
+
+    /// List the S3M entries this web player can currently offer, one tab record per line.
+    #[wasm_bindgen]
+    pub fn archive_modules(bytes: &[u8]) -> Result<String, JsValue> {
+        archive_module_records(bytes).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Extract one central-directory entry into page-owned module bytes.
+    #[wasm_bindgen]
+    pub fn archive_extract(bytes: &[u8], index: u32) -> Result<Vec<u8>, JsValue> {
+        extract(bytes, index as usize).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     #[wasm_bindgen]
@@ -158,6 +189,9 @@ mod exports {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     const FIXTURE: &[u8] = include_bytes!("../../../crates/starplayer-s3m/tests/fixtures/REFLEX.S3M");
 
@@ -185,5 +219,16 @@ mod tests {
         let title = with_module(String::new(), |module| module.header().title.to_string());
         assert!(inspect(b"broken").is_err());
         assert_eq!(with_module(String::new(), |module| module.header().title.to_string()), title);
+    }
+
+    #[test]
+    fn archive_modules_uses_tab_separated_page_records() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file("REFLEX.S3M", SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)).unwrap();
+        writer.write_all(b"s3m").unwrap();
+        writer.start_file("readme.txt", SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"notes").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        assert_eq!(archive_module_records(&bytes).unwrap(), "0\tREFLEX.S3M\t3\n");
     }
 }

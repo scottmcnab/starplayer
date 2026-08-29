@@ -28,6 +28,8 @@ const elements = {
     instrumentCount: byId('instrument-count'), instrumentList: byId('instrument-list'), commandTransport: byId('command-transport'),
     telemetryTransport: byId('telemetry-transport'), quantum: byId('quantum'), memory: byId('memory'),
     dropped: byId('dropped'), retired: byId('retired'), health: byId('health'), forceFallback: byId('force-fallback'),
+    archivePicker: byId('archive-picker'), archivePickerName: byId('archive-picker-name'), archiveEntries: byId('archive-entries'),
+    archiveLoad: byId('archive-load'), archiveCancel: byId('archive-cancel'),
 };
 
 const state = {
@@ -48,6 +50,9 @@ const state = {
     activationMemoryBytes: 0,
     loadCount: 0,
     retiredSeen: 0,
+    archiveChoices: [],
+    archivePickerResolve: null,
+    archivePreviousFocus: null,
 };
 
 const loaderReady = initLoader().then(loadEffectNames);
@@ -155,15 +160,35 @@ function createNode(processorOptions, wasmBytes) {
 
 async function loadBuffer(buffer, label) {
     const audio = startAudio();
+    const previousMessage = elements.message.textContent;
     clearError();
     showMessage(`Checking ${label}…`);
     try {
         await loaderReady;
-        Loader.inspect_s3m(new Uint8Array(buffer));
-        const metadata = readMetadata(label);
+        let moduleBuffer = buffer;
+        let moduleLabel = label;
+        const inputBytes = new Uint8Array(buffer);
+        if (Loader.is_archive(inputBytes)) {
+            const entries = parseArchiveModules(Loader.archive_modules(inputBytes));
+            if (entries.length === 0) {
+                throw new Error(`No S3M modules were found inside ${label}.`);
+            }
+            const choice = entries.length === 1 ? entries[0] : await chooseArchiveEntry(entries, label);
+            if (choice === null) {
+                audio.catch(() => {});
+                showMessage(previousMessage);
+                return;
+            }
+            showMessage(`Extracting ${choice.name} from ${label}…`);
+            const extracted = Loader.archive_extract(inputBytes, choice.index);
+            moduleBuffer = Uint8Array.from(extracted).buffer;
+            moduleLabel = `${choice.name} (from ${label})`;
+        }
+        Loader.inspect_s3m(new Uint8Array(moduleBuffer));
+        const metadata = readMetadata(moduleLabel);
         await audio;
-        showMessage(`Activating ${label}…`);
-        const result = await activateModule(buffer);
+        showMessage(`Activating ${moduleLabel}…`);
+        const result = await activateModule(moduleBuffer);
         state.metadata = metadata;
         state.activationMemoryBytes = result.memoryBytes;
         state.loadCount += 1;
@@ -171,7 +196,7 @@ async function loadBuffer(buffer, label) {
         setControlsEnabled(true);
         queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(Number(elements.volume.value) * 65535 / 100), 0);
         queueCommand(Ring.OPCODE_PLAY, 0, 0);
-        showMessage(`Playing ${metadata.title || label}.`);
+        showMessage(`Playing ${metadata.title || moduleLabel}.`);
 
         // The engine applies LoadModule at the next quantum. Collection happens in a
         // later worklet message task, never inside process(). Two attempts cover a busy
@@ -182,6 +207,65 @@ async function loadBuffer(buffer, label) {
         showError(`Could not load ${label}: ${error && error.message ? error.message : error}`);
         showMessage(state.metadata ? `Still playing ${state.metadata.title}.` : 'The player is ready for another file.');
     }
+}
+
+function parseArchiveModules(records) {
+    const entries = [];
+    for (const record of records.split('\n')) {
+        if (record === '') continue;
+        const fields = record.split('\t');
+        if (fields.length !== 3) throw new Error('The archive entry list was malformed.');
+        const index = Number(fields[0]);
+        const size = Number(fields[2]);
+        if (!Number.isSafeInteger(index) || index < 0 || index > 0xFFFF_FFFF || !Number.isSafeInteger(size) || size < 0) {
+            throw new Error('The archive entry list contained an invalid index or size.');
+        }
+        entries.push({ index, name: fields[1], size });
+    }
+    return entries;
+}
+
+function chooseArchiveEntry(entries, archiveLabel) {
+    if (state.archivePickerResolve !== null) finishArchivePicker(null);
+    state.archiveChoices = entries;
+    state.archivePreviousFocus = document.activeElement;
+    elements.archivePickerName.textContent = archiveLabel;
+    elements.archiveEntries.replaceChildren();
+    for (const [choiceIndex, entry] of entries.entries()) {
+        const option = document.createElement('option');
+        option.value = String(choiceIndex);
+        option.textContent = `${entry.name} — ${formatByteSize(entry.size)}`;
+        elements.archiveEntries.append(option);
+    }
+    elements.archiveEntries.selectedIndex = 0;
+    elements.archivePicker.hidden = false;
+    showMessage(`Choose one of ${entries.length} S3M modules in ${archiveLabel}. Playback continues until you load one.`);
+    const promise = new Promise((resolve) => { state.archivePickerResolve = resolve; });
+    elements.archiveEntries.focus();
+    return promise;
+}
+
+function finishArchivePicker(choice) {
+    const resolve = state.archivePickerResolve;
+    if (resolve === null) return;
+    state.archivePickerResolve = null;
+    elements.archivePicker.hidden = true;
+    state.archiveChoices = [];
+    const previousFocus = state.archivePreviousFocus;
+    state.archivePreviousFocus = null;
+    if (previousFocus instanceof HTMLElement) previousFocus.focus();
+    resolve(choice);
+}
+
+function loadArchiveChoice() {
+    const choice = state.archiveChoices[elements.archiveEntries.selectedIndex];
+    if (choice) finishArchivePicker(choice);
+}
+
+function formatByteSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function readMetadata(label) {
@@ -274,7 +358,7 @@ function flushFallbackCommands() {
 function renderMetadata() {
     const metadata = state.metadata;
     elements.title.textContent = metadata.title;
-    elements.moduleDetail.textContent = `${metadata.channels} channels · ${metadata.orders} orders · ${metadata.patterns} patterns · ${metadata.instruments.length} instruments`;
+    elements.moduleDetail.textContent = `${metadata.label} · ${metadata.channels} channels · ${metadata.orders} orders · ${metadata.patterns} patterns · ${metadata.instruments.length} instruments`;
     elements.seekOrder.max = String(Math.max(0, metadata.orders - 1));
     elements.instrumentCount.textContent = String(metadata.instruments.length);
     elements.instrumentList.replaceChildren();
@@ -511,6 +595,18 @@ elements.filePicker.addEventListener('change', () => {
     elements.filePicker.value = '';
 });
 elements.loadFixture.addEventListener('click', () => loadFixture().catch(showError));
+elements.archiveLoad.addEventListener('click', loadArchiveChoice);
+elements.archiveCancel.addEventListener('click', () => finishArchivePicker(null));
+elements.archiveEntries.addEventListener('dblclick', loadArchiveChoice);
+elements.archivePicker.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+        event.preventDefault();
+        finishArchivePicker(null);
+    } else if (event.key === 'Enter' && event.target === elements.archiveEntries) {
+        event.preventDefault();
+        loadArchiveChoice();
+    }
+});
 elements.urlForm.addEventListener('submit', (event) => {
     event.preventDefault();
     const url = elements.url.value.trim();

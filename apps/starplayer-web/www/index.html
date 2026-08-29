@@ -20,15 +20,30 @@
     </header>
 
     <div id="error" class="notice error" role="alert" hidden></div>
-    <div id="message" class="notice" role="status">Choose a fixture or drop an S3M to begin.</div>
+    <div id="message" class="notice" role="status">Choose a fixture or drop an S3M or ZIP to begin.</div>
+    <section id="archive-picker" class="notice archive-picker" aria-labelledby="archive-picker-heading" hidden>
+        <div class="archive-picker-heading">
+            <div>
+                <p class="section-label">Archive contents</p>
+                <h2 id="archive-picker-heading">Choose an S3M</h2>
+            </div>
+            <span id="archive-picker-name"></span>
+        </div>
+        <label for="archive-entries">Modules in this ZIP</label>
+        <select id="archive-entries" size="5"></select>
+        <div class="archive-picker-actions">
+            <button id="archive-load" class="primary" type="button">Load selected</button>
+            <button id="archive-cancel" type="button">Cancel</button>
+        </div>
+    </section>
 
     <section class="load-panel" aria-labelledby="load-heading">
         <div>
-            <p class="section-label" id="load-heading">Load an S3M</p>
+            <p class="section-label" id="load-heading">Load an S3M or ZIP</p>
             <div class="load-actions">
                 <button class="primary" id="start-audio">Start audio</button>
                 <label class="button" for="file-picker">Choose file</label>
-                <input id="file-picker" type="file" accept=".s3m,audio/s3m" hidden>
+                <input id="file-picker" type="file" accept=".s3m,.zip,audio/s3m,application/zip" hidden>
                 <select id="fixture-picker" aria-label="Bundled fixture">
                     <option value="">Bundled fixture…</option>
                     <option>ARMANI.S3M</option>
@@ -40,12 +55,12 @@
                 <button id="load-fixture">Load fixture</button>
             </div>
             <form id="url-form" class="url-form">
-                <input id="url" type="url" inputmode="url" placeholder="https://example.com/song.s3m" aria-label="S3M URL">
+                <input id="url" type="url" inputmode="url" placeholder="https://example.com/pack.zip" aria-label="S3M or ZIP URL">
                 <button type="submit">Load URL</button>
             </form>
         </div>
         <div id="drop-zone" class="drop-zone" tabindex="0">
-            <strong>Drop .s3m here</strong>
+            <strong>Drop .s3m or .zip here</strong>
             <span>The live graph survives a bad file.</span>
         </div>
     </section>
