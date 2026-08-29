@@ -49,7 +49,7 @@ plan set, and `AGENTS.md`.
 
 | Milestone | Status | Master plan | Notes |
 |---|---|---|---|
-| M0 Foundations + WASM spike | **Not started** — next | [M0](engine/M0-master-plan.md) | 4 task files ready: [A1](engine/M0-task-A1-workspace-skeleton.md) workspace/CI, [A2](engine/M0-task-A2-core-types.md) core types, [A3](engine/M0-task-A3-minimal-mixer-and-determinism.md) mixer + determinism test, [A4](engine/M0-task-A4-audioworklet-spike.md) AudioWorklet sine wave. Exit: **sound from a browser tab** |
+| M0 Foundations + WASM spike | **In progress** | [M0](engine/M0-master-plan.md) | Landed: [A1](engine/complete/M0-task-A1-workspace-skeleton.md) workspace/CI, [A2](engine/complete/M0-task-A2-core-types.md) core types. In flight: [A3](engine/M0-task-A3-minimal-mixer-and-determinism.md) mixer + determinism test, [A4](engine/M0-task-A4-audioworklet-spike.md) AudioWorklet sine wave. Exit: **sound from a browser tab** |
 | M1 S3M in the browser | Not started | [M1](engine/M1-master-plan.md) | 7 task files ready, B1–B7. [B4](engine/M1-task-B4-s3m-effects.md) is the accuracy core and the largest single task. Exit: **a real `.s3m` plays in a browser** |
 | M2 MOD + MTM native, accuracy machinery | Not started | [M2](engine/M2-master-plan.md) | 8 task files ready, C1–C8. [C8](engine/M2-task-C8-dos-reference-harness.md) is **deferred** with an explicit trigger |
 | M3 Native surfaces | Not started | [M3](engine/M3-master-plan.md) | cpal host, CLI, offline renderer, telemetry split |
