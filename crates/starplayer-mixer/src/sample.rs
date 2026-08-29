@@ -19,31 +19,11 @@
 
 use alloc::vec::Vec;
 
-/// Frames appended to every sample's PCM so an interpolator can read past the end of the
-/// data, or past the loop point, without a branch in the inner loop (architecture §6).
-///
-/// # Why eight (task A3, research point 2)
-///
-/// The count has to satisfy the widest kernel that can ever be selected at run time, not
-/// the widest one implemented today, because it is baked into the sample data by the
-/// loader and changing it later is a format-wide change:
-///
-/// | Kernel | Frames read at or after `index` | Guard frames needed |
-/// |---|---|---|
-/// | [`Nearest`](starplayer_dsp::Nearest) | `index` | 0 |
-/// | [`Linear`](starplayer_dsp::Linear) | `index + 1` | 1 |
-/// | Cubic Hermite, 4-tap (M7) | `index + 2` | 2 |
-/// | Windowed sinc, 8-tap (M7) | `index + 4` | 4 |
-///
-/// Eight is the next power of two above that maximum. It leaves room for a 16-tap sinc
-/// (which would need 8) without another format-wide change, keeps each sample's data
-/// 16-byte-aligned in length terms, and costs 16 bytes per sample — nothing next to the
-/// sample itself.
-///
-/// The *leading* taps a symmetric kernel wants (`index - 3` for an 8-tap sinc) are a
-/// different problem with a different answer — a pre-roll before the sample start and
-/// before the loop start — and belong to M7 along with the kernels that need them.
-pub const GUARD_FRAMES: usize = 8;
+/// The guard-frame count, defined in `starplayer-core` because `starplayer-model`'s
+/// module builder has to fill the guard frames in and cannot depend on this crate.
+/// See [`starplayer_core::GUARD_FRAMES`] for why the count is eight and what the frames
+/// contain.
+pub use starplayer_core::GUARD_FRAMES;
 
 /// Enforced at compile time rather than in a test, so that adding a kernel which needs
 /// more guard frames than the samples carry cannot build at all.

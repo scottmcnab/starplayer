@@ -1,7 +1,9 @@
 //! Fixed-point arithmetic (Q0.16 / Q1.15 / Q32.32), the `Frame` / `Step` / `Note`
 //! newtypes, `Event` / `TimedEvent`, `VoiceParams` and its dirty bits, the `TempoModel`
 //! concept, the `FrameClock`, and the period and waveform tables. The `RowClock`
-//! (architecture §4) and the shared `Error` type arrive with the crates that need them.
+//! (architecture §4) arrives with the crate that needs it. The shared `Error` type
+//! ([`error`]) landed with M1-task-B1, when the module builder and the loaders became its
+//! first users.
 //!
 //! No IO and no side effects: everything here is pure arithmetic and plain data, so it
 //! compiles unchanged for the audio thread, a bare-metal target and WASM.
@@ -30,14 +32,17 @@
 extern crate alloc;
 
 pub mod clock;
+pub mod error;
 pub mod event;
 pub mod fixed;
 pub mod frame;
 pub mod note;
+pub mod sample;
 pub mod tables;
 pub mod tempo;
 
 pub use clock::FrameClock;
+pub use error::Error;
 pub use event::{
     ChannelId, Command, DirtyBits, Event, FilterParams, InstrumentId, Interpolator, SampleId,
     Target, TimedEvent, TriggerFlags, TriggerSpec, VoiceId, VoiceParam, VoiceParams,
@@ -45,5 +50,6 @@ pub use event::{
 pub use fixed::{I1F15, Q32_32, Step, U0F16};
 pub use frame::Frame;
 pub use note::{Note, Period};
+pub use sample::GUARD_FRAMES;
 pub use tables::{PERIOD_TABLE, ST3_C4_SPEED, ST3_FREQUENCY_NUMERATOR, ST3_PERIOD_SCALE};
 pub use tempo::{ExactFixedPoint, ItModern, St3Truncating, TempoModel, TempoModelId};
