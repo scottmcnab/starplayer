@@ -288,21 +288,9 @@ fn load_pattern<R: ModuleReader + ?Sized>(source: &Source<'_, R>, pattern_offset
     Ok(())
 }
 
-/// Trim a fixed-width field to the text it holds: everything before the first NUL, with
-/// trailing blanks removed.
-///
-/// Bytes are mapped to characters one for one (Latin-1), because a 1994 tracker's title
-/// field is a code page, not UTF-8, and mapping is the only conversion that cannot fail.
-/// Leading blanks are kept: several of the owner's sample names are centred captions.
-fn text(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
-    let trimmed = bytes.get(..end).unwrap_or(bytes);
-    let mut text: String = trimmed.iter().map(|byte| char::from(*byte)).collect();
-    while text.ends_with([' ', '\t', '\r', '\n']) {
-        text.pop();
-    }
-    text
-}
+/// A fixed-width text field, decoded as the code page Scream Tracker 3 displayed it in.
+/// See [`starplayer_model::decode_cp437`] for why that is CP437 rather than Latin-1.
+fn text(bytes: &[u8]) -> String { starplayer_model::decode_cp437(bytes) }
 
 /// Bounds-checked reads over a [`ModuleReader`], with the borrowing fast path taken
 /// wherever the source offers one.

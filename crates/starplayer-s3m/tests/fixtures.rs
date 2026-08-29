@@ -255,10 +255,10 @@ fn reflexs_first_sample_carries_its_loop_volume_and_c2spd() {
 }
 
 #[test]
-fn a_sample_name_with_a_high_byte_is_read_as_latin_one() {
+fn a_sample_name_with_a_high_byte_is_read_as_code_page_437() {
     let module = starplayer_s3m::load(PETRI).expect("PETRI.S3M loads");
     // `tclosedh.sam (no\xFFheader)` — the byte is 0xFF, not UTF-8.
-    assert_eq!(module.sample(SampleId(1)).expect("sample 1").name(), "tclosedh.sam (noÿheader)");
+    assert_eq!(module.sample(SampleId(1)).expect("sample 1").name(), "tclosedh.sam (no\u{a0}header)");
 }
 
 #[test]
