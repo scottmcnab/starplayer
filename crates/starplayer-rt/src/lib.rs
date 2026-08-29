@@ -1,5 +1,6 @@
-//! Real-time plumbing shared by every host: the SPSC ring, the garbage channel, and the
-//! `portable-atomic` shim used on targets that lack native compare-and-swap.
+//! Real-time plumbing shared by every host: the SPSC ring, the garbage channel, the
+//! telemetry snapshot channel, and the `portable-atomic` shim used on targets that lack
+//! native compare-and-swap.
 //!
 //! Everything here is wait-free on the audio side. No allocation, no locks and no panics
 //! may occur on a path reachable from `render()`.
@@ -49,6 +50,14 @@
 //!
 //! Its API is wrapped rather than re-exported: [`Producer`] and [`Consumer`] are the
 //! shapes the engine wants, and the dependency stays replaceable.
+//!
+//! # The telemetry snapshot channel
+//!
+//! [`snapshot`] builds on the same ring to publish one whole `Copy` payload per tick,
+//! which is the architecture §9(a) "triple buffer or seqlock" slot. A real triple buffer
+//! needs `UnsafeCell` for the same reason the ring does, and the one obvious dependency
+//! (`triple_buffer`) is `std`-only, so it is a bounded channel of whole snapshots
+//! instead — see that module for the full argument.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -56,9 +65,11 @@
 extern crate alloc;
 
 pub mod garbage;
+pub mod snapshot;
 pub mod spsc;
 
 pub use garbage::{GarbageChannel, GarbageCollector, garbage_channel};
+pub use snapshot::{DEFAULT_SNAPSHOT_DEPTH, SnapshotPublisher, SnapshotReader, snapshot_channel};
 pub use spsc::{Consumer, Producer, channel};
 
 /// The workspace's one `Arc`.

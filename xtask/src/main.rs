@@ -37,6 +37,15 @@ const NO_STD_CRATES: &[&str] = &[
     "starplayer",
 ];
 
+/// Optional features that pull in a whole extra crate and therefore need their own
+/// bare-metal check: the loop above only ever compiles the *minimal* configuration, so a
+/// dependency reachable only through a feature would never be built for the bare-metal
+/// target at all.
+///
+/// `starplayer-engine/telemetry` is the first of these — it turns on the optional
+/// `starplayer-telemetry` edge (architecture §11, M1-B6).
+const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry")];
+
 const JOBS: &[&str] = &["host-tests", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
 
 fn main() -> ExitCode {
@@ -146,8 +155,17 @@ fn parse_job_argument(arguments: &[String]) -> Result<Option<&str>, String> {
 
 // ── jobs ────────────────────────────────────────────────────────────────────────────
 
+/// The workspace's tests, plus a second pass over `starplayer-engine` with `telemetry`
+/// on.
+///
+/// The second pass is not redundant: `crates/starplayer-engine/tests/telemetry.rs` is
+/// `#![cfg(feature = "telemetry")]` in its entirety, so the default-feature run compiles it
+/// to nothing. `telemetry` is not in any default feature set — it must not be, since the
+/// engine is embeddable without a UI — so without this line the whole of M1-B6's
+/// engine-side verification would silently never run.
 fn job_host_tests() -> bool {
     cargo(&["test", "--workspace"])
+        && cargo(&["test", "-p", "starplayer-engine", "--features", "telemetry"])
 }
 
 /// The web build has to keep working on every commit, both for the facade the app
@@ -177,6 +195,15 @@ fn job_no_std_check() -> bool {
             "-p", crate_name,
         ]);
         all_succeeded &= succeeded;
+    }
+    for (crate_name, feature) in FEATURE_ENABLED_NO_STD_CHECKS {
+        all_succeeded &= cargo(&[
+            "check",
+            "--target", BARE_METAL_TARGET,
+            "--no-default-features",
+            "--features", feature,
+            "-p", crate_name,
+        ]);
     }
     all_succeeded
 }

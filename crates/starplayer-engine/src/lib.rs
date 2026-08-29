@@ -40,8 +40,15 @@
 //! * [`demo`] — a four-byte toy tracker format, so all of the above is testable before any
 //!   loader exists.
 //!
-//! Not here yet: effect interpretation (B4), telemetry publishing (B6), instruments (M4),
-//! the DSP graph, and background voices (M6).
+//! # What M1 adds (task B6)
+//!
+//! * [`telemetry`] — behind `feature = "telemetry"`: the `_MActual*` snapshot discipline
+//!   ([`PatternSequencer::sounding_position`]), one coherent
+//!   [`Snapshot`](starplayer_telemetry::Snapshot) published per tracker tick, and
+//!   [`Engine::telemetry_reader`] as the UI's way in.
+//!
+//! Not here yet: effect interpretation (B4), instruments (M4), the DSP graph, and
+//! background voices (M6).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -57,6 +64,8 @@ pub mod engine;
 pub mod ring;
 pub mod sequencer;
 pub mod source;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 
 pub use channel::{Channel, ChannelTable};
 pub use command::{

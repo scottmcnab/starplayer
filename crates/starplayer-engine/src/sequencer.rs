@@ -34,7 +34,7 @@
 //! *decoding* is not here either: the sequencer hands the processor the row's packed bytes
 //! in the format's own encoding and never looks inside them.
 
-use starplayer_core::{Frame, FrameClock, RowAdvance, RowClock, TempoModel};
+use starplayer_core::{ChannelId, Frame, FrameClock, Note, RowAdvance, RowClock, TempoModel, U0F16};
 use starplayer_mixer::VoicePool;
 
 use crate::channel::ChannelTable;
@@ -199,6 +199,14 @@ pub struct TickOutcome {
 ///
 /// Everything a tick may write to, and nothing else — in particular not the output buffer:
 /// a processor says *what happens*, never *what it sounds like*.
+///
+/// # Telling the UI what happened
+///
+/// The `report_*` methods are the modern spelling of `ChannelData._CMDVal` / `_CMDData`,
+/// the fields the original marked "for host program" (architecture §9,
+/// `plans/reference/original-star-ui.md` §2.3). They are **no-ops unless the `telemetry`
+/// feature is on**, and the feature is deliberately invisible in their signatures: a
+/// format's effect processor calls them unconditionally and never grows a `cfg`.
 pub struct TickContext<'engine> {
     /// The absolute output frame this tick lands on.
     pub frame: Frame,
@@ -214,9 +222,37 @@ pub struct TickContext<'engine> {
     pub position: SongPosition,
     /// The tempo in effect as the tick begins.
     pub tempo_bpm: u16,
+    /// Where the tick describes itself for the UI. Reached through the `report_*` methods
+    /// rather than directly, so that a format crate never mentions the feature.
+    #[cfg(feature = "telemetry")]
+    telemetry: Option<&'engine mut starplayer_telemetry::TelemetryPublisher>,
 }
 
-impl TickContext<'_> {
+impl<'engine> TickContext<'engine> {
+    /// A tick context with no telemetry attached.
+    ///
+    /// The sequencer builds its own; this exists so a format crate's tests can drive a
+    /// processor without one, under either feature set.
+    pub fn new(
+        frame: Frame,
+        voices: &'engine mut VoicePool,
+        channels: &'engine mut ChannelTable,
+        row_clock: RowClock,
+        position: SongPosition,
+        tempo_bpm: u16,
+    ) -> TickContext<'engine> {
+        TickContext {
+            frame,
+            voices,
+            channels,
+            row_clock,
+            position,
+            tempo_bpm,
+            #[cfg(feature = "telemetry")]
+            telemetry: None,
+        }
+    }
+
     /// The outcome of a tick that changed nothing about the timing.
     ///
     /// **Start every tick from this.** It carries forward the tempo, speed and pattern
@@ -230,6 +266,48 @@ impl TickContext<'_> {
             jump: None,
             stop: false,
         }
+    }
+
+    /// Report the row's effect column for `channel` — the raw command code and parameter
+    /// plus the English name from the format's own
+    /// [`EffectNames`](starplayer_model::EffectNames) table.
+    ///
+    /// A no-op unless the `telemetry` feature is on. The name is resolved by the format
+    /// crate because the same letter means different things in different formats and
+    /// `starplayer-telemetry` may not depend on `starplayer-model`.
+    pub fn report_effect(&mut self, channel: ChannelId, code: u8, param: u8, name: &'static str) {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = self.telemetry.as_deref_mut() {
+            telemetry.report_effect(channel, starplayer_telemetry::EffectDisplay { code, param, name });
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = (channel, code, param, name);
+    }
+
+    /// Report the row's note and instrument columns for `channel`, overriding what the
+    /// sounding voice says.
+    ///
+    /// Only needed where the two differ — a note parsed but delayed by `SDx`, or a
+    /// portamento target the voice has not reached. A no-op unless the `telemetry` feature
+    /// is on. `None` leaves the previous value alone.
+    pub fn report_note(&mut self, channel: ChannelId, note: Option<Note>, instrument: Option<u8>) {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = self.telemetry.as_deref_mut() {
+            telemetry.report_note(channel, note, instrument);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = (channel, note, instrument);
+    }
+
+    /// Report the module's global volume (`Vxx`). A no-op unless the `telemetry` feature
+    /// is on.
+    pub fn report_global_volume(&mut self, global_volume: U0F16) {
+        #[cfg(feature = "telemetry")]
+        if let Some(telemetry) = self.telemetry.as_deref_mut() {
+            telemetry.set_global_volume(global_volume);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        let _ = global_volume;
     }
 }
 
@@ -331,6 +409,11 @@ pub struct PatternSequencer<Tempo: TempoModel, Processor: TrackerProcessor, Data
     restart_order: u16,
     pending_jump: Option<Jump>,
     song_looped: bool,
+    /// The `_MActual*` snapshot: the position latched at the top of the row that is
+    /// currently *sounding*. See [`PatternSequencer::sounding_position`].
+    sounding_position: SongPosition,
+    /// The `_MActualTick` half of the same snapshot: the tick within that row.
+    sounding_tick: u16,
 }
 
 impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternSequencer<Tempo, Processor, Data> {
@@ -351,6 +434,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             restart_order: settings.restart_order,
             pending_jump: None,
             song_looped: false,
+            sounding_position: SongPosition::default(),
+            sounding_tick: 0,
         };
         if !sequencer.move_to_order(settings.restart_order, 0) {
             sequencer.state = SequencerState::Stopped;
@@ -360,7 +445,25 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     }
 
     /// Where in the song the *next* tick will be.
+    ///
+    /// This is the live cursor — the original's `_MCurrentRow` / `_MCurrentPos` /
+    /// `_MCurrentPatt`. Between the last tick of a row and the first tick of the next it
+    /// has already moved on, so **a display must not render this**; render
+    /// [`PatternSequencer::sounding_position`] instead.
     pub const fn position(&self) -> SongPosition { self.position }
+
+    /// Where in the song the row that is currently **sounding** is.
+    ///
+    /// The original's `_MActualRow` / `_MActualPos` / `_MActualPatt`, latched at the top of
+    /// each row precisely so the display shows the row being heard rather than the one
+    /// being parsed (`plans/reference/original-star-ui.md` §2.1,
+    /// `original-s3mlib-analysis.md` §2). It is the difference between a display that looks
+    /// right and one that runs a row ahead, and it is what B6's telemetry publishes.
+    pub const fn sounding_position(&self) -> SongPosition { self.sounding_position }
+
+    /// The tick within the sounding row — `_MActualTick`, counting **up** from 0 and
+    /// absolute across pattern-delay repeats, like [`RowClock::tick_in_row`].
+    pub const fn sounding_tick(&self) -> u16 { self.sounding_tick }
 
     /// The current row's tick budget and absolute tick index.
     pub const fn row_clock(&self) -> RowClock { self.row_clock }
@@ -427,6 +530,21 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// The only caller is [`EventSource::dispatch`]; it is separate so that the boundary
     /// computation in [`PatternSequencer::commit`] cannot be interleaved with it.
     fn run_tick(&mut self, frame: Frame, context: &mut EngineContext<'_>) -> TickOutcome {
+        // The `_MActual*` latch. The live cursor does not move within a row, so latching
+        // here rather than reading `self.position` matters only between the end of one
+        // row's last tick and the start of the next row's first — which is exactly the
+        // window a UI polls in, and exactly where an unlatched display runs a row ahead.
+        if self.row_clock.is_first_tick_of_row() {
+            self.sounding_position = self.position;
+            #[cfg(feature = "telemetry")]
+            if let Some(telemetry) = context.telemetry.as_deref_mut() {
+                // `_CMDVal` / `_CMDData` are re-read per row, so a row whose channel has no
+                // effect shows none rather than the previous row's.
+                telemetry.clear_effects();
+            }
+        }
+        self.sounding_tick = self.row_clock.tick_in_row;
+
         let mut tick = TickContext {
             frame,
             voices: &mut *context.voices,
@@ -434,6 +552,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             row_clock: self.row_clock,
             position: self.position,
             tempo_bpm: self.tempo_bpm,
+            #[cfg(feature = "telemetry")]
+            telemetry: context.telemetry.as_deref_mut(),
         };
 
         if !self.row_clock.is_first_tick_of_row() {
@@ -578,6 +698,25 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         let rows = self.data.rows_in_pattern(pattern).unwrap_or(1).max(1);
         if row >= rows { 0 } else { row }
     }
+
+    /// Publish one coherent snapshot — **once per tick**, at the end of dispatch.
+    ///
+    /// Everything in it is from this tick: the `_MActual*` position latched at the top of
+    /// the sounding row, the speed and tempo the tick left in effect, and the channel and
+    /// voice state as it stands before anything is mixed. Any effect the processor reported
+    /// during the tick is already in the working snapshot.
+    ///
+    /// Allocation-free: the publisher owns its snapshot inline and the ring was allocated
+    /// when the engine was built.
+    #[cfg(feature = "telemetry")]
+    fn publish_telemetry(&mut self, context: &mut EngineContext<'_>) {
+        let Some(telemetry) = context.telemetry.as_deref_mut() else { return };
+        let sounding = self.sounding_position;
+        telemetry.set_position(sounding.order, sounding.pattern, sounding.row, self.sounding_tick);
+        telemetry.set_timing(self.row_clock.speed, self.tempo_bpm);
+        crate::telemetry::capture_channels(telemetry, context.channels, context.voices);
+        telemetry.publish();
+    }
 }
 
 impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> EventSource for PatternSequencer<Tempo, Processor, Data> {
@@ -606,6 +745,9 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> EventSou
 
         let outcome = self.run_tick(frame, context);
         self.commit(outcome);
+
+        #[cfg(feature = "telemetry")]
+        self.publish_telemetry(context);
     }
 }
 
@@ -646,12 +788,7 @@ mod tests {
         /// Run the next tick and report the frame it landed on.
         fn tick(&mut self, sequencer: &mut TestSequencer) -> Option<Frame> {
             let frame = sequencer.next_event_frame()?;
-            let mut context = EngineContext {
-                frame,
-                voices: &mut self.voices,
-                channels: &mut self.channels,
-                control: &mut self.control,
-            };
+            let mut context = EngineContext::new(frame, &mut self.voices, &mut self.channels, &mut self.control);
             sequencer.dispatch(frame, &mut context);
             Some(frame)
         }

@@ -182,6 +182,13 @@ where
     master_volume: U0F16,
     limiter: Limiter,
     warnings: EngineWarnings,
+    /// The audio thread's half of the telemetry channel (architecture §9). Written once
+    /// per tracker tick from inside the sequencer's dispatch.
+    #[cfg(feature = "telemetry")]
+    telemetry: starplayer_telemetry::TelemetryPublisher,
+    /// The UI's half, held until [`Engine::telemetry_reader`] claims it.
+    #[cfg(feature = "telemetry")]
+    telemetry_reader: Option<starplayer_telemetry::TelemetryReader>,
     interpolator: core::marker::PhantomData<Interp>,
 }
 
@@ -205,6 +212,8 @@ where
     pub fn with_settings(settings: EngineSettings) -> Engine<Path, Interp, Out, Module> {
         let (command_producer, command_consumer) = starplayer_rt::channel(settings.command_capacity);
         let (garbage, collector) = garbage_channel(settings.garbage_capacity);
+        #[cfg(feature = "telemetry")]
+        let (telemetry, telemetry_reader) = starplayer_telemetry::telemetry_channel();
 
         Engine {
             voices: VoicePool::new(settings.voice_capacity),
@@ -224,8 +233,27 @@ where
             master_volume: U0F16::MAX,
             limiter: Limiter::SoftKnee,
             warnings: EngineWarnings::default(),
+            #[cfg(feature = "telemetry")]
+            telemetry,
+            #[cfg(feature = "telemetry")]
+            telemetry_reader: Some(telemetry_reader),
             interpolator: core::marker::PhantomData,
         }
+    }
+
+    /// Claim the telemetry reader, once (architecture §9).
+    ///
+    /// Held by the engine until taken, for the same reason as
+    /// [`Engine::take_control`]: it keeps [`Engine::new`] infallible, and a host that never
+    /// draws anything never has to think about it. A host that *does* must take it
+    /// **before** the engine goes to the audio thread — the reader is the only way back
+    /// out, and there is exactly one of it.
+    ///
+    /// The snapshot it hands out is published once per tracker tick from the sequencer's
+    /// dispatch; see [`crate::telemetry`].
+    #[cfg(feature = "telemetry")]
+    pub fn telemetry_reader(&mut self) -> Option<starplayer_telemetry::TelemetryReader> {
+        self.telemetry_reader.take()
     }
 
     /// Claim the control-side handle, once.
@@ -477,12 +505,15 @@ where
             }
 
             if source_due {
-                let mut context = EngineContext {
-                    frame: self.source_frame,
-                    voices: &mut self.voices,
-                    channels: &mut self.channels,
-                    control: &mut self.control,
-                };
+                // Mirrored before the dispatch rather than after, because the dispatch is
+                // what publishes. A flag raised *by* this tick therefore appears in the
+                // next tick's snapshot; the flags are sticky, so nothing is lost.
+                #[cfg(feature = "telemetry")]
+                self.telemetry.set_warnings(self.warnings.into());
+
+                let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+                #[cfg(feature = "telemetry")]
+                context.set_telemetry(&mut self.telemetry);
                 self.sources.dispatch(self.source_frame, &mut context);
             }
             // Re-read rather than reusing `control_due`: the dispatch above may have taken

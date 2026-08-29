@@ -182,6 +182,7 @@ dependencies = [
  "starplayer-mixer",
  "starplayer-model",
  "starplayer-rt",
+ "starplayer-telemetry",
 ]
 
 [[package]]

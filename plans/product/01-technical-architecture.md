@@ -605,6 +605,41 @@ This is a **first-class API**, not a debug hook. It is what the web UI, the TUI 
 future tracker editor render from. The original's `ChannelData` deliberately carried
 `_CMDVal`, `_CMDData`, `_VUBarLevel` and `_ActiveFlag` "for host program" — same idea.
 
+### 9.1 What publishes (a), and why it is not a triple buffer (M1-B6)
+
+A real triple buffer is not implementable under `#![forbid(unsafe_code)]`, for the same
+reason §8.1 gives for the SPSC ring: its writer holds `&mut` to one slot while the reader
+holds `&` to another, disjoint by an invariant living in an index atomic that the borrow
+checker cannot see, so the slots must be `UnsafeCell`. The escape used for the ring — take
+an audited dependency — has no equivalent here: `triple_buffer` is `std`-only (§11.2
+already flags it), so it cannot serve the bare-metal target CI checks on every commit.
+`ringbuf`'s own `push_overwrite` needs `&mut Rb`, not the producer half, and its docs say
+so explicitly.
+
+So (a) is published through **`starplayer_rt::snapshot`: a bounded SPSC channel of whole
+snapshots**, three deep — the same three copies a triple buffer would have allocated. A
+snapshot is moved into the ring in one piece and out in one piece, so it is atomic by
+construction and no reader can observe a torn one. The writer never blocks: a publish that
+finds the ring full is *dropped* and counted (`Snapshot::publishes_dropped`, plus a gap in
+`Snapshot::sequence`), which a reader three ticks behind was never going to draw anyway.
+It also needs strictly less than a triple buffer would — an SPSC ring only loads and stores
+its two index atomics, so unlike `AtomicUsize::swap` there is no compare-and-swap anywhere
+on this path and `riscv32imc` does not reach for `portable-atomic/critical-section` to
+publish telemetry.
+
+`Snapshot` carries a **fixed 64 channels**, not a const generic: 64 is IT's pattern channel
+count and therefore the widest in scope, and a const generic would appear in the signature
+of every function in every UI that touches a snapshot to save a couple of kilobytes on a
+type that exists to be memcpy'd once per tick.
+
+Cadence is **once per tracker tick**, published from the sequencer's dispatch after the
+tick's outcome is committed. That is the `_MActual*` cadence the original used, and it is
+the only rate at which every number in the snapshot is from the same moment. Per render
+quantum would republish an unchanged snapshot six times a tick; per host block would make
+the telemetry rate depend on the host's buffer size.
+
+M3 revisits the primitive when the scope rings of (b) arrive.
+
 ### Q1 resolution (M0-A4)
 
 **`SharedArrayBuffer` is the default; `postMessage` is a real fallback, not a second-class
@@ -727,7 +762,8 @@ crates/
                         InstrumentDef, display-only PatternCell.  → core
   starplayer-engine     render loop, EventSource, Instrument, channel binding,
                         RENDER_QUANTUM adapter, command queue,
-                        telemetry publisher.        → core, rt, dsp, mixer, model
+                        telemetry publisher.        → core, rt, dsp, mixer, model,
+                                                      telemetry (feature `telemetry`)
   starplayer-mod        MOD loader + ProTracker effect processor  ┐
   starplayer-s3m        S3M loader + ST3 effect processor         │ each → engine, model
   starplayer-mtm        MTM loader + effect processor             │
@@ -747,6 +783,21 @@ apps/
   starplayer-tui        STAR.EXE homage (ratatui)
 xtask/                  build orchestration, wasm packaging, golden regeneration
 ```
+
+The `starplayer-engine` → `starplayer-telemetry` edge is **optional**, behind the engine's
+`telemetry` feature, and it runs that way round deliberately (M1-B6). Only the engine can
+fill a snapshot in coherently — transport position, channel table and voice pool all have
+to be read at one instant — so the engine owns the publisher and the format crates decorate
+it through `TickContext::report_effect` / `report_note`, which compile to nothing when the
+feature is off. The alternative, a `TelemetrySink` trait declared in the engine and
+implemented in `starplayer-telemetry`, would put a `dyn` call on the tick path and split
+the snapshot types across two crates for every UI to reassemble.
+
+Note what `starplayer-telemetry` therefore still cannot see: `starplayer-model`, and so the
+`EffectNames` table of English effect names that lives there beside the display-only
+`PatternCell`. It is not duplicated. `EffectDisplay` carries the raw code, the parameter and
+a `&'static str`, and the format crate — the only code that knew what the bytes meant —
+resolves the name.
 
 **Loader and effect processor live in the same crate per format**, because file
 semantics and effect semantics are inseparable — one crate, one feature flag, one
@@ -777,7 +828,8 @@ midi = []; smf = []
 ### 11.2 Candidate dependencies
 
 `fixed`, `bytemuck`, `heapless`, `bitflags`, `portable-atomic`, `critical-section`;
-`rtrb` / `triple_buffer` (std hosts only); `midly` (no_std-capable SMF); `cpal`,
+`rtrb` / `triple_buffer` (std hosts only — and therefore **rejected** for the telemetry
+snapshot, see §9.1); `midly` (no_std-capable SMF); `cpal`,
 `midir`, `wasm-bindgen`, `ratatui`; `clack` / `nih-plug` later.
 Test-only: `libopenmpt` / `libxmp` bindings, `cargo-fuzz`, `assert_no_alloc`.
 

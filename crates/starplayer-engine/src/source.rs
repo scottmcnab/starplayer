@@ -42,7 +42,14 @@ use crate::control::ControlClock;
 /// free, while a dyn call per parameter write would not be.
 ///
 /// It deliberately does **not** widen to the output buffer: a source says *what* happens,
-/// never *what it sounds like*. The telemetry publisher joins it in B6.
+/// never *what it sounds like*. The telemetry publisher joined it in B6, and is the one
+/// exception: it is write-only, and a source may only *describe* itself through it.
+///
+/// # Build one with [`EngineContext::new`]
+///
+/// The telemetry field only exists under `feature = "telemetry"`, so a struct literal
+/// would compile under one feature set and not the other. [`EngineContext::new`] compiles
+/// under both and is the only supported way to make one.
 pub struct EngineContext<'engine> {
     /// The frame being dispatched. Equal to the engine's source clock.
     pub frame: Frame,
@@ -53,12 +60,47 @@ pub struct EngineContext<'engine> {
     /// The clock envelopes advance on. A tracker sequencer takes it over by calling
     /// [`ControlClock::tick_from_tracker`] (architecture §5.4).
     pub control: &'engine mut ControlClock,
+    /// Where a source describes itself for the UI, when the host asked for telemetry
+    /// (architecture §9). `None` means nobody is watching and every report is a no-op.
+    #[cfg(feature = "telemetry")]
+    pub telemetry: Option<&'engine mut starplayer_telemetry::TelemetryPublisher>,
 }
 
-impl EngineContext<'_> {
+impl<'engine> EngineContext<'engine> {
+    /// A context with no telemetry attached.
+    pub fn new(
+        frame: Frame,
+        voices: &'engine mut VoicePool,
+        channels: &'engine mut ChannelTable,
+        control: &'engine mut ControlClock,
+    ) -> EngineContext<'engine> {
+        EngineContext {
+            frame,
+            voices,
+            channels,
+            control,
+            #[cfg(feature = "telemetry")]
+            telemetry: None,
+        }
+    }
+
+    /// Attach a telemetry publisher, so everything dispatched through this context
+    /// describes itself for the UI.
+    #[cfg(feature = "telemetry")]
+    pub fn set_telemetry(&mut self, telemetry: &'engine mut starplayer_telemetry::TelemetryPublisher) {
+        self.telemetry = Some(telemetry);
+    }
+
     /// Reborrow, so a source can hand a shorter-lived context to something it owns.
     pub fn reborrow(&mut self) -> EngineContext<'_> {
-        EngineContext { frame: self.frame, voices: self.voices, channels: self.channels, control: self.control }
+        EngineContext {
+            frame: self.frame,
+            voices: self.voices,
+            channels: self.channels,
+            control: self.control,
+            #[cfg(feature = "telemetry")]
+            telemetry: self.telemetry.as_deref_mut(),
+        }
     }
 }
 
@@ -357,7 +399,7 @@ mod tests {
             if frame > until {
                 break;
             }
-            let mut context = EngineContext { frame, voices: &mut voices, channels: &mut channels, control: &mut control };
+            let mut context = EngineContext::new(frame, &mut voices, &mut channels, &mut control);
             mux.dispatch(frame, &mut context);
             mux.advance_to(frame);
         }
