@@ -123,10 +123,15 @@ class Page {
             '--no-sandbox',
             '--disable-gpu',
             '--disable-dev-shm-usage',
-            // Headless Chromium has no speaker, but the AudioWorklet still renders in
-            // real time against a null sink. Without this the context stays suspended
-            // because a synthetic click is not a user gesture.
+            // The AudioWorklet renders in real time whether or not anything listens.
+            // Without this the context stays suspended, because a synthetic click is
+            // not a user gesture.
             '--autoplay-policy=no-user-gesture-required',
+            // `--headless=new` is a full browser and DOES open the system audio device:
+            // under WSLg that is PulseAudio forwarded to the Windows speakers, and the
+            // owner heard the test corpus playing from a closed tab. Mute the output
+            // (the worklet still renders and the telemetry still moves).
+            '--mute-audio',
             '--user-data-dir=' + join(process.env.TMPDIR ?? '/tmp', `starplayer-cdp-${port}`),
             'about:blank',
         ], { stdio: ['ignore', 'ignore', 'ignore'] });
