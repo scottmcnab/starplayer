@@ -2,3 +2,5 @@
 /pkg
 /dist
 /node_modules
+# Self-signed certificate for `dev-server.mjs --tls`.
+/.dev-tls

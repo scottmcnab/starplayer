@@ -79,7 +79,8 @@ fn print_usage() {
     println!("  goldens            regenerate golden renders (not implemented)");
     println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
     println!("  serve [--port N] [--host ADDR]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
-    println!("                     --host 0.0.0.0 exposes it to the LAN (plain http there is not a secure context: postMessage fallback)");
+    println!("                     --host 0.0.0.0 exposes it to the LAN; add --tls [--tls-san ip,ip] there, since AudioWorklet");
+    println!("                     and SharedArrayBuffer only exist in a secure context (https or localhost)");
     println!();
     println!("ci jobs:");
     for job in JOBS {
@@ -527,7 +528,7 @@ fn run_wasm(arguments: &[String]) -> bool {
     println!();
     println!("xtask wasm: packaged into {}", output_directory.display());
     if serve_afterwards {
-        return serve(&root, port, DEFAULT_SERVE_HOST);
+        return serve(&root, port, DEFAULT_SERVE_HOST, None);
     }
     println!("     run `cargo xtask serve` and open http://localhost:{DEFAULT_SERVE_PORT}/");
     true
@@ -736,9 +737,22 @@ fn report_output(output_directory: &Path) -> bool {
 fn run_serve(arguments: &[String]) -> bool {
     let mut port = DEFAULT_SERVE_PORT;
     let mut host = DEFAULT_SERVE_HOST.to_string();
+    let mut tls_subject_alt_names: Option<String> = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--tls" => {
+                tls_subject_alt_names.get_or_insert_with(String::new);
+                index += 1;
+            }
+            "--tls-san" => {
+                let Some(value) = arguments.get(index + 1) else {
+                    eprintln!("xtask serve: `--tls-san` needs a comma-separated list");
+                    return false;
+                };
+                tls_subject_alt_names = Some(value.clone());
+                index += 2;
+            }
             "--host" => {
                 let Some(value) = arguments.get(index + 1) else {
                     eprintln!("xtask serve: `--host` needs a value");
@@ -765,10 +779,12 @@ fn run_serve(arguments: &[String]) -> bool {
             }
         }
     }
-    serve(&workspace_root(), port, &host)
+    serve(&workspace_root(), port, &host, tls_subject_alt_names.as_deref())
 }
 
-fn serve(root: &Path, port: u16, host: &str) -> bool {
+/// `tls_subject_alt_names`: `None` for plain http; `Some(list)` for https with a self-signed
+/// certificate whose subjectAltName carries the comma-separated `list` (may be empty).
+fn serve(root: &Path, port: u16, host: &str, tls_subject_alt_names: Option<&str>) -> bool {
     let output_directory = root.join(WEB_OUTPUT_DIRECTORY);
     if !output_directory.join("index.html").exists() {
         eprintln!("xtask serve: `{}` is not packaged yet — run `cargo xtask wasm` first", output_directory.display());
@@ -776,12 +792,16 @@ fn serve(root: &Path, port: u16, host: &str) -> bool {
     }
 
     let script = root.join(DEV_SERVER_SCRIPT);
-    println!("     node {} --port {port} --host {host}", script.display());
-    match Command::new("node")
-        .arg(&script)
-        .args(["--port", &port.to_string(), "--host", host, "--root"])
-        .arg(&output_directory)
-        .status()
+    let mut node = Command::new("node");
+    node.arg(&script).args(["--port", &port.to_string(), "--host", host, "--root"]).arg(&output_directory);
+    if let Some(subject_alt_names) = tls_subject_alt_names {
+        node.arg("--tls");
+        if !subject_alt_names.is_empty() {
+            node.args(["--tls-san", subject_alt_names]);
+        }
+    }
+    println!("     node {} --port {port} --host {host}{}", script.display(), if tls_subject_alt_names.is_some() { " --tls" } else { "" });
+    match node.status()
     {
         Ok(status) if status.success() => true,
         Ok(status) => {

@@ -93,6 +93,12 @@ async function startAudio() {
         }
         const wasmBytes = await response.arrayBuffer();
         const wasmModule = await WebAssembly.compile(wasmBytes);
+        if (!state.context.audioWorklet) {
+            // `AudioContext.audioWorklet` only exists in a secure context: https, or
+            // http://localhost. A plain-http LAN address gets neither it nor
+            // SharedArrayBuffer, so say so instead of "cannot read addModule".
+            throw new Error('AudioWorklet is unavailable here: the player must be served over https or from localhost (a secure context).');
+        }
         await state.context.audioWorklet.addModule(WORKLET_URL);
         await unlock;
 
