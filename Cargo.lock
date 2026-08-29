@@ -266,6 +266,7 @@ dependencies = [
 name = "starplayer-s3m"
 version = "0.1.0"
 dependencies = [
+ "starplayer-core",
  "starplayer-engine",
  "starplayer-model",
 ]
