@@ -13,5 +13,7 @@
 extern crate alloc;
 
 pub mod interpolate;
+pub mod ramp;
 
 pub use interpolate::{Interpolate, Linear, Nearest};
+pub use ramp::GainRamp;

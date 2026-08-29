@@ -4,10 +4,11 @@ use alloc::vec;
 use alloc::boxed::Box;
 
 use starplayer_core::{DirtyBits, VoiceId, VoiceParams};
-use starplayer_dsp::Interpolate;
+use starplayer_dsp::{GainRamp, Interpolate};
 
+use crate::gain::{RAMP_FRAMES, voice_gain_units};
 use crate::kernel::{VoiceStatus, accumulate_voice};
-use crate::path::MixPath;
+use crate::path::{MixPath, Stereo};
 use crate::sample::SampleRegion;
 
 /// What a voice is playing, for the benefit of code that has to *find* voices rather than
@@ -30,6 +31,15 @@ pub struct VoiceTag {
 }
 
 /// One sounding sample.
+///
+/// # The ramp state lives here
+///
+/// A voice carries its own left/right [`GainRamp`] pair rather than the mixer keeping a
+/// side table, because the ramp is part of what the voice *is*: it survives being split
+/// across render segments, it is what makes a stop a fade rather than a cut, and it has to
+/// travel with the voice when the pool hands it out. Both ramps advance one step per
+/// output frame and know nothing about block boundaries, which is what keeps a ramped
+/// render byte-identical at every host buffer size.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Voice {
     /// Pitch, volume, pan, filter and the dirty bits. Written directly by whoever owns
@@ -40,12 +50,105 @@ pub struct Voice {
     region: SampleRegion,
     /// Q32.32 playback position within the sample, sample-relative.
     position: u64,
+    /// Left/right gain, in the units of [`voice_gain_units`], mid-ramp.
+    gains: Stereo<GainRamp>,
+    /// Whether a ping-pong loop is currently travelling backwards.
+    reverse: bool,
+    /// Whether the voice is fading out towards release.
+    stopping: bool,
 }
 
 impl Voice {
     /// A voice playing `region` from `offset_frames`, with `params`.
+    ///
+    /// The gain **ramps up from silence** over [`RAMP_FRAMES`] rather than starting at
+    /// full volume. Most samples start near zero and would not click either way, but the
+    /// ones that do not — a looped waveform captured mid-cycle, which is most of a
+    /// chiptune's instruments — click on every single note otherwise. This is the modern
+    /// equivalent of what the GUS driver got from hardware: `_GIRQStartVoice` programmed
+    /// the volume and *then* started the voice, one ramp behind the note
+    /// (`plans/reference/original-s3mlib-analysis.md` §7).
     pub fn new(tag: VoiceTag, region: SampleRegion, params: VoiceParams, offset_frames: u32) -> Voice {
-        Voice { params, tag, region, position: (offset_frames as u64) << 32 }
+        let mut voice = Voice {
+            params,
+            tag,
+            region,
+            position: (offset_frames as u64) << 32,
+            gains: Stereo::new(GainRamp::steady(0), GainRamp::steady(0)),
+            reverse: false,
+            stopping: false,
+        };
+        voice.params.dirty.remove(DirtyBits::STOP);
+        voice.glide_to_params();
+        voice
+    }
+
+    /// Skip the attack ramp and start at full gain.
+    ///
+    /// For a caller that knows its sample starts at zero and wants the attack unaltered —
+    /// and for tests that would rather assert on a steady gain than on a ramp.
+    pub fn settle_gains(&mut self) {
+        let units = voice_gain_units(self.params.volume, self.params.pan);
+        self.gains.left.jump_to(units.left);
+        self.gains.right.jump_to(units.right);
+    }
+
+    /// The gain both channels are currently mixing at, in [`voice_gain_units`] units.
+    pub const fn current_gain_units(&self) -> Stereo<i32> {
+        Stereo::new(self.gains.left.current(), self.gains.right.current())
+    }
+
+    /// Whether either channel's gain is still moving.
+    pub const fn is_ramping(&self) -> bool { self.gains.left.is_ramping() || self.gains.right.is_ramping() }
+
+    /// Whether a ping-pong loop is currently travelling backwards.
+    pub const fn is_reversed(&self) -> bool { self.reverse }
+
+    /// Set the ping-pong direction. The kernel's other write-back.
+    pub const fn set_reversed(&mut self, reverse: bool) { self.reverse = reverse; }
+
+    /// Frames of gain ramp left to run, over both channels.
+    pub(crate) fn gain_ramp_frames_remaining(&self) -> u32 {
+        self.gains.left.frames_remaining().max(self.gains.right.frames_remaining())
+    }
+
+    /// The ramps themselves, for the render kernel to advance.
+    pub(crate) fn gains_mut(&mut self) -> &mut Stereo<GainRamp> { &mut self.gains }
+
+    /// Whether a stopped voice has finished fading and may be released.
+    pub(crate) fn finished_ramping_out(&self) -> bool { self.stopping && !self.is_ramping() }
+
+    /// Consume the dirty bits and point the gain ramps at wherever they now have to go.
+    ///
+    /// `VOLUME` and `PAN` both retarget one composite gain, so a pan slide and a volume
+    /// slide landing on the same frame produce one movement rather than two. `SAMPLE` does
+    /// **not** retarget anything: a retrigger changes the waveform, not the gain, and
+    /// smoothing the waveform discontinuity a retrigger creates means deferring the restart
+    /// behind a fade — which is what the GUS driver did in its ramp-end IRQ, and which
+    /// belongs to whoever owns the channel, not to the mixer.
+    ///
+    /// Returns [`VoiceStatus::Finished`] for a stopped voice that has nothing left to fade.
+    pub(crate) fn retarget_gains(&mut self) -> VoiceStatus {
+        if self.params.dirty.contains(DirtyBits::STOP) {
+            self.stopping = true;
+        }
+        if self.stopping {
+            self.gains.left.glide_to(0, RAMP_FRAMES);
+            self.gains.right.glide_to(0, RAMP_FRAMES);
+        } else if self.params.dirty.intersects(DirtyBits::VOLUME | DirtyBits::PAN) {
+            self.glide_to_params();
+        }
+        // Consumed, the way the original's `SB_ProcessTracks` ends with
+        // `mov [edi+_ChannelFlag],0` (`STARPLAY/S3MLIB.ASM` ~5828).
+        self.params.clear_dirty();
+
+        if self.finished_ramping_out() { VoiceStatus::Finished } else { VoiceStatus::Sounding }
+    }
+
+    fn glide_to_params(&mut self) {
+        let units = voice_gain_units(self.params.volume, self.params.pan);
+        self.gains.left.glide_to(units.left, RAMP_FRAMES);
+        self.gains.right.glide_to(units.right, RAMP_FRAMES);
     }
 
     /// Which sample this voice plays, and where it lives in the PCM blob.
@@ -67,13 +170,21 @@ impl Voice {
     /// Restart from `offset_frames` (`Oxx`, and every plain retrigger).
     pub fn retrigger(&mut self, offset_frames: u32) {
         self.position = (offset_frames as u64) << 32;
+        self.reverse = false;
         self.params.dirty.insert(DirtyBits::SAMPLE);
     }
 
     /// Whether the owner has asked this voice to stop — the original's `_CHN_StopVoice`.
-    pub const fn wants_stop(&self) -> bool { self.params.dirty.contains(DirtyBits::STOP) }
+    pub const fn wants_stop(&self) -> bool {
+        self.stopping || self.params.dirty.contains(DirtyBits::STOP)
+    }
 
-    /// Ask this voice to stop at the start of the next render segment.
+    /// Ask this voice to stop.
+    ///
+    /// The voice **fades** over [`RAMP_FRAMES`] and is released when the fade lands, rather
+    /// than being cut where it stands. A hard cut of a voice mid-waveform is a step
+    /// discontinuity — the loudest click a mixer can make — and every S3M `SCx` note cut,
+    /// every `Kxx`, and every note that steals a voice would produce one.
     pub fn stop(&mut self) { self.params.dirty.insert(DirtyBits::STOP); }
 }
 
@@ -246,6 +357,7 @@ mod tests {
     use starplayer_core::{Step, U0F16};
     use starplayer_dsp::Linear;
 
+    use crate::gain::RAMP_FRAMES;
     use crate::path::{FixedFrame, FixedPath};
     use crate::sample::{LoopSpan, append_guarded_sample};
 
@@ -313,16 +425,54 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_voice_is_released_without_rendering() {
-        let (blob, region) = one_shot_blob(64);
+    fn a_stopped_voice_fades_out_and_is_then_released() {
+        let (blob, region) = one_shot_blob(512);
         let mut pool = VoicePool::new(2);
         let voice = pool.allocate(VoiceTag::default(), region, sounding_params(), 0).expect("slot 0");
+        {
+            let voice = pool.get_mut(voice).expect("the voice is live");
+            voice.settle_gains();
+            voice.stop();
+        }
+
+        let mut destination = [FixedFrame::default(); RAMP_FRAMES as usize / 2];
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        assert_eq!(pool.voices_active(), 1, "half a ramp in, the voice is still fading");
+        let first = destination.first().map(|frame| frame.left).unwrap_or(0);
+        let last = destination.last().map(|frame| frame.left).unwrap_or(0);
+        assert!(first != 0 && last.abs() < first.abs(), "the fade got somewhere: {first} then {last}");
+
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        assert_eq!(pool.voices_active(), 0, "and the voice is released the moment the fade lands");
+        assert!(pool.get(voice).is_none(), "the handle went stale");
+    }
+
+    #[test]
+    fn stopping_a_silent_voice_releases_it_at_once() {
+        let (blob, region) = one_shot_blob(64);
+        let mut pool = VoicePool::new(2);
+        let voice = pool.allocate(VoiceTag::default(), region, VoiceParams::SILENT, 0).expect("slot 0");
         pool.get_mut(voice).expect("the voice is live").stop();
 
         let mut destination = [FixedFrame::default(); 4];
         pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
-        assert_eq!(pool.voices_active(), 0);
-        assert_eq!(destination, [FixedFrame::default(); 4], "a stopped voice contributes nothing");
+        assert_eq!(pool.voices_active(), 0, "there is nothing to fade");
+        assert_eq!(destination, [FixedFrame::default(); 4]);
+    }
+
+    /// The attack ramp is the other half of the anti-click story: a voice starts from
+    /// silence rather than jumping to full gain on its first frame.
+    #[test]
+    fn a_fresh_voice_ramps_up_from_silence() {
+        let (blob, region) = one_shot_blob(512);
+        let mut pool = VoicePool::new(1);
+        pool.allocate(VoiceTag::default(), region, sounding_params(), 0).expect("slot 0");
+
+        let mut destination = [FixedFrame::default(); RAMP_FRAMES as usize * 2];
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        let first = destination.first().map(|frame| frame.left).unwrap_or(0);
+        let settled = destination.last().map(|frame| frame.left).unwrap_or(0);
+        assert!(first.abs() * 8 < settled.abs(), "the first frame is a fraction of the settled gain: {first} then {settled}");
     }
 
     #[test]
