@@ -268,8 +268,11 @@ name = "starplayer-s3m"
 version = "0.1.0"
 dependencies = [
  "starplayer-core",
+ "starplayer-dsp",
  "starplayer-engine",
+ "starplayer-mixer",
  "starplayer-model",
+ "starplayer-rt",
 ]
 
 [[package]]

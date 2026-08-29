@@ -21,3 +21,7 @@ extern crate alloc;
 
 #[cfg(feature = "std")]
 extern crate std;
+
+/// Scream Tracker 3 loading, native pattern access and sequencer construction.
+#[cfg(feature = "s3m")]
+pub use starplayer_s3m as s3m;

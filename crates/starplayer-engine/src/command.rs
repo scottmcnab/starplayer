@@ -5,6 +5,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use starplayer_core::Command;
+use starplayer_model::Module as TrackerModule;
 use starplayer_rt::{Arc, GarbageCollector, Producer};
 
 /// Commands the ring holds before a control thread that outruns the audio thread starts
@@ -58,6 +59,11 @@ impl PcmSource for Vec<i16> {
 
 impl PcmSource for Box<[i16]> {
     fn pcm(&self) -> &[i16] { self }
+}
+
+/// The loaded tracker module is the production PCM source promised by architecture §6.
+impl PcmSource for TrackerModule {
+    fn pcm(&self) -> &[i16] { self.pcm() }
 }
 
 impl<Source: PcmSource> PcmSource for Arc<Source> {

@@ -78,6 +78,7 @@ extern crate alloc;
 pub mod header;
 pub mod loader;
 pub mod pattern;
+pub mod processor;
 pub mod sample;
 
 pub use header::{
@@ -88,6 +89,7 @@ pub use loader::{load, load_from, probe, probe_reader};
 pub use pattern::{
     COMMAND_NONE, INSTRUMENT_NONE, NOTE_CUT, NOTE_NONE, PatternView, ROWS, S3mCell, VOLUME_NONE, unpack,
 };
+pub use processor::{S3mChannel, S3mPatternData, S3mProcessor, sequencer_for};
 pub use sample::S3mSampleHeader;
 
 // Re-exported so a host can name every type it needs from this one crate.

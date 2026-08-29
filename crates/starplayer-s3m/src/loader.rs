@@ -39,7 +39,7 @@
 //! | Sample data parapointer past EOF | empty sample; the header's volume and C2SPD are still kept |
 //! | Sample data running past EOF | clamped to what is there |
 //! | `C2Spd` of 0 | replaced with 8363, the format default; the builder rejects a zero rate |
-//! | Sample `vol` above 64 | clamped to 64 |
+//! | Sample `vol` above 64 | coerced to 0, matching ST3 instrument-change semantics |
 //! | `loopend` past the sample's length | clamped to the length |
 //! | `loopstart >= loopend` after clamping | the sample does not loop |
 //! | Pattern parapointer of 0 | an empty 64-row pattern, which is what Scream Tracker 3 means by it |
@@ -253,7 +253,7 @@ fn load_instrument<R: ModuleReader + ?Sized>(source: &Source<'_, R>, header_offs
             true => loop_end as u32,
             false => 0,
         },
-        default_volume: unit_from_ratio(sample_header.volume as u32, 64),
+        default_volume: unit_from_ratio(if sample_header.volume > 64 { 0 } else { sample_header.volume as u32 }, 64),
         reference_rate_hz: match sample_header.c2spd {
             0 => FALLBACK_C2SPD,
             rate => rate,
