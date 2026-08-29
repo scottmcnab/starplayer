@@ -453,6 +453,12 @@ where
             // The garbage-channel case, and the reason the channel exists: dropping the
             // last `Arc<Module>` here would call `free()` inside the audio callback.
             Command::LoadModule(module) => {
+                // Every live voice indexes the PCM of the module that triggered it, so it
+                // must go before the new PCM becomes visible; otherwise it reads the new
+                // module's samples at the old offsets. The bindings go with it; the
+                // channels' mute flags are the host's and stay.
+                self.voices.release_all();
+                self.channels.forget_all();
                 if let Some(retired) = self.module.replace(module)
                     && let Err(orphan) = self.garbage.retire(retired)
                 {

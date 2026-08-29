@@ -356,6 +356,9 @@ fn a_loaded_module_is_what_the_engine_plays() {
     let mut engine: ModuleEngine = Engine::new(8);
     let mut control = engine.take_control().expect("the handle");
     control.load_module(counting_module(&drops)).map_err(|_| "queued").expect("the ring has room");
+    // The command drains at the top of the next quantum; a voice triggered before that
+    // belongs to whatever was loaded before and is released with it.
+    engine.render(&mut vec![0i16; RENDER_QUANTUM * 2]);
 
     let params = VoiceParams { step: Step::ONE, volume: U0F16::MAX, ..VoiceParams::SILENT };
     engine.voices_mut().allocate(VoiceTag::default(), region, params, 0).expect("a fresh pool has room");
@@ -363,6 +366,36 @@ fn a_loaded_module_is_what_the_engine_plays() {
     let mut output = vec![0i16; RENDER_QUANTUM * 2];
     engine.render(&mut output);
     assert!(output.iter().any(|sample| *sample != 0), "the voice resolved against the loaded module's PCM");
+}
+
+#[test]
+fn loading_a_module_releases_every_voice_the_previous_module_was_playing() {
+    // A voice triggered from module A carries an offset into A's PCM. After the swap to
+    // B it must not exist at all — left alone it would read B's samples at A's offsets,
+    // which is the "weird sounds after loading another file" bug.
+    let drops = StdArc::new(AtomicUsize::new(0));
+    let (_blob, region) = looping_blob();
+    let mut engine: ModuleEngine = Engine::new(8);
+    let mut control = engine.take_control().expect("the handle");
+    control.load_module(counting_module(&drops)).map_err(|_| "queued").expect("room");
+    engine.render(&mut vec![0i16; RENDER_QUANTUM * 2]);
+
+    let params = VoiceParams { step: Step::ONE, volume: U0F16::MAX, ..VoiceParams::SILENT };
+    let voice = engine.voices_mut().allocate(VoiceTag { channel: 3, ..VoiceTag::default() }, region, params, 0).expect("room");
+    engine.channels_mut().get_mut(starplayer_core::ChannelId(3)).expect("channel 3").foreground = Some(voice);
+    engine.channels_mut().get_mut(starplayer_core::ChannelId(3)).expect("channel 3").muted = true;
+    assert_eq!(engine.voices().voices_active(), 1);
+
+    control.load_module(counting_module(&drops)).map_err(|_| "queued").expect("room");
+    let mut output = vec![1i16; RENDER_QUANTUM * 2];
+    engine.render(&mut output);
+
+    assert_eq!(engine.voices().voices_active(), 0, "the old module's voices are gone with it");
+    assert!(engine.voices().get(voice).is_none(), "the old handle is stale");
+    assert!(engine.channels().get(starplayer_core::ChannelId(3)).is_some_and(|lane| lane.foreground.is_none()), "the binding went too");
+    assert!(engine.channels().get(starplayer_core::ChannelId(3)).is_some_and(|lane| lane.muted), "the host's mute flag survives a load");
+    assert!(output.iter().all(|sample| *sample == 0), "nothing from the old module is audible");
+    assert_eq!(control.collect_all_garbage(), 1, "the retired module still comes back down the garbage channel");
 }
 
 // ── the rest of the control plane ───────────────────────────────────────────────────

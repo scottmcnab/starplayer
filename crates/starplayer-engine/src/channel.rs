@@ -146,6 +146,15 @@ impl ChannelTable {
         }
     }
 
+    /// Forget every binding without touching the pool — for after
+    /// [`VoicePool::release_all`], when the handles are all stale by construction. Mute
+    /// flags are the host's and survive.
+    pub fn forget_all(&mut self) {
+        for lane in self.channels.iter_mut() {
+            lane.foreground = None;
+        }
+    }
+
     /// Forget any voice handle that has gone stale, so [`ChannelTable::is_sounding`] and
     /// the telemetry view agree with the pool.
     pub fn release_finished(&mut self, voices: &VoicePool) {

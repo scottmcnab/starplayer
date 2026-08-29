@@ -285,6 +285,28 @@ impl VoicePool {
     }
 
     /// Return a voice to the pool, invalidating `id`. Returns whether it was live.
+    /// Release every voice at once, invalidating every outstanding [`VoiceId`].
+    ///
+    /// What a module swap needs: each voice's [`SampleRegion`] indexes the PCM of the
+    /// module it was triggered from, so once that module is gone the voice would read the
+    /// new module's samples at the old offsets. No ramp — the data it would ramp over is
+    /// already the wrong data.
+    pub fn release_all(&mut self) {
+        for index in 0..self.slots.len() {
+            let free_head = self.free_head;
+            let Some(slot) = self.slots.get_mut(index) else { continue };
+            if !slot.active {
+                continue;
+            }
+            slot.active = false;
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.next_free = free_head;
+            slot.voice = Voice::default();
+            self.free_head = index as u16;
+            self.active_count = self.active_count.saturating_sub(1);
+        }
+    }
+
     pub fn release(&mut self, id: VoiceId) -> bool {
         let free_head = self.free_head;
         let Some(slot) = self.live_slot_mut(id) else { return false };
