@@ -61,6 +61,7 @@ pub mod command;
 pub mod control;
 pub mod demo;
 pub mod engine;
+pub mod mixer_mode;
 pub mod ring;
 pub mod sequencer;
 pub mod source;
@@ -76,6 +77,7 @@ pub use engine::{
     DEFAULT_SAMPLE_RATE_HZ, Engine, EngineSettings, EngineWarnings, MAX_EVENTS_PER_BLOCK, MAX_ZERO_ADVANCE,
     RENDER_QUANTUM,
 };
+pub use mixer_mode::{MixPathKind, MixerMode, OutputDepth};
 pub use ring::OutputRing;
 pub use sequencer::{
     EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, SongPosition,

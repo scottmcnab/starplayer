@@ -32,10 +32,10 @@ use std::vec;
 use std::vec::Vec;
 
 use command::{CommandRing, WireCommand};
-use starplayer::core::{ChannelId, Command, ExactFixedPoint, Frame, U0F16};
-use starplayer::dsp::{GainRamp, Linear};
-use starplayer::engine::{Engine, EngineContext, EngineHandle, EngineSettings, EventSource, PatternSequencer, RENDER_QUANTUM};
-use starplayer::mixer::{FloatPath, StereoF32};
+use starplayer::core::{ChannelId, Command, ExactFixedPoint, Frame, Interpolator, U0F16};
+use starplayer::dsp::{GainRamp, Interpolate, Linear, Nearest};
+use starplayer::engine::{Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode, OutputDepth, PatternSequencer, RENDER_QUANTUM};
+use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
 use starplayer::model::Module;
 use starplayer::rt::Arc;
 use starplayer::s3m::{S3mPatternData, S3mProcessor};
@@ -45,8 +45,8 @@ pub use command::COMMAND_RING_CAPACITY;
 
 /// Frames the wasm-owned planar buffer can expose in one call.
 pub const MAX_FRAMES_PER_CALL: usize = 1024;
-/// The browser player is stereo.
-pub const OUTPUT_CHANNELS: usize = 2;
+/// The largest channel count the browser player exposes.
+pub const MAX_OUTPUT_CHANNELS: usize = 2;
 
 /// The transient reservation forces wasm pages to be committed before any view is taken.
 /// It is returned to the allocator immediately and then reused by module activation.
@@ -64,15 +64,94 @@ const OPCODE_SEEK_ORDER: u8 = 3;
 const OPCODE_SEEK_ROW: u8 = 4;
 const OPCODE_MASTER_VOLUME: u8 = 5;
 const OPCODE_MUTE_CHANNEL: u8 = 6;
+const OPCODE_SET_MIXER_MODE: u8 = 7;
 
 /// Layout exported to the worklet, then copied coherently to the SAB telemetry block.
-const TELEMETRY_HEADER_WORDS: usize = 18;
+const TELEMETRY_HEADER_WORDS: usize = 19;
 const TELEMETRY_CHANNEL_WORDS: usize = 8;
 const TELEMETRY_CHANNELS: usize = 64;
 const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
 
 type S3mSequencer = PatternSequencer<ExactFixedPoint, S3mProcessor, S3mPatternData>;
-type WebEngine = Engine<FloatPath, Linear, StereoF32, Arc<Module>>;
+
+const DITHER_SEED: u32 = 0x5354_4152;
+
+/// What building one typed arm hands back: the engine, its control handle, its reader.
+type BuiltEngine<Path, Interp, Out> = (Engine<Path, Interp, Out, Arc<Module>>, EngineHandle<Arc<Module>>, TelemetryReader);
+
+fn build_engine_arm<Path, Interp, Out>(settings: EngineSettings) -> BuiltEngine<Path, Interp, Out>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let mut engine = Engine::<Path, Interp, Out, Arc<Module>>::with_settings(settings);
+    let control = engine.take_control().expect("a new engine owns its control handle");
+    let telemetry = engine.telemetry_reader().expect("telemetry is enabled for the web host");
+    (engine, control, telemetry)
+}
+
+macro_rules! render_web_arm {
+    (float, $engine:ident, $frames:ident, $float_interleaved:ident, $fixed_interleaved:ident, $channel_count:expr) => {{
+        let sample_count = $frames.saturating_mul($channel_count);
+        if let Some(destination) = $float_interleaved.get_mut(..sample_count) { $engine.render(destination); }
+    }};
+    (fixed, $engine:ident, $frames:ident, $float_interleaved:ident, $fixed_interleaved:ident, $channel_count:expr) => {{
+        let sample_count = $frames.saturating_mul($channel_count);
+        if let Some(destination) = $fixed_interleaved.get_mut(..sample_count) { $engine.render(destination); }
+    }};
+}
+
+macro_rules! define_web_engine {
+    ($($variant:ident => ($path_kind:path, $interpolator_kind:path, $channels:literal, $path:ty, $interpolator:ty, $output:ty, $buffer:ident)),+ $(,)?) => {
+        enum WebEngine {
+            $($variant(Engine<$path, $interpolator, $output, Arc<Module>>)),+
+        }
+
+        impl WebEngine {
+            fn build(mode: MixerMode, settings: EngineSettings) -> Result<(WebEngine, EngineHandle<Arc<Module>>, TelemetryReader), String> {
+                match (mode.path, mode.interpolator, mode.channels) {
+                    $(($path_kind, $interpolator_kind, $channels) => {
+                        let (engine, control, telemetry) = build_engine_arm::<$path, $interpolator, $output>(settings);
+                        Ok((WebEngine::$variant(engine), control, telemetry))
+                    },)+
+                    _ => Err(String::from("the web host supports only nearest/linear mono/stereo engine arms")),
+                }
+            }
+
+            fn set_source(&mut self, source: Box<dyn EventSource>) {
+                match self { $(WebEngine::$variant(engine) => engine.set_source(source),)+ }
+            }
+
+            fn render_native(&mut self, frames: usize, float_interleaved: &mut [f32], fixed_interleaved: &mut [i16]) {
+                match self {
+                    $(WebEngine::$variant(engine) => render_web_arm!($buffer, engine, frames, float_interleaved, fixed_interleaved, $channels),)+
+                }
+            }
+
+            fn frame(&self) -> Frame { match self { $(WebEngine::$variant(engine) => engine.frame(),)+ } }
+            fn source_frame(&self) -> Frame { match self { $(WebEngine::$variant(engine) => engine.source_frame(),)+ } }
+            fn is_playing(&self) -> bool { match self { $(WebEngine::$variant(engine) => engine.is_playing(),)+ } }
+            fn master_volume(&self) -> U0F16 { match self { $(WebEngine::$variant(engine) => engine.master_volume(),)+ } }
+            #[cfg(test)]
+            fn warnings(&self) -> starplayer::engine::EngineWarnings { match self { $(WebEngine::$variant(engine) => engine.warnings(),)+ } }
+
+            #[cfg(test)]
+            fn module(&self) -> Option<&Arc<Module>> { match self { $(WebEngine::$variant(engine) => engine.module(),)+ } }
+        }
+    };
+}
+
+define_web_engine! {
+    FloatNearestMono => (MixPathKind::Float, Interpolator::None, 1, FloatPath, Nearest, FloatOut<f32, 1>, float),
+    FloatNearestStereo => (MixPathKind::Float, Interpolator::None, 2, FloatPath, Nearest, FloatOut<f32, 2>, float),
+    FloatLinearMono => (MixPathKind::Float, Interpolator::Linear, 1, FloatPath, Linear, FloatOut<f32, 1>, float),
+    FloatLinearStereo => (MixPathKind::Float, Interpolator::Linear, 2, FloatPath, Linear, FloatOut<f32, 2>, float),
+    FixedNearestMono => (MixPathKind::Fixed, Interpolator::None, 1, FixedPath, Nearest, FixedOut<i16, 1>, fixed),
+    FixedNearestStereo => (MixPathKind::Fixed, Interpolator::None, 2, FixedPath, Nearest, FixedOut<i16, 2>, fixed),
+    FixedLinearMono => (MixPathKind::Fixed, Interpolator::Linear, 1, FixedPath, Linear, FixedOut<i16, 1>, fixed),
+    FixedLinearStereo => (MixPathKind::Fixed, Interpolator::Linear, 2, FixedPath, Linear, FixedOut<i16, 2>, fixed),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SeekKind {
@@ -131,6 +210,45 @@ impl EventSource for SeekableS3mSource {
     }
 }
 
+fn dither_for(mode: MixerMode) -> Dither {
+    if mode.dither { Dither::seeded(DITHER_SEED) } else { Dither::OFF }
+}
+
+fn quantize_float_sample(value: f32, depth: OutputDepth, dither: &mut Dither) -> (f32, Option<i16>) {
+    match depth {
+        OutputDepth::F32 => (<f32 as HostSample>::from_unit_f32(value, dither), None),
+        OutputDepth::I32 => (<i32 as HostSample>::from_unit_f32(value, dither) as f32 * (1.0 / 2_147_483_520.0), None),
+        OutputDepth::I24 => (<I24 as HostSample>::from_unit_f32(value, dither).0 as f32 * (1.0 / 8_388_607.0), None),
+        OutputDepth::I16 => {
+            let quantized = <i16 as HostSample>::from_unit_f32(value, dither);
+            (quantized as f32 * (1.0 / 32_767.0), Some(quantized))
+        }
+        OutputDepth::I8 => (<i8 as HostSample>::from_unit_f32(value, dither) as f32 * (1.0 / 127.0), None),
+    }
+}
+
+fn quantize_fixed_sample(value: i32, depth: OutputDepth, dither: &mut Dither) -> (f32, Option<i16>) {
+    match depth {
+        OutputDepth::F32 => (<f32 as HostSample>::from_i16_scale(value, dither), None),
+        OutputDepth::I32 => (<i32 as HostSample>::from_i16_scale(value, dither) as f32 * (1.0 / 2_147_483_520.0), None),
+        OutputDepth::I24 => (<I24 as HostSample>::from_i16_scale(value, dither).0 as f32 * (1.0 / 8_388_607.0), None),
+        OutputDepth::I16 => {
+            let quantized = <i16 as HostSample>::from_i16_scale(value, dither);
+            (quantized as f32 * (1.0 / 32_767.0), Some(quantized))
+        }
+        OutputDepth::I8 => (<i8 as HostSample>::from_i16_scale(value, dither) as f32 * (1.0 / 127.0), None),
+    }
+}
+
+fn source_for(module: Arc<Module>, sample_rate_hz: u32, order: u16, frame: Frame) -> (Box<dyn EventSource>, Rc<Cell<SeekRequest>>) {
+    let mut sequencer = starplayer::s3m::sequencer_for(module, sample_rate_hz, ExactFixedPoint);
+    let _ = sequencer.seek_order(order);
+    sequencer.restart_clock_at(frame);
+    let request = Rc::new(Cell::new(SeekRequest::default()));
+    let source = SeekableS3mSource { sequencer, request: Rc::clone(&request) };
+    (Box::new(source), request)
+}
+
 struct Host {
     engine: WebEngine,
     /// The `AudioContext`'s own rate, kept because it cannot be recovered from the engine:
@@ -141,7 +259,11 @@ struct Host {
     telemetry: TelemetryReader,
     commands: CommandRing,
     seek_request: Option<Rc<Cell<SeekRequest>>>,
-    interleaved: Vec<f32>,
+    current_module: Option<Arc<Module>>,
+    active_mode: MixerMode,
+    float_interleaved: Vec<f32>,
+    fixed_interleaved: Vec<i16>,
+    quantized_i16: Vec<i16>,
     planar: Vec<f32>,
     telemetry_words: Box<[i32]>,
     transport_gain: GainRamp,
@@ -151,27 +273,36 @@ struct Host {
     module_generation: u32,
     retired_modules_collected: u32,
     last_peak: f32,
+    dither: Dither,
 }
 
 impl Host {
+    #[cfg(test)]
     fn new(sample_rate_hz: u32) -> Host {
-        let mut engine = WebEngine::with_settings(EngineSettings {
+        Host::with_mode(sample_rate_hz, MixerMode::DEFAULT).expect("the default mixer mode has a web engine arm")
+    }
+
+    fn with_mode(sample_rate_hz: u32, active_mode: MixerMode) -> Result<Host, String> {
+        let settings = EngineSettings {
             sample_rate_hz,
             voice_capacity: 64,
             channel_count: 32,
             ..EngineSettings::default()
-        });
-        let control = engine.take_control().expect("a new engine owns its control handle");
-        let telemetry = engine.telemetry_reader().expect("telemetry is enabled for the web host");
-        Host {
+        };
+        let (engine, control, telemetry) = WebEngine::build(active_mode, settings)?;
+        Ok(Host {
             engine,
             sample_rate_hz,
             control,
             telemetry,
             commands: CommandRing::new(),
             seek_request: None,
-            interleaved: vec![0.0; MAX_FRAMES_PER_CALL * OUTPUT_CHANNELS],
-            planar: vec![0.0; MAX_FRAMES_PER_CALL * OUTPUT_CHANNELS],
+            current_module: None,
+            active_mode,
+            float_interleaved: vec![0.0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
+            fixed_interleaved: vec![0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
+            quantized_i16: vec![0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
+            planar: vec![0.0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
             telemetry_words: vec![0; TELEMETRY_WORDS].into_boxed_slice(),
             transport_gain: GainRamp::steady(TRANSPORT_GAIN_UNITY),
             pending_engine_stop: false,
@@ -180,7 +311,8 @@ impl Host {
             module_generation: 0,
             retired_modules_collected: 0,
             last_peak: 0.0,
-        }
+            dither: dither_for(active_mode),
+        })
     }
 
     /// Decode, construct and queue a module. Called from the worklet's message handler,
@@ -188,21 +320,66 @@ impl Host {
     fn load_module(&mut self, bytes: &[u8]) -> Result<u32, String> {
         let loaded = starplayer::s3m::load(bytes).map_err(|error| error.to_string())?;
         let module = Arc::new(loaded);
-        let mut sequencer = starplayer::s3m::sequencer_for(Arc::clone(&module), self.sample_rate_hz, ExactFixedPoint);
         // A new sequencer's tick clock starts at frame zero, but the engine's musical
         // clock is monotonic and has been running since `init`. Without this the first
         // tick of the new module is due thousands of frames in the past, and the engine
         // burns ticks trying to catch up until it gives up and raises
         // `zero_advance_forced`. Start the clock where the engine actually is.
-        sequencer.restart_clock_at(self.engine.source_frame());
-        let request = Rc::new(Cell::new(SeekRequest::default()));
-        let source = SeekableS3mSource { sequencer, request: Rc::clone(&request) };
+        let (source, request) = source_for(Arc::clone(&module), self.sample_rate_hz, 0, self.engine.source_frame());
 
         self.control.load_module(Arc::clone(&module)).map_err(|_| String::from("the engine command ring is full"))?;
-        self.engine.set_source(Box::new(source));
+        self.engine.set_source(source);
         self.seek_request = Some(request);
+        self.current_module = Some(module);
         self.module_generation = self.module_generation.wrapping_add(1).max(1);
         Ok(self.module_generation)
+    }
+
+    /// Rebuild the typed engine in a worklet message task, retaining the same module Arc
+    /// and the order whose audio is currently sounding.
+    fn set_mixer_mode(&mut self, mode: MixerMode) -> Result<u32, String> {
+        if mode == self.active_mode {
+            return Ok(mode.to_wire());
+        }
+        let settings = EngineSettings {
+            sample_rate_hz: self.sample_rate_hz,
+            voice_capacity: 64,
+            channel_count: 32,
+            ..EngineSettings::default()
+        };
+        let snapshot = *self.telemetry.read();
+        let sounding_order = snapshot.transport.order;
+        let was_playing = self.engine.is_playing() && !self.pending_engine_stop;
+        let master_volume = self.engine.master_volume();
+        let (mut engine, mut control, telemetry) = WebEngine::build(mode, settings)?;
+        let mut seek_request = None;
+
+        if let Some(module) = self.current_module.as_ref() {
+            let (source, request) = source_for(Arc::clone(module), self.sample_rate_hz, sounding_order, engine.source_frame());
+            control.load_module(Arc::clone(module)).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
+            engine.set_source(source);
+            seek_request = Some(request);
+        }
+        control.send(Command::SetMasterVolume(master_volume)).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
+        for (channel_index, channel) in snapshot.channels.iter().enumerate() {
+            if channel.muted {
+                let command = Command::MuteChannel { channel: ChannelId(channel_index as u16), muted: true };
+                control.send(command).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
+            }
+        }
+        if !was_playing {
+            control.send(Command::Stop).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
+        }
+
+        self.engine = engine;
+        self.control = control;
+        self.telemetry = telemetry;
+        self.seek_request = seek_request;
+        self.active_mode = mode;
+        self.dither = dither_for(mode);
+        self.transport_gain = GainRamp::steady(if was_playing { TRANSPORT_GAIN_UNITY } else { 0 });
+        self.pending_engine_stop = false;
+        Ok(mode.to_wire())
     }
 
     fn enqueue(&mut self, command: WireCommand) -> bool { self.commands.push(command) }
@@ -211,13 +388,16 @@ impl Host {
         match command.opcode {
             OPCODE_PLAY => Some(Command::Play),
             OPCODE_STOP => Some(Command::Stop),
-            OPCODE_SEEK_ORDER => Some(Command::SeekOrder(command.argument)),
-            OPCODE_SEEK_ROW => Some(Command::SeekRow(command.argument)),
-            OPCODE_MASTER_VOLUME => Some(Command::SetMasterVolume(U0F16::from_bits(command.argument))),
+            OPCODE_SEEK_ORDER => Some(Command::SeekOrder(command.argument as u16)),
+            OPCODE_SEEK_ROW => Some(Command::SeekRow(command.argument as u16)),
+            OPCODE_MASTER_VOLUME => Some(Command::SetMasterVolume(U0F16::from_bits(command.argument as u16))),
             OPCODE_MUTE_CHANNEL => Some(Command::MuteChannel {
-                channel: ChannelId(command.argument),
+                channel: ChannelId(command.argument as u16),
                 muted: command.extra != 0,
             }),
+            // This opcode is handled synchronously by the worklet message handler; it
+            // must never reach the render-path staging ring.
+            OPCODE_SET_MIXER_MODE => None,
             _ => None,
         }
     }
@@ -266,19 +446,34 @@ impl Host {
     fn process(&mut self, frames: usize) -> f32 {
         self.drain_commands();
         let frames = frames.min(MAX_FRAMES_PER_CALL);
-        let sample_count = frames.saturating_mul(OUTPUT_CHANNELS);
-        if let Some(interleaved) = self.interleaved.get_mut(..sample_count) {
-            self.engine.render(interleaved);
-        }
+        self.engine.render_native(frames, &mut self.float_interleaved, &mut self.fixed_interleaved);
 
         let mut peak = 0.0f32;
         for frame in 0..frames {
-            let gain = self.transport_gain.advance() as f32 / TRANSPORT_GAIN_UNITY as f32;
-            let left = self.interleaved.get(frame * 2).copied().unwrap_or(0.0) * gain;
-            let right = self.interleaved.get(frame * 2 + 1).copied().unwrap_or(0.0) * gain;
-            if let Some(sample) = self.planar.get_mut(frame) { *sample = left; }
-            if let Some(sample) = self.planar.get_mut(MAX_FRAMES_PER_CALL + frame) { *sample = right; }
-            peak = peak.max(left.abs()).max(right.abs());
+            let gain_units = self.transport_gain.advance();
+            for channel in 0..self.active_mode.channels as usize {
+                let interleaved_index = frame.saturating_mul(self.active_mode.channels as usize).saturating_add(channel);
+                let (output, quantized_i16) = match self.active_mode.path {
+                    MixPathKind::Float => {
+                        let native = self.float_interleaved.get(interleaved_index).copied().unwrap_or(0.0);
+                        let gained = native * gain_units as f32 / TRANSPORT_GAIN_UNITY as f32;
+                        quantize_float_sample(gained, self.active_mode.depth, &mut self.dither)
+                    }
+                    MixPathKind::Fixed => {
+                        let native = self.fixed_interleaved.get(interleaved_index).copied().unwrap_or(0) as i32;
+                        let gained = ((native as i64 * gain_units as i64) / TRANSPORT_GAIN_UNITY as i64) as i32;
+                        quantize_fixed_sample(gained, self.active_mode.depth, &mut self.dither)
+                    }
+                };
+                if let Some(quantized) = quantized_i16
+                    && let Some(destination) = self.quantized_i16.get_mut(interleaved_index)
+                {
+                    *destination = quantized;
+                }
+                let planar_index = channel.saturating_mul(MAX_FRAMES_PER_CALL).saturating_add(frame);
+                if let Some(destination) = self.planar.get_mut(planar_index) { *destination = output; }
+                peak = peak.max(output.abs());
+            }
         }
 
         if self.pending_engine_stop && !self.transport_gain.is_ramping() {
@@ -325,6 +520,7 @@ impl Host {
             // reading costs a UI nothing, so it rides the same block as scalars for now.
             (self.last_peak.clamp(0.0, 1.0) * 65_535.0) as i32,
             self.retired_modules_collected as i32,
+            self.active_mode.to_wire() as i32,
         ];
         if let Some(destination) = self.telemetry_words.get_mut(..TELEMETRY_HEADER_WORDS) {
             destination.copy_from_slice(&header);
@@ -385,14 +581,20 @@ mod exports {
 
     /// Allocate the engine, rings and all steady-state render buffers.
     #[wasm_bindgen]
-    pub fn init(sample_rate: f32, _channels: u32) {
+    pub fn init(sample_rate: f32, mixer_mode_wire: u32) -> bool {
         drop(core::hint::black_box(vec![0u8; HEAP_RESERVE_BYTES]));
         let sample_rate_hz = sample_rate.round().clamp(8_000.0, 384_000.0) as u32;
+        let mode = MixerMode::from_wire(mixer_mode_wire).unwrap_or(MixerMode::DEFAULT);
+        let mut initialized = false;
         HOST.with(|cell| {
-            if let Ok(mut slot) = cell.try_borrow_mut() {
-                *slot = Some(Host::new(sample_rate_hz));
+            if let Ok(mut slot) = cell.try_borrow_mut()
+                && let Ok(host) = Host::with_mode(sample_rate_hz, mode)
+            {
+                *slot = Some(host);
+                initialized = true;
             }
         });
+        initialized
     }
 
     /// Decode and activate one validated S3M byte buffer outside `process()`.
@@ -408,8 +610,19 @@ mod exports {
     /// Decode one SAB/fallback wire record into the wasm-side fixed command ring.
     #[wasm_bindgen]
     pub fn enqueue_command(opcode: u32, argument: u32, extra: u32) -> bool {
-        let command = WireCommand { opcode: opcode as u8, argument: argument as u16, extra: extra as u16 };
+        let command = WireCommand { opcode: opcode as u8, argument, extra };
         with_host(false, |host| host.enqueue(command))
+    }
+
+    /// Rebuild the selected typed engine outside `process()`.
+    #[wasm_bindgen]
+    pub fn set_mixer_mode(wire: u32) -> Result<u32, JsValue> {
+        let mode = MixerMode::from_wire(wire).ok_or_else(|| JsValue::from_str("invalid mixer mode wire value"))?;
+        HOST.with(|cell| {
+            let mut slot = cell.try_borrow_mut().map_err(|_| JsValue::from_str("the worklet host is busy"))?;
+            let host = slot.as_mut().ok_or_else(|| JsValue::from_str("the worklet host is not initialized"))?;
+            host.set_mixer_mode(mode).map_err(|message| JsValue::from_str(&message))
+        })
     }
 
     #[wasm_bindgen]
@@ -419,7 +632,7 @@ mod exports {
     pub fn output_ptr() -> u32 { with_host(0, |host| host.planar.as_ptr() as usize as u32) }
 
     #[wasm_bindgen]
-    pub fn output_len() -> u32 { (MAX_FRAMES_PER_CALL * OUTPUT_CHANNELS) as u32 }
+    pub fn output_len() -> u32 { (MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS) as u32 }
 
     #[wasm_bindgen]
     pub fn output_channel_stride() -> u32 { MAX_FRAMES_PER_CALL as u32 }
@@ -454,8 +667,110 @@ mod exports {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
+
+    fn mode(path: MixPathKind, interpolator: Interpolator, depth: OutputDepth, dither: bool, channels: u8) -> MixerMode {
+        MixerMode { path, interpolator, depth, dither, channels }
+    }
+
+    fn rendered_planar(mode: MixerMode, quanta: usize) -> Vec<f32> {
+        let mut host = Host::with_mode(48_000, mode).expect("test mode has an engine arm");
+        assert!(host.load_module(FIXTURE).is_ok());
+        let mut output = Vec::with_capacity(quanta * RENDER_QUANTUM * mode.channels as usize);
+        for _ in 0..quanta {
+            host.process(RENDER_QUANTUM);
+            for channel in 0..mode.channels as usize {
+                let first = channel * MAX_FRAMES_PER_CALL;
+                output.extend_from_slice(&host.planar[first..first + RENDER_QUANTUM]);
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn all_eight_typed_engine_arms_build_and_render_a_quantum() {
+        for path in [MixPathKind::Float, MixPathKind::Fixed] {
+            for interpolator in [Interpolator::None, Interpolator::Linear] {
+                for channels in [1, 2] {
+                    let mode = mode(path, interpolator, OutputDepth::F32, false, channels);
+                    let mut host = Host::with_mode(48_000, mode).expect("the documented arm exists");
+                    assert!(host.load_module(FIXTURE).is_ok());
+                    host.process(RENDER_QUANTUM);
+                    assert_eq!(host.active_mode, mode);
+                    assert_eq!(host.telemetry_words[18] as u32, mode.to_wire());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switching_mode_keeps_the_sounding_order_generation_and_same_module_arc() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        host.process(RENDER_QUANTUM);
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_SEEK_ORDER, argument: 1, extra: 0 }));
+        for _ in 0..10 { host.process(RENDER_QUANTUM); }
+        assert_eq!(host.telemetry.read().transport.order, 1);
+        let generation = host.module_generation;
+        let retired = host.retired_modules_collected;
+        let module = Arc::clone(host.current_module.as_ref().expect("the host retains its module"));
+
+        let retro = mode(MixPathKind::Fixed, Interpolator::None, OutputDepth::I8, false, 2);
+        assert_eq!(host.set_mixer_mode(retro), Ok(retro.to_wire()));
+        for _ in 0..10 { host.process(RENDER_QUANTUM); }
+
+        assert_eq!(host.telemetry.read().transport.order, 1, "the rebuilt sequencer seeks to the sounding order");
+        assert_eq!(host.module_generation, generation, "a mode switch is not a module reload");
+        assert_eq!(host.retired_modules_collected, retired, "the same Arc is not retired through the audio channel");
+        assert_eq!(host.collect_garbage(), 0, "no module was retired by the switch");
+        assert!(Arc::ptr_eq(host.current_module.as_ref().expect("module retained"), &module));
+        assert!(Arc::ptr_eq(host.engine.module().expect("new engine loaded the module"), &module));
+    }
+
+    #[test]
+    fn fixed_i16_post_quantisation_is_bit_exact_with_the_engine_output() {
+        let fixed_i16 = mode(MixPathKind::Fixed, Interpolator::Linear, OutputDepth::I16, true, 2);
+        let mut host = Host::with_mode(48_000, fixed_i16).expect("fixed stereo arm exists");
+        assert!(host.load_module(FIXTURE).is_ok());
+        let mut heard = false;
+        for _ in 0..200 {
+            host.process(RENDER_QUANTUM);
+            let native = &host.fixed_interleaved[..RENDER_QUANTUM * 2];
+            let quantized = &host.quantized_i16[..RENDER_QUANTUM * 2];
+            assert_eq!(quantized, native, "fixed I16 uses the engine's native samples unchanged");
+            heard |= native.iter().any(|sample| *sample != 0);
+        }
+        assert!(heard, "the comparison covered non-silent output");
+    }
+
+    /// The fixture opens quietly, so a short render only reaches a couple of dozen codes.
+    /// Two thousand quanta reach a peak of about 0.39 full scale, where the same passage at
+    /// full depth takes thousands of distinct values and the 8-bit one still cannot.
+    #[test]
+    fn i8_output_uses_no_more_than_256_values() {
+        let quanta = 2_000;
+        let eight_bit = rendered_planar(mode(MixPathKind::Float, Interpolator::Linear, OutputDepth::I8, false, 2), quanta);
+        let values: BTreeSet<u32> = eight_bit.iter().map(|sample| sample.to_bits()).collect();
+        assert!(values.len() <= 256, "8-bit output produced {} distinct values", values.len());
+        assert!(values.len() > 1, "the fixture produced more than one 8-bit value");
+        assert!(eight_bit.iter().any(|sample| *sample != 0.0), "the comparison covered non-silent output");
+
+        let full_depth = rendered_planar(mode(MixPathKind::Float, Interpolator::Linear, OutputDepth::F32, false, 2), quanta);
+        let full_values: BTreeSet<u32> = full_depth.iter().map(|sample| sample.to_bits()).collect();
+        assert!(full_values.len() > 256, "the same passage at full depth takes only {} distinct values", full_values.len());
+    }
+
+    #[test]
+    fn dither_changes_output_and_is_deterministic() {
+        let dithered_mode = mode(MixPathKind::Float, Interpolator::Linear, OutputDepth::I8, true, 2);
+        let first = rendered_planar(dithered_mode, 100);
+        let second = rendered_planar(dithered_mode, 100);
+        let undithered = rendered_planar(MixerMode { dither: false, ..dithered_mode }, 100);
+        assert_eq!(first, second, "the seeded TPDF stream repeats exactly");
+        assert_ne!(first, undithered, "enabling dither changes reduced-depth output");
+    }
 
     #[test]
     fn a_real_s3m_reaches_the_real_engine_and_renders() {

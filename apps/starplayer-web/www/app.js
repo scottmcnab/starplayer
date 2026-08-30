@@ -4,7 +4,8 @@ const Ring = globalThis.StarPlayerRing;
 const HOST_WASM_URL = 'starplayer_host_wasm_bg.wasm';
 const WORKLET_URL = 'starplayer-worklet.js';
 const PROCESSOR_NAME = 'starplayer-player';
-const OUTPUT_CHANNELS = 2;
+const MIXER_STORAGE_KEY = 'starplayer.output-and-mixer.v1';
+const DEFAULT_MIXER_MODE = 0x0000_0202;
 const PATTERN_WINDOW_ROWS = 13;
 const PATTERN_CELL_BYTES = 5;
 
@@ -30,6 +31,15 @@ const elements = {
     dropped: byId('dropped'), retired: byId('retired'), health: byId('health'), forceFallback: byId('force-fallback'),
     archivePicker: byId('archive-picker'), archivePickerName: byId('archive-picker-name'), archiveEntries: byId('archive-entries'),
     archiveLoad: byId('archive-load'), archiveCancel: byId('archive-cancel'),
+    engineMode: byId('engine-mode'), outputStatus: byId('output-status'), sampleRateStatus: byId('sample-rate-status'),
+    contextState: byId('context-state'), baseLatency: byId('base-latency'), outputLatency: byId('output-latency'),
+    channelStatus: byId('channel-status'), maxChannelCount: byId('max-channel-count'), sinkStatus: byId('sink-status'),
+    workletRate: byId('worklet-rate'), outputEngineMode: byId('output-engine-mode'), sampleRate: byId('sample-rate'),
+    applySampleRate: byId('apply-sample-rate'), outputDeviceLabel: byId('output-device-label'), outputDevice: byId('output-device'),
+    applyOutputDevice: byId('apply-output-device'), chooseOutputDevice: byId('choose-output-device'), outputDeviceNote: byId('output-device-note'),
+    outputChannels: byId('output-channels'), applyChannels: byId('apply-channels'), mixerPath: byId('mixer-path'),
+    mixerInterpolator: byId('mixer-interpolator'), mixerDepth: byId('mixer-depth'), mixerDither: byId('mixer-dither'),
+    applyMixer: byId('apply-mixer'),
 };
 
 const state = {
@@ -50,6 +60,15 @@ const state = {
     activationMemoryBytes: 0,
     loadCount: 0,
     retiredSeen: 0,
+    currentModuleBytes: null,
+    wasmModule: null,
+    wasmBytes: null,
+    workletSampleRate: null,
+    requestedSampleRate: '',
+    rateReport: '',
+    activeModeWire: DEFAULT_MIXER_MODE,
+    outputChannelCount: 2,
+    outputDevices: new Map(),
     archiveChoices: [],
     archivePickerResolve: null,
     archivePreviousFocus: null,
@@ -75,6 +94,125 @@ function sharedMemoryAvailable() {
     return typeof SharedArrayBuffer === 'function' && globalThis.crossOriginIsolated === true;
 }
 
+function mixerModeFromControls(channels = Number(elements.outputChannels.value) === 1 ? 1 : 2) {
+    const path = elements.mixerPath.value === 'fixed' ? 1 : 0;
+    const interpolator = elements.mixerInterpolator.value === 'linear' ? 1 : 0;
+    const depth = { f32: 0, i32: 1, i24: 2, i16: 3, i8: 4 }[elements.mixerDepth.value] ?? 0;
+    const dither = elements.mixerDither.value === 'tpdf' ? 1 : 0;
+    return (path | (interpolator << 1) | (depth << 3) | (dither << 6) | (channels << 8)) >>> 0;
+}
+
+function describeMixerMode(wire) {
+    if (!Number.isInteger(wire)) return '—';
+    const path = (wire & 1) === 0 ? 'float' : 'fixed';
+    const interpolators = ['nearest', 'linear', 'cubic', 'sinc'];
+    const depths = ['32-bit float', '32-bit int', '24-bit', '16-bit', '8-bit'];
+    const interpolator = interpolators[(wire >>> 1) & 3] ?? 'unknown';
+    const depth = depths[(wire >>> 3) & 7] ?? 'unknown';
+    const dither = (wire & (1 << 6)) === 0 ? '' : ' · TPDF';
+    const channels = ((wire >>> 8) & 0xFF) === 1 ? 'mono' : 'stereo';
+    return `${path} · ${interpolator} · ${depth}${dither} · ${channels}`;
+}
+
+function selectStoredValue(select, value) {
+    if ([...select.options].some((option) => option.value === String(value))) select.value = String(value);
+}
+
+function restorePreferences() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(MIXER_STORAGE_KEY) || 'null');
+        if (!saved || typeof saved !== 'object') return;
+        selectStoredValue(elements.sampleRate, saved.sampleRate ?? '');
+        selectStoredValue(elements.outputChannels, saved.channels ?? '2');
+        selectStoredValue(elements.mixerPath, saved.path ?? 'float');
+        selectStoredValue(elements.mixerInterpolator, saved.interpolator ?? 'linear');
+        selectStoredValue(elements.mixerDepth, saved.depth ?? 'f32');
+        selectStoredValue(elements.mixerDither, saved.dither ?? 'off');
+        if (typeof saved.sinkId === 'string') elements.outputDevice.dataset.savedSinkId = saved.sinkId;
+    } catch (_) {
+        // Storage may be disabled or contain data from a broken older development build.
+    }
+}
+
+function persistPreferences() {
+    try {
+        localStorage.setItem(MIXER_STORAGE_KEY, JSON.stringify({
+            sampleRate: elements.sampleRate.value,
+            sinkId: state.context?.sinkId ?? elements.outputDevice.value,
+            channels: elements.outputChannels.value,
+            path: elements.mixerPath.value,
+            interpolator: elements.mixerInterpolator.value,
+            depth: elements.mixerDepth.value,
+            dither: elements.mixerDither.value,
+        }));
+    } catch (_) {
+        // A private or storage-blocked page still gets fully working in-memory controls.
+    }
+}
+
+function formatRate(value) {
+    return Number.isFinite(value) ? `${Math.round(value).toLocaleString()} Hz` : '—';
+}
+
+function formatLatency(value) {
+    return Number.isFinite(value) ? `${(value * 1000).toFixed(2)} ms` : 'unavailable';
+}
+
+function updateOutputPanel() {
+    const context = state.context;
+    // Before the first `Start audio` there is no context to have asked anything of, so the
+    // "requested" half reports the pending selection instead of a request never made.
+    const pending = context === null ? elements.sampleRate.value : state.requestedSampleRate;
+    const requested = pending === '' ? 'device default' : formatRate(Number(pending));
+    elements.sampleRateStatus.textContent = state.rateReport || `${requested} / ${context ? formatRate(context.sampleRate) : '—'}`;
+    elements.contextState.textContent = context?.state ?? '—';
+    elements.baseLatency.textContent = context ? formatLatency(context.baseLatency) : '—';
+    elements.outputLatency.textContent = context ? formatLatency(context.outputLatency) : '—';
+    const channels = context ? state.outputChannelCount : (Number(elements.outputChannels.value) === 1 ? 1 : 2);
+    elements.channelStatus.textContent = context ? `${channels === 1 ? 'mono' : 'stereo'} · destination ${context.destination.channelCount}` : (channels === 1 ? 'mono' : 'stereo');
+    elements.maxChannelCount.textContent = context ? String(context.destination.maxChannelCount) : '—';
+    elements.workletRate.textContent = state.workletSampleRate === null ? '—' : formatRate(state.workletSampleRate);
+    const description = describeMixerMode(state.activeModeWire);
+    elements.engineMode.textContent = description;
+    elements.outputEngineMode.textContent = description;
+    elements.outputStatus.textContent = context ? `${formatRate(context.sampleRate)} · ${context.state}` : 'audio asleep';
+    const sinkId = context && 'sinkId' in context ? context.sinkId : '';
+    const device = state.outputDevices.get(sinkId);
+    elements.sinkStatus.textContent = device?.label || (sinkId ? `device ${sinkId.slice(0, 8)}…` : 'default');
+}
+
+function installGraph(graph) {
+    state.node = graph.node;
+    state.commandRing = graph.commandRing;
+    state.telemetry = graph.telemetry;
+    state.workletSampleRate = graph.node.starplayerSampleRate ?? graph.context.sampleRate;
+    state.outputChannelCount = graph.channels;
+    if (graph.node.starplayerRenderQuantum) elements.quantum.textContent = `${graph.node.starplayerRenderQuantum} frames`;
+}
+
+async function prepareNode(context, channels, mixerMode, addModule) {
+    if (!context.audioWorklet) {
+        throw new Error('AudioWorklet is unavailable here: the player must be served over https or from localhost (a secure context).');
+    }
+    if (addModule) await context.audioWorklet.addModule(WORKLET_URL);
+    const shared = sharedMemoryAvailable() && !elements.forceFallback.checked;
+    const commandRing = shared ? Ring.createCommandRing() : null;
+    const telemetry = shared ? Ring.createTelemetry() : null;
+    const processorOptions = {
+        channelCount: channels,
+        mixerMode,
+        wasmModule: state.wasmModule,
+        commandRing: commandRing ? commandRing.buffer : null,
+        telemetry: telemetry ? telemetry.buffer : null,
+    };
+    const node = createNode(context, processorOptions, state.wasmBytes, channels);
+    node.port.onmessage = (event) => onWorkletMessage(event.data, node);
+    node.onprocessorerror = () => {
+        if (node === state.node) showError('The AudioWorklet processor stopped unexpectedly. Reload the page to restart it.');
+    };
+    return { context, node, commandRing, telemetry, channels };
+}
+
 async function startAudio() {
     if (state.node !== null) {
         await state.context.resume();
@@ -86,7 +224,10 @@ async function startAudio() {
 
     // Construct and resume before the first await. That keeps this function inside the
     // originating tap on iOS Safari, whose audio unlock rules are stricter than Chromium.
-    state.context = new AudioContext({ latencyHint: 'interactive' });
+    state.requestedSampleRate = elements.sampleRate.value;
+    const contextOptions = { latencyHint: 'interactive' };
+    if (state.requestedSampleRate !== '') contextOptions.sampleRate = Number(state.requestedSampleRate);
+    state.context = new AudioContext(contextOptions);
     const unlock = state.context.resume();
     state.startPromise = (async () => {
         clearError();
@@ -98,28 +239,15 @@ async function startAudio() {
         }
         const wasmBytes = await response.arrayBuffer();
         const wasmModule = await WebAssembly.compile(wasmBytes);
-        if (!state.context.audioWorklet) {
-            // `AudioContext.audioWorklet` only exists in a secure context: https, or
-            // http://localhost. A plain-http LAN address gets neither it nor
-            // SharedArrayBuffer, so say so instead of "cannot read addModule".
-            throw new Error('AudioWorklet is unavailable here: the player must be served over https or from localhost (a secure context).');
-        }
-        await state.context.audioWorklet.addModule(WORKLET_URL);
+        state.wasmBytes = wasmBytes;
+        state.wasmModule = wasmModule;
         await unlock;
 
-        const shared = sharedMemoryAvailable() && !elements.forceFallback.checked;
-        state.commandRing = shared ? Ring.createCommandRing() : null;
-        state.telemetry = shared ? Ring.createTelemetry() : null;
-        const processorOptions = {
-            channelCount: OUTPUT_CHANNELS,
-            wasmModule,
-            commandRing: state.commandRing ? state.commandRing.buffer : null,
-            telemetry: state.telemetry ? state.telemetry.buffer : null,
-        };
-        state.node = createNode(processorOptions, wasmBytes);
-        state.node.port.onmessage = (event) => onWorkletMessage(event.data);
-        state.node.onprocessorerror = () => showError('The AudioWorklet processor stopped unexpectedly. Reload the page to restart it.');
+        const channels = Number(elements.outputChannels.value) === 1 ? 1 : 2;
+        const graph = await prepareNode(state.context, channels, mixerModeFromControls(), true);
+        installGraph(graph);
         state.node.connect(state.context.destination);
+        state.context.addEventListener('statechange', updateOutputPanel);
 
         elements.commandTransport.textContent = state.commandRing ? 'SharedArrayBuffer SPSC ring' : 'postMessage, batched once per frame';
         elements.telemetryTransport.textContent = state.telemetry ? 'SharedArrayBuffer seqlock' : `postMessage every ${Ring.TELEMETRY_FALLBACK_QUANTA} quanta`;
@@ -127,6 +255,15 @@ async function startAudio() {
         elements.transportChip.classList.add('live');
         elements.startAudio.textContent = 'Audio ready';
         elements.forceFallback.disabled = true;
+        state.rateReport = `${state.requestedSampleRate === '' ? 'device default' : formatRate(Number(state.requestedSampleRate))} / ${formatRate(state.context.sampleRate)}`;
+        await refreshOutputDevices();
+        const savedSinkId = elements.outputDevice.dataset.savedSinkId;
+        if (savedSinkId && typeof state.context.setSinkId === 'function') {
+            await state.context.setSinkId(savedSinkId).catch((error) => {
+                elements.outputDeviceNote.textContent = `Saved output was not available (${error.name || error.message}).`;
+            });
+        }
+        updateOutputPanel();
         showMessage('Audio is ready. Load a module.');
     })().catch(async (error) => {
         showError(error);
@@ -143,18 +280,18 @@ async function startAudio() {
     return state.startPromise;
 }
 
-function createNode(processorOptions, wasmBytes) {
+function createNode(context, processorOptions, wasmBytes, channels) {
     const options = {
         numberOfInputs: 0,
         numberOfOutputs: 1,
-        outputChannelCount: [OUTPUT_CHANNELS],
+        outputChannelCount: [channels],
         processorOptions,
     };
     try {
-        return new AudioWorkletNode(state.context, PROCESSOR_NAME, options);
+        return new AudioWorkletNode(context, PROCESSOR_NAME, options);
     } catch (error) {
         options.processorOptions = { ...processorOptions, wasmModule: null, wasmBytes };
-        return new AudioWorkletNode(state.context, PROCESSOR_NAME, options);
+        return new AudioWorkletNode(context, PROCESSOR_NAME, options);
     }
 }
 
@@ -188,8 +325,10 @@ async function loadBuffer(buffer, label) {
         const metadata = readMetadata(moduleLabel);
         await audio;
         showMessage(`Activating ${moduleLabel}…`);
-        const result = await activateModule(moduleBuffer);
+        const retainedBytes = moduleBuffer.slice(0);
+        const result = await activateModuleOnNode(state.node, moduleBuffer);
         state.metadata = metadata;
+        state.currentModuleBytes = retainedBytes;
         state.activationMemoryBytes = result.memoryBytes;
         state.loadCount += 1;
         renderMetadata();
@@ -286,21 +425,28 @@ function readMetadata(label) {
     };
 }
 
-function activateModule(buffer) {
+function activateModuleOnNode(node, buffer) {
     const requestId = state.nextRequestId++;
     return new Promise((resolve, reject) => {
         state.pendingLoads.set(requestId, { resolve, reject });
-        state.node.port.postMessage({ type: 'loadModule', requestId, bytes: buffer }, [buffer]);
+        node.port.postMessage({ type: 'loadModule', requestId, bytes: buffer }, [buffer]);
     });
 }
 
-function onWorkletMessage(message) {
+function onWorkletMessage(message, node) {
     if (message.type === 'ready') {
-        elements.quantum.textContent = `${message.renderQuantum} frames`;
+        node.starplayerSampleRate = message.sampleRate;
+        node.starplayerRenderQuantum = message.renderQuantum;
+        if (node === state.node) {
+            state.workletSampleRate = message.sampleRate;
+            elements.quantum.textContent = `${message.renderQuantum} frames`;
+            updateOutputPanel();
+        }
     } else if (message.type === 'quantum') {
+        if (node !== state.node) return;
         elements.quantum.textContent = `${message.frames} frames${message.matchesEngine ? '' : ' (unexpected)'}`;
     } else if (message.type === 'telemetry') {
-        state.latest = message;
+        if (node === state.node) state.latest = message;
     } else if (message.type === 'moduleLoaded' || message.type === 'moduleError') {
         const pending = state.pendingLoads.get(message.requestId);
         if (pending) {
@@ -309,13 +455,22 @@ function onWorkletMessage(message) {
             else pending.reject(new Error(message.reason));
         }
     } else if (message.type === 'garbageCollected') {
+        if (node !== state.node) return;
         state.retiredSeen = message.total;
         elements.retired.textContent = `${state.retiredSeen} returned, ${message.pending} pending`;
         if (state.loadCount > 1 && message.collected > 0) {
             showMessage(`Playing ${state.metadata.title}; the retired module Arc returned off the audio callback.`);
         }
     } else if (message.type === 'fault') {
-        showError(`Audio engine fault: ${message.reason}`);
+        if (node === state.node) showError(`Audio engine fault: ${message.reason}`);
+    } else if (message.type === 'mixerModeApplied') {
+        if (node !== state.node) return;
+        state.activeModeWire = message.active >>> 0;
+        state.activationMemoryBytes = message.memoryBytes;
+        updateOutputPanel();
+        showMessage(`Mixer active: ${describeMixerMode(state.activeModeWire)}.`);
+    } else if (message.type === 'mixerModeError') {
+        if (node === state.node) showError(`Could not switch mixer mode: ${message.reason}`);
     }
 }
 
@@ -341,18 +496,218 @@ function flushFallbackCommands() {
     if (state.node === null || state.fallbackCommands.length === 0) return;
     if (state.commandRing !== null) {
         const remaining = [];
+        let modeQueued = false;
         for (let index = 0; index < state.fallbackCommands.length; index += 3) {
             if (!Ring.pushCommand(state.commandRing, state.fallbackCommands[index], state.fallbackCommands[index + 1], state.fallbackCommands[index + 2])) {
                 remaining.push(...state.fallbackCommands.slice(index));
                 break;
             }
+            modeQueued ||= state.fallbackCommands[index] === Ring.OPCODE_SET_MIXER_MODE;
         }
         state.fallbackCommands = remaining;
+        if (modeQueued) state.node.port.postMessage({ type: 'flushCommands' });
         return;
     }
     const commands = state.fallbackCommands;
     state.fallbackCommands = [];
     state.node.port.postMessage({ type: 'commandBatch', commands });
+}
+
+function sendCommandsToGraph(graph, commands) {
+    if (graph.commandRing !== null) {
+        for (let index = 0; index < commands.length; index += 3) {
+            if (!Ring.pushCommand(graph.commandRing, commands[index], commands[index + 1], commands[index + 2])) {
+                throw new Error('The new audio graph command ring filled while restoring playback.');
+            }
+        }
+    } else {
+        graph.node.port.postMessage({ type: 'commandBatch', commands });
+    }
+}
+
+function playbackRestoreCommands() {
+    const order = state.latest?.order ?? 0;
+    const playing = state.latest?.playing ?? state.metadata !== null;
+    const volume = Math.round(Number(elements.volume.value) * 65535 / 100);
+    return [
+        Ring.OPCODE_MASTER_VOLUME, volume, 0,
+        Ring.OPCODE_SEEK_ORDER, order, 0,
+        playing ? Ring.OPCODE_PLAY : Ring.OPCODE_STOP, 0, 0,
+    ];
+}
+
+async function rebuildAudioContext() {
+    if (state.node === null) {
+        await startAudio();
+        return;
+    }
+    const requested = elements.sampleRate.value;
+    const label = requested === '' ? 'device default' : formatRate(Number(requested));
+    const oldContext = state.context;
+    const oldNode = state.node;
+    const oldSinkId = 'sinkId' in oldContext ? oldContext.sinkId : '';
+    const restoreCommands = playbackRestoreCommands();
+    const contextOptions = { latencyHint: 'interactive' };
+    if (requested !== '') contextOptions.sampleRate = Number(requested);
+    let candidateContext = null;
+    let candidateNode = null;
+    try {
+        // Construction is synchronous and is the point at which Firefox may throw
+        // NotSupportedError. Nothing in the live graph has changed yet.
+        candidateContext = new AudioContext(contextOptions);
+        const unlock = candidateContext.resume();
+        const channels = Number(elements.outputChannels.value) === 1 ? 1 : 2;
+        const graph = await prepareNode(candidateContext, channels, mixerModeFromControls(), true);
+        candidateNode = graph.node;
+        const activation = state.currentModuleBytes === null
+            ? null
+            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0));
+        if (oldSinkId && typeof candidateContext.setSinkId === 'function') {
+            await candidateContext.setSinkId(oldSinkId).catch((error) => {
+                elements.outputDeviceNote.textContent = `The previous output device could not be restored (${error.name || error.message}).`;
+            });
+        }
+        await unlock;
+        graph.node.connect(candidateContext.destination);
+        if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
+        state.context = candidateContext;
+        installGraph(graph);
+        state.latest = null;
+        state.activeModeWire = mixerModeFromControls();
+        if (activation) state.activationMemoryBytes = activation.memoryBytes;
+        oldNode.disconnect();
+        await oldContext.close().catch(() => {});
+        state.requestedSampleRate = requested;
+        state.rateReport = `${label} / ${formatRate(candidateContext.sampleRate)}`;
+        candidateContext.addEventListener('statechange', updateOutputPanel);
+        persistPreferences();
+        await refreshOutputDevices();
+        updateOutputPanel();
+        showMessage(`Output rate rebuilt: requested ${label}, actual ${formatRate(candidateContext.sampleRate)}; playback restored at the sounding order.`);
+    } catch (error) {
+        if (candidateNode !== null) candidateNode.disconnect();
+        if (candidateContext !== null) await candidateContext.close().catch(() => {});
+        const name = error?.name || 'Error';
+        state.rateReport = `${label} refused (${name}); kept ${formatRate(oldContext.sampleRate)}`;
+        updateOutputPanel();
+        showMessage(`Sample-rate request was refused (${name}); the existing ${formatRate(oldContext.sampleRate)} context is still playing.`);
+    }
+}
+
+async function rebuildOutputChannels() {
+    const alreadyStarted = state.node !== null;
+    await startAudio();
+    if (!alreadyStarted) {
+        persistPreferences();
+        updateOutputPanel();
+        return;
+    }
+    const channels = Number(elements.outputChannels.value) === 1 ? 1 : 2;
+    const oldNode = state.node;
+    const restoreCommands = playbackRestoreCommands();
+    let candidateNode = null;
+    try {
+        const graph = await prepareNode(state.context, channels, mixerModeFromControls(), false);
+        candidateNode = graph.node;
+        const activation = state.currentModuleBytes === null
+            ? null
+            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0));
+        graph.node.connect(state.context.destination);
+        if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
+        installGraph(graph);
+        state.latest = null;
+        state.activeModeWire = mixerModeFromControls();
+        if (activation) state.activationMemoryBytes = activation.memoryBytes;
+        oldNode.disconnect();
+        persistPreferences();
+        updateOutputPanel();
+        showMessage(`Output rebuilt for ${channels === 1 ? 'mono' : 'stereo'}; playback restored at the sounding order.`);
+    } catch (error) {
+        if (candidateNode !== null) candidateNode.disconnect();
+        showError(`Could not rebuild the output channels: ${error.message || error}`);
+    }
+}
+
+function applyMixerMode() {
+    persistPreferences();
+    const wire = mixerModeFromControls(state.node === null ? undefined : state.outputChannelCount);
+    if (state.node === null) {
+        state.activeModeWire = wire;
+        updateOutputPanel();
+        showMessage('Mixer choice saved; it will be used when audio starts.');
+        return;
+    }
+    queueCommand(Ring.OPCODE_SET_MIXER_MODE, wire, 0);
+    if (state.commandRing !== null) state.node.port.postMessage({ type: 'flushCommands' });
+}
+
+async function refreshOutputDevices() {
+    const sinkSupported = typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype;
+    const selectorSupported = navigator.mediaDevices && typeof navigator.mediaDevices.selectAudioOutput === 'function';
+    elements.outputDeviceLabel.hidden = !sinkSupported;
+    elements.applyOutputDevice.hidden = !sinkSupported;
+    elements.chooseOutputDevice.hidden = !selectorSupported;
+    if (!sinkSupported) {
+        elements.outputDeviceNote.textContent = 'This browser does not expose AudioContext.setSinkId(); the system default output is used.';
+        updateOutputPanel();
+        return;
+    }
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') {
+        elements.outputDeviceNote.textContent = 'Output-device enumeration is unavailable; the default output remains usable.';
+        return;
+    }
+    try {
+        const devices = (await navigator.mediaDevices.enumerateDevices()).filter((device) => device.kind === 'audiooutput');
+        const selected = state.context && 'sinkId' in state.context
+            ? state.context.sinkId
+            : (elements.outputDevice.dataset.savedSinkId || '');
+        state.outputDevices.clear();
+        elements.outputDevice.replaceChildren();
+        const defaultOption = document.createElement('option');
+        defaultOption.value = '';
+        defaultOption.textContent = 'Default';
+        elements.outputDevice.append(defaultOption);
+        state.outputDevices.set('', { label: 'default' });
+        devices.forEach((device, index) => {
+            const option = document.createElement('option');
+            option.value = device.deviceId;
+            option.textContent = device.label || (device.deviceId === 'default' ? 'Default' : `Output ${index + 1}`);
+            elements.outputDevice.append(option);
+            state.outputDevices.set(device.deviceId, device);
+        });
+        if ([...elements.outputDevice.options].some((option) => option.value === selected)) elements.outputDevice.value = selected;
+        elements.outputDeviceNote.textContent = devices.some((device) => device.label)
+            ? 'Choose a permitted browser output.'
+            : 'Device labels remain hidden until the browser grants output permission; default is available.';
+        updateOutputPanel();
+    } catch (error) {
+        elements.outputDeviceNote.textContent = `Could not enumerate outputs (${error.name || error.message}); default remains available.`;
+    }
+}
+
+async function applyOutputDevice() {
+    await startAudio();
+    if (typeof state.context.setSinkId !== 'function') return;
+    try {
+        await state.context.setSinkId(elements.outputDevice.value);
+        persistPreferences();
+        await refreshOutputDevices();
+        updateOutputPanel();
+        showMessage(`Output device: ${elements.sinkStatus.textContent}.`);
+    } catch (error) {
+        showError(`Could not select that output device: ${error.name || error.message}`);
+    }
+}
+
+async function chooseOutputDevice() {
+    try {
+        const device = await navigator.mediaDevices.selectAudioOutput();
+        await refreshOutputDevices();
+        selectStoredValue(elements.outputDevice, device.deviceId);
+        await applyOutputDevice();
+    } catch (error) {
+        elements.outputDeviceNote.textContent = `No output was selected (${error.name || error.message}).`;
+    }
 }
 
 /// The instrument column is sized once per module, to the longest name in it, and clipped
@@ -517,6 +872,7 @@ function updatePattern(snapshot) {
 function updateSnapshot(snapshot) {
     if (!snapshot || snapshot.sequence === 0 || !state.metadata) return;
     state.latest = snapshot;
+    state.activeModeWire = snapshot.mixerModeWire >>> 0;
     setText(elements.order, `${snapshot.order + 1}/${state.metadata.orders}`);
     setText(elements.pattern, String(snapshot.pattern));
     setText(elements.row, `${String(snapshot.row).padStart(2, '0')}:${snapshot.tick}`);
@@ -537,6 +893,7 @@ function updateSnapshot(snapshot) {
     elements.retired.textContent = `${state.retiredSeen} returned, ${snapshot.pendingGarbage} pending`;
     elements.health.textContent = snapshot.warnings === 0 && stable ? 'healthy' : 'warning';
     elements.health.style.color = snapshot.warnings === 0 && stable ? 'var(--accent)' : 'var(--danger)';
+    updateOutputPanel();
     if (snapshot.warnings !== 0) showError(`Engine warning flags: 0x${snapshot.warnings.toString(16)}`);
 }
 
@@ -651,12 +1008,30 @@ elements.volume.addEventListener('input', () => {
     queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(percent * 65535 / 100));
 });
 
+elements.applySampleRate.addEventListener('click', () => rebuildAudioContext().catch(showError));
+elements.applyChannels.addEventListener('click', () => rebuildOutputChannels().catch(showError));
+elements.applyOutputDevice.addEventListener('click', () => applyOutputDevice().catch(showError));
+elements.chooseOutputDevice.addEventListener('click', () => chooseOutputDevice().catch(showError));
+elements.applyMixer.addEventListener('click', applyMixerMode);
+// A choice is remembered as it is made, not only when it is applied: the owner's test
+// setup should survive a reload even if the page is reloaded mid-comparison.
+for (const select of [elements.sampleRate, elements.outputChannels, elements.mixerPath, elements.mixerInterpolator, elements.mixerDepth, elements.mixerDither]) {
+    select.addEventListener('change', persistPreferences);
+}
+if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function') {
+    navigator.mediaDevices.addEventListener('devicechange', () => { refreshOutputDevices().catch(() => {}); });
+}
+
 elements.forceFallback.disabled = !sharedMemoryAvailable();
 if (!sharedMemoryAvailable()) {
     elements.forceFallback.checked = true;
     elements.commandTransport.textContent = 'postMessage fallback (COOP/COEP unavailable)';
     elements.telemetryTransport.textContent = 'postMessage fallback (COOP/COEP unavailable)';
 }
+restorePreferences();
+state.activeModeWire = mixerModeFromControls();
+updateOutputPanel();
+refreshOutputDevices().catch(() => {});
 requestAnimationFrame(refresh);
 
 // `app.js` is a module and therefore deferred. This is the one honest signal that its

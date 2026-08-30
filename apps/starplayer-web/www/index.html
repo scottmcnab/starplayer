@@ -144,8 +144,64 @@
                 <div><dt title="Loading a module allocates on the worklet instance; that growth happens in a message task, outside process(). Only growth during playback is a defect.">Measured</dt><dd>across playback, not across loads</dd></div>
                 <div><dt>Dropped</dt><dd id="dropped">0</dd></div>
                 <div><dt>Retired modules</dt><dd id="retired">0</dd></div>
+                <div><dt>Active mixer</dt><dd id="engine-mode">—</dd></div>
             </dl>
             <label class="fallback"><input id="force-fallback" type="checkbox"> Test postMessage fallback</label>
+        </article>
+        <article class="panel diagnostics output-panel">
+            <div class="panel-heading"><h2>Output</h2><span id="output-status">audio asleep</span></div>
+            <dl>
+                <div><dt>Requested / actual</dt><dd id="sample-rate-status">device default / —</dd></div>
+                <div><dt>Context</dt><dd id="context-state">—</dd></div>
+                <div><dt>Base latency</dt><dd id="base-latency">—</dd></div>
+                <div><dt>Output latency</dt><dd id="output-latency">—</dd></div>
+                <div><dt>Channels</dt><dd id="channel-status">—</dd></div>
+                <div><dt>Device limit</dt><dd id="max-channel-count">—</dd></div>
+                <div><dt>Sink</dt><dd id="sink-status">default</dd></div>
+                <div><dt>Worklet rate</dt><dd id="worklet-rate">—</dd></div>
+                <div><dt>Engine mode</dt><dd id="output-engine-mode">—</dd></div>
+            </dl>
+            <div class="option-grid">
+                <label>Requested sample rate
+                    <select id="sample-rate">
+                        <option value="">Device default</option>
+                        <option>8000</option><option>11025</option><option>16000</option><option>22050</option>
+                        <option>32000</option><option>44100</option><option>48000</option><option>88200</option><option>96000</option>
+                    </select>
+                </label>
+                <button id="apply-sample-rate" type="button">Apply rate</button>
+                <label id="output-device-label">Output device
+                    <select id="output-device"><option value="">Default</option></select>
+                </label>
+                <button id="apply-output-device" type="button">Apply device</button>
+                <button id="choose-output-device" type="button" hidden>Choose device…</button>
+                <p id="output-device-note" class="option-note"></p>
+                <label>Channels
+                    <select id="output-channels"><option value="2">Stereo</option><option value="1">Mono</option></select>
+                </label>
+                <button id="apply-channels" type="button">Apply channels</button>
+            </div>
+        </article>
+        <article class="panel diagnostics mixer-panel">
+            <div class="panel-heading"><h2>Mixer</h2><span>applied between render callbacks</span></div>
+            <div class="option-grid mixer-options">
+                <label>Path
+                    <select id="mixer-path"><option value="float">Float</option><option value="fixed">Fixed-point</option></select>
+                </label>
+                <label>Interpolation
+                    <select id="mixer-interpolator"><option value="linear">Linear</option><option value="nearest">Nearest</option></select>
+                </label>
+                <label>Depth
+                    <select id="mixer-depth">
+                        <option value="f32">32-bit float</option><option value="i32">32-bit int</option><option value="i24">24-bit</option>
+                        <option value="i16">16-bit</option><option value="i8">8-bit</option>
+                    </select>
+                </label>
+                <label>Dither
+                    <select id="mixer-dither"><option value="off">Off</option><option value="tpdf">TPDF</option></select>
+                </label>
+                <button id="apply-mixer" class="primary" type="button">Apply mixer</button>
+            </div>
         </article>
     </section>
 </main>

@@ -40,6 +40,7 @@ const commandRing = Ring.createCommandRing();
 const telemetry = Ring.createTelemetry();
 const processor = new Processor({ processorOptions: {
     channelCount: 2,
+    mixerMode: 0x0000_0202,
     wasmModule: new WebAssembly.Module(wasmBytes),
     commandRing: commandRing.buffer,
     telemetry: telemetry.buffer,
@@ -89,6 +90,13 @@ quantum();
 assert.equal(quantum(), 0, 'Stop ramps to clean silence');
 Ring.pushCommand(commandRing, Ring.OPCODE_PLAY, 0, 0);
 quantum();
+
+Ring.pushCommand(commandRing, Ring.OPCODE_SET_MIXER_MODE, 0x0000_0221, 0);
+port.dispatch({ type: 'flushCommands' });
+assert.ok(port.messages.some((message) => message.type === 'mixerModeApplied' && message.active === 0x0000_0221));
+quantum();
+snapshot = Ring.readTelemetry(telemetry);
+assert.equal(snapshot.mixerModeWire, 0x0000_0221);
 
 port.dispatch({ type: 'loadModule', requestId: 2, bytes: secondFixture });
 assert.ok(port.messages.some((message) => message.type === 'moduleLoaded' && message.requestId === 2));

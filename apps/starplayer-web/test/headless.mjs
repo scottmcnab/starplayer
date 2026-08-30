@@ -302,8 +302,29 @@ const READ_STATE = `
         instruments: document.querySelectorAll('#instrument-list li').length,
         crossOriginIsolated: globalThis.crossOriginIsolated === true,
         archivePickerVisible: !document.getElementById('archive-picker').hidden,
+        engineMode: text('engine-mode'),
+        outputEngineMode: text('output-engine-mode'),
+        outputStatus: text('output-status'),
+        sampleRateStatus: text('sample-rate-status'),
+        contextState: text('context-state'),
+        baseLatency: text('base-latency'),
+        outputLatency: text('output-latency'),
+        channelStatus: text('channel-status'),
+        maxChannelCount: text('max-channel-count'),
+        sinkStatus: text('sink-status'),
+        workletRate: text('worklet-rate'),
     };
 `;
+
+/// The Output panel formats rates with `toLocaleString`, so "22,050 Hz" and "22050 Hz" are
+/// both correct depending on the browser's locale. Compare the digits, not the text.
+function rateDigits(text) {
+    return Number(text.replace(/[^0-9]/g, ''));
+}
+
+function orderNumber(text) {
+    return Number(text.split('/')[0]);
+}
 
 async function loadFixture(page, name) {
     await page.evaluate(`
@@ -512,6 +533,103 @@ async function run(executable, mode) {
         const afterSurvival = await page.evaluate(READ_STATE);
         assert.notEqual(afterSurvival.row, beforeSurvival.row, 'playback continued through the failed load');
         assert.equal(afterSurvival.memory, baselineMemory, 'a failed load did not grow wasm memory');
+
+        // ── a rebuilt AudioContext at another sample rate ───────────────────────────
+        // Changing the rate is a whole-graph rebuild: a new AudioContext, a new worklet
+        // node, the module reloaded from the bytes the page retained, and the transport
+        // seeked back to the order that was sounding. Chromium honours every rate in the
+        // menu; Firefox may throw NotSupportedError, which the page has to report while
+        // keeping the old context alive. Both outcomes pass here, and the report says which.
+        // The broken-file banner above is still on screen and stays there: nothing here
+        // clears it, so these steps assert the banner never says anything *new*.
+        const beforeRate = await page.evaluate(READ_STATE);
+        const rateBefore = rateDigits(beforeRate.workletRate);
+        const orderBefore = orderNumber(beforeRate.order);
+        assert.equal(beforeRate.engineMode, 'float · linear · 32-bit float · stereo', 'the default mixer mode is reported before anything is changed');
+        await page.evaluate(`
+            const select = document.getElementById('sample-rate');
+            select.value = '22050';
+            select.dispatchEvent(new Event('change'));
+            document.getElementById('apply-sample-rate').click();
+            return true;
+        `);
+        await page.waitFor('the 22050 Hz request to be reported', "document.getElementById('sample-rate-status').textContent.replace(/[^0-9]/g, '').startsWith('22050')");
+        await page.waitFor('telemetry from the rebuilt graph', `document.getElementById('row').textContent !== ${JSON.stringify(beforeRate.row)}`);
+        await delay(2000);
+        const rebuilt = await page.evaluate(READ_STATE);
+        const rateAfter = rateDigits(rebuilt.workletRate);
+        const refused = /refused/.test(rebuilt.sampleRateStatus);
+        assert.ok(refused || rateAfter === 22050, `the context rate moved to 22050 Hz, or the refusal was reported: ${rebuilt.sampleRateStatus}`);
+        if (refused) assert.equal(rateAfter, rateBefore, 'a refused rate leaves the old context playing');
+        assert.equal(rateDigits(rebuilt.outputStatus), rateAfter, 'the context and the worklet agree on the rate');
+        assert.equal(rebuilt.chip, 'playing', 'the rebuilt graph is playing again');
+        assert.equal(rebuilt.errorText, beforeRate.errorText, `the rate rebuild raised an error: ${rebuilt.errorText}`);
+        const orderAfter = orderNumber(rebuilt.order);
+        assert.ok(orderAfter >= orderBefore && orderAfter <= orderBefore + 1, `the rebuild resumed at the sounding order (${orderBefore} → ${orderAfter})`);
+        assert.equal(rebuilt.health, 'healthy');
+        report.rateRequested = 22050;
+        report.rateActual = rateAfter;
+        report.rateStatus = rebuilt.sampleRateStatus;
+        report.rateRefused = refused;
+        report.orderAcrossRebuild = `${orderBefore} → ${orderAfter}`;
+        report.latency = `${rebuilt.baseLatency} base, ${rebuilt.outputLatency} output`;
+        report.sink = `${rebuilt.sinkStatus} (max ${rebuilt.maxChannelCount} channels)`;
+
+        // ── the retro mixer mode, applied to the live engine ────────────────────────
+        // The mode string is read back out of the engine's own telemetry header, so this
+        // asserts the whole round trip: page select → wire opcode → host engine rebuild →
+        // active mode word → panel.
+        const beforeMixer = await page.evaluate(READ_STATE);
+        await page.evaluate(`
+            document.getElementById('mixer-path').value = 'fixed';
+            document.getElementById('mixer-interpolator').value = 'nearest';
+            document.getElementById('mixer-depth').value = 'i8';
+            document.getElementById('mixer-dither').value = 'off';
+            document.getElementById('apply-mixer').click();
+            return true;
+        `);
+        await page.waitFor('the retro mixer mode in the engine telemetry', "document.getElementById('engine-mode').textContent === 'fixed \u00b7 nearest \u00b7 8-bit \u00b7 stereo'");
+        const retro = await page.evaluate(READ_STATE);
+        assert.equal(retro.outputEngineMode, 'fixed \u00b7 nearest \u00b7 8-bit \u00b7 stereo', 'the Output panel shows the same active mode');
+        assert.equal(retro.chip, 'playing', 'the engine rebuild did not stop the transport');
+        assert.equal(retro.order, beforeMixer.order, 'the rebuilt engine resumed at the order that was sounding');
+        // The rebuilt sequencer seeks to the sounding order, which restarts it at row 0, so
+        // two samples taken the same distance after two rebuilds read the same row. Wait for
+        // the row to move instead of comparing two snapshots.
+        await page.waitFor('the 8-bit fixed path to keep rendering', `document.getElementById('row').textContent !== ${JSON.stringify(retro.row)}`);
+        await delay(2000);
+        const afterRetro = await page.evaluate(READ_STATE);
+        assert.equal(afterRetro.memory, retro.memory, `wasm memory moved after the engine rebuild: ${afterRetro.memory}`);
+        assert.ok(afterRetro.memory.includes('stable'), `wasm memory grew after the engine rebuild: ${afterRetro.memory}`);
+        assert.equal(afterRetro.health, 'healthy');
+        assert.equal(afterRetro.errorText, beforeRate.errorText, `the mixer switch raised an error: ${afterRetro.errorText}`);
+        const stored = await page.evaluate("return localStorage.getItem('starplayer.output-and-mixer.v1');");
+        assert.match(stored, /"sampleRate":"22050"/, 'the requested rate is remembered');
+        assert.match(stored, /"depth":"i8"/, 'the mixer depth is remembered');
+        assert.match(stored, /"path":"fixed"/, 'the mixer path is remembered');
+        report.mixerMode = retro.engineMode;
+        report.mixerMemory = afterRetro.memory;
+        report.stored = JSON.parse(stored);
+
+        // ── mono, which rebuilds the node inside the same AudioContext ──────────────
+        // The mono engine arms are otherwise only reached by the Rust unit tests; this is
+        // the one place the whole mono path renders through a real AudioWorklet.
+        await page.evaluate(`
+            const select = document.getElementById('output-channels');
+            select.value = '1';
+            select.dispatchEvent(new Event('change'));
+            document.getElementById('apply-channels').click();
+            return true;
+        `);
+        await page.waitFor('the mono engine arm', "document.getElementById('engine-mode').textContent === 'fixed \u00b7 nearest \u00b7 8-bit \u00b7 mono'");
+        const mono = await page.evaluate(READ_STATE);
+        assert.match(mono.channelStatus, /^mono/, `the Output panel reports mono: ${mono.channelStatus}`);
+        assert.equal(mono.chip, 'playing', 'the mono rebuild kept the transport running');
+        await page.waitFor('the mono path to keep rendering', `document.getElementById('row').textContent !== ${JSON.stringify(mono.row)}`);
+        const afterMono = await page.evaluate(READ_STATE);
+        assert.equal(afterMono.errorText, beforeRate.errorText, `the mono rebuild raised an error: ${afterMono.errorText}`);
+        report.monoMode = mono.engineMode;
+        report.monoChannels = mono.channelStatus;
 
         // ── phone width ─────────────────────────────────────────────────────────────
         await page.send('Emulation.setDeviceMetricsOverride', {

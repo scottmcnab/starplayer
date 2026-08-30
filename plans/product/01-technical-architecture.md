@@ -513,6 +513,21 @@ sample):
 Output conversion handles 8/16/24/32-bit integer and f32, mono and stereo, with
 dithering for the reduced-depth cases.
 
+**The host owns the choice, not the engine (M1-B9).** Path, interpolator and output format
+are type parameters of `Engine`, so selecting one is a re-instantiation, not a field write:
+`Command::SetInterpolator` stays flagged as unsupported precisely because the engine cannot
+rebuild itself from inside its own command handler. `starplayer-engine` therefore exports
+only `MixerMode` — plain `no_std` data (path, interpolator, depth, dither, channels) with a
+stable `u32` wire encoding — and a host holds an enum over the instantiations it is willing
+to build. The web host's set is 2 paths × 2 interpolators × mono/stereo = 8 arms, built by
+a macro. Depth and dither are **not** arms: they are a post-quantisation stage in the host,
+applied with the mixer's own `HostSample` conversions and `Dither` after the output ring
+and before the buffer the audio callback reads. That gives five depths on every arm without
+forty instantiations, and leaves the fixed path's native `i16` untouched at `I16` depth, so
+the golden bit-exact path stays bit-exact. Switching mode is a rebuild performed off the
+render path, keeping the same `Arc<Module>`, seeking the rebuilt sequencer to the order that
+was sounding and restarting its clock at the new engine's frame.
+
 SIMD (via `core::simd` behind a feature) is an optimisation *inside* the monomorphised
 loop, never a semantic change. A scalar-equivalence test gates it.
 
@@ -701,17 +716,22 @@ A4 carried one command (`SetFrequency`) and one scalar back. B7 kept both transp
 both shapes and widened them, without changing the decisions above.
 
 **Commands** are fixed three-word records — opcode, argument, extra — in the same SPSC
-ring, covering play, stop, seek order, seek row, master volume and channel mute. The
-worklet decodes each record into a `starplayer_core::Command` and stages it in a
-fixed-capacity queue drained immediately before `Engine::render`, so the JavaScript edge
-never touches the engine's own control ring. On the fallback path the page batches every
-control change made during one animation frame into one message, so "no `postMessage` per
-interaction" holds on both paths.
+ring, covering play, stop, seek order, seek row, master volume, channel mute and
+`SET_MIXER_MODE` (opcode 7, argument = `MixerMode::to_wire()`). The worklet decodes each
+record into a `starplayer_core::Command` and stages it in a fixed-capacity queue drained
+immediately before `Engine::render`, so the JavaScript edge never touches the engine's own
+control ring. On the fallback path the page batches every control change made during one
+animation frame into one message, so "no `postMessage` per interaction" holds on both
+paths. `SET_MIXER_MODE` is the one opcode that is *not* staged for the render path:
+rebuilding a typed engine allocates (§7.1), so whichever drain sees it only retains the
+scalar, and the rebuild runs in a worklet message task — the page follows a ring push with
+a `flushCommands` message to provide one.
 
-**Snapshots** cross as a flat `Int32Array`: an 18-word header (sequence, dropped publishes,
+**Snapshots** cross as a flat `Int32Array`: a 19-word header (sequence, dropped publishes,
 channel count, voices, order, pattern, row, tick, speed, BPM, global volume, warning bits,
-engine frame, pending garbage, module generation, playing, master peak, retired modules)
-then eight words per channel for all 64. The seqlock is the page's; the worklet copies the
+engine frame, pending garbage, module generation, playing, master peak, retired modules,
+**active mixer mode**) then eight words per channel for all 64. The mode word is what the
+host actually built rather than what was requested, so the page can show the difference. The seqlock is the page's; the worklet copies the
 whole block between an odd and an even sequence store. What does **not** cross is
 `EffectDisplay::name` — a `&'static str` has no meaning in another address space, let alone
 another realm. The **whole English name table crosses once**, at start-up, from the

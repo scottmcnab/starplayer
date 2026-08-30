@@ -14,7 +14,9 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             : new WebAssembly.Module(settings.wasmBytes);
         const wasm = wasm_bindgen.initSync({ module });
 
-        wasm_bindgen.init(sampleRate, settings.channelCount);
+        if (!wasm_bindgen.init(sampleRate, settings.mixerMode)) {
+            throw new Error('the requested mixer mode has no web engine arm');
+        }
         this.memory = wasm.memory;
         this.renderQuantum = wasm_bindgen.render_quantum();
         this.channelCount = settings.channelCount;
@@ -27,8 +29,17 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         this.stableMemoryBytes = this.initialMemoryBytes;
         this.bindViews();
 
+        this.pendingMixerMode = null;
+        // Every other opcode is staged for the render path. A mode change is not: whichever
+        // drain sees it — process(), or a message task — it is only retained as a scalar,
+        // because rebuilding a typed engine allocates. `applyPendingMixerMode` runs it, and
+        // is only ever called from a message task.
         this.applyCommand = (opcode, argument, extra) => {
-            wasm_bindgen.enqueue_command(opcode, argument, extra);
+            if (opcode === Ring.OPCODE_SET_MIXER_MODE) {
+                this.pendingMixerMode = argument >>> 0;
+            } else {
+                wasm_bindgen.enqueue_command(opcode, argument, extra);
+            }
         };
         this.port.onmessage = (event) => this.onMessage(event.data);
         this.port.postMessage({
@@ -39,6 +50,25 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             commandTransport: this.commandRing ? 'SharedArrayBuffer' : 'postMessage',
             telemetryTransport: this.telemetry ? 'SharedArrayBuffer' : 'postMessage',
         });
+    }
+
+    applyPendingMixerMode() {
+        if (this.pendingMixerMode === null) return;
+        const requested = this.pendingMixerMode;
+        this.pendingMixerMode = null;
+        try {
+            const active = wasm_bindgen.set_mixer_mode(requested);
+            // Rebuilding typed engine storage may grow wasm memory. Rebase only here,
+            // outside process(), exactly as module activation does.
+            this.bindViews();
+            this.port.postMessage({ type: 'mixerModeApplied', requested, active, memoryBytes: this.stableMemoryBytes });
+        } catch (error) {
+            this.port.postMessage({
+                type: 'mixerModeError',
+                requested,
+                reason: error && error.message ? error.message : String(error),
+            });
+        }
     }
 
     bindViews() {
@@ -81,6 +111,12 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             }
         } else if (message.type === 'commandBatch') {
             Ring.drainFallbackCommands(message.commands, this.applyCommand);
+            this.applyPendingMixerMode();
+        } else if (message.type === 'flushCommands') {
+            if (this.commandRing !== null) {
+                Ring.drainCommands(this.commandRing, this.applyCommand);
+            }
+            this.applyPendingMixerMode();
         } else if (message.type === 'collectGarbage') {
             const collected = wasm_bindgen.collect_garbage();
             this.port.postMessage({

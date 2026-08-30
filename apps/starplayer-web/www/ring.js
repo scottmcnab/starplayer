@@ -20,6 +20,7 @@
     const OPCODE_SEEK_ROW = 4;
     const OPCODE_MASTER_VOLUME = 5;
     const OPCODE_MUTE_CHANNEL = 6;
+    const OPCODE_SET_MIXER_MODE = 7;
 
     function viewCommandRing(buffer) {
         return { buffer, words: new Int32Array(buffer) };
@@ -84,7 +85,7 @@
     }
 
     // Rust's packed Snapshot layout. The SAB adds a seqlock and diagnostics ahead of it.
-    const SNAPSHOT_HEADER_WORDS = 18;
+    const SNAPSHOT_HEADER_WORDS = 19;
     const SNAPSHOT_CHANNEL_WORDS = 8;
     const SNAPSHOT_CHANNELS = 64;
     const SNAPSHOT_WORDS = SNAPSHOT_HEADER_WORDS + SNAPSHOT_CHANNELS * SNAPSHOT_CHANNEL_WORDS;
@@ -156,6 +157,7 @@
             playing: source[15] !== 0,
             masterPeak: source[16],
             retiredCollected: source[17],
+            mixerModeWire: source[18] >>> 0,
             channels,
             memoryBytes: diagnostics.memoryBytes,
             quantumFrames: diagnostics.quantumFrames,
@@ -201,6 +203,7 @@
         OPCODE_SEEK_ROW,
         OPCODE_MASTER_VOLUME,
         OPCODE_MUTE_CHANNEL,
+        OPCODE_SET_MIXER_MODE,
         SNAPSHOT_WORDS,
         TELEMETRY_BYTES,
         TELEMETRY_FALLBACK_QUANTA,

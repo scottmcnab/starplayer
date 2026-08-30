@@ -15,8 +15,8 @@ const CAPACITY_MASK: usize = COMMAND_RING_CAPACITY - 1;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireCommand {
     pub opcode: u8,
-    pub argument: u16,
-    pub extra: u16,
+    pub argument: u32,
+    pub extra: u32,
 }
 
 /// A bounded, allocation-free queue. It is SPSC at the browser boundary: the worklet's
@@ -81,7 +81,7 @@ mod tests {
     fn overflow_is_visible_and_preserves_queued_records() {
         let mut ring = CommandRing::new();
         for index in 0..COMMAND_RING_CAPACITY {
-            assert!(ring.push(WireCommand { opcode: 1, argument: index as u16, extra: 0 }));
+            assert!(ring.push(WireCommand { opcode: 1, argument: index as u32, extra: 0 }));
         }
         assert!(!ring.push(WireCommand::default()));
         assert_eq!(ring.dropped(), 1);

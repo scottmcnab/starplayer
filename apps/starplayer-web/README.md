@@ -68,6 +68,87 @@ At phone width the channel and pattern tables scroll horizontally. Collapsing a 
 row or paginating channels would hide the relationship between instrument, note, VU and
 the English effect name; a deliberate horizontal swipe preserves it.
 
+## Output and mixer options
+
+Two panels beside the Engine panel expose what the browser is actually doing and what the
+mixer is actually doing, and let both be changed while a module plays.
+
+**Output** reports the live `AudioContext`: requested versus actual `sampleRate`,
+`state`, `baseLatency`, `outputLatency`, the node's channel count against
+`destination.maxChannelCount`, the sink, and the worklet's own `sampleRate` — which must
+agree with the context, and is shown separately so a disagreement is visible rather than
+inferred.
+
+- **Requested sample rate** — `device default` or one of 8000 … 96000. There is no way to
+  retune a running `AudioContext`, so applying one **rebuilds the whole graph**: a new
+  context with `{ sampleRate, latencyHint }`, the worklet module re-added, a new node with
+  the same `processorOptions` shape, the current module reloaded from the bytes the page
+  retains for exactly this purpose, a seek back to the order that was sounding, and play if
+  it was playing. The old context is kept until the new one has a node, so a browser that
+  refuses the rate (Firefox throws `NotSupportedError` for rates the device cannot do)
+  leaves the music running and the panel reports the refusal. Chromium 151 honours every
+  rate in the menu exactly — see the table below.
+- **Output device** — populated from `navigator.mediaDevices.enumerateDevices()` and
+  applied with `AudioContext.setSinkId()`. Labels stay blank until the browser grants
+  output permission; the select and its Apply button hide themselves, with a note, on a
+  browser without `setSinkId`. `navigator.mediaDevices.selectAudioOutput()` is offered as
+  **Choose device…** where it exists (Firefox). `setSinkId` needs **no** Permissions-Policy
+  header here: `speaker-selection` is not among the 82 policy-controlled features
+  Chromium 151 implements, and for a top-level same-origin document the specification's
+  default allowlist is `self` anyway. The dev server therefore sends no extra header.
+- **Channels** — stereo or mono. Applying rebuilds the worklet node inside the same
+  context with `outputChannelCount: [n]` and a mixer mode whose channel count matches.
+
+**Mixer** selects path (float / fixed-point), interpolation (linear / nearest), depth
+(32-bit float, 32-bit int, 24-bit, 16-bit, 8-bit) and dither (off / TPDF). Applying sends
+one `SET_MIXER_MODE` command; the Engine panel's **Active mixer** line is read back out of
+the telemetry header, so it shows what the host actually built rather than what was asked
+for. A 1994 S3M through `fixed · nearest · 8-bit · mono` at 11025 Hz is the point of the
+exercise.
+
+Every one of those choices is written to `localStorage` (in a try/catch — a
+storage-blocked page still works, it just forgets). The module is never persisted.
+
+### Why the host owns the mixer mode
+
+The engine's path, interpolator and output format are **type parameters**, so changing one
+is a re-instantiation, not a field write — `Command::SetInterpolator` is still flagged as
+unsupported for exactly that reason. `starplayer-engine` therefore carries only
+`MixerMode`, a plain `no_std` description with a stable `u32` wire encoding, and
+`starplayer-host-wasm` owns an eight-arm enum over the engine instantiations the mode can
+select (2 paths × 2 interpolators × mono/stereo), built by a macro so each arm is one line.
+
+Depth and dither are **not** engine arms. They are a post-quantisation stage in the host,
+applied to the rendered samples with the mixer's own `HostSample` conversions and `Dither`
+after the engine's output ring and before the planar copy the worklet reads. That gives
+all five depths on all eight arms without forty engine instantiations, and it keeps the
+fixed path's native `i16` output bit-exact at `I16` depth — the golden path M2 will hash.
+
+A mode switch happens in the worklet's message handler, never in `process()`. It rebuilds
+the engine at the same sample rate, hands it the `Arc<Module>` the host already holds — no
+bytes cross again and nothing is retired — rebuilds the sequencer with `sequencer_for`,
+seeks it to the order that was sounding, restarts its clock at the new engine's frame, and
+restores master volume, channel mutes and the play/stop state.
+
+### What Chromium 151 headless does with a requested rate
+
+| Requested | Actual `sampleRate` |
+|---|---|
+| device default | 44100 |
+| 8000 | 8000 |
+| 11025 | 11025 |
+| 16000 | 16000 |
+| 22050 | 22050 |
+| 32000 | 32000 |
+| 44100 | 44100 |
+| 48000 | 48000 |
+| 88200 | 88200 |
+| 96000 | 96000 |
+
+No rate was refused and none was silently resampled to the device rate: Chromium honours
+the constructor argument and resamples on its own output side. Firefox and Safari have not
+been run here (neither is installed) and still need an owner check.
+
 ### Reading the memory line
 
 The Engine panel's memory line is the check that matters for real-time safety, and it
@@ -104,8 +185,11 @@ protocol with Node's built-in `WebSocket`, and runs the page three ways — cros
 isolated on shared memory, isolated with the fallback forced, and served without COOP/COEP
 at all. Each run plays a fixture, asserts the quantum is 128 frames and wasm memory does
 not move, loads a second module over the top of the first and waits for the retired Arc,
-drops a deliberately broken file and checks that playback survives it, and finally shrinks
-the viewport to 390×844 and asserts nothing overflows horizontally.
+drops a deliberately broken file and checks that playback survives it, rebuilds the graph
+at 22050 Hz and checks the song comes back at the order that was sounding, switches the
+mixer to `fixed · nearest · 8-bit · stereo` and then to mono and checks both round-trip
+through the telemetry header without growing wasm memory, and finally shrinks the viewport
+to 390×844 and asserts nothing overflows horizontally.
 
 The Node worklet harness does not need a browser: it stubs `AudioWorkletGlobalScope`,
 hides Node's `TextDecoder` so the bundle has to supply its own, loads a real bundled
