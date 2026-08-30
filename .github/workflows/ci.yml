@@ -21,7 +21,7 @@ jobs:
     name: host tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -31,7 +31,7 @@ jobs:
     name: wasm build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -41,7 +41,7 @@ jobs:
     name: no_std check (bare metal)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -51,7 +51,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -61,7 +61,7 @@ jobs:
     name: no-std purity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
