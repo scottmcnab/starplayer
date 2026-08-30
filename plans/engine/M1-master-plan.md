@@ -62,3 +62,8 @@ Every task file in M1 cites `plans/reference/original-s3mlib-analysis.md` by sec
 That document is the specification; `plans/product/03-accuracy-policy.md` §3 lists the
 seven places (D1–D7) where we deliberately do **not** follow it. Read both before
 starting B2 or B4.
+
+## Status
+
+**Complete.** All seven tasks plus follow-ups B8 and B9 are in `complete/`; the owner's
+listening check on real modules passed on 2026-08-30.
