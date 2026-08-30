@@ -92,6 +92,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .channel-table { min-width: 790px; }
 .channel-table tr.inactive { color: #647184; }
 .channel-table button { min-height: 24px; padding: 2px 8px; font-size: 11px; }
+/* Fixed-width text columns, so a long instrument name or effect name never reflows the
+   table. `--instrument-width` is set per module from its longest name (app.js); the
+   effect column fits the longest English name in the table ("vibrato & vol. slide"). */
+.channel-table td.instrument { width: var(--instrument-width, 16ch); max-width: var(--instrument-width, 16ch); overflow: hidden; text-overflow: ellipsis; }
+.channel-table td.effect { width: 22ch; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; }
 .effect { color: var(--accent-2); }
 .master-meter { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; color: var(--muted); font-size: 12px; }
 .vu-track { display: block; width: 128px; height: 9px; border-radius: 2px; overflow: hidden; background: #252f3b; }

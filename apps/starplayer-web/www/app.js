@@ -355,8 +355,18 @@ function flushFallbackCommands() {
     state.node.port.postMessage({ type: 'commandBatch', commands });
 }
 
+/// The instrument column is sized once per module, to the longest name in it, and clipped
+/// with an ellipsis after that. Left auto-width, the column re-measured on every snapshot
+/// as different names came and went, and the whole table shuffled with it.
+function sizeInstrumentColumn(metadata) {
+    const longest = metadata.instruments.reduce((width, instrument) => Math.max(width, instrument.name.length), 0);
+    const widthInCharacters = Math.min(28, Math.max(6, longest));
+    document.documentElement.style.setProperty('--instrument-width', `${widthInCharacters}ch`);
+}
+
 function renderMetadata() {
     const metadata = state.metadata;
+    sizeInstrumentColumn(metadata);
     elements.title.textContent = metadata.title;
     elements.moduleDetail.textContent = `${metadata.label} · ${metadata.channels} channels · ${metadata.orders} orders · ${metadata.patterns} patterns · ${metadata.instruments.length} instruments`;
     elements.seekOrder.max = String(Math.max(0, metadata.orders - 1));
@@ -402,6 +412,7 @@ function ensureChannelRows(count) {
         const vuFill = document.createElement('span');
         const mute = document.createElement('button');
         channel.textContent = String(index + 1).padStart(2, '0');
+        instrument.className = 'instrument';
         effect.className = 'effect';
         vuTrack.className = 'vu-track';
         vuFill.className = 'vu-fill';
