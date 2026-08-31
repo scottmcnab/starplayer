@@ -6,8 +6,12 @@ It plays MOD/S3M/MTM (and later XM/IT), runs in the browser via WASM, on native
 desktop, and on `no_std` embedded targets, and is designed to be embedded in other
 projects rather than to be one application.
 
-The original 80386 assembly sources live in `STARPLAY/`. **They are a read-only
-historical reference and must never be modified.** They are also *gutted* — most of the
+The original 80386 assembly sources live in `STARPLAY/` and `STARPLAY-2.25s/`.
+**Both are read-only historical references and must never be modified.**
+`STARPLAY-2.25s/` is the public source release of StarPlayer 2.25s (Hornet's
+`sp-code.zip`, Dec 1996): complete and assemblable (pmode 2.51, TASM + DOS `link` via
+`MAKESP.BAT`), including the full 4,347-line UI. `STARPLAY/` is the later, unfinished
+PMODE/W rewrite; They are also *gutted* — most of the
 engine sits inside TASM `comment %` blocks, so the tree does not assemble as-is; the
 text is intact and complete, and is the specification for MOD/S3M/MTM effect semantics.
 
@@ -52,7 +56,8 @@ crates/     starplayer-{core,rt,dsp,mixer,model,engine}   no_std + alloc
 apps/       starplayer-{web,cli,tui}
 xtask/      build orchestration, wasm packaging, golden regeneration
 plans/      design and implementation plans — see plans/README.md
-STARPLAY/   original DOS sources (read-only)
+STARPLAY/   original DOS sources — unfinished PMODE/W rewrite (read-only)
+STARPLAY-2.25s/  released 2.25s sources, complete and buildable (read-only)
 ```
 
 ## Plans & docs

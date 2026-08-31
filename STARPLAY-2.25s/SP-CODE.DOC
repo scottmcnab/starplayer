@@ -1,0 +1,264 @@
+Û²±°        ²°ÛÛÛ       ÛÛÛÛÛÛÛÛÛßßßßß Û ßßßßßßß ÛÛÛÛÛ   ß   ßßßßßß ßßßßßßßß±²Û 
+Û±°      ²±°±  Û²±° °±²ÛÛ²²Û         ÛÛ ÛÛ     ÛÛÛ   ÛÛÛ                    °±Û 
+Û°     Û²²±±             Û±±Û      ±±²   ÛÛ   ÛÛÛ   ÛÛÛ                      °Û 
+Û    ²ÛÛÛÛÛÛÛÛÛÛÛ       °°±±°°    °±Û    ÛÛ²Û  ²ÛÛÛÛ²      P L A Y E R        Û 
+Û              ÛÛÛÛ     Û°°±±   °ÛÛÛßßß   ²ÛÛÛ ²²ÛÛ Û²²                       Û 
+Û  °°±±²²ÛÛ°°±±²ÛÛÛÛÛ  ÛÛ²²°±  ±²ÛÛ      °±²Û   ²²ÛÛ  ±±Û                     Û 
+Û °±²ÛÛÛÛ°°±±±±²²ÛÛ   ÛÛ²²±±°°  ±²ÛÛ    °±²Û    ±±²²Û  ±°Û°Û                  Û 
+Û  °                            °±²ÛÛÛ        °±±²²Û     °Û°°±±²             
+ÛÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜÜ Ü ÜÜ ÜÜ    Ü    Ü                ±°²Û²Û²±±° ÜÛ Ü ÜÜÛ 
+ 
+		     -+ starplayer 2.25s source code +-
+			   released 6th dec 1996
+ 
+	      100% assembly coding by scott mcnab (jedi/oxygen)
+
+ ------------------------------- -------- ----- - - 
+ introduction.
+ ------------------------------- -------- ----- - -
+
+ included in this archive is the complete source code for starplayer 2.25,
+ including the music library, cd audio and all interface code. i am assuming
+ you are already familiar with what starplayer is and what its main features
+ are (and are familiar/experienced with tran's pmode extender). if you
+ aren't then you should grab starp225.zip and read starplay.doc which comes
+ with that (this documentation is also included in this archive if you have
+ trouble finding it). this archive contains the release version executable and
+ can be found at a number of sites including:
+
+	ftp://ftp.cdrom.com/pub/demos/music/programs/players/starp225.zip
+	ftp://cygnus.uwa.edu.au/pub/people/jedi/starp225.zip
+
+ also, if you have a unix shell account you might be able to get a copy from
+ my .plan file by typing:
+
+	finger jedi@tartarus.uwa.edu.au | uudecode
+
+ basically for those who (still) don't know, starplayer is a protected mode
+ s3m/mtm/mod/cd player for gravis ultrasound and soundblaster soundcards.
+ it lets you load several modules into memory at once and flip between them
+ quickly in a dos shell. it has a nifty popup menu with file selector so you
+ can find and load new modules from within other dos programs. it can also
+ operate as a mtm/mod -> s3m module format converter and has lots of other
+ neat things such as ctrl-alt-del crash recovery and support for loading
+ modules from filelist files. as this is a source code release i'm not going
+ to cover how to use all these features and you'll just have to get the
+ executable release (starp225.zip) mentioned above.
+
+ ------------------------------- -------- ----- - -
+ the source code
+ ------------------------------- -------- ----- - -
+
+ the source code consists of the following files:
+
+	 starplay.asm - main program user interface code (popup menus, file
+			selection, status bars, etc)
+	   s3mlib.asm - music library code (s3m playback code, loading code,
+			mtm/mod conversion code)
+	 cdromlib.asm - cd audio library code (requires mscdex driver)
+
+ the other two files, pmode.asm and file.asm are part of the pmode 2.51
+ distribution by thomas pytel (a.k.a tran). they are included so the player
+ can be assembled straight away in case you don't already have them.
+ (you should have these files anyway if you are familiar with programming
+ using pmode).
+
+ the include files s3mlib.inc and cdromlib.inc contain the public function
+ definitions and are required to compile starplayer. you will also need to
+ include these into your main program if you wish to use the music library.
+ the files pmode.inc and file.inc are required by any pmode programs.
+
+ ------------------------------- -------- ----- - -
+ assembling
+ ------------------------------- -------- ----- - -
+
+ to assemble starplayer from this source code you will require turbo assembler
+ (tasm.exe, version 4.0 recommended, older versions may also work) and the
+ standard linker (link.exe) which comes with dos (or tlink if you prefer).
+
+ assemble starplayer simply by running makesp.bat at the dos prompt. if you
+ want to make the executable as small as the release version (~25k) then use
+ an exe compressor such as pklite.
+
+ note: a precompiled executable (starplay.exe) is present in this archive so
+ you can look at the program even if you havn't got tasm.
+
+ ------------------------------- -------- ----- - -
+ using the music library in your own programs
+ ------------------------------- -------- ----- - -
+
+ this is probably what most of you will want to do. the basic procedure is:
+
+	include the s3mlib function declarations in your code32 segment:
+		include pmode.inc               ;required for pmode programs
+		include s3mlib.inc
+
+	initialise the sound system with device information.
+	first, set the global soundcard addressing variables:
+		mov [__PortAddr],PORT           ;set soundcard port
+		mov [__IntNum],IRQ              ;set soundcard irq
+		mov [__DMAChan],DMA             ;set soundcard dma channel
+	then call the initialisation procedure:
+		mov al,[ForceCard]
+		mov bx,[Default_MixRate]
+		mov dx,[Default_BufLen]
+		call PM_InitSystem
+		jc error                        ;error if carry flag is set
+	ForceCard contains the soundcard device number, usually set
+	this to DEVICE_AUTO to autodetect
+	(can also be DEVICE_GUS or DEVICE_SBMONO)
+	the port, irq and dma values can be read from the ULTRASND= and
+	BLASTER= environment variables...see starplay.asm for an example.
+
+	load the module to play and get a handle for it
+		mov ebx,[Handle]
+		mov al,LOAD_DUMP+LOAD_HI        ;Load module into hi mem,
+						;then dump samples to device
+		mov edx,offset Filename
+		call PM_LoadModule
+		jc error
+	Handle is a pointer to an empty structure of M_Struc_Size bytes.
+	Must have enough room here to store the entire structure before the
+	PM_LoadModule function is called.
+	Carry flag is set if there is an error loading the module (eg. file
+	type is not recognised)
+
+	note: there is another useful function PM_GetFileType which can be
+	used to quickly identify the type of module given by a particular
+	filename without loading it. the calling procedure for this is as
+	follows:
+		mov edx,offset Filename         ;filename to examine
+		mov edi,offset Title            ;28 chars to fill with title
+		call PM_GetFileType
+		jc error                        ;carry set if not valid module
+						;  or if file error
+	on return, al register contains: 0 if not recognised
+		       or TYPE_S3M, TYPE_MTM, TYPE_MOD accordingly
+	and the memory pointed to by edi will be filled with the module title.
+	this function is used by the file selector in starplayer to identify
+	possible modules and extract the title.
+
+	start playing the module using this code:
+		mov al,[ForceVol]               ;almost always set to zero
+		mov ebx,[Handle]
+		call PM_PlayModule
+	the ForceVol value is used to force soundblaster mixing amplification
+	different to that specified in the module being played. this normally
+	isn't required so set it to zero.
+	Handle is a pointer to the structure filled by PM_LoadModule
+
+	you can stop playback using PM_StopModule
+		call PM_StopModule
+
+	you can get/set the master module volume once a module is playing
+	by using PM_GetMasterVol and PM_SetMasterVol
+		call PM_GetMasterVol            ;returns current volume in al
+	and
+		mov al,[MasterVol]              ;volume between 0 and 64
+		call PM_SetMasterVol
+
+	finally, before you exit the program make sure you call
+	PM_CloseSystem to properly reset the sound card and tidy up
+		call PM_CloseSystem
+	this will automatically call PM_StopModule if required.
+
+ that covers the basic procedure for loading and playing modules. if you want
+ to do things such as changing the current pattern/row/tempo etc or get info
+ for volume bars etc then you will need to read/modify the module handle
+ data structure directly (see Module struc in s3mlib.inc). starplay.asm has
+ several examples on how to do this.
+
+ the global variable __CurrentModule is a pointer to the currently playing
+ Module struc and the variable __ChannelData is a pointer to 32 consecutive
+ ChannelData strucs, one for each channel of the current module. be careful
+ when messing with the data in these structures.
+
+ there are a few other music library functions which may be useful. they are:
+	PM_GetDeviceRAM - returns the amount of free ram remaining on the
+		current sound device (free gus dram or system ram for sb).
+		this function sets the global variable __DeviceRAM accordingly
+		and returns carry set if there is an error.
+	PM_ReleaseModule - call this to release device ram (ie. free gus dram)
+		edx = handle for module to release
+		al = 0 to free device ram or non-zero to also free system ram
+			(ie. remove module from memory entirely)
+		note: this function is very limited! it MUST be called in
+		the reverse order which modules are loaded or device samples
+		may get corrupted. it releases system memory simply by
+		increasing the pmode free memory counter which is a very nasty
+		hack so make sure you don't allocate any memory in between
+		loading and releasing modules and make sure modules are freed
+		in the reverse order to how they were loaded. this function
+		and the lack of proper memory management is the cause of a lot
+		of troubles with the 'r' key in the popup menu.
+	PM_SetLoopCode - use this to set an optional function which will be
+		called whenever a module loops back to the beginning.
+		starplayer uses this to start playing the next module in the
+		list when one finishes.
+		call with edx=pointer to near code32 routine
+		this routine must preserve all registers and return with a
+		normal ret instruction. see starplay.asm for an example.
+
+ assembling and linking is straightforward - take a look at makesp.bat
+
+ using cdromlib can be fairly tricky thanks to the complexity of the mscdex
+ api so your best bet is to wade through starplay.asm and pick out what you
+ can. cdromlib.asm contains function definitions and information regarding
+ parameter passing if you need more details. you will need to include
+ cdromlib.inc into your code32 segment and link with cdromlib.obj
+
+ an interesting thing to do is to uncomment the SETRASTERON and SETRASTEROFF
+ macros in s3mlib.asm (lines 4192, 4329, 5587 and 5652). this will change
+ the value of screen colour 0 whenever the music library irq is executing and
+ can be used to get a rough idea of how much cpu time is being dedicated to
+ playing music.
+
+ ------------------------------- -------- ----- - -
+ summary
+ ------------------------------- -------- ----- - -
+
+ this source code has been sitting on my harddrive untouched for almost a
+ year now so i have decided to release it for others to use and learn from.
+ most of it is very messy and poorly designed (especially the user interface
+ stuff) but it is functional and for simple music in pmode programs it is
+ often ideal. i stopped working on this code when i decided to make the
+ switch from pmode 2.51 to pmode/w to overcome some of the limitations of the
+ old pmode code and hence no work has been done on it since. a lot of the
+ code has been entirely rewritten using the new extender but it is still not
+ finished thanks to university commitments.
+
+ since then i have postponed that idea indefinately while i work on a module
+ player for linux. the new design allows for playback over multiple devices
+ and the playback of multiple modules (by one or more processes) on the one
+ device. eventually i hope to port this player to dos when it may become the
+ next major version of starplayer and will have all the features (such as
+ xm/it etc) which are still lacking. as such there probably won't be another
+ starplayer using this code base.
+
+ feel free to use this code in your own demos/intros/musicdisks/etc. if you
+ use it for anything i am interested in seeing it. an email or a letter to the
+ address below and a word in the credits would make me really happy. if you
+ make any bugfixes or add any new features to this code please pass them on to
+ me and i'll release a new starplayer and give you the appropriate credit.
+
+ i can be contacted at:
+
+	email:  jedi@tartarus.uwa.edu.au
+		jedi@cygnus.uwa.edu.au
+		mcnab-sd@ee.uwa.edu.au
+
+	snail:  scott mcnab
+		5 honeydew close
+		maida vale, 6057
+		western australia
+
+ i also maintain homepages of various forms:
+
+	  www:  http://www.uwa.edu.au/student/jedi
+		http://www.it.com.au/oxygen/
+
+ enjoy!
+
+ ---------------------------------------------------------- -------- ----- - - 
+				o x y g e n
+ - - ----- ------- -----------------------------------------------------------

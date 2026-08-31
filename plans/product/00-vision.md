@@ -75,7 +75,10 @@ Made by the project owner; do not re-litigate in derived plans.
    (`plans/engine/M2-task-C8-dos-reference-harness.md`).
 6. **`no_std` + `alloc` from day one**, CI-enforced on a bare-metal target. Retrofitting
    `no_std` later forces a rewrite of the IO and error layers.
-7. **Licence deferred.** The repo stays private; no licence files or SPDX headers are
+7. **Licence deferred.** (Context found 2026-08-31: the owner's own 1996 source release
+   `STARPLAY-2.25s/SP-CODE.DOC` already granted free use of the original code with a
+   credit request, and the owner holds the rights — so the decision is unconstrained by
+   third parties.) The repo stays private; no licence files or SPDX headers are
    added yet. Revisit before going public.
 
 ## What StarPlayer is not

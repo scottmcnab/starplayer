@@ -1,0 +1,154 @@
+ ---------------------------------------------------------- -------- ----- - -
+			    --+ Starplayer +--
+			 --+ Revision History +--
+ - - ----- ------- -----------------------------------------------------------
+
+  Legend:
+	 + new feature
+	 - bug fix/update
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.25s -- SP-CODE.ZIP -- 5/12/96
+	 - minor cosmetic changes
+ This is the starplayer source code release. Contains all source code for
+ starplayer and the oxyplay music library version 2.25
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.25 -- STARP225.ZIP -- 14/2/96
+	 - GUS IRQ and DMA is forced to equal the UTRASND= variable so should
+	   initialise correctly all the time (even after using ST3)
+	 - minor code optimisation for size
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.24 -- STARP224.ZIP -- 6/2/96
+	 + added support for CD audio! (uses MSCDEX compatible CDROM driver)
+	 - corrected a minor bug in implementation of portamento command
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.23 -- STARP223.ZIP -- 24/9/95
+	 + added 16-bit sample support for S3M/MTM formats (GUS only)
+	 - fixed problem with ICS mixer chip on GUS revisions 3.7+
+	 - f10 menu appears by default if no filespec is given on cmd-line
+	 - scroll-lock is now turned off automatically on DOS shell
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.22 -- STARP222.ZIP -- 26/5/95
+	 + added support for loading from playlist files (indicated with @)
+	 - major bug fix which was causing divide overflows and instability
+	 - portamento target note is now shown on vu bar display
+	 - fixed bug when trying to free samples on SB cards
+	 - minor correction to implementation of set vib/trem wave commands
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.21 -- STARP221.ZIP -- 20/5/95
+	 + sorts filenames into alphabetical order
+	 + added Vxx global volume command (ST3)
+	 - fixed major bug in gus initialisation
+	 - fixed slight bug with menu highlight bar
+	 - fixed crash bug in module loader when low on ram
+	 - minor code optimisation and cosmetic changes
+	 - reduced conventional ram overhead slightly
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.20 -- STARP220.ZIP -- 13/5/95
+	 + can now load up to 64 modules into memory at once
+	 + added f10 popup menu
+	 + added file selection menu to locate modules
+	 + added song selection menu
+	 + added direct filespec loading (TAB from menu)
+	 + load/save modules from within a dos shell
+	 + added ctrl-f11 and ctrl-f12 to select previous/next song
+	 + added ctrl-alt-del crash recovery (when scroll-lock on)
+	 + added command line parameter '-z' to set screen size
+	 + added key 'z' to switch video between 80*25 and 80*50
+	 - loads ?? channel MOD files with id code '??CH' (eg dope.mod)
+	 - VU bars now turn black when no sample is playing on channel
+	 - removed cli interface *sigh*
+	 - fixed minor gus song initialisation bug
+	 - changed default video mode back to 80*25
+	 - activates scroll-lock by default
+	 - returns error info if program aborts
+	 - slight optimisation in gus output
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.12 -- STARP212.ZIP -- 20/4/95
+	 + now loads MultiTracker modules! (MTM files)
+	 + added VU bars at the request of many people :)
+	 - changed video mode to 80*50
+	 - modified header to show total song length
+	 - several minor bug fixes
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.11 -- STARP211.ZIP -- 12/3/95
+	 + added command line parameter '-c' to select soundcard type
+	 - massive optimisation of sb mixing code
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.10 -- STARP210.ZIP -- 5/3/95
+	 + now supports the SoundBlaster series of soundcards!!!
+	   (support for mono SB up to 44khz)
+	 + added command line parameter '-m' to set mixing rate on SB cards
+	 + added command line parameter '-b' to set mixing buffer size
+	 + added command line parameter '-a' to set mixing amplification
+	 + added command line parameters '-?' and '-h' for help
+	 - device address is now shown in hexadecimal for clarity
+	 - extended device info for soundblaster cards
+	 - changed default to continuous play (shift-f? selects looped module)
+	 - minor ajustment to pattern indicator
+	 - gus dma now uses separate buffer than disk to prevent crashes
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.03 -- STARP203.ZIP -- 25/2/95
+	 + added non-looping continuous play ability
+	   (shift function-key plays modules continuously)
+	 + added command line parameter '-d' to disable DMA sample dumping
+	 + added new cli command 'w' to write selected module to disk as .s3m
+	 - decreased conventional ram overhead by reducing disk buffer size
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.02 -- STARP202.ZIP -- 14/2/95
+	 - major system lock-up bug fix release!
+	   otherwise functionally identical to version 2.01
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.01 -- STARP201.ZIP -- 12/2/95
+	 + uses DMA to transfer samples to GUS ram
+	 - fixed major bug reading default channel pan settings
+	 - loads 16 channel MOD files with id code '16CH'
+	 - fixed minor bug in retrig command
+	 - fixed minor problem with tempos slightly less than 122 bpm
+
+---------------------------------------------------------- -------- ----- - -
+ Version 2.00 -- STARP200.ZIP -- 31/12/94
+	 + now loads 4,6,8 channel MOD files!
+	 + now 100% ultraclick free!
+	   (removed clicks from ends of non-looping samples)
+	 + added support for default channel pan settings (ST3.2)
+	 + added Uxx fine vibrato command (ST3.2)
+	 + added S1x glissando control (ST3.2 & PT)
+	 + added cli comand "v" to view the sample list of a module
+	 + added ability to load multiple files with filespec wildcards
+	 + now supports amiga limits
+	 - minor loop click correction
+	 - fixed bug in fx jump tables
+	 - fixed bug caused by invalid patterns
+	 - minor correction to help screen key list
+	 - current (not the next) position is now shown in the header bar
+	 - fixed a (very) minor bug in the way sample cmds are handled
+	 - fixed few bugs in the vibrato command
+
+---------------------------------------------------------- -------- ----- - -
+ Version 1.00 -- STARP100.ZIP -- 16/10/94
+	 + First release:
+		 - load S3M files only
+		 - GUS support only
+		 - 99% ultraclick free
+		 - full ST3.01 FX implementation
+		 - channel panning with S8x and Xxx commands
+		 - ability to load 8 modules into extended memory
+		 - ability to swap between modules using function keys
+		 - keys available within dos shell
+
+---------------------------------------------------------- -------- ----- - -
+				 o x y g e n
+ - - ----- ------- -----------------------------------------------------------

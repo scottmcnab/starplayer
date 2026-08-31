@@ -1,0 +1,335 @@
+€≤±∞        ≤∞€€€       €€€€€€€€€ﬂﬂﬂﬂﬂ € ﬂﬂﬂﬂﬂﬂﬂ €€€€€   ﬂ   ﬂﬂﬂﬂﬂﬂ ﬂﬂﬂﬂﬂﬂﬂﬂ±≤€ 
+€±∞      ≤±∞±  €≤±∞ ∞±≤€€≤≤€         €€ €€     €€€   €€€                    ∞±€ 
+€∞     €≤≤±±             €±±€      ±±≤   €€   €€€   €€€                      ∞€ 
+€    ≤€€€€€€€€€€€       ∞∞±±∞∞    ∞±€    €€≤€  ≤€€€€≤      P L A Y E R        € 
+€              €€€€     €∞∞±±   ∞€€€ﬂﬂﬂ   ≤€€€ ≤≤€€ €≤≤                       € 
+€  ∞∞±±≤≤€€∞∞±±≤€€€€€  €€≤≤∞±  ±≤€€      ∞±≤€   ≤≤€€  ±±€                     € 
+€ ∞±≤€€€€∞∞±±±±≤≤€€   €€≤≤±±∞∞  ±≤€€    ∞±≤€    ±±≤≤€  ±∞€∞€                  € 
+€  ∞                            ∞±≤€€€        ∞±±≤≤€     ∞€∞∞±±≤             
+€‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹‹ ‹ ‹‹ ‹‹    ‹    ‹                ±∞≤€≤€≤±±∞ ‹€ ‹ ‹‹€ 
+ 
+			       version 2.25s
+			   released 6th feb 1996
+ 
+		   100% assembly coding by jedi / oxygen
+
+		 *****************************************
+		**   this documentation is part of the   **
+		**  starplayer source code archive. see  **
+		**     sp-code.doc for more details.     **
+		 *****************************************
+
+ ------------------------------- -------- ----- - - 
+			   welcome to starplayer
+			  - - ----- ------- ---------------------------------- 
+
+ welcome to version 2.25s of starplayer. for those who dont know, starplayer
+ is a s3m/mod/mtm module player for the PC which supports the Gravis
+ Ultrasound and SoundBlaster series of sound cards. unlike most other players,
+ starplayer is a 32-bit protected mode multi-module player. this means it uses
+ your 386 or higher processor to load many modules into extended memory and
+ then play any of these while taking only minimal conventional ram.
+
+ new to version 2.24 is cd-audio support. using your cdrom drive and MSCDEX
+ cdrom driver starplayer extends its background playing and track switching
+ abilities to cd audio. the 'C' key in the main screen or popup menu switches
+ between normal and cd audio modes. all the scroll-lock function key abilities
+ have been extended to this mode, including shift key detect for single track
+ play. a summary of hot-keys available in this mode:
+
+	F1-F8 : start playing tracks 1-8 on the cd. if shift key is also held
+		then only a single track is played, otherwise it defaults to
+		disc play.
+	   F9 : stop/resume playing current track.
+	  F10 : activates the popup menu with additional commands
+
+	  F11 : rewind current track by 10 seconds
+    shift-F11 : rewind current track by 20 seconds
+     ctrl-F11 : play previous track on cd
+      alt-F11 : decrease cd volume, if supported by your cdrom drive
+
+	  F12 : fastforward current track by 10 seconds
+    shift-F12 : fastforward current track by 20 seconds
+     ctrl-F12 : play next track on cd
+      alt-F12 : increase cd volume, if supported by your cdrom drive
+
+in addition, these keys are available in the popup menu in this mode:
+
+	  ESC : quit menu back to program
+	    C : toggle between cd-audio and normal mode
+	    E : eject/close cd tray
+		it is recommended that this function is always used when changing
+		compact discs so starplayer knows when to load the stats from a
+		new disc.
+
+ ------------------------------ -------- ----- - - 
+				instructions 
+			  - - ----- ------- ---------------------------------- 
+ 
+ starplayer should be loaded from dos. the command line format is: 
+ 
+	starplay [-?] [-options] [filespec]
+
+ soundcard type, address, irq and dma settings are determined from either the
+ ULTRASND= or BLASTER= environment variables. starplayer will first check for
+ the presence of a gus and then, failing that, a soundblaster.
+
+ NOTE: starplayer does not detect soundcards via hardware, so ensure that
+ these settings are present and correct!
+
+ the format for the soundblaster environment variable is
+		SET BLASTER=A2x0 Ix Dx Tx
+	where:
+		A2x0 is the base address in hexadecimal
+		Ix   is the irq number
+		Dx   is the dma channel
+		Tx   is the FM chip version (not used by starplayer)
+
+ a typical soundblaster environment statement would thus be
+		SET BLASTER=A220 I7 D1 T1
+
+ the option -d disables DMA sample dumping which may be necessary with certain
+ memory managers. if noise is heard while playing, use this option or try
+ removing the offending memory manager. (eg EMM386, QEMM, etc)
+
+ other options can be listed by using the -? or -h parameters.
+
+ ------------------------------- -------- ----- - -
+ main screen:
+
+ when you enter the module player you will be presented with a status bar
+ at the top of the screen and a list of options at the bottom. the player
+ version number, and active device statistics are listed at the bottom. if a
+ filespec is presented on the command line, the player will attempt to load
+ these modules (wildcard filespecs are permitted) and play the first loaded
+ module. when playing, channel vu bars, sample, note, volume, panning and
+ effect statistics are also displayed.
+
+ most of the functuality of starplayer has been taken from this screen and
+ placed in the f10 popup menu. these commands are still available at this
+ screen however to maintain a level of similarity to previous versions of
+ starplayer which used a command line interface:
+ 
+	l <filespec> - load module(s) "filespec" into memory
+		       the palette is faded while loading. starplayer will 
+		       attempt to load all modiles matching the filespec 
+		       into free slots. if no extension is given starplayer 
+		       will also search for '.s3m' and '.mod' files which 
+		       match the given filespec. 
+
+	s            - stop module. (or F9 with scroll-lock) 
+		       this will stop playing the current module. 
+
+	d            - shell to dos (use EXIT to return) 
+		       one of the most powerful features of starplayer is the 
+		       ability to shell to dos with 8 modules loaded into 
+		       extended ram and switch between them using hotkeys 
+		       with only minimal conventional ram overhead. the 
+		       hotkeys are only active when the scroll-lock key is on. 
+		       this enables the f-keys to still be used normally when 
+		       scroll-lock is off. the keys are listed below. 
+
+	z            - toggle video mode. this switches the screen between
+		       80*25 and 80*50. this may be necessary to view all the
+		       channel vu bars on large modules.
+
+	q / esc      - quit starplayer.
+
+ in addition to these, the following keys are active in the player, and during
+ a dos shell, when the scroll lock key is activated. 
+ 
+	f1-f8     - start playing song 1-8 continuously
+		    palette is faded while loading samples onto device ram. 
+	shift-f?  - play song 1-8 only (looped)
+	f9        - stop playing
+	f10       - activate popup menu
+	f11       - decrease pattern
+	f12       - increase pattern 
+	alt-f11   - dec. volume 
+	alt-f12   - inc. volume 
+	ctrl-f11  - previous song
+	ctrl-f12  - next song
+
+------------------------------- -------- ----- - -
+ song selection menu: (f10, with scroll lock active)
+
+ this popup menu provides the backbone to the new starplayer interface.
+ from here it is possible to select modules to play, view sample lists, load
+ and save modules and release them from device and system ram.
+
+ in the centre of the menu a list of loaded modules and their size, number of
+ channels, samples, patterns and order length are listed. white module names
+ are modules which are currently loaded into device ram, while grey indicates
+ that when played, samples will have to be dumped to device ram.
+
+ the red highlight bar indicates the module which is currently being played.
+ the blue highlight bar is used to select modules for various operations. this
+ highlight bar can be moved using the up/down cursor keys, and with the page
+ up, page down, home and end keys. the keys listed at the bottom of the screen
+ provide various functions:
+
+	space/p/enter - play the highlighted module. enter differs from space
+			and p in that once the module has been started, the
+			popup menu will close. by holding shift while pressing
+			these keys will loop the highlighted module.
+			(ie. disable continuous play). note that the screen
+			will be dimmed while samples are being dumped to
+			device ram. (if required)
+
+	l             - activate the file selection menu. (see below)
+
+	tab           - load modules by specifying a direct path and filespec.
+			this allows the quick loading of multiple files
+			through the use of wildcard characters.
+
+	s             - stop playing current module. (same as f9)
+
+	v             - view sample list of highlighted module. this lists all
+			the samples of the highlighted module, with their
+			titles, sizes and loop positions. up and down arrows
+			can be used to scroll this list.
+
+	f             - free samples from device ram. this removes the samples
+			of the last loaded module from device ram. use this if
+			output on a gus becomes corrupt.
+
+	r             - release the last loaded module from ram. this removes
+			the last loaded module from both system and device ram
+			and frees up the last slot for other modules.
+
+	w             - write highlighted module to disk. this function
+			prompts for a filename and will save the highlighted
+			module as a s3m file, which is a much more efficient
+			file format than mod or mtm. thus, starplayer can
+			function also as a mod->s3m and a mtm->s3m convertor.
+
+	esc           - quits the popup menu, returning control to the
+			foreground program.
+
+ ------------------------------- -------- ----- - -
+ file selection menu: ('l' from within the popup song selection menu)
+
+ this menu provides a convenient means of locating and loading modules which
+ may be in any path or drive on your system. the current path is indicated at
+ the top of the screen, and available directories and drives are listed in
+ white. all the files in the directory are searched to identify possible
+ modules. those found are listed, along with their type (S3M, MOD or MTM),
+ title and size in bytes.
+
+ the arrow, page up/down, home and end keys can be used to move the blue
+ selection bar. pressing space will tag the highlighted module to be loaded,
+ while * will tag all the modules found in the current path. pressing enter
+ on a module will load that module, plus any others which are tagged within
+ that directory, and return to the song selection menu. pressing enter on a
+ directory or drive will load any tagged modules and change the current path.
+
+ pressing esc will quit the menu without loading any tagged modules.
+
+ ------------------------------- -------- ----- - -
+ tips from the author:
+
+ starplayer uses a few tricks and techniques which both dos and Tran's pmode
+ were not really designed to do. although pmode was designed to support calls
+ from protected mode to real mode, it was never intended to fully support a
+ dos shell. similarly, dos was never designed to be re-entrant or to have time
+ critical routines interrupted for long periods of time. therefore it is
+ recommended that for safe operation, the popup menu only be used when the
+ disk is not being accessed. it is definately recommended that modules are not
+ loaded when the disk is being accessed by a foreground program.
+
+ if, for some reason, starplayer only partially freezes and the keyboard
+ routine is still responsive, pressing control-alt-delete will attempt to
+ close starplayer and return to dos without causing a system reset. this is
+ most useful if the system freezes while dumping samples to device ram.
+
+ note that when in a DOS shell, all extended memory remains allocated and is
+ hence unavailable for other programs. also to prevent a system crash do not
+ attempt to load multiple copies of starplayer or load any other protected
+ mode program whilst starplayer is in memory....
+
+ ------------------------------- -------- ----- - - 
+				 disclaimer 
+			  - - ----- ------- ---------------------------------- 
+ 
+ this program and associated files are freeware. as such, no money may be
+ charged for it, nor may it be distributed in a commercial venture. there is 
+ no warranty or claim of fitness or reliability. the programs are distributed 
+ AS IS, and as such neither the authors, those who have associations with the 
+ demo group known as "oxygen", nor any data retrieval network or system from 
+ which this was collected shall be held liable for any loss of data, down 
+ time, loss of revenue or profit or any other direct or indirect damage or 
+ claims caused by this program. 
+
+ this program is written entirely in pmode assembler without a debugger so
+ don't blame us for whatever happens! we know of quite a few bugs which can
+ make your computer lock up, reset, fall back to dos, or play modules
+ incorrectly. if you find any specific bugs, PLEASE TAKE YOUR TIME TO NOTIFY
+ THE AUTHOR! bugs cannot be eradicated if we dont know about them!
+
+ in plain english, if it crashes your system, or causes you physical, 
+ psychological or emotional torment, or causes your cat to go off its food, 
+ tough! :-) 
+ 
+ ------------------------------ -------- ----- - - 
+			       major releases 
+			  - - ----- ------- ---------------------------------- 
+ 
+ product      talent       description
+ -------------------------------------------------------------------------> 
+ cyanide.zip  rb/kt/stx/xc Cyanide Demo for the PC - won the 1994 C-Party
+ cyndptch.zip stx          Cyanide Patch for Lame Sound Cards (SB et al) 
+ starp100.zip jd/stx       Starplayer - Best S3M player for the GUS yet. 
+ startro.zip  jd/kt/stx    BBS Loader for Star BBS
+ tedium.zip   jd/kt/stx    An intro about its title - tedium.
+ starp200.zip jd           Starplayer - MOD file support, 100% click free 
+ starp201.zip jd           Starplayer - DMA to dump samples, pan bug fix 
+ starp202.zip jd           Starplayer - quick version 2.01 crash bug fix
+ starp203.zip jd           Starplayer - continuous play feature plus more
+ starp210.zip jd           Starplayer - new soundblaster support!
+ starp211.zip jd           Starplayer - improved soundblaster mixing
+ starp212.zip jd           Starplayer - MTM support and VU-bars
+ starp220.zip jd           Starplayer - 64 modules, load from shell, menus!
+ starp221.zip jd           Starplayer - alphabetical filename sorting
+ starp222.zip jd           Starplayer - support for playlist files
+ dusken.zip   jd/kt        'Dusken' - Musicdisk by Raphael BlackWolf
+ starp223.zip jd           Starplayer - bugfix for ICS mixer, 16-bit samples
+ tdm-code.zip jd           ASM source code for the tedium intro
+ starp224.zip jd           Starplayer - cd-audio support
+ starp225.zip jd           Starplayer - GUS init bugfix
+ sp-code.zip  jd           ASM source code for starplayer 2.25
+
+ other interesting releases:
+ 
+ product      talent      description 
+ -------------------------------------------------------------------------> 
+ r-delivr.zip jd          Deliverance. 2nd Placed Rookie Entry in Music 
+			  Contest ][. 
+ My Child     jd          Module part of 'expOZe', australian music disk.
+ After Sunset jase        Module part of 'expOZe', australian music disk.
+ Kingdom Skys jase        1st Placed Vetran entry in Music Contest 3.
+ StepBack     kt          7th Placed entry in OZ96 music competition.
+
+ plus countless other music releases i can't remember now.
+
+ ------------------------------ -------- ----- - -
+			   contacting the author
+			  - - ----- ------- ---------------------------------- 
+
+ send email to jedi/oxygen at
+
+	   jedi@tartarus.uwa.edu.au
+
+ or send a letter to
+
+	 scott mcnab
+	 5 honeydew close
+	 maida vale wa 6057
+	 australia
+
+ see sp-code.doc for more details.
+
+		      see you in the next oxygen release!
+ 
+ ---------------------------------------------------------- -------- ----- - - 
+				 o x y g e n 
+ - - ----- ------- -----------------------------------------------------------

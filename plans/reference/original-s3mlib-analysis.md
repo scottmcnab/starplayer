@@ -13,6 +13,34 @@ implement, the accuracy policy wins — it records the deliberate deviations.
 
 ---
 
+## 0.a A second, complete reference: `STARPLAY-2.25s/`
+
+Added 2026-08-31: the **public source release of StarPlayer 2.25s** (Hornet archive,
+`sp-code.zip`, 6 Dec 1996) is imported as `STARPLAY-2.25s/` — also read-only. Unlike
+`STARPLAY/` it is complete and assemblable: tran's pmode 2.51 (`PMODE.ASM`, `FILE.ASM`),
+the full 4,347-line UI (`STARPLAY.ASM`), `MAKESP.BAT` (TASM + DOS `link`), and a prebuilt
+`STARPLAY.EXE` matching the `starp225.zip` binary release.
+
+A marker-stripped diff of the two `S3MLIB.ASM`s shows the **entire tracker core is
+byte-identical** (whitespace aside): `__UpdateTracker`, both FX jump tables and every
+`S_FX_*`/`M_FX_*` handler, `EFXJumpTable`, the period and waveform tables, and the
+loaders. The only real differences are the extender port shell (pmode 2.51 vs PMODE/W
+memory/init and GUS register plumbing) and the `SETRASTERON/OFF` debug macros. So:
+
+- `STARPLAY/` is the *later, unfinished PMODE/W rewrite* that `SP-CODE.DOC` itself
+  describes ("a lot of the code has been entirely rewritten using the new extender but
+  it is still not finished") — which is why it is gutted;
+- every semantic this document transcribes, quirks and defects included, is confirmed
+  present in a **shipped, widely-used release**, not just a private work-in-progress;
+- where a `comment %` boundary in `STARPLAY/` ever leaves an ambiguity,
+  `STARPLAY-2.25s/S3MLIB.ASM` is the tiebreaker — and it assembles.
+
+`SP-CODE.DOC` also carries the owner's 1996 grant: "feel free to use this code in your
+own demos/intros/musicdisks/etc" with a credit request — relevant to licence decision 7
+in `plans/product/00-vision.md`.
+
+---
+
 ## 0. The source is gutted
 
 Almost the entire engine sits inside TASM `comment %` … `%` blocks and therefore does

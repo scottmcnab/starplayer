@@ -30,11 +30,17 @@ thing in question.
 Instead, dump the original's own per-tick `ChannelData` and compare it against our C1
 trace. That is an apples-to-apples comparison of exactly the state we care about.
 
-### Why this is even possible
+### Why this is even possible — updated 2026-08-31
 
-The sources are gutted — most of `S3MLIB.ASM` sits inside TASM `comment %` blocks — but
-the text is complete, and the build chain in `P.BAT` is intact:
-`tasm /ml /m2` × 3 → `wlink @pmodew.lnk system pmodew ...` → `pmwbind /R /O /Sdos4gw.exe`.
+**No reconstruction is needed any more.** `STARPLAY-2.25s/` (imported from Hornet's
+`sp-code.zip`) is the complete, assemblable 2.25s source: `MAKESP.BAT` builds it with
+TASM 4.0 + DOS `link` on the pmode 2.51 extender, and its tracker core is byte-identical
+to the text inside `STARPLAY/`'s `comment %` blocks
+(`plans/reference/original-s3mlib-analysis.md` §0.a). If this task's trigger fires,
+start from `STARPLAY-2.25s/` (copied to `tools/dos-reference/`, since both original
+trees are read-only) and replace `STARPLAY.ASM` with the harness — deliverable 1's
+comment-stripping step is obsolete. The `P.BAT` PMODE/W chain in `STARPLAY/` remains a
+fallback only.
 
 ## Deliverables
 
