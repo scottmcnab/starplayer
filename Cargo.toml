@@ -31,6 +31,9 @@ bitflags = { version = "2.13", default-features = false }
 # that the read-only module archive path does not need.
 zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Canonical golden renders are SHA-256 fingerprints. Hashing lives in the std-only
+# offline crate; no digest code or dependency enters the real-time graph.
+sha2 = { version = "0.10", default-features = false }
 
 # The real-time plumbing's three dependencies, all `no_std` and none enabling `std` at
 # the feature set selected here. See `crates/starplayer-rt/src/lib.rs` for why each one

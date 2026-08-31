@@ -1,2 +1,9 @@
 [alias]
 xtask = "run -p xtask --"
+
+# Architecture section 7.3 requires ordinary float multiply/add operations to stay as
+# two separately rounded IEEE-754 operations. Rust's operators already have that
+# language-level meaning; this LLVM setting makes the backend policy explicit as well,
+# including release/LTO builds on targets where an FMA instruction is available.
+[build]
+rustflags = ["-C", "llvm-args=-fp-contract=off"]

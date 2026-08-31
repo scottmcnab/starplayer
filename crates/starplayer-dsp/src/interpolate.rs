@@ -91,13 +91,27 @@ impl Interpolate for Linear {
     fn sample_fixed(frames: &[i16], index: usize, fraction_bits: u32) -> i32 {
         let current = frame_at(frames, index) as i64;
         let next = frame_at(frames, index.wrapping_add(1)) as i64;
-        // Q0.16 of the position fraction: the low 16 bits are dropped rather than
-        // rounded, which is what a 16.16-position tracker mixer does and keeps the
-        // expression to one multiply and one shift. The 17-bit difference times the
-        // 16-bit fraction needs 33 bits, so the intermediate is `i64`.
-        let fraction = (fraction_bits >> 16) as i64;
-        (current + (((next - current) * fraction) >> 16)) as i32
+        // Use the whole Q0.32 position fraction and round the 48-bit signed product to
+        // nearest, ties away from zero. C6 makes this the canonical fixed-path rounding
+        // rule: unlike an arithmetic shift it has no negative-slope DC bias, and the
+        // widened intermediate is still comfortably inside `i64`.
+        let interpolated_delta = round_shift_nearest((next - current) * fraction_bits as i64, 32);
+        (current + interpolated_delta) as i32
     }
+}
+
+/// Remove fractional bits with the canonical fixed-mixer rounding rule: nearest, with
+/// exact half-way values rounded away from zero.
+const fn round_shift_nearest(value: i64, fractional_bits: u32) -> i64 {
+    if fractional_bits == 0 {
+        return value;
+    }
+    if fractional_bits >= 64 {
+        return 0;
+    }
+    let half = 1u64 << (fractional_bits - 1);
+    let rounded = value.unsigned_abs().saturating_add(half) >> fractional_bits;
+    if value < 0 { -(rounded as i64) } else { rounded as i64 }
 }
 
 /// `1.0 / 2^32`, exact in `f32`.
@@ -138,12 +152,11 @@ mod tests {
     }
 
     #[test]
-    fn linear_fixed_truncates_toward_negative_infinity() {
-        // 1000 + ((-2000 * 16384) >> 16) = 1000 - 500 = 500 at a quarter step.
+    fn linear_fixed_rounds_to_nearest_without_a_negative_bias() {
         assert_eq!(Linear::sample_fixed(&RAMP, 1, 0x4000_0000), 500);
-        // The arithmetic shift floors, so a descending slope lands one LSB low rather
-        // than rounding to nearest. Stated here because the goldens will encode it.
-        assert_eq!(Linear::sample_fixed(&[0, -1], 0, 0x0001_0000), -1, "one Q0.16 tick down a descending slope floors to -1");
+        assert_eq!(Linear::sample_fixed(&[0, -1], 0, 1), 0, "a tiny descending fraction rounds to zero, not minus one");
+        assert_eq!(Linear::sample_fixed(&[0, 1], 0, 0x8000_0000), 1, "positive half-way values round away from zero");
+        assert_eq!(Linear::sample_fixed(&[0, -1], 0, 0x8000_0000), -1, "negative half-way values round away from zero");
     }
 
     #[test]

@@ -147,14 +147,14 @@ impl MixPath for FixedPath {
     /// Q15 gain: `32767` is unity.
     type Gain = i32;
 
-    /// Truncating, deliberately: the fixed path's rounding rules are stated once and then
-    /// never change, because the goldens encode them.
-    fn gain(units: i32) -> i32 { units >> GAIN_FRACTION_BITS }
+    /// Round to nearest, ties away from zero. C6 makes this rule part of the golden
+    /// contract for every fixed-path precision reduction.
+    fn gain(units: i32) -> i32 { round_shift_nearest(units as i64, GAIN_FRACTION_BITS) as i32 }
 
     fn mix<Interp: Interpolate>(destination: &mut FixedFrame, frames: &[i16], index: usize, fraction_bits: u32, gains: Stereo<i32>) {
         let value = Interp::sample_fixed(frames, index, fraction_bits) as i64;
-        destination.left = destination.left.saturating_add(((value * gains.left as i64) >> 15) as i32);
-        destination.right = destination.right.saturating_add(((value * gains.right as i64) >> 15) as i32);
+        destination.left = destination.left.saturating_add(round_shift_nearest(value * gains.left as i64, 15) as i32);
+        destination.right = destination.right.saturating_add(round_shift_nearest(value * gains.right as i64, 15) as i32);
     }
 
     fn master(quantum: &mut [FixedFrame], settings: MasterSettings) {
@@ -162,6 +162,21 @@ impl MixPath for FixedPath {
             *frame = process_fixed(*frame, settings);
         }
     }
+}
+
+/// Remove fractional bits with the canonical fixed-path rule: nearest, with exact
+/// half-way values rounded away from zero. All callers use products small enough that
+/// adding the half-bit cannot overflow the unsigned magnitude.
+pub(crate) const fn round_shift_nearest(value: i64, fractional_bits: u32) -> i64 {
+    if fractional_bits == 0 {
+        return value;
+    }
+    if fractional_bits >= 64 {
+        return 0;
+    }
+    let half = 1u64 << (fractional_bits - 1);
+    let rounded = value.unsigned_abs().saturating_add(half) >> fractional_bits;
+    if value < 0 { -(rounded as i64) } else { rounded as i64 }
 }
 
 /// Gain units to a float multiplier.
@@ -182,10 +197,9 @@ mod tests {
         let gains = FixedPath::gains(U0F16::MAX, I1F15::MIN);
         let mut frame = FixedFrame::default();
         FixedPath::mix::<Nearest>(&mut frame, &[20_000], 0, 0, gains);
-        // Unity is one LSB below 1.0 on both scales and both shifts truncate, so a
-        // full-scale voice lands a couple of LSBs low. Asserted exactly, because this is
-        // the path the goldens fingerprint.
-        assert_eq!(frame, Stereo::new(19_998, 0));
+        // Q15 positive unity is one LSB below 1.0. The two precision reductions round to
+        // nearest, so only that representational LSB remains.
+        assert_eq!(frame, Stereo::new(19_999, 0));
     }
 
     #[test]
@@ -194,8 +208,8 @@ mod tests {
         let mut frame = FixedFrame::default();
         FixedPath::mix::<Nearest>(&mut frame, &[20_000], 0, 0, gains);
         assert_eq!(frame.left, frame.right);
-        // 20000 x 0.70710678 = 14142, less the two truncations.
-        assert_eq!(frame.left, 14_141);
+        // 20000 x 0.70710678 = 14142.1, rounded to nearest.
+        assert_eq!(frame.left, 14_142);
     }
 
     #[test]
@@ -235,6 +249,14 @@ mod tests {
         assert_eq!(frame.left, i32::MAX);
         FixedPath::mix::<Nearest>(&mut frame, &[-32_768], 0, 0, gains);
         assert_eq!(frame.right, i32::MIN);
+    }
+
+    #[test]
+    fn fixed_precision_reductions_round_half_away_from_zero() {
+        assert_eq!(round_shift_nearest(3, 1), 2);
+        assert_eq!(round_shift_nearest(-3, 1), -2);
+        assert_eq!(round_shift_nearest(1, 1), 1);
+        assert_eq!(round_shift_nearest(-1, 1), -1);
     }
 
     #[test]

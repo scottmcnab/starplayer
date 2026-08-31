@@ -1,9 +1,10 @@
 //! Build orchestration for the StarPlayer workspace.
 //!
-//! `cargo xtask ci` runs exactly the matrix that `.github/workflows/ci.yml` runs, so an
-//! agent can verify a change locally without pushing. CI invokes the same subcommands
-//! one job at a time (`cargo xtask ci --job <job>`), which keeps the two definitions
-//! from drifting apart — there is only one definition.
+//! `cargo xtask ci` runs the host-portable part of `.github/workflows/ci.yml`, and CI
+//! invokes those subcommands one job at a time (`cargo xtask ci --job <job>`). The
+//! workflow additionally repeats the golden job on a native ARM64 runner and executes
+//! the WASIp1 golden helper under Wasmtime; those target-specific executions cannot be
+//! reproduced by a host xtask process alone.
 //!
 //! No dependencies: `std` only, argv parsed by hand.
 
@@ -46,7 +47,7 @@ const NO_STD_CRATES: &[&str] = &[
 /// `starplayer-telemetry` edge (architecture §11, M1-B6).
 const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry")];
 
-const JOBS: &[&str] = &["host-tests", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
+const JOBS: &[&str] = &["host-tests", "goldens", "fma-check", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
 
     let succeeded = match subcommand {
         Some("ci") => run_ci(&arguments[1..]),
-        Some("goldens") => not_implemented("goldens", "regenerating golden renders (M1)"),
+        Some("goldens") => run_goldens(&arguments[1..]),
         Some("trace") => run_trace(&arguments[1..]),
         Some("wasm") => run_wasm(&arguments[1..]),
         Some("serve") => run_serve(&arguments[1..]),
@@ -77,7 +78,7 @@ fn print_usage() {
     println!();
     println!("subcommands:");
     println!("  ci [--job <job>]   run the CI matrix locally, or a single job of it");
-    println!("  goldens            regenerate golden renders (not implemented)");
+    println!("  goldens [--check]  regenerate canonical SHA-256 renders, or verify them");
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
     println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
     println!("  serve [--port N] [--host ADDR]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
@@ -88,11 +89,6 @@ fn print_usage() {
     for job in JOBS {
         println!("  {job}");
     }
-}
-
-fn not_implemented(subcommand: &str, what: &str) -> bool {
-    println!("xtask {subcommand}: not implemented — {what}");
-    true
 }
 
 /// Run the std-only offline trace driver without making xtask depend on the audio crate
@@ -124,6 +120,32 @@ fn run_trace(arguments: &[String]) -> bool {
     }
 }
 
+/// Run the std-only golden driver without adding audio or digest dependencies to xtask.
+/// A dedicated target directory avoids recursively waiting on the parent cargo process's
+/// target-directory lock.
+fn run_goldens(arguments: &[String]) -> bool {
+    if !(arguments.is_empty() || matches!(arguments, [flag] if flag == "--check")) {
+        eprintln!("xtask goldens: usage: cargo xtask goldens [--check]");
+        return false;
+    }
+    let mut command = Command::new(cargo_binary());
+    command
+        .current_dir(workspace_root())
+        .args(["run", "--quiet", "--target-dir", "target/xtask-goldens", "-p", "starplayer-offline", "--bin", "starplayer-goldens", "--"])
+        .args(arguments);
+    match command.status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("xtask goldens: offline driver exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("xtask goldens: offline driver failed to start: {error}");
+            false
+        }
+    }
+}
+
 fn run_ci(arguments: &[String]) -> bool {
     let requested_job = match parse_job_argument(arguments) {
         Ok(job) => job,
@@ -143,6 +165,8 @@ fn run_ci(arguments: &[String]) -> bool {
         println!("\n=== xtask ci: {job} ===");
         let succeeded = match *job {
             "host-tests" => job_host_tests(),
+            "goldens" => run_goldens(&["--check".to_string()]),
+            "fma-check" => job_fma_check(),
             "wasm-build" => job_wasm_build(),
             "no-std-check" => job_no_std_check(),
             "clippy" => job_clippy(),
@@ -199,6 +223,123 @@ fn parse_job_argument(arguments: &[String]) -> Result<Option<&str>, String> {
 fn job_host_tests() -> bool {
     cargo(&["test", "--workspace"])
         && cargo(&["test", "-p", "starplayer-engine", "--features", "telemetry"])
+}
+
+/// Compile the real offline float renderer for an x86-64 CPU where FMA is explicitly
+/// available, then inspect both optimized LLVM IR and machine code. `.cargo/config.toml`
+/// supplies `-C llvm-args=-fp-contract=off`; seeing ordinary multiply operations but no
+/// contract flag, intrinsic or fused instruction proves the setting took effect rather
+/// than merely being accepted.
+fn job_fma_check() -> bool {
+    let target_directory = std::env::temp_dir().join(format!("starplayer-fma-check-{}", std::process::id()));
+    if !remove_fma_target_directory(&target_directory) {
+        return false;
+    }
+
+    let audit_succeeded = run_fma_audit(&target_directory);
+    let cleanup_succeeded = remove_fma_target_directory(&target_directory);
+    audit_succeeded && cleanup_succeeded
+}
+
+fn run_fma_audit(target_directory: &Path) -> bool {
+    println!("     cargo rustc -p starplayer-offline --release --lib -- -C target-feature=+fma --emit=asm,llvm-ir");
+    let status = Command::new(cargo_binary())
+        .current_dir(workspace_root())
+        .env("CARGO_TARGET_DIR", target_directory)
+        .args(["rustc", "-p", "starplayer-offline", "--release", "--lib", "--", "-C", "target-feature=+fma", "--emit=asm,llvm-ir"])
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("     FMA audit build exited with {status}");
+            return false;
+        }
+        Err(error) => {
+            eprintln!("     FMA audit build failed to start: {error}");
+            return false;
+        }
+    }
+
+    let mut assembly_paths = Vec::new();
+    collect_files_with_extension(target_directory, "s", &mut assembly_paths);
+    let mut saw_float_multiply = false;
+    for path in &assembly_paths {
+        let assembly = match std::fs::read_to_string(path) {
+            Ok(assembly) => assembly.to_ascii_lowercase(),
+            Err(error) => {
+                eprintln!("     cannot read FMA audit output `{}`: {error}", path.display());
+                return false;
+            }
+        };
+        saw_float_multiply |= assembly.contains("mulss") || assembly.contains("mulps");
+        for mnemonic in ["vfmadd", "vfmsub", "vfnmadd", "vfnmsub"] {
+            if assembly.contains(mnemonic) {
+                eprintln!("     FMA contraction found in `{}`: mnemonic `{mnemonic}`", path.display());
+                return false;
+            }
+        }
+    }
+    if !saw_float_multiply {
+        eprintln!("     FMA audit was inconclusive: optimized assembly contained no f32 multiply");
+        return false;
+    }
+
+    let mut llvm_ir_paths = Vec::new();
+    collect_files_with_extension(target_directory, "ll", &mut llvm_ir_paths);
+    let mut saw_ir_float_multiply = false;
+    for path in &llvm_ir_paths {
+        let llvm_ir = match std::fs::read_to_string(path) {
+            Ok(llvm_ir) => llvm_ir.to_ascii_lowercase(),
+            Err(error) => {
+                eprintln!("     cannot read FMA audit IR `{}`: {error}", path.display());
+                return false;
+            }
+        };
+        saw_ir_float_multiply |= llvm_ir.contains("fmul ");
+        if llvm_ir.contains("llvm.fma.") || llvm_ir.contains("llvm.fmuladd.") {
+            eprintln!("     FMA/fmuladd intrinsic found in `{}`", path.display());
+            return false;
+        }
+        if llvm_ir.lines().any(|line| line.contains("contract") && (line.contains("fmul") || line.contains("fadd") || line.contains("fsub"))) {
+            eprintln!("     contract-enabled float operation found in `{}`", path.display());
+            return false;
+        }
+    }
+    if !saw_ir_float_multiply {
+        eprintln!("     FMA audit was inconclusive: optimized LLVM IR contained no f32 multiply");
+        return false;
+    }
+    println!("     FMA audit passed: separate multiply in IR/machine code, no contraction marker, intrinsic or fused mnemonic");
+    true
+}
+
+/// Delete only the exact PID-scoped audit directory. A stale directory would let an
+/// audit inspect artifacts from an earlier process whose PID was reused, so failure to
+/// remove it also fails the job.
+fn remove_fma_target_directory(target_directory: &Path) -> bool {
+    match std::fs::remove_dir_all(target_directory) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            eprintln!("     cannot remove FMA audit directory `{}`: {error}", target_directory.display());
+            false
+        }
+    }
+}
+
+fn collect_files_with_extension(directory: &Path, extension: &str, destination: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_with_extension(&path, extension, destination);
+        } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+            destination.push(path);
+        }
+    }
 }
 
 /// The web build has to keep working on every commit, both for the facade the app

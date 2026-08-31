@@ -151,6 +151,9 @@ fn pan_entry(index: usize) -> i32 { PAN_TABLE.get(index).copied().unwrap_or(0) a
 
 /// Interpolate between two table entries. `fraction` is `PAN_INDEX_SHIFT` bits wide.
 const fn pan_lerp(from: i32, to: i32, fraction: i32) -> i32 {
+    // Keep the table interpolation's endpoint convention: at `I1F15::MAX`, flooring the
+    // descending left edge reaches exact silence. The canonical round-to-nearest rule is
+    // for signal precision reductions, not for selecting a point on the pan-law table.
     from + (((to - from) * fraction) >> PAN_INDEX_SHIFT)
 }
 
@@ -266,6 +269,6 @@ mod tests {
     fn unity_fits_a_signed_32_bit_gain() {
         assert_eq!(GAIN_UNITY, 2_147_385_345);
         const { assert!(GAIN_UNITY < i32::MAX, "the gain-unit space must not overflow the ramp's i32") };
-        assert_eq!(GAIN_UNITY >> GAIN_FRACTION_BITS, 32_766, "one LSB below Q15 unity, as it was in M0");
+        assert_eq!(crate::path::round_shift_nearest(GAIN_UNITY as i64, GAIN_FRACTION_BITS), 32_767, "C6 rounds the full gain-unit range to Q15 unity");
     }
 }

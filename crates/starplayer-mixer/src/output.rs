@@ -40,7 +40,7 @@
 
 use core::marker::PhantomData;
 
-use crate::path::{FixedFrame, FloatFrame};
+use crate::path::{FixedFrame, FloatFrame, round_shift_nearest};
 
 /// A 24-bit sample, sign-extended into an `i32`.
 ///
@@ -176,7 +176,7 @@ impl HostSample for i8 {
     /// the output at this depth.
     fn from_i16_scale(value: i32, dither: &mut Dither) -> i8 {
         let dithered = value as i64 + dither.tpdf(1 << 8) as i64;
-        ((clamp_i16(dithered) as i32 + 128) >> 8).clamp(-128, 127) as i8
+        round_shift_nearest(clamp_i16(dithered) as i64, 8).clamp(-128, 127) as i8
     }
 }
 
@@ -298,11 +298,9 @@ impl<Sample: HostSample> OutputFormat for FixedOut<Sample, 2> {
     }
 }
 
-/// Mono on the fixed path: the two channels summed and halved with an arithmetic shift.
-///
-/// The shift floors rather than rounding to nearest — one LSB of DC on negative signal —
-/// which is what every integer tracker mixer has always done, including the original's
-/// `Mixer_8bitMono`. Stated rather than accidental, because the goldens encode it.
+/// Mono on the fixed path: the two channels summed and rounded to nearest, ties away from
+/// zero. The original's arithmetic shift had a negative one-LSB DC bias; C6 deliberately
+/// chooses the better-sounding symmetric convention for the modern canonical mixer.
 impl<Sample: HostSample> OutputFormat for FixedOut<Sample, 1> {
     type Accumulator = FixedFrame;
     type Sample = Sample;
@@ -310,7 +308,7 @@ impl<Sample: HostSample> OutputFormat for FixedOut<Sample, 1> {
 
     fn convert_dithered(dither: &mut Dither, source: &[FixedFrame], destination: &mut [Sample]) {
         for (frame, sample) in source.iter().zip(destination.iter_mut()) {
-            let summed = (frame.left as i64 + frame.right as i64) >> 1;
+            let summed = round_shift_nearest(frame.left as i64 + frame.right as i64, 1);
             *sample = Sample::from_i16_scale(clamp_i32(summed), dither);
         }
     }
@@ -385,11 +383,11 @@ mod tests {
     }
 
     #[test]
-    fn mono_i16_halves_with_an_arithmetic_shift() {
-        let source = [Stereo::new(1_000, 2_000), Stereo::new(-1, 0), Stereo::new(i32::MAX, i32::MAX)];
+    fn mono_i16_rounds_halves_symmetrically() {
+        let source = [Stereo::new(1_000, 2_001), Stereo::new(-1, -2), Stereo::new(i32::MAX, i32::MAX)];
         let mut destination = [0i16; 3];
         MonoI16::convert(&source, &mut destination);
-        assert_eq!(destination, [1_500, -1, i16::MAX], "the shift floors, so -1/2 is -1, not 0");
+        assert_eq!(destination, [1_501, -2, i16::MAX], "positive and negative half-way sums both round away from zero");
     }
 
     #[test]

@@ -40,7 +40,7 @@
 
 use starplayer_core::U0F16;
 
-use crate::path::Stereo;
+use crate::path::{Stereo, round_shift_nearest};
 
 /// What the master bus does to a whole quantum.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -140,7 +140,7 @@ pub fn soft_knee_fixed(magnitude: i32) -> i32 {
     let fraction = magnitude & ((1 << LIMITER_INDEX_SHIFT) - 1);
     let from = limiter_entry(index);
     let to = limiter_entry(index + 1);
-    from + (((to - from) * fraction) >> LIMITER_INDEX_SHIFT)
+    from + round_shift_nearest((to - from) as i64 * fraction as i64, LIMITER_INDEX_SHIFT) as i32
 }
 
 /// The same curve for the float path, reading the same table so the two paths describe the
@@ -187,9 +187,9 @@ fn bound_f32(value: f32, limiter: Limiter) -> f32 {
 }
 
 fn bound_fixed(value: i32, volume: i64, limiter: Limiter) -> i32 {
-    // Q0.16 master volume, truncating — the fixed path states its rounding rules once and
-    // then never changes them, because the goldens encode them.
-    let scaled = (value as i64 * volume) >> 16;
+    // Q0.16 master volume, reduced with the same round-to-nearest rule as voice gain and
+    // interpolation. This is part of the C6 golden contract.
+    let scaled = round_shift_nearest(value as i64 * volume, 16);
     match limiter {
         Limiter::Clamp => scaled.clamp(-32_767, 32_767) as i32,
         Limiter::SoftKnee => {
@@ -251,15 +251,13 @@ mod tests {
     }
 
     /// The curve itself is exactly odd; the master-volume multiply that precedes it is an
-    /// arithmetic shift, which floors, so a negative sample can land one LSB low. That is
-    /// the same flooring the fixed path states everywhere else, and it is why this asserts
-    /// to within an LSB rather than to the bit.
+    /// signed round-to-nearest rule that precedes it is odd-symmetric too.
     #[test]
     fn the_limiter_is_odd_symmetric() {
         for magnitude in [1i32, 100, 20_000, 32_767, 40_000] {
             let positive = bound_fixed(magnitude, 65_535, Limiter::SoftKnee);
             let negative = bound_fixed(-magnitude, 65_535, Limiter::SoftKnee);
-            assert!((positive + negative).abs() <= 1, "{magnitude}: {positive} against {negative}");
+            assert_eq!(positive, -negative, "{magnitude}: {positive} against {negative}");
         }
     }
 

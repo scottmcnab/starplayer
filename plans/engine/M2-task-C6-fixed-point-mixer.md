@@ -67,6 +67,48 @@ anywhere in the RT path**, on either mixer. Tables only.
 3. Whether module *loading* is deterministic enough to hash the `Module` itself as a
    cheaper first-line check. B1 made `Module` hashable for exactly this.
 
+## Research resolution and implementation contract
+
+- **Shared kernel:** M0/M1 had already landed one `accumulate_voice<Path, Interp>` loop
+  with real `FloatPath` and `FixedPath` implementations. C6 keeps that shape and changes
+  the fixed arithmetic behind the existing implementation; no new trait or duplicate
+  voice loop is introduced.
+- **Rounding:** every signed fixed-path signal reduction now rounds to nearest, with
+  exact ties away from zero. This covers Q0.32 linear interpolation, Q15 voice gain,
+  master volume, limiter interpolation, mono fold-down and reduced-depth output. Pan-law
+  table selection keeps its pre-existing endpoint flooring so hard pan still makes the
+  far channel exactly silent. Ten seconds (441,000 frames) from each fixture form the
+  bounded golden segment; each `i16` is hashed in explicit little-endian order.
+- **FMA:** `.cargo/config.toml` passes LLVM `-fp-contract=off` for every profile and
+  target. `cargo xtask ci --job fma-check` compiles the actual float offline renderer
+  with x86 FMA available, then rejects LLVM `contract` flags, `llvm.fma`/`llvm.fmuladd`
+  intrinsics and fused machine mnemonics while requiring ordinary float multiplies in
+  both outputs.
+- **ARM64 CI:** GitHub's hosted-runner reference lists the native
+  `ubuntu-24.04-arm` label, so the committed workflow uses it rather than QEMU:
+  <https://docs.github.com/en/actions/reference/runners/github-hosted-runners>.
+- **WASM CI:** Rust documents `wasm32-wasip1` as a Tier-2 target with a self-contained
+  sysroot and the same default WebAssembly features as `wasm32-unknown-unknown`:
+  <https://doc.rust-lang.org/rustc/platform-support/wasm32-wasip1.html>. The official
+  Bytecode Alliance setup action installs Wasmtime, whose documented `--dir=.` capability
+  exposes the committed hashes to `--check`:
+  <https://github.com/bytecodealliance/actions>,
+  <https://docs.wasmtime.dev/cli-options.html>. The workflow pins the patched 46.0.2
+  release: <https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.2>. This
+  executes the integer renderer as WebAssembly; it is not a browser/JS ABI test. The
+  existing `wasm32-unknown-unknown` build job remains the browser compile check.
+- **Float tolerance:** average segmental SNR uses 1,024-frame windows, excludes segments
+  below −80 dBFS RMS, caps exact matches at 120 dB, and gates at 60 dB. The five-fixture
+  corpus measures 71.03–85.81 dB with the C6 rounding contract.
+- **Module hashing:** `Module` remains deterministically `Hash`, but an additional module
+  digest would only repeat loader coverage and cannot detect mixer regressions. The audio
+  SHA-256 is retained as the required first-line golden.
+- **Honest local gap:** the development host is x86-64 and has no native ARM64 hardware
+  or Wasmtime. Native x86 results are locally verified, and the WASIp1 checker was also
+  executed locally under Node's WASI runtime. The checked-in native ARM64 runner and
+  pinned Wasmtime job remain the authoritative executable checks for those environments,
+  rather than treating cross-compilation as proof of execution.
+
 ## Verification
 
 - The same module renders to the same hash on two runs, at six different host block sizes.

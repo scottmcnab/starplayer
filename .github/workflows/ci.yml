@@ -1,6 +1,7 @@
-# Every job here is a single `cargo xtask ci --job <job>` invocation, and
-# `cargo xtask ci` runs exactly this set locally. There is one definition of the CI
-# matrix — xtask/src/main.rs — so local verification and CI cannot drift apart.
+# Every host job here is a single `cargo xtask ci --job <job>` invocation, and
+# `cargo xtask ci` runs that set locally. The ARM64 golden job repeats the same xtask job
+# natively. The WASIp1 job is the one exception: xtask is a host executable, so CI builds
+# and runs the golden helper itself under Wasmtime.
 #
 # The toolchain, including the wasm32 and riscv32 targets, comes from
 # rust-toolchain.toml; `rustup show` installs it.
@@ -26,6 +27,53 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask ci --job host-tests
+
+  goldens-x86-64:
+    name: golden hashes (x86-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job goldens
+
+  goldens-aarch64:
+    name: golden hashes (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job goldens
+
+  goldens-wasm32:
+    name: golden hashes (wasm32-wasip1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+        with:
+          version: "46.0.2"
+      - name: Build canonical renderer for WebAssembly
+        run: cargo build --release --target wasm32-wasip1 -p starplayer-offline --bin starplayer-goldens
+      - name: Compare WebAssembly hashes with the committed x86-64 contract
+        run: wasmtime --dir=. target/wasm32-wasip1/release/starplayer-goldens.wasm --check
+
+  fma-check:
+    name: float FMA contraction audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job fma-check
 
   wasm-build:
     name: wasm build
