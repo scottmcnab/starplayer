@@ -192,6 +192,9 @@ where
     /// The UI's half, held until [`Engine::telemetry_reader`] claims it.
     #[cfg(feature = "telemetry")]
     telemetry_reader: Option<starplayer_telemetry::TelemetryReader>,
+    /// Diagnostic per-tick trace. The field does not exist in shipping builds.
+    #[cfg(feature = "trace")]
+    trace: crate::trace::TraceRecorder,
     interpolator: core::marker::PhantomData<Interp>,
 }
 
@@ -241,6 +244,8 @@ where
             telemetry,
             #[cfg(feature = "telemetry")]
             telemetry_reader: Some(telemetry_reader),
+            #[cfg(feature = "trace")]
+            trace: crate::trace::TraceRecorder::default(),
             interpolator: core::marker::PhantomData,
         }
     }
@@ -259,6 +264,18 @@ where
     pub fn telemetry_reader(&mut self) -> Option<starplayer_telemetry::TelemetryReader> {
         self.telemetry_reader.take()
     }
+
+    /// Ticks captured so far in a diagnostic trace build.
+    #[cfg(feature = "trace")]
+    pub fn trace(&self) -> &crate::trace::Trace { self.trace.trace() }
+
+    /// Take the captured trace and leave the engine recording into an empty one.
+    #[cfg(feature = "trace")]
+    pub fn take_trace(&mut self) -> crate::trace::Trace { self.trace.take() }
+
+    /// Discard every captured tick without changing playback state.
+    #[cfg(feature = "trace")]
+    pub fn clear_trace(&mut self) { self.trace.clear(); }
 
     /// Claim the control-side handle, once.
     ///
@@ -532,6 +549,8 @@ where
                 let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
                 #[cfg(feature = "telemetry")]
                 context.set_telemetry(&mut self.telemetry);
+                #[cfg(feature = "trace")]
+                context.set_trace(&mut self.trace);
                 self.sources.dispatch(self.source_frame, &mut context);
             }
             // Re-read rather than reusing `control_due`: the dispatch above may have taken

@@ -64,6 +64,9 @@ pub struct EngineContext<'engine> {
     /// (architecture §9). `None` means nobody is watching and every report is a no-op.
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<&'engine mut starplayer_telemetry::TelemetryPublisher>,
+    /// Per-tick diagnostic recorder. Absent, including as a field, when tracing is off.
+    #[cfg(feature = "trace")]
+    pub(crate) trace: Option<&'engine mut crate::trace::TraceRecorder>,
 }
 
 impl<'engine> EngineContext<'engine> {
@@ -81,6 +84,8 @@ impl<'engine> EngineContext<'engine> {
             control,
             #[cfg(feature = "telemetry")]
             telemetry: None,
+            #[cfg(feature = "trace")]
+            trace: None,
         }
     }
 
@@ -89,6 +94,31 @@ impl<'engine> EngineContext<'engine> {
     #[cfg(feature = "telemetry")]
     pub fn set_telemetry(&mut self, telemetry: &'engine mut starplayer_telemetry::TelemetryPublisher) {
         self.telemetry = Some(telemetry);
+    }
+
+    /// Attach the engine-owned diagnostic recorder.
+    #[cfg(feature = "trace")]
+    pub(crate) fn set_trace(&mut self, trace: &'engine mut crate::trace::TraceRecorder) {
+        self.trace = Some(trace);
+    }
+
+    /// Apply one absolute parameter write and feed the trace hook in diagnostic builds.
+    /// A stale voice remains a no-op.
+    #[inline]
+    pub fn write_voice_param(&mut self, voice: VoiceId, param: VoiceParam) {
+        #[cfg(feature = "trace")]
+        let channel = self.voices.get(voice).map(|state| state.tag.channel);
+        let Some(state) = self.voices.get_mut(voice) else { return };
+        param.apply(&mut state.params);
+        #[cfg(feature = "trace")]
+        if let (Some(trace), Some(channel)) = (self.trace.as_deref_mut(), channel) {
+            let flag = match param {
+                VoiceParam::Step(_) | VoiceParam::Filter(_) => starplayer_core::DirtyBits::PITCH,
+                VoiceParam::Volume(_) => starplayer_core::DirtyBits::VOLUME,
+                VoiceParam::Pan(_) => starplayer_core::DirtyBits::PAN,
+            };
+            trace.record_channel_flags(starplayer_core::ChannelId(channel as u16), flag);
+        }
     }
 
     /// Reborrow, so a source can hand a shorter-lived context to something it owns.
@@ -100,6 +130,8 @@ impl<'engine> EngineContext<'engine> {
             control: self.control,
             #[cfg(feature = "telemetry")]
             telemetry: self.telemetry.as_deref_mut(),
+            #[cfg(feature = "trace")]
+            trace: self.trace.as_deref_mut(),
         }
     }
 }
@@ -195,9 +227,7 @@ impl EventSource for ScriptedSource {
             if action.frame > frame {
                 break;
             }
-            if let Some(voice) = context.voices.get_mut(action.voice) {
-                action.param.apply(&mut voice.params);
-            }
+            context.write_voice_param(action.voice, action.param);
             self.next += 1;
         }
     }

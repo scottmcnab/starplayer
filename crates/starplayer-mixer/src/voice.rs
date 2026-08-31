@@ -22,9 +22,9 @@ pub struct VoiceTag {
     /// Which channel triggered the voice. Still set for an IT background voice, which is
     /// no longer *owned* by that channel.
     pub channel: u8,
-    /// Which instrument.
+    /// One-based tracker instrument number; zero means none.
     pub instrument: u8,
-    /// Which sample.
+    /// One-based tracker sample number; zero means none.
     pub sample: u8,
     /// Which note.
     pub note: u8,

@@ -67,6 +67,8 @@ pub mod sequencer;
 pub mod source;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
+#[cfg(feature = "trace")]
+pub mod trace;
 
 pub use channel::{Channel, ChannelTable};
 pub use command::{
@@ -81,9 +83,11 @@ pub use mixer_mode::{MixPathKind, MixerMode, OutputDepth};
 pub use ring::OutputRing;
 pub use sequencer::{
     EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, SongPosition,
-    TickContext, TickOutcome, TrackerProcessor,
+    TickContext, TickOutcome, TraceChannelState, TrackerProcessor,
 };
 pub use source::{EngineContext, EventSource, ScriptedAction, ScriptedSource, SilentSource, SourceMux, SourceSlot};
+#[cfg(feature = "trace")]
+pub use trace::{TRACE_FORMAT_VERSION, Trace, TraceChannel, TraceTick};
 
 use starplayer_mixer::{FixedPath, FloatPath, StereoF32, StereoI16};
 

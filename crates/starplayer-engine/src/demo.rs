@@ -216,12 +216,12 @@ impl TrackerProcessor for DemoProcessor {
             match note {
                 DEMO_NOTE_NONE => {}
                 DEMO_NOTE_CUT => {
-                    context.channels.stop(channel, context.voices);
+                    context.stop_channel(channel);
                 }
                 note => {
                     let params = VoiceParams { step: self.step_for(note), volume: demo_volume(volume), ..VoiceParams::SILENT };
                     let tag = VoiceTag { channel: index as u8, instrument: 1, sample: 1, note };
-                    if context.channels.trigger(channel, context.voices, tag, self.region, params, 0).is_some() {
+                    if context.trigger_channel(channel, tag, self.region, params, 0).is_some() {
                         self.notes_triggered = self.notes_triggered.saturating_add(1);
                     }
                 }

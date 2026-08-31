@@ -34,8 +34,8 @@
 //! *decoding* is not here either: the sequencer hands the processor the row's packed bytes
 //! in the format's own encoding and never looks inside them.
 
-use starplayer_core::{ChannelId, Frame, FrameClock, Note, RowAdvance, RowClock, TempoModel, U0F16};
-use starplayer_mixer::VoicePool;
+use starplayer_core::{ChannelId, DirtyBits, Frame, FrameClock, Note, RowAdvance, RowClock, TempoModel, U0F16, VoiceId, VoiceParam, VoiceParams};
+use starplayer_mixer::{SampleRegion, VoicePool, VoiceTag};
 
 use crate::channel::ChannelTable;
 use crate::source::{EngineContext, EventSource};
@@ -226,6 +226,29 @@ pub struct TickContext<'engine> {
     /// rather than directly, so that a format crate never mentions the feature.
     #[cfg(feature = "telemetry")]
     telemetry: Option<&'engine mut starplayer_telemetry::TelemetryPublisher>,
+    /// Per-tick diagnostic recorder. Reached only through the reporting/write helpers.
+    #[cfg(feature = "trace")]
+    trace: Option<&'engine mut crate::trace::TraceRecorder>,
+}
+
+/// Format-native state which cannot be reconstructed from [`VoiceParams`].
+///
+/// The type is always available so format processors call one stable API; the reporting
+/// method and the value disappear after inlining when `trace` is disabled.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TraceChannelState {
+    /// Linear note with C-0 as zero.
+    pub note: Option<u8>,
+    /// One-based instrument number, or zero.
+    pub instrument: u16,
+    /// One-based sample number, or zero.
+    pub sample: u16,
+    /// Format channel volume normalized to 0..64.
+    pub volume: u16,
+    /// Format-native integer period.
+    pub period: u32,
+    /// Pan normalized to 0..255.
+    pub pan: u16,
 }
 
 impl<'engine> TickContext<'engine> {
@@ -250,6 +273,8 @@ impl<'engine> TickContext<'engine> {
             tempo_bpm,
             #[cfg(feature = "telemetry")]
             telemetry: None,
+            #[cfg(feature = "trace")]
+            trace: None,
         }
     }
 
@@ -308,6 +333,80 @@ impl<'engine> TickContext<'engine> {
         }
         #[cfg(not(feature = "telemetry"))]
         let _ = global_volume;
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.trace.as_deref_mut() {
+            let scaled = ((global_volume.to_bits() as u32 * 64 + 32_767) / 65_535) as u8;
+            trace.report_global_volume(scaled);
+        }
+    }
+
+    /// Report format-native channel state for the stable per-tick trace.
+    ///
+    /// This is a no-op without `trace`, so format crates do not grow feature-dependent
+    /// call sites.
+    #[inline]
+    pub fn report_trace_channel(&mut self, channel: ChannelId, state: TraceChannelState) {
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.report_channel(channel, state);
+        }
+        #[cfg(not(feature = "trace"))]
+        let _ = (channel, state);
+    }
+
+    /// Start or retrigger a channel and trace the initial parameter writes.
+    #[inline]
+    pub fn trigger_channel(
+        &mut self,
+        channel: ChannelId,
+        tag: VoiceTag,
+        region: SampleRegion,
+        params: VoiceParams,
+        offset_frames: u32,
+    ) -> Option<VoiceId> {
+        let voice = self.channels.trigger(channel, self.voices, tag, region, params, offset_frames)?;
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.record_voice_flags(self.voices, voice, params.dirty);
+        }
+        Some(voice)
+    }
+
+    /// Stop and unbind a channel, preserving the stop write in the tick trace even though
+    /// the foreground handle is deliberately cleared immediately.
+    #[inline]
+    pub fn stop_channel(&mut self, channel: ChannelId) -> bool {
+        #[cfg(feature = "trace")]
+        if self.channels.is_sounding(channel, self.voices)
+            && let Some(trace) = self.trace.as_deref_mut()
+        {
+            trace.record_channel_flags(channel, DirtyBits::STOP);
+        }
+        self.channels.stop(channel, self.voices)
+    }
+
+    /// Apply one absolute parameter write and feed the trace hook.
+    #[inline]
+    pub fn write_voice_param(&mut self, voice: VoiceId, param: VoiceParam) {
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.record_param_write(self.voices, voice, param);
+        }
+        if let Some(state) = self.voices.get_mut(voice) {
+            param.apply(&mut state.params);
+        }
+    }
+
+    /// Set a non-value dirty bit such as tempo and feed the same trace hook.
+    #[inline]
+    pub fn mark_voice_dirty(&mut self, voice: VoiceId, flags: DirtyBits) {
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.record_voice_flags(self.voices, voice, flags);
+        }
+        if let Some(state) = self.voices.get_mut(voice) {
+            state.params.dirty.insert(flags);
+        }
     }
 }
 
@@ -545,6 +644,11 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         }
         self.sounding_tick = self.row_clock.tick_in_row;
 
+        #[cfg(feature = "trace")]
+        if let Some(trace) = context.trace.as_deref_mut() {
+            trace.begin_tick(frame, self.sounding_position, self.sounding_tick, self.data.channel_count());
+        }
+
         let mut tick = TickContext {
             frame,
             voices: &mut *context.voices,
@@ -554,6 +658,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             tempo_bpm: self.tempo_bpm,
             #[cfg(feature = "telemetry")]
             telemetry: context.telemetry.as_deref_mut(),
+            #[cfg(feature = "trace")]
+            trace: context.trace.as_deref_mut(),
         };
 
         if !self.row_clock.is_first_tick_of_row() {
@@ -748,6 +854,11 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> EventSou
 
         let outcome = self.run_tick(frame, context);
         self.commit(outcome);
+
+        #[cfg(feature = "trace")]
+        if let Some(trace) = context.trace.as_deref_mut() {
+            trace.finish_tick(self.row_clock.speed, self.tempo_bpm, context.channels, context.voices);
+        }
 
         #[cfg(feature = "telemetry")]
         self.publish_telemetry(context);

@@ -11,7 +11,7 @@ use alloc::vec;
 use starplayer_core::fixed::unit_from_ratio;
 use starplayer_core::tables::{PERIOD_TABLE, ST3_FREQUENCY_NUMERATOR, ST3_PERIOD_SCALE, waveform_sample};
 use starplayer_core::{ChannelId, DirtyBits, Frame, InstrumentId, Note, Step, TempoModel, U0F16, VoiceParams};
-use starplayer_engine::{EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
+use starplayer_engine::{EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TraceChannelState, TrackerProcessor};
 use starplayer_mixer::{LoopSpan, SampleRegion, VoiceTag};
 use starplayer_model::{EffectNames, LoopMode, Module, OrderEntry as ModelOrderEntry};
 use starplayer_rt::Arc;
@@ -581,7 +581,7 @@ impl S3mProcessor {
 
         if dirty.contains(DirtyBits::SAMPLE) {
             if self.channels[channel_index].sample_number == NO_SAMPLE {
-                context.channels.stop(channel_id, context.voices);
+                context.stop_channel(channel_id);
                 self.channels[channel_index].pending_dirty = DirtyBits::empty();
                 return;
             }
@@ -592,19 +592,44 @@ impl S3mProcessor {
             {
                 let region = sample_region(sample);
                 let params = self.voice_params(channel_index, dirty);
-                let tag = VoiceTag { channel: channel_index as u8, instrument: instrument_number, sample: sample_id.0 as u8, note: linear_note(self.channels[channel_index].current_note) };
-                context.channels.trigger(channel_id, context.voices, tag, region, params, self.channels[channel_index].sample_offset);
+                let sample_number = sample_id.0.saturating_add(1).min(u8::MAX as u16) as u8;
+                let tag = VoiceTag { channel: channel_index as u8, instrument: instrument_number, sample: sample_number, note: linear_note(self.channels[channel_index].current_note) };
+                context.trigger_channel(channel_id, tag, region, params, self.channels[channel_index].sample_offset);
             }
         } else if let Some(voice_id) = context.channels.foreground(channel_id)
-            && let Some(voice) = context.voices.get_mut(voice_id)
         {
             let state = &self.channels[channel_index];
-            if dirty.contains(DirtyBits::PITCH) { voice.params.set_step(step_from_period(state.actual_period, self.sample_rate_hz)); }
-            if dirty.contains(DirtyBits::VOLUME) { voice.params.set_volume(scaled_volume(state.actual_volume, self.global_volume)); }
-            if dirty.contains(DirtyBits::PAN) { voice.params.set_pan(pan_nibble_to_bipolar(state.pan_position)); }
-            if dirty.contains(DirtyBits::TEMPO) { voice.params.dirty.insert(DirtyBits::TEMPO); }
+            if dirty.contains(DirtyBits::PITCH) { context.write_voice_param(voice_id, starplayer_core::VoiceParam::Step(step_from_period(state.actual_period, self.sample_rate_hz))); }
+            if dirty.contains(DirtyBits::VOLUME) { context.write_voice_param(voice_id, starplayer_core::VoiceParam::Volume(scaled_volume(state.actual_volume, self.global_volume))); }
+            if dirty.contains(DirtyBits::PAN) { context.write_voice_param(voice_id, starplayer_core::VoiceParam::Pan(pan_nibble_to_bipolar(state.pan_position))); }
+            if dirty.contains(DirtyBits::TEMPO) { context.mark_voice_dirty(voice_id, DirtyBits::TEMPO); }
         }
         self.channels[channel_index].pending_dirty = DirtyBits::empty();
+    }
+
+    fn report_trace_channels(&self, context: &mut TickContext<'_>) {
+        for (channel_index, state) in self.channels.iter().enumerate() {
+            context.report_trace_channel(ChannelId(channel_index as u16), self.trace_channel_state(state));
+        }
+    }
+
+    fn trace_channel_state(&self, state: &S3mChannel) -> TraceChannelState {
+        let note = (state.current_note != 0).then_some(linear_note(state.current_note));
+        let instrument = if state.sample_number == NO_SAMPLE { 0 } else { state.sample_number as u16 };
+        let sample = instrument
+            .checked_sub(1)
+            .and_then(|instrument| self.module.instrument(InstrumentId(instrument)))
+            .and_then(|instrument| instrument.sample)
+            .map(|sample| sample.0.saturating_add(1))
+            .unwrap_or(0);
+        TraceChannelState {
+            note,
+            instrument,
+            sample,
+            volume: state.actual_volume as u16,
+            period: state.actual_period,
+            pan: state.pan_position as u16 * 17,
+        }
     }
 
     fn voice_params(&self, channel_index: usize, dirty: DirtyBits) -> VoiceParams {
@@ -624,6 +649,7 @@ impl S3mProcessor {
 
 impl TrackerProcessor for S3mProcessor {
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+        context.report_global_volume(unit_from_ratio(self.global_volume as u32, 64));
         let mut outcome = context.outcome();
         if self.last_pattern.is_some_and(|pattern| pattern != row.pattern) { self.pattern_loop_start = 0; }
         self.last_pattern = Some(row.pattern);
@@ -637,16 +663,19 @@ impl TrackerProcessor for S3mProcessor {
             self.clip_pitch(channel_index);
         }
         for channel_index in 0..self.channels.len() { self.flush_channel(context, channel_index); }
+        self.report_trace_channels(context);
         outcome
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {
+        context.report_global_volume(unit_from_ratio(self.global_volume as u32, 64));
         let outcome = context.outcome();
         for channel_index in 0..self.channels.len() {
             self.minor_effect(channel_index);
             self.clip_pitch(channel_index);
             self.flush_channel(context, channel_index);
         }
+        self.report_trace_channels(context);
         outcome
     }
 }
@@ -706,7 +735,7 @@ mod tests {
     use starplayer_core::{Frame, RowClock};
     use starplayer_engine::{ChannelTable, SongPosition};
     use starplayer_mixer::VoicePool;
-    use starplayer_model::{ModuleBuilder, ModuleFormat, ModuleHeader};
+    use starplayer_model::{InstrumentDef, ModuleBuilder, ModuleFormat, ModuleHeader, SampleSpec};
 
     fn processor() -> S3mProcessor {
         let mut builder = ModuleBuilder::new();
@@ -722,6 +751,37 @@ mod tests {
         let mut channels = ChannelTable::new(1);
         let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
         test(&mut processor, &mut context);
+    }
+
+    #[test]
+    fn trace_resolves_sample_number_independently_of_instrument_slot() {
+        let mut builder = ModuleBuilder::new();
+        let sample = builder.add_sample(&[0], SampleSpec::one_shot("pcm")).expect("one PCM sample");
+        builder.add_instrument(InstrumentDef::default()).expect("empty instrument slot zero");
+        builder.add_instrument(InstrumentDef::from_sample("pcm", sample, U0F16::MAX)).expect("PCM instrument slot one");
+        builder.add_pattern(&vec![255u8; ROWS as usize * CELL_BYTES], ROWS, 1).expect("one fixed-stride pattern");
+        builder.set_orders(&[0, starplayer_model::ORDER_END]);
+        builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
+        let mut processor = S3mProcessor::new(Arc::new(builder.build().expect("valid module")), 44_100);
+        processor.channels[0].sample_number = 2;
+
+        let state = processor.trace_channel_state(&processor.channels[0]);
+        assert_eq!(state.instrument, 2, "trace keeps the one-based S3M instrument slot");
+        assert_eq!(state.sample, 1, "trace reports the mapped model sample in the one-based domain");
+
+        processor.channels[0].sample_number = 1;
+        let empty_state = processor.trace_channel_state(&processor.channels[0]);
+        assert_eq!(empty_state.sample, 0, "an empty instrument has no trace sample");
+
+        processor.channels[0].sample_number = 2;
+        processor.channels[0].current_note = 0x40;
+        processor.channels[0].pending_dirty = DirtyBits::SAMPLE;
+        let mut voices = VoicePool::new(1);
+        let mut channels = ChannelTable::new(1);
+        let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+        processor.flush_channel(&mut context, 0);
+        let voice = context.channels.foreground(ChannelId(0)).and_then(|voice| context.voices.get(voice)).expect("triggered PCM voice");
+        assert_eq!(voice.tag.sample, 1, "fallback voice metadata uses the same one-based sample number");
     }
 
     #[test]

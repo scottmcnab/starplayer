@@ -55,6 +55,7 @@ fn main() -> ExitCode {
     let succeeded = match subcommand {
         Some("ci") => run_ci(&arguments[1..]),
         Some("goldens") => not_implemented("goldens", "regenerating golden renders (M1)"),
+        Some("trace") => run_trace(&arguments[1..]),
         Some("wasm") => run_wasm(&arguments[1..]),
         Some("serve") => run_serve(&arguments[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -77,6 +78,7 @@ fn print_usage() {
     println!("subcommands:");
     println!("  ci [--job <job>]   run the CI matrix locally, or a single job of it");
     println!("  goldens            regenerate golden renders (not implemented)");
+    println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
     println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
     println!("  serve [--port N] [--host ADDR]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
     println!("                     --host 0.0.0.0 exposes it to the LAN; add --tls [--tls-san ip,ip] there, since AudioWorklet");
@@ -91,6 +93,35 @@ fn print_usage() {
 fn not_implemented(subcommand: &str, what: &str) -> bool {
     println!("xtask {subcommand}: not implemented — {what}");
     true
+}
+
+/// Run the std-only offline trace driver without making xtask depend on the audio crate
+/// graph. Keeping xtask dependency-free is a repository invariant; the helper binary is
+/// also useful to hosts that want the same capture path directly.
+fn run_trace(arguments: &[String]) -> bool {
+    if arguments.is_empty() {
+        eprintln!("xtask trace: usage: cargo xtask trace <module> [--ticks N]");
+        return false;
+    }
+    let mut command = Command::new(cargo_binary());
+    command
+        .current_dir(workspace_root())
+        // The parent `cargo xtask` process owns the workspace target-directory lock for
+        // as long as xtask runs. A dedicated target dir avoids recursively waiting on our
+        // own lock while preserving xtask's dependency-free manifest.
+        .args(["run", "--quiet", "--target-dir", "target/xtask-trace", "-p", "starplayer-offline", "--bin", "starplayer-trace", "--"])
+        .args(arguments);
+    match command.status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("xtask trace: offline driver exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("xtask trace: offline driver failed to start: {error}");
+            false
+        }
+    }
 }
 
 fn run_ci(arguments: &[String]) -> bool {

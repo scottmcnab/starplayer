@@ -5,5 +5,5 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-starplayer = { workspace = true, features = ["std"] }
+starplayer = { workspace = true, features = ["std", "trace"] }
 starplayer-offline = { workspace = true }
