@@ -102,6 +102,91 @@ The reference for MOD effect behaviour is ProTracker, not the original assembly.
 - Panning: channel 0 left, 1 right, 2 right, 3 left.
 - **Owner check**: at least three well-known `.mod` files sound right.
 
+## Coordinator review gate — 2026-09-01
+
+The first implementation and an independent source audit are complete, but C3 is **not
+ready to land**. The implementation remains unstaged and uncommitted until every item
+below is corrected or replaced by a source-backed documented exclusion. These findings
+are the repair specification for the next implementation pass.
+
+### Loader correctness
+
+1. **Scan all 128 order entries when locating sample data.** The current loader derives
+   the pattern count from only the declared `song_length` prefix. That contradicts the
+   deliverable above and ProTracker's all-128-entry pattern scan: a higher unused order
+   still occupies pattern bytes in the file. Ignoring it moves the computed sample-data
+   offset into pattern data and corrupts every decoded sample. Add a regression fixture
+   whose active order prefix names pattern zero and whose inactive order tail names a
+   higher pattern; assert both the pattern count and the first sample bytes. Continue to
+   ignore `255`, and preserve the special stored-pair accounting for `FLT8`.
+
+### Effect-state correctness
+
+2. **Base arpeggio on the channel's current period, not a stale note number.** After
+   period slides or tone portamento, `current_note` no longer identifies the sounding
+   period. Match ProTracker's period-table search from the current period and selected
+   finetune row, including its wrap/sentinel behaviour. Cover arpeggio immediately after
+   both a plain period slide and a completed tone portamento.
+
+3. **Latch whether the current row actually contains a note.** `EDx` on a row without a
+   note must not retrigger the historical `current_note`. Use explicit row-local delayed
+   trigger state rather than inferring eligibility from persistent channel state. Cover
+   `ED0`, a positive `EDx`, no-note `EDx`, and row-delay repetitions.
+
+4. **Audit `E9x` tick-zero and row-delay behaviour with the same row-local note state.**
+   The current retrigger path can restart or reset state on repeated tick zero even when
+   ProTracker would retain the existing sample pointer. Add focused oracle-derived tests
+   for note and no-note rows, including `EEx` repetition.
+
+5. **Correct `9xx` memory and no-note behaviour.** A `9xx` row must update and apply the
+   retained sample offset according to ProTracker even when the row has no new note, and
+   an `E9x` retrigger must not erase the retained offset state. Preserve the already
+   implemented PT 1/2 double-offset pointer rule and the past-end one-word rule. Test each
+   transition independently so one rule cannot mask another.
+
+6. **Apply `Fxx` BPM at ProTracker's CIA update boundary.** The current tick outcome
+   commits the new tempo for the interval beginning at the command's tick zero; PT uses
+   the old duration for that interval and installs the new CIA value for the following
+   tick. Implement this without weakening sample-exact event boundaries, then assert the
+   absolute frame of the first two tick boundaries around a tempo change.
+
+7. **Find tone-portamento targets in the selected finetune row.** Do not first identify a
+   slot in the zero-finetune row and then index that slot in another row. ProTracker scans
+   the selected finetune table for the packed period. Add a non-exact/intermediate-period
+   case where the two algorithms choose different targets.
+
+8. **Reset vibrato and tremolo phases when a delayed note actually triggers.** Latching
+   an `EDx` row must not reset the LFO phases early. Cover both retriggering waveforms
+   (selectors 0–3) and no-retrigger selectors (4–7).
+
+### Host and conformance completion
+
+9. **Finish the browser's user-facing MOD dispatch.** `apps/starplayer-web/www/index.html`
+   still describes and accepts only S3M/ZIP, while archive messages in `app.js` say S3M
+   even when MOD entries are offered. Update the file picker accept list, load/drop/URL
+   labels, archive heading, empty-archive error, and archive-choice message to say MOD or
+   generic module where appropriate. Keep the already-correct native backend dispatch
+   and effect-name refresh ordering, and add a regression check for the visible strings.
+
+10. **Integrate and execute the C2 MOD corpus gate before archiving C3.** The parallel C3
+    branch predates the landed C2 harness, so this is completed after bringing C3 onto the
+    current `m2` integration branch. Register the native `trace_mod` capture and use
+    format-specific oracle projection: libxmp MOD notes require subtracting 24 rather
+    than the S3M subtract-12 mapping, and MOD period Q12 requires division by 4096 rather
+    than 1024. Make a deliberate, documented projection or tolerance decision for the
+    integer libxmp sample-position oracle versus StarPlayer's fractional position. Run
+    all 27 pinned MOD cases; every case must pass or have a specific written exclusion,
+    with no remaining format gate.
+
+### Required re-review
+
+- Add a focused regression for every item above; a green existing suite is insufficient
+  because the first implementation passed it while these defects remained.
+- Re-run the task's package, workspace, clippy, `no_std`, bare-metal facade, WASM, trace,
+  block-size determinism, conformance, and `git diff --check` commands.
+- Obtain a second independent source audit after the repair pass. The coordinator reviews
+  that report and the complete diff before staging any implementation path.
+
 ## Out of scope
 
 MTM (C4). Any S3M conversion path. XM (M5).
