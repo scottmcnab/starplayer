@@ -130,8 +130,8 @@ pub struct PatternCell {
 /// in the program, and both modern UIs want it. This is that table.
 ///
 /// One table per format, because the same letter means different things in different
-/// formats. [`EffectNames::S3M`] is the one M1 needs; the MOD, MTM, XM and IT tables
-/// arrive with those format crates.
+/// formats. [`EffectNames::S3M`] and [`EffectNames::MOD`] are available; MTM, XM and IT
+/// tables arrive with those format crates.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EffectNames {
     commands: &'static [(u8, &'static str)],
@@ -145,6 +145,13 @@ impl EffectNames {
         commands: S3M_COMMAND_NAMES,
         subcommand_code: S3M_SUBCOMMAND_CODE,
         subcommands: S3M_SUBCOMMAND_NAMES,
+    };
+
+    /// ProTracker command and `E` sub-command names.
+    pub const MOD: EffectNames = EffectNames {
+        commands: MOD_COMMAND_NAMES,
+        subcommand_code: 0xE,
+        subcommands: MOD_SUBCOMMAND_NAMES,
     };
 
     /// A table for a format whose commands carry no sub-command nybble.
@@ -211,6 +218,43 @@ const S3M_SUBCOMMAND_NAMES: &[(u8, &str)] = &[
     (0xE, "pattern delay"),
 ];
 
+const MOD_COMMAND_NAMES: &[(u8, &str)] = &[
+    (0x0, "arpeggio"),
+    (0x1, "portamento up"),
+    (0x2, "portamento down"),
+    (0x3, "tone portamento"),
+    (0x4, "vibrato"),
+    (0x5, "tone porta & volume slide"),
+    (0x6, "vibrato & volume slide"),
+    (0x7, "tremolo"),
+    (0x8, "channel pan"),
+    (0x9, "sample offset"),
+    (0xA, "volume slide"),
+    (0xB, "position jump"),
+    (0xC, "set volume"),
+    (0xD, "pattern break"),
+    (0xF, "set speed/tempo"),
+];
+
+const MOD_SUBCOMMAND_NAMES: &[(u8, &str)] = &[
+    (0x0, "set filter"),
+    (0x1, "fine portamento up"),
+    (0x2, "fine portamento down"),
+    (0x3, "glissando control"),
+    (0x4, "set vibrato waveform"),
+    (0x5, "set finetune"),
+    (0x6, "pattern loop"),
+    (0x7, "set tremolo waveform"),
+    (0x8, "channel pan"),
+    (0x9, "note retrigger"),
+    (0xA, "fine volume slide up"),
+    (0xB, "fine volume slide down"),
+    (0xC, "note cut"),
+    (0xD, "note delay"),
+    (0xE, "pattern delay"),
+    (0xF, "invert loop"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +285,14 @@ mod tests {
         let cell = EffectCell::new(s3m_command_code(b'D'), 0x0F, &EffectNames::S3M);
         assert_eq!(cell, EffectCell { code: 4, param: 0x0F, name: "volume slide" });
         assert_eq!(EffectCell::new(s3m_command_code(b'M'), 0, &EffectNames::S3M).name, "");
+    }
+
+    #[test]
+    fn mod_commands_and_extended_commands_have_their_own_names() {
+        assert_eq!(EffectNames::MOD.name(0, 0x37), Some("arpeggio"));
+        assert_eq!(EffectNames::MOD.name(0xD, 0x31), Some("pattern break"));
+        assert_eq!(EffectNames::MOD.name(0xE, 0xD3), Some("note delay"));
+        assert_eq!(EffectNames::MOD.name(0xE, 0xFF), Some("invert loop"));
     }
 
     #[test]

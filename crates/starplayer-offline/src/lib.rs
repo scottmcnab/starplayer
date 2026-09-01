@@ -15,7 +15,7 @@ use starplayer::core::{Error, ExactFixedPoint, Frame, Interpolator};
 use starplayer::dsp::Linear;
 use starplayer::engine::{EndOfSongPolicy, Engine, EngineSettings, EngineWarnings, EventSource, PatternSequencer, SequencerSettings, Trace};
 use starplayer::mixer::{FixedPath, FloatPath, Limiter, MixPath, MonoF32, MonoI16, OutputFormat, StereoI16};
-use starplayer::model::Module;
+use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::Arc;
 
 use sha2::{Digest, Sha256};
@@ -66,7 +66,7 @@ impl Default for TraceOptions {
 /// Failure to load or finish a diagnostic trace.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TraceError {
-    /// The S3M loader rejected the input.
+    /// No enabled native loader accepted the input.
     Load(Error),
     /// Playback did not terminate within [`MAX_CAPTURE_TICKS`].
     TickLimit,
@@ -102,7 +102,7 @@ impl From<Error> for RenderError {
 impl fmt::Display for TraceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TraceError::Load(error) => write!(formatter, "could not load S3M module: {error}"),
+            TraceError::Load(error) => write!(formatter, "could not load module: {error}"),
             TraceError::TickLimit => write!(formatter, "trace exceeded the safety limit of {MAX_CAPTURE_TICKS} ticks"),
         }
     }
@@ -246,12 +246,23 @@ where
     if warnings.any() { Err(RenderError::EngineWarnings(warnings)) } else { Ok(output) }
 }
 
+/// Autodetect a supported module and capture its stable per-tick trace with that format's
+/// native processor.
+pub fn trace_module(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
+    trace_loaded(Arc::new(starplayer::load(bytes)?), options)
+}
+
 /// Load an S3M and capture its stable per-tick trace.
-///
-/// M1 has one production loader/effect processor, S3M. MOD and MTM route through the same
-/// entry point when their native processors land in C3/C4; no format is lowered to S3M.
 pub fn trace_s3m(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
-    let module = Arc::new(starplayer::s3m::load(bytes)?);
+    trace_loaded(Arc::new(starplayer::s3m::load(bytes)?), options)
+}
+
+/// Load a MOD and capture its stable per-tick trace through the ProTracker processor.
+pub fn trace_mod(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
+    trace_loaded(Arc::new(starplayer::mod_file::load(bytes)?), options)
+}
+
+fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, TraceError> {
     let channel_count = module.header().channel_count as usize;
     let engine_settings = EngineSettings {
         sample_rate_hz: TRACE_SAMPLE_RATE_HZ,
@@ -271,13 +282,22 @@ pub fn trace_s3m(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceErro
         restart_order: 0,
         end_of_song: EndOfSongPolicy::Stop,
     };
-    let sequencer = PatternSequencer::new(
-        ExactFixedPoint,
-        starplayer::s3m::S3mPatternData(Arc::clone(&module)),
-        starplayer::s3m::S3mProcessor::new(module, TRACE_SAMPLE_RATE_HZ),
-        sequencer_settings,
-    );
-    engine.set_source(Box::new(sequencer));
+    let source: Box<dyn EventSource> = match module.header().format {
+        ModuleFormat::S3m => Box::new(PatternSequencer::new(
+            ExactFixedPoint,
+            starplayer::s3m::S3mPatternData(Arc::clone(&module)),
+            starplayer::s3m::S3mProcessor::new(module, TRACE_SAMPLE_RATE_HZ),
+            sequencer_settings,
+        )),
+        ModuleFormat::Mod => Box::new(PatternSequencer::new(
+            ExactFixedPoint,
+            starplayer::mod_file::ModPatternData(Arc::clone(&module)),
+            starplayer::mod_file::ModProcessor::new(module, TRACE_SAMPLE_RATE_HZ),
+            sequencer_settings,
+        )),
+        _ => return Err(TraceError::Load(Error::Invalid("format has no offline native processor"))),
+    };
+    engine.set_source(source);
 
     let requested_ticks = options.ticks.unwrap_or(MAX_CAPTURE_TICKS);
     if requested_ticks == 0 {
@@ -311,6 +331,17 @@ mod tests {
         ("PETRI.S3M", include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M")),
         ("REFLEX.S3M", REFLEX),
     ];
+
+    fn minimal_mod() -> Vec<u8> {
+        let mut bytes = vec![0; 1084 + 64 * 4 * 4 + 256];
+        bytes[..10].copy_from_slice(b"native mod");
+        bytes[42..44].copy_from_slice(&128u16.to_be_bytes());
+        bytes[45] = 64;
+        bytes[950] = 1;
+        bytes[1080..1084].copy_from_slice(b"M.K.");
+        bytes[1084..1088].copy_from_slice(&starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0, param: 0 }.to_bytes());
+        bytes
+    }
 
     fn trace_with_block_size(host_block_frames: usize) -> Trace {
         trace_s3m(REFLEX, TraceOptions { ticks: Some(24), host_block_frames }).expect("REFLEX traces")
@@ -349,6 +380,17 @@ mod tests {
             assert!(float.iter().all(|sample| sample.is_finite()), "{name}: float render contains NaN or infinity");
             let snr = segmental_snr_db(&fixed, &float, SEGMENTAL_SNR_FRAMES).expect("the module has audible segments");
             assert!(snr >= MIN_FLOAT_FIXED_SEGMENTAL_SNR_DB, "{name}: {snr:.2} dB is below the {MIN_FLOAT_FIXED_SEGMENTAL_SNR_DB:.2} dB contract");
+        }
+    }
+
+    #[test]
+    fn native_mod_trace_is_repeatable_and_host_block_size_independent() {
+        let module = minimal_mod();
+        let first = trace_module(&module, TraceOptions { ticks: Some(24), host_block_frames: 128 }).expect("MOD traces").to_text();
+        assert!(first.contains("per=000428"), "the trace carries native MOD periods: {first}");
+        for host_block_frames in [1, 3, 64, 128, 4096, 8191] {
+            let trace = trace_mod(&module, TraceOptions { ticks: Some(24), host_block_frames }).expect("native MOD trace").to_text();
+            assert_eq!(trace, first, "host block size {host_block_frames} changed the MOD trace");
         }
     }
 }

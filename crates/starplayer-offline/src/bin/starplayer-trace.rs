@@ -4,7 +4,7 @@
 
 use std::process::ExitCode;
 
-use starplayer_offline::{TraceOptions, trace_s3m};
+use starplayer_offline::{TraceOptions, trace_module};
 
 fn main() -> ExitCode {
     match run() {
@@ -31,7 +31,7 @@ fn run() -> Result<(), String> {
     }
 
     let bytes = std::fs::read(&module_path).map_err(|error| format!("could not read `{module_path}`: {error}"))?;
-    let trace = trace_s3m(&bytes, TraceOptions { ticks, ..TraceOptions::default() }).map_err(|error| error.to_string())?;
+    let trace = trace_module(&bytes, TraceOptions { ticks, ..TraceOptions::default() }).map_err(|error| error.to_string())?;
     print!("{}", trace.to_text());
     Ok(())
 }

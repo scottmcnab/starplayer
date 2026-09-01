@@ -41,3 +41,32 @@ pub use starplayer_telemetry as telemetry;
 /// Scream Tracker 3 loading, native pattern access and sequencer construction.
 #[cfg(feature = "s3m")]
 pub use starplayer_s3m as s3m;
+
+/// ProTracker MOD loading, native pattern access and sequencer construction.
+///
+/// `mod` is a Rust keyword, so the facade spells the namespace `mod_file`; the generic
+/// [`load`] and [`probe`] entry points normally mean callers do not need this name.
+#[cfg(feature = "mod")]
+pub use starplayer_mod as mod_file;
+
+/// Identify a module using the probes for the format capabilities compiled into this
+/// facade. No extension or S3M lowering participates in this decision.
+pub fn probe(bytes: &[u8]) -> Option<starplayer_model::ModuleFormat> {
+    let _ = bytes;
+    #[cfg(feature = "s3m")]
+    if starplayer_s3m::probe(bytes) { return Some(starplayer_model::ModuleFormat::S3m); }
+    #[cfg(feature = "mod")]
+    if starplayer_mod::probe(bytes) { return Some(starplayer_model::ModuleFormat::Mod); }
+    None
+}
+
+/// Autodetect and load a module through its native format crate.
+pub fn load(bytes: &[u8]) -> Result<starplayer_model::Module, starplayer_core::Error> {
+    match probe(bytes) {
+        #[cfg(feature = "s3m")]
+        Some(starplayer_model::ModuleFormat::S3m) => starplayer_s3m::load(bytes),
+        #[cfg(feature = "mod")]
+        Some(starplayer_model::ModuleFormat::Mod) => starplayer_mod::load(bytes),
+        _ => Err(starplayer_core::Error::BadMagic),
+    }
+}

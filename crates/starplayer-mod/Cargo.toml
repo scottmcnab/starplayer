@@ -5,14 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+starplayer-core = { workspace = true }
 starplayer-engine = { workspace = true }
+starplayer-mixer = { workspace = true }
 starplayer-model = { workspace = true }
+starplayer-rt = { workspace = true }
 
 [features]
 default = []
-std = ["starplayer-engine/std", "starplayer-model/std"]
-alloc = ["starplayer-engine/alloc", "starplayer-model/alloc"]
-serde = ["starplayer-engine/serde", "starplayer-model/serde"]
+std = ["starplayer-core/std", "starplayer-engine/std", "starplayer-mixer/std", "starplayer-model/std", "starplayer-rt/std"]
+alloc = ["starplayer-core/alloc", "starplayer-engine/alloc", "starplayer-mixer/alloc", "starplayer-model/alloc", "starplayer-rt/alloc"]
+serde = ["starplayer-core/serde", "starplayer-engine/serde", "starplayer-model/serde"]
 # Reproduce the original DOS player's quirks instead of the canonical
 # behaviour. See plans/product/03-accuracy-policy.md section 2.
 quirks-starplayer = []
+
+[dev-dependencies]
+starplayer-dsp = { workspace = true }

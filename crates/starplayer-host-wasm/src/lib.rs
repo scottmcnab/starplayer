@@ -3,14 +3,15 @@
 //! The worklet owns this wasm instance. A second, page-side wasm instance validates
 //! files and supplies metadata without touching the render instance. Once validation
 //! succeeds the original `ArrayBuffer` is transferred here; activation builds the
-//! `Arc<Module>` and S3M sequencer outside `process()`, then hands the module through the
+//! `Arc<Module>` and format-native sequencer outside `process()`, then hands the module through the
 //! engine's typed command ring. Every buffer used by `process()` is allocated by `init`.
 //!
 //! # Why the module is decoded twice
 //!
 //! The two instances do not share memory, so an `Arc<Module>` built on the page cannot be
 //! handed to the worklet — only bytes can cross, and they cross once, as a transferred
-//! `ArrayBuffer`. Each instance therefore runs `starplayer::s3m::load` on those bytes.
+//! `ArrayBuffer`. Each instance therefore runs the facade's native format autodetection on
+//! those bytes.
 //! That is milliseconds of work and a second copy of the module, and it buys two things
 //! worth more than either: an untrusted file is rejected on the page, before it can reach
 //! the live audio graph at all, and the pattern view's `PatternCell` decoding runs on the
@@ -36,7 +37,8 @@ use starplayer::core::{ChannelId, Command, ExactFixedPoint, Frame, Interpolator,
 use starplayer::dsp::{GainRamp, Interpolate, Linear, Nearest};
 use starplayer::engine::{Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode, OutputDepth, PatternSequencer, RENDER_QUANTUM};
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
-use starplayer::model::Module;
+use starplayer::model::{Module, ModuleFormat};
+use starplayer::mod_file::{ModPatternData, ModProcessor};
 use starplayer::rt::Arc;
 use starplayer::s3m::{S3mPatternData, S3mProcessor};
 use starplayer::telemetry::{Snapshot, TelemetryReader};
@@ -73,6 +75,8 @@ const TELEMETRY_CHANNELS: usize = 64;
 const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
 
 type S3mSequencer = PatternSequencer<ExactFixedPoint, S3mProcessor, S3mPatternData>;
+type ModSequencer = PatternSequencer<ExactFixedPoint, ModProcessor, ModPatternData>;
+type BuiltSource = (Box<dyn EventSource>, Rc<Cell<SeekRequest>>);
 
 const DITHER_SEED: u32 = 0x5354_4152;
 
@@ -167,19 +171,50 @@ struct SeekRequest {
     frame: Frame,
 }
 
-/// A concrete S3M source with a host-owned seek mailbox.
+enum NativeSequencer {
+    S3m(S3mSequencer),
+    Mod(ModSequencer),
+}
+
+impl NativeSequencer {
+    fn next_event_frame(&self) -> Option<Frame> {
+        match self { NativeSequencer::S3m(sequencer) => sequencer.next_event_frame(), NativeSequencer::Mod(sequencer) => sequencer.next_event_frame() }
+    }
+
+    fn advance_to(&mut self, frame: Frame) {
+        match self { NativeSequencer::S3m(sequencer) => sequencer.advance_to(frame), NativeSequencer::Mod(sequencer) => sequencer.advance_to(frame) }
+    }
+
+    fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        match self { NativeSequencer::S3m(sequencer) => sequencer.dispatch(frame, context), NativeSequencer::Mod(sequencer) => sequencer.dispatch(frame, context) }
+    }
+
+    fn seek_order(&mut self, order: u16) {
+        match self { NativeSequencer::S3m(sequencer) => { let _ = sequencer.seek_order(order); }, NativeSequencer::Mod(sequencer) => { let _ = sequencer.seek_order(order); } }
+    }
+
+    fn seek_row(&mut self, row: u16) {
+        match self { NativeSequencer::S3m(sequencer) => sequencer.seek_row(row), NativeSequencer::Mod(sequencer) => sequencer.seek_row(row) }
+    }
+
+    fn restart_clock_at(&mut self, frame: Frame) {
+        match self { NativeSequencer::S3m(sequencer) => sequencer.restart_clock_at(frame), NativeSequencer::Mod(sequencer) => sequencer.restart_clock_at(frame) }
+    }
+}
+
+/// A format-native tracker source with a host-owned seek mailbox.
 ///
 /// `Engine` intentionally stores `dyn EventSource`, so its generic command handler cannot
 /// downcast to `PatternSequencer`. This wrapper is the safe host-specific bridge: the
 /// command remains a typed `Command`, but order/row seeks become one fixed-size mailbox
 /// write. The wrapper consumes it at an event boundary and restarts the sequencer clock
 /// on the engine's monotonic source timeline. No allocation occurs in `process()`.
-struct SeekableS3mSource {
-    sequencer: S3mSequencer,
+struct SeekableModuleSource {
+    sequencer: NativeSequencer,
     request: Rc<Cell<SeekRequest>>,
 }
 
-impl EventSource for SeekableS3mSource {
+impl EventSource for SeekableModuleSource {
     fn next_event_frame(&self) -> Option<Frame> {
         let request = self.request.get();
         match request.kind {
@@ -198,7 +233,7 @@ impl EventSource for SeekableS3mSource {
         if !matches!(request.kind, SeekKind::None) && frame >= request.frame {
             self.request.set(SeekRequest::default());
             match request.kind {
-                SeekKind::Order(order) => { let _ = self.sequencer.seek_order(order); }
+                SeekKind::Order(order) => self.sequencer.seek_order(order),
                 SeekKind::Row(row) => self.sequencer.seek_row(row),
                 SeekKind::None => {}
             }
@@ -240,13 +275,17 @@ fn quantize_fixed_sample(value: i32, depth: OutputDepth, dither: &mut Dither) ->
     }
 }
 
-fn source_for(module: Arc<Module>, sample_rate_hz: u32, order: u16, frame: Frame) -> (Box<dyn EventSource>, Rc<Cell<SeekRequest>>) {
-    let mut sequencer = starplayer::s3m::sequencer_for(module, sample_rate_hz, ExactFixedPoint);
-    let _ = sequencer.seek_order(order);
+fn source_for(module: Arc<Module>, sample_rate_hz: u32, order: u16, frame: Frame) -> Result<BuiltSource, String> {
+    let mut sequencer = match module.header().format {
+        ModuleFormat::S3m => NativeSequencer::S3m(starplayer::s3m::sequencer_for(module, sample_rate_hz, ExactFixedPoint)),
+        ModuleFormat::Mod => NativeSequencer::Mod(starplayer::mod_file::sequencer_for(module, sample_rate_hz, ExactFixedPoint)),
+        _ => return Err(String::from("the module format has no web-audio processor")),
+    };
+    sequencer.seek_order(order);
     sequencer.restart_clock_at(frame);
     let request = Rc::new(Cell::new(SeekRequest::default()));
-    let source = SeekableS3mSource { sequencer, request: Rc::clone(&request) };
-    (Box::new(source), request)
+    let source = SeekableModuleSource { sequencer, request: Rc::clone(&request) };
+    Ok((Box::new(source), request))
 }
 
 struct Host {
@@ -318,14 +357,14 @@ impl Host {
     /// Decode, construct and queue a module. Called from the worklet's message handler,
     /// never from `process()`; a failed decode leaves the previous module and source live.
     fn load_module(&mut self, bytes: &[u8]) -> Result<u32, String> {
-        let loaded = starplayer::s3m::load(bytes).map_err(|error| error.to_string())?;
+        let loaded = starplayer::load(bytes).map_err(|error| error.to_string())?;
         let module = Arc::new(loaded);
         // A new sequencer's tick clock starts at frame zero, but the engine's musical
         // clock is monotonic and has been running since `init`. Without this the first
         // tick of the new module is due thousands of frames in the past, and the engine
         // burns ticks trying to catch up until it gives up and raises
         // `zero_advance_forced`. Start the clock where the engine actually is.
-        let (source, request) = source_for(Arc::clone(&module), self.sample_rate_hz, 0, self.engine.source_frame());
+        let (source, request) = source_for(Arc::clone(&module), self.sample_rate_hz, 0, self.engine.source_frame())?;
 
         self.control.load_module(Arc::clone(&module)).map_err(|_| String::from("the engine command ring is full"))?;
         self.engine.set_source(source);
@@ -355,7 +394,7 @@ impl Host {
         let mut seek_request = None;
 
         if let Some(module) = self.current_module.as_ref() {
-            let (source, request) = source_for(Arc::clone(module), self.sample_rate_hz, sounding_order, engine.source_frame());
+            let (source, request) = source_for(Arc::clone(module), self.sample_rate_hz, sounding_order, engine.source_frame())?;
             control.load_module(Arc::clone(module)).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
             engine.set_source(source);
             seek_request = Some(request);
@@ -597,7 +636,7 @@ mod exports {
         initialized
     }
 
-    /// Decode and activate one validated S3M byte buffer outside `process()`.
+    /// Decode and activate one validated native module byte buffer outside `process()`.
     #[wasm_bindgen]
     pub fn load_module(bytes: &[u8]) -> Result<u32, JsValue> {
         HOST.with(|cell| {
@@ -670,6 +709,20 @@ mod tests {
     use std::collections::BTreeSet;
 
     const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
+
+    fn minimal_mod() -> Vec<u8> {
+        const SAMPLE_FRAMES: usize = 256;
+        let mut bytes = vec![0; 1084 + 64 * 4 * 4 + SAMPLE_FRAMES];
+        bytes[..10].copy_from_slice(b"native mod");
+        bytes[42..44].copy_from_slice(&((SAMPLE_FRAMES / 2) as u16).to_be_bytes());
+        bytes[45] = 64;
+        bytes[950] = 1;
+        bytes[1080..1084].copy_from_slice(b"M.K.");
+        bytes[1084..1088].copy_from_slice(&starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0, param: 0 }.to_bytes());
+        let sample_offset = 1084 + 64 * 4 * 4;
+        for (index, byte) in bytes[sample_offset..].iter_mut().enumerate() { *byte = if index & 1 == 0 { 0x7F } else { 0x80 }; }
+        bytes
+    }
 
     fn mode(path: MixPathKind, interpolator: Interpolator, depth: OutputDepth, dither: bool, channels: u8) -> MixerMode {
         MixerMode { path, interpolator, depth, dither, channels }
@@ -781,6 +834,15 @@ mod tests {
             heard |= host.process(RENDER_QUANTUM) > 0.0;
         }
         assert!(heard, "the S3M sequencer should trigger sample audio");
+        assert!(host.telemetry.read().sequence > 0);
+    }
+
+    #[test]
+    fn a_mod_uses_the_native_processor_and_reaches_the_real_engine() {
+        let mut host = Host::new(48_000);
+        assert_eq!(host.load_module(&minimal_mod()), Ok(1));
+        assert_eq!(host.current_module.as_ref().map(|module| module.header().format), Some(ModuleFormat::Mod));
+        assert!((0..20).any(|_| host.process(RENDER_QUANTUM) > 0.0), "the MOD sequencer should trigger sample audio");
         assert!(host.telemetry.read().sequence > 0);
     }
 

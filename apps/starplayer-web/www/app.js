@@ -322,6 +322,7 @@ async function loadBuffer(buffer, label) {
             moduleLabel = `${choice.name} (from ${label})`;
         }
         Loader.inspect_s3m(new Uint8Array(moduleBuffer));
+        loadEffectNames();
         const metadata = readMetadata(moduleLabel);
         await audio;
         showMessage(`Activating ${moduleLabel}…`);
@@ -941,7 +942,7 @@ function loadEffectNames() {
 }
 
 function effectName(code, param) {
-    if (code === 0) return '';
+    if (code === 0 && param === 0) return '';
     return EFFECT_NAMES.get(`${code}.${param >> 4}`) || EFFECT_NAMES.get(`${code}`) || '';
 }
 

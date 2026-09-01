@@ -1,4 +1,4 @@
-//! Page-side S3M loader and display view.
+//! Page-side native module loader and display view.
 //!
 //! This is deliberately a second wasm instance, separate from the AudioWorklet engine.
 //! It validates untrusted bytes and exposes title/instrument metadata plus windowed
@@ -10,8 +10,9 @@
 use std::cell::RefCell;
 use std::vec::Vec;
 
-use starplayer::model::{EffectNames, Module, NoteCell, PatternId, s3m_command_code};
-use starplayer::s3m::PatternView;
+use starplayer::model::{EffectNames, Module, ModuleFormat, NoteCell, PatternCell, PatternId, s3m_command_code};
+use starplayer::mod_file::PatternView as ModPatternView;
+use starplayer::s3m::PatternView as S3mPatternView;
 use starplayer_archive::{ArchiveError, extract, is_zip, list_modules};
 
 const DISPLAY_CELL_BYTES: usize = 5;
@@ -34,7 +35,7 @@ fn with_module<T>(fallback: T, action: impl FnOnce(&Module) -> T) -> T {
 fn inspect(bytes: &[u8]) -> Result<(), String> {
     // `load(&[u8])` is ModuleReader's borrowing fast path: the loader borrows pattern and
     // sample ranges directly instead of first copying them into intermediate buffers.
-    let module = starplayer::s3m::load(bytes).map_err(|error| error.to_string())?;
+    let module = starplayer::load(bytes).map_err(|error| error.to_string())?;
     MODULE.with(|cell| {
         let mut slot = cell.try_borrow_mut().map_err(|_| String::from("the page-side loader is busy"))?;
         *slot = Some(module);
@@ -49,20 +50,40 @@ fn inspect(bytes: &[u8]) -> Result<(), String> {
 /// the command code, and the high nybble of the parameter for S3M's `S` sub-commands —
 /// the same two cases [`EffectNames::name`] itself distinguishes.
 fn effect_name_records() -> String {
-    let subcommand_code = s3m_command_code(b'S');
-    let mut records = String::new();
-    for code in 1..=26u8 {
-        if code == subcommand_code {
-            for nybble in 0..=0x0Fu8 {
-                if let Some(name) = EffectNames::S3M.name(code, nybble << 4) {
-                    records.push_str(&format!("{code}:{nybble}:{name}\n"));
+    with_module(String::new(), |module| {
+        let mut records = String::new();
+        match module.header().format {
+            ModuleFormat::S3m => {
+                let subcommand_code = s3m_command_code(b'S');
+                for code in 1..=26u8 {
+                    if code == subcommand_code {
+                        for nybble in 0..=0x0Fu8 {
+                            if let Some(name) = EffectNames::S3M.name(code, nybble << 4) {
+                                records.push_str(&format!("{code}:{nybble}:{name}\n"));
+                            }
+                        }
+                    } else if let Some(name) = EffectNames::S3M.name(code, 0) {
+                        records.push_str(&format!("{code}:-1:{name}\n"));
+                    }
                 }
             }
-        } else if let Some(name) = EffectNames::S3M.name(code, 0) {
-            records.push_str(&format!("{code}:-1:{name}\n"));
+            ModuleFormat::Mod => {
+                for code in 0..=0x0Fu8 {
+                    if code == 0xE {
+                        for nybble in 0..=0x0Fu8 {
+                            if let Some(name) = EffectNames::MOD.name(code, nybble << 4) {
+                                records.push_str(&format!("{code}:{nybble}:{name}\n"));
+                            }
+                        }
+                    } else if let Some(name) = EffectNames::MOD.name(code, 1) {
+                        records.push_str(&format!("{code}:-1:{name}\n"));
+                    }
+                }
+            }
+            _ => {}
         }
-    }
-    records
+        records
+    })
 }
 
 fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
@@ -72,7 +93,7 @@ fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
         Err(error) => return Err(error),
     };
     let mut records = String::new();
-    for entry in entries.into_iter().filter(|entry| entry.format == starplayer::model::ModuleFormat::S3m) {
+    for entry in entries.into_iter().filter(|entry| matches!(entry.format, ModuleFormat::S3m | ModuleFormat::Mod)) {
         let safe_name = entry.name.replace(['\t', '\r', '\n'], " ");
         records.push_str(&format!("{}\t{}\t{}\n", entry.index, safe_name, entry.size));
     }
@@ -81,28 +102,42 @@ fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
 
 fn pattern_window_bytes(pattern: u16, first_row: u16, row_count: u16) -> Vec<u8> {
     with_module(Vec::new(), |module| {
-        let Some(view) = PatternView::new(module, PatternId(pattern)) else { return Vec::new() };
-        let available = view.rows().saturating_sub(first_row);
-        let rows = row_count.min(available);
-        let mut output = Vec::with_capacity(rows as usize * view.channels() as usize * DISPLAY_CELL_BYTES);
-        for row in first_row..first_row.saturating_add(rows) {
-            for channel in 0..view.channels() {
-                let display = view.cell(row, channel).map(|cell| cell.display()).unwrap_or_default();
-                let note = match display.note {
-                    NoteCell::None => NOTE_NONE,
-                    NoteCell::Cut => NOTE_CUT,
-                    NoteCell::Off => NOTE_OFF,
-                    NoteCell::Note(semitone) => semitone,
-                };
-                output.push(note);
-                output.push(display.instrument.unwrap_or(0));
-                output.push(display.volume.unwrap_or(VALUE_NONE));
-                output.push(display.effect.map(|effect| effect.code).unwrap_or(0));
-                output.push(display.effect.map(|effect| effect.param).unwrap_or(0));
+        let mut output = Vec::new();
+        match module.header().format {
+            ModuleFormat::S3m => {
+                let Some(view) = S3mPatternView::new(module, PatternId(pattern)) else { return output };
+                let rows = row_count.min(view.rows().saturating_sub(first_row));
+                output.reserve(rows as usize * view.channels() as usize * DISPLAY_CELL_BYTES);
+                for row in first_row..first_row.saturating_add(rows) {
+                    for channel in 0..view.channels() { append_display(&mut output, view.cell(row, channel).map(|cell| cell.display()).unwrap_or_default()); }
+                }
             }
+            ModuleFormat::Mod => {
+                let Some(view) = ModPatternView::new(module, PatternId(pattern)) else { return output };
+                let rows = row_count.min(view.rows().saturating_sub(first_row));
+                output.reserve(rows as usize * view.channels() as usize * DISPLAY_CELL_BYTES);
+                for row in first_row..first_row.saturating_add(rows) {
+                    for channel in 0..view.channels() { append_display(&mut output, view.cell(row, channel).map(|cell| cell.display()).unwrap_or_default()); }
+                }
+            }
+            _ => {}
         }
         output
     })
+}
+
+fn append_display(output: &mut Vec<u8>, display: PatternCell) {
+    let note = match display.note {
+        NoteCell::None => NOTE_NONE,
+        NoteCell::Cut => NOTE_CUT,
+        NoteCell::Off => NOTE_OFF,
+        NoteCell::Note(semitone) => semitone,
+    };
+    output.push(note);
+    output.push(display.instrument.unwrap_or(0));
+    output.push(display.volume.unwrap_or(VALUE_NONE));
+    output.push(display.effect.map(|effect| effect.code).unwrap_or(0));
+    output.push(display.effect.map(|effect| effect.param).unwrap_or(0));
 }
 
 #[allow(unsafe_code, reason = "`#[wasm_bindgen]` expands to unsafe ABI shims")]
@@ -110,7 +145,8 @@ mod exports {
     use super::*;
     use wasm_bindgen::prelude::{JsValue, wasm_bindgen};
 
-    /// Validate and retain an S3M. The previous valid module survives an error.
+    /// Validate and retain a supported native module. The previous valid module survives
+    /// an error. The legacy export name is retained for the existing page glue.
     #[wasm_bindgen]
     pub fn inspect_s3m(bytes: &[u8]) -> Result<(), JsValue> {
         inspect(bytes).map_err(|message| JsValue::from_str(&message))
@@ -120,7 +156,7 @@ mod exports {
     #[wasm_bindgen]
     pub fn is_archive(bytes: &[u8]) -> bool { is_zip(bytes) }
 
-    /// List the S3M entries this web player can currently offer, one tab record per line.
+    /// List the S3M and MOD entries this web player can offer, one tab record per line.
     #[wasm_bindgen]
     pub fn archive_modules(bytes: &[u8]) -> Result<String, JsValue> {
         archive_module_records(bytes).map_err(|error| JsValue::from_str(&error.to_string()))
@@ -181,7 +217,7 @@ mod exports {
         pattern_window_bytes(pattern as u16, first_row as u16, row_count.min(u16::MAX as u32) as u16)
     }
 
-    /// The S3M effect-name table, read once at start-up. See [`effect_name_records`].
+    /// The current module format's effect-name table. See [`effect_name_records`].
     #[wasm_bindgen]
     pub fn effect_names() -> String { effect_name_records() }
 }
@@ -195,6 +231,17 @@ mod tests {
 
     const FIXTURE: &[u8] = include_bytes!("../../../crates/starplayer-s3m/tests/fixtures/REFLEX.S3M");
 
+    fn minimal_mod() -> Vec<u8> {
+        let mut bytes = vec![0; 1084 + 64 * 4 * 4 + 8];
+        bytes[..10].copy_from_slice(b"native mod");
+        bytes[42..44].copy_from_slice(&4u16.to_be_bytes());
+        bytes[45] = 64;
+        bytes[950] = 1;
+        bytes[1080..1084].copy_from_slice(b"M.K.");
+        bytes[1084..1088].copy_from_slice(&starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0xF, param: 6 }.to_bytes());
+        bytes
+    }
+
     #[test]
     fn page_loader_exposes_metadata_and_pattern_cells() {
         assert!(inspect(FIXTURE).is_ok());
@@ -206,11 +253,30 @@ mod tests {
 
     #[test]
     fn the_effect_name_table_reaches_the_page_from_the_engine_s_own_table() {
+        assert!(inspect(FIXTURE).is_ok());
         let records = effect_name_records();
         assert!(records.contains(&format!("{}:-1:vibrato\n", s3m_command_code(b'H'))), "{records}");
         assert!(records.contains(&format!("{}:12:note cut\n", s3m_command_code(b'S'))), "{records}");
         let codes: Vec<&str> = records.lines().filter_map(|line| line.split(':').next()).collect();
         assert!(!codes.contains(&s3m_command_code(b'M').to_string().as_str()), "S3M has no M command");
+    }
+
+    #[test]
+    fn page_loader_and_pattern_view_dispatch_to_native_mod() {
+        assert!(inspect(&minimal_mod()).is_ok());
+        assert_eq!(with_module(ModuleFormat::S3m, |module| module.header().format), ModuleFormat::Mod);
+        assert_eq!(pattern_window_bytes(0, 0, 1).get(..5), Some(&[48, 1, VALUE_NONE, 0xF, 6][..]));
+        assert!(effect_name_records().contains("15:-1:set speed/tempo\n"));
+    }
+
+    #[test]
+    fn browser_refreshes_format_specific_effect_names_before_rendering_metadata() {
+        let app = include_str!("../www/app.js");
+        let load_buffer = app.split_once("async function loadBuffer").expect("loadBuffer").1;
+        let inspect = load_buffer.find("Loader.inspect_s3m(new Uint8Array(moduleBuffer));").expect("inspect call");
+        let refresh = load_buffer.find("loadEffectNames();").expect("effect-name refresh");
+        let metadata = load_buffer.find("const metadata = readMetadata(moduleLabel);").expect("metadata render");
+        assert!(inspect < refresh && refresh < metadata, "the newly inspected format table must be loaded before page rendering");
     }
 
     #[test]
@@ -226,9 +292,11 @@ mod tests {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         writer.start_file("REFLEX.S3M", SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)).unwrap();
         writer.write_all(b"s3m").unwrap();
+        writer.start_file("native.mod", SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"mod").unwrap();
         writer.start_file("readme.txt", SimpleFileOptions::default()).unwrap();
         writer.write_all(b"notes").unwrap();
         let bytes = writer.finish().unwrap().into_inner();
-        assert_eq!(archive_module_records(&bytes).unwrap(), "0\tREFLEX.S3M\t3\n");
+        assert_eq!(archive_module_records(&bytes).unwrap(), "0\tREFLEX.S3M\t3\n1\tnative.mod\t3\n");
     }
 }

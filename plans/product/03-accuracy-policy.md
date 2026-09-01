@@ -57,9 +57,11 @@ default.
 | Tick length `(rate * 10 / bpm) >> 2`, truncating twice — ~1.3 s of drift over a 4-minute song at 130 BPM | `TempoModel::ExactFixedPoint` — `rate * 2.5 / bpm` in Q32.32, accumulated, drift-free | `TempoModel::St3Truncating` |
 | MOD and MTM interpreted through an in-memory S3M conversion | Native per-format effect processors | Not offered — see §4 |
 
-## 3. Defects in the original that we deliberately do NOT reproduce
+## 3. Documented deviations from the reference implementations
 
-Each is a coding defect, not a format behaviour. Each is implemented canonically.
+Entries D1–D9 are coding defects in the original assembly and are implemented
+canonically. Later entries record deliberate determinism/architecture choices or visible
+conformance gaps; none may be hidden behind an accuracy claim.
 
 | # | Defect | Where | What we do instead |
 |---|---|---|---|
@@ -72,6 +74,10 @@ Each is a coding defect, not a format behaviour. Each is implemented canonically
 | D7 | Only the low 16 bits of the 32-bit C2SPD field are read from the S3M sample header | `__UpdateTracker` | Read the full 32-bit field |
 | D8 | Only the low 16 bits of the S3M sample header's 24-bit `memseg` parapointer are read (`movzx edx,word ptr [esi+0eh]`), so sample data past the first megabyte of a file is fetched from the wrong offset | `SB_ProcessTracks` 5740, `_GIRQStartVoice` 4774 | Read the full 24 bits: the high byte at `0x0D`, then the word at `0x0E`. Every file in the owner's 1994–96 collection has that high byte zero, so no module the original could play loads differently |
 | D9 | Tremolo advances `_VibCount` with `cmp al,64 / jbe`, retaining phase 64 when the sum lands exactly there; the next tick indexes one entry past every 64-entry waveform table | `M_FX_R` 3470–3473 | Reduce the shared vibrato/tremolo phase modulo 64, as the `Hxy` and `Uxy` handlers do and as ST3 requires |
+| D10 | ProTracker `EFx` invert-loop rewrites successive bytes in a sample's loop in place | PT 2.3D `UpdateFunk` / libxmp `test_effect_ef_invert_loop` | Recognise and report `EFx`, but leave audio unchanged. StarPlayer's PCM is an immutable `Arc<Module>` shared with the RT mixer; canonical mutation would require a lock, RT allocation, or an unbounded per-voice overlay. Those all violate stronger architecture invariants. This is a known MOD accuracy gap, not an original defect |
+| D11 | MOD waveform selector 3 is random and has no portable canonical seed/sequence; libxmp normally seeds its player RNG from wall-clock time | libxmp `src/lfo.c`, `src/rng.c` | Use a fixed-seed, integer-only xorshift32 stream owned by `ModProcessor`. The waveform remains random-shaped and independent per replay step, while repeated runs and x86/ARM/WASM fixed-point output remain byte-identical. This intentionally chooses reproducibility over matching an unspecified random sequence |
+| D12 | ProTracker 1/2 queues an instrument-only or tone-portamento sample swap and changes the DMA sample pointer at the current sample's end or loop boundary | OpenMPT `PortaSmpChange_PT`, `PortaSwapPT`, `PTInstrSwap`, `PTStoppedSwap`, `PTSwapEmpty`, `PTSwapNoLoop` | Apply the new volume and finetune state immediately, but retain the sounding sample until an explicit note or retrigger. The mixer currently has no fixed-size queued region replacement or processor callback at a voice boundary. These cases remain named C2 exclusions until that RT-safe boundary event exists |
+| D13 | A ProTracker `EDx` note delay greater than the current speed can leak into the next row, under narrow conditions, without restarting the sample | OpenMPT `NoteDelay-NextRow.mod` (documented-only in the pinned libxmp suite) | Clear the delayed-note latch when the next row is read. Reproducing the leak needs cross-row deferred-trigger state and an exact oracle for its continuation rules; the upstream case is not currently a libxmp frame-state gate, so it remains an explicit compatibility gap |
 
 D1, D2 and D5 change audible output on modules that use those waveforms or wide
 arpeggios. That is intended: the canonical behaviour is what Scream Tracker 3 produced,
@@ -84,6 +90,13 @@ and matching it is what the "most accurate S3M playback" claim actually means.
   are documented in `plans/reference/original-s3mlib-analysis.md` but not implemented.
 - **MOD/MTM via S3M conversion.** Not offered even as a compatibility mode. It destroys
   format identity before the player sees it and is a dead end once XM/IT arrive.
+- **Tagless 15-sample Soundtracker MOD.** Its header offsets, loop units and effect/tempo
+  dialect differ from tagged 31-sample ProTracker files; C3 rejects it explicitly.
+- **Octalyser / Digital Tracker MOD dialects.** `CD61` and `FA04` / `FA06` are outside
+  C3's accepted signature set and carry different pattern-loop behaviour.
+- **Startrekker AM synthesis.** The envelope and oscillator parameters live in a sibling
+  `.NT` / `.AS` file which the byte-slice facade does not receive. Ordinary `FLT4` PCM
+  and paired-pattern `FLT8` modules are supported; AM-synth fixtures are not.
 - **GUS emulation.** The GUS driver's voice-count-adaptive `Divisor_Table` output rate
   and its deferred ramp-then-start note trigger are recorded as history. The modern
   mixer has no equivalent constraint.
