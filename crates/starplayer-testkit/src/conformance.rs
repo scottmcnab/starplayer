@@ -392,7 +392,11 @@ fn signed_i16(value: i64, line_number: usize, name: &str) -> Result<i16, String>
 /// shape, then invoke the C1 differ.
 pub fn diff_libxmp_dump(format: ConformanceFormat, upstream: &[LibxmpTick], actual: &Trace) -> Result<TraceDiff, String> {
     let (expected, actual) = project_libxmp_dump(format, upstream, actual)?;
-    let tolerances = TraceTolerances { frame: 45, period: 1, position: 1u64 << 32, ..TraceTolerances::default() };
+    // libxmp's own mixer-data comparator permits one integer source frame. MOD first
+    // projects C1's fraction away below, then applies that same whole-frame bound;
+    // S3M/MTM preserve C2's equivalent tolerance.
+    let position_tolerance = 1u64 << 32;
+    let tolerances = TraceTolerances { frame: 45, period: 1, position: position_tolerance, ..TraceTolerances::default() };
     Ok(diff_traces(&expected, &actual, &tolerances))
 }
 
@@ -431,17 +435,23 @@ fn project_libxmp_dump(format: ConformanceFormat, upstream: &[LibxmpTick], actua
             .chain(actual_tick.channels.iter().filter(|channel| channel.active).map(|channel| channel.channel))
             .collect();
         for channel_id in channel_ids {
-            let actual_channel = actual_tick.channels.iter().find(|channel| channel.channel == channel_id).cloned()
+            let mut actual_channel = actual_tick.channels.iter().find(|channel| channel.channel == channel_id).cloned()
                 .unwrap_or_else(|| TraceChannel { channel: channel_id, ..TraceChannel::default() });
+            // C1 names the sample reference-rate pitch C-4, one octave above the
+            // ProTracker display octave used as the MOD comparison axis. libxmp's
+            // mixer note is a further octave above C1, so expected and actual remove
+            // two octaves and one octave respectively.
+            if format == ConformanceFormat::Mod {
+                actual_channel.note = actual_channel.note.map(|note| note.saturating_sub(12));
+            }
+            actual_channel.position = project_actual_position(format, actual_channel.position);
             let mut expected_channel = actual_channel.clone();
             if let Some(upstream_channel) = upstream_by_channel.get(&channel_id) {
                 expected_channel.active = true;
-                // libxmp numbers its first playable octave from 12; C1 numbers C-0
-                // from zero.
-                expected_channel.note = Some(upstream_channel.note.saturating_sub(12));
+                expected_channel.note = Some(project_note(format, upstream_channel.note));
                 expected_channel.instrument = upstream_channel.instrument_zero_based.saturating_add(1);
                 expected_channel.volume = (upstream_channel.volume_x16 + 8) / 16;
-                expected_channel.period = (upstream_channel.period_q12 + 512) / 1024;
+                expected_channel.period = project_period(format, upstream_channel.period_q12);
                 expected_channel.pan = project_pan(format, upstream_channel.pan_signed);
                 expected_channel.position = (upstream_channel.position as u64) << 32;
                 if let Some(cutoff) = upstream_channel.cutoff {
@@ -470,6 +480,35 @@ fn project_libxmp_dump(format: ConformanceFormat, upstream: &[LibxmpTick], actua
     }
 
     Ok((Trace { version: TRACE_FORMAT_VERSION, ticks: expected_ticks }, Trace { version: actual.version, ticks: actual_ticks }))
+}
+
+fn project_note(format: ConformanceFormat, note: u8) -> u8 {
+    // The MOD comparison axis is ProTracker's displayed octave: libxmp's mixer is
+    // two octaves above it, while C1 (projected above) is one. S3M/MTM compare on
+    // C1's axis and therefore remove libxmp's one-octave bias.
+    note.saturating_sub(match format {
+        ConformanceFormat::Mod => 24,
+        ConformanceFormat::S3m | ConformanceFormat::Mtm => 12,
+    })
+}
+
+fn project_period(format: ConformanceFormat, period_q12: u32) -> u32 {
+    // MOD's trace period is the Amiga period itself. S3M/MTM retain C2's native
+    // quarter-period scale, hence their additional factor of four.
+    let divisor = match format {
+        ConformanceFormat::Mod => 4096,
+        ConformanceFormat::S3m | ConformanceFormat::Mtm => 1024,
+    };
+    period_q12.saturating_add(divisor / 2) / divisor
+}
+
+fn project_actual_position(format: ConformanceFormat, position: u64) -> u64 {
+    match format {
+        // libxmp's `pos0` deliberately discards the mixer's fraction. Compare MOD in
+        // that observable integer domain by flooring StarPlayer's Q32.32 position.
+        ConformanceFormat::Mod => position & !(u32::MAX as u64),
+        ConformanceFormat::S3m | ConformanceFormat::Mtm => position,
+    }
 }
 
 fn project_pan(format: ConformanceFormat, pan_signed: i16) -> u16 {
@@ -600,6 +639,46 @@ mod tests {
         assert_eq!(project_pan(ConformanceFormat::Mod, -15), 113);
         assert_eq!(project_pan(ConformanceFormat::S3m, -15), 119);
         assert_eq!(project_pan(ConformanceFormat::Mtm, -15), 119);
+    }
+
+    #[test]
+    fn mod_projection_uses_native_axes_and_libxmp_integer_position_bound() {
+        let dump = parse_libxmp_dump("20 0 0 0 1753088 60 0 1024 8 7 0 0\n").expect("valid dump");
+        let mut trace = Trace {
+            version: TRACE_FORMAT_VERSION,
+            ticks: vec![TraceTick {
+                tick: 0,
+                frame: Frame::ZERO,
+                position: SongPosition { order: 0, pattern: 0, row: 0 },
+                tick_in_row: 0,
+                speed: 6,
+                bpm: 125,
+                global_volume: 64,
+                channels: vec![TraceChannel {
+                    channel: 0,
+                    active: true,
+                    note: Some(48),
+                    instrument: 1,
+                    sample: 1,
+                    volume: 64,
+                    period: 428,
+                    pan: 136,
+                    position: (7u64 << 32) | 0x89ab_cdef,
+                    cutoff: 255,
+                    resonance: 0,
+                    flags: DirtyBits::empty(),
+                }],
+            }],
+        };
+        let identical = diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace).expect("aligned");
+        assert!(identical.is_identical(), "{identical}");
+
+        trace.ticks[0].channels[0].position = (8u64 << 32) | 1;
+        assert!(diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace).expect("aligned").is_identical());
+
+        trace.ticks[0].channels[0].position = 9u64 << 32;
+        let difference = diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace).expect("aligned");
+        assert_eq!(difference.first_divergence.expect("different").field.to_string(), "position");
     }
 
     #[test]

@@ -104,6 +104,14 @@ less acceptable than this rare known gap. Accuracy policy D10 records the deviat
 
 ## Known conformance exclusions
 
+The C2 adapter maps libxmp's MOD-specific axes without passing through S3M. The common
+comparison note axis is ProTracker's displayed octave: libxmp mixer notes subtract 24,
+while C1's C-4-at-reference-rate identity subtracts 12. Q12 periods divide by 4096 into
+native Amiga periods. libxmp exposes mixer `pos0` as an integer source position before
+mixing, while StarPlayer retains a Q32.32 source position. The MOD comparison floors
+StarPlayer's fraction and applies the pinned libxmp comparator's own one-integer-sample
+bound. A two-frame playback-step error remains observable.
+
 The C2 corpus contains dialect and compatibility cases wider than the tagged ProTracker
 scope of C3. They must remain visible exclusions when C2 registers `trace_mod`; they are
 not evidence that MOD was lowered through another format:
@@ -124,6 +132,15 @@ not evidence that MOD was lowered through another format:
 - The corpus's default-mode `PortaSmpChange.data` deliberately expects the non-ProTracker
   interpretation (keep the old sample indefinitely). It is an oracle for a different
   compatibility profile, while C3's reference is ProTracker 1/2.
+
+The pinned libxmp mixer dump is also not a PAL Paula position oracle. Its MOD loader sets
+the default software-mixer C-4 rate to NTSC 8363 Hz, whereas the native processor follows
+PT's PAL `3_546_895 / period` sample clock. The adapter still floors C1's fractional
+position and applies libxmp's own one-integer-sample tolerance; it does not inflate that
+bound when the clock difference accumulates or changes a one-shot's active lifetime.
+Accuracy-policy D14 lists the affected executed cases. D15 likewise records the two
+dumps whose first timestamp assumes libxmp's immediate `Fxx` tempo interval rather than
+PT's CIA update boundary, and D16 records the out-of-range arpeggio volume disagreement.
 
 OpenMPT's `NoteDelay-NextRow.mod` is documented-only in the pinned libxmp suite. PT lets
 an `EDx` whose delay exceeds the current speed leak into the next row under narrow

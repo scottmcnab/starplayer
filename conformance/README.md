@@ -29,11 +29,17 @@ Playback stops before the second loop. Unmapped and sample-ended voices are omit
 libxmp permits one millisecond of time error and one integer sample of position error;
 its period is a floating-point-derived Q12 value. StarPlayer's adapter compares libxmp's
 end-of-frame time with the exact C1 tick-end frame (45 output frames of tolerance),
-subtracts libxmp's one-octave note-number bias, rounds period to the native quarter-period
-scale, divides volume by 16, and adds one to the instrument number. MOD pan preserves the
-full unsigned byte so `8xx` low bits remain observable; S3M and MTM pan decode libxmp's
-high-nibble representation onto their native 4-bit grid. Period is
-allowed one native unit and sample position one whole source frame. Cutoff zero is
+divides volume by 16, and adds one to the instrument number. MOD's comparison axis is
+the ProTracker display octave: the adapter subtracts two octaves from libxmp's mixer
+note and one octave from C1's reference-rate note, and divides Q12 period by 4096 into
+native Amiga periods. S3M and MTM retain C2's one-octave subtraction and division by
+1024 into their native quarter-period scale. MOD pan preserves the full unsigned byte
+so `8xx` low bits remain observable; S3M and MTM pan decode libxmp's high-nibble
+representation onto their native 4-bit grid. Period is allowed one native unit. For MOD,
+libxmp's `pos0` is the integer source position before mixing, so the adapter floors
+StarPlayer's Q32.32 position and then applies libxmp's own one-integer-sample comparison
+bound. A two-frame playback-step error remains visible. S3M and MTM retain C2's
+equivalent one-source-frame position tolerance. Cutoff zero is
 libxmp's disabled-filter sentinel and maps
 to C1's equivalent fully-open 255; like libxmp, the two fully-open cutoff values 254 and
 255 are equivalent. Other cutoff and resonance values compare directly. Only sample
@@ -61,17 +67,18 @@ perceptual/audio comparison remains M3 and is not fabricated here.
 Every exclusion must name a manifest case and contain both a non-empty reason and an
 accuracy-policy or tracking reference. Unknown, duplicate, or incomplete entries make
 the command fail. Excluded cases are still executed, and an unexpected pass makes the
-exclusion stale and fails the command.
+exclusion stale and fails the command. Accepted format boundaries and deliberate
+secondary-oracle disagreements link to the accuracy policy. Unresolved engine failures
+link to `known-failures.md`; those remain M2 exit blockers, and their reasons record the
+first observed mismatch from the pinned run.
 
-Current engine failures link to `known-failures.md`. They are M2 exit blockers rather
-than accepted deviations, and the reasons record the first observed mismatch from the
-pinned run.
-
-MOD and MTM cases are not exclusions while their native loaders/processors are absent.
-They are reported as explicit C3/C4 gates and kept in the total. When those format
-capture paths land, their integration must register the corresponding function in the
-runner's capability table; the gate does not claim automatic discovery. A missing
-implemented-format loader is never converted into an exclusion.
+MTM cases are not exclusions while its native loader/processor is absent. They are
+reported as an explicit C4 gate and kept in the total. When that format capture path
+lands, its integration must register the corresponding function in the runner's
+capability table; the gate does not claim automatic discovery. A missing implemented-
+format loader is never converted into an exclusion. MOD is registered through its
+native C3 trace path; each pinned MOD case therefore executes as a pass or a named
+exclusion, never a format gate.
 
 ## Licensing finding (decision deferred)
 

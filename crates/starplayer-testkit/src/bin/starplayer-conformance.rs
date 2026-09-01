@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use starplayer::engine::Trace;
-use starplayer_offline::{TraceOptions, trace_s3m};
+use starplayer_offline::{TraceOptions, trace_mod, trace_s3m};
 use starplayer_testkit::conformance::{
     ConformanceCase, ConformanceExclusion, ConformanceFormat, audit_pinned_corpus, diff_libxmp_dump,
     parse_case_manifest, parse_exclusions, parse_libxmp_dump,
@@ -67,15 +67,15 @@ fn run() -> Result<bool, String> {
         inventory.openmpt_modules, inventory.openmpt_oracle_modules, inventory.openmpt_documented_only,
     );
 
-    // Capability registry, not format lowering. C3/C4 integration registers its real
-    // capture function here; until then a missing capability is a visible gate, never
-    // an exclusion or fabricated pass. This is deliberately a function table rather
-    // than a trait committed before the second implementation exists.
+    // Capability registry, not format lowering. Each format integration registers its
+    // native capture function here; until then a missing capability is a visible gate,
+    // never an exclusion or fabricated pass. This is deliberately a function table
+    // rather than a trait committed before the second implementation exists.
     let capture_functions: BTreeMap<ConformanceFormat, CaptureTrace> = [
+        (ConformanceFormat::Mod, capture_mod as CaptureTrace),
         (ConformanceFormat::S3m, capture_s3m as CaptureTrace),
     ].into_iter().collect();
     let pending_integrations: BTreeMap<ConformanceFormat, &str> = [
-        (ConformanceFormat::Mod, "C3"),
         (ConformanceFormat::Mtm, "C4"),
     ].into_iter().collect();
 
@@ -209,6 +209,10 @@ fn compare_case(corpus: &Path, case: &ConformanceCase, capture: CaptureTrace) ->
 
 fn capture_s3m(module: &[u8], ticks: usize) -> Result<Trace, String> {
     trace_s3m(module, TraceOptions { ticks: Some(ticks), ..TraceOptions::default() }).map_err(|error| error.to_string())
+}
+
+fn capture_mod(module: &[u8], ticks: usize) -> Result<Trace, String> {
+    trace_mod(module, TraceOptions { ticks: Some(ticks), ..TraceOptions::default() }).map_err(|error| error.to_string())
 }
 
 fn indent(message: &str) -> String {

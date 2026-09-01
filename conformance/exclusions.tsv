@@ -1,5 +1,32 @@
 # StarPlayer conformance exclusions v1. Tab-separated.
 # case-id	reason	accuracy-policy-or-tracking-reference
+libxmp-mod-pattern-jump-octalyser-break	C3 deliberately rejects this CD61 Octalyser dialect at the loader signature gate	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+libxmp-mod-pattern-loop-dt-breakjump	C3 deliberately rejects this FA04/FA06 Digital Tracker pattern-loop dialect at the loader signature gate	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+libxmp-mod-pattern-loop-dt	C3 deliberately rejects this FA04/FA06 Digital Tracker pattern-loop dialect at the loader signature gate	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+libxmp-mod-pattern-loop-octalyser	C3 deliberately rejects this CD61 Octalyser pattern-loop dialect at the loader signature gate	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+libxmp-mod-pattern-loop-octalyser-breakjump	C3 deliberately rejects this CD61 Octalyser pattern-loop dialect at the loader signature gate	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+openmpt-mod-amiga-limits-finetune	D14: PAL-versus-NTSC sample advance exceeds libxmp's one-frame bound at tick 3 channel 3	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-arpeggio-wraparound	D16: PT's flat-table zero period retains volume 64 where libxmp silences the voice at tick 1	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-delay-break	D15: libxmp timestamps command tick zero at the new BPM while PT first spends the old CIA interval	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-finetune	D14: PAL-versus-NTSC sample advance exceeds libxmp's one-frame bound at tick 2 channel 0	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-instrument-swap-retrigger	D14: the PAL one-shot remains active into row 1 frame 8 after libxmp's NTSC voice has ended	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-pattern-jump	D14: the PAL voice remains active on the otherwise silent jump destination row 0 before libxmp resumes at row 1	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-portamento-sample-change	D17: this oracle requests the non-ProTracker default sample-change profile and first differs in sounding instrument at tick 6	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-portamento-sample-change-pt	D12: queued tone-portamento sample replacement needs a mixer voice-boundary event and first differs in voice lifetime at tick 37	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-portamento-swap-pt	D12: queued tone-portamento sample replacement needs a mixer voice-boundary event and diverges before oracle row 34	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-portamento-target	D14: PAL-versus-NTSC loop wrap differs by tick 11 even though the traced portamento period agrees	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-instrument-swap	D14: PAL/NTSC position first exceeds the bound at tick 9; the later queued lone-instrument replacement also remains a D12 mixer-boundary gap	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-instrument-volume	D14: PAL-versus-NTSC loop position exceeds libxmp's one-frame bound only at the final compared tick	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-sample-offset	D14: PAL one-shot lifetime leaves an active channel at row 7 frame 3 after libxmp's NTSC voice has ended	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-stopped-swap	D12: queued replacement after a stopped one-shot needs a mixer voice-boundary event and diverges before row 2	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-swap-empty	D12: queued replacement from an empty sample needs a mixer voice-boundary event and leaves an extra active row-0 voice	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-swap-no-loop	D12: queued replacement between non-looped samples needs a mixer voice-boundary event and first changes voice lifetime at tick 17	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+openmpt-mod-vibrato-reset	D15: libxmp timestamps command tick zero at the new BPM while PT first spends the old CIA interval	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+libxmp-mod-future-composer-envelope	Startrekker AM envelope parameters live in an unavailable sibling sidecar and cannot be reconstructed from MOD bytes	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+libxmp-mod-future-composer-ignore-volume	Startrekker AM volume semantics require an unavailable sibling sidecar and synthesizer path	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+libxmp-mod-future-composer-new-note	Startrekker AM new-note semantics require an unavailable sibling sidecar and synthesizer path	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+libxmp-mod-future-composer-override	Startrekker AM override semantics require an unavailable sibling sidecar and synthesizer path	plans/product/03-accuracy-policy.md#4-not-offered-at-all
+libxmp-mod-future-composer-period-fall	Startrekker AM period-envelope semantics require an unavailable sibling sidecar and synthesizer path	plans/product/03-accuracy-policy.md#4-not-offered-at-all
 libxmp-s3m-pattern-loop-imf-breakjump	StarPlayer takes row 2 instead of the IMF-compatible break/jump destination at tick 8	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
 libxmp-s3m-pattern-loop-imf	StarPlayer restarts row 0 instead of continuing the IMF-compatible loop at tick 12	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
 libxmp-s3m-pattern-loop-mpt-breakjump	StarPlayer trace ends before the OpenMPT-compatible loop reaches the oracle's row 2	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility

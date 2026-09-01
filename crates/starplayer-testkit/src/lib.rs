@@ -14,9 +14,10 @@
 //! state. `time` is rounded end-of-frame milliseconds and is compared with StarPlayer's
 //! exact tick-end frame. Presence in the dump defines the active channel set; extra
 //! StarPlayer voices remain observable. Order/pattern, speed/BPM/global volume, sample
-//! number, fractional position and dirty flags have no libxmp column, so only those are
-//! projected from StarPlayer's trace. libxmp itself tolerates one millisecond and one
-//! integer sample position; the adapter expresses those bounds as C1 tolerances.
+//! number, fractional position and dirty flags have no libxmp column. MOD explicitly
+//! projects StarPlayer's Q32.32 position down to libxmp's whole-frame `pos0` domain;
+//! all formats then apply libxmp's own one-frame position bound. Timing keeps libxmp's
+//! one-millisecond bound.
 
 #![forbid(unsafe_code)]
 
