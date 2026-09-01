@@ -308,7 +308,7 @@ async function loadBuffer(buffer, label) {
         if (Loader.is_archive(inputBytes)) {
             const entries = parseArchiveModules(Loader.archive_modules(inputBytes));
             if (entries.length === 0) {
-                throw new Error(`No S3M modules were found inside ${label}.`);
+                throw new Error(`No supported modules were found inside ${label}.`);
             }
             const choice = entries.length === 1 ? entries[0] : await chooseArchiveEntry(entries, label);
             if (choice === null) {
@@ -379,7 +379,7 @@ function chooseArchiveEntry(entries, archiveLabel) {
     }
     elements.archiveEntries.selectedIndex = 0;
     elements.archivePicker.hidden = false;
-    showMessage(`Choose one of ${entries.length} S3M modules in ${archiveLabel}. Playback continues until you load one.`);
+    showMessage(`Choose one of ${entries.length} modules in ${archiveLabel}. Playback continues until you load one.`);
     const promise = new Promise((resolve) => { state.archivePickerResolve = resolve; });
     elements.archiveEntries.focus();
     return promise;

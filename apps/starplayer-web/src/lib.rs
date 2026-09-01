@@ -280,6 +280,24 @@ mod tests {
     }
 
     #[test]
+    fn browser_visible_loader_copy_accepts_and_advertises_mod() {
+        let index = include_str!("../www/index.html");
+        assert!(index.contains("S3M and MOD modules"));
+        assert!(index.contains("drop an S3M, MOD, or ZIP"));
+        assert!(index.contains("Choose a module"));
+        assert!(index.contains("Load an S3M, MOD, or ZIP"));
+        assert!(index.contains("accept=\".s3m,.mod,.zip,audio/s3m,audio/mod,audio/x-mod,application/zip\""));
+        assert!(index.contains("aria-label=\"S3M, MOD, or ZIP URL\""));
+        assert!(index.contains("Drop .s3m, .mod, or .zip here"));
+
+        let app = include_str!("../www/app.js");
+        assert!(app.contains("No supported modules were found inside"));
+        assert!(app.contains("Choose one of ${entries.length} modules in ${archiveLabel}"));
+        assert!(!app.contains("No S3M modules were found inside"));
+        assert!(!app.contains("S3M modules in ${archiveLabel}"));
+    }
+
+    #[test]
     fn malformed_input_does_not_replace_the_last_good_module() {
         assert!(inspect(FIXTURE).is_ok());
         let title = with_module(String::new(), |module| module.header().title.to_string());

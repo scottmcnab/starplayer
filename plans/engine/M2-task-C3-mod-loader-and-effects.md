@@ -155,9 +155,11 @@ are the repair specification for the next implementation pass.
    the selected finetune table for the packed period. Add a non-exact/intermediate-period
    case where the two algorithms choose different targets.
 
-8. **Reset vibrato and tremolo phases when a delayed note actually triggers.** Latching
-   an `EDx` row must not reset the LFO phases early. Cover both retriggering waveforms
-   (selectors 0–3) and no-retrigger selectors (4–7).
+8. **Preserve vibrato and tremolo phases across delayed-note triggers.** The pinned PT
+   source deliberately skips the ordinary-note phase reset while latching `EDx`, and
+   `noteDelay` reaches `doRetrg` without resetting either phase when the delay expires.
+   Cover selectors 0–7. This differs from libxmp's delayed-event path; for C3 the named
+   primary ProTracker source governs and the oracle disagreement must stay documented.
 
 ### Host and conformance completion
 

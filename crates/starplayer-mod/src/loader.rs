@@ -62,10 +62,9 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
     if !(1..=128).contains(&song_length) { return Err(Error::Invalid("MOD song length must be 1..=128")); }
 
     let order_bytes = fixed.get(ORDER_OFFSET..ORDER_OFFSET + 128).ok_or(Error::Truncated { offset: ORDER_OFFSET, needed: 128 })?;
-    // Only the declared song prefix is live. Trackers normally zero-filled the tail,
-    // but real files exist with stale editor bytes there; treating those as orders moves
-    // the sample-data offset and makes an otherwise valid module look truncated.
-    let pattern_count = order_bytes.iter().take(song_length).copied().filter(|order| *order != 255)
+    // ProTracker scans the complete on-disk table when locating sample data. Entries
+    // after song_length are not played, but their patterns still occupy file space.
+    let pattern_count = order_bytes.iter().copied().filter(|order| *order != 255)
         .map(|order| logical_order(order, layout) as usize).max().map(|order| order + 1).unwrap_or(0);
     let pattern_bytes = (pattern_count as u64)
         .checked_mul(ROWS as u64).and_then(|value| value.checked_mul(channels as u64)).and_then(|value| value.checked_mul(CELL_BYTES as u64))
@@ -262,12 +261,21 @@ mod tests {
     }
 
     #[test]
-    fn stale_orders_after_song_length_do_not_inflate_pattern_count() {
-        let mut bytes = minimal_mod();
-        bytes[ORDER_OFFSET + 127] = 127;
-        let module = load(&bytes).expect("inactive order tail is ignored");
+    fn inactive_order_tail_still_locates_stored_patterns_and_sample_data() {
+        let one_pattern = minimal_mod();
+        let pattern_stride = ROWS as usize * 4 * CELL_BYTES;
+        let mut bytes = vec![0; one_pattern.len() + pattern_stride];
+        bytes[..HEADER_BYTES + pattern_stride].copy_from_slice(&one_pattern[..HEADER_BYTES + pattern_stride]);
+        bytes[HEADER_BYTES + pattern_stride..HEADER_BYTES + pattern_stride * 2].fill(0x55);
+        bytes[HEADER_BYTES + pattern_stride * 2..].copy_from_slice(&one_pattern[HEADER_BYTES + pattern_stride..]);
+        bytes[ORDER_OFFSET + 126] = 255;
+        bytes[ORDER_OFFSET + 127] = 1;
+
+        let module = load(&bytes).expect("inactive order patterns still occupy the file");
         assert!(module.pattern(starplayer_model::PatternId(0)).is_some());
-        assert!(module.pattern(starplayer_model::PatternId(1)).is_none());
+        assert!(module.pattern(starplayer_model::PatternId(1)).is_some());
+        assert!(module.pattern(starplayer_model::PatternId(2)).is_none());
+        assert_eq!(module.sample_pcm(starplayer_core::SampleId(0)).and_then(|pcm| pcm.first()).copied(), Some(i16::MIN));
     }
 
     #[test]

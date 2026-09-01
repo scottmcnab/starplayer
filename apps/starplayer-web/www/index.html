@@ -14,18 +14,18 @@
         <div>
             <p class="eyebrow">real-time tracked music</p>
             <h1><span>✦</span> StarPlayer</h1>
-            <p class="subtitle">Scream Tracker 3, played by the Rust engine in an AudioWorklet.</p>
+            <p class="subtitle">S3M and MOD modules, played by the Rust engine in an AudioWorklet.</p>
         </div>
         <div class="transport-chip" id="transport-chip">audio asleep</div>
     </header>
 
     <div id="error" class="notice error" role="alert" hidden></div>
-    <div id="message" class="notice" role="status">Choose a fixture or drop an S3M or ZIP to begin.</div>
+    <div id="message" class="notice" role="status">Choose a fixture or drop an S3M, MOD, or ZIP to begin.</div>
     <section id="archive-picker" class="notice archive-picker" aria-labelledby="archive-picker-heading" hidden>
         <div class="archive-picker-heading">
             <div>
                 <p class="section-label">Archive contents</p>
-                <h2 id="archive-picker-heading">Choose an S3M</h2>
+                <h2 id="archive-picker-heading">Choose a module</h2>
             </div>
             <span id="archive-picker-name"></span>
         </div>
@@ -39,11 +39,11 @@
 
     <section class="load-panel" aria-labelledby="load-heading">
         <div>
-            <p class="section-label" id="load-heading">Load an S3M or ZIP</p>
+            <p class="section-label" id="load-heading">Load an S3M, MOD, or ZIP</p>
             <div class="load-actions">
                 <button class="primary" id="start-audio">Start audio</button>
                 <label class="button" for="file-picker">Choose file</label>
-                <input id="file-picker" type="file" accept=".s3m,.zip,audio/s3m,application/zip" hidden>
+                <input id="file-picker" type="file" accept=".s3m,.mod,.zip,audio/s3m,audio/mod,audio/x-mod,application/zip" hidden>
                 <select id="fixture-picker" aria-label="Bundled fixture">
                     <option value="">Bundled fixture…</option>
                     <option>ARMANI.S3M</option>
@@ -55,12 +55,12 @@
                 <button id="load-fixture">Load fixture</button>
             </div>
             <form id="url-form" class="url-form">
-                <input id="url" type="url" inputmode="url" placeholder="https://example.com/pack.zip" aria-label="S3M or ZIP URL">
+                <input id="url" type="url" inputmode="url" placeholder="https://example.com/song.mod" aria-label="S3M, MOD, or ZIP URL">
                 <button type="submit">Load URL</button>
             </form>
         </div>
         <div id="drop-zone" class="drop-zone" tabindex="0">
-            <strong>Drop .s3m or .zip here</strong>
+            <strong>Drop .s3m, .mod, or .zip here</strong>
             <span>The live graph survives a bad file.</span>
         </div>
     </section>

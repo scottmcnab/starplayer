@@ -56,6 +56,10 @@ pub struct ModChannel {
     pub glissando_enabled: bool,
     pub pattern_loop_start: u16,
     pub pattern_loop_count: u8,
+    /// Whether this pattern row contains a packed period. Unlike `current_note`, this
+    /// is row-local and remains valid across EEx repeats without leaking into a new row.
+    pub row_note_present: bool,
+    /// This row's note is controlled by EDx and may trigger once per delayed repeat.
     pub delayed_note: bool,
     pub offset_past_end: bool,
     /// Last EFx value. EF is parsed but deliberately has no PCM mutation; see
@@ -93,6 +97,7 @@ impl ModChannel {
             glissando_enabled: false,
             pattern_loop_start: 0,
             pattern_loop_count: 0,
+            row_note_present: false,
             delayed_note: false,
             offset_past_end: false,
             invert_loop_speed: 0,
@@ -138,6 +143,7 @@ pub struct ModProcessor {
     last_pattern: Option<u16>,
     row_pattern_break: bool,
     waveform_random_state: u32,
+    pending_tempo: Option<(u16, usize)>,
 }
 
 impl ModProcessor {
@@ -156,6 +162,7 @@ impl ModProcessor {
             // Unlike libxmp's wall-clock seed, a fixed seed preserves StarPlayer's
             // byte-identical replay invariant while still implementing waveform 3.
             waveform_random_state: 0x6D2B_79F5,
+            pending_tempo: None,
         }
     }
 
@@ -174,8 +181,8 @@ impl ModProcessor {
             }
             state.command = 0;
             state.command_data = 0;
+            state.row_note_present = false;
             state.delayed_note = false;
-            state.offset_past_end = false;
             state.offset_post_trigger = 0;
         }
     }
@@ -193,6 +200,7 @@ impl ModProcessor {
                 state.sample_number = cell.instrument;
                 state.finetune = finetune_from_rate(sample.reference_rate_hz());
                 state.sample_offset = 0;
+                state.offset_past_end = false;
                 let volume = ((sample.default_volume().to_bits() as u32 * 64 + 32_767) / 65_535) as u8;
                 state.current_volume = volume;
                 state.actual_volume = volume;
@@ -205,30 +213,33 @@ impl ModProcessor {
         // finetuned row. Keep those two operations visibly ordered: a raw 428 with
         // finetune +7 is still C, but plays the +7 table's period 407.
         let note = cell.linear_note();
+        self.channels[channel_index].row_note_present = note.is_some();
         if note.is_some() || cell.instrument != 0 { context.report_note(channel_id, note.map(Note::new), (cell.instrument != 0).then_some(cell.instrument)); }
 
         // E5 changes the finetune used to look up a note on the same row.
         if cell.effect == 0xE && cell.param >> 4 == 5 { self.channels[channel_index].finetune = cell.param & 15; }
 
         let Some(note) = note else { return false };
-        let period = extended_period(self.channels[channel_index].finetune, note);
         if matches!(cell.effect, 3 | 5) {
             let state = &mut self.channels[channel_index];
-            state.target_note = note;
-            state.target_period = period;
+            let (target_note, target_period) = tone_portamento_target(state.finetune, cell.period);
+            state.target_note = target_note;
+            state.target_period = target_period;
             return true;
         }
 
-        let delayed = cell.effect == 0xE && cell.param >> 4 == 0xD && cell.param & 15 != 0;
+        let period = extended_period(self.channels[channel_index].finetune, note);
+        let delayed = cell.effect == 0xE && cell.param >> 4 == 0xD;
         let state = &mut self.channels[channel_index];
         state.current_note = note;
         state.current_period = period;
         state.actual_period = period;
         state.delayed_note = delayed;
         if !delayed { state.pending_dirty.insert(DirtyBits::SAMPLE | DirtyBits::PITCH); }
-        if state.vibrato_waveform & 4 == 0 { state.vibrato_phase = 0; }
-        if state.tremolo_waveform & 4 == 0 { state.tremolo_phase = 0; }
-        self.refresh_offset_past_end(channel_index);
+        if !delayed {
+            if state.vibrato_waveform & 4 == 0 { state.vibrato_phase = 0; }
+            if state.tremolo_waveform & 4 == 0 { state.tremolo_phase = 0; }
+        }
         true
     }
 
@@ -269,7 +280,7 @@ impl ModProcessor {
                 self.row_pattern_break = true;
                 self.clear_command(channel_index);
             }
-            0xE => self.static_extended(channel_index, cell.param, note_present, row, outcome),
+            0xE => self.static_extended(channel_index, cell.param, row, outcome),
             0xF if cell.param == 0 => {
                 outcome.stop = true;
                 self.clear_command(channel_index);
@@ -279,15 +290,16 @@ impl ModProcessor {
                 self.clear_command(channel_index);
             }
             0xF => {
-                outcome.tempo_bpm = cell.param as u16;
-                self.channels[channel_index].pending_dirty.insert(DirtyBits::TEMPO);
+                // PT writes the CIA latch now, but the timer adopts it at the next
+                // interrupt. Defer the outcome until that next tracker event.
+                self.pending_tempo = Some((cell.param as u16, channel_index));
                 self.clear_command(channel_index);
             }
             _ => self.clear_command(channel_index),
         }
     }
 
-    fn static_extended(&mut self, channel_index: usize, parameter: u8, note_present: bool, row: u16, outcome: &mut TickOutcome) {
+    fn static_extended(&mut self, channel_index: usize, parameter: u8, row: u16, outcome: &mut TickOutcome) {
         let subcommand = parameter >> 4;
         let value = parameter & 15;
         match subcommand {
@@ -321,13 +333,14 @@ impl ModProcessor {
             9 => {
                 // E9x without a note retriggers on tick zero; a note on this row already
                 // performed that restart and must not be triggered twice.
-                if !note_present { self.retrigger(channel_index); }
+                if !self.channels[channel_index].row_note_present { self.retrigger(channel_index); }
             }
             0xA => self.slide_volume(channel_index, value, 0),
             0xB => self.slide_volume(channel_index, 0, value),
             0xC if value == 0 => { self.cut_note(channel_index); self.clear_command(channel_index); }
             0xC => {}
-            0xD if value == 0 => { self.trigger_delayed(channel_index); self.clear_command(channel_index); }
+            // Keep ED0 latched so pattern-delay repeat tick zero runs noteDelay again.
+            0xD if value == 0 => self.trigger_delayed(channel_index),
             0xD => {}
             0xE => { outcome.pattern_delay = value; }
             0xF => {
@@ -366,7 +379,8 @@ impl ModProcessor {
         match subcommand {
             1 if repeat_zero => self.slide_period(channel_index, false, value as u32),
             2 if repeat_zero => self.slide_period(channel_index, true, value as u32),
-            9 if value != 0 && local_tick.is_multiple_of(value) => self.retrigger(channel_index),
+            9 if value != 0 && local_tick.is_multiple_of(value)
+                && (local_tick != 0 || !self.channels[channel_index].row_note_present) => self.retrigger(channel_index),
             0xA if repeat_zero => self.slide_volume(channel_index, value, 0),
             0xB if repeat_zero => self.slide_volume(channel_index, 0, value),
             0xC if local_tick == value => self.cut_note(channel_index),
@@ -391,27 +405,35 @@ impl ModProcessor {
 
     fn sample_offset(&mut self, channel_index: usize, note_present: bool, parameter: u8) {
         if parameter != 0 { self.channels[channel_index].offset_memory = parameter; }
-        if !note_present { return; }
         let offset = (self.channels[channel_index].offset_memory as u32) << 8;
-        self.channels[channel_index].sample_offset = offset;
         // PT 1/2 starts this note at the requested offset, then advances the retained
         // sample pointer by the same amount once more. A later note without a new
         // instrument consequently starts at twice the original offset.
-        self.channels[channel_index].offset_post_trigger = offset;
-        self.refresh_offset_past_end(channel_index);
+        if self.advance_sample_pointer(channel_index, offset) && note_present {
+            self.channels[channel_index].offset_post_trigger = offset;
+        }
     }
 
-    fn refresh_offset_past_end(&mut self, channel_index: usize) {
-        let offset = self.channels[channel_index].sample_offset;
-        self.channels[channel_index].offset_past_end = self.sample_index(channel_index).is_some_and(|sample| offset >= sample.length_frames());
+    fn advance_sample_pointer(&mut self, channel_index: usize, amount: u32) -> bool {
+        let Some(sample_length) = self.sample_index(channel_index).map(|sample| sample.length_frames()) else { return false };
+        let state = &mut self.channels[channel_index];
+        let remaining = if state.offset_past_end { 1 } else { sample_length.saturating_sub(state.sample_offset) };
+        if amount < remaining {
+            state.sample_offset = state.sample_offset.saturating_add(amount);
+            true
+        } else {
+            // sampleOffset sets n_length to one word but deliberately leaves n_start at
+            // the last successfully advanced pointer.
+            state.offset_past_end = true;
+            false
+        }
     }
 
     fn finish_row_effects(&mut self, channel_index: usize) {
         let added = self.channels[channel_index].offset_post_trigger;
         if added == 0 { return; }
-        self.channels[channel_index].sample_offset = self.channels[channel_index].sample_offset.saturating_add(added);
         self.channels[channel_index].offset_post_trigger = 0;
-        self.refresh_offset_past_end(channel_index);
+        let _ = self.advance_sample_pointer(channel_index, added);
     }
 
     fn finish_row_outcome(&self, current_order: u16, outcome: &mut TickOutcome) {
@@ -432,16 +454,24 @@ impl ModProcessor {
     }
 
     fn arpeggio(&mut self, channel_index: usize, tick: u8) {
-        let state = &mut self.channels[channel_index];
-        if state.current_note == NO_NOTE { return; }
-        let semitones = match tick % 3 { 1 => state.command_data >> 4, 2 => state.command_data & 15, _ => 0 };
-        state.actual_period = if self.amiga_limits && (36..=71).contains(&state.current_note) {
-            let table_index = (state.current_note - 36) as usize + semitones as usize;
-            let wrapped = table_index % 37;
-            if wrapped == 36 { 0 } else { PROTRACKER_PERIODS[(state.finetune & 15) as usize][wrapped] as u32 }
-        } else {
-            extended_period(state.finetune, state.current_note.saturating_add(semitones).min(95))
+        let (current_note, current_period, finetune, parameter) = {
+            let state = &self.channels[channel_index];
+            (state.current_note, state.current_period, state.finetune, state.command_data)
         };
+        if current_note == NO_NOTE { return; }
+        let phase = tick % 3;
+        let semitones = match phase { 1 => parameter >> 4, 2 => parameter & 15, _ => 0 };
+        let actual_period = if phase == 0 {
+            current_period
+        } else if self.amiga_limits {
+            let base = period_table_slot(finetune, current_period);
+            protracker_arpeggio_period(finetune, base + semitones as usize)
+        } else {
+            let base_note = (0..=95u8).find(|note| current_period >= extended_period(finetune, *note)).unwrap_or(95);
+            extended_period(finetune, base_note.saturating_add(semitones).min(95))
+        };
+        let state = &mut self.channels[channel_index];
+        state.actual_period = actual_period;
         state.pending_dirty.insert(DirtyBits::PITCH);
     }
 
@@ -518,15 +548,19 @@ impl ModProcessor {
 
     fn retrigger(&mut self, channel_index: usize) {
         if self.channels[channel_index].sample_number == NO_SAMPLE || self.channels[channel_index].current_note == NO_NOTE { return; }
-        self.channels[channel_index].sample_offset = 0;
-        self.channels[channel_index].offset_past_end = false;
         self.channels[channel_index].pending_dirty.insert(DirtyBits::SAMPLE);
     }
 
     fn trigger_delayed(&mut self, channel_index: usize) {
-        if !self.channels[channel_index].delayed_note && self.channels[channel_index].current_note == NO_NOTE { return; }
-        self.channels[channel_index].delayed_note = false;
-        if self.channels[channel_index].sample_number != NO_SAMPLE { self.channels[channel_index].pending_dirty.insert(DirtyBits::SAMPLE | DirtyBits::PITCH); }
+        let state = &mut self.channels[channel_index];
+        if !state.delayed_note || !state.row_note_present { return; }
+        if state.sample_number != NO_SAMPLE { state.pending_dirty.insert(DirtyBits::SAMPLE | DirtyBits::PITCH); }
+    }
+
+    fn apply_pending_tempo(&mut self, outcome: &mut TickOutcome) {
+        let Some((tempo_bpm, channel_index)) = self.pending_tempo.take() else { return };
+        outcome.tempo_bpm = tempo_bpm;
+        if let Some(channel) = self.channels.get_mut(channel_index) { channel.pending_dirty.insert(DirtyBits::TEMPO); }
     }
 
     fn cut_note(&mut self, channel_index: usize) { self.set_volume(channel_index, 0); }
@@ -560,21 +594,22 @@ impl ModProcessor {
                 self.channels[channel_index].pending_dirty = DirtyBits::empty();
                 return;
             };
-            let region = if self.channels[channel_index].offset_past_end {
-                // PT leaves the sample pointer at its start and forces a one-word length.
-                SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames().min(2))
+            let state = &self.channels[channel_index];
+            let region = if state.offset_past_end {
+                // Keep PT's retained n_start while restricting playback after it to one
+                // word. The region ends two frames after the logical retained offset.
+                let end = state.sample_offset.saturating_add(2).min(sample.length_frames());
+                SampleRegion::one_shot(sample.pcm_offset(), end)
             } else {
                 sample_region(sample)
             };
-            let state = &self.channels[channel_index];
             let tag = VoiceTag {
                 channel: channel_index as u8,
                 instrument: state.sample_number,
                 sample: state.sample_number,
                 note: if state.current_note == NO_NOTE { 0 } else { state.current_note },
             };
-            let offset = if state.offset_past_end { 0 } else { state.sample_offset };
-            context.trigger_channel(channel_id, tag, region, self.voice_params(channel_index, dirty), offset);
+            context.trigger_channel(channel_id, tag, region, self.voice_params(channel_index, dirty), state.sample_offset);
         } else if let Some(voice) = context.channels.foreground(channel_id) {
             let state = &self.channels[channel_index];
             if dirty.contains(DirtyBits::PITCH) { context.write_voice_param(voice, starplayer_core::VoiceParam::Step(step_from_period(state.actual_period, self.sample_rate_hz))); }
@@ -627,6 +662,7 @@ impl TrackerProcessor for ModProcessor {
         self.row_pattern_break = false;
         self.reset_row();
         let mut outcome = context.outcome();
+        self.apply_pending_tempo(&mut outcome);
         let channel_count = core::cmp::min(self.channels.len(), row.bytes.len() / CELL_BYTES);
         for channel_index in 0..channel_count {
             let start = channel_index * CELL_BYTES;
@@ -646,7 +682,8 @@ impl TrackerProcessor for ModProcessor {
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {
         context.report_global_volume(U0F16::MAX);
-        let outcome = context.outcome();
+        let mut outcome = context.outcome();
+        self.apply_pending_tempo(&mut outcome);
         let local_tick = if context.row_clock.speed == 0 { 0 } else { (context.row_clock.tick_in_row % context.row_clock.speed as u16) as u8 };
         let repeat_zero = context.row_clock.is_first_tick_of_repeat();
         for channel_index in 0..self.channels.len() {
@@ -669,6 +706,36 @@ pub fn sequencer_for<Tempo: TempoModel>(module: Arc<Module>, sample_rate_hz: u32
         end_of_song: EndOfSongPolicy::Loop,
     };
     PatternSequencer::new(tempo_model, ModPatternData(Arc::clone(&module)), ModProcessor::new(module, sample_rate_hz), settings)
+}
+
+const PROTRACKER_ARPEGGIO_OVERFLOW: [u16; 15] = [
+    774, 1800, 2314, 3087, 4113, 4627, 5400, 6426, 6940, 7713, 8739, 9253, 24625, 12851, 13365,
+];
+
+fn period_table_slot(finetune: u8, period: u32) -> usize {
+    PROTRACKER_PERIODS[(finetune & 15) as usize].iter()
+        .position(|candidate| period >= *candidate as u32).unwrap_or(36)
+}
+
+/// Read PT's physically flat 16 x 37 table, including its zero sentinels and the
+/// documented 15-word overflow padding following finetune -1.
+fn protracker_arpeggio_period(finetune: u8, slot: usize) -> u32 {
+    let absolute = (finetune & 15) as usize * 37 + slot;
+    if absolute < 16 * 37 {
+        let row = absolute / 37;
+        let column = absolute % 37;
+        if column == 36 { 0 } else { PROTRACKER_PERIODS[row][column] as u32 }
+    } else {
+        PROTRACKER_ARPEGGIO_OVERFLOW.get(absolute - 16 * 37).copied().unwrap_or(0) as u32
+    }
+}
+
+fn tone_portamento_target(finetune: u8, packed_period: u16) -> (u8, u32) {
+    let mut slot = period_table_slot(finetune, packed_period as u32);
+    // PT compensates its signed finetune rows after scanning the selected row.
+    if finetune & 8 != 0 && slot > 0 { slot -= 1; }
+    let note = if slot < 36 { 36 + slot as u8 } else { NO_NOTE };
+    (note, protracker_arpeggio_period(finetune, slot))
 }
 
 fn clamp_period(amiga_limits: bool, finetune: u8, period: u32) -> u32 {
@@ -729,8 +796,8 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use starplayer_core::RowClock;
-    use starplayer_engine::{ChannelTable, SongPosition};
+    use starplayer_core::{ExactFixedPoint, RowClock, VoiceId};
+    use starplayer_engine::{ChannelTable, ControlClock, EngineContext, EventSource, SongPosition};
     use starplayer_mixer::VoicePool;
     use starplayer_model::{InstrumentDef, ModuleBuilder, ModuleFormat, ModuleHeader, SampleSpec};
 
@@ -764,6 +831,41 @@ mod tests {
         clock.repeat_index = (absolute_tick / 6) as u8;
         let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, clock, SongPosition::default(), 125);
         processor.tick(&mut context)
+    }
+
+    struct ProcessorHarness {
+        voices: VoicePool,
+        channels: ChannelTable,
+    }
+
+    impl ProcessorHarness {
+        fn new() -> ProcessorHarness { ProcessorHarness { voices: VoicePool::new(2), channels: ChannelTable::new(1) } }
+
+        fn row(&mut self, processor: &mut ModProcessor, cell: ModCell) -> TickOutcome {
+            let mut context = TickContext::new(Frame::ZERO, &mut self.voices, &mut self.channels, RowClock::new(6), SongPosition::default(), 125);
+            let bytes = cell.to_bytes();
+            processor.row(&mut context, RowRef { order: 0, pattern: 0, row: 0, bytes: &bytes })
+        }
+
+        fn tick(&mut self, processor: &mut ModProcessor, absolute_tick: u16, pattern_delay: u8) -> TickOutcome {
+            let mut clock = RowClock::new(6);
+            clock.pattern_delay = pattern_delay;
+            clock.tick_in_row = absolute_tick;
+            clock.repeat_index = (absolute_tick / 6) as u8;
+            let mut context = TickContext::new(Frame::ZERO, &mut self.voices, &mut self.channels, clock, SongPosition::default(), 125);
+            processor.tick(&mut context)
+        }
+
+        fn foreground(&self) -> Option<VoiceId> { self.channels.foreground(ChannelId(0)) }
+
+        fn position(&self) -> Option<u64> { self.foreground().and_then(|voice| self.voices.get(voice)).map(|voice| voice.position()) }
+
+        fn region_length(&self) -> Option<u32> { self.foreground().and_then(|voice| self.voices.get(voice)).map(|voice| voice.region().length_frames()) }
+
+        fn remaining_frames(&self) -> Option<u32> {
+            self.foreground().and_then(|voice| self.voices.get(voice))
+                .map(|voice| voice.region().length_frames().saturating_sub((voice.position() >> 32) as u32))
+        }
     }
 
     #[test]
@@ -837,25 +939,72 @@ mod tests {
     }
 
     #[test]
-    fn sample_offset_memory_past_end_and_pt_double_add_are_native_mod_semantics() {
+    fn a_note_with_9xx_keeps_pt_s_double_offset_pointer_rule() {
         let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
         let _ = process_row(&mut processor, ModCell { period: 428, instrument: 1, effect: 9, param: 1 });
         assert_eq!(processor.channel(0).map(|state| state.sample_offset), Some(512), "PT retains a second addition after starting at 0x100");
+    }
+
+    #[test]
+    fn no_note_9xx_applies_parameter_memory_to_the_retained_pointer() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let _ = process_row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let _ = process_row(&mut processor, ModCell { effect: 9, param: 1, ..ModCell::EMPTY });
+        assert_eq!(processor.channel(0).map(|state| state.sample_offset), Some(256));
+        let _ = process_row(&mut processor, ModCell { effect: 9, param: 0, ..ModCell::EMPTY });
+        assert_eq!(processor.channel(0).map(|state| state.sample_offset), Some(512), "900 reapplies the last nonzero offset without a note");
+    }
+
+    #[test]
+    fn a_new_instrument_resets_the_pointer_before_900_recall() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let _ = process_row(&mut processor, ModCell { period: 428, instrument: 1, effect: 9, param: 1 });
         let _ = process_row(&mut processor, ModCell { period: 428, instrument: 0, ..ModCell::EMPTY });
         assert_eq!(processor.channel(0).map(|state| state.sample_offset), Some(512), "a note without an instrument reuses PT's retained pointer");
         let _ = process_row(&mut processor, ModCell { period: 428, instrument: 1, effect: 9, param: 0 });
         assert_eq!(processor.channel(0).map(|state| state.sample_offset), Some(512), "900 recalls the last nonzero offset after a new instrument resets the pointer");
+    }
 
-        let _ = process_row(&mut processor, ModCell { period: 428, instrument: 1, effect: 9, param: 8 });
-        assert_eq!(processor.channel(0).map(|state| state.sample_offset), Some(4096));
+    #[test]
+    fn an_initial_past_end_offset_keeps_the_sample_base_as_a_one_word_region() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 128);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let _ = harness.row(&mut processor, ModCell { effect: 9, param: 1, ..ModCell::EMPTY });
+        assert_eq!(processor.channel(0).map(|state| state.sample_offset), Some(0));
         assert_eq!(processor.channel(0).map(|state| state.offset_past_end), Some(true));
+        let _ = harness.row(&mut processor, ModCell { effect: 0xE, param: 0x92, ..ModCell::EMPTY });
+        assert_eq!(processor.channel(0).map(|state| state.sample_offset), Some(0), "the failed first advance retains the sample base");
+        assert_eq!(processor.channel(0).map(|state| state.offset_past_end), Some(true));
+        assert_eq!(harness.position(), Some(0));
+        assert_eq!(harness.region_length(), Some(2));
+    }
+
+    #[test]
+    fn a_later_past_end_offset_keeps_the_last_successful_pointer_as_one_word() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let _ = harness.row(&mut processor, ModCell { effect: 9, param: 1, ..ModCell::EMPTY });
+        assert_eq!(processor.channels[0].sample_offset, 256);
+        assert!(!processor.channels[0].offset_past_end);
+
+        let _ = harness.row(&mut processor, ModCell { effect: 9, param: 3, ..ModCell::EMPTY });
+        assert_eq!(processor.channels[0].sample_offset, 256, "0x300 equals the 768-frame remainder, so PT leaves n_start unchanged");
+        assert!(processor.channels[0].offset_past_end);
+
+        let _ = harness.row(&mut processor, ModCell { effect: 0xE, param: 0x92, ..ModCell::EMPTY });
+        assert_eq!(harness.position(), Some(256u64 << 32));
+        assert_eq!(harness.remaining_frames(), Some(2));
+        assert_eq!(processor.channels[0].sample_offset, 256, "E9 retains the failed-offset pointer");
     }
 
     #[test]
     fn speed_and_tempo_split_at_thirty_two_and_f00_stops() {
         let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
         assert_eq!(process_row(&mut processor, ModCell { effect: 0xF, param: 31, ..ModCell::EMPTY }).speed, 31);
-        assert_eq!(process_row(&mut processor, ModCell { effect: 0xF, param: 32, ..ModCell::EMPTY }).tempo_bpm, 32);
+        assert_eq!(process_row(&mut processor, ModCell { effect: 0xF, param: 32, ..ModCell::EMPTY }).tempo_bpm, 125);
+        assert_eq!(process_tick(&mut processor, 1, 0).tempo_bpm, 32);
         assert!(process_row(&mut processor, ModCell { effect: 0xF, param: 0, ..ModCell::EMPTY }).stop);
     }
 
@@ -883,8 +1032,40 @@ mod tests {
         processor.arpeggio(0, 1);
         assert_eq!(processor.channels[0].actual_period, 0);
         processor.arpeggio(0, 2);
-        assert_eq!(processor.channels[0].actual_period, 856);
+        assert_eq!(processor.channels[0].actual_period, 850, "the flat PT table wraps into finetune +1 after its zero sentinel");
         assert_eq!(step_from_period(0, 44_100), Step::ZERO);
+    }
+
+    #[test]
+    fn arpeggio_searches_the_period_reached_by_a_plain_slide() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let state = &mut processor.channels[0];
+        state.current_note = 48;
+        state.current_period = 428;
+        processor.slide_period(0, false, 1);
+        processor.channels[0].command_data = 0x01;
+        processor.arpeggio(0, 1);
+        assert_eq!(processor.channels[0].actual_period, 404, "a zero offset on arpeggio phase one still performs PT's table search");
+        processor.channels[0].command_data = 0x10;
+        processor.arpeggio(0, 1);
+        assert_eq!(processor.channels[0].current_period, 427);
+        assert_eq!(processor.channels[0].actual_period, 381, "427 scans to C# before the one-semitone arpeggio offset");
+    }
+
+    #[test]
+    fn arpeggio_searches_a_completed_tone_portamento_period() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let state = &mut processor.channels[0];
+        state.current_note = 48;
+        state.current_period = 430;
+        state.target_period = 404;
+        state.target_note = 49;
+        state.portamento_memory = 32;
+        state.command_data = 0x10;
+        processor.tone_portamento(0);
+        assert_eq!(processor.channels[0].target_period, 0);
+        processor.arpeggio(0, 1);
+        assert_eq!(processor.channels[0].actual_period, 381, "the finished C# target, not stale C note state, is the base");
     }
 
     #[test]
@@ -910,5 +1091,130 @@ mod tests {
         processor.tone_portamento(0);
         assert_eq!(processor.channels[0].current_period, 428);
         assert_eq!(processor.channels[0].target_period, 0);
+    }
+
+    #[test]
+    fn tone_portamento_scans_the_selected_positive_finetune_row() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[7], 1024);
+        let _ = process_row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let _ = process_row(&mut processor, ModCell { period: 420, effect: 3, param: 4, ..ModCell::EMPTY });
+        assert_eq!(processor.channels[0].target_period, 407, "selected +7 scan differs from rebuilding zero-row slot 13 as 384");
+    }
+
+    #[test]
+    fn tone_portamento_applies_pt_s_negative_finetune_slot_adjustment() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[15], 1024);
+        let _ = process_row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let _ = process_row(&mut processor, ModCell { period: 420, effect: 3, param: 4, ..ModCell::EMPTY });
+        assert_eq!(processor.channels[0].target_period, 431, "-1 scans slot 13 then applies PT's one-slot negative-finetune correction");
+    }
+
+    #[test]
+    fn ed0_triggers_only_a_note_from_its_own_row_and_repeats_with_ee() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, effect: 0xE, param: 0xD0 });
+        let first = harness.foreground().expect("ED0 note triggers at row tick zero");
+        let _ = harness.tick(&mut processor, 6, 1);
+        let repeated = harness.foreground().expect("ED0 note repeats at delayed tick zero");
+        assert_ne!(first, repeated);
+
+        let _ = harness.row(&mut processor, ModCell { effect: 0xE, param: 0xD0, ..ModCell::EMPTY });
+        let no_note = harness.foreground();
+        let _ = harness.tick(&mut processor, 6, 1);
+        assert_eq!(harness.foreground(), no_note, "a no-note ED0 does not reuse historical current_note");
+    }
+
+    #[test]
+    fn positive_ed_waits_for_its_tick_and_retriggers_on_pattern_delay_repeats() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, effect: 0xE, param: 0xD2 });
+        assert_eq!(harness.foreground(), None, "ED2 does not trigger while the row is latched");
+        let _ = harness.tick(&mut processor, 1, 0);
+        assert_eq!(harness.foreground(), None);
+        let _ = harness.tick(&mut processor, 2, 0);
+        let first = harness.foreground().expect("ED2 triggers on tick two");
+        let _ = harness.tick(&mut processor, 8, 1);
+        assert_ne!(harness.foreground(), Some(first), "ED2 triggers again at tick two of the EEx repeat");
+    }
+
+    #[test]
+    fn no_note_positive_ed_does_not_retrigger_a_historical_note() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let original = harness.foreground();
+        let _ = harness.row(&mut processor, ModCell { effect: 0xE, param: 0xD2, ..ModCell::EMPTY });
+        let _ = harness.tick(&mut processor, 2, 0);
+        let _ = harness.tick(&mut processor, 8, 1);
+        assert_eq!(harness.foreground(), original);
+    }
+
+    #[test]
+    fn e9_note_rows_skip_tick_zero_while_no_note_rows_retrigger_retained_offsets() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, effect: 9, param: 1 });
+        assert_eq!(processor.channels[0].sample_offset, 512);
+
+        let _ = harness.row(&mut processor, ModCell { period: 404, effect: 0xE, param: 0x92, ..ModCell::EMPTY });
+        let note_tick_zero = harness.foreground().expect("the note itself triggers once");
+        assert_eq!(harness.position(), Some(512u64 << 32));
+        let _ = harness.tick(&mut processor, 6, 1);
+        assert_eq!(harness.foreground(), Some(note_tick_zero), "row-delay tick zero does not double-trigger a note row");
+
+        let _ = harness.row(&mut processor, ModCell { effect: 0xE, param: 0x92, ..ModCell::EMPTY });
+        let no_note_tick_zero = harness.foreground().expect("no-note E92 retriggers at tick zero");
+        assert_ne!(no_note_tick_zero, note_tick_zero);
+        assert_eq!(harness.position(), Some(512u64 << 32));
+        let _ = harness.tick(&mut processor, 2, 0);
+        let interval_retrigger = harness.foreground().expect("E92 retriggers on tick two");
+        assert_ne!(interval_retrigger, no_note_tick_zero);
+        assert_eq!(harness.position(), Some(512u64 << 32));
+        let _ = harness.tick(&mut processor, 6, 1);
+        assert_ne!(harness.foreground(), Some(interval_retrigger), "no-note E92 retriggers at repeated tick zero");
+        assert_eq!(processor.channels[0].sample_offset, 512);
+    }
+
+    #[test]
+    fn delayed_notes_preserve_all_lfo_waveform_phases_at_the_trigger_tick() {
+        for selector in 0..=7 {
+            let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+            processor.channels[0].vibrato_waveform = selector;
+            processor.channels[0].tremolo_waveform = selector;
+            processor.channels[0].vibrato_phase = 76;
+            processor.channels[0].tremolo_phase = 92;
+            let _ = process_row(&mut processor, ModCell { period: 428, instrument: 1, effect: 0xE, param: 0xD2 });
+            assert_eq!((processor.channels[0].vibrato_phase, processor.channels[0].tremolo_phase), (76, 92), "selector {selector} is unchanged while ED2 waits");
+            let _ = process_tick(&mut processor, 1, 0);
+            assert_eq!((processor.channels[0].vibrato_phase, processor.channels[0].tremolo_phase), (76, 92));
+            let _ = process_tick(&mut processor, 2, 0);
+            assert_eq!((processor.channels[0].vibrato_phase, processor.channels[0].tremolo_phase), (76, 92), "PT noteDelay/doRetrg preserves selector {selector}");
+        }
+    }
+
+    #[test]
+    fn bpm_change_uses_the_old_tick_zero_interval_then_the_new_cia_interval() {
+        let mut pattern = vec![0; 64 * CELL_BYTES];
+        pattern[..CELL_BYTES].copy_from_slice(&ModCell { effect: 0xF, param: 250, ..ModCell::EMPTY }.to_bytes());
+        let mut builder = ModuleBuilder::new();
+        builder.add_pattern(&pattern, 64, 1).expect("pattern");
+        builder.set_orders(&[0, starplayer_model::ORDER_END]);
+        builder.set_header(ModuleHeader::new(ModuleFormat::Mod, 1));
+        let module = Arc::new(builder.build().expect("module"));
+        let mut sequencer = sequencer_for(module, 44_100, ExactFixedPoint);
+        let mut voices = VoicePool::new(2);
+        let mut channels = ChannelTable::new(1);
+        let mut control = ControlClock::new(44_100, Frame::ZERO);
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let frame = sequencer.next_event_frame().expect("tick");
+            frames.push(frame);
+            let mut context = EngineContext::new(frame, &mut voices, &mut channels, &mut control);
+            sequencer.dispatch(frame, &mut context);
+        }
+        assert_eq!(frames, vec![Frame(0), Frame(882), Frame(1323)]);
+        assert_eq!(sequencer.tempo_bpm(), 250);
     }
 }

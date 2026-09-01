@@ -27,11 +27,11 @@ requires a supported signature at offset 1080 and `load` returns `BadMagic` for 
 files. A future Soundtracker loader can add this as an explicit dialect rather than
 silently applying ProTracker semantics.
 
-Pattern count uses the highest non-255 order in the declared `song_length` prefix, plus
-one. The task's “highest order” rule is deliberately interpreted as the highest *live*
-order: bytes after `song_length` are editor padding, and some real modules retain stale
-values there. Counting a stale tail value changes the computed sample-data offset and can
-turn a valid module into a truncation error. A focused loader test fixes this boundary.
+Pattern storage uses the highest non-255 value across all 128 order bytes, plus one, as
+ProTracker's loader does. Only the declared `song_length` prefix is played, but an unused
+tail entry can still name a pattern physically present before the sample payload. Scanning
+only live orders would place the sample-data offset inside that stored pattern. `FLT8`
+applies the same all-entry scan after translating its stored half-pattern order numbers.
 
 `FLT8` is the one tagged layout exception: Startrekker writes one logical eight-channel
 pattern as all 64 rows of channels 0–3 followed by all 64 rows of channels 4–7, and its
@@ -44,8 +44,16 @@ remains the ordinary eight-cells-per-row layout.
 Pattern periods are decoded as PT's `setPeriod` does: scan the zero-finetune row to find
 the note slot, then read the same slot from the instrument's selected finetune row. For
 example, raw period 428 remains C-4 on StarPlayer's C-0 note axis when instrument
-finetune +7 is latched, and sounds at period 407. Pitch, arpeggio, portamento targets and glissando all stay in this table
-domain; no S3M C2SPD period lowering is used.
+finetune +7 is latched, and sounds at period 407. Pitch, arpeggio, portamento targets and
+glissando all stay in this table domain; no S3M C2SPD period lowering is used.
+
+Arpeggio searches the selected finetune row from the channel's live period on each
+non-base phase, so a preceding period slide or completed tone portamento changes its base
+even though the last packed note does not. The lookup treats PT's period table as
+physically flat: every finetune row has a zero sentinel, overflow can enter the next row,
+and the final `-1` row uses PT's pinned 15-word overflow padding. Tone-portamento target
+lookup also scans the selected row directly and retains PT's one-slot adjustment for
+negative finetunes.
 
 `Dxx` pattern break is BCD (`10 * high + low`). Values decoding past row 63 go to row
 zero, matching PT's break handling.
@@ -53,8 +61,22 @@ zero, matching PT's break handling.
 ProTracker 1/2's `9xx` pointer bug is retained: the current note starts at `xx * 256`,
 then the retained channel pointer advances by the same amount again. A following note
 without a new instrument therefore starts at twice the original offset. A new instrument
-resets that retained pointer, `900` recalls the last nonzero parameter, and an offset past
-the sample end selects the one-word start-of-sample region.
+resets that retained pointer, and `900` recalls the last nonzero parameter. Each offset is
+tested against the channel's remaining sample length. On failure PT forces a one-word
+length but does not change the last successfully advanced pointer.
+
+`9xx` advances the retained pointer even on a row without a note. `E9x` restarts from
+that pointer rather than resetting it. Both `E9x` and `EDx` use the packed-note presence
+latched for the current row (and retained across `EEx` repeats), never the historical
+channel note. PT also preserves both vibrato and tremolo phases for every waveform across
+an `EDx`: `setPeriod` skips the ordinary-note reset, then `noteDelay` calls `doRetrg`,
+which has no phase writes. libxmp's delayed-event path instead resets retrigger-enabled
+selectors 0–3; C3 follows its named primary PT source and treats that oracle difference
+as an explicit conformance exclusion.
+
+`Fxx` values from 32 through 255 use PT's CIA boundary: tick zero is followed by one
+interval at the old BPM, and the new BPM is committed by the next tracker event for the
+interval after it. Speed values below 32 remain immediate row-clock changes.
 
 When `EEx` shares a row with `Dxx`, PT spends the delayed repeats and then skips the
 break target row. The processor advances the target once more, including the row-63 case
