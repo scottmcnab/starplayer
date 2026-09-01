@@ -19,6 +19,12 @@ const BARE_METAL_TARGET: &str = "riscv32imc-unknown-none-elf";
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
+const LIBXMP_CORPUS_REVISION: &str = "6ec0ba21b1b28f91e22b68a51d59207c6bbf6139";
+const LIBXMP_CORPUS_SHA256: &str = "5cb12ffba9371779a7e7c46c4494480f2c52a498db855e99c8a479c5fbba9f20";
+const LIBXMP_CORPUS_URL: &str = "https://codeload.github.com/libxmp/libxmp/tar.gz/6ec0ba21b1b28f91e22b68a51d59207c6bbf6139";
+const CONFORMANCE_MANIFEST: &str = "conformance/cases.tsv";
+const CONFORMANCE_EXCLUSIONS: &str = "conformance/exclusions.tsv";
+
 /// Every crate that must stay `no_std`. The facade is last so a purity failure inside it
 /// is reported after the crate that actually caused it.
 const NO_STD_CRATES: &[&str] = &[
@@ -47,7 +53,7 @@ const NO_STD_CRATES: &[&str] = &[
 /// `starplayer-telemetry` edge (architecture §11, M1-B6).
 const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry")];
 
-const JOBS: &[&str] = &["host-tests", "goldens", "fma-check", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
+const JOBS: &[&str] = &["host-tests", "conformance", "goldens", "fma-check", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -55,6 +61,7 @@ fn main() -> ExitCode {
 
     let succeeded = match subcommand {
         Some("ci") => run_ci(&arguments[1..]),
+        Some("conformance") => run_conformance(&arguments[1..]),
         Some("goldens") => run_goldens(&arguments[1..]),
         Some("trace") => run_trace(&arguments[1..]),
         Some("wasm") => run_wasm(&arguments[1..]),
@@ -78,6 +85,7 @@ fn print_usage() {
     println!();
     println!("subcommands:");
     println!("  ci [--job <job>]   run the CI matrix locally, or a single job of it");
+    println!("  conformance [--offline|--fetch-only] [--archive PATH]   acquire and run the pinned tracker corpora");
     println!("  goldens [--check]  regenerate canonical SHA-256 renders, or verify them");
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
     println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
@@ -146,6 +154,200 @@ fn run_goldens(arguments: &[String]) -> bool {
     }
 }
 
+/// Acquire the immutable corpus snapshot and run the std-only testkit driver.
+///
+/// `--offline` refuses acquisition and is the CI gate. `--fetch-only` prepares the cache
+/// without compiling or running the harness. `--archive PATH` lets maintainers validate
+/// a previously downloaded archive while still enforcing the pinned checksum.
+fn run_conformance(arguments: &[String]) -> bool {
+    let mut offline = false;
+    let mut fetch_only = false;
+    let mut supplied_archive: Option<PathBuf> = None;
+    let mut index = 0usize;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--offline" => { offline = true; index += 1; }
+            "--fetch-only" => { fetch_only = true; index += 1; }
+            "--archive" => {
+                let Some(path) = arguments.get(index + 1) else {
+                    eprintln!("xtask conformance: `--archive` needs a path");
+                    return false;
+                };
+                supplied_archive = Some(PathBuf::from(path));
+                index += 2;
+            }
+            other => {
+                eprintln!("xtask conformance: unexpected argument `{other}`");
+                return false;
+            }
+        }
+    }
+    if offline && supplied_archive.is_some() {
+        eprintln!("xtask conformance: `--offline` and `--archive` are mutually exclusive");
+        return false;
+    }
+
+    let root = workspace_root();
+    let corpus = conformance_corpus_directory(&root);
+    if supplied_archive.is_some() || !corpus_is_ready(&corpus) {
+        if offline {
+            eprintln!("xtask conformance: pinned corpus is not cached at `{}`", corpus.display());
+            eprintln!("                   run `cargo xtask conformance --fetch-only` during acquisition");
+            return false;
+        }
+        if !acquire_conformance_corpus(&root, &corpus, supplied_archive.as_deref()) {
+            return false;
+        }
+    }
+
+    println!("xtask conformance: libxmp corpus {LIBXMP_CORPUS_REVISION}");
+    if fetch_only {
+        println!("xtask conformance: cache ready at {}", corpus.display());
+        return true;
+    }
+
+    let mut command = Command::new(cargo_binary());
+    command
+        .current_dir(&root)
+        .args([
+            "run", "--quiet", "--target-dir", "target/xtask-conformance",
+            "-p", "starplayer-testkit", "--bin", "starplayer-conformance", "--",
+            "--corpus",
+        ])
+        .arg(corpus.join("test-dev"))
+        .args(["--manifest", CONFORMANCE_MANIFEST, "--exclusions", CONFORMANCE_EXCLUSIONS]);
+    match command.status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("xtask conformance: harness exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("xtask conformance: harness failed to start: {error}");
+            false
+        }
+    }
+}
+
+fn conformance_corpus_directory(root: &Path) -> PathBuf {
+    root.join("target/conformance/corpora").join(format!("libxmp-{LIBXMP_CORPUS_REVISION}"))
+}
+
+fn corpus_is_ready(corpus: &Path) -> bool {
+    let marker = std::fs::read_to_string(corpus.join(".starplayer-revision"));
+    matches!(marker, Ok(value) if value.trim() == LIBXMP_CORPUS_REVISION) && corpus.join("test-dev").is_dir()
+}
+
+fn acquire_conformance_corpus(root: &Path, corpus: &Path, supplied_archive: Option<&Path>) -> bool {
+    let downloads = root.join("target/conformance/downloads");
+    if let Err(error) = std::fs::create_dir_all(&downloads) {
+        eprintln!("xtask conformance: cannot create `{}`: {error}", downloads.display());
+        return false;
+    }
+    let cached_archive = downloads.join(format!("libxmp-{LIBXMP_CORPUS_REVISION}.tar.gz"));
+    let archive = supplied_archive.unwrap_or(&cached_archive);
+    if supplied_archive.is_none() && !archive.is_file() && !download_corpus_archive(archive) {
+        return false;
+    }
+    if !verify_sha256(archive, LIBXMP_CORPUS_SHA256) {
+        if supplied_archive.is_none() {
+            let _ = std::fs::remove_file(archive);
+        }
+        return false;
+    }
+
+    let Some(parent) = corpus.parent() else {
+        eprintln!("xtask conformance: corpus path has no parent");
+        return false;
+    };
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        eprintln!("xtask conformance: cannot create `{}`: {error}", parent.display());
+        return false;
+    }
+    let partial = parent.join(format!(".libxmp-{LIBXMP_CORPUS_REVISION}.partial"));
+    if partial.exists() && let Err(error) = std::fs::remove_dir_all(&partial) {
+        eprintln!("xtask conformance: cannot clear partial extraction `{}`: {error}", partial.display());
+        return false;
+    }
+    if let Err(error) = std::fs::create_dir_all(&partial) {
+        eprintln!("xtask conformance: cannot create `{}`: {error}", partial.display());
+        return false;
+    }
+
+    println!("     tar -xzf {}", archive.display());
+    let status = Command::new("tar")
+        .args(["-xzf"])
+        .arg(archive)
+        .args(["-C"])
+        .arg(&partial)
+        .arg("--strip-components=1")
+        .status();
+    if !matches!(status, Ok(status) if status.success()) {
+        eprintln!("xtask conformance: failed to extract `{}`", archive.display());
+        let _ = std::fs::remove_dir_all(&partial);
+        return false;
+    }
+    if let Err(error) = std::fs::write(partial.join(".starplayer-revision"), format!("{LIBXMP_CORPUS_REVISION}\n")) {
+        eprintln!("xtask conformance: cannot write revision marker: {error}");
+        let _ = std::fs::remove_dir_all(&partial);
+        return false;
+    }
+    if corpus.exists() && let Err(error) = std::fs::remove_dir_all(corpus) {
+        eprintln!("xtask conformance: cannot replace stale corpus `{}`: {error}", corpus.display());
+        let _ = std::fs::remove_dir_all(&partial);
+        return false;
+    }
+    if let Err(error) = std::fs::rename(&partial, corpus) {
+        eprintln!("xtask conformance: cannot install corpus at `{}`: {error}", corpus.display());
+        let _ = std::fs::remove_dir_all(&partial);
+        return false;
+    }
+    true
+}
+
+fn download_corpus_archive(destination: &Path) -> bool {
+    let partial = destination.with_extension("tar.gz.partial");
+    let _ = std::fs::remove_file(&partial);
+    println!("     curl {LIBXMP_CORPUS_URL}");
+    let status = Command::new("curl")
+        .args(["--fail", "--location", "--retry", "3", "--output"])
+        .arg(&partial)
+        .arg(LIBXMP_CORPUS_URL)
+        .status();
+    if !matches!(status, Ok(status) if status.success()) {
+        eprintln!("xtask conformance: failed to download the pinned libxmp archive");
+        let _ = std::fs::remove_file(&partial);
+        return false;
+    }
+    if let Err(error) = std::fs::rename(&partial, destination) {
+        eprintln!("xtask conformance: cannot cache `{}`: {error}", destination.display());
+        let _ = std::fs::remove_file(&partial);
+        return false;
+    }
+    true
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> bool {
+    println!("     sha256sum {}", path.display());
+    let output = Command::new("sha256sum").arg(path).output();
+    let Ok(output) = output else {
+        eprintln!("xtask conformance: `sha256sum` is required to verify the corpus archive");
+        return false;
+    };
+    if !output.status.success() {
+        eprintln!("xtask conformance: sha256sum failed for `{}`", path.display());
+        return false;
+    }
+    let actual = String::from_utf8_lossy(&output.stdout).split_whitespace().next().unwrap_or("").to_string();
+    if actual != expected {
+        eprintln!("xtask conformance: checksum mismatch for `{}`", path.display());
+        eprintln!("                   expected {expected}");
+        eprintln!("                   actual   {actual}");
+        return false;
+    }
+    true
+}
+
 fn run_ci(arguments: &[String]) -> bool {
     let requested_job = match parse_job_argument(arguments) {
         Ok(job) => job,
@@ -165,6 +367,7 @@ fn run_ci(arguments: &[String]) -> bool {
         println!("\n=== xtask ci: {job} ===");
         let succeeded = match *job {
             "host-tests" => job_host_tests(),
+            "conformance" => job_conformance(),
             "goldens" => run_goldens(&["--check".to_string()]),
             "fma-check" => job_fma_check(),
             "wasm-build" => job_wasm_build(),
@@ -340,6 +543,13 @@ fn collect_files_with_extension(directory: &Path, extension: &str, destination: 
             destination.push(path);
         }
     }
+}
+
+/// Corpus acquisition is deliberately separate from the CI test command. The workflow
+/// restores or prepares the checksum-pinned cache first; this job proves that the tests
+/// themselves have no live third-party dependency.
+fn job_conformance() -> bool {
+    run_conformance(&["--offline".to_string()])
 }
 
 /// The web build has to keep working on every commit, both for the facade the app

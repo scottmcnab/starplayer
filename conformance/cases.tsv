@@ -1,0 +1,49 @@
+# StarPlayer conformance manifest v1. Tab-separated; paths are relative to libxmp test-dev/.
+# id	source	format	module	oracle	behaviour
+libxmp-s3m-pattern-jump-mpt-break	libxmp	s3m	data/pattern_jump_mpt_break.s3m	data/pattern_jump_mpt_break_s3m.data	OpenMPT-compatible position jump and break interaction
+libxmp-mtm-pattern-jump-break	libxmp	mtm	data/pattern_jump_mtm_break.mtm	data/pattern_jump_mtm_break.data	MTM position jump and pattern break interaction
+libxmp-mod-pattern-jump-octalyser-break	libxmp	mod	data/pattern_jump_octalyser_break.mod	data/pattern_jump_octalyser_break.data	Octalyser MOD position jump and pattern break interaction
+libxmp-s3m-pattern-jump-st3-break	libxmp	s3m	data/pattern_jump_st3_break.s3m	data/pattern_jump_st3_break.data	Scream Tracker 3 position jump and pattern break interaction
+libxmp-mod-pattern-loop-dt-breakjump	libxmp	mod	data/pattern_loop_dt_breakjump.mod	data/pattern_loop_dt_breakjump_mod.data	Digital Tracker MOD loop with break and jump
+libxmp-mod-pattern-loop-dt	libxmp	mod	data/pattern_loop_dt.mod	data/pattern_loop_dt_mod.data	Digital Tracker MOD pattern loop
+libxmp-s3m-pattern-loop-imf-breakjump	libxmp	s3m	data/pattern_loop_imf_breakjump.s3m	data/pattern_loop_imf_breakjump_s3m.data	IMF-compatible S3M loop with break and jump
+libxmp-s3m-pattern-loop-imf	libxmp	s3m	data/pattern_loop_imf.s3m	data/pattern_loop_imf_s3m.data	IMF-compatible S3M pattern loop
+libxmp-s3m-pattern-loop-mpt-breakjump	libxmp	s3m	data/pattern_loop_mpt_breakjump.s3m	data/pattern_loop_mpt_breakjump_s3m.data	OpenMPT-compatible S3M loop with break and jump
+libxmp-s3m-pattern-loop-mpt	libxmp	s3m	data/pattern_loop_mpt.s3m	data/pattern_loop_mpt_s3m.data	OpenMPT-compatible S3M pattern loop
+libxmp-mod-pattern-loop-octalyser	libxmp	mod	data/pattern_loop_octalyser.mod	data/pattern_loop_octalyser.data	Octalyser MOD pattern loop
+libxmp-mod-pattern-loop-octalyser-breakjump	libxmp	mod	data/pattern_loop_octalyser_breakjump.mod	data/pattern_loop_octalyser_breakjump.data	Octalyser MOD loop with break and jump
+libxmp-s3m-pattern-loop-st301	libxmp	s3m	data/pattern_loop_st301.s3m	data/pattern_loop_st301.data	Scream Tracker 3.01 pattern loop
+libxmp-s3m-pattern-loop-st301-breakjump	libxmp	s3m	data/pattern_loop_st301_breakjump.s3m	data/pattern_loop_st301_breakjump.data	Scream Tracker 3.01 loop with break and jump
+libxmp-s3m-pattern-loop-st321	libxmp	s3m	data/pattern_loop_st321.s3m	data/pattern_loop_st321.data	Scream Tracker 3.21 pattern loop
+libxmp-s3m-pattern-loop-st321-breakjump	libxmp	s3m	data/pattern_loop_st321_breakjump.s3m	data/pattern_loop_st321_breakjump.data	Scream Tracker 3.21 loop with break and jump
+openmpt-mod-amiga-limits-finetune	openmpt	mod	openmpt/mod/AmigaLimitsFinetune.mod	openmpt/mod/AmigaLimitsFinetune.data	Finetune-dependent ProTracker Amiga period limits
+openmpt-mod-arpeggio-wraparound	openmpt	mod	openmpt/mod/ArpWraparound.mod	openmpt/mod/ArpWraparound.data	ProTracker arpeggio beyond the Amiga frequency range
+openmpt-mod-delay-break	openmpt	mod	openmpt/mod/DelayBreak.mod	openmpt/mod/DelayBreak.data	ProTracker row delay and pattern break interaction
+openmpt-mod-finetune	openmpt	mod	openmpt/mod/finetune.mod	openmpt/mod/finetune.data	ProTracker E5x finetune and portamento interaction
+openmpt-mod-instrument-swap-retrigger	openmpt	mod	openmpt/mod/InstrSwapRetrigger.mod	openmpt/mod/InstrSwapRetrigger.data	ProTracker instrument swap with E9x retrigger
+openmpt-mod-pattern-jump	openmpt	mod	openmpt/mod/PatternJump.mod	openmpt/mod/PatternJump.data	ProTracker Bxx overrides an earlier Dxx
+openmpt-mod-portamento-sample-change	openmpt	mod	openmpt/mod/PortaSmpChange.mod	openmpt/mod/PortaSmpChange.data	Default MOD sample-change behavior during portamento
+openmpt-mod-portamento-sample-change-pt	openmpt	mod	openmpt/mod/PortaSmpChange.mod	openmpt/mod/PortaSmpChange_PT.data	ProTracker sample-change behavior during portamento
+openmpt-mod-portamento-swap-pt	openmpt	mod	openmpt/mod/PortaSwapPT.mod	openmpt/mod/PortaSwapPT.data	ProTracker portamento sample swapping and finetune
+openmpt-mod-portamento-target	openmpt	mod	openmpt/mod/PortaTarget.mod	openmpt/mod/PortaTarget.data	ProTracker portamento target lifetime
+openmpt-mod-instrument-swap	openmpt	mod	openmpt/mod/PTInstrSwap.mod	openmpt/mod/PTInstrSwap.data	ProTracker delayed sample swap on a lone instrument
+openmpt-mod-instrument-volume	openmpt	mod	openmpt/mod/PTInstrVolume.mod	openmpt/mod/PTInstrVolume.data	ProTracker lone-instrument volume persistence
+openmpt-mod-sample-offset	openmpt	mod	openmpt/mod/ptoffset.mod	openmpt/mod/ptoffset.data	ProTracker double-applied sample offset
+openmpt-mod-stopped-swap	openmpt	mod	openmpt/mod/PTStoppedSwap.mod	openmpt/mod/PTStoppedSwap.data	ProTracker sample swap after a one-shot stopped
+openmpt-mod-swap-empty	openmpt	mod	openmpt/mod/PTSwapEmpty.mod	openmpt/mod/PTSwapEmpty.data	ProTracker swap from an empty sample slot
+openmpt-mod-swap-no-loop	openmpt	mod	openmpt/mod/PTSwapNoLoop.mod	openmpt/mod/PTSwapNoLoop.data	ProTracker swapping from and to non-looped samples
+openmpt-mod-vibrato-reset	openmpt	mod	openmpt/mod/VibratoReset.mod	openmpt/mod/VibratoReset.data	ProTracker first-tick vibrato and tremolo phase
+openmpt-s3m-amiga-limits	openmpt	s3m	openmpt/s3m/AmigaLimits.s3m	openmpt/s3m/AmigaLimits.data	Scream Tracker 3 Amiga period limits
+openmpt-s3m-frequency-limits	openmpt	s3m	openmpt/s3m/FreqLimits.s3m	openmpt/s3m/FreqLimits.data	Scream Tracker 3 high-frequency cutoff
+openmpt-s3m-parameter-memory	openmpt	s3m	openmpt/s3m/ParamMemory.s3m	openmpt/s3m/ParamMemory.data	Scream Tracker 3 effect parameter memories
+openmpt-s3m-pattern-delays-retrigger	openmpt	s3m	openmpt/s3m/PatternDelaysRetrig.s3m	openmpt/s3m/PatternDelaysRetrig.data	Scream Tracker 3 first ticks across row delays
+openmpt-s3m-period-limit	openmpt	s3m	openmpt/s3m/PeriodLimit.s3m	openmpt/s3m/PeriodLimit.data	Scream Tracker 3 lower output-period limit and zero cut
+openmpt-s3m-portamento-sample-change	openmpt	s3m	openmpt/s3m/PortaSmpChange.s3m	openmpt/s3m/PortaSmpChange.data	Scream Tracker 3 portamento keeps the old sample
+libxmp-mod-future-composer-envelope	libxmp	mod	data/flt_am_envelope.mod	data/flt_am_envelope.data	Startrekker AM synth envelope playback in a MOD container
+libxmp-mod-future-composer-ignore-volume	libxmp	mod	data/flt_am_ignore_volfx.mod	data/flt_am_ignore_volfx.data	Startrekker AM synth ignores MOD volume effects
+libxmp-mod-future-composer-new-note	libxmp	mod	data/flt_am_new_note.mod	data/flt_am_new_note.data	Startrekker AM synth new-note behavior
+libxmp-mod-future-composer-override	libxmp	mod	data/flt_am_override.mod	data/flt_am_override.data	Startrekker AM synth override behavior
+libxmp-mod-future-composer-period-fall	libxmp	mod	data/flt_am_period_fall.mod	data/flt_am_period_fall.data	Startrekker AM synth falling-period behavior
+libxmp-mtm-tempo	libxmp	mtm	data/TEMPO.MTM	data/tempo_mtm.data	MultiTracker tempo command
+libxmp-mtm-tempo-two	libxmp	mtm	data/TEMPO2.MTM	data/tempo2_mtm.data	MultiTracker alternate tempo command sequence
+libxmp-s3m-sample-portamento	libxmp	s3m	data/s3m_sample_porta.s3m	data/s3m_sample_porta.data	Scream Tracker 3 instrument change during tone portamento

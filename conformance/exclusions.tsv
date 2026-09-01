@@ -1,0 +1,17 @@
+# StarPlayer conformance exclusions v1. Tab-separated.
+# case-id	reason	accuracy-policy-or-tracking-reference
+libxmp-s3m-pattern-loop-imf-breakjump	StarPlayer takes row 2 instead of the IMF-compatible break/jump destination at tick 8	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
+libxmp-s3m-pattern-loop-imf	StarPlayer restarts row 0 instead of continuing the IMF-compatible loop at tick 12	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
+libxmp-s3m-pattern-loop-mpt-breakjump	StarPlayer trace ends before the OpenMPT-compatible loop reaches the oracle's row 2	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
+libxmp-s3m-pattern-loop-mpt	StarPlayer restarts row 0 instead of reaching the OpenMPT-compatible row 4 at tick 16	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
+libxmp-s3m-pattern-loop-st301	StarPlayer restarts row 0 instead of reaching the ST3.01 row 8 at tick 27	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
+libxmp-s3m-pattern-loop-st301-breakjump	StarPlayer reaches row 2 instead of the ST3.01 break/jump destination at tick 4	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
+libxmp-s3m-pattern-loop-st321	StarPlayer restarts row 0 instead of continuing the ST3.21 loop at tick 30	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
+libxmp-s3m-pattern-loop-st321-breakjump	StarPlayer restarts row 0 instead of following the ST3.21 break/jump at tick 24	conformance/known-failures.md#c2-s3m-001--pattern-loop-compatibility
+openmpt-s3m-amiga-limits	Amiga-limited period and sample advance diverge beginning at tick 1	conformance/known-failures.md#c2-s3m-002--amiga-period-limits
+openmpt-s3m-frequency-limits	A voice remains active above ST3's high-frequency cutoff at row 5 frame 2	conformance/known-failures.md#c2-s3m-003--high-frequency-cutoff
+openmpt-s3m-parameter-memory	Effect-memory handling produces a different active row/frame sequence by row 16	conformance/known-failures.md#c2-s3m-004--effect-parameter-memory
+openmpt-s3m-pattern-delays-retrigger	Row delay remains on row 0 through frame 12 instead of advancing to row 1 frame 0	conformance/known-failures.md#c2-s3m-005--row-delay-and-retrigger
+openmpt-s3m-period-limit	Lower-limit note identity and sample advance diverge from the mixer oracle	conformance/known-failures.md#c2-s3m-006--lower-period-limit
+openmpt-s3m-portamento-sample-change	Tone portamento changes the sounding instrument identity instead of retaining instrument 1	conformance/known-failures.md#c2-s3m-007--portamento-sample-change
+libxmp-s3m-sample-portamento	Instrument-change portamento leaves an active voice on row 3 where the oracle next resumes at row 16	conformance/known-failures.md#c2-s3m-008--sample-portamento-continuation

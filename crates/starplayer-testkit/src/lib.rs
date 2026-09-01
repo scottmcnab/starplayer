@@ -10,13 +10,13 @@
 //! `gen_mixer_data` writes twelve whitespace-separated values:
 //! `time row frame channel period note instrument volume pan position cutoff resonance`.
 //! Map `row`, `frame` (libxmp's tick-in-row), `channel`, `period`, `note`, `instrument`,
-//! `volume`, `pan`, integer `position`, `cutoff` and `resonance` to their like-named v1
-//! fields. Its `time` is rounded milliseconds; StarPlayer's exact output `frm` replaces
-//! it. Order/pattern, speed/BPM/global volume, activity, sample number, fractional
-//! position and dirty flags have no libxmp dump column and must be populated by the C2
-//! adapter's playback metadata or deliberately excluded field by field. libxmp itself
-//! tolerates one millisecond and one integer sample position; represent the latter here as
-//! `TraceTolerances { position: 1 << 32, ..Default::default() }`.
+//! `volume`, `pan`, integer `position`, `cutoff` and `resonance` to their corresponding v1
+//! state. `time` is rounded end-of-frame milliseconds and is compared with StarPlayer's
+//! exact tick-end frame. Presence in the dump defines the active channel set; extra
+//! StarPlayer voices remain observable. Order/pattern, speed/BPM/global volume, sample
+//! number, fractional position and dirty flags have no libxmp column, so only those are
+//! projected from StarPlayer's trace. libxmp itself tolerates one millisecond and one
+//! integer sample position; the adapter expresses those bounds as C1 tolerances.
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +24,8 @@ use std::fmt;
 
 use starplayer::core::{DirtyBits, Frame};
 use starplayer::engine::{TRACE_FORMAT_VERSION, SongPosition, Trace, TraceChannel, TraceTick};
+
+pub mod conformance;
 
 /// A malformed or unsupported trace text document.
 #[derive(Clone, Debug, PartialEq, Eq)]

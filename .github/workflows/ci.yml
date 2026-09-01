@@ -75,6 +75,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask ci --job fma-check
 
+  conformance:
+    name: conformance corpora
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore pinned corpus
+        id: corpus-cache
+        uses: actions/cache@v4
+        with:
+          path: target/conformance
+          key: conformance-libxmp-6ec0ba21b1b28f91e22b68a51d59207c6bbf6139
+      - name: Acquire and verify pinned corpus
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        run: cargo xtask conformance --fetch-only
+      - name: Run with live corpus acquisition disabled
+        run: cargo xtask ci --job conformance
+
   wasm-build:
     name: wasm build
     runs-on: ubuntu-latest
