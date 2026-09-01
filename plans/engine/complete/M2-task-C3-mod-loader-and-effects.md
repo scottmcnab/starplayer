@@ -3,6 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) |
+| Status | Landed — owner listening check pending |
 | Depends on | M1 |
 | Blocks | C5, C7 |
 | Parallel with | C4 |
