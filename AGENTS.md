@@ -83,7 +83,11 @@ direction. Task files record *how*; foundation docs record *what and why*.
 3. Delegate implementation to a **GPT-5.6-sol** worker against the task file. The task
    file's header table names the least-capable model tier safe to hand it to.
 4. Review the diff and run the task's Verification section before committing.
-5. Move the plan to the area's `complete/` once landed and only owner acceptance remains.
+5. Merge the branch from the target branch's own checkout with **`git merge --no-ff`**,
+   never a fast-forward, so every branch landing is a merge commit that names the branch
+   and can be reverted or inspected as one unit. This applies to task branches landing on
+   a milestone branch and to milestone branches landing on `main`.
+6. Move the plan to the area's `complete/` once landed and only owner acceptance remains.
 
 ## Working agreements
 
