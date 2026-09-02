@@ -51,6 +51,15 @@ reusable `starplayer-archive` crate. The page lists and, after any required pick
 extracts an S3M before the existing validation and activation path begins. The worklet is
 therefore still given only module bytes and never receives or inflates an archive.
 
+The most recently opened archive is retained, so its other tracks stay one click away: a
+**Track from …** dropdown and a **Load from ZIP** button appear in the load panel beside
+the bundled-fixture controls, listing the same `name — size` entries the modal shows and
+keeping the playing entry selected. The list survives cancelling the modal and survives
+loading a plain module; opening another ZIP replaces it. Loading from it goes through the
+same extract-and-activate path as the modal pick, so the label and messages are identical.
+Only the one archive's bytes are held — `archive_extract` returns a fresh copy per call —
+and nothing is remembered across a page reload.
+
 Commands are typed fixed-size records in an SPSC `SharedArrayBuffer` ring. Without SAB,
 the page batches every control change made during one animation frame into one message.
 Coherent B6 snapshots use an odd/even seqlock over shared memory; the fallback posts a

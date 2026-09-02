@@ -31,6 +31,7 @@ const elements = {
     dropped: byId('dropped'), retired: byId('retired'), health: byId('health'), forceFallback: byId('force-fallback'),
     archivePicker: byId('archive-picker'), archivePickerName: byId('archive-picker-name'), archiveEntries: byId('archive-entries'),
     archiveLoad: byId('archive-load'), archiveCancel: byId('archive-cancel'),
+    archiveTracks: byId('archive-tracks'), loadArchiveTrack: byId('load-archive-track'),
     engineMode: byId('engine-mode'), outputStatus: byId('output-status'), sampleRateStatus: byId('sample-rate-status'),
     contextState: byId('context-state'), baseLatency: byId('base-latency'), outputLatency: byId('output-latency'),
     channelStatus: byId('channel-status'), maxChannelCount: byId('max-channel-count'), sinkStatus: byId('sink-status'),
@@ -70,6 +71,7 @@ const state = {
     outputChannelCount: 2,
     outputDevices: new Map(),
     archiveChoices: [],
+    retainedArchive: null,
     archivePickerResolve: null,
     archivePreviousFocus: null,
     moduleRevision: 0,
@@ -308,55 +310,77 @@ async function loadBuffer(buffer, label) {
     showMessage(`Checking ${label}…`);
     try {
         await loaderReady;
-        let moduleBuffer = buffer;
-        let moduleLabel = label;
         const inputBytes = new Uint8Array(buffer);
         if (Loader.is_archive(inputBytes)) {
             const entries = parseArchiveModules(Loader.archive_modules(inputBytes));
             if (entries.length === 0) {
                 throw new Error(`No supported modules were found inside ${label}.`);
             }
+
+            // Retained before the pick, so cancelling the modal still leaves this ZIP's
+            // other tracks one click away in the load panel.
+            const archive = retainArchive(label, inputBytes, entries);
             const choice = entries.length === 1 ? entries[0] : await chooseArchiveEntry(entries, label);
             if (choice === null) {
                 audio.catch(() => {});
                 showMessage(previousMessage);
                 return;
             }
-            showMessage(`Extracting ${choice.name} from ${label}…`);
-            const extracted = Loader.archive_extract(inputBytes, choice.index);
-            moduleBuffer = Uint8Array.from(extracted).buffer;
-            moduleLabel = `${choice.name} (from ${label})`;
+            await playArchiveEntry(archive, choice, audio);
+            return;
         }
-        Loader.inspect_s3m(new Uint8Array(moduleBuffer));
-        loadEffectNames();
-        const metadata = readMetadata(moduleLabel);
-        await audio;
-        showMessage(`Activating ${moduleLabel}…`);
-        const retainedBytes = moduleBuffer.slice(0);
-        const revision = ++state.moduleRevision;
-        const headphoneFriendlyModPanning = elements.modHeadphonePanning.checked;
-        const result = await activateModuleOnNode(state.node, moduleBuffer, headphoneFriendlyModPanning);
-        if (revision !== state.moduleRevision) return;
-        state.metadata = metadata;
-        state.currentModuleBytes = retainedBytes;
-        state.activeModHeadphonePanning = metadata.isMod && headphoneFriendlyModPanning;
-        state.activationMemoryBytes = result.memoryBytes;
-        state.loadCount += 1;
-        renderMetadata();
-        setControlsEnabled(true);
-        queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(Number(elements.volume.value) * 65535 / 100), 0);
-        queueCommand(Ring.OPCODE_PLAY, 0, 0);
-        showMessage(`Playing ${metadata.title || moduleLabel}.`);
-
-        // The engine applies LoadModule at the next quantum. Collection happens in a
-        // later worklet message task, never inside process(). Two attempts cover a busy
-        // tab without turning garbage collection into a render-path poll.
-        setTimeout(requestGarbageCollection, 100);
-        setTimeout(requestGarbageCollection, 500);
+        await activateLoadedModule(buffer, label, audio);
     } catch (error) {
-        showError(`Could not load ${label}: ${error && error.message ? error.message : error}`);
-        showMessage(state.metadata ? `Still playing ${state.metadata.title}.` : 'The player is ready for another file.');
+        reportLoadFailure(label, error);
     }
+}
+
+/// Everything that happens once a module's own bytes are known: validate them on the
+/// page, refresh the format's effect-name table, then activate on the worklet and play.
+/// `loadBuffer` and the retained-archive dropdown are the two routes in, so a track
+/// loads identically whichever one the user took. Returns false when a later load has
+/// already claimed the module revision and this activation must be discarded.
+async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
+    Loader.inspect_s3m(new Uint8Array(moduleBuffer));
+    loadEffectNames();
+    const metadata = readMetadata(moduleLabel);
+    await audio;
+    showMessage(`Activating ${moduleLabel}…`);
+    const retainedBytes = moduleBuffer.slice(0);
+    const revision = ++state.moduleRevision;
+    const headphoneFriendlyModPanning = elements.modHeadphonePanning.checked;
+    const result = await activateModuleOnNode(state.node, moduleBuffer, headphoneFriendlyModPanning);
+    if (revision !== state.moduleRevision) return false;
+    state.metadata = metadata;
+    state.currentModuleBytes = retainedBytes;
+    state.activeModHeadphonePanning = metadata.isMod && headphoneFriendlyModPanning;
+    state.activationMemoryBytes = result.memoryBytes;
+    state.loadCount += 1;
+    renderMetadata();
+    setControlsEnabled(true);
+    queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(Number(elements.volume.value) * 65535 / 100), 0);
+    queueCommand(Ring.OPCODE_PLAY, 0, 0);
+    showMessage(`Playing ${metadata.title || moduleLabel}.`);
+
+    // The engine applies LoadModule at the next quantum. Collection happens in a
+    // later worklet message task, never inside process(). Two attempts cover a busy
+    // tab without turning garbage collection into a render-path poll.
+    setTimeout(requestGarbageCollection, 100);
+    setTimeout(requestGarbageCollection, 500);
+    return true;
+}
+
+async function playArchiveEntry(archive, choice, audio) {
+    showMessage(`Extracting ${choice.name} from ${archive.label}…`);
+    const extracted = Loader.archive_extract(archive.bytes, choice.index);
+    const moduleBuffer = Uint8Array.from(extracted).buffer;
+    const activated = await activateLoadedModule(moduleBuffer, `${choice.name} (from ${archive.label})`, audio);
+    if (activated) selectRetainedArchiveTrack(archive, choice);
+}
+
+function reportLoadFailure(label, error) {
+    showError(`Could not load ${label}: ${error && error.message ? error.message : error}`);
+    showMessage(state.metadata ? `Still playing ${state.metadata.title}.` : 'The player is ready for another file.');
 }
 
 function parseArchiveModules(records) {
@@ -380,13 +404,7 @@ function chooseArchiveEntry(entries, archiveLabel) {
     state.archiveChoices = entries;
     state.archivePreviousFocus = document.activeElement;
     elements.archivePickerName.textContent = archiveLabel;
-    elements.archiveEntries.replaceChildren();
-    for (const [choiceIndex, entry] of entries.entries()) {
-        const option = document.createElement('option');
-        option.value = String(choiceIndex);
-        option.textContent = `${entry.name} — ${formatByteSize(entry.size)}`;
-        elements.archiveEntries.append(option);
-    }
+    fillArchiveOptions(elements.archiveEntries, entries);
     elements.archiveEntries.selectedIndex = 0;
     elements.archivePicker.hidden = false;
     showMessage(`Choose one of ${entries.length} modules in ${archiveLabel}. Playback continues until you load one.`);
@@ -410,6 +428,63 @@ function finishArchivePicker(choice) {
 function loadArchiveChoice() {
     const choice = state.archiveChoices[elements.archiveEntries.selectedIndex];
     if (choice) finishArchivePicker(choice);
+}
+
+/// One archive is remembered at a time. Its entry list stays in the load panel so the
+/// other tracks in a dropped ZIP are one click away instead of another drop away; the
+/// ZIP's own bytes are the only extra memory this holds, because `archive_extract`
+/// hands back a fresh copy on every call.
+function retainArchive(label, bytes, entries) {
+    const archive = { label, bytes, entries };
+    state.retainedArchive = archive;
+    renderRetainedArchive();
+    return archive;
+}
+
+function fillArchiveOptions(select, entries) {
+    select.replaceChildren();
+    for (const [choiceIndex, entry] of entries.entries()) {
+        const option = document.createElement('option');
+        option.value = String(choiceIndex);
+        option.textContent = `${entry.name} — ${formatByteSize(entry.size)}`;
+        select.append(option);
+    }
+}
+
+function renderRetainedArchive() {
+    const archive = state.retainedArchive;
+    elements.archiveTracks.hidden = archive === null;
+    elements.loadArchiveTrack.hidden = archive === null;
+    if (archive === null) return;
+    fillArchiveOptions(elements.archiveTracks, archive.entries);
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = `Track from ${archive.label}…`;
+    elements.archiveTracks.prepend(placeholder);
+    elements.archiveTracks.selectedIndex = 0;
+}
+
+function selectRetainedArchiveTrack(archive, choice) {
+    if (state.retainedArchive !== archive) return;
+    elements.archiveTracks.value = String(archive.entries.indexOf(choice));
+}
+
+function loadRetainedArchiveTrack() {
+    const archive = state.retainedArchive;
+    if (archive === null) return;
+    const selected = elements.archiveTracks.value;
+    if (selected === '') {
+        showMessage(`Choose one of the ${archive.entries.length} modules in ${archive.label}.`);
+        return;
+    }
+
+    // The modal owns `archivePickerResolve`. Loading from the dropdown while it is open
+    // cancels it rather than resolving it a second time.
+    if (state.archivePickerResolve !== null) finishArchivePicker(null);
+    const choice = archive.entries[Number(selected)];
+    const audio = startAudio();
+    clearError();
+    playArchiveEntry(archive, choice, audio).catch((error) => reportLoadFailure(archive.label, error));
 }
 
 function formatByteSize(bytes) {
@@ -1058,6 +1133,7 @@ elements.loadFixture.addEventListener('click', () => loadFixture().catch(showErr
 elements.archiveLoad.addEventListener('click', loadArchiveChoice);
 elements.archiveCancel.addEventListener('click', () => finishArchivePicker(null));
 elements.archiveEntries.addEventListener('dblclick', loadArchiveChoice);
+elements.loadArchiveTrack.addEventListener('click', loadRetainedArchiveTrack);
 elements.archivePicker.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
         event.preventDefault();

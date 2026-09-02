@@ -626,6 +626,41 @@ async function run(executable, mode) {
         report.retiredAfterSwap = swapped.retired;
         report.secondTitle = swapped.title;
 
+        // ── the retained ZIP keeps its other tracks one click away ──────────────────
+        const trackPicker = await page.evaluate(`
+            const select = document.getElementById('archive-tracks');
+            return {
+                hidden: select.hidden,
+                buttonHidden: document.getElementById('load-archive-track').hidden,
+                options: [...select.options].map((option) => option.textContent),
+                selected: select.selectedOptions[0].textContent,
+            };
+        `);
+        assert.equal(trackPicker.hidden, false, 'the retained-archive dropdown stays on the page');
+        assert.equal(trackPicker.buttonHidden, false, 'the retained-archive load button stays on the page');
+        assert.match(trackPicker.options[0], /two-modules\.zip/, 'the placeholder names the retained archive');
+        assert.deepEqual(trackPicker.options.slice(1), pickerEntries, 'the dropdown lists what the modal listed');
+        assert.match(trackPicker.selected, /MOVEMENT\.S3M/, 'the playing entry is selected in the dropdown');
+
+        await page.evaluate("document.getElementById('archive-tracks').value = '0'; document.getElementById('load-archive-track').click(); return true;");
+        await page.waitFor('the other ZIP track, loaded from the dropdown', "document.getElementById('module-detail').textContent.includes('REFLEX.S3M (from two-modules.zip)')");
+        const fromDropdown = await page.evaluate(READ_STATE);
+        assert.equal(fromDropdown.archivePickerVisible, false, 'the dropdown loads without reopening the modal');
+        assert.equal(fromDropdown.errorShown, false, `the dropdown load raised an error: ${fromDropdown.errorText}`);
+        assert.equal(fromDropdown.chip, 'playing');
+        report.archiveDropdownLabel = fromDropdown.moduleDetail.split(' · ')[0];
+
+        // A plain module leaves the retained ZIP alone; another ZIP replaces it.
+        await loadFixture(page, SECOND_MODULE);
+        await page.waitFor('the bundled fixture over the ZIP track', `document.getElementById('module-detail').textContent.includes(${JSON.stringify(SECOND_MODULE)}) && !document.getElementById('module-detail').textContent.includes('(from ')`);
+        assert.equal(await page.evaluate("return document.getElementById('archive-tracks').hidden;"), false, 'a plain module leaves the retained ZIP in the load panel');
+        await loadFile(page, singleModuleZip, 'one-module.zip');
+        await page.waitFor('the replacing single-module ZIP', "document.getElementById('module-detail').textContent.includes('REFLEX.S3M (from one-module.zip)')");
+        const replacedPicker = await page.evaluate("return [...document.getElementById('archive-tracks').options].map((option) => option.textContent);");
+        assert.equal(replacedPicker.length, 2, 'the replacing ZIP lists its one module behind the placeholder');
+        assert.match(replacedPicker[0], /one-module\.zip/);
+        assert.match(replacedPicker[1], /REFLEX\.S3M/);
+
         // Exercise the same archive front half through drag-and-drop as a third route.
         await loadFile(page, singleModuleZip, 'dropped.zip', true);
         await page.waitFor('the dropped ZIP module', "document.getElementById('module-detail').textContent.includes('REFLEX.S3M (from dropped.zip)')");

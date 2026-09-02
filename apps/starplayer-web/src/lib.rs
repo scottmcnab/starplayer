@@ -319,10 +319,10 @@ mod tests {
     #[test]
     fn browser_refreshes_format_specific_effect_names_before_rendering_metadata() {
         let app = include_str!("../www/app.js");
-        let load_buffer = app.split_once("async function loadBuffer").expect("loadBuffer").1;
-        let inspect = load_buffer.find("Loader.inspect_s3m(new Uint8Array(moduleBuffer));").expect("inspect call");
-        let refresh = load_buffer.find("loadEffectNames();").expect("effect-name refresh");
-        let metadata = load_buffer.find("const metadata = readMetadata(moduleLabel);").expect("metadata render");
+        let activate = app.split_once("async function activateLoadedModule").expect("activateLoadedModule").1;
+        let inspect = activate.find("Loader.inspect_s3m(new Uint8Array(moduleBuffer));").expect("inspect call");
+        let refresh = activate.find("loadEffectNames();").expect("effect-name refresh");
+        let metadata = activate.find("const metadata = readMetadata(moduleLabel);").expect("metadata render");
         assert!(inspect < refresh && refresh < metadata, "the newly inspected format table must be loaded before page rendering");
     }
 
@@ -336,6 +336,10 @@ mod tests {
         assert!(index.contains("accept=\".s3m,.mod,.mtm,.zip,audio/s3m,audio/mod,audio/x-mod,audio/mtm,application/zip\""));
         assert!(index.contains("aria-label=\"S3M, MOD, MTM, or ZIP URL\""));
         assert!(index.contains("Drop .s3m, .mod, .mtm, or .zip here"));
+        assert!(index.contains("id=\"archive-tracks\""));
+        assert!(index.contains("aria-label=\"Track from the last ZIP\""));
+        assert!(index.contains("id=\"load-archive-track\""));
+        assert!(index.contains(">Load from ZIP</button>"));
         assert!(index.contains("id=\"mod-headphone-panning\""));
         assert!(index.contains("Headphone-friendly MOD panning"));
         assert!(index.contains("S3M-style 60% stereo spacing"));
@@ -348,6 +352,7 @@ mod tests {
         assert!(app.contains("saved.headphoneFriendlyModPanning === true"), "missing fields in older v1 objects must restore unchecked");
         assert!(app.contains("headphoneFriendlyModPanning: elements.modHeadphonePanning.checked"));
         assert!(app.contains("isMod: Loader.module_is_mod()"));
+        assert!(app.contains("Track from ${archive.label}…"), "the dropdown placeholder names the retained archive");
     }
 
     #[test]
