@@ -133,10 +133,10 @@ in that state.
 
 ## Current standing
 
-After C3b's ProTracker fidelity repairs and the mixer voice-boundary sample swap, 14 of
-the 47 pinned cases pass: MOD 11 of 27, S3M 2 of 17, MTM 1 of 3. Seven of the MOD passes
-waive `position` alone under D14 and enforce every other field, and one waives
-`frame,position` under D15. The remaining 33 split into 13 accepted deviations and 20
+After the C2a harness repairs, C3b's ProTracker fidelity repairs and the C9 S3M repairs,
+23 of the 47 pinned cases pass: MOD 11 of 27, S3M 11 of 17, MTM 1 of 3. Eight of the MOD
+passes and seven of the S3M passes waive one or more fields under an accuracy-policy entry
+and enforce every other field. The remaining 24 split into 13 accepted deviations and 11
 known failures:
 
 - **Accepted accuracy-policy deviations**: the oracle-representation entries D14–D22 and
@@ -147,10 +147,12 @@ known failures:
   channel for that whole tick, and the adapter's D18 projection covers only a one-shot
   running out.
 - **Tracker dialects** awaiting `plans/engine/M2-task-C5-quirks-and-tempo-models.md`: five
-  Octalyser / Digital Tracker MOD cases and six S3M `cwtv` pattern-loop modes.
-- **Tracked repairs**: the S3M records in
-  `plans/engine/M2-task-C9-s3m-conformance-repairs.md`. No MOD or MTM case is a tracked
-  repair any more.
+  Octalyser / Digital Tracker MOD cases and five S3M `cwtv` pattern-loop modes. The sixth,
+  `libxmp-s3m-pattern-loop-mpt-breakjump`, started passing on the shared ST3.21 flow path
+  that C9 corrected and no longer carries an exclusion.
+- **Tracked repairs**: the one remaining S3M record, `C2-S3M-009` in
+  `conformance/known-failures.md` (the `Rxy` tremolo phase question left by C9). No MOD or
+  MTM case is a tracked repair any more.
 
 C3b's own before/after, on the pinned corpus: MOD went from 7 of 27 to 11 of 27.
 `openmpt-mod-vibrato-reset` was fixed by the LFO magnitude rounding;
@@ -159,7 +161,8 @@ were fixed by the voice-boundary swap. Four MOD cases that C3b's task file liste
 targets were re-diagnosed rather than fixed and now cite the accuracy policy:
 `openmpt-mod-delay-break` (D21, PT's tick-zero `E9x` retrigger),
 `openmpt-mod-portamento-swap-pt` (D22, PT's tick-zero instrument latch under `EDx`), and
-the two D18 cases above.
+the two D18 cases above. C9's: S3M went from 2 of 17 to 11 of 17, with D24–D39 recording
+what it found.
 
 Because the old aligner returned a string error before the differ ever ran, most of the
 pre-C2a reasons named an alignment position rather than a state difference. Every reason

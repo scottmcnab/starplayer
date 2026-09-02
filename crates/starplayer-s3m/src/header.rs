@@ -38,8 +38,12 @@ pub const CHANNEL_ENABLED_LIMIT: u8 = 0x0F;
 /// no heuristic is guessed at.
 pub const DEFAULT_PAN_PRESENT: u8 = 252;
 
-/// The pan nibble `ClearChannels` gives every channel before anything overrides it.
-pub const PAN_CENTRE: u8 = 7;
+/// The pan nibble a channel starts on before anything overrides it.
+///
+/// D24: the original's `ClearChannels` writes 7 here; Scream Tracker 3 writes 8, which is
+/// also what its own default-pan blocks contain and what libxmp and OpenMPT decode a
+/// centred S3M channel to. The canonical value wins.
+pub const PAN_CENTRE: u8 = 8;
 
 /// The pan nibble a stereo module's *left* channels get (`ClearChannels`: `mov al,03h`).
 pub const PAN_LEFT: u8 = 3;
@@ -288,13 +292,12 @@ pub fn default_pan_nibbles(channel_settings: &[u8; MAX_CHANNELS], stereo: bool, 
 
 /// Turn one 0..=15 pan nibble into the model's bipolar pan.
 ///
-/// **Centre is 7.5, not 7.** The original's two stereo defaults are [`PAN_LEFT`] = 3 and
-/// [`PAN_RIGHT`] = 12, which are equidistant from 7.5 and *not* from 7, and Scream
-/// Tracker 3's own pan blocks write 8 where the original's `ClearChannels` writes 7 (both
-/// of the owner's files that carry a block do). Both values are the integer neighbours of
-/// a centre that the 4-bit GUS balance register cannot express exactly, so the mapping
-/// used here is `(2 * nibble - 15) / 15`: hard left and hard right reach full scale, 3 and
-/// 12 stay symmetric, and 7 and 8 land 6.7 % either side of centre.
+/// **Centre is 7.5, not 7 or 8.** The original's two stereo defaults are [`PAN_LEFT`] = 3
+/// and [`PAN_RIGHT`] = 12, which are equidistant from 7.5. Both 7 and 8 are the integer
+/// neighbours of a centre that the 4-bit GUS balance register cannot express exactly, so
+/// the mapping used here is `(2 * nibble - 15) / 15`: hard left and hard right reach full
+/// scale, 3 and 12 stay symmetric, and 7 and 8 land 6.7 % either side of centre. Scream
+/// Tracker 3 picks 8 as its own centre, so [`PAN_CENTRE`] is 8.
 ///
 /// A mono module never goes through this at all — the loader leaves its pan table empty,
 /// which is the model's "centre every channel".
@@ -404,8 +407,8 @@ mod tests {
         assert_eq!(pan_nibble_to_bipolar(0), I1F15::MIN + I1F15::DELTA, "hard left is full scale");
         assert_eq!(pan_nibble_to_bipolar(15), I1F15::MAX, "hard right is full scale");
         assert_eq!(pan_nibble_to_bipolar(PAN_LEFT), -pan_nibble_to_bipolar(PAN_RIGHT));
-        assert_eq!(pan_nibble_to_bipolar(PAN_CENTRE), -pan_nibble_to_bipolar(8));
-        assert!(pan_nibble_to_bipolar(PAN_CENTRE) < I1F15::ZERO);
+        assert_eq!(pan_nibble_to_bipolar(PAN_CENTRE), -pan_nibble_to_bipolar(7));
+        assert!(pan_nibble_to_bipolar(PAN_CENTRE) > I1F15::ZERO, "D24: ST3's centre nibble sits just right of centre");
     }
 
     #[test]

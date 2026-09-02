@@ -461,7 +461,8 @@ pub trait TrackerProcessor {
     /// re-fetch notes on a repeat either.
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome;
 
-    /// Every other tick of the row, including the first tick of a pattern-delay repeat.
+    /// Every other tick of the row, including the first tick of a pattern-delay repeat
+    /// unless the format overrides [`TrackerProcessor::row_repeat`].
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome;
 
     /// Drop every piece of replay state a seek must not carry across the discontinuity:
@@ -474,6 +475,19 @@ pub trait TrackerProcessor {
     /// Called from [`PatternSequencer::seek_order`] and [`PatternSequencer::seek_row`],
     /// which a host may drive from the audio thread: **no allocation** (architecture §8).
     fn reset(&mut self);
+
+    /// The first tick of a pattern-delay repeat, when the row itself is not being
+    /// re-fetched.
+    ///
+    /// The default is [`TrackerProcessor::tick`] — the ProtracKer and MultiTracker
+    /// behaviour the original assembly also has, where a repeat is simply more ticks of
+    /// the same row. Scream Tracker 3 instead treats every repeat's first tick as a first
+    /// tick and re-runs the row's tick-zero effects without re-triggering its notes
+    /// (OpenMPT `PatternDelaysRetrig.s3m`), so `starplayer-s3m` overrides this.
+    fn row_repeat(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+        let _ = row;
+        self.tick(context)
+    }
 }
 
 // ── the sequencer ───────────────────────────────────────────────────────────────────
@@ -700,7 +714,16 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         };
 
         if !self.row_clock.is_first_tick_of_row() {
-            return self.processor.tick(&mut tick);
+            if !self.row_clock.is_first_tick_of_repeat() {
+                return self.processor.tick(&mut tick);
+            }
+            return match self.data.row_bytes(self.position.pattern, self.position.row) {
+                Some(bytes) => {
+                    let row = RowRef { order: self.position.order, pattern: self.position.pattern, row: self.position.row, bytes };
+                    self.processor.row_repeat(&mut tick, row)
+                }
+                None => self.processor.tick(&mut tick),
+            };
         }
 
         // The first tick of a row — and *only* the first, not the first of each

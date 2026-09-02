@@ -252,3 +252,124 @@ fn pattern_data_returns_exact_fixed_stride_rows() {
     assert_eq!(S3mCell::from_bytes(&row_zero[..5]), Some(first));
     assert_eq!(S3mCell::from_bytes(&row_one[5..]), Some(second));
 }
+
+// ── M2-C9: ST3.21 flow, row delay and instrument latching ───────────────────────────
+
+/// Play `ticks` ticks and report the sounding row of each.
+fn sounding_rows(module: Arc<Module>, channels: usize, ticks: usize) -> Vec<u16> {
+    let mut sequencer = sequencer(module);
+    let mut harness = SequencerHarness::new(channels);
+    let mut rows = Vec::new();
+    for _ in 0..ticks {
+        harness.tick(&mut sequencer);
+        rows.push(sequencer.sounding_position().row);
+    }
+    rows
+}
+
+#[test]
+fn a_second_sbx_without_its_own_sb0_loops_from_just_after_the_first_one() {
+    // D30: ST3 advances the loop target past the `SBx` row when a loop terminates, so a
+    // later `SBx` with no `SB0` of its own loops the rows in between (libxmp
+    // `pattern_loop_st321.s3m`).
+    let loop_start = S3mCell { command: 19, info: 0xB0, ..S3mCell::EMPTY };
+    let loop_twice = S3mCell { command: 19, info: 0xB2, ..S3mCell::EMPTY };
+    let loop_once = S3mCell { command: 19, info: 0xB1, ..S3mCell::EMPTY };
+    let module = module_with_pattern(6, 1, &[(0, 0, loop_start), (1, 0, loop_twice), (4, 0, loop_once)], false, 1);
+    assert_eq!(sounding_rows(module, 1, 12), vec![0, 1, 0, 1, 0, 1, 2, 3, 4, 2, 3, 4], "rows 0-1 play three times, then rows 2-4 twice from the advanced target");
+}
+
+#[test]
+fn one_row_carrying_several_sbx_parameters_spends_one_iteration_each() {
+    // D30: ST3 stores the first parameter and counts it down once per `SBx` on the row,
+    // so `SB2` beside `SB1` is two channels of one two-iteration loop, not two loops.
+    let loop_start = S3mCell { command: 19, info: 0xB0, ..S3mCell::EMPTY };
+    let loop_twice = S3mCell { command: 19, info: 0xB2, ..S3mCell::EMPTY };
+    let loop_once = S3mCell { command: 19, info: 0xB1, ..S3mCell::EMPTY };
+    let module = module_with_pattern(4, 2, &[(0, 0, loop_start), (2, 0, loop_twice), (2, 1, loop_once)], false, 1);
+    assert_eq!(sounding_rows(module, 8, 8), vec![0, 1, 2, 0, 1, 2, 3, 0], "the pair spends two of the two iterations, so the range plays twice");
+}
+
+#[test]
+fn a_loop_jump_beats_a_bxx_or_cxx_on_the_same_row_from_any_channel() {
+    // D30: ST3.21 blocks a later `Bxx`/`Cxx` and cancels an earlier one while the loop is
+    // still running, and lets it through on the iteration that ends the loop
+    // (libxmp `pattern_loop_st321_breakjump.s3m`).
+    let loop_start = S3mCell { command: 19, info: 0xB0, ..S3mCell::EMPTY };
+    let loop_once = S3mCell { command: 19, info: 0xB1, ..S3mCell::EMPTY };
+    let jump = S3mCell { command: 2, info: 1, ..S3mCell::EMPTY };
+    for (loop_channel, jump_channel) in [(1u8, 0u8), (0, 1)] {
+        let mut pattern_zero = vec![0u8; 4 * 2 * 5];
+        let mut pattern_one = vec![0u8; 4 * 2 * 5];
+        for cell in pattern_zero.chunks_exact_mut(5).chain(pattern_one.chunks_exact_mut(5)) { cell.copy_from_slice(&S3mCell::EMPTY.to_bytes()); }
+        for (row, channel, cell) in [(0u16, loop_channel, loop_start), (1, loop_channel, loop_once), (1, jump_channel, jump)] {
+            let start = (row as usize * 2 + channel as usize) * 5;
+            pattern_zero[start..start + 5].copy_from_slice(&cell.to_bytes());
+        }
+        let mut builder = ModuleBuilder::new();
+        builder.add_pattern(&pattern_zero, 4, 2).expect("pattern zero");
+        builder.add_pattern(&pattern_one, 4, 2).expect("pattern one");
+        builder.set_orders(&[0, 1, ORDER_END]);
+        let mut header = ModuleHeader::new(ModuleFormat::S3m, 2);
+        header.initial_speed = 1;
+        builder.set_header(header);
+        let mut sequencer = sequencer(Arc::new(builder.build().expect("two-pattern module")));
+        let mut harness = SequencerHarness::new(2);
+        let mut positions = Vec::new();
+        for _ in 0..5 {
+            harness.tick(&mut sequencer);
+            positions.push((sequencer.sounding_position().order, sequencer.sounding_position().row));
+        }
+        assert_eq!(positions, vec![(0, 0), (0, 1), (0, 0), (0, 1), (1, 0)], "loop channel {loop_channel}: the loop runs first and the Bxx only fires once it is over");
+    }
+}
+
+#[test]
+fn a_row_delay_repeat_runs_the_rows_tick_zero_effects_again() {
+    // D33: OpenMPT `PatternDelaysRetrig.s3m` — every repeat is another first tick, so a
+    // fine portamento on the row is applied once per repeat while the note is not
+    // retriggered.
+    let note = S3mCell { note: 0x40, instrument: 1, volume: VOLUME_NONE, command: 0, info: 0 };
+    let delay_and_slide = S3mCell { note: 0xFF, instrument: 0, volume: VOLUME_NONE, command: 19, info: 0xE1 };
+    let fine_slide = S3mCell { note: 0xFF, instrument: 0, volume: VOLUME_NONE, command: 5, info: 0xFF };
+    let module = module_with_pattern(3, 2, &[(0, 0, note), (1, 0, fine_slide), (1, 1, delay_and_slide)], true, 3);
+    let mut sequencer = sequencer(module);
+    let mut harness = SequencerHarness::new(2);
+    let mut periods = Vec::new();
+    for _ in 0..9 {
+        harness.tick(&mut sequencer);
+        periods.push(sequencer.processor().channel(0).expect("channel zero").actual_period);
+    }
+    assert_eq!(periods, vec![1712, 1712, 1712, 1772, 1772, 1772, 1832, 1832, 1832], "EFF slides sixty units on the first tick of the row and of its one repeat");
+}
+
+#[test]
+fn only_the_first_non_zero_row_delay_on_a_row_counts() {
+    // D32: `SE0` on an earlier channel does not cancel a later `SE2`, and a second
+    // non-zero `SEx` does not replace the first (OpenMPT `PatternDelays.s3m`).
+    let no_delay = S3mCell { command: 19, info: 0xE0, ..S3mCell::EMPTY };
+    let two = S3mCell { command: 19, info: 0xE2, ..S3mCell::EMPTY };
+    let one = S3mCell { command: 19, info: 0xE1, ..S3mCell::EMPTY };
+    let module = module_with_pattern(2, 3, &[(0, 0, no_delay), (0, 1, two), (0, 2, one)], false, 1);
+    let mut sequencer = sequencer(module);
+    let mut harness = SequencerHarness::new(3);
+    harness.tick(&mut sequencer);
+    assert_eq!(sequencer.row_clock().total_ticks(), 3, "SE0 is ignored, the first non-zero SEx wins, and the later SE1 does not replace it");
+}
+
+#[test]
+fn a_note_cut_keeps_the_voice_alive_at_zero_volume() {
+    // D29: libxmp `s3m_sample_porta.s3m` — `^^^` silences the channel, it does not stop
+    // the sample, so the voice is still there for the next row to portamento from.
+    let note = S3mCell { note: 0x40, instrument: 1, volume: VOLUME_NONE, command: 0, info: 0 };
+    let cut = S3mCell { note: 0xFE, instrument: 0, volume: VOLUME_NONE, command: 0, info: 0 };
+    let module = module_with_pattern(3, 1, &[(0, 0, note), (1, 0, cut)], true, 1);
+    let mut sequencer = sequencer(module);
+    let mut harness = SequencerHarness::new(1);
+    harness.tick(&mut sequencer);
+    let sounding = harness.channels.foreground(starplayer_core::ChannelId(0)).expect("the note sounds");
+    harness.tick(&mut sequencer);
+    assert_eq!(harness.channels.foreground(starplayer_core::ChannelId(0)), Some(sounding), "the cut voice is the same voice");
+    assert_eq!(sequencer.processor().channel(0).expect("channel zero").actual_volume, 0, "and it is silent");
+    assert_eq!(sequencer.processor().channel(0).expect("channel zero").sample_number, 1, "with its instrument still latched");
+}

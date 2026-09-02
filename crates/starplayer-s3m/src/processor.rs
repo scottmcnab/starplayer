@@ -23,6 +23,10 @@ use crate::pattern::{CELL_BYTES, COMMAND_NONE, INSTRUMENT_NONE, NOTE_CUT, NOTE_N
 
 const NO_SAMPLE: u8 = 255;
 const DEFAULT_PERIOD: u32 = 1712;
+/// D26: Scream Tracker 3 clamps the *output* period to at least 64 in its own period x 4
+/// domain, and stops the channel outright once a slide reaches zero (OpenMPT
+/// `PeriodLimit.s3m`). The unclamped period keeps sliding underneath the clamp.
+const MIN_OUTPUT_PERIOD: u32 = 64;
 const DEFAULT_REFERENCE_RATE_HZ: u32 = 8363;
 const FINE_TUNE_TABLE: [u32; 16] = [7895, 7941, 7985, 8046, 8107, 8169, 8232, 8280, 8363, 8413, 8463, 8529, 8581, 8651, 8723, 8757];
 const RETRIGGER_TABLE: [i8; 16] = [0, -1, -2, -4, -8, -16, 0, 0, 0, 1, 2, 4, 8, 16, 0, 0];
@@ -44,7 +48,7 @@ pub struct S3mChannel {
     pub command: u8,                      // `_CommandValue`
     pub command_data: u8,                 // `_DataValue`
     pub portamento_memory: u8,            // `_PortaValue`
-    pub volume_slide_memory: u8,          // `_VolSlideValue` (shared D/E/F)
+    pub parameter_memory: u8,             // `_VolSlideValue`, D25: ST3's one shared memory
     pub vibrato_memory: u8,               // `_VibValue` (shared H/R/U)
     pub vibrato_phase: u8,                // `_VibCount` (shared H/R/U)
     pub vibrato_waveform: u8,             // `_VibTable`
@@ -60,6 +64,11 @@ pub struct S3mChannel {
     pub arpeggio_memory: u8,              // `_ArpValue`
     pub offset_memory: u8,                // `_OffsetValue`
     pub glissando_enabled: bool,           // `_GlissFlag`
+    /// D29: set by `^^^`/`SCx`, which silence the channel without stopping the voice.
+    /// `Qxy` refuses to retrigger a cut channel (OpenMPT `RetrigAfterNoteCut.s3m`).
+    pub note_cut: bool,
+    /// D26: a slide reached period zero; the voice stops at the next flush.
+    pub stop_voice: bool,
 }
 
 impl S3mChannel {
@@ -79,7 +88,7 @@ impl S3mChannel {
             command: 0,
             command_data: 0,
             portamento_memory: 0,
-            volume_slide_memory: 0,
+            parameter_memory: 0,
             vibrato_memory: 0,
             vibrato_phase: 0,
             vibrato_waveform: 0,
@@ -95,6 +104,8 @@ impl S3mChannel {
             arpeggio_memory: 0,
             offset_memory: 0,
             glissando_enabled: false,
+            note_cut: false,
+            stop_voice: false,
         }
     }
 }
@@ -137,7 +148,10 @@ pub struct S3mProcessor {
     amiga_limits: bool,
     pattern_loop_start: u16,
     pattern_loop_count: u8,
-    last_pattern: Option<u16>,
+    /// D30: an `SBx` that jumps this row cancels any `Bxx`/`Cxx` already seen on it and
+    /// blocks any that follow, whichever channel they sit on.
+    pattern_loop_jumped: bool,
+    last_order: Option<(u16, u16)>,
 }
 
 impl S3mProcessor {
@@ -146,7 +160,7 @@ impl S3mProcessor {
         let global_volume = ((header.global_volume.to_bits() as u32 * 64 + 32767) / 65535) as u8;
         let mut states = VecBuilder::new();
         for index in 0..header.channel_count {
-            let pan = header.default_pan.get(index as usize).copied().map(pan_to_nibble).unwrap_or(7);
+            let pan = header.default_pan.get(index as usize).copied().map(pan_to_nibble).unwrap_or(crate::header::PAN_CENTRE);
             states.push(S3mChannel::new(index, pan));
         }
         S3mProcessor {
@@ -157,7 +171,8 @@ impl S3mProcessor {
             global_volume,
             pattern_loop_start: 0,
             pattern_loop_count: 0,
-            last_pattern: None,
+            pattern_loop_jumped: false,
+            last_order: None,
         }
     }
 
@@ -182,15 +197,23 @@ impl S3mProcessor {
             context.report_note(channel_id, cell.linear_semitone().map(Note::new), (cell.instrument != 0).then_some(cell.instrument));
         }
 
+        // D28: `Gxx`/`Lxx` keeps the sounding sample and its C2SPD; only the named
+        // instrument's default volume is adopted (OpenMPT `PortaSmpChange.s3m`). The
+        // original assigns `_SampleNum` before it ever looks at the command.
+        let sounding = context.channels.is_sounding(channel_id, context.voices);
+        let tone_portamento = matches!(cell.command, 7 | 12) && sounding && self.channels[channel_index].sample_number != NO_SAMPLE;
+
         if cell.instrument != INSTRUMENT_NONE {
             let instrument_id = InstrumentId((cell.instrument - 1) as u16);
             if let Some(sample_id) = self.module.instrument(instrument_id).and_then(|instrument| instrument.sample)
                 && let Some(sample) = self.module.sample(sample_id)
             {
-                // PtrToSample succeeded: only now does the assembly assign _SampleNum.
-                self.channels[channel_index].sample_number = cell.instrument;
-                // D7: SampleIndex preserves and this reads the full 32-bit C2SPD.
-                self.channels[channel_index].reference_rate_hz = sample.reference_rate_hz();
+                if !tone_portamento {
+                    // PtrToSample succeeded: only now does the assembly assign _SampleNum.
+                    self.channels[channel_index].sample_number = cell.instrument;
+                    // D7: SampleIndex preserves and this reads the full 32-bit C2SPD.
+                    self.channels[channel_index].reference_rate_hz = sample.reference_rate_hz();
+                }
                 let volume = ((sample.default_volume().to_bits() as u32 * 64 + 32767) / 65535) as u8;
                 self.channels[channel_index].sample_volume = volume;
                 self.channels[channel_index].current_volume = volume;
@@ -203,14 +226,14 @@ impl S3mProcessor {
             NOTE_NONE => {}
             NOTE_CUT => self.cut_note(channel_index),
             note => {
-                let sounding = context.channels.is_sounding(channel_id, context.voices);
-                let portamento = sounding && matches!(cell.command, 7 | 12) && self.channels[channel_index].sample_number != NO_SAMPLE;
                 let period = period_from_note(note, self.channels[channel_index].reference_rate_hz);
-                if portamento {
+                if tone_portamento {
                     self.channels[channel_index].target_note = note;
                     self.channels[channel_index].target_period = period;
+                    self.channels[channel_index].note_cut = false;
                 } else {
                     let state = &mut self.channels[channel_index];
+                    state.note_cut = false;
                     state.current_note = note;
                     state.target_note = note;
                     state.current_period = period;
@@ -232,33 +255,53 @@ impl S3mProcessor {
         }
     }
 
+    /// `^^^` and `SCx`.
+    ///
+    /// D29: Scream Tracker 3 only takes the channel volume to zero; the voice keeps
+    /// running, which is why `Qxy` cannot revive it and why a cut voice still advances
+    /// through its loop (libxmp `s3m_sample_porta.s3m`). The original's `@@cutnote`
+    /// clears `_SampleNum` and stops the voice instead.
     fn cut_note(&mut self, channel_index: usize) {
         let state = &mut self.channels[channel_index];
-        state.current_note = 0;
-        state.target_note = 0;
-        state.current_period = DEFAULT_PERIOD;
-        state.target_period = DEFAULT_PERIOD;
-        state.actual_period = DEFAULT_PERIOD;
-        state.sample_number = NO_SAMPLE;
-        state.sample_offset = 0;
-        state.pending_dirty.insert(DirtyBits::SAMPLE);
+        state.current_volume = 0;
+        state.actual_volume = 0;
+        state.note_cut = true;
+        state.pending_dirty.insert(DirtyBits::VOLUME);
+    }
+
+    /// The unconditional channel stop: a slide that reaches period zero (D26).
+    ///
+    /// The instrument stays latched, so a later note with an empty instrument column
+    /// still sounds (OpenMPT `PeriodLimit.s3m` plays `B-7` with no instrument after the
+    /// slide has stopped the channel).
+    fn stop_note(&mut self, channel_index: usize) {
+        let state = &mut self.channels[channel_index];
+        state.stop_voice = true;
+        state.pending_dirty.remove(DirtyBits::PITCH);
     }
 
     fn static_effect(&mut self, context: &mut TickContext<'_>, channel_index: usize, cell: S3mCell, outcome: &mut TickOutcome) {
+        // D25: every command with a non-zero parameter feeds the one shared memory, the
+        // unimplemented ones included (OpenMPT `NOP.s3m`).
+        self.write_parameter_memory(channel_index, cell.info);
         match cell.command {
             // Analysis §4, S_FX_A (2776). D6: canonical ST3 ignores A00.
             1 if cell.info != 0 => { outcome.speed = cell.info; self.clear_minor(channel_index); }
             // Analysis §4, S_FX_B (2782). Preserve Cxx's row when both share a row.
             2 => {
-                let break_row = outcome.jump.filter(|jump| !jump.within_pattern).and_then(|jump| jump.row);
-                outcome.jump = Some(match break_row { Some(row) => Jump::to_order_row(cell.info as u16, row), None => Jump::to_order(cell.info as u16) });
+                if !self.pattern_loop_jumped {
+                    let break_row = outcome.jump.filter(|jump| !jump.within_pattern).and_then(|jump| jump.row);
+                    outcome.jump = Some(match break_row { Some(row) => Jump::to_order_row(cell.info as u16, row), None => Jump::to_order(cell.info as u16) });
+                }
                 self.clear_minor(channel_index);
             }
             // Analysis §4, S_FX_C (2792). The packed byte is decimal, not hexadecimal.
             3 => {
-                let row = (cell.info >> 4) as u16 * 10 + (cell.info & 15) as u16;
-                let jump_order = outcome.jump.filter(|jump| !jump.within_pattern).and_then(|jump| jump.order);
-                outcome.jump = Some(match jump_order { Some(order) => Jump::to_order_row(order, row), None => Jump::break_to_row(row) });
+                if !self.pattern_loop_jumped {
+                    let row = (cell.info >> 4) as u16 * 10 + (cell.info & 15) as u16;
+                    let jump_order = outcome.jump.filter(|jump| !jump.within_pattern).and_then(|jump| jump.order);
+                    outcome.jump = Some(match jump_order { Some(order) => Jump::to_order_row(order, row), None => Jump::break_to_row(row) });
+                }
                 self.clear_minor(channel_index);
             }
             // Analysis §4, S_FX_D (2805).
@@ -274,27 +317,31 @@ impl S3mProcessor {
             // Analysis §4, S_FX_H (2920); R and U reuse this handler.
             8 | 18 | 21 => self.static_vibrato(channel_index, cell.command, cell.info),
             // Analysis §4, S_FX_I (2941), including tick zero. D3 reads this channel's own volume.
-            9 => { self.set_minor(channel_index, 9, if cell.info == 0 { self.channels[channel_index].command_data } else { cell.info }); self.minor_tremor(channel_index); }
+            9 => { let value = self.recall_parameter(channel_index, cell.info); self.set_minor(channel_index, 9, value); self.minor_tremor(channel_index); }
             // Analysis §4, S_FX_J (2956), including tick zero.
-            10 => { self.channels[channel_index].arpeggio_count = 1; let value = if cell.info == 0 { self.channels[channel_index].arpeggio_memory } else { cell.info }; self.channels[channel_index].arpeggio_memory = value; self.set_minor(channel_index, 10, value); self.minor_arpeggio(channel_index); }
+            10 => { self.channels[channel_index].arpeggio_count = 1; let value = self.recall_parameter(channel_index, cell.info); self.channels[channel_index].arpeggio_memory = value; self.set_minor(channel_index, 10, value); self.minor_arpeggio(channel_index); }
             // Analysis §4, S_FX_K/L (2973/2987).
-            11 => { self.static_volume_slide(channel_index, cell.info); self.static_vibrato(channel_index, 8, 0); self.channels[channel_index].command = 11; self.channels[channel_index].command_data = cell.info; }
-            12 => {
+            11 => {
+                let value = self.recall_parameter(channel_index, cell.info);
                 self.static_volume_slide(channel_index, cell.info);
-                let portamento = self.channels[channel_index].portamento_memory;
-                self.set_minor(channel_index, 7, portamento);
-                self.channels[channel_index].command = 12;
-                self.channels[channel_index].command_data = cell.info;
+                self.static_vibrato(channel_index, 8, 0);
+                self.set_minor(channel_index, 11, value);
+            }
+            12 => {
+                let value = self.recall_parameter(channel_index, cell.info);
+                self.static_volume_slide(channel_index, cell.info);
+                self.set_minor(channel_index, 12, value);
             }
             // Analysis §4, S_FX_O (3001), gated on a note being present.
             15 => { let value = if cell.info == 0 { self.channels[channel_index].offset_memory } else { cell.info }; self.channels[channel_index].offset_memory = value; self.channels[channel_index].sample_offset = (value as u32) << 8; if self.channels[channel_index].current_note != 0 { self.channels[channel_index].pending_dirty.insert(DirtyBits::SAMPLE); } self.clear_minor(channel_index); }
             // Analysis §4, S_FX_Q (3015).
             17 => self.static_retrigger(channel_index, cell.info),
             // Analysis §4, S_FX_S (3038).
-            19 => self.static_special(channel_index, cell.info, context.position.row, outcome),
+            19 => { let value = self.recall_parameter(channel_index, cell.info); self.static_special(channel_index, value, context.position.row, outcome); }
             // Analysis §4, S_FX_T (3130).
             20 => {
-                outcome.tempo_bpm = core::cmp::max(cell.info as u16, 32);
+                let value = self.recall_parameter(channel_index, cell.info);
+                outcome.tempo_bpm = core::cmp::max(value as u16, 32);
                 self.channels[channel_index].pending_dirty.insert(DirtyBits::TEMPO);
                 self.clear_minor(channel_index);
             }
@@ -314,24 +361,20 @@ impl S3mProcessor {
     }
 
     fn static_volume_slide(&mut self, channel_index: usize, parameter: u8) {
-        let value = if parameter == 0 { self.channels[channel_index].volume_slide_memory } else { parameter };
+        let value = self.recall_parameter(channel_index, parameter);
         if value > 0xF0 {
             self.slide_volume(channel_index, 0, value & 15);
-            self.channels[channel_index].volume_slide_memory = value;
             self.clear_minor(channel_index);
         } else if value & 15 == 15 && value >> 4 != 0 {
             self.slide_volume(channel_index, value >> 4, 0);
-            self.channels[channel_index].volume_slide_memory = value;
             self.clear_minor(channel_index);
         } else {
-            self.channels[channel_index].volume_slide_memory = value;
             self.set_minor(channel_index, 4, value);
         }
     }
 
     fn static_pitch_slide(&mut self, channel_index: usize, command: u8, parameter: u8) {
-        let value = if parameter == 0 { self.channels[channel_index].volume_slide_memory } else { parameter };
-        self.channels[channel_index].volume_slide_memory = value;
+        let value = self.recall_parameter(channel_index, parameter);
         if value <= 0xDF {
             self.set_minor(channel_index, command, value);
         } else {
@@ -350,7 +393,7 @@ impl S3mProcessor {
     }
 
     fn static_retrigger(&mut self, channel_index: usize, parameter: u8) {
-        let value = if parameter == 0 { self.channels[channel_index].retrigger_memory } else { parameter };
+        let value = self.recall_parameter(channel_index, parameter);
         self.channels[channel_index].retrigger_memory = value;
         if self.channels[channel_index].special_value == 0 {
             self.channels[channel_index].special_value = value & 15;
@@ -378,14 +421,29 @@ impl S3mProcessor {
             // Analysis §4, S_FX_S S8x (3094): direct pan nibble.
             8 => { self.channels[channel_index].pan_position = value; self.channels[channel_index].pending_dirty.insert(DirtyBits::PAN); self.clear_minor(channel_index); }
             // Analysis §4, S_FX_S SBx (3101): inner pattern loop.
+            //
+            // D30: ST3 counts **down** from the parameter the first `SBx` stored, so a row
+            // carrying several different `SBx` parameters consumes one iteration per
+            // channel instead of restarting the count; when the loop ends the target
+            // advances past the `SBx` row; and a loop jump wins over `Bxx`/`Cxx` on the
+            // same row whichever channel they sit on. The original increments a counter
+            // towards the parameter, never advances the target, and lets a later channel's
+            // `Bxx` replace the loop jump.
             11 => {
                 if value == 0 {
                     self.pattern_loop_start = row;
-                } else if self.pattern_loop_count < value {
-                    self.pattern_loop_count = self.pattern_loop_count.saturating_add(1);
+                } else if self.pattern_loop_count == 0 {
+                    self.pattern_loop_count = value;
                     outcome.jump = Some(Jump::within_pattern_to_row(self.pattern_loop_start));
+                    self.pattern_loop_jumped = true;
                 } else {
-                    self.pattern_loop_count = 0;
+                    self.pattern_loop_count -= 1;
+                    if self.pattern_loop_count != 0 {
+                        outcome.jump = Some(Jump::within_pattern_to_row(self.pattern_loop_start));
+                        self.pattern_loop_jumped = true;
+                    } else {
+                        self.pattern_loop_start = row.saturating_add(1);
+                    }
                 }
                 self.clear_minor(channel_index);
             }
@@ -398,8 +456,12 @@ impl S3mProcessor {
                 self.channels[channel_index].pending_dirty = DirtyBits::empty();
                 self.channels[channel_index].command = 19;
             }
-            // Analysis §4, S_FX_S SEx (3146): whole row repeats without a refetch.
-            14 => { outcome.pattern_delay = value; self.clear_minor(channel_index); }
+            // Analysis §4, S_FX_S SEx (3146): the whole row repeats.
+            //
+            // D32: only the **first** non-zero `SEx` on a row counts (OpenMPT
+            // `PatternDelays.s3m`); the original lets the rightmost channel's value win
+            // and lets `SE0` clear a delay an earlier channel already asked for.
+            14 => { if value != 0 && outcome.pattern_delay == 0 { outcome.pattern_delay = value; } self.clear_minor(channel_index); }
             // Analysis §4, S_FX_S SFx (3152): unsupported funk repeat.
             _ => self.clear_minor(channel_index),
         }
@@ -426,8 +488,10 @@ impl S3mProcessor {
     }
 
     fn minor_volume_slide(&mut self, channel_index: usize) {
-        let value = self.channels[channel_index].volume_slide_memory;
-        if value & 0xF0 != 0 { self.slide_volume(channel_index, value >> 4, 0); } else { self.slide_volume(channel_index, 0, value & 15); }
+        // D27: when both nibbles are set ST3 slides *down*; `M_FX_D` tests the high nibble
+        // first and slides up instead (OpenMPT `ParamMemory.s3m` needs `D82` to be `D02`).
+        let value = self.channels[channel_index].command_data;
+        if value & 15 != 0 { self.slide_volume(channel_index, 0, value & 15); } else { self.slide_volume(channel_index, value >> 4, 0); }
     }
 
     fn slide_volume(&mut self, channel_index: usize, up: u8, down: u8) {
@@ -438,7 +502,9 @@ impl S3mProcessor {
     }
 
     fn slide_period(&mut self, channel_index: usize, down: bool, amount: u32) {
-        let period = if down { self.channels[channel_index].current_period.saturating_add(amount) } else { self.channels[channel_index].current_period.saturating_sub(amount).max(1) };
+        // D26: an upward slide is allowed to reach zero; `clip_pitch` stops the channel
+        // there rather than pinning the period at one.
+        let period = if down { self.channels[channel_index].current_period.saturating_add(amount) } else { self.channels[channel_index].current_period.saturating_sub(amount) };
         self.channels[channel_index].current_period = period;
         self.channels[channel_index].actual_period = period;
         self.channels[channel_index].pending_dirty.insert(DirtyBits::PITCH);
@@ -466,29 +532,38 @@ impl S3mProcessor {
         state.vibrato_phase = state.vibrato_phase.wrapping_add(state.vibrato_memory >> 4) & 63;
     }
 
+    /// D35: the tremolo depth is `table * depth / 64`, the same scale ProTracker, libxmp
+    /// and OpenMPT use. `M_FX_R` copies `M_FX_H`'s `sar eax,7` but leaves out its
+    /// `sal edx,2` — the line is commented out in the original — which halves it. The
+    /// division truncates towards zero rather than flooring, so a negative half-step
+    /// rounds the same way the reference implementations round it.
     fn minor_tremolo(&mut self, channel_index: usize) {
         let state = &mut self.channels[channel_index];
         let sample = waveform_sample(state.tremolo_waveform, state.vibrato_phase) as i32;
-        let delta = (sample * (state.vibrato_memory & 15) as i32) >> 7;
+        let delta = sample * (state.vibrato_memory & 15) as i32 / 64;
         state.actual_volume = (state.current_volume as i32 + delta).clamp(0, 64) as u8;
         state.pending_dirty.insert(DirtyBits::VOLUME);
         // D9: canonical modulo-64 phase, not M_FX_R's one-past-the-table `jbe` defect.
         state.vibrato_phase = state.vibrato_phase.wrapping_add(state.vibrato_memory >> 4) & 63;
     }
 
+    /// D34: the on phase lasts exactly `x` ticks and the off phase exactly `y`, counting
+    /// the tick the effect starts on. `M_FX_I` reloads the counter and *then* spends a
+    /// whole tick on it, so each phase runs one tick long. A zero nibble counts as one.
     fn minor_tremor(&mut self, channel_index: usize) {
         let state = &mut self.channels[channel_index];
-        if state.tremor_count != 0 { state.tremor_count -= 1; return; }
-        if state.tremor_on {
-            state.tremor_on = false;
-            state.tremor_count = state.command_data & 15;
-            state.actual_volume = 0;
-        } else {
-            state.tremor_on = true;
-            state.tremor_count = state.command_data >> 4;
-            // D3: read this channel's current_volume, not the undefined EDI register.
-            state.actual_volume = state.current_volume;
+        if state.tremor_count == 0 {
+            if state.tremor_on {
+                state.tremor_on = false;
+                state.tremor_count = (state.command_data & 15).max(1);
+            } else {
+                state.tremor_on = true;
+                state.tremor_count = (state.command_data >> 4).max(1);
+            }
         }
+        state.tremor_count -= 1;
+        // D3: read this channel's current_volume, not the undefined EDI register.
+        state.actual_volume = if state.tremor_on { state.current_volume } else { 0 };
         state.pending_dirty.insert(DirtyBits::VOLUME);
     }
 
@@ -507,7 +582,7 @@ impl S3mProcessor {
     fn minor_retrigger(&mut self, channel_index: usize) {
         let state = &mut self.channels[channel_index];
         state.special_value = state.special_value.wrapping_sub(1);
-        if state.special_value != 0 || state.current_note == 0 { return; }
+        if state.special_value != 0 || state.current_note == 0 || state.note_cut { return; }
         state.special_value = state.retrigger_memory & 15;
         state.sample_offset = 0;
         state.pending_dirty.insert(DirtyBits::SAMPLE);
@@ -543,6 +618,11 @@ impl S3mProcessor {
 
     fn clip_pitch(&mut self, channel_index: usize) {
         if !self.channels[channel_index].pending_dirty.contains(DirtyBits::PITCH) { return; }
+        if self.channels[channel_index].current_period == 0 {
+            // D26: a slide that reaches period zero stops the channel outright.
+            self.stop_note(channel_index);
+            return;
+        }
         let state = &mut self.channels[channel_index];
         if state.glissando_enabled {
             // Analysis §4, ClipPitch (2634–2688): convert back to the unscaled Amiga
@@ -573,11 +653,26 @@ impl S3mProcessor {
             let scaled = (selected as u64).saturating_mul(ST3_PERIOD_SCALE as u64) >> octave;
             state.actual_period = (scaled / state.reference_rate_hz.max(1) as u64).max(1).min(u32::MAX as u64) as u32;
         }
-        if self.amiga_limits { state.actual_period = state.actual_period.clamp(452, 3424); }
+        if self.amiga_limits {
+            // D31: ST3 clamps the channel period itself, so a slide that runs into the
+            // limit resumes from it. `ClipPitch` clamps only `_ActualPeriod`, which lets
+            // `_CurrentPeriod` keep running away underneath.
+            state.current_period = state.current_period.clamp(452, 3424);
+            state.actual_period = state.actual_period.clamp(452, 3424);
+        }
+        // D26: ST3's lower output-period limit. The unclamped `current_period` keeps
+        // sliding underneath it, so a later downward slide resumes from the true value.
+        state.actual_period = state.actual_period.max(MIN_OUTPUT_PERIOD);
     }
 
     fn flush_channel(&mut self, context: &mut TickContext<'_>, channel_index: usize) {
         let channel_id = ChannelId(channel_index as u16);
+        if self.channels[channel_index].stop_voice {
+            self.channels[channel_index].stop_voice = false;
+            self.channels[channel_index].pending_dirty = DirtyBits::empty();
+            context.stop_channel(channel_id);
+            return;
+        }
         let dirty = self.channels[channel_index].pending_dirty;
         if dirty.is_empty() { return; }
 
@@ -654,14 +749,35 @@ impl S3mProcessor {
 
     fn set_minor(&mut self, channel_index: usize, command: u8, data: u8) { self.channels[channel_index].command = command; self.channels[channel_index].command_data = data; }
     fn clear_minor(&mut self, channel_index: usize) { self.set_minor(channel_index, 0, 0); }
+
+    /// D25: ST3 keeps **one** parameter memory per channel. A non-zero parameter on any
+    /// command writes it; a zero parameter on `D`, `E`, `F`, `I`, `J`, `K`, `L`, `Q`, `S`
+    /// and `T` reads it back, so `H82` on one row makes the next row's `D00` behave as
+    /// `D02` (OpenMPT `ParamMemory.s3m`). `G` and the `H`/`R`/`U` family keep their own
+    /// read memories and only write this one.
+    fn recall_parameter(&mut self, channel_index: usize, parameter: u8) -> u8 {
+        if parameter == 0 { return self.channels[channel_index].parameter_memory; }
+        self.channels[channel_index].parameter_memory = parameter;
+        parameter
+    }
+
+    fn write_parameter_memory(&mut self, channel_index: usize, value: u8) {
+        if value != 0 { self.channels[channel_index].parameter_memory = value; }
+    }
 }
 
 impl TrackerProcessor for S3mProcessor {
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, 64));
         let mut outcome = context.outcome();
-        if self.last_pattern.is_some_and(|pattern| pattern != row.pattern) { self.pattern_loop_start = 0; }
-        self.last_pattern = Some(row.pattern);
+        // D30: every position change resets the one global loop target and counter
+        // (OpenMPT `LoopReset.s3m`).
+        if self.last_order.is_some_and(|position| position != (row.order, row.pattern)) {
+            self.pattern_loop_start = 0;
+            self.pattern_loop_count = 0;
+        }
+        self.last_order = Some((row.order, row.pattern));
+        self.pattern_loop_jumped = false;
         self.reset_row();
         let channel_count = core::cmp::min(self.channels.len(), row.bytes.len() / CELL_BYTES);
         for channel_index in 0..channel_count {
@@ -683,12 +799,34 @@ impl TrackerProcessor for S3mProcessor {
         let header = self.module.header();
         self.global_volume = ((header.global_volume.to_bits() as u32 * 64 + 32767) / 65535) as u8;
         for channel_index in 0..self.channels.len() {
-            let pan = header.default_pan.get(channel_index).copied().map(pan_to_nibble).unwrap_or(7);
+            let pan = header.default_pan.get(channel_index).copied().map(pan_to_nibble).unwrap_or(crate::header::PAN_CENTRE);
             self.channels[channel_index] = S3mChannel::new(channel_index as u8, pan);
         }
         self.pattern_loop_start = 0;
         self.pattern_loop_count = 0;
-        self.last_pattern = None;
+        self.last_order = None;
+        self.pattern_loop_jumped = false;
+    }
+
+    /// D33: every `SEx` repeat of a row is another first tick in ST3, so the row's
+    /// tick-zero effects run again — without re-latching its notes, which keep sounding
+    /// from the first pass (OpenMPT `PatternDelaysRetrig.s3m`). `__UpdateTracker`
+    /// decrements `_MRowDelay` and skips the row entirely instead.
+    fn row_repeat(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+        context.report_global_volume(unit_from_ratio(self.global_volume as u32, 64));
+        let mut outcome = context.outcome();
+        self.reset_row();
+        let channel_count = core::cmp::min(self.channels.len(), row.bytes.len() / CELL_BYTES);
+        for channel_index in 0..channel_count {
+            let start = channel_index * CELL_BYTES;
+            let Some(cell) = S3mCell::from_bytes(row.bytes.get(start..start + CELL_BYTES).unwrap_or(&[])) else { continue };
+            self.static_effect(context, channel_index, cell, &mut outcome);
+            self.clip_pitch(channel_index);
+        }
+        for channel_index in 0..self.channels.len() { self.flush_channel(context, channel_index); }
+        #[cfg(feature = "trace")]
+        self.report_trace_channels(context);
+        outcome
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {
@@ -810,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn dxy_classification_order_and_normal_high_nibble_priority_match_st3() {
+    fn dxy_classification_order_and_normal_down_nibble_priority_match_st3() {
         let mut processor = processor();
         processor.channels[0].current_volume = 10;
         processor.channels[0].actual_volume = 10;
@@ -835,6 +973,11 @@ mod tests {
         processor.static_volume_slide(0, 0x20);
         processor.minor_volume_slide(0);
         assert_eq!(processor.channels[0].actual_volume, 64, "a normal upward slide clamps at 64");
+        processor.channels[0].current_volume = 32;
+        processor.channels[0].actual_volume = 32;
+        processor.static_volume_slide(0, 0x82);
+        processor.minor_volume_slide(0);
+        assert_eq!(processor.channels[0].actual_volume, 30, "D27: with both nibbles set the down nibble wins, so D82 is D02");
     }
 
     #[test]
@@ -846,7 +989,7 @@ mod tests {
         processor.channels[0].current_period = 100;
         processor.static_pitch_slide(0, 5, 0);
         processor.minor_effect(0);
-        assert_eq!(processor.channels[0].volume_slide_memory, 5);
+        assert_eq!(processor.channels[0].parameter_memory, 5);
         assert_eq!(processor.channels[0].actual_period, 120, "E00 uses the 5 remembered by D05 and multiplies it by four");
     }
 
@@ -959,20 +1102,228 @@ mod tests {
     }
 
     #[test]
-    fn pattern_loop_and_external_jumps_obey_channel_order_without_merging_destinations() {
+    fn a_loop_jump_cancels_a_break_or_jump_on_the_same_row_in_either_channel_order() {
         with_context(|processor, context| {
+            // D30: `SBx` first, then `Bxx` on a later channel — the jump is blocked.
             processor.pattern_loop_start = 4;
             let mut outcome = context.outcome();
             processor.static_special(0, 0xB1, 7, &mut outcome);
             assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(4)));
             processor.static_effect(context, 0, S3mCell { command: 2, info: 3, ..S3mCell::EMPTY }, &mut outcome);
-            assert_eq!(outcome.jump, Some(Jump::to_order(3)), "a later Bxx replaces SBx instead of inheriting its row");
+            assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(4)), "D30: a loop jump blocks a Bxx that follows it on the row");
 
+            // `Cxx` first, then `SBx` — the break is cancelled.
+            processor.pattern_loop_count = 0;
+            processor.pattern_loop_jumped = false;
             let mut outcome = context.outcome();
             processor.static_effect(context, 0, S3mCell { command: 3, info: 0x12, ..S3mCell::EMPTY }, &mut outcome);
-            processor.pattern_loop_count = 0;
             processor.static_special(0, 0xB1, 7, &mut outcome);
-            assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(4)), "a later SBx replaces Cxx with its in-pattern destination");
+            assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(4)), "D30: a loop jump cancels a Cxx already seen on the row");
+
+            // The iteration that ends the loop lets the break through again.
+            processor.pattern_loop_jumped = false;
+            let mut outcome = context.outcome();
+            processor.static_special(0, 0xB1, 7, &mut outcome);
+            assert_eq!(outcome.jump, None, "the final SBx iteration produces no jump");
+            assert_eq!(processor.pattern_loop_start, 8, "D30: the loop target advances past the SBx row when the loop ends");
+            processor.static_effect(context, 0, S3mCell { command: 2, info: 3, ..S3mCell::EMPTY }, &mut outcome);
+            assert_eq!(outcome.jump, Some(Jump::to_order(3)), "a Bxx on the terminating row is honoured");
         });
+    }
+
+    #[test]
+    fn one_row_of_several_sbx_parameters_counts_down_once_per_channel() {
+        with_context(|processor, context| {
+            // D30: ST3 stores the first parameter and every later `SBx` on the row spends
+            // one iteration of it, rather than each one restarting its own count.
+            let mut outcome = context.outcome();
+            processor.static_special(0, 0xB4, 13, &mut outcome);
+            assert_eq!(processor.pattern_loop_count, 4, "the first SBx stores its own parameter");
+            for expected in [3, 2, 1] {
+                processor.static_special(0, 0xB1, 13, &mut outcome);
+                assert_eq!(processor.pattern_loop_count, expected, "each further SBx on the row spends one iteration");
+            }
+            assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(0)));
+            let _ = context;
+        });
+    }
+
+    #[test]
+    fn every_effect_family_recalls_the_one_shared_parameter_memory() {
+        // D25: `H82` seeds the shared memory, and each following zero-parameter command
+        // behaves as if it had been written with `82` (OpenMPT `ParamMemory.s3m`).
+        for (command, info, expected) in [
+            (4u8, 0u8, 0x82u8),  // Dxy volume slide
+            (5, 0, 0x82),        // Exx portamento down
+            (6, 0, 0x82),        // Fxx portamento up
+            (9, 0, 0x82),        // Ixy tremor
+            (10, 0, 0x82),       // Jxy arpeggio
+            (17, 0, 0x82),       // Qxy retrigger
+            (19, 0, 0x82),       // Sxy special
+        ] {
+            with_context(|processor, context| {
+                let mut outcome = context.outcome();
+                processor.static_effect(context, 0, S3mCell { command: 8, info: 0x82, ..S3mCell::EMPTY }, &mut outcome);
+                assert_eq!(processor.channels[0].parameter_memory, 0x82, "H82 writes the shared memory");
+                processor.static_effect(context, 0, S3mCell { command, info, ..S3mCell::EMPTY }, &mut outcome);
+                assert_eq!(processor.channels[0].parameter_memory, expected, "command {command} with a zero parameter leaves the shared memory alone");
+                let used = match command {
+                    // D and Q store the effective parameter in the minor slot.
+                    4 | 9 | 10 | 17 => processor.channels[0].command_data,
+                    5 | 6 => processor.channels[0].command_data,
+                    _ => processor.channels[0].parameter_memory,
+                };
+                assert_eq!(used, expected, "command {command} runs with the recalled parameter");
+            });
+        }
+    }
+
+    #[test]
+    fn an_unimplemented_command_with_a_parameter_still_feeds_the_shared_memory() {
+        // D25: OpenMPT `NOP.s3m` — a no-op effect cell contributes its parameter.
+        with_context(|processor, context| {
+            let mut outcome = context.outcome();
+            processor.static_effect(context, 0, S3mCell { command: 26, info: 0x37, ..S3mCell::EMPTY }, &mut outcome);
+            processor.static_effect(context, 0, S3mCell { command: 10, info: 0, ..S3mCell::EMPTY }, &mut outcome);
+            assert_eq!(processor.channels[0].arpeggio_memory, 0x37, "J00 arpeggiates with the no-op command's parameter");
+        });
+    }
+
+    #[test]
+    fn the_output_period_clamps_at_sixty_four_and_period_zero_stops_the_channel() {
+        // D26: OpenMPT `PeriodLimit.s3m`.
+        let mut processor = processor();
+        processor.channels[0].current_period = 65;
+        processor.channels[0].actual_period = 65;
+        processor.channels[0].pending_dirty = DirtyBits::PITCH;
+        processor.clip_pitch(0);
+        assert_eq!(processor.channels[0].actual_period, 65, "a period just above the limit is untouched");
+        assert!(!processor.channels[0].stop_voice);
+
+        processor.channels[0].current_period = 48;
+        processor.channels[0].actual_period = 48;
+        processor.channels[0].pending_dirty = DirtyBits::PITCH;
+        processor.clip_pitch(0);
+        assert_eq!(processor.channels[0].actual_period, 64, "a period below the limit is clamped to 64");
+        assert_eq!(processor.channels[0].current_period, 48, "the channel period keeps its true value underneath the clamp");
+        assert!(!processor.channels[0].stop_voice, "clamping does not stop the channel");
+
+        processor.channels[0].command = 6;
+        processor.channels[0].command_data = 12;
+        processor.minor_effect(0);
+        assert_eq!(processor.channels[0].current_period, 0, "F0C takes the remaining 48 units to exactly zero");
+        processor.clip_pitch(0);
+        assert!(processor.channels[0].stop_voice, "D26: period zero stops the channel");
+        assert_eq!(processor.channels[0].sample_number, NO_SAMPLE, "the synthetic channel had no instrument to keep");
+    }
+
+    #[test]
+    fn amiga_limits_clamp_the_channel_period_and_the_step_it_produces() {
+        // D31: OpenMPT `AmigaLimits.s3m` — 113 * 4 and 856 * 4, applied to the state.
+        let mut processor = processor();
+        processor.amiga_limits = true;
+        for (start, slide_down, expected) in [(453u32, false, 452u32), (3420, true, 3424)] {
+            processor.channels[0].current_period = start;
+            processor.channels[0].actual_period = start;
+            processor.channels[0].command = if slide_down { 5 } else { 6 };
+            processor.channels[0].command_data = 16;
+            processor.minor_effect(0);
+            processor.clip_pitch(0);
+            assert_eq!(processor.channels[0].actual_period, expected, "the output period stops at the Amiga bound");
+            assert_eq!(processor.channels[0].current_period, expected, "D31: the channel period stops there too, so the slide back out starts from the bound");
+        }
+        assert_eq!(step_from_period(452, 44_100), Step::from_ratio((ST3_FREQUENCY_NUMERATOR / 452) as u64, 44_100));
+        assert_eq!(step_from_period(3424, 44_100), Step::from_ratio((ST3_FREQUENCY_NUMERATOR / 3424) as u64, 44_100));
+    }
+
+    #[test]
+    fn tone_portamento_with_a_new_instrument_keeps_the_sample_and_takes_the_volume() {
+        // D28: OpenMPT `PortaSmpChange.s3m`.
+        let mut builder = ModuleBuilder::new();
+        let loud = builder.add_sample(&[0, 0, 0, 0], SampleSpec::one_shot("loud")).expect("first sample");
+        let mut quiet_spec = SampleSpec::one_shot("quiet");
+        quiet_spec.default_volume = U0F16::from_bits(16384);
+        let quiet = builder.add_sample(&[0, 0, 0, 0], quiet_spec).expect("second sample");
+        builder.add_instrument(InstrumentDef::from_sample("loud", loud, U0F16::MAX)).expect("instrument one");
+        builder.add_instrument(InstrumentDef::from_sample("quiet", quiet, U0F16::MAX)).expect("instrument two");
+        builder.add_pattern(&vec![255u8; ROWS as usize * CELL_BYTES], ROWS, 1).expect("one fixed-stride pattern");
+        builder.set_orders(&[0, starplayer_model::ORDER_END]);
+        builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
+        let mut processor = S3mProcessor::new(Arc::new(builder.build().expect("valid module")), 44_100);
+
+        let mut voices = VoicePool::new(2);
+        let mut channels = ChannelTable::new(1);
+        let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+        processor.latch_cell(&mut context, 0, S3mCell { note: 0x40, instrument: 1, volume: VOLUME_NONE, command: 0, info: 0 });
+        processor.flush_channel(&mut context, 0);
+        assert_eq!(processor.channels[0].sample_number, 1);
+        let sounding = context.channels.foreground(ChannelId(0)).expect("the first note sounds");
+
+        processor.latch_cell(&mut context, 0, S3mCell { note: 0x44, instrument: 2, volume: VOLUME_NONE, command: 7, info: 2 });
+        assert_eq!(processor.channels[0].sample_number, 1, "D28: the sounding instrument is kept");
+        assert_eq!(processor.channels[0].current_volume, 16, "D28: the new instrument's default volume is adopted");
+        assert_eq!(processor.channels[0].reference_rate_hz, DEFAULT_REFERENCE_RATE_HZ, "the sounding sample's C2SPD is kept");
+        processor.flush_channel(&mut context, 0);
+        assert_eq!(context.channels.foreground(ChannelId(0)), Some(sounding), "the voice is not retriggered");
+    }
+
+    #[test]
+    fn a_note_cut_silences_the_channel_without_stopping_its_voice() {
+        // D29: libxmp `s3m_sample_porta.s3m` keeps the cut voice looping at volume zero.
+        let mut processor = processor();
+        processor.channels[0].sample_number = 1;
+        processor.channels[0].current_note = 0x40;
+        processor.channels[0].current_volume = 64;
+        processor.channels[0].actual_volume = 64;
+        processor.channels[0].current_period = 1712;
+        processor.cut_note(0);
+        assert_eq!(processor.channels[0].actual_volume, 0, "the cut takes the volume to zero");
+        assert_eq!(processor.channels[0].sample_number, 1, "D29: the sample keeps playing");
+        assert_eq!(processor.channels[0].current_period, 1712, "the pitch is untouched");
+        assert!(!processor.channels[0].pending_dirty.contains(DirtyBits::SAMPLE), "no retrigger and no stop");
+
+        processor.channels[0].retrigger_memory = 0x01;
+        processor.channels[0].special_value = 1;
+        processor.minor_retrigger(0);
+        assert_eq!(processor.channels[0].actual_volume, 0, "D29: Qxy does not revive a cut channel");
+    }
+
+    #[test]
+    fn the_tremor_phases_last_exactly_x_and_y_ticks() {
+        // D34: OpenMPT `ParamMemory.s3m` row 23 — I82 is eight ticks on and two off,
+        // counting the tick the effect starts on.
+        let mut processor = processor();
+        processor.channels[0].current_volume = 64;
+        processor.channels[0].command_data = 0x82;
+        let mut volumes = alloc::vec::Vec::new();
+        for _ in 0..12 {
+            processor.minor_tremor(0);
+            volumes.push(processor.channels[0].actual_volume);
+        }
+        assert_eq!(volumes, alloc::vec![64, 64, 64, 64, 64, 64, 64, 64, 0, 0, 64, 64], "eight ticks loud, two silent, then loud again");
+    }
+
+    #[test]
+    fn the_tremolo_depth_is_the_protracker_scale_and_not_half_of_it() {
+        // D35: `table * depth / 64`, truncating towards zero like every reference does.
+        let mut processor = processor();
+        processor.channels[0].current_volume = 64;
+        processor.channels[0].vibrato_memory = 0x82;
+        processor.channels[0].vibrato_phase = 40;
+        processor.minor_tremolo(0);
+        assert_eq!(processor.channels[0].actual_volume, 59, "phase 40 of the sine is -180, so depth 2 removes five");
+        processor.channels[0].current_volume = 32;
+        processor.channels[0].vibrato_phase = 16;
+        processor.minor_tremolo(0);
+        assert_eq!(processor.channels[0].actual_volume, 39, "phase 16 is +255, so depth 2 adds seven");
+    }
+
+    #[test]
+    fn the_default_pan_nibble_of_a_centred_channel_is_eight() {
+        // D24: ST3's own centre, not the original's 7.
+        let processor = processor();
+        assert_eq!(processor.channels[0].pan_position, crate::header::PAN_CENTRE);
+        assert_eq!(crate::header::PAN_CENTRE, 8);
+        assert_eq!(processor.trace_channel_state(&processor.channels[0]).pan, 136);
     }
 }

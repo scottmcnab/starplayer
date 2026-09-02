@@ -276,6 +276,16 @@ Two subtleties worth stating explicitly, both reproduced:
 - `_ActualVol` is **not** restored from `_CurrentVol` — so tremolo and tremor volume
   offsets persist into the next row until something writes a volume.
 
+A third is **not** reproduced. `if _MRowDelay: dec, skip the row` makes an `SEx` repeat
+nothing but more ticks of the same row. Scream Tracker 3 treats the first tick of every
+repeat as a first tick and runs the row's tick-zero effects again, without re-triggering
+its notes (accuracy-policy D33, OpenMPT `PatternDelaysRetrig.s3m`). `SEx` itself is also
+first-wins rather than last-wins: only the first non-zero `SEx` on a row sets the delay,
+where `S_FX_S` writes `_MRowDelay` unconditionally so the rightmost channel wins and an
+`SE0` cancels an earlier request (D32). ST3 evaluates its "left" channels before its
+"right" ones when deciding which is first; that ordering is *not* reproduced and no
+pinned corpus case distinguishes it.
+
 ---
 
 ## 4. Effects
@@ -322,10 +332,18 @@ else                                → store for per-tick processing
 ```
 
 So `DFx` (x≠0) is fine-down, `DxF` (x≠0) is fine-up, and `DF0` / `D0F` fall through to
-the *normal* slide path. Per tick (`M_FX_D`) the **high nibble wins**: slide up by the
-high nibble if `xy & F0` is non-zero, otherwise down by the low nibble. Underflow is
-detected with the unsigned trick `cmp al,64 / jna ok` — any value 65–255 after
-subtraction clamps to 0.
+the *normal* slide path. Underflow is detected with the unsigned trick
+`cmp al,64 / jna ok` — any value 65–255 after subtraction clamps to 0.
+
+Per tick, `M_FX_D` tests the high nibble first and slides **up** by it when `xy & F0` is
+non-zero. **That is a defect** (accuracy-policy D27): Scream Tracker 3 gives the *down*
+nibble priority, so `D82` slides down by 2. It only shows when both nibbles are set,
+which is exactly what `D00` recalling a shared `82` produces — OpenMPT `ParamMemory.s3m`
+is the fixture. `DF0`, `D0F` and the single-nibble forms are unaffected either way.
+
+libxmp additionally applies a `D0F` or `DF0` slide on tick zero (`src/effects.c:355-378`,
+on the strength of a user report its own comment calls a suspicion). ST3, OpenMPT and
+`S_FX_D` do not; accuracy-policy D38 records the disagreement.
 
 **`Exx` / `Fxx` pitch slides.**
 
@@ -337,7 +355,14 @@ elif    xx <= 0EFh → extra-fine, instant:    period ±= (xx & 0F) * 1
 else               → fine,       instant:    period ±= (xx & 0F) * 4
 ```
 
-The shared `_VolSlideValue` across D/E/F is real ST3 behaviour, not a bug. The `×4`
+The shared `_VolSlideValue` across D/E/F is real ST3 behaviour, not a bug — and it does
+not go far enough. ST3 keeps **one** parameter memory per channel that every command with
+a non-zero parameter writes, the ones it does not implement included, and that `Dxy`,
+`Exx`, `Fxx`, `Ixy`, `Jxy`, `Kxy`, `Lxy`, `Qxy`, `Sxy` and `Txx` read back on a zero
+parameter; `Gxx` and the `Hxy`/`Rxy`/`Uxy` family keep their own read memories and write
+the shared one as well. The original's `_PortaValue`, `_VibValue`, `_RetrigValue`,
+`_ArpValue` and `_OffsetValue` are five separate memories where ST3 has one
+(accuracy-policy D25; OpenMPT `ParamMemory.s3m` and `NOP.s3m`). The `×4`
 everywhere reflects **S3M periods = Amiga periods × 4**.
 
 **`Gxx` tone portamento.** Step `= xx*4` per tick with explicit overshoot prevention in
@@ -354,6 +379,11 @@ else:   normal note: CurrentPeriod = TargetPeriod = ActualPeriod = period
 
 Critically this depends on `_ActiveFlag`, which the **driver** maintains — a portamento
 onto a channel whose one-shot sample has already finished behaves as a fresh trigger.
+
+The instrument column is handled *before* this test, at 2503, so a `Gxx`/`Lxx` row naming
+a different instrument changes `_SampleNum` and `_C4SPD` under the sounding note. **That
+is a defect** (accuracy-policy D28): ST3 keeps the sounding sample and its C2SPD and takes
+only the new instrument's default volume.
 
 **`Hxy` vibrato.** Parameter merge rule:
 
@@ -373,7 +403,15 @@ _VibCount = (_VibCount + (_VibValue >> 4)) mod 64
 
 `Uxy` (fine vibrato) is identical **without the `<< 2`** — exactly quarter depth.
 `Rxy` tremolo uses the same table, counter and `_VibValue`, without the `<< 2`, adds to
-`_CurrentVol`, clamps 0–64 and writes `_ActualVol`.
+`_CurrentVol`, clamps 0–64 and writes `_ActualVol`. **The missing `<< 2` is a defect**
+(accuracy-policy D35): the `sal edx,2` is present but commented out in the source, so the
+tremolo swings half as far as ProTracker, libxmp and OpenMPT all make it. The scale is
+`table × depth / 64`, truncating towards zero.
+
+`Rxy` sharing `_VibCount` with `Hxy`/`Uxy` is **still** reproduced, and it is the last
+open S3M conformance question: libxmp and OpenMPT give the tremolo its own phase, and
+libxmp also applies the tremolo delta on tick zero without advancing that phase. See
+`conformance/known-failures.md` `C2-S3M-009`.
 
 **Waveform tables** (435–470), 64 signed 16-bit entries each, amplitude ±255:
 
@@ -388,13 +426,19 @@ _VibCount = (_VibCount + (_VibValue >> 4)) mod 64
 - `Vib_Rand_Table` — 128 **fixed** pseudo-random entries (only 0–63 reachable). A fixed
   table, not an RNG, so waveform 3 is fully deterministic.
 
-**`Ixy` tremor.** Memory in `_DataValue`; the tick handler also runs on tick 0.
+**`Ixy` tremor.** Parameter from the shared memory (D25); the tick handler also runs on
+tick 0.
 
 ```
 if _TremorCount != 0 : dec ; return
 if _TremorFlag == 1  : flag = 0 ; count = xy & 0F ; _ActualVol = 0
 else                 : flag = 1 ; count = xy >> 4 ; _ActualVol = _CurrentVol
 ```
+
+Reloading the counter and *then* spending a further tick on it makes each phase one tick
+too long. **That is a defect** (accuracy-policy D34): ST3's on phase is exactly `x` ticks
+and its off phase exactly `y`, counting the tick the effect starts on, and a zero nibble
+counts as one.
 
 The "restore volume" branch reads `[edi+_CurrentVol]` while the minor-tick loop passes
 the channel in **esi**; `edi` is undefined there. *See accuracy policy D3.*
@@ -447,9 +491,22 @@ with four multiplicative special cases: `x=6 → vol*2/3`, `x=7 → vol/2`,
   `_MRowLoopCount < x` then increment the count, `dec _MCurrentPos`,
   `_MCurrentRow = 0FEh`, `_BreakToRow = _MRowLoopStart`; else reset the count to 0.
   `_MRowLoopStart` resets to 0 whenever a pattern is left.
+
+  **Three defects here** (accuracy-policy D30, and libxmp's `FLOW_MODE_ST3_321` is the
+  written spec). ST3 counts *down* from the parameter the first `SBx` on the row stored,
+  so a row carrying several `SBx` spends one iteration per channel instead of restarting
+  the count. When a loop terminates, ST3 advances the global target to the `SBx` row plus
+  one, so a following `SBx` with no `SB0` of its own loops the rows in between. And a loop
+  jump cancels a `Bxx`/`Cxx` already seen on the row and blocks any that follow, whichever
+  channel carries it — the original lets a later channel's `Bxx` replace the loop jump.
+  Both the target and the counter reset on every position change, not only on a pattern
+  change.
 - `SCx` — note cut. Stores `x` in `_SpecialValue`; the tick handler decrements and, at
   0, cuts: `_CurrentNote = 0`, all three periods = 1712, `_SampleNum = 255`,
-  `_SampleOffset = 0`, `_CHN_NewSamp`, `_CommandValue = 0`.
+  `_SampleOffset = 0`, `_CHN_NewSamp`, `_CommandValue = 0`. **Stopping the voice is a
+  defect** (accuracy-policy D29): ST3's cut only takes the channel volume to zero, which
+  is why `Qxy` cannot revive a cut channel and why a later tone portamento still has a
+  voice to slide.
 - `SDx` — note delay. **The clever one.** The tick-0 handler saves the *entire*
   `_ChannelFlag` byte into `_SpecialValue` and zeroes `_ChannelFlag`, so the note,
   volume and pitch the row already latched simply never reach the hardware. The tick
@@ -457,7 +514,10 @@ with four multiplicative special cases: `x=6 → vol*2/3`, `x=7 → vol/2`,
   tick) and, on reaching 0, restores `_ChannelFlag = _SpecialValue`, releasing the note.
 - `SEx` — pattern delay. `_MRowDelay = x`, consumed at the top of the major update: the
   row is **not** re-parsed, but the tick counter is reloaded, so the previous row's
-  per-tick effects keep running for `x` extra rows.
+  per-tick effects keep running for `x` extra rows. Two defects: ST3 re-runs the row's
+  tick-zero effects on the first tick of every repeat, without re-triggering its notes
+  (D33), and only the first non-zero `SEx` on the row sets the delay where this writes
+  `_MRowDelay` unconditionally (D32).
 - `SFx` — funk repeat, deliberately ignored.
 
 **`Txx` tempo** clamps to `>= 20h` (32 BPM) and sets `_CHN_NewBPM`, which the driver
@@ -466,8 +526,8 @@ turns into a timer reprogram (GUS) or a new `_SB_GapLength` (SB).
 **`Xxx` set pan.** `pan = xx >> 3; if pan >= 10h then pan -= 1; pan &= 0Fh` — maps
 0–255 into 0–15 with 0xFF → 15.
 
-**Note bytes.** 255 = no note; 254 = cut (same actions as `SCx` firing); 0 in
-`_CurrentNote` means "no note present" and gates `Oxx` and `Qxy`.
+**Note bytes.** 255 = no note; 254 = cut (same actions as `SCx` firing, so D29 applies to
+it too); 0 in `_CurrentNote` means "no note present" and gates `Oxx` and `Qxy`.
 
 **Instrument change** (2503–2525). A new instrument number always reloads `_C4SPD` and
 resets `_CurrentVol = _ActualVol = ` the sample's default volume, flagging `_CHN_NewVol`
@@ -571,7 +631,10 @@ directly rather than inheriting this by accident.
 
 ### Panning at playback
 
-`ClearChannels` (3617) per channel: default pan **7** (centre). If `_stereoflag`, read
+`ClearChannels` (3617) per channel: default pan **7**. **That 7 is a defect**
+(accuracy-policy D24): Scream Tracker 3 uses **8** as its centre nibble, which is what its
+own default-pan blocks contain and what libxmp and OpenMPT decode a centred S3M channel
+to. If `_stereoflag`, read
 S3M channel-setting byte `[0x40+chan]`: `>= 128` → 7; `< 8` → **3** (left); else →
 **0Ch** (right). Then `LoadPanSettings` (3585) overrides from the 32-byte default-pan
 array when header[0x35] == 252, taking `byte & 0x0F` only when bit 5 is set. Channel init
@@ -596,6 +659,20 @@ period = (Period_Table[n] * 8363 * 16 >> oct) / _C4SPD        ; minimum 1
 `8363 * 16 = 133808`. With the default C2SPD of 8363 this gives `27392 >> oct`, so
 octave 4 ⇒ 1712 = Amiga 428 × 4. **S3M periods are Amiga periods × 4** — which is why
 every slide multiplies by 4 and the Amiga clamp is `[113*4, 856*4]`.
+
+Two things `ClipPitch` gets wrong. It applies the Amiga clamp to `_ActualPeriod` only, so
+`_CurrentPeriod` keeps sliding past the bound and a slide back out starts from a runaway
+value (accuracy-policy D31; OpenMPT clamps the channel period itself). And it has no lower
+bound at all: ST3 clamps the **output** period to at least 64 while the channel period
+keeps sliding underneath, and stops the channel outright when the channel period reaches
+zero (accuracy-policy D26; OpenMPT `PeriodLimit.s3m`, `FreqLimits.s3m`).
+
+The 12-entry integer table is up to 0.3 % away from the ideal for notes other than C
+(`G#` is 1076 where the exact value is 1079.4). libxmp derives every period from a
+continuous `13696 / 2^(n/12)` instead, and represents a sample's C2SPD as a note transpose
+plus a finetune rather than as a period divisor, so its mixer voice reports a
+pitch-domain note. Both are oracle representation differences, not engine gaps —
+accuracy-policy D36 and D37.
 
 **Period → frequency** (`PeriodToPitch`, 3561): `hz = 14317056 / period`
 (`0DA7600h`, the ST3 constant). **Note:** `0DA7600h` is 14,317,056, which is *not*
@@ -685,9 +762,12 @@ SB mixer explains the original's sound. Neither is reimplemented: see
 
 1. Sample-slice-accurate tick placement (mix in gap-length chunks, never one tick per
    buffer).
-2. Shared parameter memories: **D/E/F share `_VolSlideValue`**; **H/R/U share
-   `_VibValue` and `_VibCount`**.
-3. `Dxy` fine-slide classification order, and the high-nibble-wins rule per tick.
+2. Shared parameter memory: ST3 keeps **one** per channel, written by every command with
+   a non-zero parameter and read back by every command with a zero one, with `Gxx` and
+   the **H/R/U** family (which also share `_VibValue` and `_VibCount`) keeping their own
+   read memories (D25).
+3. `Dxy` fine-slide classification order, and the **down**-nibble-wins rule per tick
+   (D27 — the original's `M_FX_D` tests the high nibble first).
 4. `Cxx` pattern break interpreted as **decimal**.
 5. `SDx` note delay implemented by stashing and restoring the whole dirty-flag byte.
 6. `_SpecialValue` surviving across rows only for command 17 (`Qxy`).
@@ -701,5 +781,11 @@ SB mixer explains the original's sound. Neither is reimplemented: see
     Amiga-limits flag derived from the song's octave range, and the sign conventions
     (MOD signed, S3M and MTM unsigned).
 
-And what must **not** be replicated: see `plans/product/03-accuracy-policy.md` §3
-(D1–D7).
+And what must **not** be replicated: see `plans/product/03-accuracy-policy.md` §3.
+D1–D9 are the waveform, arpeggio, tremor-register, C2SPD, parapointer and phase-wrap
+defects; D24–D35 are the twelve the M2 conformance corpus found — the centre pan nibble,
+the split parameter memories, the missing output-period floor and zero-cut, the volume
+slide's nibble priority, the instrument latch under tone portamento, the note cut
+stopping the voice, three `SBx` pattern-loop rules, the Amiga clamp reaching only the
+output period, `SEx` being last-wins and its repeats skipping the row, the tremor phase
+lengths, and the halved tremolo depth.
