@@ -13,6 +13,55 @@
 //! `starplayer-mixer`, `starplayer-model`, `starplayer-engine`, and — behind their own
 //! features — `starplayer-{mod,s3m,mtm,xm,it}`, `starplayer-midi`,
 //! `starplayer-telemetry`.
+//!
+//! # Quirk profiles and tracker dialects
+//!
+//! Two different questions, answered by two different types, and it is worth keeping them
+//! apart.
+//!
+//! A **quirk profile** is what *you* choose. [`QuirkSet`](core::quirks::QuirkSet) is a
+//! small `Copy` struct of named fields — a tempo model, a Paula clock, a handful of
+//! booleans — and it has two named profiles. [`QuirkSet::canonical`](core::quirks::QuirkSet::canonical)
+//! is the default: ProTracker 2.3D and Scream Tracker 3.21 as those programs actually
+//! behaved. [`QuirkSet::starplayer_classic`](core::quirks::QuirkSet::starplayer_classic)
+//! is the 1990s DOS StarPlayer's own behaviour where it differs and a modern default
+//! should not have it — today that is its double-truncated tick length, which drifts
+//! about 1.3 seconds over a four-minute song. Use `canonical()` to play modules
+//! accurately; use `starplayer_classic()` to hear what the original sounded like. The
+//! `quirks-starplayer` cargo feature makes the classic profile the per-dialect default for
+//! a whole build.
+//!
+//! A **dialect** is what the *file* says. [`FormatDialect`](core::quirks::FormatDialect)
+//! is what a loader concluded from the header alone — `CD61` is an Atari Octalyser MOD,
+//! an S3M whose `Cwt/v` is below `0x1303` came from Scream Tracker 3.01 — and it is stored
+//! in [`ModuleHeader::dialect`](model::ModuleHeader::dialect). Those trackers wrote the
+//! same file format but replayed it differently, mostly in how `E6x` / `SBx` pattern loops
+//! interact with pattern breaks and position jumps, so a module has to be played by its
+//! own tracker's rules to sound right. You do not choose a dialect; the file does.
+//!
+//! The two meet in [`QuirkSelection`](core::quirks::QuirkSelection), which is the
+//! precedence written into the type:
+//!
+//! ```no_run
+//! use starplayer::core::quirks::{QuirkSelection, QuirkSet};
+//! # let module: starplayer::rt::Arc<starplayer::model::Module> = unimplemented!();
+//! // The usual case: let the file's dialect decide.
+//! let sequencer = starplayer::mod_file::sequencer_with_quirks(module.clone(), 44_100, QuirkSelection::FromDialect);
+//! // Or override it, for a compatibility menu or a regression test.
+//! let classic = starplayer::mod_file::sequencer_with_quirks(module, 44_100, QuirkSelection::Override(QuirkSet::starplayer_classic()));
+//! ```
+//!
+//! The chosen set also carries the [`TempoModelId`](core::TempoModelId), so one argument
+//! selects both the effect behaviour and the tick length. It is resolved **once**, when
+//! the sequencer is built, and is fixed for the lifetime of that loaded module: there is
+//! no setter, because a channel whose effect memories were written under one rule and read
+//! under another is not a tracker any tracker ever was. Load the module again to change
+//! it.
+//!
+//! Every field names the `plans/product/03-accuracy-policy.md` entry it implements, and a
+//! field with no policy entry is not allowed. That document is the reference for what
+//! "accurate" means here and for every place StarPlayer knowingly differs from ProTracker,
+//! Scream Tracker 3 or the oracles it is measured against.
 
 #![no_std]
 #![forbid(unsafe_code)]

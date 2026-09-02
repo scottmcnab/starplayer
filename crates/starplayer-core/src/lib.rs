@@ -1,7 +1,8 @@
 //! Fixed-point arithmetic (Q0.16 / Q1.15 / Q32.32), the `Frame` / `Step` / `Note`
 //! newtypes, `Event` / `TimedEvent`, `VoiceParams` and its dirty bits, the `TempoModel`
-//! concept, the `FrameClock`, the `RowClock`, the period and waveform tables, and the
-//! shared `Error` type ([`error`]).
+//! concept, the `QuirkSet` / `FormatDialect` replay-behaviour data ([`quirks`]), the
+//! `FrameClock`, the `RowClock`, the period and waveform tables, and the shared `Error`
+//! type ([`error`]).
 //!
 //! No IO and no side effects: everything here is pure arithmetic and plain data, so it
 //! compiles unchanged for the audio thread, a bare-metal target and WASM.
@@ -35,6 +36,7 @@ pub mod event;
 pub mod fixed;
 pub mod frame;
 pub mod note;
+pub mod quirks;
 pub mod row_clock;
 pub mod sample;
 pub mod tables;
@@ -49,6 +51,10 @@ pub use event::{
 pub use fixed::{I1F15, Q32_32, Step, U0F16};
 pub use frame::Frame;
 pub use note::{Note, Period};
+pub use quirks::{
+    BreakParameter, FormatDialect, ModLoopDialect, PatternFlow, PaulaClock, QuirkSelection,
+    QuirkSet, S3mLoopDialect,
+};
 pub use row_clock::{RowAdvance, RowClock};
 pub use sample::GUARD_FRAMES;
 pub use tables::{PERIOD_TABLE, ST3_C4_SPEED, ST3_FREQUENCY_NUMERATOR, ST3_PERIOD_SCALE};

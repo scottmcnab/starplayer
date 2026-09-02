@@ -70,6 +70,7 @@ telemetry = ["dep:starplayer-telemetry", "starplayer-engine/telemetry"]
 trace = ["starplayer-engine/trace", "starplayer-mod?/trace", "starplayer-s3m?/trace", "starplayer-mtm?/trace"]
 
 quirks-starplayer = [
+    "starplayer-core/quirks-starplayer",
     "starplayer-mod?/quirks-starplayer",
     "starplayer-s3m?/quirks-starplayer",
     "starplayer-mtm?/quirks-starplayer",

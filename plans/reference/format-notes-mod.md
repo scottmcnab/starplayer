@@ -49,15 +49,37 @@ order values name those stored four-channel halves (`0, 2, 4, ...`). The loader 
 those live order values and interleaves each pair into native row-major MOD cells. `8CHN`
 remains the ordinary eight-cells-per-row layout.
 
-The accepted signature set is exactly `M.K.`, `M!K!` and `FLT4` (4 channels), `6CHN`,
-`8CHN`, `FLT8` (paired halves), single-digit `dCHN` for 1–9 channels, and two-digit
-`nnCHN` for 1–32. `M!K!` is what ProTracker itself writes once a module exceeds 64
-patterns — it is common, and libxmp lists it first — and the single-digit `dCHN` form is
-used by several trackers; C3b added both. `CD61`
-(Octalyser) and `FA04` / `FA06` (Digital Tracker) are deliberately outside this set for a
-different reason — they are tracker dialects with their own pattern-loop semantics, owned
-by `plans/engine/M2-task-C5-quirks-and-tempo-models.md`, not signatures to be waved
-through with ProTracker semantics.
+The accepted signature set mirrors libxmp's `mod_magic[]` table
+(`src/loaders/mod_load.c:76-95`) and each entry carries a `FormatDialect` as well as a
+channel count:
+
+| Tag | Channels | Dialect |
+|---|---|---|
+| `M.K.`, `M!K!` | 4 | `ProTracker` |
+| `M&K!`, `N.T.`, `LARD`, `NSMS` | 4 | `ProTracker3` |
+| `FLT4` | 4 | `Startrekker` |
+| `FLT8` | 8, paired halves | `Startrekker` |
+| `CD61`, `CD81` | 6, 8 | `Octalyser` |
+| `FA04`, `FA06`, `FA08` | 4, 6, 8 | `DigitalTracker` |
+| `6CHN`, `8CHN`, `dCHN` (1–9), `nnCH` (1–32), `TDZ1`–`TDZ4` | as written | `FastTracker` |
+
+`M!K!` is what ProTracker itself writes once a module exceeds 64 patterns — it is common,
+and libxmp lists it first — and the single-digit `dCHN` form is used by several trackers;
+C3b added both. C5 added the rest. The `ProTracker3` and `FastTracker` dialects play
+exactly as ProTracker does; they are recorded because libxmp's own timing heuristics key
+off them and M5 may need to.
+
+`CD61` and `FA04` / `FA06` were held back by C3 for a reason, and C5 accepted them **in
+the same change** that gave them their pattern-loop dialect: accepting the tag alone would
+have turned five honest exclusions into silent wrong playback. `.M.K` — Software Visions
+DMF — is still outside the set: its first 2108 bytes are word-flipped to little endian, so
+reading it needs a byte-order pass rather than a tag entry.
+
+Digital Tracker keeps **four more header bytes** — always `00 40 00 00` — between the tag
+and the pattern data, so its pattern data starts at 1088 and its sample data four bytes
+later than a ProTracker file's would. libxmp skips them with a bare `hio_read32b`
+(`mod_load.c:533-539`); the loader carries the same four bytes as
+`ModLayout::extra_header_bytes`.
 
 ## Sample loop gate
 
@@ -85,7 +107,13 @@ lookup also scans the selected row directly and retains PT's one-slot adjustment
 negative finetunes.
 
 `Dxx` pattern break is BCD (`10 * high + low`). Values decoding past row 63 go to row
-zero, matching PT's break handling.
+zero, matching PT's break handling. C5 moved the choice into the `QuirkSet` field
+`mod_break_parameter`, because MultiTracker reads the same byte as hexadecimal; the
+ProTracker dialect's value is unchanged. `F00` ending the song moved to
+`mod_f00_stops_song` for the same reason, and the queued sample swap below to
+`protracker_sample_swap_at_boundary`. The Paula clock the step derivation divides by is
+`mod_paula_clock`, PAL under `canonical()` — see accuracy policy D14 for why NTSC is
+offered but never selected by a loader.
 
 ProTracker 1/2's `9xx` pointer bug is retained: the current note starts at `xx * 256`,
 then the retained channel pointer advances by the same amount again. A following note
@@ -144,12 +172,16 @@ handling is a fidelity gap rather than a decision:
   pattern changes**; only `E60` writes it. A pattern whose first `E6x` has no preceding
   `E60` therefore loops back to the previous pattern's mark. C3 cleared
   `pattern_loop_start` on every pattern change and so looped to row 0; C3b removed that
-  reset.
+  reset. C5 moved the state itself out of `ModChannel` into
+  `starplayer-engine`'s `PatternFlowState`, which is shared with S3M and parameterised by
+  the module's dialect; ProTracker's `PatternFlow` has neither `global_target` nor
+  `pattern_reset`, so the behaviour is unchanged.
 - PT's `mt_Tremolo2` chooses the half of the ramp waveform by testing `n_vibratopos`, the
   vibrato phase, rather than `n_tremolopos`. This is a ProTracker bug; StarPlayer's default
-  reads the ramp from the tremolo phase, and the PT behaviour becomes a `QuirkSet` field in
-  `plans/engine/M2-task-C5-quirks-and-tempo-models.md`. Accuracy policy D20 records it.
-  libxmp does not model the bug, so no corpus oracle can distinguish the two.
+  reads the ramp from the tremolo phase, and the PT behaviour is the `QuirkSet` field
+  `protracker_tremolo_ramp_from_vibrato_phase`, added by C5 and off under `canonical()`.
+  Accuracy policy D20 records it. libxmp does not model the bug, so no corpus oracle can
+  distinguish the two and a unit test is the only thing that observes the field.
 - The processor needed a **reset hook on seek**. `PatternSequencer::seek_order` /
   `seek_row` moved the cursor only, so a pending CIA tempo, the LFO random state, effect
   memories and loop counters all survived a seek and a seeked render differed from a fresh
@@ -233,12 +265,16 @@ The C2 corpus contains dialect and compatibility cases wider than the tagged Pro
 scope of C3. They must remain visible exclusions when C2 registers `trace_mod`; they are
 not evidence that MOD was lowered through another format:
 
-- `CD61` Octalyser and `FA04` / `FA06` Digital Tracker files use signatures and pattern-
-  loop dialects outside C3's accepted tag set, so the loader rejects them rather than
-  guessing ProTracker semantics. These are dialects StarPlayer intends to support, not
-  refusals: the five cases are tracked by
-  `plans/engine/M2-task-C5-quirks-and-tempo-models.md`, which detects the dialect from the
-  signature and maps it to `QuirkSet` fields.
+- `CD61` Octalyser and `FA04` / `FA06` Digital Tracker files were outside C3's accepted
+  tag set because they are tracker dialects with their own pattern-loop semantics. C5
+  accepted the tags and implemented the dialects together, and four of the five cases now
+  pass. All five waive `frame` and `position` under accuracy-policy D15: each fixture sets
+  its tempo with an `Fxx` of 32 or more on row 0, and ProTracker's CIA latch defers that to
+  the next tracker event, so StarPlayer's first interval is 882 frames where libxmp's is
+  already at the new tempo. The fifth, `libxmp-mod-pattern-loop-dt`, produces a row
+  sequence identical to the oracle's for all 488 ticks; what fails is the harness's
+  residual-offset pairing across the fixture's alternating 255 and 63 BPM sections, which
+  is recorded as `C2-MOD-001` in `conformance/known-failures.md`.
 - Startrekker AM-synth tests require a separate sibling `.NT` / `.AS` parameter file and
   a synthesizer/envelope path. The slice-based facade intentionally receives only the
   `.mod` bytes; ordinary `FLT4` PCM modules remain supported, but the five `flt_am_*`

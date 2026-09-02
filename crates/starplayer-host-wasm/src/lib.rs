@@ -33,7 +33,8 @@ use std::vec;
 use std::vec::Vec;
 
 use command::{CommandRing, WireCommand};
-use starplayer::core::{ChannelId, Command, ExactFixedPoint, Frame, Interpolator, U0F16};
+use starplayer::core::quirks::QuirkSelection;
+use starplayer::core::{ChannelId, Command, Frame, Interpolator, TempoModelId, U0F16};
 use starplayer::dsp::{GainRamp, Interpolate, Linear, Nearest};
 use starplayer::engine::{Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode, OutputDepth, PatternSequencer, RENDER_QUANTUM};
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
@@ -75,9 +76,12 @@ const TELEMETRY_CHANNEL_WORDS: usize = 8;
 const TELEMETRY_CHANNELS: usize = 64;
 const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
 
-type S3mSequencer = PatternSequencer<ExactFixedPoint, S3mProcessor, S3mPatternData>;
-type ModSequencer = PatternSequencer<ExactFixedPoint, ModProcessor, ModPatternData>;
-type MtmSequencer = PatternSequencer<ExactFixedPoint, MtmProcessor, MtmPatternData>;
+// `TempoModelId` rather than a zero-sized model: the module's resolved `QuirkSet` chooses
+// the tempo model along with everything else, so the host cannot pin one here. It
+// dispatches through a `match` at tick rate, around 50 Hz.
+type S3mSequencer = PatternSequencer<TempoModelId, S3mProcessor, S3mPatternData>;
+type ModSequencer = PatternSequencer<TempoModelId, ModProcessor, ModPatternData>;
+type MtmSequencer = PatternSequencer<TempoModelId, MtmProcessor, MtmPatternData>;
 type BuiltSource = (Box<dyn EventSource>, Rc<Cell<SeekRequest>>);
 
 const DITHER_SEED: u32 = 0x5354_4152;
@@ -303,10 +307,12 @@ fn quantize_fixed_sample(value: i32, depth: OutputDepth, dither: &mut Dither) ->
 }
 
 fn source_for(module: Arc<Module>, sample_rate_hz: u32, order: u16, frame: Frame) -> Result<BuiltSource, String> {
+    // The file's own dialect decides the quirks; the web player exposes no override yet.
+    let quirks = QuirkSelection::FromDialect;
     let mut sequencer = match module.header().format {
-        ModuleFormat::S3m => NativeSequencer::S3m(starplayer::s3m::sequencer_for(module, sample_rate_hz, ExactFixedPoint)),
-        ModuleFormat::Mod => NativeSequencer::Mod(starplayer::mod_file::sequencer_for(module, sample_rate_hz, ExactFixedPoint)),
-        ModuleFormat::Mtm => NativeSequencer::Mtm(starplayer::mtm::sequencer_for(module, sample_rate_hz, ExactFixedPoint)),
+        ModuleFormat::S3m => NativeSequencer::S3m(starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks)),
+        ModuleFormat::Mod => NativeSequencer::Mod(starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks)),
+        ModuleFormat::Mtm => NativeSequencer::Mtm(starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks)),
         _ => return Err(String::from("the module format has no web-audio processor")),
     };
     sequencer.seek_order(order);

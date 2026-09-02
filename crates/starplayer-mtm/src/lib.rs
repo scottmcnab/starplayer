@@ -18,7 +18,7 @@ pub mod processor;
 
 pub use loader::{TempoMode, load, load_from, probe, probe_reader, tempo_mode, track_count};
 pub use pattern::{CELL_BYTES, MtmCell, PatternView, ROWS};
-pub use processor::{MtmPatternData, MtmProcessor, sequencer_for};
+pub use processor::{MtmPatternData, MtmProcessor, sequencer_for, sequencer_with_quirks};
 
 pub use starplayer_core::Error;
 pub use starplayer_model::Module;

@@ -4,6 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use starplayer_core::fixed::{bipolar_from_ratio, unit_from_ratio};
+use starplayer_core::quirks::FormatDialect;
 use starplayer_core::{Error, I1F15, U0F16};
 use starplayer_model::{InstrumentDef, LoopMode, Module, ModuleBuilder, ModuleFlags, ModuleFormat, ModuleHeader, ModuleReader, ORDER_END, SampleSpec};
 
@@ -73,11 +74,14 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
     let pattern_bytes = (pattern_count as u64)
         .checked_mul(ROWS as u64).and_then(|value| value.checked_mul(channels as u64)).and_then(|value| value.checked_mul(CELL_BYTES as u64))
         .and_then(|value| usize::try_from(value).ok()).ok_or(Error::TooLarge("MOD pattern data"))?;
-    let sample_data_offset = HEADER_BYTES.checked_add(pattern_bytes).ok_or(Error::TooLarge("MOD data offset"))?;
-    if sample_data_offset > source.len() { return Err(Error::Truncated { offset: HEADER_BYTES, needed: pattern_bytes }); }
+    // Digital Tracker writes four more bytes after the tag — always `00 40 00 00` — before
+    // the pattern data (libxmp `mod_load.c:533-539` skips them the same way).
+    let pattern_data_offset = HEADER_BYTES + layout.extra_header_bytes;
+    let sample_data_offset = pattern_data_offset.checked_add(pattern_bytes).ok_or(Error::TooLarge("MOD data offset"))?;
+    if sample_data_offset > source.len() { return Err(Error::Truncated { offset: pattern_data_offset, needed: pattern_bytes }); }
 
     let mut builder = ModuleBuilder::new();
-    let pattern_body = source.with_slice(HEADER_BYTES, pattern_bytes, <[u8]>::to_vec)?;
+    let pattern_body = source.with_slice(pattern_data_offset, pattern_bytes, <[u8]>::to_vec)?;
     let pattern_stride = ROWS as usize * channels as usize * CELL_BYTES;
     if layout.paired_four_channel_patterns {
         // Startrekker FLT8 stores channels 0..3 for all 64 rows, then channels 4..7
@@ -148,31 +152,63 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
         master_volume: U0F16::MAX,
         default_pan: default_pan(channels, options.stereo_separation),
         flags: ModuleFlags { amiga_limits, linear_slides: false, fast_volume_slides: false, stereo: options.stereo_separation.get() != 0 },
+        dialect: layout.dialect,
         format_extra: 0,
     });
     builder.build()
 }
 
+/// What one accepted four-byte tag says about a file: how many channels it has, how its
+/// patterns are stored, how many bytes sit between the tag and the pattern data, and which
+/// tracker wrote it.
 #[derive(Copy, Clone)]
 struct ModLayout {
     channels: u8,
     paired_four_channel_patterns: bool,
+    /// Bytes between the end of the 1084-byte header and the pattern data. Four for
+    /// Digital Tracker, zero for everything else.
+    extra_header_bytes: usize,
+    dialect: FormatDialect,
 }
 
+impl ModLayout {
+    const fn plain(channels: u8, dialect: FormatDialect) -> ModLayout {
+        ModLayout { channels, paired_four_channel_patterns: false, extra_header_bytes: 0, dialect }
+    }
+}
+
+/// The accepted tag table, mirroring libxmp's `mod_magic[]`
+/// (`src/loaders/mod_load.c:76-95`).
+///
+/// `.M.K` — Software Visions DMF — is deliberately **not** here: its first 2108 bytes are
+/// word-flipped to little endian and reading it needs a byte-order pass, not a tag entry.
 fn layout(magic: &[u8]) -> Option<ModLayout> {
     match magic {
         // `M!K!` is what ProTracker itself writes once a module exceeds 64 patterns.
-        b"M.K." | b"M!K!" | b"FLT4" => Some(ModLayout { channels: 4, paired_four_channel_patterns: false }),
-        b"6CHN" => Some(ModLayout { channels: 6, paired_four_channel_patterns: false }),
-        b"8CHN" => Some(ModLayout { channels: 8, paired_four_channel_patterns: false }),
-        b"FLT8" => Some(ModLayout { channels: 8, paired_four_channel_patterns: true }),
+        b"M.K." | b"M!K!" => Some(ModLayout::plain(4, FormatDialect::ProTracker)),
+        // Noisetracker and the ProTracker 3.x family. Played as ProTracker; the dialect is
+        // recorded because libxmp's timing heuristics key off it.
+        b"M&K!" | b"N.T." | b"LARD" | b"NSMS" => Some(ModLayout::plain(4, FormatDialect::ProTracker3)),
+        b"FLT4" => Some(ModLayout::plain(4, FormatDialect::Startrekker)),
+        b"FLT8" => Some(ModLayout { channels: 8, paired_four_channel_patterns: true, extra_header_bytes: 0, dialect: FormatDialect::Startrekker }),
+        b"6CHN" => Some(ModLayout::plain(6, FormatDialect::FastTracker)),
+        b"8CHN" => Some(ModLayout::plain(8, FormatDialect::FastTracker)),
+        // Atari Octalyser. Accepted together with its pattern-loop dialect, never before.
+        b"CD61" => Some(ModLayout::plain(6, FormatDialect::Octalyser)),
+        b"CD81" => Some(ModLayout::plain(8, FormatDialect::Octalyser)),
+        // Atari Digital Tracker, whose header carries four more bytes (`00 40 00 00`).
+        b"FA04" => Some(ModLayout { channels: 4, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
+        b"FA06" => Some(ModLayout { channels: 6, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
+        b"FA08" => Some(ModLayout { channels: 8, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
+        // TakeTracker's one- to four-channel tags.
+        [b'T', b'D', b'Z', digit @ b'1'..=b'4'] => Some(ModLayout::plain(digit - b'0', FormatDialect::FastTracker)),
         [tens, ones, b'C', b'H'] if tens.is_ascii_digit() && ones.is_ascii_digit() => {
             let count = (tens - b'0') * 10 + (ones - b'0');
-            (count > 0 && count <= 32).then_some(ModLayout { channels: count, paired_four_channel_patterns: false })
+            (count > 0 && count <= 32).then_some(ModLayout::plain(count, FormatDialect::FastTracker))
         }
         // Single-digit `dCHN`, the form several trackers write for 1..9 channels.
         [digit, b'C', b'H', b'N'] if digit.is_ascii_digit() && *digit != b'0' => {
-            Some(ModLayout { channels: digit - b'0', paired_four_channel_patterns: false })
+            Some(ModLayout::plain(digit - b'0', FormatDialect::FastTracker))
         }
         _ => None,
     }
@@ -370,9 +406,67 @@ mod tests {
         assert!(probe(&five));
         assert_eq!(load(&five).expect("single-digit CHN").header().channel_count, 5);
 
-        let mut octalyser = minimal_mod();
-        octalyser[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(b"CD61");
-        assert!(!probe(&octalyser), "tracker dialects stay outside the tag set until C5 owns their behaviour");
+        let mut protracker3 = minimal_mod();
+        protracker3[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(b"M&K!");
+        assert!(probe(&protracker3));
+        let loaded = load(&protracker3).expect("a Noisetracker / ProTracker 3 tag");
+        assert_eq!(loaded.header().channel_count, 4);
+        assert_eq!(loaded.header().dialect, FormatDialect::ProTracker3);
+    }
+
+    /// C5 deliverable 2: one loading test per accepted tag, asserting channel count and
+    /// dialect. The Octalyser and Digital Tracker tags are accepted **in the same change**
+    /// that gives them their pattern-loop dialect, never before.
+    #[test]
+    fn every_accepted_tag_loads_with_its_channel_count_and_dialect() {
+        for (tag, channels, dialect) in [
+            (b"M.K.", 4u8, FormatDialect::ProTracker),
+            (b"M!K!", 4, FormatDialect::ProTracker),
+            (b"M&K!", 4, FormatDialect::ProTracker3),
+            (b"N.T.", 4, FormatDialect::ProTracker3),
+            (b"LARD", 4, FormatDialect::ProTracker3),
+            (b"NSMS", 4, FormatDialect::ProTracker3),
+            (b"FLT4", 4, FormatDialect::Startrekker),
+            (b"CD61", 6, FormatDialect::Octalyser),
+            (b"CD81", 8, FormatDialect::Octalyser),
+            (b"FA04", 4, FormatDialect::DigitalTracker),
+            (b"FA06", 6, FormatDialect::DigitalTracker),
+            (b"FA08", 8, FormatDialect::DigitalTracker),
+            (b"6CHN", 6, FormatDialect::FastTracker),
+            (b"8CHN", 8, FormatDialect::FastTracker),
+            (b"TDZ1", 1, FormatDialect::FastTracker),
+            (b"TDZ3", 3, FormatDialect::FastTracker),
+            (b"5CHN", 5, FormatDialect::FastTracker),
+            (b"16CH", 16, FormatDialect::FastTracker),
+        ] {
+            // Digital Tracker keeps four more header bytes before the pattern data.
+            let extra = if tag[0] == b'F' && tag[1] == b'A' { 4 } else { 0 };
+            let mut bytes = vec![0; HEADER_BYTES + extra + ROWS as usize * channels as usize * CELL_BYTES];
+            bytes[SONG_LENGTH_OFFSET] = 1;
+            bytes[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(tag);
+            let name = core::str::from_utf8(tag).unwrap_or("?");
+            assert!(probe(&bytes), "{name} probes");
+            let module = load(&bytes).unwrap_or_else(|error| panic!("{name} loads: {error:?}"));
+            assert_eq!(module.header().channel_count, channels, "{name} channel count");
+            assert_eq!(module.header().dialect, dialect, "{name} dialect");
+        }
+        assert!(!probe(&vec![0; HEADER_BYTES]), "an unrecognised tag is still rejected");
+    }
+
+    /// Digital Tracker writes `00 40 00 00` between the tag and the pattern data; reading
+    /// the patterns four bytes early would decode the whole module wrongly.
+    #[test]
+    fn a_digital_tracker_file_skips_the_four_bytes_after_its_tag() {
+        let pattern_stride = ROWS as usize * 4 * CELL_BYTES;
+        let mut bytes = vec![0; HEADER_BYTES + 4 + pattern_stride];
+        bytes[SONG_LENGTH_OFFSET] = 1;
+        bytes[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(b"FA04");
+        bytes[MAGIC_OFFSET + 4..MAGIC_OFFSET + 8].copy_from_slice(&[0x00, 0x40, 0x00, 0x00]);
+        bytes[HEADER_BYTES + 4..HEADER_BYTES + 8].copy_from_slice(&ModCell { period: 428, instrument: 1, ..ModCell::EMPTY }.to_bytes());
+
+        let module = load(&bytes).expect("Digital Tracker MOD");
+        let pattern = crate::PatternView::new(&module, starplayer_model::PatternId(0)).expect("pattern 0");
+        assert_eq!(pattern.cell(0, 0).map(|cell| cell.period), Some(428), "the pattern data starts at 1088, not 1084");
     }
 
     #[test]

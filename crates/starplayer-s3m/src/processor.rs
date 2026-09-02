@@ -10,8 +10,9 @@ use alloc::vec;
 
 use starplayer_core::fixed::unit_from_ratio;
 use starplayer_core::tables::{PERIOD_TABLE, ST3_FREQUENCY_NUMERATOR, ST3_PERIOD_SCALE, waveform_sample};
-use starplayer_core::{ChannelId, DirtyBits, Frame, InstrumentId, Note, Step, TempoModel, U0F16, VoiceParams};
-use starplayer_engine::{EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
+use starplayer_core::quirks::{QuirkSelection, QuirkSet};
+use starplayer_core::{ChannelId, DirtyBits, Frame, InstrumentId, Note, Step, TempoModel, TempoModelId, U0F16, VoiceParams};
+use starplayer_engine::{EndOfSongPolicy, OrderEntry, PatternData, PatternFlowState, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
 #[cfg(any(feature = "trace", test))]
 use starplayer_engine::TraceChannelState;
 use starplayer_mixer::{LoopSpan, SampleRegion, VoiceTag};
@@ -146,35 +147,51 @@ pub struct S3mProcessor {
     sample_rate_hz: u32,
     global_volume: u8,
     amiga_limits: bool,
-    pattern_loop_start: u16,
-    pattern_loop_count: u8,
-    /// D30: an `SBx` that jumps this row cancels any `Bxx`/`Cxx` already seen on it and
-    /// blocks any that follow, whichever channel they sit on.
-    pattern_loop_jumped: bool,
+    /// The replay behaviour this module was loaded with. Resolved once, at construction,
+    /// and never written again — see [`starplayer_core::quirks`].
+    quirks: QuirkSet,
+    /// `SB0`/`SBx`, `Bxx` and `Cxx` bookkeeping under the module's
+    /// [`S3mLoopDialect`](starplayer_core::quirks::S3mLoopDialect). D30 is the ST3.21
+    /// baseline it defaults to.
+    flow: PatternFlowState,
     last_order: Option<(u16, u16)>,
 }
 
 impl S3mProcessor {
+    /// An ST3 processor whose quirks come from the dialect the loader detected.
     pub fn new(module: Arc<Module>, sample_rate_hz: u32) -> S3mProcessor {
+        S3mProcessor::with_quirks(module, sample_rate_hz, QuirkSelection::FromDialect)
+    }
+
+    /// An ST3 processor with an explicit [`QuirkSelection`]: `FromDialect` takes the
+    /// loader's answer, `Override` takes the host's.
+    pub fn with_quirks(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection) -> S3mProcessor {
         let header = module.header();
+        let quirks = quirks.resolve(header.dialect);
         let global_volume = ((header.global_volume.to_bits() as u32 * 64 + 32767) / 65535) as u8;
         let mut states = VecBuilder::new();
         for index in 0..header.channel_count {
             let pan = header.default_pan.get(index as usize).copied().map(pan_to_nibble).unwrap_or(crate::header::PAN_CENTRE);
             states.push(S3mChannel::new(index, pan));
         }
+        let header_channel_count = header.channel_count as usize;
         S3mProcessor {
             amiga_limits: header.flags.amiga_limits,
             module,
             channels: states.finish(),
             sample_rate_hz,
             global_volume,
-            pattern_loop_start: 0,
-            pattern_loop_count: 0,
-            pattern_loop_jumped: false,
+            quirks,
+            flow: PatternFlowState::new(quirks.s3m_pattern_loop.flow(), header_channel_count),
             last_order: None,
         }
     }
+
+    /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
+    pub const fn quirks(&self) -> QuirkSet { self.quirks }
+
+    /// The pattern-loop and break/jump bookkeeping, for inspection by a host or a test.
+    pub const fn pattern_flow(&self) -> &PatternFlowState { &self.flow }
 
     pub fn channels(&self) -> &[S3mChannel] { &self.channels }
     pub fn channel(&self, channel: u8) -> Option<&S3mChannel> { self.channels.get(channel as usize) }
@@ -289,19 +306,12 @@ impl S3mProcessor {
             1 if cell.info != 0 => { outcome.speed = cell.info; self.clear_minor(channel_index); }
             // Analysis §4, S_FX_B (2782). Preserve Cxx's row when both share a row.
             2 => {
-                if !self.pattern_loop_jumped {
-                    let break_row = outcome.jump.filter(|jump| !jump.within_pattern).and_then(|jump| jump.row);
-                    outcome.jump = Some(match break_row { Some(row) => Jump::to_order_row(cell.info as u16, row), None => Jump::to_order(cell.info as u16) });
-                }
+                self.flow.pattern_jump(cell.info as u16);
                 self.clear_minor(channel_index);
             }
             // Analysis §4, S_FX_C (2792). The packed byte is decimal, not hexadecimal.
             3 => {
-                if !self.pattern_loop_jumped {
-                    let row = (cell.info >> 4) as u16 * 10 + (cell.info & 15) as u16;
-                    let jump_order = outcome.jump.filter(|jump| !jump.within_pattern).and_then(|jump| jump.order);
-                    outcome.jump = Some(match jump_order { Some(order) => Jump::to_order_row(order, row), None => Jump::break_to_row(row) });
-                }
+                self.flow.pattern_break((cell.info >> 4) as u16 * 10 + (cell.info & 15) as u16);
                 self.clear_minor(channel_index);
             }
             // Analysis §4, S_FX_D (2805).
@@ -430,21 +440,7 @@ impl S3mProcessor {
             // towards the parameter, never advances the target, and lets a later channel's
             // `Bxx` replace the loop jump.
             11 => {
-                if value == 0 {
-                    self.pattern_loop_start = row;
-                } else if self.pattern_loop_count == 0 {
-                    self.pattern_loop_count = value;
-                    outcome.jump = Some(Jump::within_pattern_to_row(self.pattern_loop_start));
-                    self.pattern_loop_jumped = true;
-                } else {
-                    self.pattern_loop_count -= 1;
-                    if self.pattern_loop_count != 0 {
-                        outcome.jump = Some(Jump::within_pattern_to_row(self.pattern_loop_start));
-                        self.pattern_loop_jumped = true;
-                    } else {
-                        self.pattern_loop_start = row.saturating_add(1);
-                    }
-                }
+                self.flow.pattern_loop(channel_index, row, value);
                 self.clear_minor(channel_index);
             }
             // Analysis §4, S_FX_S SCx (3126) and M_FX_S (3479): delayed note cut.
@@ -771,13 +767,13 @@ impl TrackerProcessor for S3mProcessor {
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, 64));
         let mut outcome = context.outcome();
         // D30: every position change resets the one global loop target and counter
-        // (OpenMPT `LoopReset.s3m`).
+        // (OpenMPT `LoopReset.s3m`). ModPlug 1.16 and Imago Orpheus differ, so the rule
+        // lives in the dialect's `PatternFlow` rather than here.
         if self.last_order.is_some_and(|position| position != (row.order, row.pattern)) {
-            self.pattern_loop_start = 0;
-            self.pattern_loop_count = 0;
+            self.flow.position_changed();
         }
         self.last_order = Some((row.order, row.pattern));
-        self.pattern_loop_jumped = false;
+        self.flow.begin_row();
         self.reset_row();
         let channel_count = core::cmp::min(self.channels.len(), row.bytes.len() / CELL_BYTES);
         for channel_index in 0..channel_count {
@@ -787,6 +783,7 @@ impl TrackerProcessor for S3mProcessor {
             self.static_effect(context, channel_index, cell, &mut outcome);
             self.clip_pitch(channel_index);
         }
+        outcome.jump = self.flow.jump();
         for channel_index in 0..self.channels.len() { self.flush_channel(context, channel_index); }
         #[cfg(feature = "trace")]
         self.report_trace_channels(context);
@@ -802,10 +799,8 @@ impl TrackerProcessor for S3mProcessor {
             let pan = header.default_pan.get(channel_index).copied().map(pan_to_nibble).unwrap_or(crate::header::PAN_CENTRE);
             self.channels[channel_index] = S3mChannel::new(channel_index as u8, pan);
         }
-        self.pattern_loop_start = 0;
-        self.pattern_loop_count = 0;
+        self.flow.reset();
         self.last_order = None;
-        self.pattern_loop_jumped = false;
     }
 
     /// D33: every `SEx` repeat of a row is another first tick in ST3, so the row's
@@ -815,6 +810,7 @@ impl TrackerProcessor for S3mProcessor {
     fn row_repeat(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, 64));
         let mut outcome = context.outcome();
+        self.flow.begin_row();
         self.reset_row();
         let channel_count = core::cmp::min(self.channels.len(), row.bytes.len() / CELL_BYTES);
         for channel_index in 0..channel_count {
@@ -823,6 +819,7 @@ impl TrackerProcessor for S3mProcessor {
             self.static_effect(context, channel_index, cell, &mut outcome);
             self.clip_pitch(channel_index);
         }
+        outcome.jump = self.flow.jump();
         for channel_index in 0..self.channels.len() { self.flush_channel(context, channel_index); }
         #[cfg(feature = "trace")]
         self.report_trace_channels(context);
@@ -844,16 +841,37 @@ impl TrackerProcessor for S3mProcessor {
 }
 
 /// Build the public S3M sequencer with header speed, tempo, global volume and pan state.
+///
+/// The quirks come from the [`FormatDialect`](starplayer_core::quirks::FormatDialect) the
+/// loader stored in the module header; the tempo model is the caller's.
+/// [`sequencer_with_quirks`] is the form that takes both from one [`QuirkSelection`].
 pub fn sequencer_for<Tempo: TempoModel>(module: Arc<Module>, sample_rate_hz: u32, tempo_model: Tempo) -> PatternSequencer<Tempo, S3mProcessor, S3mPatternData> {
-    let settings = SequencerSettings {
+    let settings = sequencer_settings(&module, sample_rate_hz);
+    PatternSequencer::new(tempo_model, S3mPatternData(Arc::clone(&module)), S3mProcessor::new(module, sample_rate_hz), settings)
+}
+
+/// Build the public S3M sequencer under an explicit [`QuirkSelection`].
+///
+/// The selection is resolved once, against the loader-detected dialect, and supplies both
+/// the effect processor's quirks and the tempo model — so a host that asks for
+/// `QuirkSet::starplayer_classic()` gets the original's truncating tick length as well as
+/// its effect behaviour, from one argument.
+pub fn sequencer_with_quirks(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection) -> PatternSequencer<TempoModelId, S3mProcessor, S3mPatternData> {
+    let resolved = quirks.resolve(module.header().dialect);
+    let settings = sequencer_settings(&module, sample_rate_hz);
+    let processor = S3mProcessor::with_quirks(Arc::clone(&module), sample_rate_hz, QuirkSelection::Override(resolved));
+    PatternSequencer::new(resolved.tempo_model, S3mPatternData(module), processor, settings)
+}
+
+fn sequencer_settings(module: &Module, sample_rate_hz: u32) -> SequencerSettings {
+    SequencerSettings {
         sample_rate_hz,
         first_tick_frame: Frame::ZERO,
         initial_speed: module.header().initial_speed,
         initial_tempo_bpm: module.header().initial_tempo,
         restart_order: 0,
         end_of_song: EndOfSongPolicy::Loop,
-    };
-    PatternSequencer::new(tempo_model, S3mPatternData(Arc::clone(&module)), S3mProcessor::new(module, sample_rate_hz), settings)
+    }
 }
 
 fn period_from_note(note: u8, reference_rate_hz: u32) -> u32 {
@@ -895,17 +913,20 @@ impl<T> VecBuilder<T> {
 mod tests {
     use super::*;
     use crate::ROWS;
+    use starplayer_core::quirks::S3mLoopDialect;
     use starplayer_core::{Frame, RowClock};
-    use starplayer_engine::{ChannelTable, SongPosition};
+    use starplayer_engine::{ChannelTable, Jump, SongPosition};
     use starplayer_mixer::VoicePool;
     use starplayer_model::{InstrumentDef, ModuleBuilder, ModuleFormat, ModuleHeader, SampleSpec};
 
-    fn processor() -> S3mProcessor {
+    fn processor() -> S3mProcessor { S3mProcessor::new(one_channel_module(), 44_100) }
+
+    fn one_channel_module() -> Arc<Module> {
         let mut builder = ModuleBuilder::new();
         builder.add_pattern(&vec![255u8; ROWS as usize * CELL_BYTES], ROWS, 1).expect("one fixed-stride pattern");
         builder.set_orders(&[0, starplayer_model::ORDER_END]);
         builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
-        S3mProcessor::new(Arc::new(builder.build().expect("valid module")), 44_100)
+        Arc::new(builder.build().expect("valid module"))
     }
 
     fn with_context(test: impl FnOnce(&mut S3mProcessor, &mut TickContext<'_>)) {
@@ -998,7 +1019,7 @@ mod tests {
         with_context(|processor, context| {
             let mut outcome = context.outcome();
             processor.static_effect(context, 0, S3mCell { command: 3, info: 0x10, ..S3mCell::EMPTY }, &mut outcome);
-            assert_eq!(outcome.jump, Some(Jump::break_to_row(10)));
+            assert_eq!(processor.pattern_flow().jump(), Some(Jump::break_to_row(10)));
             processor.static_effect(context, 0, S3mCell { command: 1, info: 0, ..S3mCell::EMPTY }, &mut outcome);
             assert_eq!(outcome.speed, 6, "D6: A00 does not stall the clock");
         });
@@ -1087,7 +1108,7 @@ mod tests {
             processor.static_special(0, 0x8E, 7, &mut outcome);
             assert_eq!(processor.channels[0].pan_position, 14);
             processor.static_special(0, 0xB0, 7, &mut outcome);
-            assert_eq!(processor.pattern_loop_start, 7);
+            assert_eq!(processor.pattern_flow().start(0), 7);
             processor.static_special(0, 0xC2, 7, &mut outcome);
             assert_eq!(processor.channels[0].special_value, 2);
             processor.channels[0].pending_dirty = DirtyBits::VOLUME | DirtyBits::PAN;
@@ -1105,29 +1126,28 @@ mod tests {
     fn a_loop_jump_cancels_a_break_or_jump_on_the_same_row_in_either_channel_order() {
         with_context(|processor, context| {
             // D30: `SBx` first, then `Bxx` on a later channel — the jump is blocked.
-            processor.pattern_loop_start = 4;
             let mut outcome = context.outcome();
-            processor.static_special(0, 0xB1, 7, &mut outcome);
-            assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(4)));
+            processor.static_special(0, 0xB0, 4, &mut outcome);
+            processor.static_special(0, 0xB2, 7, &mut outcome);
+            assert_eq!(processor.pattern_flow().jump(), Some(Jump::within_pattern_to_row(4)));
             processor.static_effect(context, 0, S3mCell { command: 2, info: 3, ..S3mCell::EMPTY }, &mut outcome);
-            assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(4)), "D30: a loop jump blocks a Bxx that follows it on the row");
+            assert_eq!(processor.pattern_flow().jump(), Some(Jump::within_pattern_to_row(4)), "D30: a loop jump blocks a Bxx that follows it on the row");
 
             // `Cxx` first, then `SBx` — the break is cancelled.
-            processor.pattern_loop_count = 0;
-            processor.pattern_loop_jumped = false;
+            processor.flow.begin_row();
             let mut outcome = context.outcome();
             processor.static_effect(context, 0, S3mCell { command: 3, info: 0x12, ..S3mCell::EMPTY }, &mut outcome);
             processor.static_special(0, 0xB1, 7, &mut outcome);
-            assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(4)), "D30: a loop jump cancels a Cxx already seen on the row");
+            assert_eq!(processor.pattern_flow().jump(), Some(Jump::within_pattern_to_row(4)), "D30: a loop jump cancels a Cxx already seen on the row");
 
             // The iteration that ends the loop lets the break through again.
-            processor.pattern_loop_jumped = false;
+            processor.flow.begin_row();
             let mut outcome = context.outcome();
             processor.static_special(0, 0xB1, 7, &mut outcome);
-            assert_eq!(outcome.jump, None, "the final SBx iteration produces no jump");
-            assert_eq!(processor.pattern_loop_start, 8, "D30: the loop target advances past the SBx row when the loop ends");
+            assert_eq!(processor.pattern_flow().jump(), None, "the final SBx iteration produces no jump");
+            assert_eq!(processor.pattern_flow().start(0), 8, "D30: the loop target advances past the SBx row when the loop ends");
             processor.static_effect(context, 0, S3mCell { command: 2, info: 3, ..S3mCell::EMPTY }, &mut outcome);
-            assert_eq!(outcome.jump, Some(Jump::to_order(3)), "a Bxx on the terminating row is honoured");
+            assert_eq!(processor.pattern_flow().jump(), Some(Jump::to_order_row(3, 0)), "a Bxx on the terminating row is honoured");
         });
     }
 
@@ -1138,14 +1158,32 @@ mod tests {
             // one iteration of it, rather than each one restarting its own count.
             let mut outcome = context.outcome();
             processor.static_special(0, 0xB4, 13, &mut outcome);
-            assert_eq!(processor.pattern_loop_count, 4, "the first SBx stores its own parameter");
+            assert_eq!(processor.pattern_flow().count(0), 4, "the first SBx stores its own parameter");
             for expected in [3, 2, 1] {
                 processor.static_special(0, 0xB1, 13, &mut outcome);
-                assert_eq!(processor.pattern_loop_count, expected, "each further SBx on the row spends one iteration");
+                assert_eq!(processor.pattern_flow().count(0), expected, "each further SBx on the row spends one iteration");
             }
-            assert_eq!(outcome.jump, Some(Jump::within_pattern_to_row(0)));
+            assert_eq!(processor.pattern_flow().jump(), Some(Jump::within_pattern_to_row(0)));
             let _ = context;
         });
+    }
+
+    /// The dialect fields are per module: the same processor code plays a ModPlug 1.16 or
+    /// Imago Orpheus S3M by a different set of flow rules, chosen once at construction.
+    #[test]
+    fn the_s3m_loop_dialect_changes_the_flow_rules_the_processor_runs() {
+        for (dialect, expected) in [
+            (S3mLoopDialect::ScreamTracker321, true),
+            (S3mLoopDialect::ScreamTracker301, false),
+            (S3mLoopDialect::ModPlug116, true),
+            (S3mLoopDialect::ImagoOrpheus, false),
+        ] {
+            let quirks = QuirkSet { s3m_pattern_loop: dialect, ..QuirkSet::canonical() };
+            let module = one_channel_module();
+            let processor = S3mProcessor::with_quirks(module, 44_100, QuirkSelection::Override(quirks));
+            assert_eq!(processor.quirks().s3m_pattern_loop, dialect);
+            assert_eq!(processor.pattern_flow().flow().delay_jump, expected, "{dialect:?} blocks a later Bxx");
+        }
     }
 
     #[test]

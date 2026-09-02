@@ -65,12 +65,18 @@ explicit semantic effect boundary in `starplayer-mod`. The shared core owns only
 ProTracker-compatible commands 0..F and their tick state. No serialized MOD period or
 S3M command enters the MTM path.
 
-The MultiTracker profile differs from ProTracker at these named points:
+The MultiTracker profile differs from ProTracker at these named points. Three of them
+became `QuirkSet` fields in C5 — the loader stores `FormatDialect::MultiTracker` in the
+module header and `QuirkSet::multitracker()` is what that resolves to — so they are now
+data rather than matches on `EffectSemantics`. The rest stay in `EffectSemantics`, because
+they are decoding differences rather than behaviour switches.
 
-- `Dxx` is a hexadecimal row number, not BCD.
-- `F00` is a **no-op**, not ProTracker's "stop the song". libxmp's `fx_s3m_speed` ignores
-  a zero parameter outright and MultiTracker has no stop command; C3b gated the stop arm
-  on `EffectSemantics::ProTracker`.
+- `Dxx` is a hexadecimal row number, not BCD (`mod_break_parameter`).
+- `F00` is a **no-op**, not ProTracker's "stop the song" (`mod_f00_stops_song`). libxmp's
+  `fx_s3m_speed` ignores a zero parameter outright and MultiTracker has no stop command;
+  C3b gated the stop arm on `EffectSemantics::ProTracker` and C5 moved it to the field.
+- There is no queued instrument-column sample swap
+  (`protracker_sample_swap_at_boundary`); see accuracy policy D12 and the MOD notes.
 - `E8x` uses the **loader's 0..15 header pan grid**, not ProTracker's `value << 4` on the
   0..255 domain. libxmp is self-consistent the other way — its MTM loader rewrites `E8x`
   into `FX_SETPAN` with `fxp <<= 4` and its four-bit pan projection divides by 16 again —

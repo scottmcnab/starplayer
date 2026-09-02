@@ -22,7 +22,7 @@ serde = ["starplayer-core/serde", "starplayer-engine/serde", "starplayer-model/s
 trace = ["starplayer-engine/trace"]
 # Reproduce the original DOS player's quirks instead of the canonical
 # behaviour. See plans/product/03-accuracy-policy.md section 2.
-quirks-starplayer = []
+quirks-starplayer = ["starplayer-core/quirks-starplayer"]
 
 [dev-dependencies]
 starplayer-dsp = { workspace = true }

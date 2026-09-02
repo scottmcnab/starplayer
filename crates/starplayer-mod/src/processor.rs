@@ -6,8 +6,9 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use starplayer_core::fixed::{bipolar_from_ratio, unit_from_ratio};
-use starplayer_core::{ChannelId, DirtyBits, Frame, I1F15, InstrumentId, Note, Step, TempoModel, U0F16, VoiceParams};
-use starplayer_engine::{EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
+use starplayer_core::quirks::{BreakParameter, PaulaClock, QuirkSelection, QuirkSet};
+use starplayer_core::{ChannelId, DirtyBits, Frame, I1F15, InstrumentId, Note, Step, TempoModel, TempoModelId, U0F16, VoiceParams};
+use starplayer_engine::{EndOfSongPolicy, OrderEntry, PatternData, PatternFlowState, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
 #[cfg(feature = "trace")]
 use starplayer_engine::TraceChannelState;
 use starplayer_mixer::{LoopSpan, SampleRegion, VoiceTag};
@@ -20,7 +21,6 @@ use crate::tables::{FINETUNE_REFERENCE_RATES, PROTRACKER_PERIODS, extended_perio
 const NO_SAMPLE: u8 = 0;
 const NO_NOTE: u8 = u8::MAX;
 const DEFAULT_PERIOD: u32 = 428;
-const PAULA_PAL_CLOCK_HZ: u64 = 3_546_895;
 const PAULA_MINIMUM_PERIOD: u32 = 113;
 /// Fixed seed for waveform selector 3; see accuracy policy D11.
 const WAVEFORM_RANDOM_SEED: u32 = 0x6D2B_79F5;
@@ -107,8 +107,6 @@ pub struct ModChannel {
     pub finetune: u8,
     pub pan: I1F15,
     pub glissando_enabled: bool,
-    pub pattern_loop_start: u16,
-    pub pattern_loop_count: u8,
     /// Whether this pattern row contains a packed period. Unlike `current_note`, this
     /// is row-local and remains valid across EEx repeats without leaking into a new row.
     pub row_note_present: bool,
@@ -156,8 +154,6 @@ impl ModChannel {
             finetune: 0,
             pan,
             glissando_enabled: false,
-            pattern_loop_start: 0,
-            pattern_loop_count: 0,
             row_note_present: false,
             delayed_note: false,
             offset_past_end: false,
@@ -208,9 +204,16 @@ pub struct ModProcessor {
     waveform_random_state: u32,
     pending_tempo: Option<(u16, usize)>,
     semantics: EffectSemantics,
+    /// The replay behaviour this module was loaded with. Resolved once, at construction,
+    /// and never written again — see [`starplayer_core::quirks`].
+    quirks: QuirkSet,
+    /// `E60`/`E6x`, `Bxx` and `Dxx` bookkeeping under the module's
+    /// [`ModLoopDialect`](starplayer_core::quirks::ModLoopDialect).
+    flow: PatternFlowState,
 }
 
 impl ModProcessor {
+    /// A ProTracker processor whose quirks come from the dialect the loader detected.
     pub fn new(module: Arc<Module>, sample_rate_hz: u32) -> ModProcessor {
         ModProcessor::with_semantics(module, sample_rate_hz, EffectSemantics::ProTracker)
     }
@@ -219,12 +222,26 @@ impl ModProcessor {
     /// vocabulary. The caller remains responsible for a native pattern decoder and a
     /// native [`TrackerProcessor`] wrapper.
     pub fn with_semantics(module: Arc<Module>, sample_rate_hz: u32, semantics: EffectSemantics) -> ModProcessor {
+        // Naming the command semantics names the dialect too: MultiTracker is a dialect
+        // of the MOD command vocabulary, so its quirks come with it rather than depending
+        // on a header field the caller may not have filled in.
+        let quirks = match semantics {
+            EffectSemantics::ProTracker => QuirkSelection::FromDialect,
+            EffectSemantics::MultiTracker { .. } => QuirkSelection::Override(QuirkSet::multitracker()),
+        };
+        ModProcessor::with_semantics_and_quirks(module, sample_rate_hz, semantics, quirks)
+    }
+
+    /// The full constructor: native command semantics plus an explicit [`QuirkSelection`].
+    pub fn with_semantics_and_quirks(module: Arc<Module>, sample_rate_hz: u32, semantics: EffectSemantics, quirks: QuirkSelection) -> ModProcessor {
+        let quirks = quirks.resolve(module.header().dialect);
         let channels = (0..module.header().channel_count).map(|channel| {
             let pan = module.header().channel_pan(channel).unwrap_or(I1F15::ZERO);
             ModChannel::new(channel, pan)
         }).collect::<Vec<_>>().into_boxed_slice();
         ModProcessor {
             amiga_limits: module.header().flags.amiga_limits,
+            flow: PatternFlowState::new(quirks.mod_pattern_loop.flow(), channels.len()),
             module,
             channels,
             sample_rate_hz,
@@ -235,8 +252,15 @@ impl ModProcessor {
             waveform_random_state: WAVEFORM_RANDOM_SEED,
             pending_tempo: None,
             semantics,
+            quirks,
         }
     }
+
+    /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
+    pub const fn quirks(&self) -> QuirkSet { self.quirks }
+
+    /// The pattern-loop and break/jump bookkeeping, for inspection by a host or a test.
+    pub const fn pattern_flow(&self) -> &PatternFlowState { &self.flow }
 
     pub fn channels(&self) -> &[ModChannel] { &self.channels }
     pub fn channel(&self, channel: u8) -> Option<&ModChannel> { self.channels.get(channel as usize) }
@@ -267,7 +291,9 @@ impl ModProcessor {
         // Native MOD cells can encode only 1..=31, while MTM's six-bit field reaches
         // 63. The decoded effect boundary validates against the loaded instrument table
         // instead of imposing MOD's serialized field width on every caller.
-        let protracker = matches!(self.semantics, EffectSemantics::ProTracker);
+        // D12: the queued boundary swap and ProTracker's null-sample reading of an empty
+        // instrument slot are one behaviour, selected by one field.
+        let protracker = self.quirks.protracker_sample_swap_at_boundary;
         if cell.instrument != 0 {
             let instrument_id = InstrumentId((cell.instrument - 1) as u16);
             let resolved = self.module.instrument(instrument_id).and_then(|instrument| instrument.sample)
@@ -359,9 +385,10 @@ impl ModProcessor {
             }
             9 => self.sample_offset(channel_index, note_present, cell.param),
             0xB => {
-                // ProTracker's later-channel Bxx resets a Dxx row already seen.
-                outcome.jump = Some(Jump::to_order(cell.param as u16));
-                self.row_pattern_break = false;
+                // ProTracker's later-channel Bxx resets a Dxx row already seen; the
+                // dialect's `PatternFlow` decides whether it does and whether a loop jump
+                // on the row blocks it.
+                if self.flow.pattern_jump(cell.param as u16) { self.row_pattern_break = false; }
                 self.clear_command(channel_index);
             }
             0xC => {
@@ -369,22 +396,20 @@ impl ModProcessor {
                 self.clear_command(channel_index);
             }
             0xD => {
-                let decoded = match self.semantics {
+                let decoded = match self.quirks.mod_break_parameter {
                     // The packed byte is BCD in ProTracker; invalid results wrap to row zero.
-                    EffectSemantics::ProTracker => (cell.param >> 4) as u16 * 10 + (cell.param & 15) as u16,
+                    BreakParameter::BinaryCodedDecimal => (cell.param >> 4) as u16 * 10 + (cell.param & 15) as u16,
                     // MultiTracker stores the row as an ordinary hexadecimal byte.
-                    EffectSemantics::MultiTracker { .. } => cell.param as u16,
+                    BreakParameter::Hexadecimal => cell.param as u16,
                 };
                 let break_row = if decoded > 63 { 0 } else { decoded };
-                let order = outcome.jump.filter(|jump| !jump.within_pattern).and_then(|jump| jump.order);
-                outcome.jump = Some(order.map(|order| Jump::to_order_row(order, break_row)).unwrap_or_else(|| Jump::break_to_row(break_row)));
-                self.row_pattern_break = true;
+                if self.flow.pattern_break(break_row) { self.row_pattern_break = true; }
                 self.clear_command(channel_index);
             }
             0xE => self.static_extended(channel_index, cell.param, row, outcome),
             // MultiTracker has no "F00 stops the song" rule; libxmp's fx_s3m_speed
             // ignores a zero parameter outright.
-            0xF if cell.param == 0 && matches!(self.semantics, EffectSemantics::ProTracker) => {
+            0xF if cell.param == 0 && self.quirks.mod_f00_stops_song => {
                 outcome.stop = true;
                 self.clear_command(channel_index);
             }
@@ -425,17 +450,7 @@ impl ModProcessor {
             4 => { self.channels[channel_index].vibrato_waveform = value & 7; self.clear_command(channel_index); }
             5 => { self.channels[channel_index].finetune = value; self.clear_command(channel_index); }
             6 => {
-                if value == 0 {
-                    self.channels[channel_index].pattern_loop_start = row;
-                } else if self.channels[channel_index].pattern_loop_count == 0 {
-                    self.channels[channel_index].pattern_loop_count = value;
-                    outcome.jump = Some(Jump::within_pattern_to_row(self.channels[channel_index].pattern_loop_start));
-                } else {
-                    self.channels[channel_index].pattern_loop_count -= 1;
-                    if self.channels[channel_index].pattern_loop_count != 0 {
-                        outcome.jump = Some(Jump::within_pattern_to_row(self.channels[channel_index].pattern_loop_start));
-                    }
-                }
+                self.flow.pattern_loop(channel_index, row, value);
                 self.clear_command(channel_index);
             }
             7 => { self.channels[channel_index].tremolo_waveform = value & 7; self.clear_command(channel_index); }
@@ -653,11 +668,18 @@ impl ModProcessor {
     }
 
     fn tremolo(&mut self, channel_index: usize) {
-        let (selector, phase, depth) = {
+        let (selector, phase, depth, ramp_half_phase) = {
             let state = &self.channels[channel_index];
-            (state.tremolo_waveform, state.tremolo_phase, state.tremolo_memory & 15)
+            // D20: PT's `mt_Tremolo2` picks which half of the ramp to read by testing
+            // `n_vibratopos` rather than `n_tremolopos`. Off under `canonical()`, where
+            // the ramp reads its own phase, which is also what libxmp and OpenMPT do.
+            let ramp_half_phase = match self.quirks.protracker_tremolo_ramp_from_vibrato_phase {
+                true => state.vibrato_phase,
+                false => state.tremolo_phase,
+            };
+            (state.tremolo_waveform, state.tremolo_phase, state.tremolo_memory & 15, ramp_half_phase)
         };
-        let waveform = self.waveform_value(selector, phase);
+        let waveform = self.tremolo_waveform_value(selector, phase, ramp_half_phase);
         let delta = lfo_delta(waveform, depth, 6);
         let state = &mut self.channels[channel_index];
         state.actual_volume = (state.current_volume as i32 + delta).clamp(0, 64) as u8;
@@ -713,6 +735,13 @@ impl ModProcessor {
             return ((random >> 23) as i16 & 511) - 256;
         }
         waveform_value(selector, phase)
+    }
+
+    /// [`Self::waveform_value`], but with the ramp's half chosen by a possibly different
+    /// phase — the one thing PT's tremolo does differently (accuracy policy D20).
+    fn tremolo_waveform_value(&mut self, selector: u8, phase: u8, ramp_half_phase: u8) -> i16 {
+        if selector & 3 != 1 || phase == ramp_half_phase { return self.waveform_value(selector, phase); }
+        ramp_waveform_value(phase, ramp_half_phase)
     }
 
     fn sample_index(&self, channel_index: usize) -> Option<&starplayer_model::SampleIndex> {
@@ -783,7 +812,7 @@ impl ModProcessor {
             self.channels[channel_index].voice_owned = true;
         } else if let Some(voice) = context.channels.foreground(channel_id) {
             let state = &self.channels[channel_index];
-            if dirty.contains(DirtyBits::PITCH) { context.write_voice_param(voice, starplayer_core::VoiceParam::Step(step_from_period(state.actual_period, self.sample_rate_hz, self.amiga_limits))); }
+            if dirty.contains(DirtyBits::PITCH) { context.write_voice_param(voice, starplayer_core::VoiceParam::Step(step_from_period(state.actual_period, self.sample_rate_hz, self.amiga_limits, self.quirks.mod_paula_clock))); }
             if dirty.contains(DirtyBits::VOLUME) { context.write_voice_param(voice, starplayer_core::VoiceParam::Volume(unit_from_ratio(state.actual_volume as u32, 64))); }
             if dirty.contains(DirtyBits::PAN) { context.write_voice_param(voice, starplayer_core::VoiceParam::Pan(state.pan)); }
             if dirty.contains(DirtyBits::TEMPO) { context.mark_voice_dirty(voice, DirtyBits::TEMPO); }
@@ -795,7 +824,7 @@ impl ModProcessor {
     fn voice_params(&self, channel_index: usize, dirty: DirtyBits) -> VoiceParams {
         let state = &self.channels[channel_index];
         VoiceParams {
-            step: step_from_period(state.actual_period, self.sample_rate_hz, self.amiga_limits),
+            step: step_from_period(state.actual_period, self.sample_rate_hz, self.amiga_limits, self.quirks.mod_paula_clock),
             volume: unit_from_ratio(state.actual_volume as u32, 64),
             pan: state.pan,
             dirty,
@@ -839,6 +868,7 @@ impl ModProcessor {
         // previous pattern's mark.
         self.last_pattern = Some(pattern);
         self.row_pattern_break = false;
+        self.flow.begin_row();
         self.reset_row();
         let mut outcome = context.outcome();
         self.apply_pending_tempo(&mut outcome);
@@ -848,6 +878,7 @@ impl ModProcessor {
             let state = &mut self.channels[channel_index];
             state.actual_period = clamp_period(self.amiga_limits, state.finetune, state.actual_period);
         }
+        outcome.jump = self.flow.jump();
         self.finish_row_outcome(order, &mut outcome);
         for channel_index in 0..self.channels.len() {
             self.flush_channel(context, channel_index);
@@ -874,6 +905,7 @@ impl TrackerProcessor for ModProcessor {
         }
         self.last_pattern = None;
         self.row_pattern_break = false;
+        self.flow.reset();
         self.waveform_random_state = WAVEFORM_RANDOM_SEED;
         self.pending_tempo = None;
     }
@@ -895,16 +927,35 @@ impl TrackerProcessor for ModProcessor {
 }
 
 /// Build a public MOD sequencer using ProTracker timing and native period semantics.
+///
+/// The quirks come from the [`FormatDialect`](starplayer_core::quirks::FormatDialect) the
+/// loader stored in the module header; the tempo model is the caller's.
+/// [`sequencer_with_quirks`] is the form that takes both from one [`QuirkSelection`].
 pub fn sequencer_for<Tempo: TempoModel>(module: Arc<Module>, sample_rate_hz: u32, tempo_model: Tempo) -> PatternSequencer<Tempo, ModProcessor, ModPatternData> {
-    let settings = SequencerSettings {
+    let settings = sequencer_settings(&module, sample_rate_hz);
+    PatternSequencer::new(tempo_model, ModPatternData(Arc::clone(&module)), ModProcessor::new(module, sample_rate_hz), settings)
+}
+
+/// Build a public MOD sequencer under an explicit [`QuirkSelection`].
+///
+/// The selection is resolved once, against the loader-detected dialect, and supplies both
+/// the effect processor's quirks and the tempo model.
+pub fn sequencer_with_quirks(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection) -> PatternSequencer<TempoModelId, ModProcessor, ModPatternData> {
+    let resolved = quirks.resolve(module.header().dialect);
+    let settings = sequencer_settings(&module, sample_rate_hz);
+    let processor = ModProcessor::with_semantics_and_quirks(Arc::clone(&module), sample_rate_hz, EffectSemantics::ProTracker, QuirkSelection::Override(resolved));
+    PatternSequencer::new(resolved.tempo_model, ModPatternData(module), processor, settings)
+}
+
+fn sequencer_settings(module: &Module, sample_rate_hz: u32) -> SequencerSettings {
+    SequencerSettings {
         sample_rate_hz,
         first_tick_frame: Frame::ZERO,
         initial_speed: module.header().initial_speed,
         initial_tempo_bpm: module.header().initial_tempo,
         restart_order: 0,
         end_of_song: EndOfSongPolicy::Loop,
-    };
-    PatternSequencer::new(tempo_model, ModPatternData(Arc::clone(&module)), ModProcessor::new(module, sample_rate_hz), settings)
+    }
 }
 
 const PROTRACKER_ARPEGGIO_OVERFLOW: [u16; 15] = [
@@ -950,6 +1001,16 @@ fn glissando_period(finetune: u8, period: u32) -> u32 {
     PROTRACKER_PERIODS[(finetune & 15) as usize][35] as u32
 }
 
+/// PT's ramp waveform with its magnitude read from `phase` and its half chosen by
+/// `half_phase`. The two are the same value everywhere except under accuracy policy D20.
+fn ramp_waveform_value(phase: u8, half_phase: u8) -> i16 {
+    let index = (phase >> 2) & 31;
+    match half_phase < 128 {
+        true => (index << 3) as i16,
+        false => -(255i16.saturating_sub((index << 3) as i16)),
+    }
+}
+
 fn waveform_value(selector: u8, phase: u8) -> i16 {
     let index = ((phase >> 2) & 31) as usize;
     match selector & 3 {
@@ -983,13 +1044,13 @@ fn lfo_delta(waveform: i16, depth: u8, shift: u32) -> i32 {
 /// Amiga's, so it follows the loader's Amiga-limits flag: a four-channel ProTracker module
 /// gets it, while extended-range MODs and MultiTracker — whose top octaves sit below 113
 /// by design and which libxmp plays unclamped — do not.
-fn step_from_period(period: u32, sample_rate_hz: u32, paula_floor: bool) -> Step {
+fn step_from_period(period: u32, sample_rate_hz: u32, paula_floor: bool, clock: PaulaClock) -> Step {
     let hardware_period = match period {
         0 => 65_536,
         period if paula_floor => period.max(PAULA_MINIMUM_PERIOD),
         period => period,
     };
-    Step::from_ratio(PAULA_PAL_CLOCK_HZ, hardware_period as u64 * sample_rate_hz.max(1) as u64)
+    Step::from_ratio(clock.hz(), hardware_period as u64 * sample_rate_hz.max(1) as u64)
 }
 
 fn sample_region(sample: &starplayer_model::SampleIndex) -> SampleRegion {
@@ -1022,7 +1083,7 @@ mod tests {
 
     use super::*;
     use starplayer_core::{ExactFixedPoint, RowClock, VoiceId};
-    use starplayer_engine::{ChannelTable, ControlClock, EngineContext, EventSource, SongPosition};
+    use starplayer_engine::{ChannelTable, ControlClock, EngineContext, EventSource, Jump, SongPosition};
     use starplayer_mixer::VoicePool;
     use starplayer_model::{InstrumentDef, ModuleBuilder, ModuleFormat, ModuleHeader, SampleSpec};
 
@@ -1505,13 +1566,25 @@ mod tests {
 
     #[test]
     fn the_paula_period_floor_and_the_period_zero_rule_apply_at_step_derivation() {
-        assert_eq!(step_from_period(1, 44_100, true), step_from_period(113, 44_100, true), "Paula clamps anything below 113 up to 113");
-        assert_eq!(step_from_period(112, 44_100, true), step_from_period(113, 44_100, true));
-        assert_eq!(step_from_period(0, 44_100, true), Step::from_ratio(PAULA_PAL_CLOCK_HZ, 65_536 * 44_100), "a written zero means 65536, not a DC hold");
-        assert_ne!(step_from_period(0, 44_100, true), Step::ZERO);
-        assert_eq!(step_from_period(428, 44_100, true), Step::from_ratio(PAULA_PAL_CLOCK_HZ, 428 * 44_100), "an ordinary period is unchanged");
-        assert_eq!(step_from_period(56, 44_100, false), Step::from_ratio(PAULA_PAL_CLOCK_HZ, 56 * 44_100), "without Amiga limits (MultiTracker, extended-range MODs) the top octaves stay below 113");
-        assert_eq!(step_from_period(0, 44_100, false), step_from_period(0, 44_100, true), "the zero rule does not depend on the flag");
+        let pal = PaulaClock::Pal;
+        assert_eq!(step_from_period(1, 44_100, true, pal), step_from_period(113, 44_100, true, pal), "Paula clamps anything below 113 up to 113");
+        assert_eq!(step_from_period(112, 44_100, true, pal), step_from_period(113, 44_100, true, pal));
+        assert_eq!(step_from_period(0, 44_100, true, pal), Step::from_ratio(PaulaClock::Pal.hz(), 65_536 * 44_100), "a written zero means 65536, not a DC hold");
+        assert_ne!(step_from_period(0, 44_100, true, pal), Step::ZERO);
+        assert_eq!(step_from_period(428, 44_100, true, pal), Step::from_ratio(PaulaClock::Pal.hz(), 428 * 44_100), "an ordinary period is unchanged");
+        assert_eq!(step_from_period(56, 44_100, false, pal), Step::from_ratio(PaulaClock::Pal.hz(), 56 * 44_100), "without Amiga limits (MultiTracker, extended-range MODs) the top octaves stay below 113");
+        assert_eq!(step_from_period(0, 44_100, false, pal), step_from_period(0, 44_100, true, pal), "the zero rule does not depend on the flag");
+    }
+
+    /// D14: the Paula clock is a `QuirkSet` field, and nothing else about the derivation
+    /// changes with it. No corpus case selects NTSC, so this is the only thing that sees
+    /// the field.
+    #[test]
+    fn the_paula_clock_quirk_selects_the_ntsc_rate_and_nothing_else() {
+        assert_eq!(step_from_period(428, 44_100, true, PaulaClock::Pal), Step::from_ratio(3_546_895, 428 * 44_100));
+        assert_eq!(step_from_period(428, 44_100, true, PaulaClock::Ntsc), Step::from_ratio(3_579_545, 428 * 44_100));
+        assert!(step_from_period(428, 44_100, true, PaulaClock::Ntsc) > step_from_period(428, 44_100, true, PaulaClock::Pal), "NTSC plays a MOD about 0.36 % sharp");
+        assert_eq!(QuirkSet::canonical().mod_paula_clock, PaulaClock::Pal, "the canonical profile is PAL");
     }
 
     #[test]
@@ -1524,10 +1597,10 @@ mod tests {
             processor.row_effects(&mut context, 0, pattern, row, [EffectCell::from(cell)])
         };
         assert_eq!(row_at(&mut processor, 0, 8, ModCell { effect: 0xE, param: 0x60, ..ModCell::EMPTY }).jump, None);
-        assert_eq!(processor.channels[0].pattern_loop_start, 8);
+        assert_eq!(processor.pattern_flow().start(0), 8);
         let jump = row_at(&mut processor, 1, 4, ModCell { effect: 0xE, param: 0x61, ..ModCell::EMPTY }).jump;
         assert_eq!(jump, Some(Jump::within_pattern_to_row(8)), "PT's per-channel n_pattpos persists across a pattern change");
-        assert_eq!(processor.channels[0].pattern_loop_start, 8, "only E60 writes the mark");
+        assert_eq!(processor.pattern_flow().start(0), 8, "only E60 writes the mark");
     }
 
     #[test]
@@ -1535,11 +1608,52 @@ mod tests {
         let mut protracker = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
         assert!(process_row(&mut protracker, ModCell { effect: 0xF, param: 0, ..ModCell::EMPTY }).stop);
 
+        assert!(protracker.quirks().mod_f00_stops_song, "the canonical MOD profile stops on F00");
+
         let mut multitracker = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
         multitracker.semantics = EffectSemantics::MultiTracker { reset_counterpart: true };
+        multitracker.quirks = QuirkSet::multitracker();
         let outcome = process_row(&mut multitracker, ModCell { effect: 0xF, param: 0, ..ModCell::EMPTY });
         assert!(!outcome.stop, "libxmp's fx_s3m_speed ignores F00 outright");
         assert_eq!((outcome.speed, outcome.tempo_bpm), (6, 125), "and it changes neither counterpart");
+    }
+
+    /// The `Dxx` parameter encoding is a `QuirkSet` field, not a branch on the format:
+    /// ProTracker reads `D16` as row 16 and MultiTracker as row 22.
+    #[test]
+    fn the_break_parameter_encoding_field_selects_bcd_or_hexadecimal() {
+        let mut protracker = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        assert_eq!(protracker.quirks().mod_break_parameter, BreakParameter::BinaryCodedDecimal);
+        assert_eq!(process_row(&mut protracker, ModCell { effect: 0xD, param: 0x16, ..ModCell::EMPTY }).jump, Some(Jump::break_to_row(16)));
+        assert_eq!(process_row(&mut protracker, ModCell { effect: 0xD, param: 0x64, ..ModCell::EMPTY }).jump, Some(Jump::break_to_row(0)), "a BCD value past row 63 wraps to row zero");
+
+        let mut multitracker = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        multitracker.quirks = QuirkSet::multitracker();
+        assert_eq!(process_row(&mut multitracker, ModCell { effect: 0xD, param: 0x16, ..ModCell::EMPTY }).jump, Some(Jump::break_to_row(0x16)));
+    }
+
+    /// D20: with the quirk off the tremolo ramp reads its own phase; with it on it takes
+    /// the half from the vibrato phase, which is PT's `mt_Tremolo2` bug. No corpus oracle
+    /// models it, so this test is the only thing that can see the field.
+    #[test]
+    fn the_tremolo_ramp_quirk_reads_the_half_from_the_vibrato_phase() {
+        let mut canonical = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let mut buggy = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        buggy.quirks = QuirkSet { protracker_tremolo_ramp_from_vibrato_phase: true, ..QuirkSet::canonical() };
+        for processor in [&mut canonical, &mut buggy] {
+            processor.channels[0].current_volume = 32;
+            processor.channels[0].actual_volume = 32;
+            processor.channels[0].tremolo_waveform = 1;
+            processor.channels[0].tremolo_memory = 0x0F;
+            // The two phases sit in opposite halves, which is the only case that differs.
+            processor.channels[0].tremolo_phase = 0;
+            processor.channels[0].vibrato_phase = 160;
+        }
+        canonical.tremolo(0);
+        buggy.tremolo(0);
+        assert_eq!(canonical.channels[0].actual_volume, 32, "the ramp's own phase 0 is the bottom of its rising half");
+        assert_eq!(buggy.channels[0].actual_volume, 0, "PT reads the falling half because n_vibratopos is negative");
+        assert!(!QuirkSet::canonical().protracker_tremolo_ramp_from_vibrato_phase, "the bug is off by default");
     }
 
     /// The 8xx byte and libxmp's `fxp << 4` E8x nibble both survive the trip through
@@ -1697,6 +1811,7 @@ mod tests {
     fn multitracker_does_not_queue_a_sample_swap() {
         let module = swap_module();
         let mut processor = ModProcessor::with_semantics(Arc::clone(&module), 44_100, EffectSemantics::MultiTracker { reset_counterpart: true });
+        assert!(!processor.quirks().protracker_sample_swap_at_boundary, "D12 is a QuirkSet field, and MultiTracker's is off");
         let mut harness = ProcessorHarness::new();
         let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
         let region = harness.region().expect("a sounding region");
@@ -1704,6 +1819,15 @@ mod tests {
         assert_eq!(harness.pending_region(), None, "MTM has no queued swap");
         assert_eq!(harness.region(), Some(region), "and does not restart the voice either");
         assert_eq!(processor.channel(0).map(|state| state.sample_number), Some(2));
+
+        // The same module and the same ProTracker command semantics, with the field on:
+        // the field is what decides, not the format.
+        let mut protracker = ModProcessor::with_semantics_and_quirks(module, 44_100, EffectSemantics::MultiTracker { reset_counterpart: true }, QuirkSelection::Override(QuirkSet::canonical()));
+        assert!(protracker.quirks().protracker_sample_swap_at_boundary);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut protracker, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let _ = harness.row(&mut protracker, ModCell { instrument: 2, ..ModCell::EMPTY });
+        assert!(harness.pending_region().is_some(), "with the field on the replacement is queued for the loop point");
     }
 
     #[test]

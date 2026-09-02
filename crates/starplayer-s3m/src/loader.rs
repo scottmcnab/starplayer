@@ -234,6 +234,7 @@ fn song_header<R: ModuleReader + ?Sized>(source: &Source<'_, R>, file_header: &S
             fast_volume_slides: file_header.fast_volume_slides(),
             stereo: file_header.is_stereo(),
         },
+        dialect: file_header.dialect(),
         format_extra: extra.encode(),
     })
 }

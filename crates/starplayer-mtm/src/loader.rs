@@ -161,6 +161,9 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
         // ConvertMTM's dummy period always disabled Amiga limits as a side effect. MTM
         // is a PC tracker format, so state that rule directly instead of reproducing it.
         flags: ModuleFlags { amiga_limits: false, linear_slides: false, fast_volume_slides: false, stereo: true },
+        // MultiTracker is its own dialect of the MOD command vocabulary: `Dxx` is
+        // hexadecimal, `F00` is a no-op and there is no queued sample swap.
+        dialect: starplayer_core::quirks::FormatDialect::MultiTracker,
         format_extra,
     });
     builder.build()

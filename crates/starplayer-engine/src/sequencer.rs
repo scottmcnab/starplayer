@@ -592,6 +592,13 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         sequencer
     }
 
+    /// The tempo model this sequencer's clock runs on.
+    ///
+    /// Chosen when the sequencer was built and fixed for its lifetime, like the module's
+    /// [`QuirkSet`](starplayer_core::quirks::QuirkSet) — which is where a format crate's
+    /// `sequencer_with_quirks` gets it from.
+    pub fn tempo_model(&self) -> &Tempo { self.clock.tempo_model() }
+
     /// Where in the song the *next* tick will be.
     ///
     /// This is the live cursor — the original's `_MCurrentRow` / `_MCurrentPos` /

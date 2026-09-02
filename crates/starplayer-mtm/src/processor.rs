@@ -6,7 +6,8 @@
 //! hexadecimal Dxx, immediate Fxx, optional speed/BPM counterpart resets, no Amiga
 //! period clamp, and no ProTracker double-offset pointer bug.
 
-use starplayer_core::{Frame, TempoModel};
+use starplayer_core::quirks::{FormatDialect, QuirkSelection, QuirkSet};
+use starplayer_core::{Frame, TempoModel, TempoModelId};
 use starplayer_engine::{EndOfSongPolicy, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
 use starplayer_model::{Module, OrderEntry as ModelOrderEntry};
 use starplayer_mod::{EffectCell, EffectNote, EffectSemantics, ModChannel, ModProcessor};
@@ -50,12 +51,28 @@ pub struct MtmProcessor {
 }
 
 impl MtmProcessor {
+    /// An MTM processor whose quirks come from the dialect the loader detected — always
+    /// [`FormatDialect::MultiTracker`](starplayer_core::quirks::FormatDialect::MultiTracker).
     pub fn new(module: Arc<Module>, sample_rate_hz: u32) -> MtmProcessor {
+        MtmProcessor::with_quirks(module, sample_rate_hz, QuirkSelection::FromDialect)
+    }
+
+    /// An MTM processor with an explicit [`QuirkSelection`].
+    ///
+    /// `FromDialect` resolves against [`FormatDialect::MultiTracker`] rather than against
+    /// the module header: an MTM *is* that dialect by construction, and a header assembled
+    /// by a test rather than by the loader is still one.
+    pub fn with_quirks(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection) -> MtmProcessor {
         let reset_counterpart = tempo_mode(&module) == Some(TempoMode::MultiTracker);
+        let semantics = EffectSemantics::MultiTracker { reset_counterpart };
+        let resolved = QuirkSelection::Override(quirks.resolve(FormatDialect::MultiTracker));
         MtmProcessor {
-            effects: ModProcessor::with_semantics(module, sample_rate_hz, EffectSemantics::MultiTracker { reset_counterpart }),
+            effects: ModProcessor::with_semantics_and_quirks(module, sample_rate_hz, semantics, resolved),
         }
     }
+
+    /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
+    pub fn quirks(&self) -> QuirkSet { self.effects.quirks() }
 
     pub fn channels(&self) -> &[ModChannel] { self.effects.channels() }
     pub fn channel(&self, channel: u8) -> Option<&ModChannel> { self.effects.channel(channel) }
@@ -83,16 +100,35 @@ impl TrackerProcessor for MtmProcessor {
 }
 
 /// Build a public MTM sequencer using native pattern data and MultiTracker timing.
+///
+/// The quirks come from the [`FormatDialect`](starplayer_core::quirks::FormatDialect) the
+/// loader stored in the module header; the tempo model is the caller's.
+/// [`sequencer_with_quirks`] is the form that takes both from one [`QuirkSelection`].
 pub fn sequencer_for<Tempo: TempoModel>(module: Arc<Module>, sample_rate_hz: u32, tempo_model: Tempo) -> PatternSequencer<Tempo, MtmProcessor, MtmPatternData> {
-    let settings = SequencerSettings {
+    let settings = sequencer_settings(&module, sample_rate_hz);
+    PatternSequencer::new(tempo_model, MtmPatternData(Arc::clone(&module)), MtmProcessor::new(module, sample_rate_hz), settings)
+}
+
+/// Build a public MTM sequencer under an explicit [`QuirkSelection`].
+///
+/// The selection is resolved once, against the loader-detected dialect, and supplies both
+/// the effect processor's quirks and the tempo model.
+pub fn sequencer_with_quirks(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection) -> PatternSequencer<TempoModelId, MtmProcessor, MtmPatternData> {
+    let resolved = quirks.resolve(FormatDialect::MultiTracker);
+    let settings = sequencer_settings(&module, sample_rate_hz);
+    let processor = MtmProcessor::with_quirks(Arc::clone(&module), sample_rate_hz, QuirkSelection::Override(resolved));
+    PatternSequencer::new(resolved.tempo_model, MtmPatternData(module), processor, settings)
+}
+
+fn sequencer_settings(module: &Module, sample_rate_hz: u32) -> SequencerSettings {
+    SequencerSettings {
         sample_rate_hz,
         first_tick_frame: Frame::ZERO,
         initial_speed: module.header().initial_speed,
         initial_tempo_bpm: module.header().initial_tempo,
         restart_order: 0,
         end_of_song: EndOfSongPolicy::Loop,
-    };
-    PatternSequencer::new(tempo_model, MtmPatternData(Arc::clone(&module)), MtmProcessor::new(module, sample_rate_hz), settings)
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +278,7 @@ mod tests {
     #[test]
     fn f00_is_a_no_op_rather_than_protracker_s_stop() {
         let mut processor = processor(true, 1024);
+        assert_eq!(processor.quirks(), QuirkSet::multitracker(), "an MTM resolves to the MultiTracker dialect whatever the header says");
         let outcome = row(&mut processor, MtmCell { effect: 0xF, param: 0, ..MtmCell::EMPTY });
         assert!(!outcome.stop, "libxmp's fx_s3m_speed ignores F00 and MultiTracker has no stop command");
         assert_eq!((outcome.speed, outcome.tempo_bpm), (6, 125));

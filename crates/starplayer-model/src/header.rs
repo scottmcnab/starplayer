@@ -4,6 +4,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
+use starplayer_core::quirks::FormatDialect;
 use starplayer_core::{I1F15, U0F16};
 
 /// Which file format a module was loaded from.
@@ -75,6 +76,15 @@ pub struct ModuleHeader {
     pub default_pan: Box<[I1F15]>,
     /// Behaviour switches shared across formats.
     pub flags: ModuleFlags,
+    /// Which tracker the loader decided wrote this file, from the header alone.
+    ///
+    /// This is the **default** source of the module's
+    /// [`QuirkSet`](starplayer_core::quirks::QuirkSet): a sequencer resolves a
+    /// [`QuirkSelection`](starplayer_core::quirks::QuirkSelection) against it once, and a
+    /// host that supplies its own quirks overrides it. Set once by the loader and never
+    /// revised; [`FormatDialect::Unknown`] means the header said nothing this loader
+    /// recognises, which resolves to canonical behaviour.
+    pub dialect: FormatDialect,
     /// Format-owned header bits. The format crate that produced the module is the only
     /// thing that may interpret this; the engine passes it through untouched.
     pub format_extra: u32,
@@ -94,6 +104,7 @@ impl ModuleHeader {
             master_volume: U0F16::MAX,
             default_pan: Box::default(),
             flags: ModuleFlags::default(),
+            dialect: FormatDialect::Unknown,
             format_extra: 0,
         }
     }

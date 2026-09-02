@@ -16,3 +16,7 @@ default = []
 std = ["fixed/std"]
 alloc = []
 serde = []
+# Select the original DOS player's own profile as the per-dialect default instead of the
+# canonical one. See plans/product/03-accuracy-policy.md section 2 and
+# `QuirkSet::profile_default`. Pure data: it gates no code and costs nothing at runtime.
+quirks-starplayer = []

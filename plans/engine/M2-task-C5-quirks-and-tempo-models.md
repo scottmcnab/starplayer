@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) |
-| Status | Outstanding |
+| Status | Landed — nine of the ten dialect cases pass; the tenth is `C2-MOD-001`, a harness record |
 | Depends on | C3 (MOD), C3b (ProTracker fidelity repairs), C2a (harness repairs) |
 | Blocks | M2 exit |
 | Parallel with | C6a, C7 |
@@ -157,6 +157,67 @@ reference.
   one test (a dead quirk is a bug).
 - `cargo test --workspace`, `cargo xtask ci --job clippy`, `--job no-std-check`,
   `cargo xtask goldens --check`.
+
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question.
+
+### 1. The 15-sample Soundtracker layout — **rejected, and recorded as such**
+
+Not added as a dialect. A `FormatDialect` selects a `QuirkSet`, which is replay behaviour;
+the tagless Soundtracker file is a different **header layout** — 15 sample records instead
+of 31, so the pattern data begins 480 bytes earlier — with different loop units and a
+different effect/tempo dialect on top. There is no tag to detect it with either, so a
+loader would have to guess from plausibility fields and would accept arbitrary input.
+Adding a quirk field cannot express any of that, and adding a variant of `FormatDialect`
+that no loader ever produces would be a dead value. It stays in accuracy policy §4, whose
+entry now records this decision, and belongs behind its own loader entry point if a real
+need for it appears. `tagless_fifteen_sample_files_are_explicitly_not_probed` still pins
+the rejection.
+
+### 2. Per format or per session — **per loaded module**, and neither of the two offered answers
+
+`QuirkSet` is one flat struct, not one per format processor and not one per engine. Its
+fields are prefixed by the format they concern (`mod_*`, `s3m_*`, `protracker_*`) and each
+processor reads only its own, which keeps the "quirks are data" property that a
+per-format-processor split would lose: with one struct, `canonical()` versus
+`starplayer_classic()` is a single field-by-field comparison and the accuracy policy has
+one table to match.
+
+The *lifetime* is what the research point was really asking about, and the answer is
+per **module**, which is stricter than per session. The resolved set is stored by value in
+the processor at construction and there is no setter. The dialect fields are per module by
+construction — a host that loads a `CD61` and an `M.K.` file at once must get different
+behaviour for each — and a session-wide `QuirkSet` could not express that. Nothing is
+global.
+
+### 3. `ItModern` — **stays an honest stub**
+
+It still returns `ExactFixedPoint`'s answer and its doc comment says so. Nothing better is
+possible yet: the behaviour that makes it different is IT's per-tick tempo slides (`Txx`
+with a non-zero high nibble, clamped to 32..=255), which are evaluated against a `speed`
+the trait deliberately ignores and against effect state only an IT processor has. A stub
+that guessed at the slide would be a wrong answer where the current one is a documented
+absent answer, and `it_modern_is_currently_exact_fixed_point` would have to be deleted
+rather than tightened when M6 arrives. `QuirkSet::tempo_model` can already select it.
+
+### 4. Octalyser and Digital Tracker — **the loop counter itself, not only the break/jump interaction**
+
+Both differ from ProTracker in the counter, and the difference is the larger of the two.
+ProTracker keeps a loop target **and** a counter per channel; Octalyser and Digital
+Tracker keep **one of each for the whole song**, so several `E6x` on one row spend
+iterations of the same counter instead of starting three independent loops. On top of
+that Octalyser ignores an `E60` while a loop is running and cancels this row's loop
+destination when a loop ends, and Digital Tracker executes only the **first** `E60` or
+`E6x` on a row at all. Both then block every break and jump on a row a loop jumped on,
+which ProTracker does not.
+
+Derived from libxmp's `FLOW_MODE_OCTALYSER` and `FLOW_MODE_DTM_2015`
+(`src/common.h:426-437`) — the code that generated the pinned dumps — and validated
+against the dumps themselves: with the global counter alone the five fixtures' row
+sequences already match, and `pattern_loop_octalyser`'s `E60`-while-looping row and
+`pattern_loop_dt`'s repeated `E6x` row are what separate the two dialects from each other.
 
 ## Out of scope
 

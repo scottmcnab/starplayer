@@ -61,6 +61,7 @@ pub mod command;
 pub mod control;
 pub mod demo;
 pub mod engine;
+pub mod flow;
 pub mod mixer_mode;
 pub mod ring;
 pub mod sequencer;
@@ -71,6 +72,7 @@ pub mod telemetry;
 pub mod trace;
 
 pub use channel::{Channel, ChannelTable};
+pub use flow::PatternFlowState;
 pub use command::{
     DEFAULT_COMMAND_CAPACITY, DEFAULT_GARBAGE_CAPACITY, EngineHandle, MAX_COMMANDS_PER_QUANTUM, PcmSource,
 };

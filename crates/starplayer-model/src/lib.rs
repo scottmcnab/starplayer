@@ -102,4 +102,5 @@ pub use sample::{DEFAULT_REFERENCE_RATE_HZ, LoopMode, SampleIndex, SampleSpec};
 pub use text::{cp437_char, decode_cp437};
 
 // Re-exported so a format crate can name every type it needs from this one crate.
+pub use starplayer_core::quirks::FormatDialect;
 pub use starplayer_core::{Error, GUARD_FRAMES, InstrumentId, SampleId};
