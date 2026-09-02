@@ -39,7 +39,7 @@ expected channel state*, which is exactly the shape of our trace format.
 | [C6](complete/M2-task-C6-fixed-point-mixer.md) ✅ | The fixed-point mixer — the bit-exact reference | M1 | C1, C3, C4 |
 | [C7](M2-task-C7-fuzzing-and-rt-safety.md) | Loader fuzzing + the allocator hook in CI | C3, C4 | C5 |
 | [C8](M2-task-C8-dos-reference-harness.md) | **Deferred**, pull-driven — see its trigger | — | — |
-| [C2a](M2-task-C2a-conformance-harness-repairs.md) | Harness repairs, `--strict`, exclusions rewritten from real results | C2 | C6a |
+| [C2a](complete/M2-task-C2a-conformance-harness-repairs.md) ✅ | Harness repairs, `--strict`, exclusions rewritten from real results | C2 | C6a |
 | [C3b](M2-task-C3b-protracker-fidelity-repairs.md) | ProTracker fidelity + MTM repairs, and the voice-boundary sample swap | C3, C4 | C9, C6a |
 | [C6a](M2-task-C6a-golden-and-build-hygiene.md) | Trace-feature hygiene, MOD/MTM goldens, `fma-check`, the web panning race | C6, C1, C3a | C2a, C3b, C9 |
 | [C9](M2-task-C9-s3m-conformance-repairs.md) | The nine S3M effect bugs the corpus found (M1 inheritance) | C2a | C3b, C6a |
@@ -62,27 +62,28 @@ until that trigger fires.
 6. The allocator hook proves no allocation inside `render()` across the whole corpus.
 7. Every new deviation found is recorded in `plans/product/03-accuracy-policy.md` §3.
 
-## Status (2026-09-02 review)
+## Status (2026-09-02 review, updated after C2a)
 
 Honest position, so that nothing downstream plans against a number that is not true.
 
-**Conformance: 3 of 47 cases pass** — MOD **0 of 27**, S3M **2 of 17**, MTM **1 of 3** —
-with **44 exclusions**. `cargo xtask conformance` nevertheless exits zero, because success
-is defined as `failed == 0` and every failure has been converted into an exclusion; 15 of
-those exclusions point at `conformance/known-failures.md`, whose own preamble says each
-record blocks this milestone's exit.
+**Conformance: 10 of 47 cases pass** — MOD **7 of 27**, S3M **2 of 17**, MTM **1 of 3** —
+with **9 accepted deviations** and **28 known failures**. Six of the MOD passes waive
+`position` alone under D14 and enforce every other field. `cargo xtask conformance` exits
+zero in its informational form; `--strict` exits non-zero on the 28 known failures and is
+the M2 exit gate once C3b, C5 and C9 land. Before C2a the standing was 3 of 47 with 44
+undifferentiated exclusions, eight of them citing an NTSC rate libxmp never selected.
 
 | Exit criterion | Status | Closed by |
 |---|---|---|
 | 1. MOD and MTM native, no S3M conversion | **Met** | C3, C4 |
 | 2. `cargo xtask goldens` regenerates; CI verifies | **Partly** — S3M only | C6a |
-| 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Not met** — 3/47 | C2a, then C3b (MOD/MTM), C9 (S3M), C5 (dialects) |
+| 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Not met** — 10/47 after C2a | C3b (MOD/MTM), C9 (S3M), C5 (dialects) |
 | 4. Cross-target hash equality on the fixed path | **Partly** — S3M fixtures only; MOD and MTM have no goldens at all | C6a |
 | 5. Loader fuzzing in CI, no panic or OOM | **Not met** | C7 |
 | 6. Allocator hook proves no allocation in `render()` | **Not met** | C7 |
-| 7. Every new deviation recorded in the accuracy policy | **Partly** — several recorded reasons were wrong (the eight MOD rows citing an NTSC rate libxmp does not select for those files) | C2a, and the accompanying policy rewrite |
+| 7. Every new deviation recorded in the accuracy policy | **Met for the current standing** — every exclusion reason records a first divergence the repaired harness observed | C2a (landed) |
 
-Landed: C1, C2, C3, C3a, C4, C6. Outstanding: C2a, C3b, C5, C6a, C7, C9. Deferred: C8.
+Landed: C1, C2, C2a, C3, C3a, C4, C6. Outstanding: C3b, C5, C6a, C7, C9. Deferred: C8.
 
 ## A note on the oracle
 

@@ -4,10 +4,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use starplayer::core::{ExactFixedPoint, Frame, FrameClock};
+use starplayer::core::{ExactFixedPoint, Frame, FrameClock, InstrumentId, SampleId};
 use starplayer::engine::{TRACE_FORMAT_VERSION, Trace, TraceChannel, TraceTick};
+use starplayer::model::Module;
 
-use crate::{TraceDiff, TraceTolerances, diff_traces};
+use crate::{TraceDiff, TraceField, TraceTolerances, diff_traces};
+
+/// The rate every C1 trace and every libxmp `test-dev` dump is generated at.
+pub const CONFORMANCE_SAMPLE_RATE_HZ: u64 = 44_100;
+
+/// libxmp's comparator permits one millisecond of time error; 45 output frames is that
+/// millisecond rounded up at 44.1 kHz.
+const FRAME_TOLERANCE: u64 = 45;
+
+/// libxmp's comparator permits one integer source frame of position error.
+const POSITION_TOLERANCE: u64 = 1u64 << 32;
+
+/// `STARPLAY/S3MLIB.ASM`'s Scream Tracker 3 frequency numerator, and ProTracker's exact
+/// PAL Paula clock. Only used to predict how far a voice advances across one tick when
+/// deciding whether libxmp legitimately dropped it (accuracy policy D18).
+const ST3_FREQUENCY_NUMERATOR: u64 = 14_317_056;
+const PAULA_PAL_CLOCK_HZ: u64 = 3_546_895;
 
 /// The formats covered by milestone M2.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,13 +85,61 @@ pub struct ConformanceCase {
     pub behaviour: String,
 }
 
-/// A known failure which is still executed on every run.
+/// The tracking reference that marks an exclusion as a deliberate, documented deviation
+/// rather than an outstanding failure.
+pub const ACCURACY_POLICY_REFERENCE: &str = "plans/product/03-accuracy-policy.md";
+
+/// What an exclusion row means for the M2 exit criteria.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExclusionKind {
+    /// The reference resolves into `plans/product/03-accuracy-policy.md`: a deliberate
+    /// difference from a secondary oracle that StarPlayer does not intend to adopt.
+    AcceptedDeviation,
+    /// Anything else — a task file, or `conformance/known-failures.md`. These block the
+    /// M2 exit, and `--strict` refuses a run that still contains one.
+    KnownFailure,
+}
+
+impl fmt::Display for ExclusionKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            ExclusionKind::AcceptedDeviation => "accepted deviation",
+            ExclusionKind::KnownFailure => "known failure",
+        })
+    }
+}
+
+/// A known failure or per-field waiver which is still executed on every run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConformanceExclusion {
     pub case_id: String,
     pub reason: String,
     pub reference: String,
+    /// Fields the differ ignores for this case alone. Empty for an ordinary exclusion,
+    /// which suppresses the whole case; non-empty for a waiver, which suppresses exactly
+    /// these fields and enforces every other one.
+    pub waived_fields: Vec<TraceField>,
 }
+
+impl ConformanceExclusion {
+    /// Whether the row waives named fields rather than the whole case.
+    pub fn is_waiver(&self) -> bool { !self.waived_fields.is_empty() }
+
+    /// Classify the row by the document its reference resolves into.
+    pub fn kind(&self) -> ExclusionKind {
+        let path = self.reference.split('#').next().unwrap_or("");
+        if path == ACCURACY_POLICY_REFERENCE { ExclusionKind::AcceptedDeviation } else { ExclusionKind::KnownFailure }
+    }
+
+    /// The waived fields, spelled the way the differ names them.
+    pub fn waiver_summary(&self) -> String {
+        self.waived_fields.iter().map(|field| field.name()).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// Structural fields describe the shape of a comparison rather than one observable value,
+/// so waiving them would silently drop whole ticks or channels from the enforcement.
+const UNWAIVABLE_FIELDS: [TraceField; 3] = [TraceField::Version, TraceField::TickCount, TraceField::ChannelCount];
 
 /// Scope accounting for the pinned snapshot.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -271,6 +336,11 @@ fn safe_relative_path(value: &str, line_number: usize, field: &str) -> Result<Pa
 }
 
 /// Parse exclusions and require every row to have a reason and tracking reference.
+///
+/// A row is `case-id`, `reason`, `reference` and an optional fourth `waive=field[,field]`
+/// column. The fourth column turns the row from "suppress this case" into "suppress
+/// exactly these fields for this case", so the effect a fixture exists to test is still
+/// compared. An empty fourth column is an ordinary exclusion.
 pub fn parse_exclusions(text: &str, cases: &[ConformanceCase]) -> Result<BTreeMap<String, ConformanceExclusion>, String> {
     let known: BTreeSet<&str> = cases.iter().map(|case| case.id.as_str()).collect();
     let mut exclusions = BTreeMap::new();
@@ -281,8 +351,8 @@ pub fn parse_exclusions(text: &str, cases: &[ConformanceCase]) -> Result<BTreeMa
             continue;
         }
         let fields: Vec<&str> = raw_line.split('\t').collect();
-        if fields.len() != 3 {
-            return Err(format!("exclusions line {line_number}: expected case id, reason, and reference"));
+        if !(3..=4).contains(&fields.len()) {
+            return Err(format!("exclusions line {line_number}: expected case id, reason, reference, and an optional `waive=` column"));
         }
         let case_id = fields[0].trim();
         let reason = fields[1].trim();
@@ -296,12 +366,42 @@ pub fn parse_exclusions(text: &str, cases: &[ConformanceCase]) -> Result<BTreeMa
         if reference.is_empty() {
             return Err(format!("exclusions line {line_number}: `{case_id}` has no accuracy-policy or tracking reference"));
         }
-        let exclusion = ConformanceExclusion { case_id: case_id.to_string(), reason: reason.to_string(), reference: reference.to_string() };
+        let waived_fields = parse_waiver(fields.get(3).map(|value| value.trim()).unwrap_or(""), case_id, line_number)?;
+        let exclusion = ConformanceExclusion {
+            case_id: case_id.to_string(),
+            reason: reason.to_string(),
+            reference: reference.to_string(),
+            waived_fields,
+        };
         if exclusions.insert(case_id.to_string(), exclusion).is_some() {
             return Err(format!("exclusions line {line_number}: duplicate case `{case_id}`"));
         }
     }
     Ok(exclusions)
+}
+
+fn parse_waiver(column: &str, case_id: &str, line_number: usize) -> Result<Vec<TraceField>, String> {
+    if column.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = column.strip_prefix("waive=")
+        .ok_or_else(|| format!("exclusions line {line_number}: `{case_id}` fourth column must be empty or `waive=field[,field]`, found `{column}`"))?;
+    let mut fields = Vec::new();
+    for name in list.split(',').map(str::trim) {
+        if name.is_empty() {
+            return Err(format!("exclusions line {line_number}: `{case_id}` names an empty waiver field"));
+        }
+        let field = TraceField::from_name(name)
+            .ok_or_else(|| format!("exclusions line {line_number}: `{case_id}` waives unknown field `{name}`"))?;
+        if UNWAIVABLE_FIELDS.contains(&field) {
+            return Err(format!("exclusions line {line_number}: `{case_id}` may not waive the structural field `{name}`"));
+        }
+        if fields.contains(&field) {
+            return Err(format!("exclusions line {line_number}: `{case_id}` waives `{name}` twice"));
+        }
+        fields.push(field);
+    }
+    Ok(fields)
 }
 
 /// One active libxmp channel record.
@@ -388,43 +488,192 @@ fn signed_i16(value: i64, line_number: usize, name: &str) -> Result<i16, String>
     i16::try_from(value).map_err(|_| format!("libxmp dump line {line_number}: {name} `{value}` is out of range"))
 }
 
-/// Project libxmp's partial state records and StarPlayer's full C1 trace onto the same
-/// shape, then invoke the C1 differ.
-pub fn diff_libxmp_dump(format: ConformanceFormat, upstream: &[LibxmpTick], actual: &Trace) -> Result<TraceDiff, String> {
-    let (expected, actual) = project_libxmp_dump(format, upstream, actual)?;
-    // libxmp's own mixer-data comparator permits one integer source frame. MOD first
-    // projects C1's fraction away below, then applies that same whole-frame bound;
-    // S3M/MTM preserve C2's equivalent tolerance.
-    let position_tolerance = 1u64 << 32;
-    let tolerances = TraceTolerances { frame: 45, period: 1, position: position_tolerance, ..TraceTolerances::default() };
-    Ok(diff_traces(&expected, &actual, &tolerances))
+/// The sample geometry the adapter needs to reason about loop wrap and one-shot ends.
+///
+/// Indexed by the C1 trace's one-based `smp` number so no field has to be added to the
+/// committed trace format for a comparison-only concern (C2a research point 1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SampleGeometry {
+    spans: Vec<Option<SampleSpan>>,
 }
 
-fn project_libxmp_dump(format: ConformanceFormat, upstream: &[LibxmpTick], actual: &Trace) -> Result<(Trace, Trace), String> {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct SampleSpan {
+    length_frames: u32,
+    loop_start: u32,
+    loop_end: u32,
+    looping: bool,
+}
+
+impl SampleGeometry {
+    /// Read the loaded module's sample table into the trace's numbering.
+    ///
+    /// MOD and MTM trace the ProTracker instrument number and their loaders add exactly
+    /// one instrument per sample, so the instrument table resolves it. The S3M processor
+    /// already resolves its instrument slot down to a sample id before tracing it.
+    pub fn from_module(format: ConformanceFormat, module: &Module) -> SampleGeometry {
+        let count = match format {
+            ConformanceFormat::Mod | ConformanceFormat::Mtm => module.instruments().len(),
+            ConformanceFormat::S3m => module.samples().len(),
+        };
+        let spans = (0..=count).map(|number| {
+            let index = u16::try_from(number.checked_sub(1)?).ok()?;
+            let sample = match format {
+                ConformanceFormat::Mod | ConformanceFormat::Mtm => {
+                    module.instrument(InstrumentId(index)).and_then(|instrument| instrument.sample).and_then(|id| module.sample(id))?
+                }
+                ConformanceFormat::S3m => module.sample(SampleId(index))?,
+            };
+            Some(SampleSpan {
+                length_frames: sample.length_frames(),
+                loop_start: sample.loop_start(),
+                loop_end: sample.loop_end(),
+                looping: sample.loop_mode().is_looping(),
+            })
+        }).collect();
+        SampleGeometry { spans }
+    }
+
+    fn span(&self, sample_number: u16) -> Option<SampleSpan> {
+        self.spans.get(sample_number as usize).copied().flatten()
+    }
+}
+
+/// Ticks to capture so a trace certainly spans the oracle's whole timeline.
+///
+/// libxmp writes no line for a tick with no mapped active voice, so the record count is a
+/// lower bound on the tick count and never an estimate of it. The timeline is the honest
+/// bound: frames needed to reach the last record, divided by the shortest tracker tick
+/// any legal tempo can produce (255 BPM), plus a margin.
+pub fn oracle_tick_budget(upstream: &[LibxmpTick]) -> usize {
+    const FASTEST_LEGAL_BPM: u64 = 255;
+    const BUDGET_MARGIN_TICKS: usize = 256;
+    let shortest_tick_frames = (CONFORMANCE_SAMPLE_RATE_HZ * 5) / (2 * FASTEST_LEGAL_BPM);
+    let frames = oracle_end_frame(upstream).0.saturating_add(FRAME_TOLERANCE);
+    (frames / shortest_tick_frames.max(1)) as usize + BUDGET_MARGIN_TICKS
+}
+
+/// The output frame libxmp's last record is timestamped at.
+pub fn oracle_end_frame(upstream: &[LibxmpTick]) -> Frame {
+    upstream.iter().map(|tick| expected_frame(tick.time_ms)).max().unwrap_or(Frame::ZERO)
+}
+
+/// Detect a capture that stopped because it ran out of tick budget rather than because
+/// the module ended.
+///
+/// This is a harness defect, never a case result: reporting it as a divergence is exactly
+/// how `libxmp-s3m-pattern-loop-mpt-breakjump` came to be filed as an engine bug.
+pub fn check_tick_budget(upstream: &[LibxmpTick], actual: &Trace, budget: usize) -> Result<(), String> {
+    let reached = tick_end_frames(actual).last().copied().unwrap_or(Frame::ZERO);
+    let needed = oracle_end_frame(upstream);
+    if actual.ticks.len() >= budget && reached.0 + FRAME_TOLERANCE < needed.0 {
+        return Err(format!(
+            "harness tick budget of {budget} tick(s) reached output frame {} but the oracle runs to frame {}; raise the budget in `oracle_tick_budget`",
+            reached.0, needed.0,
+        ));
+    }
+    Ok(())
+}
+
+/// Project libxmp's partial state records and StarPlayer's full C1 trace onto the same
+/// shape, then invoke the C1 differ.
+///
+/// `waived` names fields the differ must ignore for this case alone; every other field is
+/// enforced. Pairing problems are ordinary [`TraceDiff`] entries — an unpairable record
+/// surfaces as a `frame` or `row` divergence naming the tick — so the harness always
+/// delivers C1's promised first-divergence report.
+pub fn diff_libxmp_dump(
+    format: ConformanceFormat,
+    upstream: &[LibxmpTick],
+    actual: &Trace,
+    geometry: &SampleGeometry,
+    waived: &[TraceField],
+) -> TraceDiff {
+    let (expected, actual) = project_libxmp_dump(format, upstream, actual, geometry, waived);
+    // libxmp's own mixer-data comparator permits one integer source frame and one
+    // millisecond of time. MOD and MTM first project C1's fraction away below, then
+    // apply that same whole-frame bound; S3M compares the unfloored Q32.32 value.
+    let tolerances = TraceTolerances {
+        frame: FRAME_TOLERANCE,
+        period: 1,
+        position: POSITION_TOLERANCE,
+        ..TraceTolerances::default()
+    };
+    diff_traces(&expected, &actual, &tolerances)
+}
+
+fn expected_frame(time_ms: u64) -> Frame {
+    Frame(time_ms.saturating_mul(CONFORMANCE_SAMPLE_RATE_HZ).saturating_add(500) / 1_000)
+}
+
+/// Pair each libxmp record with the StarPlayer tick whose **end** frame carries the same
+/// timestamp.
+///
+/// libxmp records carry `time_ms` but no order index, so pairing on `(row, frame)` alone
+/// mis-associates a jump destination's row 0 with the starting order's row 0. Time is the
+/// only unambiguous key; `row` and `tick_in_row` then become ordinary compared fields.
+///
+/// A case that waives `frame` has declared its two timelines incomparable — D15's CIA
+/// latch is exactly that — so absolute time cannot be the key either. Such a case anchors
+/// on the first tick carrying the first record's `(row, frame)` and then tracks the
+/// residual offset from one paired tick to the next, which keeps the shape of the trace
+/// enforced while the timing itself is the waived field.
+fn pair_by_time(upstream: &[LibxmpTick], actual: &Trace, end_frames: &[Frame], timeline_waived: bool) -> Vec<Option<usize>> {
+    let mut search = 0usize;
+    let mut offset = 0i64;
+    if timeline_waived && let Some(first) = upstream.first() {
+        let anchor = actual.ticks.iter()
+            .position(|tick| tick.position.row == first.row && tick.tick_in_row == first.frame)
+            .unwrap_or(0);
+        offset = i64::try_from(end_frames.get(anchor).copied().unwrap_or(Frame::ZERO).0).unwrap_or(i64::MAX)
+            - i64::try_from(expected_frame(first.time_ms).0).unwrap_or(i64::MAX);
+        search = anchor;
+    }
+    upstream.iter().map(|upstream_tick| {
+        let target = expected_frame(upstream_tick.time_ms).0.saturating_add_signed(offset);
+        while search < end_frames.len() && end_frames[search].0 + FRAME_TOLERANCE < target {
+            search += 1;
+        }
+        match end_frames.get(search) {
+            Some(frame) if frame.0.abs_diff(target) <= FRAME_TOLERANCE => {
+                let paired = search;
+                search += 1;
+                if timeline_waived {
+                    offset = i64::try_from(frame.0).unwrap_or(i64::MAX)
+                        - i64::try_from(expected_frame(upstream_tick.time_ms).0).unwrap_or(i64::MAX);
+                }
+                Some(paired)
+            }
+            _ => None,
+        }
+    }).collect()
+}
+
+fn project_libxmp_dump(
+    format: ConformanceFormat,
+    upstream: &[LibxmpTick],
+    actual: &Trace,
+    geometry: &SampleGeometry,
+    waived: &[TraceField],
+) -> (Trace, Trace) {
     let mut expected_ticks = Vec::with_capacity(upstream.len());
     let mut actual_ticks = Vec::with_capacity(upstream.len());
     let actual_end_frames = tick_end_frames(actual);
-    let mut actual_index = 0usize;
+    let pairing = pair_by_time(upstream, actual, &actual_end_frames, waived.contains(&TraceField::Frame));
+    let mut fallback_index = 0usize;
 
-    for upstream_tick in upstream {
-        while let Some(actual_tick) = actual.ticks.get(actual_index) {
-            if actual_tick.position.row == upstream_tick.row && actual_tick.tick_in_row == upstream_tick.frame {
-                break;
-            }
-            if actual_tick.channels.iter().any(|channel| channel.active) {
-                return Err(format!(
-                    "trace alignment diverged at actual tick {}: expected row {} frame {}, found row {} frame {} with active channels",
-                    actual_tick.tick, upstream_tick.row, upstream_tick.frame, actual_tick.position.row, actual_tick.tick_in_row,
-                ));
-            }
-            actual_index += 1;
+    for (upstream_tick, paired) in upstream.iter().zip(pairing) {
+        // An unpairable record still has to produce a first-divergence report, so it is
+        // compared against the nearest surviving tick and diverges on `frame`.
+        let actual_index = paired.unwrap_or_else(|| fallback_index.min(actual.ticks.len().saturating_sub(1)));
+        let Some(actual_tick) = actual.ticks.get(actual_index) else { continue };
+        if paired.is_some() {
+            fallback_index = actual_index + 1;
         }
-        let Some(actual_tick) = actual.ticks.get(actual_index) else {
-            return Err(format!("trace ended before libxmp row {} frame {} at {} ms", upstream_tick.row, upstream_tick.frame, upstream_tick.time_ms));
-        };
+        let tick_frames = actual_end_frames[actual_index].0.saturating_sub(actual_tick.frame.0);
 
         let mut expected_tick = header_projection(actual_tick);
-        expected_tick.frame = Frame((upstream_tick.time_ms.saturating_mul(44_100).saturating_add(500)) / 1_000);
+        expected_tick.frame = expected_frame(upstream_tick.time_ms);
         expected_tick.position.row = upstream_tick.row;
         expected_tick.tick_in_row = upstream_tick.frame;
         let mut actual_tick_projection = header_projection(actual_tick);
@@ -435,25 +684,33 @@ fn project_libxmp_dump(format: ConformanceFormat, upstream: &[LibxmpTick], actua
             .chain(actual_tick.channels.iter().filter(|channel| channel.active).map(|channel| channel.channel))
             .collect();
         for channel_id in channel_ids {
-            let mut actual_channel = actual_tick.channels.iter().find(|channel| channel.channel == channel_id).cloned()
+            let raw_actual = actual_tick.channels.iter().find(|channel| channel.channel == channel_id).cloned()
                 .unwrap_or_else(|| TraceChannel { channel: channel_id, ..TraceChannel::default() });
+            let mut actual_channel = raw_actual.clone();
             // C1 names the sample reference-rate pitch C-4, one octave above the
             // ProTracker display octave used as the MOD comparison axis. libxmp's
             // mixer note is a further octave above C1, so expected and actual remove
             // two octaves and one octave respectively.
             if format == ConformanceFormat::Mod {
-                actual_channel.note = actual_channel.note.map(|note| note.saturating_sub(12));
+                actual_channel.note = actual_channel.note.and_then(|note| shift_note(note, 12));
             }
             actual_channel.position = project_actual_position(format, actual_channel.position);
             let mut expected_channel = actual_channel.clone();
             if let Some(upstream_channel) = upstream_by_channel.get(&channel_id) {
                 expected_channel.active = true;
-                expected_channel.note = Some(project_note(format, upstream_channel.note));
+                expected_channel.note = project_note(format, upstream_channel.note);
                 expected_channel.instrument = upstream_channel.instrument_zero_based.saturating_add(1);
                 expected_channel.volume = (upstream_channel.volume_x16 + 8) / 16;
                 expected_channel.period = project_period(format, upstream_channel.period_q12);
                 expected_channel.pan = project_pan(format, upstream_channel.pan_signed);
                 expected_channel.position = (upstream_channel.position as u64) << 32;
+                if loop_equivalent(geometry.span(actual_channel.sample), expected_channel.position, actual_channel.position) {
+                    // libxmp's own comparator accepts start/end equivalence at a loop
+                    // boundary (`test-dev/compare_mixer_data.c:78-82`); a wrapped voice
+                    // that is one frame apart circularly is at the same place, however
+                    // far apart the two linear values look.
+                    expected_channel.position = actual_channel.position;
+                }
                 if let Some(cutoff) = upstream_channel.cutoff {
                     // libxmp uses zero for its disabled-filter sentinel and treats all
                     // values at or above 254 as equivalent fully-open cutoffs. C1 uses
@@ -463,9 +720,13 @@ fn project_libxmp_dump(format: ConformanceFormat, upstream: &[LibxmpTick], actua
                 if let Some(resonance) = upstream_channel.resonance {
                     expected_channel.resonance = resonance;
                 }
-            } else {
+            } else if !one_shot_ends_within_interval(format, geometry, &raw_actual, tick_frames) {
                 // An active StarPlayer channel omitted by libxmp is an observable active
-                // set mismatch, not a channel that projection may discard.
+                // set mismatch, not a channel that projection may discard — unless it is
+                // the D18 boundary: libxmp drops a `NOTE_SAMPLE_END` voice after mixing
+                // the interval, where C1 snapshots the channel before it, so a one-shot
+                // that runs out inside this interval is legitimately live on our side.
+                // See `plans/product/03-accuracy-policy.md` entry D18.
                 expected_channel.active = false;
             }
             // These two C1 fields have no libxmp dump column.
@@ -474,22 +735,127 @@ fn project_libxmp_dump(format: ConformanceFormat, upstream: &[LibxmpTick], actua
             expected_tick.channels.push(expected_channel);
             actual_tick_projection.channels.push(actual_channel);
         }
+        for field in waived {
+            waive_field(*field, &mut expected_tick, &actual_tick_projection);
+        }
         expected_ticks.push(expected_tick);
         actual_ticks.push(actual_tick_projection);
-        actual_index += 1;
     }
 
-    Ok((Trace { version: TRACE_FORMAT_VERSION, ticks: expected_ticks }, Trace { version: actual.version, ticks: actual_ticks }))
+    (Trace { version: TRACE_FORMAT_VERSION, ticks: expected_ticks }, Trace { version: actual.version, ticks: actual_ticks })
 }
 
-fn project_note(format: ConformanceFormat, note: u8) -> u8 {
+/// Copy one field from the projected actual tick over the expected tick, so the differ
+/// cannot see a difference in it. Every other field stays enforced.
+fn waive_field(field: TraceField, expected: &mut TraceTick, actual: &TraceTick) {
+    match field {
+        TraceField::Tick => expected.tick = actual.tick,
+        TraceField::Frame => expected.frame = actual.frame,
+        TraceField::Order => expected.position.order = actual.position.order,
+        TraceField::Pattern => expected.position.pattern = actual.position.pattern,
+        TraceField::Row => expected.position.row = actual.position.row,
+        TraceField::TickInRow => expected.tick_in_row = actual.tick_in_row,
+        TraceField::Speed => expected.speed = actual.speed,
+        TraceField::Bpm => expected.bpm = actual.bpm,
+        TraceField::GlobalVolume => expected.global_volume = actual.global_volume,
+        // `parse_waiver` rejects the structural fields, so nothing else is reachable
+        // here; channel fields fall through to the per-record loop below.
+        TraceField::Version | TraceField::TickCount | TraceField::ChannelCount => {}
+        channel_field => {
+            for (expected_channel, actual_channel) in expected.channels.iter_mut().zip(&actual.channels) {
+                waive_channel_field(channel_field, expected_channel, actual_channel);
+            }
+        }
+    }
+}
+
+fn waive_channel_field(field: TraceField, expected: &mut TraceChannel, actual: &TraceChannel) {
+    match field {
+        TraceField::Channel => expected.channel = actual.channel,
+        TraceField::Active => expected.active = actual.active,
+        TraceField::Note => expected.note = actual.note,
+        TraceField::Instrument => expected.instrument = actual.instrument,
+        TraceField::Sample => expected.sample = actual.sample,
+        TraceField::Volume => expected.volume = actual.volume,
+        TraceField::Period => expected.period = actual.period,
+        TraceField::Pan => expected.pan = actual.pan,
+        TraceField::Position => expected.position = actual.position,
+        TraceField::Cutoff => expected.cutoff = actual.cutoff,
+        TraceField::Resonance => expected.resonance = actual.resonance,
+        TraceField::Flags => expected.flags = actual.flags,
+        _ => {}
+    }
+}
+
+/// Whether a one-shot voice runs out inside the interval this tick begins — the D18
+/// boundary that makes libxmp omit a record StarPlayer still reports as active.
+fn one_shot_ends_within_interval(format: ConformanceFormat, geometry: &SampleGeometry, actual: &TraceChannel, tick_frames: u64) -> bool {
+    if !actual.active {
+        return false;
+    }
+    let Some(span) = geometry.span(actual.sample) else { return false };
+    if span.looping {
+        return false;
+    }
+    let step = step_per_output_frame(format, actual.period);
+    let advance = step.saturating_mul(tick_frames as u128);
+    (actual.position as u128).saturating_add(advance) >= (span.length_frames as u128) << 32
+}
+
+/// Source frames advanced per output frame, in Q32.32. Only used to predict a one-shot's
+/// end; the mixer owns the authoritative step.
+fn step_per_output_frame(format: ConformanceFormat, period: u32) -> u128 {
+    if period == 0 {
+        return 0;
+    }
+    match format {
+        // MOD and MTM run Paula's exact PAL clock divided by the Amiga period.
+        ConformanceFormat::Mod | ConformanceFormat::Mtm => {
+            ((PAULA_PAL_CLOCK_HZ as u128) << 32) / (period as u128 * CONFORMANCE_SAMPLE_RATE_HZ as u128)
+        }
+        // ST3 truncates its playback frequency to whole hertz before dividing.
+        ConformanceFormat::S3m => {
+            (((ST3_FREQUENCY_NUMERATOR / period as u64) as u128) << 32) / CONFORMANCE_SAMPLE_RATE_HZ as u128
+        }
+    }
+}
+
+/// Circular position equivalence inside a forward loop.
+///
+/// The loop span is read from the loaded `Module` through [`SampleGeometry`] rather than
+/// added to the C1 trace format, which would have invalidated every committed expectation
+/// for a comparison-only concern.
+fn loop_equivalent(span: Option<SampleSpan>, expected: u64, actual: u64) -> bool {
+    let Some(span) = span else { return false };
+    if !span.looping || span.loop_end <= span.loop_start {
+        return false;
+    }
+    let start = (span.loop_start as u64) << 32;
+    let end = (span.loop_end as u64) << 32;
+    if expected < start || actual < start || expected > end || actual > end {
+        return false;
+    }
+    let length = end - start;
+    let forward = (expected - start) % length;
+    let backward = (actual - start) % length;
+    let distance = forward.abs_diff(backward);
+    distance.min(length - distance) <= POSITION_TOLERANCE
+}
+
+fn project_note(format: ConformanceFormat, note: u8) -> Option<u8> {
     // The MOD comparison axis is ProTracker's displayed octave: libxmp's mixer is
     // two octaves above it, while C1 (projected above) is one. S3M/MTM compare on
-    // C1's axis and therefore remove libxmp's one-octave bias.
-    note.saturating_sub(match format {
+    // C1's axis and therefore remove libxmp's one-octave bias. A note below the
+    // projection offset has no image on the comparison axis; carry that explicitly
+    // rather than clamping it to zero, where it would match every other such note.
+    shift_note(note, match format {
         ConformanceFormat::Mod => 24,
         ConformanceFormat::S3m | ConformanceFormat::Mtm => 12,
     })
+}
+
+fn shift_note(note: u8, semitones_down: i16) -> Option<u8> {
+    u8::try_from(note as i16 - semitones_down).ok()
 }
 
 fn project_period(format: ConformanceFormat, period_q12: u32) -> u32 {
@@ -560,6 +926,141 @@ mod tests {
         assert_eq!(parse_exclusions("case-one\treason\tissue-1\n", &cases).expect("valid").len(), 1);
     }
 
+    fn geometry(spans: &[Option<SampleSpan>]) -> SampleGeometry {
+        SampleGeometry { spans: core::iter::once(None).chain(spans.iter().copied()).collect() }
+    }
+
+    fn one_tick_trace(channel: TraceChannel) -> Trace {
+        Trace {
+            version: TRACE_FORMAT_VERSION,
+            ticks: vec![TraceTick {
+                tick: 0,
+                frame: Frame::ZERO,
+                position: SongPosition { order: 0, pattern: 0, row: 0 },
+                tick_in_row: 0,
+                speed: 6,
+                bpm: 125,
+                global_volume: 64,
+                channels: vec![channel],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_waiver_names_real_fields_and_only_real_fields() {
+        let cases = cases();
+        let waived = parse_exclusions("case-one\treason\tissue-1\twaive=frame,position\n", &cases).expect("valid waiver");
+        assert_eq!(waived["case-one"].waived_fields, vec![TraceField::Frame, TraceField::Position]);
+        assert!(waived["case-one"].is_waiver());
+        assert_eq!(waived["case-one"].waiver_summary(), "frame,position");
+
+        assert!(parse_exclusions("case-one\treason\tissue-1\twaive=frames\n", &cases).unwrap_err().contains("waives unknown field `frames`"));
+        assert!(parse_exclusions("case-one\treason\tissue-1\twaive=tick-count\n", &cases).unwrap_err().contains("structural field"));
+        assert!(parse_exclusions("case-one\treason\tissue-1\tframe\n", &cases).unwrap_err().contains("must be empty or `waive="));
+        assert!(parse_exclusions("case-one\treason\tissue-1\twaive=frame,frame\n", &cases).unwrap_err().contains("twice"));
+        assert!(!parse_exclusions("case-one\treason\tissue-1\t\n", &cases).expect("empty waiver column")["case-one"].is_waiver());
+    }
+
+    #[test]
+    fn an_exclusion_is_classified_by_the_document_it_points_at() {
+        let cases = cases();
+        let rows = concat!(
+            "case-one\tdeliberate\tplans/product/03-accuracy-policy.md#3-documented-deviations\n",
+            "case-two\toutstanding\tplans/engine/M2-task-C9-s3m-conformance-repairs.md\n",
+        );
+        let cases = [cases, parse_case_manifest("case-two\tlibxmp\ts3m\tdata/b.s3m\tdata/b.data\tsecond\n").expect("valid")].concat();
+        let exclusions = parse_exclusions(rows, &cases).expect("valid rows");
+        assert_eq!(exclusions["case-one"].kind(), ExclusionKind::AcceptedDeviation);
+        assert_eq!(exclusions["case-two"].kind(), ExclusionKind::KnownFailure);
+    }
+
+    #[test]
+    fn alignment_is_by_time_so_a_jump_destination_reports_its_row_as_a_field() {
+        // Two libxmp records one tick apart. The second names row 0 of a jump
+        // destination; StarPlayer is on row 1. Pairing on `(row, frame)` would walk past
+        // the tick and produce a string error, which is what C2a removed.
+        let dump = parse_libxmp_dump(concat!(
+            "20 0 0 0 1753088 60 0 1024 0 0\n",
+            "40 0 0 0 1753088 60 0 1024 0 0\n",
+        )).expect("valid dump");
+        let channel = TraceChannel { channel: 0, active: true, note: Some(48), instrument: 1, sample: 1, volume: 64, period: 1712, pan: 136, position: 0, cutoff: 255, resonance: 0, flags: DirtyBits::empty() };
+        let mut trace = one_tick_trace(channel.clone());
+        trace.ticks.push(TraceTick { tick: 1, frame: Frame(882), position: SongPosition { order: 1, pattern: 1, row: 1 }, tick_in_row: 0, channels: vec![channel], ..trace.ticks[0].clone() });
+
+        let difference = diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &SampleGeometry::default(), &[]);
+        let first = difference.first_divergence.expect("the row disagrees");
+        assert_eq!((first.tick, first.field), (Some(1), TraceField::Row), "a mis-paired row is a field, not an error");
+        assert_eq!((first.expected.as_str(), first.actual.as_str()), ("0", "1"));
+    }
+
+    #[test]
+    fn position_comparison_wraps_around_a_forward_loop() {
+        // The exact position is 64.003 in a 64-frame loop: StarPlayer reports 0 and
+        // libxmp 63, one frame apart circularly and 63 apart linearly.
+        let dump = parse_libxmp_dump("20 0 0 0 1753088 60 0 1024 0 63\n").expect("valid dump");
+        let channel = TraceChannel { channel: 0, active: true, note: Some(48), instrument: 1, sample: 1, volume: 64, period: 1712, pan: 136, position: 0, cutoff: 255, resonance: 0, flags: DirtyBits::empty() };
+        let trace = one_tick_trace(channel);
+        let looping = geometry(&[Some(SampleSpan { length_frames: 64, loop_start: 0, loop_end: 64, looping: true })]);
+        let one_shot = geometry(&[Some(SampleSpan { length_frames: 64, loop_start: 0, loop_end: 0, looping: false })]);
+
+        assert!(diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &looping, &[]).is_identical(), "wrapped positions are one frame apart");
+        let difference = diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &one_shot, &[]);
+        assert_eq!(difference.first_divergence.expect("different").field, TraceField::Position, "a one-shot has no loop to wrap through");
+    }
+
+    #[test]
+    fn a_one_shot_ending_inside_the_interval_is_the_d18_projection() {
+        // libxmp drops a `NOTE_SAMPLE_END` voice after mixing the interval; C1 snapshots
+        // the channel before it. A one-shot with 10 frames left at 44.1 kHz cannot
+        // survive an 882-frame tick, so its absence upstream is not an active-set gap.
+        let dump = parse_libxmp_dump("20 0 0 1 1753088 60 0 1024 0 0\n").expect("valid dump");
+        let ending = TraceChannel { channel: 0, active: true, note: Some(48), instrument: 1, sample: 1, volume: 64, period: 856, pan: 136, position: 990u64 << 32, cutoff: 255, resonance: 0, flags: DirtyBits::empty() };
+        let sounding = TraceChannel { channel: 1, period: 428, position: 0, ..ending.clone() };
+        let mut trace = one_tick_trace(ending);
+        trace.ticks[0].channels.push(sounding);
+        let short = geometry(&[Some(SampleSpan { length_frames: 1_000, loop_start: 0, loop_end: 0, looping: false })]);
+        let long = geometry(&[Some(SampleSpan { length_frames: 1_000_000, loop_start: 0, loop_end: 0, looping: false })]);
+
+        let projected = diff_libxmp_dump(ConformanceFormat::Mtm, &dump, &trace, &short, &[]);
+        assert!(projected.is_identical(), "the one-shot ends inside this interval: {projected}");
+        let difference = diff_libxmp_dump(ConformanceFormat::Mtm, &dump, &trace, &long, &[]);
+        assert_eq!(difference.first_divergence.expect("different").field, TraceField::Active, "a voice with data left is still an active-set mismatch");
+    }
+
+    #[test]
+    fn a_waiver_hides_exactly_one_field_and_enforces_the_rest() {
+        let dump = parse_libxmp_dump("20 0 0 0 1753088 60 0 1024 0 0\n").expect("valid dump");
+        let channel = TraceChannel { channel: 0, active: true, note: Some(48), instrument: 1, sample: 1, volume: 60, period: 1712, pan: 136, position: 0, cutoff: 255, resonance: 0, flags: DirtyBits::empty() };
+        let trace = one_tick_trace(channel);
+
+        let difference = diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &SampleGeometry::default(), &[TraceField::Position]);
+        assert_eq!(difference.first_divergence.expect("different").field, TraceField::Volume, "waiving position leaves volume enforced");
+        assert!(diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &SampleGeometry::default(), &[TraceField::Volume]).is_identical());
+    }
+
+    #[test]
+    fn note_projection_carries_an_out_of_range_note_instead_of_clamping_it() {
+        assert_eq!(project_note(ConformanceFormat::Mod, 36), Some(12));
+        assert_eq!(project_note(ConformanceFormat::Mod, 24), Some(0));
+        assert_eq!(project_note(ConformanceFormat::Mod, 23), None, "a note below the MOD offset has no image on the comparison axis");
+        assert_eq!(project_note(ConformanceFormat::S3m, 11), None);
+        assert_eq!(project_note(ConformanceFormat::S3m, 12), Some(0));
+    }
+
+    #[test]
+    fn the_tick_budget_comes_from_the_oracle_timeline_not_its_record_count() {
+        // One record at 10 seconds: the oracle is one line long, but the trace has to
+        // reach output frame 441_000 to be comparable at all.
+        let dump = parse_libxmp_dump("10000 0 0 0 1753088 60 0 1024 0 0\n").expect("valid dump");
+        let budget = oracle_tick_budget(&dump);
+        assert!(budget > 1_000, "a one-line oracle at ten seconds still needs {budget} ticks");
+        assert_eq!(oracle_end_frame(&dump), Frame(441_000));
+
+        let truncated = one_tick_trace(TraceChannel::default());
+        assert!(check_tick_budget(&dump, &truncated, 1).unwrap_err().contains("tick budget"), "exhaustion is a harness error");
+        assert!(check_tick_budget(&dump, &truncated, budget).is_ok(), "a short trace under budget ended for its own reasons");
+    }
+
     #[test]
     fn manifest_rejects_duplicate_pairs_and_false_provenance() {
         let duplicate = concat!(
@@ -628,9 +1129,9 @@ mod tests {
                 }],
             }],
         };
-        assert!(diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace).expect("aligned").is_identical());
+        assert!(diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &SampleGeometry::default(), &[]).is_identical());
         trace.ticks[0].channels[0].volume = 63;
-        let difference = diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace).expect("aligned");
+        let difference = diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &SampleGeometry::default(), &[]);
         assert_eq!(difference.first_divergence.expect("different").field.to_string(), "volume");
     }
 
@@ -670,14 +1171,14 @@ mod tests {
                 }],
             }],
         };
-        let identical = diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace).expect("aligned");
+        let identical = diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace, &SampleGeometry::default(), &[]);
         assert!(identical.is_identical(), "{identical}");
 
         trace.ticks[0].channels[0].position = (8u64 << 32) | 1;
-        assert!(diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace).expect("aligned").is_identical());
+        assert!(diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace, &SampleGeometry::default(), &[]).is_identical());
 
         trace.ticks[0].channels[0].position = 9u64 << 32;
-        let difference = diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace).expect("aligned");
+        let difference = diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace, &SampleGeometry::default(), &[]);
         assert_eq!(difference.first_divergence.expect("different").field.to_string(), "position");
     }
 
@@ -710,7 +1211,7 @@ mod tests {
                 }],
             }],
         };
-        let identical = diff_libxmp_dump(ConformanceFormat::Mtm, &dump, &trace).expect("aligned");
+        let identical = diff_libxmp_dump(ConformanceFormat::Mtm, &dump, &trace, &SampleGeometry::default(), &[]);
         assert!(identical.is_identical(), "{identical}");
     }
 
@@ -744,8 +1245,8 @@ mod tests {
                 }],
             }],
         };
-        assert!(diff_libxmp_dump(ConformanceFormat::S3m, &fully_open, &trace).expect("aligned").is_identical());
-        let difference = diff_libxmp_dump(ConformanceFormat::S3m, &operative, &trace).expect("aligned");
+        assert!(diff_libxmp_dump(ConformanceFormat::S3m, &fully_open, &trace, &SampleGeometry::default(), &[]).is_identical());
+        let difference = diff_libxmp_dump(ConformanceFormat::S3m, &operative, &trace, &SampleGeometry::default(), &[]);
         assert_eq!(difference.first_divergence.expect("different").field.to_string(), "cutoff");
     }
 }

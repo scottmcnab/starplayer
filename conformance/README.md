@@ -4,7 +4,12 @@
 `target/conformance/corpora/` and runs the machine-readable MOD, S3M and MTM playback
 cases listed in `cases.tsv`. `cargo xtask conformance --offline` refuses corpus
 acquisition and never contacts the live corpus host; it is the command used by the CI
-test step after the acquisition cache has been prepared.
+test step after the acquisition cache has been prepared. `cargo xtask conformance
+--strict` additionally exits non-zero while any known-failure exclusion remains and names
+every one of them.
+
+CI runs the informational (non-strict) form. That is deliberate until C5, C7 and C9 land;
+making it strict is one added argument in `job_conformance` in `xtask/src/main.rs`.
 
 The snapshot is libxmp commit
 `6ec0ba21b1b28f91e22b68a51d59207c6bbf6139`. The archive URL and SHA-256 are constants
@@ -29,7 +34,16 @@ Playback stops before the second loop. Unmapped and sample-ended voices are omit
 libxmp permits one millisecond of time error and one integer sample of position error;
 its period is a floating-point-derived Q12 value. StarPlayer's adapter compares libxmp's
 end-of-frame time with the exact C1 tick-end frame (45 output frames of tolerance),
-divides volume by 16, and adds one to the instrument number. MOD's comparison axis is
+divides volume by 16, and adds one to the instrument number.
+
+**Records are paired by time, not by `(row, frame)`.** A libxmp record carries `time_ms`
+but no order index, so pairing on the tracker position alone mis-associates a jump
+destination's row 0 with the starting order's row 0. The adapter finds the StarPlayer tick
+whose end frame carries the record's timestamp, within the same 45-frame bound, and then
+compares `row` and `tick_in_row` as ordinary trace fields. A record with no pairable tick
+is reported through the differ as a `frame` divergence, never as a harness string error,
+so C2's promise of a first-divergence report naming the tick, channel and field holds for
+every failure class. MOD's comparison axis is
 the ProTracker display octave: the adapter subtracts two octaves from libxmp's mixer
 note and one octave from C1's reference-rate note, and divides Q12 period by 4096 into
 native Amiga periods. Both sides advance MOD samples on the PAL clock — libxmp keeps
@@ -70,14 +84,46 @@ perceptual/audio comparison remains M3 and is not fabricated here.
 ## Exclusions and gates
 
 Every exclusion must name a manifest case and contain both a non-empty reason and an
-accuracy-policy or tracking reference. Unknown, duplicate, or incomplete entries make
-the command fail. Excluded cases are still executed, and an unexpected pass makes the
-exclusion stale and fails the command. Accepted format boundaries and deliberate
+accuracy-policy or tracking reference, plus an optional fourth `waive=` column. Unknown,
+duplicate, or incomplete entries make the command fail, as does a waiver naming a field
+the trace contract does not have. Excluded cases are still executed, and an unexpected
+pass makes the exclusion stale and fails the command. The summary splits exclusions into
+**accepted deviations**, whose reference resolves into `plans/product/03-accuracy-policy.md`,
+and **known failures**, whose reference resolves into a task file or
+`conformance/known-failures.md`. Only the second kind blocks the M2 exit, and `--strict`
+is what refuses it. Accepted format boundaries and deliberate
 secondary-oracle disagreements link to the accuracy policy. Everything else links to the
 task file that owns it — C2a for harness bugs, C3b for ProTracker fidelity and the
 voice-boundary swap, C5 for tracker dialects, C9 for the S3M records catalogued in
 `known-failures.md` — and each reason records the first observed mismatch from the pinned
 run. Those remain M2 exit blockers.
+
+### Adapter projections and the tick budget
+
+Three comparisons are projections rather than plain field equality, and each is named in
+the adapter's comments:
+
+- **Loop wrap.** libxmp's own comparator accepts start/end equivalence at a loop boundary
+  (`test-dev/compare_mixer_data.c:78-82`). The adapter reads the loop span out of the
+  loaded `Module` — nothing is added to the committed C1 trace format for a
+  comparison-only concern — and compares the two positions circularly inside that span, so
+  a voice one frame past the wrap is not reported 63 frames away from itself.
+- **Accuracy policy D18.** libxmp inspects `NOTE_SAMPLE_END` after `xmp_play_frame` has
+  rendered the interval and omits the voice; C1 snapshots the channel at the event
+  boundary before it. When a StarPlayer voice is active, libxmp has no record for that
+  channel on that tick, the region is one-shot, and the voice cannot survive the interval,
+  the pair is projected as matching. Every other absence stays an active-set mismatch.
+- **Per-field waivers.** A fourth `waive=field[,field]` column in `exclusions.tsv` makes
+  the differ ignore exactly those fields for exactly that case and enforce every other
+  one, so a fixture excluded for one documented representation difference still verifies
+  the effect it exists to test. An unknown or structural field name is a hard error. A
+  case that waives `frame` has declared its two timelines incomparable, so its records are
+  anchored on the first matching `(row, frame)` and then tracked by residual offset.
+
+The capture tick budget is derived from the oracle's **last timestamp**, not its record
+count: libxmp writes no line for a tick with no mapped active voice, so the record count
+is only a lower bound. Exhausting the budget is reported as a harness error that fails the
+run, never as a case result.
 
 All three formats are now registered through their own native trace paths — MOD by C3,
 MTM by C4, S3M from M1 — so the runner's pending-integration table is empty and its
@@ -87,21 +133,30 @@ in that state.
 
 ## Current standing
 
-3 of the 47 pinned cases pass: MOD 0 of 27, S3M 2 of 17, MTM 1 of 3. The remaining 44 are
-exclusions, and they are not one kind of thing:
+After the C2a harness repairs, 10 of the 47 pinned cases pass: MOD 7 of 27, S3M 2 of 17,
+MTM 1 of 3. Six of the MOD passes waive `position` alone under D14 and enforce every other
+field. The remaining 37 split into 9 accepted deviations and 28 known failures:
 
 - **Accepted accuracy-policy deviations** (D12 is explicitly *not* one of these): the
-  oracle-representation entries D14–D19 and the §4 Startrekker AM-synth cases.
+  oracle-representation entries D14–D19 and the §4 Startrekker AM-synth cases. D14 turns
+  out to reach further than C2 recorded — `PatternJump.mod`, `ptoffset.mod` and
+  `InstrSwapRetrigger.mod` are all finetuned, so once the harness aligned them correctly
+  their only remaining difference is the same one-to-two source frames of continuous
+  versus table finetune drift.
 - **Tracker dialects** awaiting `plans/engine/M2-task-C5-quirks-and-tempo-models.md`: five
   Octalyser / Digital Tracker MOD cases and six S3M `cwtv` pattern-loop modes.
-- **Tracked repairs**: harness bugs in
-  `plans/engine/M2-task-C2a-conformance-harness-repairs.md`, ProTracker fidelity and the
-  voice-boundary sample swap in
+- **Tracked repairs**: ProTracker fidelity and the voice-boundary sample swap in
   `plans/engine/M2-task-C3b-protracker-fidelity-repairs.md`, and the S3M records in
   `plans/engine/M2-task-C9-s3m-conformance-repairs.md`.
 
+Because the old aligner returned a string error before the differ ever ran, most of the
+pre-C2a reasons named an alignment position rather than a state difference. Every reason
+in `exclusions.tsv` now records the first divergence the repaired harness actually
+observed, and several of them are in a different place — and of a different kind — from
+what was recorded before.
+
 The pass count is the honest measure of M2's third exit criterion; the harness exiting
-zero on 44 exclusions is not.
+zero on 37 exclusions is not, which is what `--strict` exists to say.
 
 ## Deviation from the C2 task file
 

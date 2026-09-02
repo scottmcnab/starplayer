@@ -86,7 +86,7 @@ the pinned libxmp demonstrably does not select for those files.
 Harness repairs — time-based alignment, loop-aware position comparison, the D18 adapter
 projection, per-field waivers, a `--strict` mode with an honest summary, an oracle-derived
 tick budget, and the exclusions rewrite that follows from re-running — are tracked by
-[M2-task-C2a](../M2-task-C2a-conformance-harness-repairs.md). Deliverable 5's summary
+[M2-task-C2a](M2-task-C2a-conformance-harness-repairs.md) (landed). Deliverable 5's summary
 report is superseded by C2a deliverable 5.
 
 ## Out of scope

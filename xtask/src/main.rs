@@ -85,7 +85,7 @@ fn print_usage() {
     println!();
     println!("subcommands:");
     println!("  ci [--job <job>]   run the CI matrix locally, or a single job of it");
-    println!("  conformance [--offline|--fetch-only] [--archive PATH]   acquire and run the pinned tracker corpora");
+    println!("  conformance [--offline|--fetch-only] [--strict] [--archive PATH]   acquire and run the pinned tracker corpora");
     println!("  goldens [--check]  regenerate canonical SHA-256 renders, or verify them");
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
     println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
@@ -158,16 +158,21 @@ fn run_goldens(arguments: &[String]) -> bool {
 ///
 /// `--offline` refuses acquisition and is the CI gate. `--fetch-only` prepares the cache
 /// without compiling or running the harness. `--archive PATH` lets maintainers validate
-/// a previously downloaded archive while still enforcing the pinned checksum.
+/// a previously downloaded archive while still enforcing the pinned checksum. `--strict`
+/// fails the run while any known-failure exclusion remains; the `conformance` CI job
+/// deliberately runs the informational form until C5, C7 and C9 land — making it strict
+/// is the one-line change in `job_conformance`.
 fn run_conformance(arguments: &[String]) -> bool {
     let mut offline = false;
     let mut fetch_only = false;
+    let mut strict = false;
     let mut supplied_archive: Option<PathBuf> = None;
     let mut index = 0usize;
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--offline" => { offline = true; index += 1; }
             "--fetch-only" => { fetch_only = true; index += 1; }
+            "--strict" => { strict = true; index += 1; }
             "--archive" => {
                 let Some(path) = arguments.get(index + 1) else {
                     eprintln!("xtask conformance: `--archive` needs a path");
@@ -216,6 +221,9 @@ fn run_conformance(arguments: &[String]) -> bool {
         ])
         .arg(corpus.join("test-dev"))
         .args(["--manifest", CONFORMANCE_MANIFEST, "--exclusions", CONFORMANCE_EXCLUSIONS]);
+    if strict {
+        command.arg("--strict");
+    }
     match command.status() {
         Ok(status) if status.success() => true,
         Ok(status) => {
@@ -548,6 +556,10 @@ fn collect_files_with_extension(directory: &Path, extension: &str, destination: 
 /// Corpus acquisition is deliberately separate from the CI test command. The workflow
 /// restores or prepares the checksum-pinned cache first; this job proves that the tests
 /// themselves have no live third-party dependency.
+///
+/// This is the informational form: it reports the known-failure exclusions without
+/// failing on them. Once C5, C7 and C9 land, add `"--strict".to_string()` to the argument
+/// list below and CI enforces the M2 exit criterion.
 fn job_conformance() -> bool {
     run_conformance(&["--offline".to_string()])
 }

@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) |
-| Status | Outstanding |
+| Status | Landed |
 | Depends on | C2 (harness exists and runs) |
 | Blocks | C9, C5, M2 exit |
 | Parallel with | C6a |
@@ -235,3 +235,30 @@ behaviour. Fixing the S3M failures (C9), the ProTracker fidelity bugs (C3b), or 
 tracker dialects (C5). Rewriting `plans/product/03-accuracy-policy.md`,
 `plans/reference/format-notes-mod.md` or `conformance/known-failures.md` beyond the two
 consistency edits named in deliverable 9. Acquiring new corpora.
+
+## Post-landing notes (2026-09-02)
+
+All ten deliverables landed on branch `m2-c2a`. Where the outcome differed from the
+expectations written above:
+
+- **Pass count.** The four cases predicted to pass did not all pass on the repairs alone,
+  because three of their modules are finetuned and D14 drift remained on `position`.
+  `PortaTarget` passed outright. The reviewer then waived `position` alone on the seven
+  D14 rows, which the worker had left as whole-case exclusions: six pass with every
+  other field enforced, and `PTInstrSwap` exposes its D12 gap at tick 72 (C3b). The
+  standing is **10 of 47** (MOD 7/27, S3M 2/17, MTM 1/3), 9 accepted deviations, 28 known
+  failures.
+- **D15 waivers need `frame,position`**, not `frame` alone: the CIA latch offsets the
+  whole timeline, so voices are permanently offset inside their loops. A `frame` waiver
+  also switches the pairer to anchor-plus-rolling-offset. Both cases then expose real
+  ProTracker differences (`DelayBreak` voice lifetime, `VibratoReset` volume rounding),
+  now owned by C3b.
+- **`libxmp-mtm-tempo`** did not pass: D18 was removed but the trace then diverges at
+  tick 261 on D19 truncation. Its exclusion cites D19.
+- **Research point 2 (`ptoffset`)** is D14 drift on a finetune-14 sample, not a `9xx` or
+  loop-gate difference; it passes with `position` waived.
+- **Re-diagnosed S3M rows**: `pattern-loop-imf` diverges on note at tick 0, the three
+  `st301`/`st321-breakjump` rows on pan 136 vs 119 at ticks 0–2, `FreqLimits` on period
+  at tick 31 (the old "voice active at row 5" was an alignment artefact). See
+  `conformance/known-failures.md`.
+- Deliverable 9's remaining doc edits were done in the review commit that opened C2a.

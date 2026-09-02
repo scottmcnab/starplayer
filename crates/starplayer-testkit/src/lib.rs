@@ -11,10 +11,13 @@
 //! `time row frame channel period note instrument volume pan position cutoff resonance`.
 //! Map `row`, `frame` (libxmp's tick-in-row), `channel`, `period`, `note`, `instrument`,
 //! `volume`, `pan`, integer `position`, `cutoff` and `resonance` to their corresponding v1
-//! state. `time` is rounded end-of-frame milliseconds and is compared with StarPlayer's
-//! exact tick-end frame. Presence in the dump defines the active channel set; extra
-//! StarPlayer voices remain observable. Order/pattern, speed/BPM/global volume, sample
-//! number, fractional position and dirty flags have no libxmp column. MOD explicitly
+//! state. `time` is rounded end-of-frame milliseconds: it is both the key records are
+//! paired on and a compared field, because libxmp carries no order index and `(row,
+//! frame)` alone cannot tell a jump destination's row 0 from the starting order's.
+//! Presence in the dump defines the active channel set; extra StarPlayer voices remain
+//! observable, except at the accuracy-policy D18 boundary the adapter projects.
+//! Order/pattern, speed/BPM/global volume, sample number, fractional position and dirty
+//! flags have no libxmp column. MOD explicitly
 //! projects StarPlayer's Q32.32 position down to libxmp's whole-frame `pos0` domain;
 //! all formats then apply libxmp's own one-frame position bound. Timing keeps libxmp's
 //! one-millisecond bound.
@@ -261,9 +264,38 @@ pub enum TraceField {
     Flags,
 }
 
-impl fmt::Display for TraceField {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
+impl TraceField {
+    /// Every named field, in the order the differ compares them.
+    pub const ALL: [TraceField; 24] = [
+        TraceField::Version,
+        TraceField::TickCount,
+        TraceField::Tick,
+        TraceField::Frame,
+        TraceField::Order,
+        TraceField::Pattern,
+        TraceField::Row,
+        TraceField::TickInRow,
+        TraceField::Speed,
+        TraceField::Bpm,
+        TraceField::GlobalVolume,
+        TraceField::ChannelCount,
+        TraceField::Channel,
+        TraceField::Active,
+        TraceField::Note,
+        TraceField::Instrument,
+        TraceField::Sample,
+        TraceField::Volume,
+        TraceField::Period,
+        TraceField::Pan,
+        TraceField::Position,
+        TraceField::Cutoff,
+        TraceField::Resonance,
+        TraceField::Flags,
+    ];
+
+    /// The stable spelling used by [`fmt::Display`] and by conformance field waivers.
+    pub const fn name(self) -> &'static str {
+        match self {
             TraceField::Version => "version",
             TraceField::TickCount => "tick-count",
             TraceField::Tick => "tick",
@@ -288,9 +320,18 @@ impl fmt::Display for TraceField {
             TraceField::Cutoff => "cutoff",
             TraceField::Resonance => "resonance",
             TraceField::Flags => "flags",
-        };
-        formatter.write_str(name)
+        }
     }
+
+    /// Resolve a stable spelling back to its field. Unknown spellings are rejected so a
+    /// typo in a conformance waiver cannot silently waive nothing.
+    pub fn from_name(name: &str) -> Option<TraceField> {
+        TraceField::ALL.into_iter().find(|field| field.name() == name)
+    }
+}
+
+impl fmt::Display for TraceField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(self.name()) }
 }
 
 /// The earliest mismatching field.
@@ -309,9 +350,13 @@ pub struct TraceDivergence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceDiff {
     pub first_divergence: Option<TraceDivergence>,
+    /// Ticks present in both traces whose contents disagree. A length difference is
+    /// [`TraceDiff::tick_count_difference`] and is deliberately not folded in here.
     pub divergent_ticks: usize,
     /// Number of per-tick channel records that differ.
     pub divergent_channels: usize,
+    /// `|expected.ticks - actual.ticks|`: one trace being longer, not a disagreement.
+    pub tick_count_difference: usize,
     pub expected_ticks: usize,
     pub actual_ticks: usize,
     /// Previous/current/next tick blocks around the first divergence.
@@ -336,9 +381,10 @@ impl fmt::Display for TraceDiff {
         }
         write!(
             formatter,
-            "summary: {} divergent tick(s), {} divergent channel record(s); expected {} tick(s), actual {}",
+            "summary: {} divergent tick(s), {} divergent channel record(s), {} tick(s) of length difference; expected {} tick(s), actual {}",
             self.divergent_ticks,
             self.divergent_channels,
+            self.tick_count_difference,
             self.expected_ticks,
             self.actual_ticks,
         )
@@ -407,19 +453,19 @@ pub fn diff_traces(expected: &Trace, actual: &Trace, tolerances: &TraceTolerance
         }
     }
 
-    if expected.ticks.len() != actual.ticks.len() {
-        divergent_ticks += expected.ticks.len().abs_diff(actual.ticks.len());
-        if first_divergence.is_none() {
-            first_divergence = Some(divergence(
-                Some(common_ticks),
-                expected.ticks.get(common_ticks).map(|tick| tick.tick).or_else(|| actual.ticks.get(common_ticks).map(|tick| tick.tick)),
-                None,
-                TraceField::TickCount,
-                expected.ticks.len(),
-                actual.ticks.len(),
-                0,
-            ));
-        }
+    // A length difference is reported as its own quantity: `divergent_ticks` means
+    // "ticks present in both traces that disagree" and nothing else.
+    let tick_count_difference = expected.ticks.len().abs_diff(actual.ticks.len());
+    if tick_count_difference != 0 && first_divergence.is_none() {
+        first_divergence = Some(divergence(
+            Some(common_ticks),
+            expected.ticks.get(common_ticks).map(|tick| tick.tick).or_else(|| actual.ticks.get(common_ticks).map(|tick| tick.tick)),
+            None,
+            TraceField::TickCount,
+            expected.ticks.len(),
+            actual.ticks.len(),
+            0,
+        ));
     }
 
     let context = first_divergence.as_ref().and_then(|first| first.tick_index).map(|index| trace_context(expected, actual, index)).unwrap_or_default();
@@ -427,6 +473,7 @@ pub fn diff_traces(expected: &Trace, actual: &Trace, tolerances: &TraceTolerance
         first_divergence,
         divergent_ticks,
         divergent_channels,
+        tick_count_difference,
         expected_ticks: expected.ticks.len(),
         actual_ticks: actual.ticks.len(),
         context,
@@ -591,6 +638,26 @@ mod tests {
         assert!(report.contains("t=00000"), "the previous tick is context");
         assert!(report.contains("t=00002"), "the following tick is context");
         assert!(report.contains("summary: 2 divergent tick(s), 2 divergent channel record(s)"));
+    }
+
+    #[test]
+    fn a_length_difference_is_its_own_quantity_not_a_divergent_tick() {
+        let expected = example_trace();
+        let mut actual = expected.clone();
+        actual.ticks.pop();
+
+        let difference = diff_traces(&expected, &actual, &TraceTolerances::default());
+        assert_eq!(difference.divergent_ticks, 0, "the two common ticks agree");
+        assert_eq!(difference.tick_count_difference, 1);
+        assert_eq!(difference.first_divergence.map(|first| first.field), Some(TraceField::TickCount));
+    }
+
+    #[test]
+    fn every_field_round_trips_through_its_stable_name() {
+        for field in TraceField::ALL {
+            assert_eq!(TraceField::from_name(field.name()), Some(field), "{field} must parse back");
+        }
+        assert_eq!(TraceField::from_name("frames"), None, "an unknown spelling is rejected, not guessed");
     }
 
     #[test]

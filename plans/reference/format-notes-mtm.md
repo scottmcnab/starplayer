@@ -106,8 +106,9 @@ volume, and pan, but retain two deliberately visible oracle-boundary differences
   buffer-duration drift (accuracy D19).
 
 Both cases remain executed exclusions, so any later adapter or trace improvement makes
-the exclusion fail as stale. That is the expected outcome for `TEMPO.MTM`:
-`plans/engine/M2-task-C2a-conformance-harness-repairs.md` turns D18 into an adapter
-projection — when StarPlayer has an active one-shot voice, libxmp has no record, and the
-voice reaches its region end inside the tick interval, the pair is treated as matching —
-after which this case should pass and its exclusion be dropped. `TEMPO2.MTM` (D19) stays.
+the exclusion fail as stale. C2a (`plans/engine/complete/M2-task-C2a-conformance-harness-repairs.md`)
+turned D18 into an adapter projection — when StarPlayer has an active one-shot voice,
+libxmp has no record, and the voice reaches its region end inside the tick interval, the
+pair is treated as matching. That removed the row 12 tick 4 difference from `TEMPO.MTM`,
+but the trace then runs to tick 261 before diverging on position by two source frames:
+the same D19 truncation as `TEMPO2.MTM`. Both exclusions therefore cite D19.

@@ -226,36 +226,42 @@ What differs is the representation of pitch, and accuracy policy D14 now records
 - libxmp derives a finetuned period continuously, `428 · 2^(-(note + finetune/128)/12)`,
   producing non-integers such as 162.65 and 453.45 where ProTracker reads one of the 16
   integer finetune tables (163, 453). Positions drift by roughly one source frame per tick
-  on finetuned samples, which excludes `finetune`, `AmigaLimitsFinetune` and `PTInstrSwap`.
+  on finetuned samples. Since C2a those cases waive `position` alone and enforce every
+  other field: `finetune`, `AmigaLimitsFinetune`, `PatternJump`, `InstrSwapRetrigger`,
+  `ptoffset` and `PTInstrVolume` pass that way; `PTInstrSwap` then exposes the D12 gap.
 - libxmp's C-4 rate is the rounded integer 8287, making its clock `8287 × 428 =
   3_546_836 Hz` against the exact PAL `3_546_895 Hz` — 17 ppm. That crosses the
   one-integer-sample bound only at the final compared tick of `PTInstrVolume`.
 
-Four cases that a previous revision filed under the same heading are not engine deviations
-at all, and must not be read as accepted ones:
+Four cases that a previous revision filed under the same heading were not engine
+deviations at all; C2a (now landed, `plans/engine/complete/M2-task-C2a-conformance-harness-repairs.md`)
+resolved each of them:
 
 - `PortaTarget` — the harness compares floored positions with a linear `|a − b| <= 1`. The
   true position is 64.003 on a 64-frame loop, so StarPlayer reports 0 and libxmp 63.
-  libxmp's own comparator special-cases loop start/end equivalence. Harness repair, tracked
-  by `plans/engine/M2-task-C2a-conformance-harness-repairs.md`.
+  libxmp's own comparator special-cases loop start/end equivalence. The harness now
+  compares circularly inside the loop span and the case passes.
 - `PatternJump` — the trace aligner pairs records on `(row, frame)` with no time or order,
   so order 0 row 0's silent ticks are paired against libxmp's order 1 row 0 records. The
-  actual positions 0..1090 match exactly. Same task file.
+  actual positions 0..1090 match exactly. The harness now pairs by time; the case passes
+  with only D14's `position` waived.
 - `InstrSwapRetrigger` — the one-shot ends 0.07 tick into row 1 frame 8. libxmp omits a
   voice marked `NOTE_SAMPLE_END` after mixing the interval while C1 snapshots before it;
-  that is the D18 mechanism, and C2a turns it into an adapter projection rather than a
-  per-case exclusion.
-- `ptoffset` — StarPlayer's channel 0 voice stays active about 15 ticks longer than
-  libxmp's after the `9xx`-without-note sequence. Both sides are PAL, so the clock explains
-  nothing; the cause is unexplained (candidates are the `9xx` retained-pointer semantics
-  and the loop gate above) and is to be re-diagnosed against ProTracker by C3b/C2a, not
-  accepted as a deviation.
+  that is the D18 mechanism, now an adapter projection rather than a per-case exclusion.
+  The case passes with only D14's `position` waived.
+- `ptoffset` — the apparent 15-tick voice-lifetime difference was an alignment artefact.
+  Re-diagnosed by C2a: the offsets applied at ticks 0 to 7 match libxmp exactly, the first
+  difference is D14 drift on a finetune-14 sample at tick 8, and with `position` waived the
+  whole trace, active set included, matches. Not a `9xx` or loop-gate difference.
 
 D15 records the two dumps whose first timestamp assumes libxmp's immediate `Fxx` tempo
 interval rather than PT's CIA update boundary. Excluding those cases outright hides the
-behaviour they exist to test, so C2a adds a per-field waiver: only the tick-0 `frame` field
-is waived, and the rest of each trace is enforced. D16 records the out-of-range arpeggio
-volume disagreement.
+behaviour they exist to test, so C2a added a per-field waiver. Both cases waive `frame`
+and `position` (the CIA latch shifts libxmp's whole timeline, so every voice is also
+permanently offset inside its loop), and the rest of each trace is enforced. That exposed
+two real ProTracker differences now owned by C3b: `DelayBreak` keeps the row-0 voice alive
+into row 1 frame 0 where libxmp has dropped it, and `VibratoReset` disagrees on volume by
+one unit at tick 136. D16 records the out-of-range arpeggio volume disagreement.
 
 OpenMPT's `NoteDelay-NextRow.mod` is documented-only in the pinned libxmp suite. PT lets
 an `EDx` whose delay exceeds the current speed leak into the next row under narrow
