@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) |
-| Status | Landed — nine of the ten dialect cases pass; the tenth is `C2-MOD-001`, a harness record |
+| Status | Landed — all ten dialect cases pass (the tenth after a harness re-anchor, `C2-MOD-001`) |
 | Depends on | C3 (MOD), C3b (ProTracker fidelity repairs), C2a (harness repairs) |
 | Blocks | M2 exit |
 | Parallel with | C6a, C7 |
@@ -239,11 +239,12 @@ Landed on branch `m2-c5`, rebased onto C7. Nine of the ten dialect cases pass an
 corpus stands at **32 of 47**; no other case moved under `canonical()` and no golden
 changed. The worker's research resolutions above stand. Two things for the owner:
 
-- `libxmp-mod-pattern-loop-dt` is `C2-MOD-001`, a harness record: its `(row, tick)`
-  sequence matches the oracle for all 488 ticks, but the fixture's alternating 255/63 BPM
+- `libxmp-mod-pattern-loop-dt` was `C2-MOD-001`, a harness record: its `(row, tick)`
+  sequence matched the oracle for all 488 ticks, but the fixture's alternating 255/63 BPM
   rows make the D15 frame offset flip by about 1300 frames at each `Fxx`, and the
-  time-based pairer only re-derives its offset after a successful pairing. Re-anchoring on
-  `(row, tick_in_row)` when a pairing fails is C2a-style harness work.
+  time-based pairer only re-derived its offset after a successful pairing. The reviewer
+  added the re-anchor on `(row, tick_in_row)` to `pair_by_time` directly after C5 landed;
+  the case now passes and the corpus stands at **33 of 47**.
 - D40 records that `S_FX_D` and libxmp/OpenMPT classify `DFF` differently; the original
   assembly's order is kept as the primary specification, and only `pattern_loop_imf.s3m`
   contains the byte.

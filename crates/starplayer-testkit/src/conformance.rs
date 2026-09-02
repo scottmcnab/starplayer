@@ -629,6 +629,9 @@ fn pair_by_time(upstream: &[LibxmpTick], actual: &Trace, end_frames: &[Frame], t
             - i64::try_from(expected_frame(first.time_ms).0).unwrap_or(i64::MAX);
         search = anchor;
     }
+    // The first tick after the last successful pairing: where a waived timeline
+    // re-anchors when the residual offset jumps.
+    let mut next_candidate = search;
     upstream.iter().map(|upstream_tick| {
         let target = expected_frame(upstream_tick.time_ms).0.saturating_add_signed(offset);
         while search < end_frames.len() && end_frames[search].0 + FRAME_TOLERANCE < target {
@@ -638,11 +641,36 @@ fn pair_by_time(upstream: &[LibxmpTick], actual: &Trace, end_frames: &[Frame], t
             Some(frame) if frame.0.abs_diff(target) <= FRAME_TOLERANCE => {
                 let paired = search;
                 search += 1;
+                next_candidate = search;
                 if timeline_waived {
                     offset = i64::try_from(frame.0).unwrap_or(i64::MAX)
                         - i64::try_from(expected_frame(upstream_tick.time_ms).0).unwrap_or(i64::MAX);
                 }
                 Some(paired)
+            }
+            _ if timeline_waived => {
+                // A waived timeline's residual offset is only re-derived on a successful
+                // pairing, so a tempo command that moves it by more than the tolerance in
+                // one step — `DelayBreak`-style `Fxx` rows alternating 255 and 63 BPM —
+                // strands the records until the offset is re-learned. Re-anchor on the
+                // record's own `(row, frame)`, searching forward from the last pairing so
+                // a repeated row inside a loop cannot pull the cursor backwards.
+                let re_anchor = actual.ticks.iter().enumerate().skip(next_candidate)
+                    .find(|(_, tick)| tick.position.row == upstream_tick.row && tick.tick_in_row == upstream_tick.frame)
+                    .map(|(index, _)| index);
+                match re_anchor {
+                    Some(index) => {
+                        search = index + 1;
+                        next_candidate = search;
+                        offset = i64::try_from(end_frames[index].0).unwrap_or(i64::MAX)
+                            - i64::try_from(expected_frame(upstream_tick.time_ms).0).unwrap_or(i64::MAX);
+                        Some(index)
+                    }
+                    None => {
+                        search = next_candidate;
+                        None
+                    }
+                }
             }
             _ => None,
         }
@@ -991,6 +1019,30 @@ mod tests {
         let first = difference.first_divergence.expect("the row disagrees");
         assert_eq!((first.tick, first.field), (Some(1), TraceField::Row), "a mis-paired row is a field, not an error");
         assert_eq!((first.expected.as_str(), first.actual.as_str()), ("0", "1"));
+    }
+
+    #[test]
+    fn a_waived_timeline_re_anchors_on_row_and_frame_when_the_offset_jumps() {
+        // Three records a tick apart in libxmp's timeline. StarPlayer's second tick runs
+        // at 63 BPM, so its end lands 1218 frames later than the rolling offset predicts —
+        // a CIA-latched tempo change under D15 — and the third follows it. Without
+        // re-anchoring, records two and three pair with nothing and are reported against
+        // the wrong ticks. (Tick end frames come from the trace's `bpm`/`speed`, not its
+        // `frame` column.)
+        let dump = parse_libxmp_dump(concat!(
+            "20 0 0 0 1753088 60 0 1024 0 0\n",
+            "40 1 0 0 1753088 60 0 1024 0 0\n",
+            "60 2 0 0 1753088 60 0 1024 0 0\n",
+        )).expect("valid dump");
+        let channel = TraceChannel { channel: 0, active: true, note: Some(48), instrument: 1, sample: 1, volume: 64, period: 1712, pan: 136, position: 0, cutoff: 255, resonance: 0, flags: DirtyBits::empty() };
+        let mut trace = one_tick_trace(channel.clone());
+        trace.ticks.push(TraceTick { tick: 1, frame: Frame(882), bpm: 63, position: SongPosition { order: 0, pattern: 0, row: 1 }, tick_in_row: 0, channels: vec![channel.clone()], ..trace.ticks[0].clone() });
+        trace.ticks.push(TraceTick { tick: 2, frame: Frame(882 + 2100), position: SongPosition { order: 0, pattern: 0, row: 2 }, tick_in_row: 0, channels: vec![channel], ..trace.ticks[0].clone() });
+
+        let waived = diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &SampleGeometry::default(), &[TraceField::Frame]);
+        assert!(waived.is_identical(), "the pairer re-anchored on (row, frame) after the jump: {waived}");
+        let enforced = diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &SampleGeometry::default(), &[]);
+        assert_eq!(enforced.first_divergence.expect("the timing differs").field, TraceField::Frame, "without the waiver the jump is a real frame divergence");
     }
 
     #[test]

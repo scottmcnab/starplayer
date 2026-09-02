@@ -262,3 +262,8 @@ expectations written above:
   at tick 31 (the old "voice active at row 5" was an alignment artefact). See
   `conformance/known-failures.md`.
 - Deliverable 9's remaining doc edits were done in the review commit that opened C2a.
+- **Follow-up after C5 (2026-09-03).** A `frame`-waived timeline whose residual offset
+  jumps by more than the tolerance in one step (`pattern_loop_dt.mod`, alternating 255 and
+  63 BPM under D15) stranded three records per jump. `pair_by_time` now re-anchors on the
+  record's `(row, tick_in_row)` when a pairing fails, searching forward from the last
+  pairing; see `C2-MOD-001` in `conformance/known-failures.md`.

@@ -8,8 +8,8 @@ test step after the acquisition cache has been prepared. `cargo xtask conformanc
 --strict` additionally exits non-zero while any known-failure exclusion remains and names
 every one of them.
 
-CI runs the informational (non-strict) form. That is deliberate while `C2-S3M-009` and
-`C2-MOD-001` remain; making it strict is one added argument in `job_conformance` in
+CI runs the informational (non-strict) form. That is deliberate while `C2-S3M-009`
+remains; making it strict is one added argument in `job_conformance` in
 `xtask/src/main.rs`.
 
 The snapshot is libxmp commit
@@ -135,10 +135,10 @@ in that state.
 ## Current standing
 
 After the C2a harness repairs, C3b's ProTracker fidelity repairs, the C9 S3M repairs and
-C5's tracker dialects, **32 of the 47** pinned cases pass: MOD 15 of 27, S3M 16 of 17,
-MTM 1 of 3. Twelve of the MOD passes and ten of the S3M passes waive one or more fields
-under an accuracy-policy entry and enforce every other field. The remaining 15 split into
-13 accepted deviations and **2** known failures:
+C5's tracker dialects, **33 of the 47** pinned cases pass: MOD 16 of 27, S3M 16 of 17,
+MTM 1 of 3. Thirteen of the MOD passes and ten of the S3M passes waive one or more fields
+under an accuracy-policy entry and enforce every other field. The remaining 14 split into
+13 accepted deviations and **1** known failure:
 
 - **Accepted accuracy-policy deviations**: the oracle-representation entries D14–D39 and
   the §4 Startrekker AM-synth cases. D12 is no longer among them — the queued sample swap
@@ -150,17 +150,17 @@ under an accuracy-policy entry and enforce every other field. The remaining 15 s
 - **Tracker dialects**, delivered by
   `plans/engine/complete/M2-task-C5-quirks-and-tempo-models.md`: the five Octalyser / Digital
   Tracker MOD cases and the five S3M `cwtv` pattern-loop modes now select a `FormatDialect`
-  detected from the file header. Nine pass, two of them
+  detected from the file header. All ten pass, two of them
   (`libxmp-s3m-pattern-loop-imf-breakjump`, `libxmp-s3m-pattern-loop-st301-breakjump`) with
   no waiver at all and no exclusion row. `libxmp-s3m-pattern-loop-mpt-breakjump` had
   already started passing on the shared ST3.21 flow path C9 corrected.
-- **Tracked repairs**: two records in `conformance/known-failures.md` — `C2-S3M-009`, the
-  `Rxy` tremolo phase question left by C9, and `C2-MOD-001`, which C5 added and which is a
-  **harness** record: `libxmp-mod-pattern-loop-dt` produces a row sequence identical to the
-  oracle's for all 488 ticks, and what fails is `pair_by_time`'s residual-offset tracking
-  across the fixture's alternating 255 and 63 BPM sections while `frame` is waived for D15.
+- **Tracked repairs**: one record in `conformance/known-failures.md` — `C2-S3M-009`, the
+  `Rxy` tremolo phase question left by C9. (`C2-MOD-001`, the pairer's residual-offset
+  tracking across a 1300-frame tempo flip, is resolved: `pair_by_time` re-anchors a
+  waived timeline on `(row, tick_in_row)`, and `libxmp-mod-pattern-loop-dt` passes
+  across the fixture's alternating 255 and 63 BPM sections while `frame` is waived for D15.)
 
-C5's own before/after, on the pinned corpus: MOD went from 11 of 27 to 15 of 27 and S3M
+C5's own before/after, on the pinned corpus: MOD went from 11 of 27 to 15 of 27 (16 after the harness re-anchor) and S3M
 from 11 of 17 to 16 of 17, and no case outside the ten dialect targets changed state. The
 `QuirkSet` fields it added that no corpus case can see — the Paula clock (D14) and the
 ProTracker tremolo-ramp phase (D20) — are observed by unit tests instead.

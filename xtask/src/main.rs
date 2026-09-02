@@ -271,7 +271,7 @@ fn run_goldens(arguments: &[String]) -> bool {
 /// without compiling or running the harness. `--archive PATH` lets maintainers validate
 /// a previously downloaded archive while still enforcing the pinned checksum. `--strict`
 /// fails the run while any known-failure exclusion remains; the `conformance` CI job
-/// deliberately runs the informational form while `C2-MOD-001` and `C2-S3M-009` remain — making it strict
+/// deliberately runs the informational form while `C2-S3M-009` remains — making it strict
 /// is the one-line change in `job_conformance`.
 fn run_conformance(arguments: &[String]) -> bool {
     let mut offline = false;
@@ -1047,7 +1047,7 @@ fn collect_files_with_extension(directory: &Path, extension: &str, destination: 
 /// themselves have no live third-party dependency.
 ///
 /// This is the informational form: it reports the known-failure exclusions without
-/// failing on them. Once `C2-MOD-001` and `C2-S3M-009` are resolved, add `"--strict".to_string()` to the argument
+/// failing on them. Once `C2-S3M-009` is resolved, add `"--strict".to_string()` to the argument
 /// list below and CI enforces the M2 exit criterion.
 fn job_conformance() -> bool {
     run_conformance(&["--offline".to_string()])

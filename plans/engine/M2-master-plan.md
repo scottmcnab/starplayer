@@ -66,20 +66,19 @@ until that trigger fires.
 
 Honest position, so that nothing downstream plans against a number that is not true.
 
-**Conformance: 32 of 47 cases pass after C2a, C3b, C9 and C5** — MOD **15 of 27**, S3M
-**16 of 17**, MTM **1 of 3** — with **13 accepted deviations** and **2 known failures**:
-`C2-MOD-001` (a harness pairing limit under a `frame` waiver; the replay itself matches
-the oracle tick for tick) and `C2-S3M-009` (the `Rxy` tremolo phase). Every other
-exclusion is a documented oracle-representation difference. `cargo xtask conformance`
-exits zero in its informational form; `--strict` names those two records and stays off in
-CI until they are resolved. Before C2a the standing was 3 of 47 with 44 undifferentiated
-exclusions, eight of them citing an NTSC rate libxmp never selected.
+**Conformance: 33 of 47 cases pass after C2a, C3b, C9 and C5** — MOD **16 of 27**, S3M
+**16 of 17**, MTM **1 of 3** — with **13 accepted deviations** and **1 known failure**,
+`C2-S3M-009` (the `Rxy` tremolo phase, an ST3-versus-libxmp/OpenMPT question for the
+owner). Every other exclusion is a documented oracle-representation difference. `cargo
+xtask conformance` exits zero in its informational form; `--strict` names that one record
+and stays off in CI until it is resolved. Before C2a the standing was 3 of 47 with 44
+undifferentiated exclusions, eight of them citing an NTSC rate libxmp never selected.
 
 | Exit criterion | Status | Closed by |
 |---|---|---|
 | 1. MOD and MTM native, no S3M conversion | **Met** | C3, C4 |
 | 2. `cargo xtask goldens` regenerates; CI verifies | **Met** — S3M owner fixtures plus synthesised MOD and MTM fixtures | C6a (landed) |
-| 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Met as written** — 32/47 pass and every remaining case is listed with a reason; two are known failures (`C2-MOD-001`, `C2-S3M-009`) rather than accepted deviations, so `--strict` stays informational | `C2-MOD-001`, `C2-S3M-009` |
+| 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Met as written** — 33/47 pass and every remaining case is listed with a reason; one is a known failure (`C2-S3M-009`) rather than an accepted deviation, so `--strict` stays informational | `C2-S3M-009` |
 | 4. Cross-target hash equality on the fixed path | **Met** for all three formats on x86-64 and wasm32; the ARM64 leg is CI-only | C6a (landed) |
 | 5. Loader fuzzing in CI, no panic or OOM | **Met** — six `cargo-fuzz` targets (byte-level and structured, per format), a bounded per-commit job and a nightly long run; the seeds and every crash regression are replayed on the pinned toolchain in `host-tests` | C7 (landed) |
 | 6. Allocator hook proves no allocation in `render()` | **Met** — `cargo xtask ci --job rt-safety`, over every module the repository can reach, at three host block sizes and across a `LoadModule` swap | C7 (landed) |
