@@ -202,6 +202,10 @@ fn demo_volume(volume: u8) -> U0F16 {
 }
 
 impl TrackerProcessor for DemoProcessor {
+    /// The demo processor keeps counters rather than replay state, and a seek must not
+    /// discard what a caller is counting, so there is nothing to reset.
+    fn reset(&mut self) {}
+
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
         self.rows_played = self.rows_played.saturating_add(1);
         let mut outcome = context.outcome();

@@ -372,6 +372,30 @@ impl<'engine> TickContext<'engine> {
         Some(voice)
     }
 
+    /// Queue a ProTracker sample swap on `channel`'s foreground voice, to be applied when
+    /// the sounding sample next reaches its loop point or its end (accuracy policy D12).
+    ///
+    /// Returns whether a sounding voice took the queue. A caller that gets `false` has a
+    /// channel whose sample already stopped, which ProTracker starts afresh instead.
+    #[inline]
+    pub fn queue_channel_region(&mut self, channel: ChannelId, region: SampleRegion) -> bool {
+        let Some(voice) = self.channels.foreground(channel) else { return false };
+        let Some(state) = self.voices.get_mut(voice) else { return false };
+        // Queueing the sample that is already sounding is a no-op in ProTracker — the
+        // registers Paula would reload already hold it — so it must not rebase the
+        // position at the next boundary. libxmp's `libxmp_mixer_queuepatch` skips it the
+        // same way.
+        if state.region() == region { return true; }
+        state.queue_region(region);
+        // The swap has no parameter write of its own, so the trace records the queue
+        // itself; without it the C1 dump shows the sample changing with no cause.
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.record_voice_flags(self.voices, voice, DirtyBits::SAMPLE);
+        }
+        true
+    }
+
     /// Stop and unbind a channel, preserving the stop write in the tick trace even though
     /// the foreground handle is deliberately cleared immediately.
     #[inline]
@@ -439,6 +463,17 @@ pub trait TrackerProcessor {
 
     /// Every other tick of the row, including the first tick of a pattern-delay repeat.
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome;
+
+    /// Drop every piece of replay state a seek must not carry across the discontinuity:
+    /// deferred tempo commands, LFO random streams, effect memories, pattern-loop
+    /// counters and per-channel command state.
+    ///
+    /// Required rather than provided so a future format cannot forget it. A format with
+    /// genuinely nothing to reset writes an empty body and says so in a comment.
+    ///
+    /// Called from [`PatternSequencer::seek_order`] and [`PatternSequencer::seek_row`],
+    /// which a host may drive from the audio thread: **no allocation** (architecture §8).
+    fn reset(&mut self);
 }
 
 // ── the sequencer ───────────────────────────────────────────────────────────────────
@@ -605,6 +640,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         let Some((order, pattern)) = self.resolve_order(order) else { return false };
         self.set_position(order, pattern, 0);
         self.pending_jump = None;
+        self.processor.reset();
         self.state = SequencerState::Ready;
         true
     }
@@ -615,6 +651,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         let speed = self.row_clock.speed;
         self.row_clock.start_row(speed);
         self.pending_jump = None;
+        self.processor.reset();
         self.state = SequencerState::Ready;
     }
 

@@ -45,12 +45,15 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
 
     let track_count = le_u16(&header, 24)?;
     let pattern_count = header.get(26).copied().unwrap_or(0) as usize + 1;
-    let last_order = header.get(27).copied().unwrap_or(0) as usize;
-    if last_order >= ORDER_BYTES { return Err(Error::Invalid("MTM last order must be 0..=127")); }
+    // The stored order table is 128 entries; libxmp and the DOS original both keep
+    // playing a file whose declared last order runs past it rather than refusing to load.
+    let last_order = (header.get(27).copied().unwrap_or(0) as usize).min(ORDER_BYTES - 1);
     let comment_length = le_u16(&header, 28)? as usize;
     let sample_count = header.get(30).copied().unwrap_or(0) as usize;
     if sample_count > 63 { return Err(Error::Invalid("MTM sample count must be 0..=63")); }
-    if header.get(31).copied().unwrap_or(0) != 0 { return Err(Error::Unsupported("MTM module attributes")); }
+    // Byte 31 is documented "always zero". libxmp reads it into `mfh.attr` and never
+    // looks at it again, and so does the original; a stray value is not a refusal.
+    let _module_attributes = header.get(31).copied().unwrap_or(0);
     if header.get(32).copied().unwrap_or(0) != ROWS as u8 { return Err(Error::Unsupported("MTM tracks not containing 64 rows")); }
     let channel_count = header.get(33).copied().unwrap_or(0);
     if !(1..=32).contains(&channel_count) { return Err(Error::Invalid("MTM channel count must be 1..=32")); }
@@ -135,7 +138,10 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
 
     let mut playable_orders = Vec::with_capacity(last_order + 2);
     for order in orders.iter().take(last_order + 1) {
-        if *order as usize >= pattern_count { return Err(Error::OutOfRange); }
+        // An order naming a pattern that was never stored is stepped over, the same
+        // recovery the track table already uses for an out-of-range track reference.
+        // libxmp tolerates it too; refusing the whole module does not.
+        if *order as usize >= pattern_count { playable_orders.push(starplayer_model::ORDER_MARKER); continue; }
         playable_orders.push(*order as u16);
     }
     playable_orders.push(ORDER_END);
@@ -216,7 +222,7 @@ fn detect_tempo_mode(tracks: &[u8], patterns: &[Vec<u8>], channel_count: u8) -> 
     TempoMode::MultiTracker
 }
 
-fn mtm_pan(value: u8) -> I1F15 { bipolar_from_ratio(value.min(15) as i32 * 2 - 15, 15) }
+pub(crate) fn mtm_pan(value: u8) -> I1F15 { bipolar_from_ratio(value.min(15) as i32 * 2 - 15, 15) }
 
 fn le_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
     match bytes.get(offset..offset + 2) {
@@ -419,5 +425,38 @@ mod tests {
         let mut channels = valid;
         channels[33] = 0;
         assert_eq!(load(&channels), Err(Error::Invalid("MTM channel count must be 1..=32")));
+    }
+
+    // ── C3b: the loader is no longer stricter than every reference ─────────────────
+
+    #[test]
+    fn a_last_order_past_the_stored_table_clamps_instead_of_erroring() {
+        let note = MtmCell { pitch: 12, instrument: 0, effect: 0, param: 0 };
+        let mut bytes = synthetic_mtm(&[], &[track(note)], &[references(1, 0)], 1);
+        bytes[27] = 200;
+        let module = load(&bytes).expect("libxmp and the DOS original both keep playing");
+        assert_eq!(module.orders().len(), ORDER_BYTES + 1, "the 128 stored entries plus the end marker");
+        assert_eq!(module.order_entry(0), Some(starplayer_model::OrderEntry::Pattern(PatternId(0))));
+    }
+
+    #[test]
+    fn a_nonzero_module_attribute_byte_is_ignored_rather_than_refused() {
+        let mut bytes = synthetic_mtm(&[], &[], &[references(0, 0)], 1);
+        bytes[31] = 0x5A;
+        assert!(load(&bytes).is_ok(), "byte 31 is documented always-zero and read-and-ignored by libxmp");
+    }
+
+    #[test]
+    fn an_order_naming_an_unstored_pattern_is_stepped_over() {
+        let note = MtmCell { pitch: 12, instrument: 0, effect: 0, param: 0 };
+        let mut bytes = synthetic_mtm(&[], &[track(note)], &[references(1, 0), references(1, 0)], 1);
+        bytes[27] = 2;
+        // No sample headers, so the order table starts immediately after the header.
+        bytes[HEADER_BYTES + 2] = 9;
+        let module = load(&bytes).expect("an out-of-range order is recovery, not a refusal");
+        assert_eq!(module.order_entry(0), Some(starplayer_model::OrderEntry::Pattern(PatternId(0))));
+        assert_eq!(module.order_entry(1), Some(starplayer_model::OrderEntry::Pattern(PatternId(1))));
+        assert_eq!(module.order_entry(2), Some(starplayer_model::OrderEntry::Marker), "the same recovery the track table already uses");
+        assert_eq!(module.order_entry(3), Some(starplayer_model::OrderEntry::End));
     }
 }

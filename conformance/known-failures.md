@@ -7,8 +7,16 @@ still runs every excluded case, so a fix makes its exclusion fail as stale.
 
 **Who owns what.** `plans/engine/M2-task-C9-s3m-conformance-repairs.md` owns every S3M
 record below; each exclusion row names its record id and points at that task file.
-The MOD failures are not recorded here: the ProTracker fidelity repairs and the
-voice-boundary sample swap are `plans/engine/M2-task-C3b-protracker-fidelity-repairs.md`.
+No MOD or MTM case is recorded here. The ProTracker fidelity repairs and the mixer
+voice-boundary sample swap landed as
+`plans/engine/M2-task-C3b-protracker-fidelity-repairs.md`; the four MOD cases that task
+file listed as targets but did not fix turned out to be oracle-representation
+differences, and each now cites `plans/product/03-accuracy-policy.md` — D21 for
+ProTracker's tick-zero `E9x` retrigger (`openmpt-mod-delay-break`), D22 for its
+tick-zero instrument latch under `EDx` (`openmpt-mod-portamento-swap-pt`), and D18 for a
+queued stop that falls due inside a tick interval, which makes libxmp omit the channel
+for that whole tick (`openmpt-mod-swap-no-loop`,
+`openmpt-mod-portamento-sample-change-pt`).
 The harness repairs — trace alignment, loop-aware position comparison, the D18 adapter
 projection, the per-field waiver and the tick budget — landed as
 `plans/engine/complete/M2-task-C2a-conformance-harness-repairs.md`, so every first divergence

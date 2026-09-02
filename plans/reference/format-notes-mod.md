@@ -34,15 +34,14 @@ pattern physically present before the sample payload, and scanning only live ord
 place the sample-data offset inside that stored pattern. `FLT8` applies the same all-entry
 scan after translating its stored half-pattern order numbers.
 
-Which entries count is a separate question, and C3 gets it wrong. ProTracker's `mt_init`
-scans the table with a **signed** byte compare (`cmp.b` / `bgt`), so any entry from `0x80`
-to `0xFF` is negative there and can never raise the maximum; libxmp reaches the same result
-by breaking out of the scan at the first byte above `0x7f` (its "dragnet.mod" fix). As of
-C3 the loader excludes only `255`, so a file with `0x80` in its unused tail is either
-rejected as truncated or has every sample offset shifted.
-`plans/engine/M2-task-C3b-protracker-fidelity-repairs.md` changes the filter to
-`order < 0x80`; the paragraph above then describes both states, but the attribution to
-ProTracker only becomes true with that fix.
+Which entries count is a separate question. ProTracker's `mt_init` scans the table with a
+**signed** byte compare (`cmp.b` / `bgt`), so any entry from `0x80` to `0xFF` is negative
+there and can never raise the maximum; libxmp reaches the same result by breaking out of
+the scan at the first byte above `0x7f` (its "dragnet.mod" fix). C3b moved the loader's
+filter from `order != 255` to `order < 0x80`, so a file with `0x80` in its unused tail
+loads with the same pattern count and the same sample offsets as one with `0x00` there.
+A song length of zero is likewise not a structural error: libxmp loads such a module and
+plays nothing, and so does the loader.
 
 `FLT8` is the one tagged layout exception: Startrekker writes one logical eight-channel
 pattern as all 64 rows of channels 0–3 followed by all 64 rows of channels 4–7, and its
@@ -50,12 +49,11 @@ order values name those stored four-channel halves (`0, 2, 4, ...`). The loader 
 those live order values and interleaves each pair into native row-major MOD cells. `8CHN`
 remains the ordinary eight-cells-per-row layout.
 
-The accepted signature set, as of C3, is exactly `M.K.` and `FLT4` (4 channels), `6CHN`,
-`8CHN`, `FLT8` (paired halves), and two-digit `nnCHN` for 1–32 channels. Two gaps remain:
-`M!K!` is written by ProTracker itself once a module exceeds 64 patterns — it is common,
-and libxmp lists it first — and single-digit `dCHN` tags are used by several trackers.
-Both are rejected today; `plans/engine/M2-task-C3b-protracker-fidelity-repairs.md` adds
-`M!K!` as a 4-channel tag and widens the `CHN` form to one or two digits. `CD61`
+The accepted signature set is exactly `M.K.`, `M!K!` and `FLT4` (4 channels), `6CHN`,
+`8CHN`, `FLT8` (paired halves), single-digit `dCHN` for 1–9 channels, and two-digit
+`nnCHN` for 1–32. `M!K!` is what ProTracker itself writes once a module exceeds 64
+patterns — it is common, and libxmp lists it first — and the single-digit `dCHN` form is
+used by several trackers; C3b added both. `CD61`
 (Octalyser) and `FA04` / `FA06` (Digital Tracker) are deliberately outside this set for a
 different reason — they are tracker dialects with their own pattern-loop semantics, owned
 by `plans/engine/M2-task-C5-quirks-and-tempo-models.md`, not signatures to be waved
@@ -65,11 +63,10 @@ through with ProTracker semantics.
 
 A MOD sample loops when its repeat length is more than one word. ProTracker enables the
 loop for `n_replen > 1` word, that is a loop length of **4 bytes or more**, and libxmp
-uses the same `loop_size > 1` test. As of C3 the loader uses `loop_length > 4` bytes, so a
-two-word loop that is a real, audible loop in ProTracker is played here as a one-shot. The
-`> 4` rule comes from the DOS original's `ConvertSamps` converter, not from the format;
-accuracy policy §1 records the corrected attribution and
-`plans/engine/M2-task-C3b-protracker-fidelity-repairs.md` moves the gate to `>= 4`.
+uses the same `loop_size > 1` test. C3 used `loop_length > 4` bytes, which played a
+two-word loop as a one-shot; that rule came from the DOS original's `ConvertSamps`
+converter, not from the format. C3b moved the gate to `loop_length >= 4` and accuracy
+policy §1 records the corrected attribution.
 
 ## Period and finetune lookup
 
@@ -119,20 +116,24 @@ an earlier `Dxx`; a later `Dxx` combines its BCD row with the selected order.
 
 ProTracker's `mt_Vibrato3` writes `n_period ± delta` straight to Paula: the vibrato result
 is never clamped back into the Amiga table range, so a `4FF` on a C-1 (period 856) keeps
-its whole downward half even with Amiga limits on. The depth itself is an unsigned
-magnitude — PT multiplies with `mulu` and shifts with `lsr`, then adds or subtracts by the
-sign of `n_vibratopos`, so it never rounds a signed product toward −∞. As of C3 the
-processor computes `(waveform * depth) >> 7` on a signed product and then re-clamps
-`actual_period` with the Amiga limits; both are corrected by
-`plans/engine/M2-task-C3b-protracker-fidelity-repairs.md`, which also keeps the clamp where
-it belongs, on slides and tone portamento.
+its whole downward half even with Amiga limits on — it reaches period 885. The depth
+itself is an unsigned magnitude — PT multiplies with `mulu` and shifts with `lsr`, then
+adds or subtracts by the sign of `n_vibratopos`, so it never rounds a signed product
+toward −∞; phase 132 with depth 15 on period 428 gives 426, not 425. C3 computed
+`(waveform * depth) >> 7` on a signed product and then re-clamped `actual_period` with the
+Amiga limits. C3b fixed both: the LFO scales the unsigned magnitude and negates, vibrato
+writes its result unclamped, and the clamp stays where PT puts it, on the slides and on
+tone portamento.
 
 The range limit that does exist is in the hardware, not the replayer. Paula, as modelled by
 pt2-clone's `paulaSetPeriod`, clamps any period below 113 to 113 and treats period 0 as
-65536 — an audible but near-silent ~54 Hz crawl. As of C3 the step derivation floors the
-period at 1 when Amiga limits are off and maps period 0 to a zero step, which holds the
-voice's last sample value as DC; C3b applies the 113 floor and the 65536 rule at step
-derivation instead. Accuracy policy D16 records both.
+65536 — an audible but near-silent ~54 Hz crawl. C3b applies both at step derivation.
+The zero rule is unconditional (no format wants a DC hold); the 113 floor follows the
+loader's Amiga-limits flag, because it is the Amiga's limit and not the format's:
+extended-range MODs and MultiTracker put their top octaves below 113 by design and libxmp
+plays them unclamped. Under Amiga limits period 1 derives the same `Step` as period 113,
+and period 0 always derives the step for 65536 rather than `Step::ZERO`. Accuracy policy
+D16 records both.
 
 ## Pattern-loop mark, tremolo ramp, and processor reset
 
@@ -141,20 +142,63 @@ handling is a fidelity gap rather than a decision:
 
 - ProTracker's `n_pattpos` — the `E60` loop mark — is per channel and **persists across
   pattern changes**; only `E60` writes it. A pattern whose first `E6x` has no preceding
-  `E60` therefore loops back to the previous pattern's mark. As of C3 the processor clears
-  `pattern_loop_start` on every pattern change and so loops to row 0; C3b removes the
+  `E60` therefore loops back to the previous pattern's mark. C3 cleared
+  `pattern_loop_start` on every pattern change and so looped to row 0; C3b removed that
   reset.
 - PT's `mt_Tremolo2` chooses the half of the ramp waveform by testing `n_vibratopos`, the
   vibrato phase, rather than `n_tremolopos`. This is a ProTracker bug; StarPlayer's default
   reads the ramp from the tremolo phase, and the PT behaviour becomes a `QuirkSet` field in
   `plans/engine/M2-task-C5-quirks-and-tempo-models.md`. Accuracy policy D20 records it.
   libxmp does not model the bug, so no corpus oracle can distinguish the two.
-- The processor has **no reset hook on seek**. `PatternSequencer::seek_order` / `seek_row`
-  move the cursor only, so a pending CIA tempo, the LFO random state, effect memories and
-  loop counters all survive a seek and a seeked render differs from a fresh render of the
-  same order — a stale `Fxx` can still fire. C3b adds `fn reset(&mut self)` to the
-  processor trait and calls it from both seeks. (C3a's panning toggle builds a fresh
+- The processor needed a **reset hook on seek**. `PatternSequencer::seek_order` /
+  `seek_row` moved the cursor only, so a pending CIA tempo, the LFO random state, effect
+  memories and loop counters all survived a seek and a seeked render differed from a fresh
+  render of the same order — a stale `Fxx` could still fire. C3b added a required
+  `fn reset(&mut self)` to `TrackerProcessor` and calls it from both seek entry points; it
+  rewrites each channel in place and reseeds the LFO stream, so it allocates nothing and a
+  host may drive a seek from the audio thread. (C3a's panning toggle builds a fresh
   processor and is unaffected.)
+
+## The queued sample swap and ProTracker's null sample
+
+An instrument number **without** a note, or with a note and a tone portamento, does not
+restart the voice in ProTracker 1/2. The channel's volume, finetune and reported sample
+number change at once; the sample itself is written into Paula's pointer and length
+registers, and the DMA channel picks it up when it next reloads them — at the loop point,
+or at the end of a one-shot. C3b models that with one `Option<SampleRegion>` per mixer
+voice, adopted by the kernel where it already detects those two boundaries. The queue is
+only created when a note has already sounded on the channel, which is libxmp's
+`TEST_NOTE(NOTE_SET)` guard, and a note that is not a tone portamento clears it.
+
+Three sub-rules come out of the hardware and are visible in the corpus:
+
+- An instrument number naming a **slot with no sample data** is ProTracker's null sample.
+  It leaves the channel's volume, finetune and reported number alone and queues a *stop*
+  at the same boundary (`PTSwapEmpty.mod`, and `PTInstrSwap.mod` row 12, where reporting
+  the empty slot's number would be the visible error).
+- A **one-shot queued behind a one-shot** also stops rather than swapping: there are no
+  loop registers to reload (`PTStoppedSwap.mod`, `PTSwapNoLoop.mod`; libxmp
+  `src/mixer.c:726`).
+- A channel whose sample has **already run out** has no boundary left to wait for, so the
+  queued sample starts at once (libxmp's `libxmp_virt_queuepatch` fallback). Where it
+  starts depends on whether the channel still owned that voice: a voice that merely ran
+  out leaves the channel owned and the replacement starts at its loop point, while a
+  channel that was cut is an ordinary fresh note from frame zero.
+
+MTM is **not** included. libxmp gates the whole mechanism on `QUIRK_PROTRACK`, which its
+MTM loader does not set, and the MultiTracker format document describes no such rule, so
+an MTM instrument column applies volume and finetune and leaves the sounding sample
+alone — no queue, and no restart either. That is what `MtmProcessor` does.
+
+## `8xx` and `E8x` pan
+
+C3b's task file expected the pan mapping to be unable to reach hard right or exact
+centre. It can: `pan_byte` round-trips every one of the 256 `8xx` bytes through the trace
+projection exactly, and `E8x` maps `value << 4` on the same 0..255 domain, which is
+precisely what libxmp does for MOD (`fx_setpan` with `fxp <<= 4`). ProTracker itself has
+no `E8x` pan at all, so libxmp is the reference here and the mapping is left alone; a unit
+test pins the round trip. MultiTracker is the case that genuinely needed changing — see
+`format-notes-mtm.md`.
 
 ## Waveform 3 and determinism
 
@@ -200,14 +244,13 @@ not evidence that MOD was lowered through another format:
   `.mod` bytes; ordinary `FLT4` PCM modules remain supported, but the five `flt_am_*`
   cases cannot be reconstructed from those bytes alone.
 - ProTracker's instrument-only and tone-portamento sample swap changes the DMA sample
-  pointer when the currently playing sample reaches its end or loop boundary. The current
-  mixer API has no queued region replacement at a voice boundary, so StarPlayer applies
-  the new volume/finetune state immediately but keeps the old sample until an explicit
-  note or retrigger. This affects `PortaSmpChange_PT`, `PortaSwapPT`, `PTInstrSwap`,
-  `PTStoppedSwap`, `PTSwapEmpty`, and `PTSwapNoLoop`; accuracy policy D12 records it as a
-  tracked gap, not an accepted deviation. One fixed-size pending region per voice, applied
-  by the voice kernel at the wrap or one-shot end, is RT-safe;
-  `plans/engine/M2-task-C3b-protracker-fidelity-repairs.md` owns that work.
+  pointer when the currently playing sample reaches its end or loop boundary. C3b
+  implements it: one fixed-size `Option<SampleRegion>` per voice, adopted by the render
+  kernel at the forward-loop wrap or the one-shot end, so there is no allocation, no lock
+  and no branch on the hot path when the slot is empty. `PTInstrSwap`, `PTSwapEmpty` and
+  `PTStoppedSwap` now pass; `PortaSwapPT`, `PortaSmpChange_PT` and `PTSwapNoLoop` remain
+  excluded for reasons that are no longer about the swap (D22 and D18 respectively).
+  Accuracy policy D12 records the design and the two residual representation gaps.
 - The corpus's default-mode `PortaSmpChange.data` deliberately expects the non-ProTracker
   interpretation (keep the old sample indefinitely). It is an oracle for a different
   compatibility profile, while C3's reference is ProTracker 1/2.
@@ -259,9 +302,13 @@ interval rather than PT's CIA update boundary. Excluding those cases outright hi
 behaviour they exist to test, so C2a added a per-field waiver. Both cases waive `frame`
 and `position` (the CIA latch shifts libxmp's whole timeline, so every voice is also
 permanently offset inside its loop), and the rest of each trace is enforced. That exposed
-two real ProTracker differences now owned by C3b: `DelayBreak` keeps the row-0 voice alive
-into row 1 frame 0 where libxmp has dropped it, and `VibratoReset` disagrees on volume by
-one unit at tick 136. D16 records the out-of-range arpeggio volume disagreement.
+two real ProTracker differences, both since resolved by C3b. `VibratoReset`'s one-unit
+volume disagreement at tick 136 was the signed-shift LFO rounding, and the case now
+passes with only D15's waiver. `DelayBreak` keeps the row-0 voice alive into row 1 frame 0
+because ProTracker's `mt_RetrigNote` retriggers on tick zero of a row that carries `E9x`
+and no note while libxmp handles retrigger only from tick one; that is accuracy policy
+D21 and the case stays excluded for it. D16 records the out-of-range arpeggio volume
+disagreement.
 
 OpenMPT's `NoteDelay-NextRow.mod` is documented-only in the pinned libxmp suite. PT lets
 an `EDx` whose delay exceeds the current speed leak into the next row under narrow

@@ -56,6 +56,15 @@ pub struct Voice {
     reverse: bool,
     /// Whether the voice is fading out towards release.
     stopping: bool,
+    /// A region queued to replace `region` the next time the voice reaches a boundary.
+    ///
+    /// ProTracker's instrument-only and tone-portamento sample swaps write the new
+    /// sample's pointer and length into Paula but leave DMA running, so the change lands
+    /// when the channel next reloads those registers — at the loop point, or at the end
+    /// of a one-shot. One fixed-size slot per voice keeps that RT-safe: no allocation, no
+    /// lock, and the accumulation loop looks at it only where it already handles the
+    /// boundary. See accuracy policy D12.
+    pending_region: Option<SampleRegion>,
 }
 
 impl Voice {
@@ -77,6 +86,7 @@ impl Voice {
             gains: Stereo::new(GainRamp::steady(0), GainRamp::steady(0)),
             reverse: false,
             stopping: false,
+            pending_region: None,
         };
         voice.params.dirty.remove(DirtyBits::STOP);
         voice.glide_to_params();
@@ -164,11 +174,36 @@ impl Voice {
     /// `Gxx` tone portamento and IT's sample-swap semantics need in M1.
     pub fn set_region(&mut self, region: SampleRegion) {
         self.region = region;
+        self.pending_region = None;
         self.params.dirty.insert(DirtyBits::SAMPLE);
     }
 
+    /// Queue `region` to replace this voice's sample the next time it reaches a boundary
+    /// — a forward loop's wrap, or the end of a one-shot (accuracy policy D12).
+    ///
+    /// A zero-length region is ProTracker's null sample: the voice stops at that
+    /// boundary rather than continuing. A second queue before the boundary replaces the
+    /// first, which is what writing the Paula registers twice does.
+    pub fn queue_region(&mut self, region: SampleRegion) { self.pending_region = Some(region); }
+
+    /// The region waiting for the next boundary, if any.
+    pub const fn pending_region(&self) -> Option<SampleRegion> { self.pending_region }
+
+    /// Take the queued region, leaving the slot empty. The kernel's boundary handler.
+    pub(crate) const fn take_pending_region(&mut self) -> Option<SampleRegion> { self.pending_region.take() }
+
+    /// Adopt a queued region at a boundary, without the [`DirtyBits::SAMPLE`] a caller's
+    /// explicit [`Voice::set_region`] would raise: nothing outside the voice asked for
+    /// this, and the gain ramps must not be disturbed by it.
+    pub(crate) const fn adopt_region(&mut self, region: SampleRegion) { self.region = region; }
+
     /// Restart from `offset_frames` (`Oxx`, and every plain retrigger).
+    ///
+    /// A retrigger is a position change, and ProTracker's queued swap takes effect on one
+    /// immediately rather than waiting for a boundary that the restart has just moved
+    /// (libxmp `libxmp_mixer_voicepos`, OpenMPT `InstrSwapRetrigger.mod`).
     pub fn retrigger(&mut self, offset_frames: u32) {
+        if let Some(region) = self.pending_region.take() { self.region = region; }
         self.position = (offset_frames as u64) << 32;
         self.reverse = false;
         self.params.dirty.insert(DirtyBits::SAMPLE);

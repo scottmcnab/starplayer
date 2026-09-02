@@ -66,7 +66,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     pcm: &[i16],
     destination: &mut [Path::Accumulator],
 ) -> VoiceStatus {
-    let Some(sample) = SampleData::resolve(pcm, voice.region()) else {
+    let Some(mut sample) = SampleData::resolve(pcm, voice.region()) else {
         return VoiceStatus::Finished;
     };
 
@@ -77,7 +77,6 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
         return VoiceStatus::Finished;
     }
 
-    let frames = sample.frames();
     let step = voice.params.step.to_bits();
     let mut reverse = voice.is_reversed();
     let mut remaining: &mut [Path::Accumulator] = destination;
@@ -86,7 +85,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     // the loop, and a previous segment may have left the voice at the very end of a
     // one-shot.
     let mut position = voice.position();
-    let mut ended = match normalise_position(position as i128, &mut reverse, sample) {
+    let mut ended = match cross_boundary(voice, pcm, &mut sample, position as i128, &mut reverse) {
         Some(normalised) => {
             position = normalised;
             false
@@ -109,6 +108,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
         remaining = rest;
 
         // ── the run itself ──────────────────────────────────────────────────────────
+        let frames = sample.frames();
         let gains = voice.gains_mut();
         match (ramp_frames > 0, reverse) {
             (false, false) => mix_run::<Path, Interp, false, false>(window, frames, position, step, gains),
@@ -125,7 +125,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
         // that the position written back to the voice is always a real one.
         let travelled = run as i128 * step as i128;
         let advanced = if reverse { position as i128 - travelled } else { position as i128 + travelled };
-        match normalise_position(advanced, &mut reverse, sample) {
+        match cross_boundary(voice, pcm, &mut sample, advanced, &mut reverse) {
             Some(normalised) => position = normalised,
             None => {
                 position = clamp_position(advanced);
@@ -139,6 +139,57 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     voice.set_position(position);
     voice.set_reversed(reverse);
     if ended || finished_ramp { VoiceStatus::Finished } else { VoiceStatus::Sounding }
+}
+
+/// Handle whatever the voice has run into: a queued ProTracker sample swap first, then
+/// the ordinary loop wrap or one-shot end.
+///
+/// `None` means the voice is over. On a swap `sample` is repointed at the new region, so
+/// the run loop reads the replacement's frames from the next run onwards.
+fn cross_boundary<'pcm>(
+    voice: &mut Voice,
+    pcm: &'pcm [i16],
+    sample: &mut SampleData<'pcm>,
+    position: i128,
+    reverse: &mut bool,
+) -> Option<u64> {
+    if let Some(rebased) = take_queued_region(voice, pcm, sample, position) {
+        *reverse = false;
+        return rebased;
+    }
+    normalise_position(position, reverse, *sample)
+}
+
+/// Apply a queued region if `position` has reached the boundary that releases it.
+///
+/// The outer `Option` says whether a swap happened at all; the inner one says where the
+/// replacement starts, with `None` for ProTracker's null sample, whose zero-length region
+/// ends the voice at exactly that boundary.
+///
+/// Only a forward loop's wrap and a one-shot's end release a swap. A ping-pong loop
+/// cannot: no ProTracker-family format has one, and Paula has no equivalent of the turn.
+fn take_queued_region<'pcm>(voice: &mut Voice, pcm: &'pcm [i16], sample: &mut SampleData<'pcm>, position: i128) -> Option<Option<u64>> {
+    let reached = match sample.loop_span() {
+        None => position >= frames_to_bits(sample.length_frames()) as i128,
+        Some(span) if span.mode() == LoopMode::Forward => position >= frames_to_bits(span.end()) as i128,
+        Some(_) => false,
+    };
+    if !reached || voice.pending_region().is_none() {
+        return None;
+    }
+    let region = voice.take_pending_region()?;
+    let Some(replacement) = SampleData::resolve(pcm, region) else { return Some(None) };
+    // ProTracker's null sample, and a one-shot replacing a one-shot, both leave Paula
+    // with nothing to reload: the channel falls silent at the boundary instead of
+    // swapping (OpenMPT `PTStoppedSwap.mod`, `PTSwapNoLoop.mod`; libxmp `mixer.c:726`).
+    if region.length_frames() == 0 || (sample.loop_span().is_none() && region.loop_span().is_none()) {
+        return Some(None);
+    }
+    voice.adopt_region(region);
+    *sample = replacement;
+    // Paula reloads its pointer from the loop registers, so a looping replacement starts
+    // at its loop point and a one-shot starts at its first frame.
+    Some(Some(frames_to_bits(region.loop_span().map(LoopSpan::start).unwrap_or(0))))
 }
 
 /// Bring a position back inside the sample, and say which way a ping-pong loop is now
@@ -563,5 +614,117 @@ mod tests {
             assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Sounding);
             assert!(voice.position() < frames_to_bits(16), "the position stayed inside the sample");
         }
+    }
+
+    // ── C3b / accuracy policy D12: the voice-boundary sample swap ──────────────────
+
+    #[test]
+    fn a_queued_region_replaces_a_looping_sample_at_its_wrap() {
+        let old: Vec<i16> = (0..8).map(|index| 1_000 + index as i16).collect();
+        let new: Vec<i16> = (0..8).map(|index| 5_000 + index as i16).collect();
+        let mut blob = Vec::new();
+        let first = append_guarded_sample(&mut blob, &old, LoopSpan::new(0, 8));
+        let second = append_guarded_sample(&mut blob, &new, LoopSpan::new(4, 8));
+
+        let mut voice = voice_for(first, Step::ONE);
+        voice.queue_region(second);
+        let mut output = [FixedFrame::default(); 12];
+        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output), VoiceStatus::Sounding);
+        assert_eq!(voice.region(), second, "the wrap adopted the queued region");
+        assert_eq!(voice.pending_region(), None, "and cleared the slot");
+
+        let played: Vec<i32> = output.iter().map(|frame| (frame.left as i64 * 32_768 / 32_766) as i32).collect();
+        // Eight frames of the old sample, then the replacement from its loop start.
+        let expected = [1_000, 1_001, 1_002, 1_003, 1_004, 1_005, 1_006, 1_007, 5_004, 5_005, 5_006, 5_007];
+        for (index, (actual, expected)) in played.iter().zip(expected.iter()).enumerate() {
+            assert!((actual - expected).abs() <= 2, "frame {index}: {actual} rather than {expected}");
+        }
+    }
+
+    #[test]
+    fn a_queued_looping_region_takes_over_when_a_one_shot_runs_out() {
+        let new: Vec<i16> = (0..8).map(|index| 5_000 + index as i16).collect();
+        let mut blob = Vec::new();
+        let first = append_guarded_sample(&mut blob, &[1_000, 1_001, 1_002, 1_003], None);
+        let second = append_guarded_sample(&mut blob, &new, LoopSpan::new(2, 8));
+
+        let mut voice = voice_for(first, Step::ONE);
+        voice.queue_region(second);
+        let mut output = [FixedFrame::default(); 8];
+        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output), VoiceStatus::Sounding, "the one-shot's end is a swap, not an end");
+        assert_eq!(voice.region(), second);
+        let played: Vec<i32> = output.iter().map(|frame| (frame.left as i64 * 32_768 / 32_766) as i32).collect();
+        let expected = [1_000, 1_001, 1_002, 1_003, 5_002, 5_003, 5_004, 5_005];
+        for (index, (actual, expected)) in played.iter().zip(expected.iter()).enumerate() {
+            assert!((actual - expected).abs() <= 2, "frame {index}: {actual} rather than {expected}");
+        }
+    }
+
+    #[test]
+    fn a_one_shot_queued_behind_a_one_shot_stops_the_voice_and_so_does_the_null_sample() {
+        let mut blob = Vec::new();
+        let one_shot = append_guarded_sample(&mut blob, &[1_000, 1_001, 1_002, 1_003], None);
+        let other_one_shot = append_guarded_sample(&mut blob, &[2_000, 2_001], None);
+        let looping = append_guarded_sample(&mut blob, &[3_000, 3_001, 3_002, 3_003], LoopSpan::new(0, 4));
+
+        let mut voice = voice_for(one_shot, Step::ONE);
+        voice.queue_region(other_one_shot);
+        let mut output = [FixedFrame::default(); 8];
+        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output), VoiceStatus::Finished, "Paula has no loop registers to reload");
+
+        // The same queue behind a looping voice is ProTracker's null sample only when the
+        // replacement is empty.
+        let mut voice = voice_for(looping, Step::ONE);
+        voice.queue_region(SampleRegion::default());
+        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output), VoiceStatus::Finished);
+    }
+
+    #[test]
+    fn a_retrigger_adopts_a_queued_region_at_once_and_a_set_region_discards_it() {
+        let mut blob = Vec::new();
+        let first = append_guarded_sample(&mut blob, &[1_000, 1_001, 1_002, 1_003], LoopSpan::new(0, 4));
+        let second = append_guarded_sample(&mut blob, &[2_000, 2_001], LoopSpan::new(0, 2));
+
+        let mut voice = voice_for(first, Step::ONE);
+        voice.queue_region(second);
+        voice.retrigger(0);
+        assert_eq!(voice.region(), second, "a position change makes the queued sample take effect now");
+        assert_eq!(voice.pending_region(), None);
+
+        let mut voice = voice_for(first, Step::ONE);
+        voice.queue_region(second);
+        voice.set_region(first);
+        assert_eq!(voice.pending_region(), None, "an explicit region write supersedes the queue");
+    }
+
+    /// The invariant most at risk from the swap: the boundary is a property of the
+    /// voice's position, never of how the run was split.
+    #[test]
+    fn a_swap_lands_in_the_same_place_however_the_render_is_split() {
+        let old: Vec<i16> = (0..12).map(|index| 500 + 37 * index as i16).collect();
+        let new: Vec<i16> = (0..12).map(|index| 900 - 21 * index as i16).collect();
+        let mut blob = Vec::new();
+        let first = append_guarded_sample(&mut blob, &old, LoopSpan::new(3, 12));
+        let second = append_guarded_sample(&mut blob, &new, LoopSpan::new(5, 12));
+
+        let render = |chunk: usize| {
+            let mut voice = voice_for(first, Step::from_ratio(7, 3));
+            voice.queue_region(second);
+            let mut output = [FixedFrame::default(); 40];
+            let mut written = 0;
+            while written < output.len() {
+                let end = (written + chunk).min(output.len());
+                if let Some(window) = output.get_mut(written..end) {
+                    accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, window);
+                }
+                written = end;
+            }
+            (output, voice.region(), voice.position())
+        };
+        let whole = render(40);
+        for chunk in [1usize, 3, 7, 11, 25] {
+            assert_eq!(render(chunk), whole, "chunk length {chunk} moved the swap");
+        }
+        assert_eq!(whole.1, second, "the swap did happen inside the render");
     }
 }

@@ -216,6 +216,9 @@ impl TrackerProcessor for EffectReportingProcessor {
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome { context.outcome() }
+
+    /// A fixed command per row: no replay state, nothing to reset.
+    fn reset(&mut self) {}
 }
 
 fn published_effect(code: u8, param: u8) -> (u8, u8, &'static str) {

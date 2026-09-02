@@ -47,6 +47,13 @@ Amiga limits are deliberately disabled. `ConvertMTM` achieved this accidentally 
 passing dummy period 1712 through `ConvertValues`; the native loader records the intended
 result directly because MTM is a PC tracker format.
 
+The loader is deliberately no stricter than libxmp or the DOS original on three header
+fields that C4 rejected outright. A declared last order past the 128-entry stored table is
+clamped to 127; the documented always-zero attribute byte at offset 31 is read and
+ignored, as libxmp's `mfh.attr` is; and an order naming a pattern that was never stored is
+stepped over as a marker, the same recovery the track table already uses for an
+out-of-range track reference. None of the three is a reason to refuse a module that plays.
+
 `fall1.mtm` is checked during the conformance run against libxmp's `format_mtm.data`:
 title `- One Must Fall! 1 -`, 5 channels, 51 stored non-empty tracks (libxmp reports 52
 including track zero), and 12 patterns.
@@ -61,6 +68,15 @@ S3M command enters the MTM path.
 The MultiTracker profile differs from ProTracker at these named points:
 
 - `Dxx` is a hexadecimal row number, not BCD.
+- `F00` is a **no-op**, not ProTracker's "stop the song". libxmp's `fx_s3m_speed` ignores
+  a zero parameter outright and MultiTracker has no stop command; C3b gated the stop arm
+  on `EffectSemantics::ProTracker`.
+- `E8x` uses the **loader's 0..15 header pan grid**, not ProTracker's `value << 4` on the
+  0..255 domain. libxmp is self-consistent the other way — its MTM loader rewrites `E8x`
+  into `FX_SETPAN` with `fxp <<= 4` and its four-bit pan projection divides by 16 again —
+  so `E8F` has to equal header pan 15 (hard right), and `E88` header pan 8. Routing the
+  nibble through the loader's own mapping is what makes both true; C3b did that. This is
+  the one point where the shared `E8x` implementation is not shared.
 - `Fxx` takes effect immediately. Native MultiTracker use resets BPM to 125 on a speed
   command and speed to 6 on a tempo command. When low and high `Fxx` coexist on one row,
   the loader selects the widespread Dual Module Player interpretation and does not reset
@@ -71,6 +87,12 @@ The MultiTracker profile differs from ProTracker at these named points:
   wraps a looping sample into its loop, matching libxmp and the original MTM path.
 - MTM always runs without the MOD Amiga-period clamp and does not apply MOD's delayed
   pattern-break postprocessing.
+- MTM has **no queued sample swap**. ProTracker's instrument-only and tone-portamento
+  swap-at-the-loop-boundary (accuracy policy D12) is gated on `QUIRK_PROTRACK` in libxmp,
+  which `mtm_load.c` does not set, and the MultiTracker format document describes no such
+  rule; the original's `ConvertMTM` had no equivalent either. An MTM instrument column
+  therefore applies volume and finetune and leaves the sounding sample alone — it neither
+  queues a replacement nor restarts the voice. C3b research point 2, resolved.
 
 All remaining commands, including extended `E8x` pan, intentionally use the common
 ProTracker implementation specified by the format document. The public reuse types are

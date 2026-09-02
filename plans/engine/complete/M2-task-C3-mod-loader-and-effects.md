@@ -39,7 +39,10 @@ The reference for MOD effect behaviour is ProTracker, not the original assembly.
      original's tag set, which rejected `M!K!` and `[1-9]CHN`.)*
    - Title 20 bytes @0; 31 × 30-byte sample headers @20; song length @950; 128-byte order
      list @952; patterns @1084, each `4 × channels × 64` bytes.
-   - Pattern count = (highest order value, ignoring 255) + 1.
+   - Pattern count = (highest order value **below 0x80**) + 1. ProTracker's `mt_init`
+     compares each order byte signed, so any entry with the high bit set can never raise
+     the maximum. *(Corrected by C3b deliverable 5. This file originally said "ignoring
+     255", which rejects or misaligns a module with 0x80 in its unused order tail.)*
 
 2. **Sample headers**, with the two gates that matter:
    - length = BE u16 @22 × 2; volume @25 clamped to 64; loop start = BE u16 @26 × 2

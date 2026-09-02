@@ -76,6 +76,10 @@ impl TrackerProcessor for MtmProcessor {
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome { self.effects.tick(context) }
+
+    /// MTM owns no replay state of its own — track indirection is resolved at load time —
+    /// so the whole reset is the shared effect core's.
+    fn reset(&mut self) { self.effects.reset(); }
 }
 
 /// Build a public MTM sequencer using native pattern data and MultiTracker timing.
@@ -231,5 +235,36 @@ mod tests {
         let mut processor = processor_with_instruments(true, 1024, 63);
         let _ = row(&mut processor, MtmCell { pitch: 12, instrument: 63, effect: 0, param: 0 });
         assert_eq!(processor.channel(0).map(|channel| channel.sample_number), Some(63));
+    }
+
+    // ── C3b: MultiTracker corrections ─────────────────────────────────────────────
+
+    #[test]
+    fn f00_is_a_no_op_rather_than_protracker_s_stop() {
+        let mut processor = processor(true, 1024);
+        let outcome = row(&mut processor, MtmCell { effect: 0xF, param: 0, ..MtmCell::EMPTY });
+        assert!(!outcome.stop, "libxmp's fx_s3m_speed ignores F00 and MultiTracker has no stop command");
+        assert_eq!((outcome.speed, outcome.tempo_bpm), (6, 125));
+    }
+
+    #[test]
+    fn e8x_uses_the_loader_s_nibble_pan_curve() {
+        let mut processor = processor(true, 1024);
+        let _ = row(&mut processor, MtmCell { effect: 0xE, param: 0x8F, ..MtmCell::EMPTY });
+        assert_eq!(processor.channel(0).map(|channel| channel.pan), Some(crate::loader::mtm_pan(15)), "E8F equals header pan 15");
+        let _ = row(&mut processor, MtmCell { effect: 0xE, param: 0x88, ..MtmCell::EMPTY });
+        assert_eq!(processor.channel(0).map(|channel| channel.pan), Some(crate::loader::mtm_pan(8)), "E88 equals header pan 8");
+        let _ = row(&mut processor, MtmCell { effect: 0xE, param: 0x80, ..MtmCell::EMPTY });
+        assert_eq!(processor.channel(0).map(|channel| channel.pan), Some(crate::loader::mtm_pan(0)));
+    }
+
+    #[test]
+    fn a_seek_resets_the_shared_effect_core() {
+        let mut processor = processor(true, 1024);
+        let _ = row(&mut processor, MtmCell { pitch: 12, instrument: 1, effect: 4, param: 0x8F });
+        assert_eq!(processor.channel(0).map(|channel| channel.vibrato_memory), Some(0x8F));
+        TrackerProcessor::reset(&mut processor);
+        assert_eq!(processor.channel(0).map(|channel| channel.vibrato_memory), Some(0));
+        assert_eq!(processor.channel(0).map(|channel| channel.current_note), Some(u8::MAX));
     }
 }

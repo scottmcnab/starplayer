@@ -21,6 +21,9 @@ const NO_SAMPLE: u8 = 0;
 const NO_NOTE: u8 = u8::MAX;
 const DEFAULT_PERIOD: u32 = 428;
 const PAULA_PAL_CLOCK_HZ: u64 = 3_546_895;
+const PAULA_MINIMUM_PERIOD: u32 = 113;
+/// Fixed seed for waveform selector 3; see accuracy policy D11.
+const WAVEFORM_RANDOM_SEED: u32 = 0x6D2B_79F5;
 const VIBRATO_TABLE: [u8; 32] = [
     0, 24, 49, 74, 97, 120, 141, 161, 180, 197, 212, 224, 235, 244, 250, 253,
     255, 253, 250, 244, 235, 224, 212, 197, 180, 161, 141, 120, 97, 74, 49, 24,
@@ -115,6 +118,14 @@ pub struct ModChannel {
     /// Last EFx value. EF is parsed but deliberately has no PCM mutation; see
     /// `plans/reference/format-notes-mod.md`.
     pub invert_loop_speed: u8,
+    /// This row named an instrument that must not restart the voice: ProTracker's queued
+    /// sample swap (accuracy policy D12). `Some(NO_SAMPLE)` is PT's null sample, which
+    /// stops the voice at the same boundary instead of replacing it.
+    queued_swap: Option<u8>,
+    /// Whether the channel still owns a voice: one was started and nothing has cut it
+    /// since, even if its sample has since run out. This is libxmp's mapped-versus-
+    /// unmapped distinction, and it decides where a revived queued sample starts.
+    voice_owned: bool,
 }
 
 impl ModChannel {
@@ -151,6 +162,8 @@ impl ModChannel {
             delayed_note: false,
             offset_past_end: false,
             invert_loop_speed: 0,
+            queued_swap: None,
+            voice_owned: false,
         }
     }
 }
@@ -219,7 +232,7 @@ impl ModProcessor {
             row_pattern_break: false,
             // Unlike libxmp's wall-clock seed, a fixed seed preserves StarPlayer's
             // byte-identical replay invariant while still implementing waveform 3.
-            waveform_random_state: 0x6D2B_79F5,
+            waveform_random_state: WAVEFORM_RANDOM_SEED,
             pending_tempo: None,
             semantics,
         }
@@ -243,6 +256,7 @@ impl ModProcessor {
             state.row_note_present = false;
             state.delayed_note = false;
             state.offset_post_trigger = 0;
+            state.queued_swap = None;
         }
     }
 
@@ -253,20 +267,30 @@ impl ModProcessor {
         // Native MOD cells can encode only 1..=31, while MTM's six-bit field reaches
         // 63. The decoded effect boundary validates against the loaded instrument table
         // instead of imposing MOD's serialized field width on every caller.
+        let protracker = matches!(self.semantics, EffectSemantics::ProTracker);
         if cell.instrument != 0 {
             let instrument_id = InstrumentId((cell.instrument - 1) as u16);
-            if let Some(sample_id) = self.module.instrument(instrument_id).and_then(|instrument| instrument.sample)
-                && let Some(sample) = self.module.sample(sample_id)
-            {
-                let state = &mut self.channels[channel_index];
-                state.sample_number = cell.instrument;
-                state.finetune = finetune_from_rate(sample.reference_rate_hz());
-                state.sample_offset = 0;
-                state.offset_past_end = false;
-                let volume = ((sample.default_volume().to_bits() as u32 * 64 + 32_767) / 65_535) as u8;
-                state.current_volume = volume;
-                state.actual_volume = volume;
-                state.pending_dirty.insert(DirtyBits::VOLUME);
+            let resolved = self.module.instrument(instrument_id).and_then(|instrument| instrument.sample)
+                .and_then(|sample_id| self.module.sample(sample_id));
+            // ProTracker reads an instrument number whose sample holds no data as its
+            // null sample: volume, finetune and the reported number all stay, and the
+            // sounding voice stops when it next reaches its loop point.
+            match resolved.filter(|sample| !protracker || sample.length_frames() > 0) {
+                Some(sample) => {
+                    let volume = ((sample.default_volume().to_bits() as u32 * 64 + 32_767) / 65_535) as u8;
+                    let finetune = finetune_from_rate(sample.reference_rate_hz());
+                    let state = &mut self.channels[channel_index];
+                    state.sample_number = cell.instrument;
+                    state.finetune = finetune;
+                    state.sample_offset = 0;
+                    state.offset_past_end = false;
+                    state.current_volume = volume;
+                    state.actual_volume = volume;
+                    state.pending_dirty.insert(DirtyBits::VOLUME);
+                    if protracker { state.queued_swap = Some(cell.instrument); }
+                }
+                None if protracker => self.channels[channel_index].queued_swap = Some(NO_SAMPLE),
+                None => {}
             }
         }
 
@@ -301,6 +325,9 @@ impl ModProcessor {
         let period = extended_period(self.channels[channel_index].finetune, note);
         let delayed = cell.effect == 0xE && cell.param >> 4 == 0xD;
         let state = &mut self.channels[channel_index];
+        // A note that is not a tone portamento starts the new sample outright, so there
+        // is nothing left to queue.
+        state.queued_swap = None;
         state.current_note = note;
         state.current_period = period;
         state.actual_period = period;
@@ -355,10 +382,13 @@ impl ModProcessor {
                 self.clear_command(channel_index);
             }
             0xE => self.static_extended(channel_index, cell.param, row, outcome),
-            0xF if cell.param == 0 => {
+            // MultiTracker has no "F00 stops the song" rule; libxmp's fx_s3m_speed
+            // ignores a zero parameter outright.
+            0xF if cell.param == 0 && matches!(self.semantics, EffectSemantics::ProTracker) => {
                 outcome.stop = true;
                 self.clear_command(channel_index);
             }
+            0xF if cell.param == 0 => self.clear_command(channel_index),
             0xF if cell.param < 32 => {
                 outcome.speed = cell.param;
                 if matches!(self.semantics, EffectSemantics::MultiTracker { reset_counterpart: true }) {
@@ -410,7 +440,13 @@ impl ModProcessor {
             }
             7 => { self.channels[channel_index].tremolo_waveform = value & 7; self.clear_command(channel_index); }
             8 => {
-                self.channels[channel_index].pan = pan_byte(value << 4);
+                // MultiTracker's own pan domain is the header's 0..15 nibble, and the
+                // MTM loader maps it that way; ProTracker's shared E8x is libxmp's
+                // `fxp << 4` on the 0..255 domain.
+                self.channels[channel_index].pan = match self.semantics {
+                    EffectSemantics::ProTracker => pan_byte(value << 4),
+                    EffectSemantics::MultiTracker { .. } => multitracker_pan_nibble(value),
+                };
                 self.channels[channel_index].pending_dirty.insert(DirtyBits::PAN);
                 self.clear_command(channel_index);
             }
@@ -607,10 +643,11 @@ impl ModProcessor {
             (state.vibrato_waveform, state.vibrato_phase, state.vibrato_memory & 15)
         };
         let waveform = self.waveform_value(selector, phase);
-        let delta = (waveform as i32 * depth as i32) >> 7;
+        let delta = lfo_delta(waveform, depth, 7);
         let state = &mut self.channels[channel_index];
+        // mt_Vibrato3 writes n_period +/- delta straight to Paula. The Amiga table range
+        // belongs to the slides and to tone portamento, not to the LFO output.
         state.actual_period = add_signed(state.current_period, delta);
-        state.actual_period = clamp_period(self.amiga_limits, state.finetune, state.actual_period);
         state.vibrato_phase = state.vibrato_phase.wrapping_add((state.vibrato_memory >> 4) << 2);
         state.pending_dirty.insert(DirtyBits::PITCH);
     }
@@ -621,7 +658,7 @@ impl ModProcessor {
             (state.tremolo_waveform, state.tremolo_phase, state.tremolo_memory & 15)
         };
         let waveform = self.waveform_value(selector, phase);
-        let delta = (waveform as i32 * depth as i32) >> 6;
+        let delta = lfo_delta(waveform, depth, 6);
         let state = &mut self.channels[channel_index];
         state.actual_volume = (state.current_volume as i32 + delta).clamp(0, 64) as u8;
         state.tremolo_phase = state.tremolo_phase.wrapping_add((state.tremolo_memory >> 4) << 2);
@@ -684,13 +721,45 @@ impl ModProcessor {
         self.module.instrument(InstrumentId((number - 1) as u16)).and_then(|instrument| instrument.sample).and_then(|sample| self.module.sample(sample))
     }
 
+    /// ProTracker's queued sample swap: an instrument number without a note, or with a
+    /// note and a tone portamento, replaces the sounding sample only when that sample
+    /// reaches its loop point or its end (accuracy policy D12).
+    fn apply_queued_swap(&mut self, context: &mut TickContext<'_>, channel_index: usize) {
+        let Some(queued) = self.channels[channel_index].queued_swap.take() else { return };
+        // PT needs a note to have sounded on this channel before a lone instrument number
+        // means anything at all.
+        if self.channels[channel_index].current_note == NO_NOTE { return; }
+        let channel_id = ChannelId(channel_index as u16);
+        if queued == NO_SAMPLE {
+            context.queue_channel_region(channel_id, SampleRegion::default());
+            return;
+        }
+        let region = {
+            let Some(sample) = self.sample_index(channel_index) else { return };
+            sample_region(sample)
+        };
+        if context.queue_channel_region(channel_id, region) { return; }
+        // A voice that merely ran out still owns its channel; one that was cut left it
+        // unbound. PT tells the two apart the same way libxmp's `virt_queuepatch` does,
+        // and it decides where the revived sample starts: Paula reloads a still-owned
+        // channel from its loop registers, while an unbound one is an ordinary fresh
+        // note from the sample's first frame.
+        let still_owned = self.channels[channel_index].voice_owned;
+        let state = &mut self.channels[channel_index];
+        state.sample_offset = if still_owned { region.loop_span().map(|span| span.start()).unwrap_or(0) } else { 0 };
+        state.offset_past_end = false;
+        state.pending_dirty.insert(DirtyBits::SAMPLE | DirtyBits::PITCH);
+    }
+
     fn flush_channel(&mut self, context: &mut TickContext<'_>, channel_index: usize) {
+        self.apply_queued_swap(context, channel_index);
         let dirty = self.channels[channel_index].pending_dirty;
         if dirty.is_empty() { return; }
         let channel_id = ChannelId(channel_index as u16);
         if dirty.contains(DirtyBits::SAMPLE) {
             let Some(sample) = self.sample_index(channel_index) else {
                 context.stop_channel(channel_id);
+                self.channels[channel_index].voice_owned = false;
                 self.channels[channel_index].pending_dirty = DirtyBits::empty();
                 return;
             };
@@ -709,10 +778,12 @@ impl ModProcessor {
                 sample: state.sample_number,
                 note: if state.current_note == NO_NOTE { 0 } else { state.current_note },
             };
-            context.trigger_channel(channel_id, tag, region, self.voice_params(channel_index, dirty), state.sample_offset);
+            let offset_frames = state.sample_offset;
+            context.trigger_channel(channel_id, tag, region, self.voice_params(channel_index, dirty), offset_frames);
+            self.channels[channel_index].voice_owned = true;
         } else if let Some(voice) = context.channels.foreground(channel_id) {
             let state = &self.channels[channel_index];
-            if dirty.contains(DirtyBits::PITCH) { context.write_voice_param(voice, starplayer_core::VoiceParam::Step(step_from_period(state.actual_period, self.sample_rate_hz))); }
+            if dirty.contains(DirtyBits::PITCH) { context.write_voice_param(voice, starplayer_core::VoiceParam::Step(step_from_period(state.actual_period, self.sample_rate_hz, self.amiga_limits))); }
             if dirty.contains(DirtyBits::VOLUME) { context.write_voice_param(voice, starplayer_core::VoiceParam::Volume(unit_from_ratio(state.actual_volume as u32, 64))); }
             if dirty.contains(DirtyBits::PAN) { context.write_voice_param(voice, starplayer_core::VoiceParam::Pan(state.pan)); }
             if dirty.contains(DirtyBits::TEMPO) { context.mark_voice_dirty(voice, DirtyBits::TEMPO); }
@@ -724,7 +795,7 @@ impl ModProcessor {
     fn voice_params(&self, channel_index: usize, dirty: DirtyBits) -> VoiceParams {
         let state = &self.channels[channel_index];
         VoiceParams {
-            step: step_from_period(state.actual_period, self.sample_rate_hz),
+            step: step_from_period(state.actual_period, self.sample_rate_hz, self.amiga_limits),
             volume: unit_from_ratio(state.actual_volume as u32, 64),
             pan: state.pan,
             dirty,
@@ -763,9 +834,9 @@ impl ModProcessor {
         I: IntoIterator<Item = EffectCell>,
     {
         context.report_global_volume(U0F16::MAX);
-        if self.last_pattern.is_some_and(|previous| previous != pattern) {
-            for state in self.channels.iter_mut() { state.pattern_loop_start = 0; }
-        }
+        // PT's n_pattpos is per channel and survives a pattern change; only E60 writes
+        // it, so a pattern whose first E6x has no preceding E60 loops back to the
+        // previous pattern's mark.
         self.last_pattern = Some(pattern);
         self.row_pattern_break = false;
         self.reset_row();
@@ -792,6 +863,19 @@ impl TrackerProcessor for ModProcessor {
         let cells = row.bytes.chunks_exact(CELL_BYTES)
             .map(|bytes| EffectCell::from(ModCell::from_bytes(bytes).unwrap_or(ModCell::EMPTY)));
         self.row_effects(context, row.order, row.pattern, row.row, cells)
+    }
+
+    /// Drop every piece of state a seek must not carry across: the deferred CIA tempo,
+    /// the LFO random stream, every effect memory and every pattern-loop counter.
+    fn reset(&mut self) {
+        for channel_index in 0..self.channels.len() {
+            let pan = self.module.header().channel_pan(channel_index as u8).unwrap_or(I1F15::ZERO);
+            self.channels[channel_index] = ModChannel::new(channel_index as u8, pan);
+        }
+        self.last_pattern = None;
+        self.row_pattern_break = false;
+        self.waveform_random_state = WAVEFORM_RANDOM_SEED;
+        self.pending_tempo = None;
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {
@@ -883,8 +967,29 @@ fn add_signed(value: u32, delta: i32) -> u32 {
     if delta < 0 { value.saturating_sub(delta.unsigned_abs()).max(1) } else { value.saturating_add(delta as u32) }
 }
 
-fn step_from_period(period: u32, sample_rate_hz: u32) -> Step {
-    if period == 0 { Step::ZERO } else { Step::from_ratio(PAULA_PAL_CLOCK_HZ, period as u64 * sample_rate_hz.max(1) as u64) }
+/// ProTracker scales an LFO by `mulu` on the unsigned magnitude and `lsr`, then adds or
+/// subtracts by the sign of the phase counter. An arithmetic shift of the signed product
+/// would round toward minus infinity and make the negative half one unit deeper.
+fn lfo_delta(waveform: i16, depth: u8, shift: u32) -> i32 {
+    let magnitude = ((waveform.unsigned_abs() as u32 * depth as u32) >> shift) as i32;
+    if waveform < 0 { -magnitude } else { magnitude }
+}
+
+/// Paula's own range limit, as modelled by pt2-clone's `paulaSetPeriod`: a written zero
+/// means 65536 — a near-silent ~54 Hz crawl rather than a frozen DC hold — and anything
+/// below 113 is clamped up to 113.
+///
+/// The zero rule is unconditional: no format wants a frozen DC hold. The 113 floor is the
+/// Amiga's, so it follows the loader's Amiga-limits flag: a four-channel ProTracker module
+/// gets it, while extended-range MODs and MultiTracker — whose top octaves sit below 113
+/// by design and which libxmp plays unclamped — do not.
+fn step_from_period(period: u32, sample_rate_hz: u32, paula_floor: bool) -> Step {
+    let hardware_period = match period {
+        0 => 65_536,
+        period if paula_floor => period.max(PAULA_MINIMUM_PERIOD),
+        period => period,
+    };
+    Step::from_ratio(PAULA_PAL_CLOCK_HZ, hardware_period as u64 * sample_rate_hz.max(1) as u64)
 }
 
 fn sample_region(sample: &starplayer_model::SampleIndex) -> SampleRegion {
@@ -900,7 +1005,11 @@ fn finetune_from_rate(rate: u32) -> u8 {
 }
 
 fn pan_byte(value: u8) -> I1F15 { bipolar_from_ratio(value as i32 * 2 - 255, 255) }
-#[cfg(feature = "trace")]
+/// MultiTracker's native pan grid, identical to the MTM loader's header mapping.
+fn multitracker_pan_nibble(value: u8) -> I1F15 { bipolar_from_ratio(value.min(15) as i32 * 2 - 15, 15) }
+
+// The trace projection of a pan value; the pan round-trip test uses it without `trace`.
+#[cfg(any(feature = "trace", test))]
 fn pan_trace(pan: I1F15) -> u16 {
     let scaled = ((pan.to_bits() as i32 + 32_768) * 255 + 32_767) / 65_535;
     scaled.clamp(0, 255) as u16
@@ -982,6 +1091,38 @@ mod tests {
             self.foreground().and_then(|voice| self.voices.get(voice))
                 .map(|voice| voice.region().length_frames().saturating_sub((voice.position() >> 32) as u32))
         }
+
+        fn pending_region(&self) -> Option<starplayer_mixer::SampleRegion> {
+            self.foreground().and_then(|voice| self.voices.get(voice)).and_then(|voice| voice.pending_region())
+        }
+
+        fn region(&self) -> Option<starplayer_mixer::SampleRegion> {
+            self.foreground().and_then(|voice| self.voices.get(voice)).map(|voice| voice.region())
+        }
+
+        /// Render `frames` output frames of the channel's voice, so a boundary the
+        /// processor only queued actually arrives.
+        fn render(&mut self, module: &Module, frames: usize) {
+            let mut output = vec![starplayer_mixer::FixedFrame::default(); frames];
+            self.voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut output);
+        }
+    }
+
+    /// Three MOD instruments: two 64-frame forward loops and one empty slot, which is
+    /// what ProTracker reads as its null sample.
+    fn swap_module() -> Arc<Module> {
+        let mut builder = ModuleBuilder::new();
+        builder.add_pattern(&vec![0; 64 * CELL_BYTES], 64, 1).expect("pattern");
+        for base in [1_000i16, 5_000] {
+            let pcm: Vec<i16> = (0..64).map(|index| base + index as i16).collect();
+            let sample = builder.add_sample(&pcm, SampleSpec::one_shot("looping").with_forward_loop(0, 64)).expect("sample");
+            builder.add_instrument(InstrumentDef::from_sample("looping", sample, U0F16::MAX)).expect("instrument");
+        }
+        let empty = builder.add_sample(&[], SampleSpec::one_shot("empty")).expect("empty sample");
+        builder.add_instrument(InstrumentDef::from_sample("empty", empty, U0F16::MAX)).expect("empty instrument");
+        builder.set_orders(&[0, starplayer_model::ORDER_END]);
+        builder.set_header(ModuleHeader::new(ModuleFormat::Mod, 1));
+        Arc::new(builder.build().expect("module"))
     }
 
     #[test]
@@ -1149,7 +1290,6 @@ mod tests {
         assert_eq!(processor.channels[0].actual_period, 0);
         processor.arpeggio(0, 2);
         assert_eq!(processor.channels[0].actual_period, 850, "the flat PT table wraps into finetune +1 after its zero sentinel");
-        assert_eq!(step_from_period(0, 44_100), Step::ZERO);
     }
 
     #[test]
@@ -1332,5 +1472,263 @@ mod tests {
         }
         assert_eq!(frames, vec![Frame(0), Frame(882), Frame(1323)]);
         assert_eq!(sequencer.tempo_bpm(), 250);
+    }
+
+    // ── C3b: ProTracker fidelity repairs ───────────────────────────────────────────
+
+    #[test]
+    fn an_lfo_rounds_its_magnitude_rather_than_toward_minus_infinity() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let state = &mut processor.channels[0];
+        state.current_period = 428;
+        state.vibrato_phase = 132;
+        state.vibrato_memory = 0x0F;
+        processor.vibrato(0);
+        assert_eq!(processor.channels[0].actual_period, 426, "PT multiplies the unsigned magnitude and subtracts; an arithmetic shift would give 425");
+        assert_eq!(lfo_delta(-24, 15, 7), -2);
+        assert_eq!(lfo_delta(24, 15, 7), 2, "both halves of the waveform are the same depth");
+        assert_eq!(lfo_delta(-24, 15, 6), -5);
+        assert_eq!(lfo_delta(24, 15, 6), 5);
+    }
+
+    #[test]
+    fn vibrato_writes_past_the_amiga_limit_because_pt_writes_it_straight_to_paula() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let _ = process_row(&mut processor, ModCell { period: 856, instrument: 1, effect: 4, param: 0xFF });
+        let deepest = (1..6).map(|tick| {
+            let _ = process_tick(&mut processor, tick, 0);
+            processor.channels[0].actual_period
+        }).max();
+        assert_eq!(deepest, Some(885), "4FF on C-1 keeps its whole downward excursion under Amiga limits");
+        assert_eq!(processor.channels[0].current_period, 856, "the unmodulated period is untouched");
+    }
+
+    #[test]
+    fn the_paula_period_floor_and_the_period_zero_rule_apply_at_step_derivation() {
+        assert_eq!(step_from_period(1, 44_100, true), step_from_period(113, 44_100, true), "Paula clamps anything below 113 up to 113");
+        assert_eq!(step_from_period(112, 44_100, true), step_from_period(113, 44_100, true));
+        assert_eq!(step_from_period(0, 44_100, true), Step::from_ratio(PAULA_PAL_CLOCK_HZ, 65_536 * 44_100), "a written zero means 65536, not a DC hold");
+        assert_ne!(step_from_period(0, 44_100, true), Step::ZERO);
+        assert_eq!(step_from_period(428, 44_100, true), Step::from_ratio(PAULA_PAL_CLOCK_HZ, 428 * 44_100), "an ordinary period is unchanged");
+        assert_eq!(step_from_period(56, 44_100, false), Step::from_ratio(PAULA_PAL_CLOCK_HZ, 56 * 44_100), "without Amiga limits (MultiTracker, extended-range MODs) the top octaves stay below 113");
+        assert_eq!(step_from_period(0, 44_100, false), step_from_period(0, 44_100, true), "the zero rule does not depend on the flag");
+    }
+
+    #[test]
+    fn a_pattern_loop_mark_survives_a_pattern_change() {
+        let mut processor = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        let mut voices = VoicePool::new(2);
+        let mut channels = ChannelTable::new(1);
+        let mut row_at = |processor: &mut ModProcessor, pattern: u16, row: u16, cell: ModCell| {
+            let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+            processor.row_effects(&mut context, 0, pattern, row, [EffectCell::from(cell)])
+        };
+        assert_eq!(row_at(&mut processor, 0, 8, ModCell { effect: 0xE, param: 0x60, ..ModCell::EMPTY }).jump, None);
+        assert_eq!(processor.channels[0].pattern_loop_start, 8);
+        let jump = row_at(&mut processor, 1, 4, ModCell { effect: 0xE, param: 0x61, ..ModCell::EMPTY }).jump;
+        assert_eq!(jump, Some(Jump::within_pattern_to_row(8)), "PT's per-channel n_pattpos persists across a pattern change");
+        assert_eq!(processor.channels[0].pattern_loop_start, 8, "only E60 writes the mark");
+    }
+
+    #[test]
+    fn f00_stops_under_protracker_and_is_ignored_under_multitracker() {
+        let mut protracker = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        assert!(process_row(&mut protracker, ModCell { effect: 0xF, param: 0, ..ModCell::EMPTY }).stop);
+
+        let mut multitracker = processor_with_sample(true, FINETUNE_REFERENCE_RATES[0], 1024);
+        multitracker.semantics = EffectSemantics::MultiTracker { reset_counterpart: true };
+        let outcome = process_row(&mut multitracker, ModCell { effect: 0xF, param: 0, ..ModCell::EMPTY });
+        assert!(!outcome.stop, "libxmp's fx_s3m_speed ignores F00 outright");
+        assert_eq!((outcome.speed, outcome.tempo_bpm), (6, 125), "and it changes neither counterpart");
+    }
+
+    /// The 8xx byte and libxmp's `fxp << 4` E8x nibble both survive the trip through
+    /// `pan_byte` and the trace projection unchanged, so the conformance comparison sees
+    /// exactly the byte the command carried.
+    #[test]
+    fn protracker_pan_bytes_round_trip_through_the_trace_projection() {
+        for byte in 0..=255u8 {
+            assert_eq!(pan_trace(pan_byte(byte)), byte as u16, "8xx {byte:#04x} did not round-trip");
+        }
+        assert_eq!(pan_trace(pan_byte(0xF << 4)), 240, "E8F is libxmp's fxp << 4, not hard right");
+        assert_eq!(pan_trace(multitracker_pan_nibble(15)), 255, "MultiTracker's own E8x grid reaches hard right");
+        assert_eq!(pan_trace(multitracker_pan_nibble(8)), 136);
+    }
+
+    #[test]
+    fn a_seeked_render_is_byte_identical_to_a_fresh_render_of_the_same_order() {
+        let module = two_order_module();
+        let fresh = render_from_order(&module, 0, 1, 16_384);
+        let after_a_dirty_prefix = render_from_order(&module, 7, 1, 16_384);
+        assert_eq!(after_a_dirty_prefix, fresh, "a pending CIA tempo or an effect memory survived the seek");
+        assert!(fresh.iter().any(|frame| frame.left != 0), "the comparison rendered actual audio");
+    }
+
+    fn two_order_module() -> Arc<Module> {
+        // Order 0 leaves a vibrato memory on row 0 and a deferred CIA tempo on row 1, so
+        // a warm-up of exactly seven ticks stops with both still live.
+        let mut first = vec![0; 64 * CELL_BYTES];
+        first[..CELL_BYTES].copy_from_slice(&ModCell { period: 428, instrument: 1, effect: 4, param: 0x8F }.to_bytes());
+        let second_row = CELL_BYTES;
+        first[second_row..second_row + CELL_BYTES].copy_from_slice(&ModCell { effect: 0xF, param: 0x64, ..ModCell::EMPTY }.to_bytes());
+        // Order 1 recalls the vibrato memory on row 0 and retriggers on row 1, so both a
+        // depth difference and a row-length difference would be audible.
+        let mut second = vec![0; 64 * CELL_BYTES];
+        second[..CELL_BYTES].copy_from_slice(&ModCell { period: 428, instrument: 1, effect: 4, param: 0 }.to_bytes());
+        second[second_row..second_row + CELL_BYTES].copy_from_slice(&ModCell { period: 428, instrument: 1, ..ModCell::EMPTY }.to_bytes());
+
+        let mut builder = ModuleBuilder::new();
+        builder.add_pattern(&first, 64, 1).expect("first pattern");
+        builder.add_pattern(&second, 64, 1).expect("second pattern");
+        let pcm: Vec<i16> = (0..1_024).map(|index| (index as i16).wrapping_mul(31)).collect();
+        let sample = builder.add_sample(&pcm, SampleSpec::one_shot("sample")).expect("sample");
+        builder.add_instrument(InstrumentDef::from_sample("sample", sample, U0F16::MAX)).expect("instrument");
+        builder.set_orders(&[0, 1, starplayer_model::ORDER_END]);
+        builder.set_header(ModuleHeader::new(ModuleFormat::Mod, 1));
+        Arc::new(builder.build().expect("module"))
+    }
+
+    /// Dispatch `warm_up_ticks` ticks, seek to `order`, then render `frames` output frames
+    /// from a mixer state that is fresh either way — so the only thing that can differ is
+    /// what the processor carried across the seek.
+    fn render_from_order(module: &Arc<Module>, warm_up_ticks: usize, order: u16, frames: usize) -> Vec<starplayer_mixer::FixedFrame> {
+        let mut sequencer = sequencer_for(Arc::clone(module), 44_100, ExactFixedPoint);
+        {
+            let mut voices = VoicePool::new(4);
+            let mut channels = ChannelTable::new(1);
+            let mut control = ControlClock::new(44_100, Frame::ZERO);
+            for _ in 0..warm_up_ticks {
+                let Some(frame) = sequencer.next_event_frame() else { break };
+                let mut context = EngineContext::new(frame, &mut voices, &mut channels, &mut control);
+                sequencer.dispatch(frame, &mut context);
+            }
+        }
+        assert!(sequencer.seek_order(order), "the seek target resolves");
+        sequencer.restart_clock_at(Frame::ZERO);
+
+        let mut voices = VoicePool::new(4);
+        let mut channels = ChannelTable::new(1);
+        let mut control = ControlClock::new(44_100, Frame::ZERO);
+        let mut output = vec![starplayer_mixer::FixedFrame::default(); frames];
+        let mut produced = 0;
+        while produced < frames {
+            let next = sequencer.next_event_frame().map(|frame| frame.0 as usize).unwrap_or(frames).min(frames);
+            if next > produced {
+                voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut output[produced..next]);
+                produced = next;
+                continue;
+            }
+            if sequencer.next_event_frame().is_none() { break; }
+            let frame = Frame(produced as u64);
+            let mut context = EngineContext::new(frame, &mut voices, &mut channels, &mut control);
+            sequencer.dispatch(frame, &mut context);
+        }
+        output
+    }
+
+    // ── C3b / accuracy policy D12: the queued sample swap ──────────────────────────
+
+    #[test]
+    fn a_lone_instrument_queues_the_replacement_instead_of_restarting_the_voice() {
+        let module = swap_module();
+        let mut processor = ModProcessor::new(Arc::clone(&module), 44_100);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let voice = harness.foreground().expect("the note started a voice");
+        let first_region = harness.region().expect("a sounding region");
+
+        let _ = harness.row(&mut processor, ModCell { instrument: 2, ..ModCell::EMPTY });
+        assert_eq!(harness.foreground(), Some(voice), "a lone instrument never restarts the voice");
+        assert_eq!(harness.region(), Some(first_region), "and does not change the sounding sample yet");
+        assert!(harness.pending_region().is_some(), "it queues the replacement for the loop point");
+        assert_eq!(processor.channel(0).map(|state| state.sample_number), Some(2), "volume, finetune and the reported number apply at once");
+
+        harness.render(&module, 512);
+        assert_eq!(harness.foreground(), Some(voice), "the swap keeps the same voice");
+        assert_ne!(harness.region(), Some(first_region), "the loop point adopted the queued sample");
+        assert_eq!(harness.pending_region(), None);
+    }
+
+    #[test]
+    fn a_tone_portamento_naming_another_sample_queues_it_too() {
+        let module = swap_module();
+        let mut processor = ModProcessor::new(Arc::clone(&module), 44_100);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let voice = harness.foreground().expect("the note started a voice");
+        let _ = harness.row(&mut processor, ModCell { period: 404, instrument: 2, effect: 3, param: 4 });
+        assert_eq!(harness.foreground(), Some(voice), "3xy never retriggers");
+        assert!(harness.pending_region().is_some(), "the named sample waits for the boundary");
+    }
+
+    #[test]
+    fn an_empty_instrument_slot_is_pt_s_null_sample() {
+        let module = swap_module();
+        let mut processor = ModProcessor::new(Arc::clone(&module), 44_100);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let _ = harness.row(&mut processor, ModCell { instrument: 3, ..ModCell::EMPTY });
+        assert_eq!(processor.channel(0).map(|state| state.sample_number), Some(1), "an empty slot leaves the channel's sample, volume and finetune alone");
+        assert_eq!(harness.pending_region().map(|region| region.length_frames()), Some(0), "it queues the null sample");
+        harness.render(&module, 512);
+        assert_eq!(harness.foreground().and_then(|voice| harness.voices.get(voice)), None, "which stops the voice at its loop point");
+    }
+
+    #[test]
+    fn a_lone_instrument_restarts_a_channel_whose_sample_has_already_stopped() {
+        let module = swap_module();
+        let mut processor = ModProcessor::new(Arc::clone(&module), 44_100);
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let _ = harness.row(&mut processor, ModCell { instrument: 3, ..ModCell::EMPTY });
+        harness.render(&module, 512);
+        assert!(harness.foreground().and_then(|voice| harness.voices.get(voice)).is_none(), "the null sample stopped it");
+
+        let _ = harness.row(&mut processor, ModCell { instrument: 2, ..ModCell::EMPTY });
+        assert!(harness.foreground().and_then(|voice| harness.voices.get(voice)).is_some(), "there is no boundary left to wait for, so PT starts it now");
+        assert_eq!(processor.channel(0).map(|state| state.sample_number), Some(2));
+    }
+
+    /// Research point 2: MultiTracker is not a ProTracker dialect here. libxmp gates the
+    /// queued swap on `QUIRK_PROTRACK`, which its MTM loader does not set, so an MTM
+    /// instrument column applies volume and finetune and leaves the sounding sample
+    /// alone — no queue, and no restart either.
+    #[test]
+    fn multitracker_does_not_queue_a_sample_swap() {
+        let module = swap_module();
+        let mut processor = ModProcessor::with_semantics(Arc::clone(&module), 44_100, EffectSemantics::MultiTracker { reset_counterpart: true });
+        let mut harness = ProcessorHarness::new();
+        let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+        let region = harness.region().expect("a sounding region");
+        let _ = harness.row(&mut processor, ModCell { instrument: 2, ..ModCell::EMPTY });
+        assert_eq!(harness.pending_region(), None, "MTM has no queued swap");
+        assert_eq!(harness.region(), Some(region), "and does not restart the voice either");
+        assert_eq!(processor.channel(0).map(|state| state.sample_number), Some(2));
+    }
+
+    #[test]
+    fn a_queued_swap_allocates_nothing_and_survives_every_block_size() {
+        let module = swap_module();
+        let render = |chunk: usize| {
+            let mut processor = ModProcessor::new(Arc::clone(&module), 44_100);
+            let mut harness = ProcessorHarness::new();
+            let _ = harness.row(&mut processor, ModCell { period: 428, instrument: 1, ..ModCell::EMPTY });
+            let _ = harness.row(&mut processor, ModCell { instrument: 2, ..ModCell::EMPTY });
+            let voice = harness.foreground().expect("a sounding voice");
+            let mut output = vec![starplayer_mixer::FixedFrame::default(); 1_024];
+            let mut written = 0;
+            while written < output.len() {
+                let end = (written + chunk).min(output.len());
+                if let (Some(window), Some(voice)) = (output.get_mut(written..end), harness.voices.get_mut(voice)) {
+                    let _ = starplayer_mixer::accumulate_voice::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(voice, module.pcm(), window);
+                }
+                written = end;
+            }
+            output
+        };
+        let whole = render(1_024);
+        for chunk in [1usize, 3, 64, 128, 4_096, 8_191] {
+            assert_eq!(render(chunk), whole, "block size {chunk} moved the queued swap");
+        }
     }
 }

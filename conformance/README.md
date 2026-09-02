@@ -133,21 +133,33 @@ in that state.
 
 ## Current standing
 
-After the C2a harness repairs, 10 of the 47 pinned cases pass: MOD 7 of 27, S3M 2 of 17,
-MTM 1 of 3. Six of the MOD passes waive `position` alone under D14 and enforce every other
-field. The remaining 37 split into 9 accepted deviations and 28 known failures:
+After C3b's ProTracker fidelity repairs and the mixer voice-boundary sample swap, 14 of
+the 47 pinned cases pass: MOD 11 of 27, S3M 2 of 17, MTM 1 of 3. Seven of the MOD passes
+waive `position` alone under D14 and enforce every other field, and one waives
+`frame,position` under D15. The remaining 33 split into 13 accepted deviations and 20
+known failures:
 
-- **Accepted accuracy-policy deviations** (D12 is explicitly *not* one of these): the
-  oracle-representation entries D14–D19 and the §4 Startrekker AM-synth cases. D14 turns
-  out to reach further than C2 recorded — `PatternJump.mod`, `ptoffset.mod` and
-  `InstrSwapRetrigger.mod` are all finetuned, so once the harness aligned them correctly
-  their only remaining difference is the same one-to-two source frames of continuous
-  versus table finetune drift.
+- **Accepted accuracy-policy deviations**: the oracle-representation entries D14–D22 and
+  the §4 Startrekker AM-synth cases. D12 is no longer among them — the queued sample swap
+  is implemented, and the two cases that still fail around it (`openmpt-mod-swap-no-loop`,
+  `openmpt-mod-portamento-sample-change-pt`) fail on D18's post-mix omission rather than
+  on the swap: a queued stop that falls due inside a tick interval makes libxmp omit the
+  channel for that whole tick, and the adapter's D18 projection covers only a one-shot
+  running out.
 - **Tracker dialects** awaiting `plans/engine/M2-task-C5-quirks-and-tempo-models.md`: five
   Octalyser / Digital Tracker MOD cases and six S3M `cwtv` pattern-loop modes.
-- **Tracked repairs**: ProTracker fidelity and the voice-boundary sample swap in
-  `plans/engine/M2-task-C3b-protracker-fidelity-repairs.md`, and the S3M records in
-  `plans/engine/M2-task-C9-s3m-conformance-repairs.md`.
+- **Tracked repairs**: the S3M records in
+  `plans/engine/M2-task-C9-s3m-conformance-repairs.md`. No MOD or MTM case is a tracked
+  repair any more.
+
+C3b's own before/after, on the pinned corpus: MOD went from 7 of 27 to 11 of 27.
+`openmpt-mod-vibrato-reset` was fixed by the LFO magnitude rounding;
+`openmpt-mod-instrument-swap`, `openmpt-mod-swap-empty` and `openmpt-mod-stopped-swap`
+were fixed by the voice-boundary swap. Four MOD cases that C3b's task file listed as
+targets were re-diagnosed rather than fixed and now cite the accuracy policy:
+`openmpt-mod-delay-break` (D21, PT's tick-zero `E9x` retrigger),
+`openmpt-mod-portamento-swap-pt` (D22, PT's tick-zero instrument latch under `EDx`), and
+the two D18 cases above.
 
 Because the old aligner returned a string error before the differ ever ran, most of the
 pre-C2a reasons named an alignment position rather than a state difference. Every reason
@@ -156,7 +168,7 @@ observed, and several of them are in a different place — and of a different ki
 what was recorded before.
 
 The pass count is the honest measure of M2's third exit criterion; the harness exiting
-zero on 37 exclusions is not, which is what `--strict` exists to say.
+zero on 33 exclusions is not, which is what `--strict` exists to say.
 
 ## Deviation from the C2 task file
 

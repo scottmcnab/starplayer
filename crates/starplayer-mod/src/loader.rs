@@ -58,13 +58,17 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
     let fixed: [u8; HEADER_BYTES] = source.array(0)?;
     let layout = layout(fixed.get(MAGIC_OFFSET..MAGIC_OFFSET + 4).unwrap_or(&[])).ok_or(Error::BadMagic)?;
     let channels = layout.channels;
-    let song_length = fixed.get(SONG_LENGTH_OFFSET).copied().unwrap_or(0) as usize;
-    if !(1..=128).contains(&song_length) { return Err(Error::Invalid("MOD song length must be 1..=128")); }
+    // libxmp loads a zero-length order list and plays nothing; only a length past the
+    // 128-entry table is a structural error.
+    let song_length = (fixed.get(SONG_LENGTH_OFFSET).copied().unwrap_or(0) as usize).min(128);
 
     let order_bytes = fixed.get(ORDER_OFFSET..ORDER_OFFSET + 128).ok_or(Error::Truncated { offset: ORDER_OFFSET, needed: 128 })?;
     // ProTracker scans the complete on-disk table when locating sample data. Entries
     // after song_length are not played, but their patterns still occupy file space.
-    let pattern_count = order_bytes.iter().copied().filter(|order| *order != 255)
+    // ProTracker's mt_init compares each byte signed (`cmp.b` / `bgt`), so any entry
+    // with the high bit set can never raise the maximum; libxmp reaches the same result
+    // by breaking at the first byte above 0x7f (its "dragnet.mod" fix).
+    let pattern_count = order_bytes.iter().copied().filter(|order| *order < 0x80)
         .map(|order| logical_order(order, layout) as usize).max().map(|order| order + 1).unwrap_or(0);
     let pattern_bytes = (pattern_count as u64)
         .checked_mul(ROWS as u64).and_then(|value| value.checked_mul(channels as u64)).and_then(|value| value.checked_mul(CELL_BYTES as u64))
@@ -114,7 +118,10 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
         declared_sample_offset = declared_sample_offset.checked_add(declared_length).ok_or(Error::TooLarge("MOD sample data"))?;
 
         let loop_end = loop_start.saturating_add(loop_length).min(pcm.len());
-        let loops = loop_length > 4 && loop_start < loop_end;
+        // ProTracker loops whenever n_replen is more than one word, that is a repeat
+        // length of four bytes or more; libxmp's `loop_size > 1` is the same test. The
+        // `> 4` rule came from the DOS original's ConvertSamps, not from the format.
+        let loops = loop_length >= 4 && loop_start < loop_end;
         let specification = SampleSpec {
             name: name.clone(),
             loop_mode: if loops { LoopMode::Forward } else { LoopMode::None },
@@ -154,13 +161,18 @@ struct ModLayout {
 
 fn layout(magic: &[u8]) -> Option<ModLayout> {
     match magic {
-        b"M.K." | b"FLT4" => Some(ModLayout { channels: 4, paired_four_channel_patterns: false }),
+        // `M!K!` is what ProTracker itself writes once a module exceeds 64 patterns.
+        b"M.K." | b"M!K!" | b"FLT4" => Some(ModLayout { channels: 4, paired_four_channel_patterns: false }),
         b"6CHN" => Some(ModLayout { channels: 6, paired_four_channel_patterns: false }),
         b"8CHN" => Some(ModLayout { channels: 8, paired_four_channel_patterns: false }),
         b"FLT8" => Some(ModLayout { channels: 8, paired_four_channel_patterns: true }),
         [tens, ones, b'C', b'H'] if tens.is_ascii_digit() && ones.is_ascii_digit() => {
             let count = (tens - b'0') * 10 + (ones - b'0');
             (count > 0 && count <= 32).then_some(ModLayout { channels: count, paired_four_channel_patterns: false })
+        }
+        // Single-digit `dCHN`, the form several trackers write for 1..9 channels.
+        [digit, b'C', b'H', b'N'] if digit.is_ascii_digit() && *digit != b'0' => {
+            Some(ModLayout { channels: digit - b'0', paired_four_channel_patterns: false })
         }
         _ => None,
     }
@@ -232,7 +244,7 @@ mod tests {
         assert_eq!(module.pattern_bytes(starplayer_model::PatternId(0)).and_then(|bytes| ModCell::from_bytes(bytes.get(..4)?)), Some(ModCell { period: 428, instrument: 1, ..ModCell::EMPTY }));
         assert_eq!(module.sample_pcm(starplayer_core::SampleId(0)).and_then(|pcm| pcm.first()).copied(), Some(i16::MIN));
         assert_eq!(module.sample(starplayer_core::SampleId(0)).map(|sample| sample.reference_rate_hz()), Some(8280));
-        assert_eq!(module.sample(starplayer_core::SampleId(0)).map(|sample| sample.loop_mode()), Some(LoopMode::None), "a two-word loop is a one-shot");
+        assert_eq!(module.sample(starplayer_core::SampleId(0)).map(|sample| sample.loop_mode()), Some(LoopMode::Forward), "ProTracker loops a two-word repeat");
         assert!(module.header().channel_pan(0).is_some_and(|pan| pan < I1F15::ZERO));
         assert!(module.header().channel_pan(1).is_some_and(|pan| pan > I1F15::ZERO));
         assert!(module.header().channel_pan(2).is_some_and(|pan| pan > I1F15::ZERO));
@@ -303,5 +315,72 @@ mod tests {
         assert_eq!(first.cell(0, 4).map(|cell| cell.period), Some(214));
         let second = crate::PatternView::new(&module, starplayer_model::PatternId(1)).expect("second pattern");
         assert_eq!(second.cell(0, 0).map(|cell| cell.period), Some(856));
+    }
+
+    // ── C3b: ProTracker fidelity repairs ───────────────────────────────────────────
+
+    #[test]
+    fn a_two_word_loop_length_is_a_real_protracker_loop() {
+        let module = load(&minimal_mod()).expect("valid MOD");
+        let sample = module.sample(starplayer_core::SampleId(0)).expect("sample");
+        assert_eq!(sample.loop_mode(), LoopMode::Forward, "n_replen of one word loops in ProTracker");
+        assert_eq!((sample.loop_start(), sample.loop_end()), (4, 8));
+
+        // And the voice built from it wraps rather than ending.
+        let region = starplayer_mixer::LoopSpan::new(sample.loop_start(), sample.loop_end())
+            .map(|span| starplayer_mixer::SampleRegion::looping(sample.pcm_offset(), span)).expect("a looping region");
+        let mut voices = starplayer_mixer::VoicePool::new(1);
+        let params = starplayer_core::VoiceParams { step: starplayer_core::Step::ONE, volume: U0F16::MAX, ..starplayer_core::VoiceParams::SILENT };
+        voices.allocate(starplayer_mixer::VoiceTag::default(), region, params, 0).expect("slot 0");
+        let mut destination = [starplayer_mixer::FixedFrame::default(); 64];
+        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut destination);
+        assert_eq!(voices.voices_active(), 1, "a four-byte loop wraps instead of ending the voice");
+
+        let mut one_shot = minimal_mod();
+        one_shot[48..50].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(load(&one_shot).expect("valid MOD").sample(starplayer_core::SampleId(0)).map(|sample| sample.loop_mode()), Some(LoopMode::None), "a one-word repeat is still a one-shot");
+    }
+
+    #[test]
+    fn the_pattern_count_scan_ignores_order_bytes_at_or_above_0x80() {
+        let mut with_garbage = minimal_mod();
+        with_garbage[ORDER_OFFSET + 127] = 0x80;
+        let mut clean = minimal_mod();
+        clean[ORDER_OFFSET + 127] = 0x00;
+
+        let garbage_module = load(&with_garbage).expect("a 0x80 tail entry is not a pattern reference");
+        let clean_module = load(&clean).expect("valid MOD");
+        assert!(garbage_module.pattern(starplayer_model::PatternId(0)).is_some());
+        assert!(garbage_module.pattern(starplayer_model::PatternId(1)).is_none(), "0x80 never raises the stored pattern maximum");
+        assert!(clean_module.pattern(starplayer_model::PatternId(1)).is_none());
+        assert_eq!(garbage_module.sample_pcm(starplayer_core::SampleId(0)), clean_module.sample_pcm(starplayer_core::SampleId(0)));
+        assert_eq!(garbage_module.sample_pcm(starplayer_core::SampleId(0)).and_then(|pcm| pcm.first()).copied(), Some(i16::MIN));
+    }
+
+    #[test]
+    fn the_accepted_tag_set_covers_m_bang_k_bang_and_single_digit_chn() {
+        let mut bang = minimal_mod();
+        bang[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(b"M!K!");
+        assert!(probe(&bang));
+        assert_eq!(load(&bang).expect("M!K! is ProTracker's own >64-pattern tag").header().channel_count, 4);
+
+        let mut five = vec![0; HEADER_BYTES + ROWS as usize * 5 * CELL_BYTES];
+        five[SONG_LENGTH_OFFSET] = 1;
+        five[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(b"5CHN");
+        assert!(probe(&five));
+        assert_eq!(load(&five).expect("single-digit CHN").header().channel_count, 5);
+
+        let mut octalyser = minimal_mod();
+        octalyser[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(b"CD61");
+        assert!(!probe(&octalyser), "tracker dialects stay outside the tag set until C5 owns their behaviour");
+    }
+
+    #[test]
+    fn a_zero_length_order_list_loads_and_plays_nothing() {
+        let mut bytes = minimal_mod();
+        bytes[SONG_LENGTH_OFFSET] = 0;
+        let module = load(&bytes).expect("libxmp loads this and plays nothing");
+        assert_eq!(module.order_entry(0), Some(starplayer_model::OrderEntry::End));
+        assert_eq!(module.sample_pcm(starplayer_core::SampleId(0)).and_then(|pcm| pcm.first()).copied(), Some(i16::MIN), "the stored pattern still located the sample data");
     }
 }

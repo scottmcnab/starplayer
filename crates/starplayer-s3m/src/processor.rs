@@ -677,6 +677,20 @@ impl TrackerProcessor for S3mProcessor {
         outcome
     }
 
+    /// Restore the state a fresh processor would have. Nothing here allocates: the
+    /// channel array keeps its box and each entry is overwritten in place.
+    fn reset(&mut self) {
+        let header = self.module.header();
+        self.global_volume = ((header.global_volume.to_bits() as u32 * 64 + 32767) / 65535) as u8;
+        for channel_index in 0..self.channels.len() {
+            let pan = header.default_pan.get(channel_index).copied().map(pan_to_nibble).unwrap_or(7);
+            self.channels[channel_index] = S3mChannel::new(channel_index as u8, pan);
+        }
+        self.pattern_loop_start = 0;
+        self.pattern_loop_count = 0;
+        self.last_pattern = None;
+    }
+
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, 64));
         let outcome = context.outcome();
