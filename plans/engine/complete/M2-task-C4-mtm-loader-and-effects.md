@@ -3,6 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) |
+| Status | Landed |
 | Depends on | M1 |
 | Blocks | C7 |
 | Parallel with | C3 |
