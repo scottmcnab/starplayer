@@ -232,3 +232,18 @@ XM and IT dialects — they arrive with their formats.
 C7's fuzz seed corpus should include the loader cases this milestone found: `M!K!`,
 garbage order tails containing bytes at or above 0x80, a zero song length, 4-byte sample
 loops, and one file per dialect tag accepted above.
+
+## Post-landing notes (2026-09-03)
+
+Landed on branch `m2-c5`, rebased onto C7. Nine of the ten dialect cases pass and the
+corpus stands at **32 of 47**; no other case moved under `canonical()` and no golden
+changed. The worker's research resolutions above stand. Two things for the owner:
+
+- `libxmp-mod-pattern-loop-dt` is `C2-MOD-001`, a harness record: its `(row, tick)`
+  sequence matches the oracle for all 488 ticks, but the fixture's alternating 255/63 BPM
+  rows make the D15 frame offset flip by about 1300 frames at each `Fxx`, and the
+  time-based pairer only re-derives its offset after a successful pairing. Re-anchoring on
+  `(row, tick_in_row)` when a pairing fails is C2a-style harness work.
+- D40 records that `S_FX_D` and libxmp/OpenMPT classify `DFF` differently; the original
+  assembly's order is kept as the primary specification, and only `pattern_loop_imf.s3m`
+  contains the byte.

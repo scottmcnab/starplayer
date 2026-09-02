@@ -148,7 +148,7 @@ under an accuracy-policy entry and enforce every other field. The remaining 15 s
   channel for that whole tick, and the adapter's D18 projection covers only a one-shot
   running out.
 - **Tracker dialects**, delivered by
-  `plans/engine/M2-task-C5-quirks-and-tempo-models.md`: the five Octalyser / Digital
+  `plans/engine/complete/M2-task-C5-quirks-and-tempo-models.md`: the five Octalyser / Digital
   Tracker MOD cases and the five S3M `cwtv` pattern-loop modes now select a `FormatDialect`
   detected from the file header. Nine pass, two of them
   (`libxmp-s3m-pattern-loop-imf-breakjump`, `libxmp-s3m-pattern-loop-st301-breakjump`) with

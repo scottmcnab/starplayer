@@ -35,7 +35,7 @@ expected channel state*, which is exactly the shape of our trace format.
 | [C3](complete/M2-task-C3-mod-loader-and-effects.md) ✅ | MOD: loader + ProTracker effect processor | M1 | C4 |
 | [C3a](complete/M2-task-C3a-mod-headphone-panning.md) ✅ | Web option for S3M-width MOD headphone panning | C3, C4 | C5, C7 |
 | [C4](complete/M2-task-C4-mtm-loader-and-effects.md) ✅ | MTM: loader + effect processor | M1 | C3 |
-| [C5](M2-task-C5-quirks-and-tempo-models.md) | `QuirkSet`, `FormatDialect` and `TempoModel` wired end to end | C3b ✅, C2a ✅ | C7 |
+| [C5](complete/M2-task-C5-quirks-and-tempo-models.md) ✅ | `QuirkSet`, `FormatDialect` and `TempoModel` wired end to end | C3b, C2a | C7 |
 | [C6](complete/M2-task-C6-fixed-point-mixer.md) ✅ | The fixed-point mixer — the bit-exact reference | M1 | C1, C3, C4 |
 | [C7](complete/M2-task-C7-fuzzing-and-rt-safety.md) ✅ | Loader fuzzing + the allocator hook in CI | C3, C4 | C5 |
 | [C8](M2-task-C8-dos-reference-harness.md) | **Deferred**, pull-driven — see its trigger | — | — |
@@ -66,26 +66,27 @@ until that trigger fires.
 
 Honest position, so that nothing downstream plans against a number that is not true.
 
-**Conformance: 23 of 47 cases pass after C2a, C3b and C9** — MOD **11 of 27**, S3M
-**11 of 17**, MTM **1 of 3** — with **13 accepted deviations** and **11 known failures**:
-five MOD and five S3M tracker dialects for C5, and one S3M record (`C2-S3M-009`, the
-`Rxy` tremolo phase). No MOD or MTM known failure remains. Seven of the
-MOD passes waive `position` alone under D14 and enforce every other field. `cargo xtask conformance` exits
-zero in its informational form; `--strict` exits non-zero on the 28 known failures and is
-the M2 exit gate once C3b, C5 and C9 land. Before C2a the standing was 3 of 47 with 44
-undifferentiated exclusions, eight of them citing an NTSC rate libxmp never selected.
+**Conformance: 32 of 47 cases pass after C2a, C3b, C9 and C5** — MOD **15 of 27**, S3M
+**16 of 17**, MTM **1 of 3** — with **13 accepted deviations** and **2 known failures**:
+`C2-MOD-001` (a harness pairing limit under a `frame` waiver; the replay itself matches
+the oracle tick for tick) and `C2-S3M-009` (the `Rxy` tremolo phase). Every other
+exclusion is a documented oracle-representation difference. `cargo xtask conformance`
+exits zero in its informational form; `--strict` names those two records and stays off in
+CI until they are resolved. Before C2a the standing was 3 of 47 with 44 undifferentiated
+exclusions, eight of them citing an NTSC rate libxmp never selected.
 
 | Exit criterion | Status | Closed by |
 |---|---|---|
 | 1. MOD and MTM native, no S3M conversion | **Met** | C3, C4 |
 | 2. `cargo xtask goldens` regenerates; CI verifies | **Met** — S3M owner fixtures plus synthesised MOD and MTM fixtures | C6a (landed) |
-| 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Not met** — 23/47; ten of the eleven known failures are C5 tracker dialects, the eleventh is `C2-S3M-009` | C5 (dialects), `C2-S3M-009` |
+| 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Met as written** — 32/47 pass and every remaining case is listed with a reason; two are known failures (`C2-MOD-001`, `C2-S3M-009`) rather than accepted deviations, so `--strict` stays informational | `C2-MOD-001`, `C2-S3M-009` |
 | 4. Cross-target hash equality on the fixed path | **Met** for all three formats on x86-64 and wasm32; the ARM64 leg is CI-only | C6a (landed) |
 | 5. Loader fuzzing in CI, no panic or OOM | **Met** — six `cargo-fuzz` targets (byte-level and structured, per format), a bounded per-commit job and a nightly long run; the seeds and every crash regression are replayed on the pinned toolchain in `host-tests` | C7 (landed) |
 | 6. Allocator hook proves no allocation in `render()` | **Met** — `cargo xtask ci --job rt-safety`, over every module the repository can reach, at three host block sizes and across a `LoadModule` swap | C7 (landed) |
 | 7. Every new deviation recorded in the accuracy policy | **Met for the current standing** — every exclusion reason records a first divergence the repaired harness observed | C2a (landed) |
 
-Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a, C3b, C9, C7. Outstanding: C5. Deferred: C8.
+Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a, C3b, C9, C7, C5. Outstanding: none. Deferred: C8.
+Owner acceptance (the M2 listening check) is what remains before M3.
 
 ## A note on the oracle
 

@@ -7,7 +7,7 @@ still runs every excluded case, so a fix makes its exclusion fail as stale.
 
 **Who owns what.** C9 (`plans/engine/complete/M2-task-C9-s3m-conformance-repairs.md`,
 landed) left the one S3M record below; its exclusion row points here. C5
-(`plans/engine/M2-task-C5-quirks-and-tempo-models.md`) left one MOD record,
+(`plans/engine/complete/M2-task-C5-quirks-and-tempo-models.md`) left one MOD record,
 `C2-MOD-001`, which is a **harness** record rather than an engine one: the replay it
 covers agrees with the oracle tick for tick.
 No MTM case is recorded here. The ProTracker fidelity repairs and the mixer
