@@ -29,6 +29,7 @@
 //! | No `SCRM` at `0x2C`, or fewer than `0x60` bytes | [`Error::BadMagic`] / [`Error::Truncated`] |
 //! | Order list, parapointer arrays or an announced pan block past EOF | [`Error::Truncated`] — an `Insnum` or `Patnum` the file cannot support is exactly this |
 //! | No enabled channel in the 32-byte settings array | [`Error::Invalid`] |
+//! | More decoded pattern data than the file's own size can justify | [`Error::TooLarge`] — see [`MINIMUM_PATTERN_BUDGET_BYTES`] |
 //! | `initialspd` of 0 | clamped to 6; a speed of zero advances no rows |
 //! | `initialBPM` below 32 | clamped to 32, Scream Tracker 3's own floor |
 //! | `globalvol` above 64 | clamped to 64 |
@@ -72,6 +73,33 @@ const FALLBACK_SPEED: u8 = 6;
 /// Reference rate a sample whose `C2Spd` is zero is given: the format default, and what
 /// `ClearChannels` initialises `_C4SPD` to.
 const FALLBACK_C2SPD: u32 = starplayer_model::DEFAULT_REFERENCE_RATE_HZ;
+
+/// Decoded pattern bytes a file is allowed regardless of how small it is.
+///
+/// M2-C7 research point 3: *should a loader allocation be capped in production, not only
+/// under the fuzzer?* Here, yes, and this is the one place it matters. `Patnum` is a
+/// `u16` and a pattern costs **two bytes** of parapointer, so a 132 KB file may declare
+/// 65,535 patterns; each one unpacks to a fixed `64 × channels × 5` bytes, which at 32
+/// channels is 10 KB — 670 MB of decoded patterns out of a file that fits in a mail
+/// attachment. A parapointer of zero costs no further file bytes at all and is not even
+/// malformed: Scream Tracker 3 spells an empty pattern exactly that way.
+///
+/// Surviving such a file is not enough. A 2 GB length field in a 4 KB file is not a
+/// module, and a loader that allocates for it has already lost: on a phone or an embedded
+/// target the allocation succeeds and something else dies. So it is refused on principle,
+/// with a budget no real file approaches — the floor alone is 819 patterns of 32 channels,
+/// against Scream Tracker 3's own limit of 100.
+const MINIMUM_PATTERN_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Decoded pattern bytes a file earns per byte of its own size, once it is big enough for
+/// that to beat [`MINIMUM_PATTERN_BUDGET_BYTES`]. Packed S3M patterns are roughly a fifth
+/// of their decoded size, so 64× leaves two orders of magnitude of headroom.
+const PATTERN_BUDGET_PER_FILE_BYTE: usize = 64;
+
+/// The decoded-pattern budget for a file of `file_bytes`.
+fn decoded_pattern_budget(file_bytes: usize) -> usize {
+    file_bytes.saturating_mul(PATTERN_BUDGET_PER_FILE_BYTE).max(MINIMUM_PATTERN_BUDGET_BYTES)
+}
 
 /// Whether `bytes` looks like an S3M: `SCRM` at `0x2C`.
 ///
@@ -128,6 +156,17 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
         true => Some(source.array(pan_block_offset)?),
         false => None,
     };
+
+    // Every pattern unpacks to the same fixed stride whatever its parapointer says, so the
+    // whole decoded cost is known before a byte of it is allocated. See
+    // [`MINIMUM_PATTERN_BUDGET_BYTES`].
+    let decoded_pattern_bytes = pattern_pointers.len()
+        .saturating_mul(pattern::ROWS as usize)
+        .saturating_mul(addressed_channels as usize)
+        .saturating_mul(pattern::CELL_BYTES);
+    if decoded_pattern_bytes > decoded_pattern_budget(source.len()) {
+        return Err(Error::TooLarge("S3M pattern data"));
+    }
 
     let mut builder = ModuleBuilder::new();
     for pointer in &instrument_pointers {
@@ -364,5 +403,50 @@ mod tests {
     #[test]
     fn a_file_without_the_signature_is_bad_magic() {
         assert_eq!(load(&[0u8; 0x60]), Err(Error::BadMagic));
+    }
+
+    // ── C7 research point 3: the production allocation cap ─────────────────────────
+
+    /// A header with `pattern_count` patterns, 32 enabled channels, and exactly the
+    /// parapointer table that count requires — every pointer zero, which is Scream
+    /// Tracker 3's own spelling of an empty pattern and costs nothing beyond its two
+    /// bytes.
+    fn amplifying_s3m(pattern_count: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; header::HEADER_LENGTH];
+        bytes[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(&MAGIC);
+        bytes[0x20..0x22].copy_from_slice(&0u16.to_le_bytes());
+        bytes[0x22..0x24].copy_from_slice(&0u16.to_le_bytes());
+        bytes[0x24..0x26].copy_from_slice(&pattern_count.to_le_bytes());
+        bytes[0x31] = 6;
+        bytes[0x32] = 125;
+        // All 32 settings enabled, so every pattern unpacks at the maximum stride.
+        bytes.resize(header::HEADER_LENGTH + 2 * pattern_count as usize, 0);
+        bytes
+    }
+
+    #[test]
+    fn a_pattern_count_the_file_cannot_justify_is_refused_rather_than_allocated() {
+        // 4000 patterns × 64 rows × 32 channels × 5 bytes is 41 MB of decoded patterns out
+        // of an 8 KB file. The budget for 8 KB is the 4 MiB floor.
+        let bytes = amplifying_s3m(4_000);
+        assert!(bytes.len() < 9_000, "the whole attack fits in 9 KB: {} bytes", bytes.len());
+        assert_eq!(load(&bytes), Err(Error::TooLarge("S3M pattern data")));
+    }
+
+    #[test]
+    fn a_pattern_count_a_real_module_would_use_is_still_accepted() {
+        // Scream Tracker 3's own limit is 100 patterns; 256 is what the trackers that
+        // extended the format allow. Both stay inside the floor at the widest stride.
+        let module = load(&amplifying_s3m(256)).expect("256 empty 32-channel patterns are a plausible module");
+        assert_eq!(module.patterns().len(), 256);
+        assert_eq!(module.header().channel_count, 32);
+    }
+
+    #[test]
+    fn the_budget_is_a_floor_below_which_file_size_does_not_matter() {
+        assert_eq!(decoded_pattern_budget(0), MINIMUM_PATTERN_BUDGET_BYTES);
+        assert_eq!(decoded_pattern_budget(1_024), MINIMUM_PATTERN_BUDGET_BYTES, "a small file still gets the floor");
+        assert_eq!(decoded_pattern_budget(1_000_000), 64_000_000, "a big one earns its size instead");
+        assert_eq!(decoded_pattern_budget(usize::MAX), usize::MAX, "and the arithmetic saturates rather than wrapping");
     }
 }

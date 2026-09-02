@@ -1,0 +1,85 @@
+[package]
+name = "starplayer-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# **Deliberately its own workspace.** `cargo fuzz` builds with a nightly toolchain, a
+# sanitizer and `-Cpasses=sancov-module`; nothing here may reach `cargo test --workspace`,
+# `cargo clippy --workspace --all-targets` or either of the bare-metal jobs, all of which
+# run on the pinned stable toolchain. An empty `[workspace]` table is the conventional
+# `cargo-fuzz` way to say so, and it also gives this crate its own `Cargo.lock` so a
+# libFuzzer bump cannot move the engine's dependency graph.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+# The loaders under test, by path. No facade and no `starplayer-offline`: a fuzz target
+# should link the smallest graph that contains the code being exercised, so a crash points
+# at a loader rather than at everything downstream of one.
+starplayer-core = { path = "../crates/starplayer-core" }
+starplayer-model = { path = "../crates/starplayer-model" }
+starplayer-mod = { path = "../crates/starplayer-mod" }
+starplayer-s3m = { path = "../crates/starplayer-s3m" }
+starplayer-mtm = { path = "../crates/starplayer-mtm" }
+
+[lib]
+path = "src/lib.rs"
+
+# `cargo fuzz` needs the panic strategy to stay `unwind` so libFuzzer can report a panic
+# as a crash, and it needs debug assertions on so an arithmetic overflow is a finding
+# rather than a wrap. Optimisation stays on: a fuzzer that runs ten times slower explores
+# ten times less.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+incremental = false
+codegen-units = 1
+
+[[bin]]
+name = "mod_loader"
+path = "fuzz_targets/mod_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "s3m_loader"
+path = "fuzz_targets/s3m_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mtm_loader"
+path = "fuzz_targets/mtm_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mod_structured"
+path = "fuzz_targets/mod_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "s3m_structured"
+path = "fuzz_targets/s3m_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mtm_structured"
+path = "fuzz_targets/mtm_structured.rs"
+test = false
+doc = false
+bench = false

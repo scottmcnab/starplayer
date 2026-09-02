@@ -53,7 +53,70 @@ const NO_STD_CRATES: &[&str] = &[
 /// `starplayer-telemetry` edge (architecture §11, M1-B6).
 const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry")];
 
-const JOBS: &[&str] = &["host-tests", "conformance", "goldens", "fma-check", "trace-zero-cost", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
+const JOBS: &[&str] = &["host-tests", "conformance", "rt-safety", "goldens", "fma-check", "trace-zero-cost", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
+
+/// Jobs `cargo xtask ci` does **not** run in its default sweep, but `--job` still accepts.
+///
+/// `fuzz-smoke` is the only one, and it is opt-in for one reason: `cargo fuzz` needs a
+/// nightly toolchain and a `cargo install cargo-fuzz`, neither of which the pinned
+/// `rust-toolchain.toml` provides. Everything else in this file runs on the pinned
+/// toolchain, and a developer running the local matrix should not have that broken by a
+/// missing nightly. CI runs it as its own job, which installs both.
+const OPT_IN_JOBS: &[&str] = &["fuzz-smoke"];
+
+// ── loader fuzzing (M2-C7) ──────────────────────────────────────────────────────────
+
+/// The fuzz crate, relative to the workspace root. Its own workspace, deliberately — see
+/// `fuzz/Cargo.toml`.
+const FUZZ_DIRECTORY: &str = "fuzz";
+
+/// libFuzzer dictionary of format magic values, relative to [`FUZZ_DIRECTORY`].
+const FUZZ_DICTIONARY: &str = "dictionaries/tracker.dict";
+
+/// Every fuzz target, and the seed directory whose modules belong in its corpus.
+///
+/// The structured targets take an `Arbitrary` mutation program rather than module bytes,
+/// so seeding them with modules would be meaningless: their bases are compiled in with
+/// `include_bytes!`. `None` says so.
+const FUZZ_TARGETS: &[(&str, Option<&str>)] = &[
+    ("mod_loader", Some("mod")),
+    ("s3m_loader", Some("s3m")),
+    ("mtm_loader", Some("mtm")),
+    ("mod_structured", None),
+    ("s3m_structured", None),
+    ("mtm_structured", None),
+];
+
+/// Seconds each target runs in the per-commit smoke job. Six targets, so the job is a few
+/// minutes including the build — "minutes, not hours", as the task asks.
+const FUZZ_SMOKE_SECONDS: u32 = 30;
+
+/// Seconds a `cargo xtask fuzz` run gives each target when `--seconds` is not supplied.
+const FUZZ_DEFAULT_SECONDS: u32 = 60;
+
+/// Largest seed copied into a working corpus.
+///
+/// libFuzzer derives `-max_len` from the largest input it finds, and every execution then
+/// costs that much mutation and copying. A 500 KB module in the corpus makes the whole
+/// run an order of magnitude slower without reaching any code a 128 KB one does not.
+const FUZZ_SEED_SIZE_LIMIT: usize = 128 * 1024;
+
+/// Memory ceiling handed to libFuzzer, in MB.
+///
+/// The fuzz crate's own allocator caps each *input* (see `fuzz/src/lib.rs`); this is the
+/// belt to that crate's braces, and catches an allocation made outside Rust's global
+/// allocator. Both are needed: without one of them an OOM is a killed process with no
+/// artifact rather than a reproducible finding.
+const FUZZ_RSS_LIMIT_MB: u32 = 2_048;
+
+/// Ceiling on a **single** allocation, in MB. A loader that reads a length field and
+/// allocates it trips this on the first request rather than after the ring buffer fills.
+const FUZZ_MALLOC_LIMIT_MB: u32 = 512;
+
+/// Toolchain `cargo fuzz` is run under, overridable for a CI image that pins a nightly.
+fn fuzz_toolchain() -> String {
+    std::env::var("STARPLAYER_FUZZ_TOOLCHAIN").unwrap_or_else(|_| "nightly".to_string())
+}
 
 /// The LLVM policy `.cargo/config.toml` sets for the float path. Cargo **replaces**
 /// `[build] rustflags` when `RUSTFLAGS` is set rather than merging, so a job or shell that
@@ -100,6 +163,7 @@ fn main() -> ExitCode {
     let succeeded = match subcommand {
         Some("ci") => run_ci(&arguments[1..]),
         Some("conformance") => run_conformance(&arguments[1..]),
+        Some("fuzz") => run_fuzz(&arguments[1..]),
         Some("goldens") => run_goldens(&arguments[1..]),
         Some("trace") => run_trace(&arguments[1..]),
         Some("wasm") => run_wasm(&arguments[1..]),
@@ -124,6 +188,8 @@ fn print_usage() {
     println!("subcommands:");
     println!("  ci [--job <job>]   run the CI matrix locally, or a single job of it");
     println!("  conformance [--offline|--fetch-only] [--strict] [--archive PATH]   acquire and run the pinned tracker corpora");
+    println!("  fuzz [--seed] [--target NAME] [--seconds N]   seed the loader corpora and run cargo-fuzz over them");
+    println!("                     needs a nightly toolchain and `cargo install cargo-fuzz`; see fuzz/README.md");
     println!("  goldens [--check]  regenerate canonical SHA-256 renders, or verify them");
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
     println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
@@ -134,6 +200,11 @@ fn print_usage() {
     println!("ci jobs:");
     for job in JOBS {
         println!("  {job}");
+    }
+    println!();
+    println!("ci jobs not in the default sweep (`--job` only):");
+    for job in OPT_IN_JOBS {
+        println!("  {job}   (needs a nightly toolchain and `cargo install cargo-fuzz`)");
     }
 }
 
@@ -396,6 +467,177 @@ fn verify_sha256(path: &Path, expected: &str) -> bool {
     true
 }
 
+/// `cargo xtask fuzz` — seed the loader corpora, then run `cargo fuzz` over them.
+///
+/// The corpus a fuzzer starts from is most of its value, and the modules this repository
+/// can legitimately hand it live in three places: the committed seeds, the owner's own
+/// S3Ms, and the pinned libxmp corpus in the conformance cache. The last of those is not
+/// ours to commit, so it is copied into the **git-ignored** working corpus here, at run
+/// time, out of the cache the conformance job already maintains.
+fn run_fuzz(arguments: &[String]) -> bool {
+    let mut seed_only = false;
+    let mut requested_target: Option<String> = None;
+    let mut seconds = FUZZ_DEFAULT_SECONDS;
+    let mut index = 0usize;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--seed" => { seed_only = true; index += 1; }
+            "--target" => {
+                let Some(value) = arguments.get(index + 1) else {
+                    eprintln!("xtask fuzz: `--target` needs a value");
+                    return false;
+                };
+                if !FUZZ_TARGETS.iter().any(|(target, _)| target == value) {
+                    eprintln!("xtask fuzz: unknown target `{value}`; known targets: {}", fuzz_target_names().join(", "));
+                    return false;
+                }
+                requested_target = Some(value.clone());
+                index += 2;
+            }
+            "--seconds" => {
+                let parsed = arguments.get(index + 1).and_then(|value| value.parse::<u32>().ok());
+                let Some(value) = parsed else {
+                    eprintln!("xtask fuzz: `--seconds` needs a positive number");
+                    return false;
+                };
+                seconds = value;
+                index += 2;
+            }
+            other => {
+                eprintln!("xtask fuzz: unexpected argument `{other}`");
+                return false;
+            }
+        }
+    }
+
+    if !seed_fuzz_corpora() {
+        return false;
+    }
+    if seed_only {
+        return true;
+    }
+
+    let targets: Vec<&str> = match &requested_target {
+        Some(target) => vec![target.as_str()],
+        None => FUZZ_TARGETS.iter().map(|(target, _)| *target).collect(),
+    };
+    targets.iter().all(|target| run_one_fuzz_target(target, seconds))
+}
+
+fn fuzz_target_names() -> Vec<&'static str> { FUZZ_TARGETS.iter().map(|(target, _)| *target).collect() }
+
+/// Fill `fuzz/corpus/<target>/` for every byte-level target.
+///
+/// Files are copied rather than linked, and named after where they came from, so a crash
+/// artifact minimised out of one is traceable to its origin.
+fn seed_fuzz_corpora() -> bool {
+    let root = workspace_root();
+    let fuzz = root.join(FUZZ_DIRECTORY);
+
+    let pinned_corpus = conformance_corpus_directory(&root).join("test-dev/data");
+    if !pinned_corpus.is_dir() {
+        println!("xtask fuzz: pinned corpus not cached; seeding from committed modules only");
+        println!("            run `cargo xtask conformance --fetch-only` to widen the corpus");
+    }
+
+    for (target, format) in FUZZ_TARGETS {
+        let Some(format) = format else { continue };
+        let destination = fuzz.join("corpus").join(target);
+        if let Err(error) = std::fs::create_dir_all(&destination) {
+            eprintln!("xtask fuzz: cannot create `{}`: {error}", destination.display());
+            return false;
+        }
+
+        let mut copied = 0usize;
+        copied += copy_seeds_into_corpus(&fuzz.join("seeds").join(format), "seed", format, &destination);
+        copied += copy_seeds_into_corpus(&fuzz.join("regressions").join(format), "regression", format, &destination);
+        copied += copy_seeds_into_corpus(&root.join(FIXTURE_SOURCE_DIRECTORY), "owner", format, &destination);
+        copied += copy_seeds_into_corpus(&pinned_corpus, "libxmp", format, &destination);
+        println!("xtask fuzz: {target} corpus seeded with {copied} module(s)");
+    }
+    true
+}
+
+/// Copy every file in `source` that this `format`'s loader would recognise into
+/// `destination`, prefixed with `origin`. Returns how many were copied.
+fn copy_seeds_into_corpus(source: &Path, origin: &str, format: &str, destination: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(source) else { return 0 };
+    let mut copied = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if bytes.len() > FUZZ_SEED_SIZE_LIMIT || classify_module(&bytes) != Some(format) {
+            continue;
+        }
+        let Some(stem) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        let target_path = destination.join(format!("{origin}-{stem}"));
+        if std::fs::write(&target_path, &bytes).is_ok() {
+            copied += 1;
+        }
+    }
+    copied
+}
+
+/// Which loader owns these bytes, by the same magic values the loaders' own probes read.
+///
+/// xtask has no dependencies by design — including on the engine — so the three probes are
+/// restated here. They are four-byte comparisons; the risk of drift is real but small, and
+/// a seed that stops being recognised only means a slightly narrower corpus.
+fn classify_module(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.get(0x2C..0x30) == Some(b"SCRM") {
+        return Some("s3m");
+    }
+    if bytes.get(..4) == Some(b"MTM\x10") {
+        return Some("mtm");
+    }
+    match bytes.get(1080..1084) {
+        Some(b"M.K." | b"M!K!" | b"FLT4" | b"FLT8" | b"6CHN" | b"8CHN") => Some("mod"),
+        Some([tens, ones, b'C', b'H']) if tens.is_ascii_digit() && ones.is_ascii_digit() => Some("mod"),
+        Some([digit, b'C', b'H', b'N']) if digit.is_ascii_digit() && *digit != b'0' => Some("mod"),
+        _ => None,
+    }
+}
+
+fn run_one_fuzz_target(target: &str, seconds: u32) -> bool {
+    let fuzz = workspace_root().join(FUZZ_DIRECTORY);
+    let toolchain = fuzz_toolchain();
+    let arguments = [
+        "run".to_string(), toolchain.clone(), "cargo".to_string(), "fuzz".to_string(), "run".to_string(), target.to_string(),
+        "--".to_string(),
+        format!("-max_total_time={seconds}"),
+        format!("-rss_limit_mb={FUZZ_RSS_LIMIT_MB}"),
+        format!("-malloc_limit_mb={FUZZ_MALLOC_LIMIT_MB}"),
+        format!("-dict={FUZZ_DICTIONARY}"),
+        // A timeout, because a loader that loops forever is as much a denial of service as
+        // one that crashes, and libFuzzer only reports a hang if it is told what one is.
+        "-timeout=25".to_string(),
+        "-print_final_stats=1".to_string(),
+    ];
+    println!("     rustup {}", arguments.join(" "));
+
+    // `rustup run <toolchain> cargo fuzz` rather than `cargo +nightly fuzz`: `cargo xtask`
+    // sets `CARGO` to a concrete toolchain binary, and a concrete cargo does not
+    // understand `+toolchain` — only the rustup shim does.
+    match Command::new("rustup").current_dir(&fuzz).args(&arguments).status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("xtask fuzz: `{target}` exited with {status}");
+            eprintln!("            any crash input is under fuzz/artifacts/{target}/;");
+            eprintln!("            copy it into fuzz/regressions/<format>/ once the loader is fixed");
+            false
+        }
+        Err(error) => {
+            eprintln!("xtask fuzz: cannot start `rustup run {toolchain} cargo fuzz`: {error}");
+            eprintln!("            install the toolchain with `rustup toolchain install {toolchain}`");
+            eprintln!("            and the driver with `cargo install cargo-fuzz`");
+            false
+        }
+    }
+}
+
 fn run_ci(arguments: &[String]) -> bool {
     let requested_job = match parse_job_argument(arguments) {
         Ok(job) => job,
@@ -420,6 +662,8 @@ fn run_ci(arguments: &[String]) -> bool {
         let succeeded = match *job {
             "host-tests" => job_host_tests(),
             "conformance" => job_conformance(),
+            "rt-safety" => job_rt_safety(),
+            "fuzz-smoke" => job_fuzz_smoke(),
             "goldens" => run_goldens(&["--check".to_string()]),
             "fma-check" => job_fma_check(),
             "trace-zero-cost" => job_trace_zero_cost(),
@@ -454,8 +698,8 @@ fn parse_job_argument(arguments: &[String]) -> Result<Option<&str>, String> {
         match arguments[index].as_str() {
             "--job" => {
                 let value = arguments.get(index + 1).ok_or("`--job` needs a value")?;
-                if !JOBS.contains(&value.as_str()) {
-                    return Err(format!("unknown job `{value}`; known jobs: {}", JOBS.join(", ")));
+                if !JOBS.contains(&value.as_str()) && !OPT_IN_JOBS.contains(&value.as_str()) {
+                    return Err(format!("unknown job `{value}`; known jobs: {}, {}", JOBS.join(", "), OPT_IN_JOBS.join(", ")));
                 }
                 requested_job = Some(value.as_str());
                 index += 2;
@@ -807,6 +1051,56 @@ fn collect_files_with_extension(directory: &Path, extension: &str, destination: 
 /// list below and CI enforces the M2 exit criterion.
 fn job_conformance() -> bool {
     run_conformance(&["--offline".to_string()])
+}
+
+/// M2-C7 deliverable 6: the no-allocation-in-`render()` hook, over the whole corpus.
+///
+/// A release build, because the point is to render a few hundred seconds of audio through
+/// every module the repository can reach and an unoptimised mixer makes that a minute
+/// rather than a moment. `STARPLAYER_REQUIRE_CORPUS` turns "the pinned corpus is not
+/// cached" from a quiet narrowing of coverage into a failure, which is what CI wants and
+/// a developer without the cache does not.
+///
+/// This runs on the **pinned** toolchain: a global allocator is stable Rust. Only the
+/// coverage-guided fuzzing needs nightly.
+fn job_rt_safety() -> bool {
+    let corpus = conformance_corpus_directory(&workspace_root()).join("test-dev/data");
+    if !corpus.is_dir() {
+        eprintln!("xtask ci: pinned corpus is not cached at `{}`", corpus.display());
+        eprintln!("          run `cargo xtask conformance --fetch-only` during acquisition");
+        return false;
+    }
+    // The second pass is not redundant. The engine's per-tick telemetry publish is
+    // precisely the "just for telemetry" path architecture §8 warns about, and it is
+    // `#[cfg(feature = "telemetry")]`, so the default pass does not compile it into
+    // `render()` at all. This mirrors `job_host_tests`'s second engine pass.
+    rt_safety_pass(&["test", "--release", "-p", "starplayer-offline", "--test", "render_allocation", "--test", "garbage_channel", "--test", "fuzz_seeds"])
+        && rt_safety_pass(&["test", "--release", "-p", "starplayer-offline", "--features", "telemetry", "--test", "render_allocation"])
+}
+
+fn rt_safety_pass(arguments: &[&str]) -> bool {
+    println!("     cargo {}", arguments.join(" "));
+    match Command::new(cargo_binary()).current_dir(workspace_root()).env("STARPLAYER_REQUIRE_CORPUS", "1").args(arguments).status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("     the real-time safety suite exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("     cargo failed to start: {error}");
+            false
+        }
+    }
+}
+
+/// M2-C7 deliverable 5: the bounded per-commit fuzz run.
+///
+/// [`FUZZ_SMOKE_SECONDS`] per target after seeding, which is minutes rather than hours.
+/// The long runs are the scheduled `.github/workflows/fuzz.yml` job; this one exists so
+/// that a commit which breaks a loader outright cannot land, and so that the corpus keeps
+/// growing on every push.
+fn job_fuzz_smoke() -> bool {
+    run_fuzz(&["--seconds".to_string(), FUZZ_SMOKE_SECONDS.to_string()])
 }
 
 /// The web build has to keep working on every commit, both for the facade the app

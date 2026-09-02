@@ -1,0 +1,95 @@
+# The long fuzz run (M2-task-C7 deliverable 5).
+#
+# `ci.yml`'s `fuzz-smoke` job gives every target thirty seconds on every commit, which is
+# enough to catch a loader broken outright but nowhere near enough to find the input that
+# takes a rare branch. This workflow gives each target fifteen minutes every night and
+# **keeps the corpus**, so each run starts where the last one stopped and the corpus grows
+# monotonically rather than being rediscovered from the seeds every time.
+#
+# A crash here is a finding, not a flake: download the artifact bundle, reproduce it with
+# `cargo fuzz run <target> fuzz/artifacts/<target>/<input>`, fix the loader, and commit the
+# input to `fuzz/regressions/<format>/` in the same change — the pinned-stable suite
+# replays it from then on.
+
+name: fuzz
+
+on:
+  schedule:
+    # 03:17 UTC, off the hour so it does not queue behind everyone else's midnight cron.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target"
+        required: false
+        default: "900"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    # One job per target so a crash in one does not cut the others' budget short, and so
+    # the corpus caches stay independent.
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - mod_loader
+          - s3m_loader
+          - mtm_loader
+          - mod_structured
+          - s3m_structured
+          - mtm_structured
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install nightly for cargo-fuzz
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Restore pinned corpus
+        id: corpus-cache
+        uses: actions/cache@v4
+        with:
+          path: target/conformance
+          key: conformance-libxmp-6ec0ba21b1b28f91e22b68a51d59207c6bbf6139
+      - name: Acquire and verify pinned corpus
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        run: cargo xtask conformance --fetch-only
+
+      # The corpus this target grew on previous nights. `restore-keys` makes a run start
+      # from the most recent snapshot; the new key stores what this run added.
+      - name: Restore the evolved corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        run: cargo xtask fuzz --target ${{ matrix.target }} --seconds ${{ github.event.inputs.seconds || '900' }}
+
+      - name: Save the evolved corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload any crash the run found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

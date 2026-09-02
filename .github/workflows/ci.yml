@@ -105,6 +105,65 @@ jobs:
       - name: Run with live corpus acquisition disabled
         run: cargo xtask ci --job conformance
 
+  rt-safety:
+    name: real-time safety (allocator hook)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore pinned corpus
+        id: corpus-cache
+        uses: actions/cache@v4
+        with:
+          path: target/conformance
+          key: conformance-libxmp-6ec0ba21b1b28f91e22b68a51d59207c6bbf6139
+      - name: Acquire and verify pinned corpus
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        run: cargo xtask conformance --fetch-only
+      - run: cargo xtask ci --job rt-safety
+
+  # The one job not on the pinned toolchain. `cargo fuzz` needs `-Zsanitizer=address` and
+  # `-Cpasses=sancov-module`, which stable rustc rejects outright, so libFuzzer coverage
+  # instrumentation is nightly-only. Everything the fuzzer protects is *also* replayed on
+  # the pinned toolchain by `crates/starplayer-offline/tests/fuzz_seeds.rs` inside
+  # host-tests, so a nightly that breaks narrows coverage rather than losing the
+  # regression suite.
+  fuzz-smoke:
+    name: loader fuzzing (bounded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install nightly for cargo-fuzz
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Restore pinned corpus
+        id: corpus-cache
+        uses: actions/cache@v4
+        with:
+          path: target/conformance
+          key: conformance-libxmp-6ec0ba21b1b28f91e22b68a51d59207c6bbf6139
+      - name: Acquire and verify pinned corpus
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        run: cargo xtask conformance --fetch-only
+      - run: cargo xtask ci --job fuzz-smoke
+      - name: Upload any crash the run found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
   wasm-build:
     name: wasm build
     runs-on: ubuntu-latest

@@ -16,6 +16,13 @@ sha2 = { workspace = true }
 [features]
 default = []
 trace = ["starplayer/trace"]
+# The engine's per-tick telemetry publish is exactly the "just for telemetry" path
+# architecture §8 warns about, so `tests/render_allocation.rs` has to be able to arm the
+# allocator hook with it compiled in. Optional for the same reason `trace` is: declared as
+# an ordinary dependency feature it would be unified across the whole workspace and every
+# golden render would carry the publisher. `cargo xtask ci --job rt-safety` runs the suite
+# once without it and once with it.
+telemetry = ["starplayer/telemetry"]
 
 [[bin]]
 name = "starplayer-trace"

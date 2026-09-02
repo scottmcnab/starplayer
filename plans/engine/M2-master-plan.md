@@ -37,7 +37,7 @@ expected channel state*, which is exactly the shape of our trace format.
 | [C4](complete/M2-task-C4-mtm-loader-and-effects.md) ✅ | MTM: loader + effect processor | M1 | C3 |
 | [C5](M2-task-C5-quirks-and-tempo-models.md) | `QuirkSet`, `FormatDialect` and `TempoModel` wired end to end | C3b ✅, C2a ✅ | C7 |
 | [C6](complete/M2-task-C6-fixed-point-mixer.md) ✅ | The fixed-point mixer — the bit-exact reference | M1 | C1, C3, C4 |
-| [C7](M2-task-C7-fuzzing-and-rt-safety.md) | Loader fuzzing + the allocator hook in CI | C3, C4 | C5 |
+| [C7](complete/M2-task-C7-fuzzing-and-rt-safety.md) ✅ | Loader fuzzing + the allocator hook in CI | C3, C4 | C5 |
 | [C8](M2-task-C8-dos-reference-harness.md) | **Deferred**, pull-driven — see its trigger | — | — |
 | [C2a](complete/M2-task-C2a-conformance-harness-repairs.md) ✅ | Harness repairs, `--strict`, exclusions rewritten from real results | C2 | C6a |
 | [C3b](complete/M2-task-C3b-protracker-fidelity-repairs.md) ✅ | ProTracker fidelity + MTM repairs, and the voice-boundary sample swap | C3, C4 | C9, C6a |
@@ -81,11 +81,11 @@ undifferentiated exclusions, eight of them citing an NTSC rate libxmp never sele
 | 2. `cargo xtask goldens` regenerates; CI verifies | **Met** — S3M owner fixtures plus synthesised MOD and MTM fixtures | C6a (landed) |
 | 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Not met** — 23/47; ten of the eleven known failures are C5 tracker dialects, the eleventh is `C2-S3M-009` | C5 (dialects), `C2-S3M-009` |
 | 4. Cross-target hash equality on the fixed path | **Met** for all three formats on x86-64 and wasm32; the ARM64 leg is CI-only | C6a (landed) |
-| 5. Loader fuzzing in CI, no panic or OOM | **Not met** | C7 |
-| 6. Allocator hook proves no allocation in `render()` | **Not met** | C7 |
+| 5. Loader fuzzing in CI, no panic or OOM | **Met** — six `cargo-fuzz` targets (byte-level and structured, per format), a bounded per-commit job and a nightly long run; the seeds and every crash regression are replayed on the pinned toolchain in `host-tests` | C7 (landed) |
+| 6. Allocator hook proves no allocation in `render()` | **Met** — `cargo xtask ci --job rt-safety`, over every module the repository can reach, at three host block sizes and across a `LoadModule` swap | C7 (landed) |
 | 7. Every new deviation recorded in the accuracy policy | **Met for the current standing** — every exclusion reason records a first divergence the repaired harness observed | C2a (landed) |
 
-Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a, C3b, C9. Outstanding: C5, C7. Deferred: C8.
+Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a, C3b, C9, C7. Outstanding: C5. Deferred: C8.
 
 ## A note on the oracle
 

@@ -146,9 +146,9 @@ impl Default for EngineSettings {
 /// Every allocation happens in [`Engine::with_settings`] and in the off-thread setters.
 /// `render()` allocates nothing, locks nothing, and cannot panic: a source that misbehaves
 /// trips the zero-advance guard, a flooded command ring is drained in bounded batches, and
-/// sample data that does not resolve makes a voice end. See the `TODO` at the top of
-/// [`Engine::render`] for the CI hook that will prove the first of those rather than
-/// asserting it by inspection.
+/// sample data that does not resolve makes a voice end. The first of those is *proved*
+/// rather than asserted by inspection: see the allocator hook described on
+/// [`Engine::render`], which M2-C7 landed.
 pub struct Engine<Path, Interp, Out, Module = ()>
 where
     Path: MixPath,
@@ -361,10 +361,13 @@ where
     /// output is identical whatever block sizes the host uses. That is the invariant
     /// `tests/block_size_determinism.rs` exists to hold in place.
     pub fn render(&mut self, host_output: &mut [Out::Sample]) {
-        // TODO(M2-task-C7): wrap this body in `assert_no_alloc` once the allocator hook
-        // lands. Until then the no-allocation property is held by inspection: everything
-        // below indexes into buffers allocated in `Engine::with_settings`, and nothing on
-        // the path constructs a collection.
+        // The no-allocation property of this body is **enforced**, not asserted by
+        // inspection: `crates/starplayer-offline/tests/render_allocation.rs` (M2-C7)
+        // installs a global allocator that records every allocation and deallocation made
+        // while an "inside render()" thread-local is set, and drives every module in the
+        // corpus through this call with it armed. `cargo xtask ci --job rt-safety` is the
+        // CI gate. There is no wrapper here, deliberately: the hook is test-only, so a
+        // shipping build carries neither a flag nor a branch for it.
         let mut written = 0usize;
         while written < host_output.len() {
             if self.ring.is_empty() {

@@ -1,0 +1,11 @@
+# `cargo fuzz` build output, the evolving corpus, and the crash inputs libFuzzer writes.
+#
+# The corpus is *seeded* from `seeds/` and from the pinned conformance cache on every run
+# (`cargo xtask fuzz --seed`), so nothing here is worth committing — with one exception:
+# an input that actually crashed a loader is copied out of `artifacts/` into
+# `regressions/<format>/` by hand, where `crates/starplayer-offline/tests/fuzz_seeds.rs`
+# replays it on the pinned stable toolchain for ever after.
+/target
+/corpus
+/artifacts
+/coverage

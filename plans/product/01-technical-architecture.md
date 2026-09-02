@@ -559,7 +559,7 @@ inner sample loop (trait objects at block level are fine).
 | Landmine | Guard |
 |---|---|
 | Dropping the last `Arc<Module>` on the audio thread calls `free()` | **Garbage channel**: the audio thread pushes retired `Arc`s back over an SPSC for the control thread to drop |
-| A `Vec` growth in a "just for telemetry" path | Allocator hook in CI that panics on any allocation inside `render()`, run over the whole corpus |
+| A `Vec` growth in a "just for telemetry" path | Allocator hook in CI that fails on any allocation inside `render()`, run over the whole corpus (§8.2) |
 | A stray `unwrap()` or slice index | `#![deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]` on `starplayer-engine` and `starplayer-mixer` |
 | An internal inconsistency reaching the user as a crash | `render()` outputs silence rather than panicking |
 | Unsafe creeping in | `#![forbid(unsafe_code)]` in the core crates |
@@ -592,6 +592,50 @@ Two policies fall out of "fixed capacity", and both are deliberate:
   raise `EngineWarnings::retired_module_dropped`. The alternative is an unbounded queue,
   which is an allocation on the audio thread. A breach means the host has stopped calling
   `collect_all_garbage`, so the warning is the useful signal.
+
+### 8.2 How the two invariants are proved, not asserted (M2-C7)
+
+Both rules in the table above were satisfied by construction from M0 and *checked by
+inspection* until M2-C7. They now have automated enforcement, in two pieces.
+
+**The allocator hook.** `crates/starplayer-offline/tests/render_allocation.rs` installs a
+test-only `#[global_allocator]` that counts every allocation and deallocation made while a
+thread-local "inside `render()`" flag is set, and drives every module the repository can
+reach — the committed fuzz seeds, the owner's S3Ms, the synthesised MOD and MTM, and the
+pinned libxmp corpus — through `render()` with it armed, at three host block sizes. It
+records rather than panicking: a panic payload is boxed, so a panicking allocator re-enters
+itself, and unwinding out of an allocation abandons the collection that asked for it. The
+report therefore names the module that allocated, which an abort could not. A second test
+arms the hook across a `LoadModule` swap, which is the moment the retired `Arc<Module>` goes
+down the garbage channel. `cargo xtask ci --job rt-safety` is the gate, on the pinned
+toolchain, and it runs the suite twice — once plain and once with `telemetry`, because the
+per-tick publish is `#[cfg]`-gated and the default pass does not compile it into `render()`
+at all.
+
+The hook found one existing allocation, and it is the expected one: **`feature = "trace"`
+allocates inside `render()`**, because the per-tick recorder appends a `TraceTick` per
+tick. That is a diagnostic build by definition — `trace` is in no default feature set, the
+host-tests job asserts the workspace never resolves it, and `--job trace-zero-cost` proves
+the hook compiles to nothing without it — so the allocation test compiles to nothing under
+`trace` rather than asserting a promise that build never made.
+
+**The garbage channel across two threads.** `crates/starplayer-offline/tests/garbage_channel.rs`
+puts an engine on its own thread calling `render()` in a loop, keeps the control handle on
+the test thread, swaps modules mid-flight, and asserts the retired module's destructor ran
+on the *control* thread's `ThreadId`. Removing the `retire` call makes it fail with the
+audio thread's id.
+
+**Loader fuzzing.** `fuzz/` holds six `cargo-fuzz` targets — a byte-level and a structured
+one per format — with a dictionary of the format magic values, a per-input memory cap that
+turns an OOM into a reproducible artifact rather than a killed process, and a seed corpus
+built from the committed seeds plus the pinned conformance cache. `cargo fuzz` needs
+nightly, so that job is the single CI job off the pinned toolchain; the seeds and every
+crash regression are *also* replayed on the pinned toolchain inside `host-tests`, so the
+regression suite never depends on nightly. One production consequence came out of this
+work: the S3M loader now refuses a file that declares more decoded pattern data than its
+own size can justify (`MINIMUM_PATTERN_BUDGET_BYTES`), because a 132 KB file may legally
+declare 65,535 patterns, and surviving 670 MB of allocation is not the same as being right
+about it.
 
 ---
 

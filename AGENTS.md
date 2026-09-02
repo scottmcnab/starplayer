@@ -55,6 +55,7 @@ crates/     starplayer-{core,rt,dsp,mixer,model,engine}   no_std + alloc
             starplayer-{host-cpal,host-wasm,offline,testkit}   std
 apps/       starplayer-{web,cli,tui}
 xtask/      build orchestration, wasm packaging, golden regeneration
+fuzz/       cargo-fuzz loader targets and their seed corpus — its own workspace, nightly only
 plans/      design and implementation plans — see plans/README.md
 STARPLAY/   original DOS sources — unfinished PMODE/W rewrite (read-only)
 STARPLAY-2.25s/  released 2.25s sources, complete and buildable (read-only)

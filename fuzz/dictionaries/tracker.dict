@@ -1,0 +1,42 @@
+# libFuzzer dictionary for the MOD / S3M / MTM loaders (M2-C7 research point 2).
+#
+# Every token here is a value a loader compares against before it will parse anything
+# else. Without them a mutation-only fuzzer has to guess a four-byte tag out of 2^32, and
+# essentially never reaches a loader body at all; with them the first pass already lands
+# inside one. Keep this in step with `starplayer_mod::loader::layout` and the two magic
+# constants.
+
+# ── MOD: the tag at offset 1080 ─────────────────────────────────────────────────────
+mod_mk="M.K."
+mod_mk_bang="M!K!"
+mod_flt4="FLT4"
+mod_flt8="FLT8"
+mod_6chn="6CHN"
+mod_8chn="8CHN"
+mod_single_digit_chn="5CHN"
+mod_two_digit_ch="16CH"
+mod_thirty_two_ch="32CH"
+# Tags the loader does not accept yet (C5 owns their dialects). Present so the fuzzer
+# reaches the rejection path deliberately rather than by accident.
+mod_octalyser="CD61"
+mod_octa="OCTA"
+mod_tdz="TDZ4"
+
+# ── S3M ─────────────────────────────────────────────────────────────────────────────
+s3m_magic="SCRM"
+s3m_sample_magic="SCRS"
+s3m_adlib_magic="SCRI"
+# `0x1A` end-of-file marker then file type 16, the two bytes at 0x1C and 0x1D.
+s3m_type="\x1a\x10"
+# `defaultpan` == 252: a 32-byte pan block follows the parapointers.
+s3m_pan_block_marker="\xfc"
+# Scream Tracker 3.00, whose volume slides are fast whatever the general flags say.
+s3m_cwtv_st300="\x00\x13"
+s3m_cwtv_st321="\x21\x13"
+
+# ── MTM ─────────────────────────────────────────────────────────────────────────────
+mtm_magic="MTM\x10"
+
+# ── order-list markers shared by the formats ────────────────────────────────────────
+order_end="\xff"
+order_skip="\xfe"
