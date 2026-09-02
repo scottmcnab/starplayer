@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) |
-| Status | Outstanding |
+| Status | Landed |
 | Depends on | C3 (MOD), C4 (MTM) |
 | Blocks | C5, M2 exit |
 | Parallel with | C9, C6a |
@@ -267,3 +267,32 @@ Tracker dialects and their quirk flags (C5): `CD61`, `FA04`/`FA06`, `FLT8` beyon
 already loads, the PAL/NTSC clock choice, `Dxx` BCD versus hex. Harness repairs (C2a) —
 if a case fails because of the comparator, say so and leave it. S3M effect bugs (C9). The
 15-sample Soundtracker layout (C5 research point). `EF` invert loop.
+
+## Post-landing notes (2026-09-02)
+
+All twelve deliverables landed on branch `m2-c3b`, rebased onto C6a. Where the outcome
+differed from the text above:
+
+- **Deliverable 3, reviewer correction.** The worker applied the 113 floor unconditionally.
+  MultiTracker pitches above 47 and extended-range MODs put their top octaves below 113
+  by design, and libxmp plays them unclamped, so the floor now follows the loader's
+  Amiga-limits flag; the period-0 → 65536 rule stays unconditional. D16 and the MOD notes
+  say so.
+- **Deliverable 9 bullet 1 was not a bug.** `8xx` bytes round-trip through the trace
+  projection exactly and `E8x` maps `value << 4`, which is libxmp's `fx_setpan` for MOD.
+  The real curve mismatch was MTM's and is fixed under deliverable 11.
+- **Deliverable 12** also implements PT's null sample (an empty instrument slot queues a
+  stop), the one-shot-behind-one-shot stop, and the already-stopped restart with libxmp's
+  owned/unbound start split. MTM does not share the swap rule (libxmp gates it on
+  `QUIRK_PROTRACK`, which its MTM loader never sets).
+- **Four cases were reclassified as accepted deviations rather than fixed**: `DelayBreak`
+  (new D21, PT's tick-zero `E9x` retrigger without a note), `PortaSwapPT` (new D22, the
+  instrument column latched at tick zero under `EDx`), and `PTSwapNoLoop` /
+  `PortaSmpChange-PT` (D18: a queued stop falling due inside a tick, which the adapter
+  projection cannot see because the trace's `sample` column already names the queued
+  replacement). `PTStoppedSwap` waives `position` for the one tick libxmp reports a parked
+  ended voice.
+- The synthesised MOD and MTM goldens from C6a moved, as C6a predicted; the five S3M
+  goldens did not.
+- Standing: **14 of 47** (MOD 11/27), 13 accepted deviations, 20 known failures, none of
+  them MOD or MTM.

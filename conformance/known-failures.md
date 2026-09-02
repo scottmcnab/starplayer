@@ -9,7 +9,7 @@ still runs every excluded case, so a fix makes its exclusion fail as stale.
 record below; each exclusion row names its record id and points at that task file.
 No MOD or MTM case is recorded here. The ProTracker fidelity repairs and the mixer
 voice-boundary sample swap landed as
-`plans/engine/M2-task-C3b-protracker-fidelity-repairs.md`; the four MOD cases that task
+`plans/engine/complete/M2-task-C3b-protracker-fidelity-repairs.md` (landed); the four MOD cases that task
 file listed as targets but did not fix turned out to be oracle-representation
 differences, and each now cites `plans/product/03-accuracy-policy.md` — D21 for
 ProTracker's tick-zero `E9x` retrigger (`openmpt-mod-delay-break`), D22 for its
