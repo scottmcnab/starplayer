@@ -39,6 +39,7 @@ use starplayer::engine::{Engine, EngineContext, EngineHandle, EngineSettings, Ev
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::mod_file::{ModPatternData, ModProcessor};
+use starplayer::mtm::{MtmPatternData, MtmProcessor};
 use starplayer::rt::Arc;
 use starplayer::s3m::{S3mPatternData, S3mProcessor};
 use starplayer::telemetry::{Snapshot, TelemetryReader};
@@ -76,6 +77,7 @@ const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TEL
 
 type S3mSequencer = PatternSequencer<ExactFixedPoint, S3mProcessor, S3mPatternData>;
 type ModSequencer = PatternSequencer<ExactFixedPoint, ModProcessor, ModPatternData>;
+type MtmSequencer = PatternSequencer<ExactFixedPoint, MtmProcessor, MtmPatternData>;
 type BuiltSource = (Box<dyn EventSource>, Rc<Cell<SeekRequest>>);
 
 const DITHER_SEED: u32 = 0x5354_4152;
@@ -174,31 +176,56 @@ struct SeekRequest {
 enum NativeSequencer {
     S3m(S3mSequencer),
     Mod(ModSequencer),
+    Mtm(MtmSequencer),
 }
 
 impl NativeSequencer {
     fn next_event_frame(&self) -> Option<Frame> {
-        match self { NativeSequencer::S3m(sequencer) => sequencer.next_event_frame(), NativeSequencer::Mod(sequencer) => sequencer.next_event_frame() }
+        match self {
+            NativeSequencer::S3m(sequencer) => sequencer.next_event_frame(),
+            NativeSequencer::Mod(sequencer) => sequencer.next_event_frame(),
+            NativeSequencer::Mtm(sequencer) => sequencer.next_event_frame(),
+        }
     }
 
     fn advance_to(&mut self, frame: Frame) {
-        match self { NativeSequencer::S3m(sequencer) => sequencer.advance_to(frame), NativeSequencer::Mod(sequencer) => sequencer.advance_to(frame) }
+        match self {
+            NativeSequencer::S3m(sequencer) => sequencer.advance_to(frame),
+            NativeSequencer::Mod(sequencer) => sequencer.advance_to(frame),
+            NativeSequencer::Mtm(sequencer) => sequencer.advance_to(frame),
+        }
     }
 
     fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
-        match self { NativeSequencer::S3m(sequencer) => sequencer.dispatch(frame, context), NativeSequencer::Mod(sequencer) => sequencer.dispatch(frame, context) }
+        match self {
+            NativeSequencer::S3m(sequencer) => sequencer.dispatch(frame, context),
+            NativeSequencer::Mod(sequencer) => sequencer.dispatch(frame, context),
+            NativeSequencer::Mtm(sequencer) => sequencer.dispatch(frame, context),
+        }
     }
 
     fn seek_order(&mut self, order: u16) {
-        match self { NativeSequencer::S3m(sequencer) => { let _ = sequencer.seek_order(order); }, NativeSequencer::Mod(sequencer) => { let _ = sequencer.seek_order(order); } }
+        match self {
+            NativeSequencer::S3m(sequencer) => { let _ = sequencer.seek_order(order); }
+            NativeSequencer::Mod(sequencer) => { let _ = sequencer.seek_order(order); }
+            NativeSequencer::Mtm(sequencer) => { let _ = sequencer.seek_order(order); }
+        }
     }
 
     fn seek_row(&mut self, row: u16) {
-        match self { NativeSequencer::S3m(sequencer) => sequencer.seek_row(row), NativeSequencer::Mod(sequencer) => sequencer.seek_row(row) }
+        match self {
+            NativeSequencer::S3m(sequencer) => sequencer.seek_row(row),
+            NativeSequencer::Mod(sequencer) => sequencer.seek_row(row),
+            NativeSequencer::Mtm(sequencer) => sequencer.seek_row(row),
+        }
     }
 
     fn restart_clock_at(&mut self, frame: Frame) {
-        match self { NativeSequencer::S3m(sequencer) => sequencer.restart_clock_at(frame), NativeSequencer::Mod(sequencer) => sequencer.restart_clock_at(frame) }
+        match self {
+            NativeSequencer::S3m(sequencer) => sequencer.restart_clock_at(frame),
+            NativeSequencer::Mod(sequencer) => sequencer.restart_clock_at(frame),
+            NativeSequencer::Mtm(sequencer) => sequencer.restart_clock_at(frame),
+        }
     }
 }
 
@@ -279,6 +306,7 @@ fn source_for(module: Arc<Module>, sample_rate_hz: u32, order: u16, frame: Frame
     let mut sequencer = match module.header().format {
         ModuleFormat::S3m => NativeSequencer::S3m(starplayer::s3m::sequencer_for(module, sample_rate_hz, ExactFixedPoint)),
         ModuleFormat::Mod => NativeSequencer::Mod(starplayer::mod_file::sequencer_for(module, sample_rate_hz, ExactFixedPoint)),
+        ModuleFormat::Mtm => NativeSequencer::Mtm(starplayer::mtm::sequencer_for(module, sample_rate_hz, ExactFixedPoint)),
         _ => return Err(String::from("the module format has no web-audio processor")),
     };
     sequencer.seek_order(order);
@@ -724,6 +752,30 @@ mod tests {
         bytes
     }
 
+    fn minimal_mtm() -> Vec<u8> {
+        const SAMPLE_FRAMES: usize = 256;
+        const SAMPLE_HEADER: usize = 66;
+        const ORDER_TABLE: usize = SAMPLE_HEADER + 37;
+        const TRACK_DATA: usize = ORDER_TABLE + 128;
+        const PATTERN_TABLE: usize = TRACK_DATA + 192;
+        const SAMPLE_DATA: usize = PATTERN_TABLE + 64;
+        let mut bytes = vec![0; SAMPLE_DATA + SAMPLE_FRAMES];
+        bytes[..4].copy_from_slice(b"MTM\x10");
+        bytes[4..14].copy_from_slice(b"native mtm");
+        bytes[24..26].copy_from_slice(&1u16.to_le_bytes());
+        bytes[30] = 1;
+        bytes[32] = 64;
+        bytes[33] = 1;
+        bytes[34] = 8;
+        bytes[SAMPLE_HEADER..SAMPLE_HEADER + 6].copy_from_slice(b"sample");
+        bytes[SAMPLE_HEADER + 22..SAMPLE_HEADER + 26].copy_from_slice(&(SAMPLE_FRAMES as u32).to_le_bytes());
+        bytes[SAMPLE_HEADER + 35] = 64;
+        bytes[TRACK_DATA..TRACK_DATA + 3].copy_from_slice(&starplayer::mtm::MtmCell { pitch: 12, instrument: 1, effect: 0, param: 0 }.to_bytes());
+        bytes[PATTERN_TABLE..PATTERN_TABLE + 2].copy_from_slice(&1u16.to_le_bytes());
+        for (index, byte) in bytes[SAMPLE_DATA..].iter_mut().enumerate() { *byte = if index & 1 == 0 { 0xFF } else { 0x00 }; }
+        bytes
+    }
+
     fn mode(path: MixPathKind, interpolator: Interpolator, depth: OutputDepth, dither: bool, channels: u8) -> MixerMode {
         MixerMode { path, interpolator, depth, dither, channels }
     }
@@ -843,6 +895,15 @@ mod tests {
         assert_eq!(host.load_module(&minimal_mod()), Ok(1));
         assert_eq!(host.current_module.as_ref().map(|module| module.header().format), Some(ModuleFormat::Mod));
         assert!((0..20).any(|_| host.process(RENDER_QUANTUM) > 0.0), "the MOD sequencer should trigger sample audio");
+        assert!(host.telemetry.read().sequence > 0);
+    }
+
+    #[test]
+    fn an_mtm_uses_the_native_processor_and_reaches_the_real_engine() {
+        let mut host = Host::new(48_000);
+        assert_eq!(host.load_module(&minimal_mtm()), Ok(1));
+        assert_eq!(host.current_module.as_ref().map(|module| module.header().format), Some(ModuleFormat::Mtm));
+        assert!((0..20).any(|_| host.process(RENDER_QUANTUM) > 0.0), "the MTM sequencer should trigger sample audio");
         assert!(host.telemetry.read().sequence > 0);
     }
 

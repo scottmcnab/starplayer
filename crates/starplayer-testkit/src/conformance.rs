@@ -493,21 +493,21 @@ fn project_note(format: ConformanceFormat, note: u8) -> u8 {
 }
 
 fn project_period(format: ConformanceFormat, period_q12: u32) -> u32 {
-    // MOD's trace period is the Amiga period itself. S3M/MTM retain C2's native
-    // quarter-period scale, hence their additional factor of four.
+    // MOD and MTM trace the Amiga-period command domain itself. S3M retains C2's
+    // native quarter-period scale, hence its additional factor of four.
     let divisor = match format {
-        ConformanceFormat::Mod => 4096,
-        ConformanceFormat::S3m | ConformanceFormat::Mtm => 1024,
+        ConformanceFormat::Mod | ConformanceFormat::Mtm => 4096,
+        ConformanceFormat::S3m => 1024,
     };
     period_q12.saturating_add(divisor / 2) / divisor
 }
 
 fn project_actual_position(format: ConformanceFormat, position: u64) -> u64 {
     match format {
-        // libxmp's `pos0` deliberately discards the mixer's fraction. Compare MOD in
-        // that observable integer domain by flooring StarPlayer's Q32.32 position.
-        ConformanceFormat::Mod => position & !(u32::MAX as u64),
-        ConformanceFormat::S3m | ConformanceFormat::Mtm => position,
+        // libxmp's `pos0` deliberately discards the mixer's fraction. Compare formats
+        // using the MOD-period mixer domain in that same observable integer domain.
+        ConformanceFormat::Mod | ConformanceFormat::Mtm => position & !(u32::MAX as u64),
+        ConformanceFormat::S3m => position,
     }
 }
 
@@ -679,6 +679,39 @@ mod tests {
         trace.ticks[0].channels[0].position = 9u64 << 32;
         let difference = diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace).expect("aligned");
         assert_eq!(difference.first_divergence.expect("different").field.to_string(), "position");
+    }
+
+    #[test]
+    fn mtm_projection_uses_its_linear_note_and_amiga_period_axes() {
+        let dump = parse_libxmp_dump("20 0 0 0 3506176 48 0 1024 0 0 0 0\n").expect("valid dump");
+        let trace = Trace {
+            version: TRACE_FORMAT_VERSION,
+            ticks: vec![TraceTick {
+                tick: 0,
+                frame: Frame::ZERO,
+                position: SongPosition { order: 0, pattern: 0, row: 0 },
+                tick_in_row: 0,
+                speed: 6,
+                bpm: 125,
+                global_volume: 64,
+                channels: vec![TraceChannel {
+                    channel: 0,
+                    active: true,
+                    note: Some(36),
+                    instrument: 1,
+                    sample: 1,
+                    volume: 64,
+                    period: 856,
+                    pan: 136,
+                    position: 0,
+                    cutoff: 255,
+                    resonance: 0,
+                    flags: DirtyBits::empty(),
+                }],
+            }],
+        };
+        let identical = diff_libxmp_dump(ConformanceFormat::Mtm, &dump, &trace).expect("aligned");
+        assert!(identical.is_identical(), "{identical}");
     }
 
     #[test]

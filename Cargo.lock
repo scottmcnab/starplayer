@@ -409,8 +409,13 @@ dependencies = [
 name = "starplayer-mtm"
 version = "0.1.0"
 dependencies = [
+ "starplayer-core",
+ "starplayer-dsp",
  "starplayer-engine",
+ "starplayer-mixer",
+ "starplayer-mod",
  "starplayer-model",
+ "starplayer-rt",
 ]
 
 [[package]]

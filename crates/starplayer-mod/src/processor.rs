@@ -24,6 +24,54 @@ const VIBRATO_TABLE: [u8; 32] = [
     255, 253, 250, 244, 235, 224, 212, 197, 180, 161, 141, 120, 97, 74, 49, 24,
 ];
 
+/// A note entering the shared MOD-effect vocabulary.
+///
+/// MOD supplies a packed period because ProTracker deliberately searches that value in
+/// its selected finetune table. Formats such as MTM already store a linear note and must
+/// not manufacture a MOD period merely to use the common effect machinery.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum EffectNote {
+    #[default]
+    None,
+    ModPeriod(u16),
+    Linear(u8),
+}
+
+/// Decoded input to the ProTracker-compatible effect core.
+///
+/// This is an execution vocabulary, not a serialized pattern representation. MOD and
+/// MTM keep their own native cells and decode them independently before entering here.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct EffectCell {
+    pub note: EffectNote,
+    pub instrument: u8,
+    pub effect: u8,
+    pub param: u8,
+}
+
+impl From<ModCell> for EffectCell {
+    fn from(cell: ModCell) -> EffectCell {
+        EffectCell {
+            note: if cell.period == 0 { EffectNote::None } else { EffectNote::ModPeriod(cell.period) },
+            instrument: cell.instrument,
+            effect: cell.effect,
+            param: cell.param,
+        }
+    }
+}
+
+/// Format-level differences around the otherwise shared ProTracker command set.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum EffectSemantics {
+    #[default]
+    ProTracker,
+    /// MultiTracker's Dxx parameter is hexadecimal and its Fxx command is applied
+    /// immediately. `reset_counterpart` selects native MultiTracker timing, where a
+    /// speed change resets BPM to 125 and a BPM change resets speed to 6; false selects
+    /// the widespread Dual Module Player interpretation detected by the MTM loader.
+    MultiTracker { reset_counterpart: bool },
+}
+
 /// Format-native state for one ProTracker channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModChannel {
@@ -144,10 +192,18 @@ pub struct ModProcessor {
     row_pattern_break: bool,
     waveform_random_state: u32,
     pending_tempo: Option<(u16, usize)>,
+    semantics: EffectSemantics,
 }
 
 impl ModProcessor {
     pub fn new(module: Arc<Module>, sample_rate_hz: u32) -> ModProcessor {
+        ModProcessor::with_semantics(module, sample_rate_hz, EffectSemantics::ProTracker)
+    }
+
+    /// Construct the shared effect core for another format that uses the MOD command
+    /// vocabulary. The caller remains responsible for a native pattern decoder and a
+    /// native [`TrackerProcessor`] wrapper.
+    pub fn with_semantics(module: Arc<Module>, sample_rate_hz: u32, semantics: EffectSemantics) -> ModProcessor {
         let channels = (0..module.header().channel_count).map(|channel| {
             let pan = module.header().channel_pan(channel).unwrap_or(I1F15::ZERO);
             ModChannel::new(channel, pan)
@@ -163,6 +219,7 @@ impl ModProcessor {
             // byte-identical replay invariant while still implementing waveform 3.
             waveform_random_state: 0x6D2B_79F5,
             pending_tempo: None,
+            semantics,
         }
     }
 
@@ -187,11 +244,14 @@ impl ModProcessor {
         }
     }
 
-    fn latch_cell(&mut self, context: &mut TickContext<'_>, channel_index: usize, cell: ModCell) -> bool {
+    fn latch_cell(&mut self, context: &mut TickContext<'_>, channel_index: usize, cell: EffectCell) -> bool {
         let channel_id = ChannelId(channel_index as u16);
         let effect_name = if cell.effect == 0 && cell.param == 0 { "" } else { EffectNames::MOD.name(cell.effect, cell.param).unwrap_or("") };
         context.report_effect(channel_id, cell.effect, cell.param, effect_name);
-        if cell.instrument != 0 && cell.instrument <= 31 {
+        // Native MOD cells can encode only 1..=31, while MTM's six-bit field reaches
+        // 63. The decoded effect boundary validates against the loaded instrument table
+        // instead of imposing MOD's serialized field width on every caller.
+        if cell.instrument != 0 {
             let instrument_id = InstrumentId((cell.instrument - 1) as u16);
             if let Some(sample_id) = self.module.instrument(instrument_id).and_then(|instrument| instrument.sample)
                 && let Some(sample) = self.module.sample(sample_id)
@@ -212,7 +272,11 @@ impl ModProcessor {
         // period's note slot, then reads that slot from the newly latched instrument's
         // finetuned row. Keep those two operations visibly ordered: a raw 428 with
         // finetune +7 is still C, but plays the +7 table's period 407.
-        let note = cell.linear_note();
+        let note = match cell.note {
+            EffectNote::None => None,
+            EffectNote::ModPeriod(period) => crate::tables::note_from_period(period),
+            EffectNote::Linear(note) => Some(note),
+        };
         self.channels[channel_index].row_note_present = note.is_some();
         if note.is_some() || cell.instrument != 0 { context.report_note(channel_id, note.map(Note::new), (cell.instrument != 0).then_some(cell.instrument)); }
 
@@ -222,7 +286,11 @@ impl ModProcessor {
         let Some(note) = note else { return false };
         if matches!(cell.effect, 3 | 5) {
             let state = &mut self.channels[channel_index];
-            let (target_note, target_period) = tone_portamento_target(state.finetune, cell.period);
+            let (target_note, target_period) = match cell.note {
+                EffectNote::ModPeriod(period) => tone_portamento_target(state.finetune, period),
+                EffectNote::Linear(note) => (note, extended_period(state.finetune, note)),
+                EffectNote::None => (NO_NOTE, 0),
+            };
             state.target_note = target_note;
             state.target_period = target_period;
             return true;
@@ -243,7 +311,7 @@ impl ModProcessor {
         true
     }
 
-    fn static_effect(&mut self, channel_index: usize, cell: ModCell, note_present: bool, row: u16, outcome: &mut TickOutcome) {
+    fn static_effect(&mut self, channel_index: usize, cell: EffectCell, note_present: bool, row: u16, outcome: &mut TickOutcome) {
         self.channels[channel_index].command = cell.effect;
         self.channels[channel_index].command_data = cell.param;
         match cell.effect {
@@ -272,8 +340,12 @@ impl ModProcessor {
                 self.clear_command(channel_index);
             }
             0xD => {
-                // The packed byte is BCD in ProTracker; invalid results wrap to row zero.
-                let decoded = (cell.param >> 4) as u16 * 10 + (cell.param & 15) as u16;
+                let decoded = match self.semantics {
+                    // The packed byte is BCD in ProTracker; invalid results wrap to row zero.
+                    EffectSemantics::ProTracker => (cell.param >> 4) as u16 * 10 + (cell.param & 15) as u16,
+                    // MultiTracker stores the row as an ordinary hexadecimal byte.
+                    EffectSemantics::MultiTracker { .. } => cell.param as u16,
+                };
                 let break_row = if decoded > 63 { 0 } else { decoded };
                 let order = outcome.jump.filter(|jump| !jump.within_pattern).and_then(|jump| jump.order);
                 outcome.jump = Some(order.map(|order| Jump::to_order_row(order, break_row)).unwrap_or_else(|| Jump::break_to_row(break_row)));
@@ -287,12 +359,23 @@ impl ModProcessor {
             }
             0xF if cell.param < 32 => {
                 outcome.speed = cell.param;
+                if matches!(self.semantics, EffectSemantics::MultiTracker { reset_counterpart: true }) {
+                    outcome.tempo_bpm = 125;
+                }
                 self.clear_command(channel_index);
             }
             0xF => {
-                // PT writes the CIA latch now, but the timer adopts it at the next
-                // interrupt. Defer the outcome until that next tracker event.
-                self.pending_tempo = Some((cell.param as u16, channel_index));
+                match self.semantics {
+                    EffectSemantics::ProTracker => {
+                        // PT writes the CIA latch now, but the timer adopts it at the next
+                        // interrupt. Defer the outcome until that next tracker event.
+                        self.pending_tempo = Some((cell.param as u16, channel_index));
+                    }
+                    EffectSemantics::MultiTracker { reset_counterpart } => {
+                        outcome.tempo_bpm = cell.param as u16;
+                        if reset_counterpart { outcome.speed = 6; }
+                    }
+                }
                 self.clear_command(channel_index);
             }
             _ => self.clear_command(channel_index),
@@ -406,11 +489,25 @@ impl ModProcessor {
     fn sample_offset(&mut self, channel_index: usize, note_present: bool, parameter: u8) {
         if parameter != 0 { self.channels[channel_index].offset_memory = parameter; }
         let offset = (self.channels[channel_index].offset_memory as u32) << 8;
-        // PT 1/2 starts this note at the requested offset, then advances the retained
-        // sample pointer by the same amount once more. A later note without a new
-        // instrument consequently starts at twice the original offset.
-        if self.advance_sample_pointer(channel_index, offset) && note_present {
-            self.channels[channel_index].offset_post_trigger = offset;
+        match self.semantics {
+            EffectSemantics::ProTracker => {
+                // PT 1/2 starts this note at the requested offset, then advances the
+                // retained sample pointer by the same amount once more.
+                if self.advance_sample_pointer(channel_index, offset) && note_present {
+                    self.channels[channel_index].offset_post_trigger = offset;
+                }
+            }
+            EffectSemantics::MultiTracker { .. } if note_present => {
+                // MTM's offset is an absolute start position, including when it lies
+                // beyond the addressable sample. Keep the full sample region and raw
+                // position: the mixer then ends an out-of-range one-shot or wraps a
+                // looping sample through its bounded position normalisation. PT's
+                // retained-pointer/one-word fallback is deliberately not used here.
+                let state = &mut self.channels[channel_index];
+                state.sample_offset = offset;
+                state.offset_past_end = false;
+            }
+            EffectSemantics::MultiTracker { .. } => {}
         }
     }
 
@@ -437,6 +534,7 @@ impl ModProcessor {
     }
 
     fn finish_row_outcome(&self, current_order: u16, outcome: &mut TickOutcome) {
+        if !matches!(self.semantics, EffectSemantics::ProTracker) { return; }
         if outcome.pattern_delay == 0 || !self.row_pattern_break { return; }
         let Some(jump) = outcome.jump.as_mut() else { return };
         if jump.within_pattern { return; }
@@ -650,34 +748,44 @@ impl ModProcessor {
         self.channels[channel_index].command = 0;
         self.channels[channel_index].command_data = 0;
     }
-}
 
-impl TrackerProcessor for ModProcessor {
-    fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+    /// Execute one row supplied as decoded effect cells.
+    ///
+    /// MTM uses this boundary after decoding its native three-byte cells; no MOD bytes
+    /// or MOD period fields are created by that path.
+    pub fn row_effects<I>(&mut self, context: &mut TickContext<'_>, order: u16, pattern: u16, row: u16, cells: I) -> TickOutcome
+    where
+        I: IntoIterator<Item = EffectCell>,
+    {
         context.report_global_volume(U0F16::MAX);
-        if self.last_pattern.is_some_and(|pattern| pattern != row.pattern) {
+        if self.last_pattern.is_some_and(|previous| previous != pattern) {
             for state in self.channels.iter_mut() { state.pattern_loop_start = 0; }
         }
-        self.last_pattern = Some(row.pattern);
+        self.last_pattern = Some(pattern);
         self.row_pattern_break = false;
         self.reset_row();
         let mut outcome = context.outcome();
         self.apply_pending_tempo(&mut outcome);
-        let channel_count = core::cmp::min(self.channels.len(), row.bytes.len() / CELL_BYTES);
-        for channel_index in 0..channel_count {
-            let start = channel_index * CELL_BYTES;
-            let Some(cell) = ModCell::from_bytes(row.bytes.get(start..start + CELL_BYTES).unwrap_or(&[])) else { continue };
+        for (channel_index, cell) in cells.into_iter().take(self.channels.len()).enumerate() {
             let note_present = self.latch_cell(context, channel_index, cell);
-            self.static_effect(channel_index, cell, note_present, row.row, &mut outcome);
+            self.static_effect(channel_index, cell, note_present, row, &mut outcome);
             let state = &mut self.channels[channel_index];
             state.actual_period = clamp_period(self.amiga_limits, state.finetune, state.actual_period);
         }
-        self.finish_row_outcome(row.order, &mut outcome);
+        self.finish_row_outcome(order, &mut outcome);
         for channel_index in 0..self.channels.len() {
             self.flush_channel(context, channel_index);
         }
         self.report_trace_channels(context);
         outcome
+    }
+}
+
+impl TrackerProcessor for ModProcessor {
+    fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+        let cells = row.bytes.chunks_exact(CELL_BYTES)
+            .map(|bytes| EffectCell::from(ModCell::from_bytes(bytes).unwrap_or(ModCell::EMPTY)));
+        self.row_effects(context, row.order, row.pattern, row.row, cells)
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {

@@ -53,3 +53,19 @@ latching semantics during tone portamento.
 `s3m_sample_porta.s3m` leaves StarPlayer on an active row 3 frame 3 when the oracle's
 next active frame is row 16 frame 0. Resolve tone-portamento continuation after an
 instrument change and its resulting voice lifetime.
+
+## C4-MTM-001 — event-boundary one-shot lifetime
+
+`TEMPO.MTM` agrees through row 12 frame 3. StarPlayer's next C1 snapshot is row 12 frame
+4 with the one-shot active at source position 9356; it ends while that tick interval is
+rendered. libxmp's test inspects after `xmp_play_frame` and omits the ended voice, so its
+next active record is row 16 frame 0. Accuracy-policy D18 deliberately keeps the C1
+event-boundary contract.
+
+## C4-MTM-002 — per-tick integer timing drift
+
+`TEMPO2.MTM` agrees on control state, note, period, volume and pan, but at tick 53 its
+libxmp integer source position is 1501 while StarPlayer reports 1503 after projection.
+libxmp truncates every mixer tick to an integer output-frame count; StarPlayer carries
+the exact rational remainder. Accuracy-policy D19 preserves drift-free timing and the
+existing one-source-frame comparison bound.

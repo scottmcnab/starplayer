@@ -42,3 +42,5 @@ openmpt-s3m-pattern-delays-retrigger	Row delay remains on row 0 through frame 12
 openmpt-s3m-period-limit	Lower-limit note identity and sample advance diverge from the mixer oracle	conformance/known-failures.md#c2-s3m-006--lower-period-limit
 openmpt-s3m-portamento-sample-change	Tone portamento changes the sounding instrument identity instead of retaining instrument 1	conformance/known-failures.md#c2-s3m-007--portamento-sample-change
 libxmp-s3m-sample-portamento	Instrument-change portamento leaves an active voice on row 3 where the oracle next resumes at row 16	conformance/known-failures.md#c2-s3m-008--sample-portamento-continuation
+libxmp-mtm-tempo	D18: C1 sees the one-shot active at the row 12 tick 4 event boundary before it ends inside the interval; libxmp inspects after mixing	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations
+libxmp-mtm-tempo-two	D19: exact rational tick timing accumulates two integer source frames beyond libxmp's per-tick truncation by tick 53	plans/product/03-accuracy-policy.md#3-documented-deviations-from-the-reference-implementations

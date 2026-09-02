@@ -12,6 +12,7 @@ use std::vec::Vec;
 
 use starplayer::model::{EffectNames, Module, ModuleFormat, NoteCell, PatternCell, PatternId, s3m_command_code};
 use starplayer::mod_file::PatternView as ModPatternView;
+use starplayer::mtm::PatternView as MtmPatternView;
 use starplayer::s3m::PatternView as S3mPatternView;
 use starplayer_archive::{ArchiveError, extract, is_zip, list_modules};
 
@@ -67,7 +68,7 @@ fn effect_name_records() -> String {
                     }
                 }
             }
-            ModuleFormat::Mod => {
+            ModuleFormat::Mod | ModuleFormat::Mtm => {
                 for code in 0..=0x0Fu8 {
                     if code == 0xE {
                         for nybble in 0..=0x0Fu8 {
@@ -93,7 +94,7 @@ fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
         Err(error) => return Err(error),
     };
     let mut records = String::new();
-    for entry in entries.into_iter().filter(|entry| matches!(entry.format, ModuleFormat::S3m | ModuleFormat::Mod)) {
+    for entry in entries.into_iter().filter(|entry| matches!(entry.format, ModuleFormat::S3m | ModuleFormat::Mod | ModuleFormat::Mtm)) {
         let safe_name = entry.name.replace(['\t', '\r', '\n'], " ");
         records.push_str(&format!("{}\t{}\t{}\n", entry.index, safe_name, entry.size));
     }
@@ -114,6 +115,14 @@ fn pattern_window_bytes(pattern: u16, first_row: u16, row_count: u16) -> Vec<u8>
             }
             ModuleFormat::Mod => {
                 let Some(view) = ModPatternView::new(module, PatternId(pattern)) else { return output };
+                let rows = row_count.min(view.rows().saturating_sub(first_row));
+                output.reserve(rows as usize * view.channels() as usize * DISPLAY_CELL_BYTES);
+                for row in first_row..first_row.saturating_add(rows) {
+                    for channel in 0..view.channels() { append_display(&mut output, view.cell(row, channel).map(|cell| cell.display()).unwrap_or_default()); }
+                }
+            }
+            ModuleFormat::Mtm => {
+                let Some(view) = MtmPatternView::new(module, PatternId(pattern)) else { return output };
                 let rows = row_count.min(view.rows().saturating_sub(first_row));
                 output.reserve(rows as usize * view.channels() as usize * DISPLAY_CELL_BYTES);
                 for row in first_row..first_row.saturating_add(rows) {
@@ -156,7 +165,7 @@ mod exports {
     #[wasm_bindgen]
     pub fn is_archive(bytes: &[u8]) -> bool { is_zip(bytes) }
 
-    /// List the S3M and MOD entries this web player can offer, one tab record per line.
+    /// List the S3M, MOD and MTM entries this web player can offer, one tab record per line.
     #[wasm_bindgen]
     pub fn archive_modules(bytes: &[u8]) -> Result<String, JsValue> {
         archive_module_records(bytes).map_err(|error| JsValue::from_str(&error.to_string()))
@@ -242,6 +251,28 @@ mod tests {
         bytes
     }
 
+    fn minimal_mtm() -> Vec<u8> {
+        const SAMPLE_HEADER: usize = 66;
+        const ORDER_TABLE: usize = SAMPLE_HEADER + 37;
+        const TRACK_DATA: usize = ORDER_TABLE + 128;
+        const PATTERN_TABLE: usize = TRACK_DATA + 192;
+        const SAMPLE_DATA: usize = PATTERN_TABLE + 64;
+        let mut bytes = vec![0; SAMPLE_DATA + 8];
+        bytes[..4].copy_from_slice(b"MTM\x10");
+        bytes[4..14].copy_from_slice(b"native mtm");
+        bytes[24..26].copy_from_slice(&1u16.to_le_bytes());
+        bytes[30] = 1;
+        bytes[32] = 64;
+        bytes[33] = 1;
+        bytes[34] = 8;
+        bytes[SAMPLE_HEADER..SAMPLE_HEADER + 6].copy_from_slice(b"sample");
+        bytes[SAMPLE_HEADER + 22..SAMPLE_HEADER + 26].copy_from_slice(&8u32.to_le_bytes());
+        bytes[SAMPLE_HEADER + 35] = 64;
+        bytes[TRACK_DATA..TRACK_DATA + 3].copy_from_slice(&starplayer::mtm::MtmCell { pitch: 12, instrument: 1, effect: 0xF, param: 6 }.to_bytes());
+        bytes[PATTERN_TABLE..PATTERN_TABLE + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn page_loader_exposes_metadata_and_pattern_cells() {
         assert!(inspect(FIXTURE).is_ok());
@@ -270,6 +301,14 @@ mod tests {
     }
 
     #[test]
+    fn page_loader_and_pattern_view_dispatch_to_native_mtm() {
+        assert!(inspect(&minimal_mtm()).is_ok());
+        assert_eq!(with_module(ModuleFormat::S3m, |module| module.header().format), ModuleFormat::Mtm);
+        assert_eq!(pattern_window_bytes(0, 0, 1).get(..5), Some(&[36, 1, VALUE_NONE, 0xF, 6][..]));
+        assert!(effect_name_records().contains("15:-1:set speed/tempo\n"));
+    }
+
+    #[test]
     fn browser_refreshes_format_specific_effect_names_before_rendering_metadata() {
         let app = include_str!("../www/app.js");
         let load_buffer = app.split_once("async function loadBuffer").expect("loadBuffer").1;
@@ -280,15 +319,15 @@ mod tests {
     }
 
     #[test]
-    fn browser_visible_loader_copy_accepts_and_advertises_mod() {
+    fn browser_visible_loader_copy_accepts_and_advertises_mod_and_mtm() {
         let index = include_str!("../www/index.html");
-        assert!(index.contains("S3M and MOD modules"));
-        assert!(index.contains("drop an S3M, MOD, or ZIP"));
+        assert!(index.contains("S3M, MOD and MTM modules"));
+        assert!(index.contains("drop an S3M, MOD, MTM, or ZIP"));
         assert!(index.contains("Choose a module"));
-        assert!(index.contains("Load an S3M, MOD, or ZIP"));
-        assert!(index.contains("accept=\".s3m,.mod,.zip,audio/s3m,audio/mod,audio/x-mod,application/zip\""));
-        assert!(index.contains("aria-label=\"S3M, MOD, or ZIP URL\""));
-        assert!(index.contains("Drop .s3m, .mod, or .zip here"));
+        assert!(index.contains("Load an S3M, MOD, MTM, or ZIP"));
+        assert!(index.contains("accept=\".s3m,.mod,.mtm,.zip,audio/s3m,audio/mod,audio/x-mod,audio/mtm,application/zip\""));
+        assert!(index.contains("aria-label=\"S3M, MOD, MTM, or ZIP URL\""));
+        assert!(index.contains("Drop .s3m, .mod, .mtm, or .zip here"));
 
         let app = include_str!("../www/app.js");
         assert!(app.contains("No supported modules were found inside"));
@@ -312,9 +351,11 @@ mod tests {
         writer.write_all(b"s3m").unwrap();
         writer.start_file("native.mod", SimpleFileOptions::default()).unwrap();
         writer.write_all(b"mod").unwrap();
+        writer.start_file("native.mtm", SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"mtm").unwrap();
         writer.start_file("readme.txt", SimpleFileOptions::default()).unwrap();
         writer.write_all(b"notes").unwrap();
         let bytes = writer.finish().unwrap().into_inner();
-        assert_eq!(archive_module_records(&bytes).unwrap(), "0\tREFLEX.S3M\t3\n1\tnative.mod\t3\n");
+        assert_eq!(archive_module_records(&bytes).unwrap(), "0\tREFLEX.S3M\t3\n1\tnative.mod\t3\n2\tnative.mtm\t3\n");
     }
 }

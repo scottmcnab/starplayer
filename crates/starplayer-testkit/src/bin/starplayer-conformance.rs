@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use starplayer::engine::Trace;
-use starplayer_offline::{TraceOptions, trace_mod, trace_s3m};
+use starplayer_offline::{TraceOptions, trace_mod, trace_mtm, trace_s3m};
 use starplayer_testkit::conformance::{
     ConformanceCase, ConformanceExclusion, ConformanceFormat, audit_pinned_corpus, diff_libxmp_dump,
     parse_case_manifest, parse_exclusions, parse_libxmp_dump,
@@ -57,6 +57,7 @@ fn run() -> Result<bool, String> {
     let exclusions_text = read(&exclusions_path)?;
     let exclusions = parse_exclusions(&exclusions_text, &cases)?;
     validate_corpus(&corpus, &cases)?;
+    validate_mtm_reference_module(&corpus)?;
     let inventory = audit_pinned_corpus(&corpus, &cases)?;
     println!(
         "corpus inventory: {} MOD/S3M/MTM binaries; {} frame-state cases over {} unique modules; {} seed/documentation binaries without a state oracle",
@@ -73,11 +74,10 @@ fn run() -> Result<bool, String> {
     // rather than a trait committed before the second implementation exists.
     let capture_functions: BTreeMap<ConformanceFormat, CaptureTrace> = [
         (ConformanceFormat::Mod, capture_mod as CaptureTrace),
+        (ConformanceFormat::Mtm, capture_mtm as CaptureTrace),
         (ConformanceFormat::S3m, capture_s3m as CaptureTrace),
     ].into_iter().collect();
-    let pending_integrations: BTreeMap<ConformanceFormat, &str> = [
-        (ConformanceFormat::Mtm, "C4"),
-    ].into_iter().collect();
+    let pending_integrations: BTreeMap<ConformanceFormat, &str> = BTreeMap::new();
 
     let mut totals = Counts::default();
     let mut by_format = BTreeMap::new();
@@ -155,6 +155,28 @@ fn validate_corpus(corpus: &Path, cases: &[ConformanceCase]) -> Result<(), Strin
     }
 }
 
+fn validate_mtm_reference_module(corpus: &Path) -> Result<(), String> {
+    let relative = Path::new("data/m/fall1.mtm");
+    let path = corpus.join(relative);
+    let bytes = std::fs::read(&path).map_err(|error| format!("could not read pinned MTM loader reference `{}`: {error}", path.display()))?;
+    let module = starplayer::mtm::load(&bytes).map_err(|error| format!("could not load pinned MTM loader reference `{}`: {error}", path.display()))?;
+    let observed = (
+        module.header().title.as_ref(),
+        module.header().channel_count,
+        starplayer::mtm::track_count(&module),
+        module.patterns().len(),
+    );
+    let expected = ("- One Must Fall! 1 -", 5, Some(51), 12);
+    if observed != expected {
+        return Err(format!(
+            "pinned MTM loader reference metadata differs from libxmp format_mtm.data: got title {:?}, {} channels, {:?} stored tracks, {} patterns",
+            observed.0, observed.1, observed.2, observed.3,
+        ));
+    }
+    println!("MTM loader reference: fall1.mtm title/channels/stored-tracks/patterns match libxmp");
+    Ok(())
+}
+
 fn run_case(
     corpus: &Path,
     case: &ConformanceCase,
@@ -213,6 +235,10 @@ fn capture_s3m(module: &[u8], ticks: usize) -> Result<Trace, String> {
 
 fn capture_mod(module: &[u8], ticks: usize) -> Result<Trace, String> {
     trace_mod(module, TraceOptions { ticks: Some(ticks), ..TraceOptions::default() }).map_err(|error| error.to_string())
+}
+
+fn capture_mtm(module: &[u8], ticks: usize) -> Result<Trace, String> {
+    trace_mtm(module, TraceOptions { ticks: Some(ticks), ..TraceOptions::default() }).map_err(|error| error.to_string())
 }
 
 fn indent(message: &str) -> String {

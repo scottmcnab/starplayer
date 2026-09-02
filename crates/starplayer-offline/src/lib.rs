@@ -262,6 +262,11 @@ pub fn trace_mod(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceErro
     trace_loaded(Arc::new(starplayer::mod_file::load(bytes)?), options)
 }
 
+/// Load an MTM and capture its stable per-tick trace through the MultiTracker processor.
+pub fn trace_mtm(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
+    trace_loaded(Arc::new(starplayer::mtm::load(bytes)?), options)
+}
+
 fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, TraceError> {
     let channel_count = module.header().channel_count as usize;
     let engine_settings = EngineSettings {
@@ -293,6 +298,12 @@ fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, Tra
             ExactFixedPoint,
             starplayer::mod_file::ModPatternData(Arc::clone(&module)),
             starplayer::mod_file::ModProcessor::new(module, TRACE_SAMPLE_RATE_HZ),
+            sequencer_settings,
+        )),
+        ModuleFormat::Mtm => Box::new(PatternSequencer::new(
+            ExactFixedPoint,
+            starplayer::mtm::MtmPatternData(Arc::clone(&module)),
+            starplayer::mtm::MtmProcessor::new(module, TRACE_SAMPLE_RATE_HZ),
             sequencer_settings,
         )),
         _ => return Err(TraceError::Load(Error::Invalid("format has no offline native processor"))),
@@ -343,8 +354,64 @@ mod tests {
         bytes
     }
 
+    fn minimal_mtm() -> Vec<u8> {
+        const SAMPLE_HEADER: usize = 66;
+        const ORDER_TABLE: usize = SAMPLE_HEADER + 37;
+        const TRACK_DATA: usize = ORDER_TABLE + 128;
+        const PATTERN_TABLE: usize = TRACK_DATA + 192;
+        const SAMPLE_DATA: usize = PATTERN_TABLE + 64;
+        let mut bytes = vec![0; SAMPLE_DATA + 256];
+        bytes[..4].copy_from_slice(b"MTM\x10");
+        bytes[4..14].copy_from_slice(b"native mtm");
+        bytes[24..26].copy_from_slice(&1u16.to_le_bytes());
+        bytes[30] = 1;
+        bytes[32] = 64;
+        bytes[33] = 1;
+        bytes[34] = 8;
+        bytes[SAMPLE_HEADER..SAMPLE_HEADER + 6].copy_from_slice(b"sample");
+        bytes[SAMPLE_HEADER + 22..SAMPLE_HEADER + 26].copy_from_slice(&256u32.to_le_bytes());
+        bytes[SAMPLE_HEADER + 35] = 64;
+        bytes[TRACK_DATA..TRACK_DATA + 3].copy_from_slice(&starplayer::mtm::MtmCell { pitch: 12, instrument: 1, effect: 0, param: 0 }.to_bytes());
+        bytes[PATTERN_TABLE..PATTERN_TABLE + 2].copy_from_slice(&1u16.to_le_bytes());
+        for (index, byte) in bytes[SAMPLE_DATA..].iter_mut().enumerate() { *byte = if index & 1 == 0 { 0xFF } else { 0x00 }; }
+        bytes
+    }
+
+    fn mtm_with_a_mod_tag_collision() -> Vec<u8> {
+        const TRACK_COUNT: usize = 5;
+        const TRACK_OFFSET: usize = 66 + 128;
+        const PATTERN_OFFSET: usize = TRACK_OFFSET + TRACK_COUNT * 192;
+        let mut bytes = vec![0; PATTERN_OFFSET + 64];
+        bytes[..4].copy_from_slice(b"MTM\x10");
+        bytes[24..26].copy_from_slice(&(TRACK_COUNT as u16).to_le_bytes());
+        bytes[32] = 64;
+        bytes[33] = 1;
+        bytes[34] = 8;
+        bytes[1080..1084].copy_from_slice(b"M.K.");
+        bytes
+    }
+
     fn trace_with_block_size(host_block_frames: usize) -> Trace {
         trace_s3m(REFLEX, TraceOptions { ticks: Some(24), host_block_frames }).expect("REFLEX traces")
+    }
+
+    fn render_mtm_with_block_size(bytes: &[u8], host_block_frames: usize) -> Vec<i16> {
+        let module = Arc::new(starplayer::mtm::load(bytes).expect("valid MTM"));
+        let settings = EngineSettings {
+            sample_rate_hz: 44_100,
+            channel_count: module.header().channel_count as usize,
+            voice_capacity: module.header().channel_count.max(1) as usize,
+            ..EngineSettings::default()
+        };
+        let mut engine: Engine<FixedPath, Linear, StereoI16, Arc<Module>> = Engine::with_settings(settings);
+        let mut control = engine.take_control().expect("fresh control");
+        control.load_module(Arc::clone(&module)).expect("fresh command queue");
+        engine.set_source(Box::new(starplayer::mtm::sequencer_for(module, 44_100, ExactFixedPoint)));
+        engine.set_limiter(Limiter::Clamp);
+        let mut output = vec![0; 44_100 * 2];
+        for block in output.chunks_mut(host_block_frames.max(1) * 2) { engine.render(block); }
+        assert!(!engine.warnings().any());
+        output
     }
 
     #[test]
@@ -391,6 +458,36 @@ mod tests {
         for host_block_frames in [1, 3, 64, 128, 4096, 8191] {
             let trace = trace_mod(&module, TraceOptions { ticks: Some(24), host_block_frames }).expect("native MOD trace").to_text();
             assert_eq!(trace, first, "host block size {host_block_frames} changed the MOD trace");
+        }
+    }
+
+    #[test]
+    fn native_mtm_trace_is_repeatable_and_host_block_size_independent() {
+        let module = minimal_mtm();
+        let first = trace_module(&module, TraceOptions { ticks: Some(24), host_block_frames: 128 }).expect("MTM traces").to_text();
+        assert!(first.contains("per=000856"), "the trace carries native MTM periods: {first}");
+        for host_block_frames in [1, 3, 64, 128, 4096, 8191] {
+            let trace = trace_mtm(&module, TraceOptions { ticks: Some(24), host_block_frames }).expect("native MTM trace").to_text();
+            assert_eq!(trace, first, "host block size {host_block_frames} changed the MTM trace");
+        }
+    }
+
+    #[test]
+    fn generic_trace_dispatch_prefers_strong_mtm_magic_over_a_mod_tag_collision() {
+        let module = mtm_with_a_mod_tag_collision();
+        assert!(starplayer::mod_file::probe(&module), "the fixture reaches the weak MOD probe");
+        assert_eq!(starplayer::probe(&module), Some(ModuleFormat::Mtm));
+        let options = TraceOptions { ticks: Some(4), host_block_frames: 128 };
+        assert_eq!(trace_module(&module, options).expect("generic MTM trace"), trace_mtm(&module, options).expect("native MTM trace"));
+    }
+
+    #[test]
+    fn native_mtm_audio_is_host_block_size_independent() {
+        let module = minimal_mtm();
+        let reference = render_mtm_with_block_size(&module, 128);
+        assert!(reference.iter().any(|sample| *sample != 0), "the native MTM render is audible");
+        for host_block_frames in [1, 3, 64, 128, 4096, 8191] {
+            assert_eq!(render_mtm_with_block_size(&module, host_block_frames), reference, "host block size {host_block_frames} changed MTM PCM");
         }
     }
 }
