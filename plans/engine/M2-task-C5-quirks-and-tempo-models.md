@@ -88,7 +88,7 @@ reference.
 
    | Field | Policy | Corpus cases it must flip |
    |---|---|---|
-   | S3M pattern-loop dialect (`St321` / `St301` / `ModPlug116` / `ImagoOrpheus`) | §2 dialect note | `libxmp-s3m-pattern-loop-imf`, `-imf-breakjump`, `-mpt`, `-mpt-breakjump`, `-st301`, `-st301-breakjump` |
+   | S3M pattern-loop dialect (`St321` / `St301` / `ModPlug116` / `ImagoOrpheus`) | §2 dialect note | `libxmp-s3m-pattern-loop-imf`, `-imf-breakjump`, `-mpt`, `-st301`, `-st301-breakjump` (`-mpt-breakjump` already passes since C9's ST3.21 flow repairs) |
    | MOD Paula clock (PAL / NTSC) | D14 | none directly; it must **not** move any currently passing case under `canonical()` |
    | MOD `F00` stop | §1 (ProTracker) versus MTM's no-op, delivered by C3b | none directly; asserted by unit test |
    | MOD pattern-loop dialect (ProTracker / Octalyser / Digital Tracker) | §2 dialect note | `libxmp-mod-pattern-jump-octalyser-break`, `libxmp-mod-pattern-loop-octalyser`, `-octalyser-breakjump`, `libxmp-mod-pattern-loop-dt`, `-dt-breakjump` |

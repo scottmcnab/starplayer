@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) |
-| Status | Outstanding |
+| Status | Landed |
 | Depends on | C2a (harness repairs; the diagnoses below must be re-confirmed after it) |
 | Blocks | M2 exit |
 | Parallel with | C3b, C6a |
@@ -195,3 +195,28 @@ Each item below quotes its **current first divergence verbatim** from the pinned
 The six non-ST3.21 pattern-loop dialect cases (C5). MOD and MTM behaviour (C3b). Harness
 comparator repairs (C2a) — if you find another comparator artefact, report it to C2a and
 leave the engine alone. New S3M features; this task only makes existing effects correct.
+
+## Post-landing notes (2026-09-02)
+
+Landed on branch `m2-c9`, rebased onto C3b. Eight of the nine target cases pass; S3M
+moved from 2 of 17 to 11 of 17 and the five S3M goldens did not change. Where the outcome
+differed from the text above:
+
+- **The quoted first divergences predated C2a** and several were representation
+  differences, not effect bugs: libxmp reports a non-8363 Hz C2SPD as a note transpose
+  (now D37, waived on `note` for `PatternDelaysRetrig` and `PeriodLimit`), and derives
+  periods continuously where ST3 uses its integer table (D36, waived on `position`).
+- **Policy entries were renumbered on landing.** The worker wrote D21–D36; C3b had
+  already taken D21–D23 on its own branch, so C9's entries are **D24–D39** everywhere.
+- **Deliverable 3 (`ParamMemory`) is the one remainder**, recorded as `C2-S3M-009`: the
+  `Rxy` tremolo phase question (ST3 shares `_VibCount` with `Hxy`/`Uxy`; libxmp and
+  OpenMPT do not, and libxmp applies the delta on tick zero). Its exclusion row points at
+  that record; `--strict` still names it.
+- **`libxmp-s3m-pattern-loop-mpt-breakjump`, a C5 dialect case, started passing** on the
+  corrected ST3.21 flow path, so research point 1's expectation did not hold; C5's target
+  list should treat it as already green. `-mpt`, `-st301` and `-st301-breakjump` moved to
+  new first divergences (recorded in `conformance/exclusions.tsv`).
+- A new `TrackerProcessor::row_repeat` hook (default: `tick`) carries D33; MOD and MTM
+  behaviour is unchanged.
+- Not reproduced, no pinned case distinguishes them: ST3's left-before-right channel
+  evaluation order (D32) and the tick-zero handling of `Kxy`/`Lxy` combined slides.

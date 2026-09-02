@@ -8,7 +8,8 @@ test step after the acquisition cache has been prepared. `cargo xtask conformanc
 --strict` additionally exits non-zero while any known-failure exclusion remains and names
 every one of them.
 
-CI runs the informational (non-strict) form. That is deliberate until C5, C7 and C9 land;
+CI runs the informational (non-strict) form. That is deliberate until C5 lands and
+`C2-S3M-009` is resolved;
 making it strict is one added argument in `job_conformance` in `xtask/src/main.rs`.
 
 The snapshot is libxmp commit
@@ -139,7 +140,7 @@ passes and seven of the S3M passes waive one or more fields under an accuracy-po
 and enforce every other field. The remaining 24 split into 13 accepted deviations and 11
 known failures:
 
-- **Accepted accuracy-policy deviations**: the oracle-representation entries D14–D22 and
+- **Accepted accuracy-policy deviations**: the oracle-representation entries D14–D39 and
   the §4 Startrekker AM-synth cases. D12 is no longer among them — the queued sample swap
   is implemented, and the two cases that still fail around it (`openmpt-mod-swap-no-loop`,
   `openmpt-mod-portamento-sample-change-pt`) fail on D18's post-mix omission rather than

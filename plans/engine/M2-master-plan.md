@@ -42,7 +42,7 @@ expected channel state*, which is exactly the shape of our trace format.
 | [C2a](complete/M2-task-C2a-conformance-harness-repairs.md) ✅ | Harness repairs, `--strict`, exclusions rewritten from real results | C2 | C6a |
 | [C3b](complete/M2-task-C3b-protracker-fidelity-repairs.md) ✅ | ProTracker fidelity + MTM repairs, and the voice-boundary sample swap | C3, C4 | C9, C6a |
 | [C6a](complete/M2-task-C6a-golden-and-build-hygiene.md) ✅ | Trace-feature hygiene, MOD/MTM goldens, `fma-check`, the web panning race | C6, C1, C3a | C2a, C3b, C9 |
-| [C9](M2-task-C9-s3m-conformance-repairs.md) | The nine S3M effect bugs the corpus found (M1 inheritance) | C2a | C3b, C6a |
+| [C9](complete/M2-task-C9-s3m-conformance-repairs.md) ✅ | The nine S3M effect bugs the corpus found (M1 inheritance) | C2a | C3b, C6a |
 
 C2a, C3b, C6a and C9 are the follow-ups opened by the 2026-09-02 branch review. C2a comes
 first: it changes which cases actually fail, so C3b and C9 must not be diagnosed against
@@ -66,9 +66,10 @@ until that trigger fires.
 
 Honest position, so that nothing downstream plans against a number that is not true.
 
-**Conformance: 14 of 47 cases pass after C3b** — MOD **11 of 27**, S3M **2 of 17**, MTM
-**1 of 3** — with **13 accepted deviations** and **20 known failures** (5 MOD tracker
-dialects for C5, 15 S3M for C5 and C9). No MOD or MTM known failure remains. Seven of the
+**Conformance: 23 of 47 cases pass after C2a, C3b and C9** — MOD **11 of 27**, S3M
+**11 of 17**, MTM **1 of 3** — with **13 accepted deviations** and **11 known failures**:
+five MOD and five S3M tracker dialects for C5, and one S3M record (`C2-S3M-009`, the
+`Rxy` tremolo phase). No MOD or MTM known failure remains. Seven of the
 MOD passes waive `position` alone under D14 and enforce every other field. `cargo xtask conformance` exits
 zero in its informational form; `--strict` exits non-zero on the 28 known failures and is
 the M2 exit gate once C3b, C5 and C9 land. Before C2a the standing was 3 of 47 with 44
@@ -78,13 +79,13 @@ undifferentiated exclusions, eight of them citing an NTSC rate libxmp never sele
 |---|---|---|
 | 1. MOD and MTM native, no S3M conversion | **Met** | C3, C4 |
 | 2. `cargo xtask goldens` regenerates; CI verifies | **Met** — S3M owner fixtures plus synthesised MOD and MTM fixtures | C6a (landed) |
-| 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Not met** — 14/47 after C3b; every remaining MOD/MTM exclusion is an accepted deviation or a C5 dialect | C9 (S3M), C5 (dialects) |
+| 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Not met** — 23/47; ten of the eleven known failures are C5 tracker dialects, the eleventh is `C2-S3M-009` | C5 (dialects), `C2-S3M-009` |
 | 4. Cross-target hash equality on the fixed path | **Met** for all three formats on x86-64 and wasm32; the ARM64 leg is CI-only | C6a (landed) |
 | 5. Loader fuzzing in CI, no panic or OOM | **Not met** | C7 |
 | 6. Allocator hook proves no allocation in `render()` | **Not met** | C7 |
 | 7. Every new deviation recorded in the accuracy policy | **Met for the current standing** — every exclusion reason records a first divergence the repaired harness observed | C2a (landed) |
 
-Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a, C3b. Outstanding: C5, C7, C9. Deferred: C8.
+Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a, C3b, C9. Outstanding: C5, C7. Deferred: C8.
 
 ## A note on the oracle
 

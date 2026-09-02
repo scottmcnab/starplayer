@@ -152,7 +152,7 @@ fn run() -> Result<bool, String> {
     }
     if !strict && !blocking.is_empty() {
         println!(
-            "informational: {} known-failure exclusion(s) remain; `--strict` fails on them once C5, C7 and C9 land",
+            "informational: {} known-failure exclusion(s) remain; `--strict` fails on them once C5 lands and `C2-S3M-009` is resolved",
             blocking.len(),
         );
     }

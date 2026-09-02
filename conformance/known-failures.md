@@ -5,8 +5,8 @@ deviations. Every record blocks the M2 exit until the engine conforms or the doc
 behaviour is deliberately resolved in `plans/product/03-accuracy-policy.md`. The harness
 still runs every excluded case, so a fix makes its exclusion fail as stale.
 
-**Who owns what.** `plans/engine/M2-task-C9-s3m-conformance-repairs.md` owns the one S3M
-record below.
+**Who owns what.** C9 (`plans/engine/complete/M2-task-C9-s3m-conformance-repairs.md`,
+landed) left the one S3M record below; its exclusion row points here.
 No MOD or MTM case is recorded here. The ProTracker fidelity repairs and the mixer
 voice-boundary sample swap landed as
 `plans/engine/complete/M2-task-C3b-protracker-fidelity-repairs.md` (landed); the four MOD cases that task
