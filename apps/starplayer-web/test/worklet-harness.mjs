@@ -10,6 +10,23 @@ const wasmBytes = await readFile(new URL('starplayer_host_wasm_bg.wasm', root));
 const firstFixture = await readFile(new URL('modules/REFLEX.S3M', root));
 const secondFixture = await readFile(new URL('modules/MOVEMENT.S3M', root));
 
+function syntheticMod() {
+    const headerBytes = 1084;
+    const patternBytes = 64 * 4 * 4;
+    const sampleFrames = 256;
+    const bytes = new Uint8Array(headerBytes + patternBytes + sampleFrames);
+    bytes.set(new TextEncoder().encode('headphone test'), 0);
+    bytes.set([(sampleFrames / 2) >> 8, (sampleFrames / 2) & 0xFF], 42);
+    bytes[45] = 64;
+    bytes[950] = 1;
+    bytes.set(new TextEncoder().encode('M.K.'), 1080);
+    for (let channel = 0; channel < 4; channel += 1) bytes.set([0x01, 0xAC, 0x10, 0x00], headerBytes + channel * 4);
+    for (let index = headerBytes + patternBytes; index < bytes.length; index += 1) {
+        bytes[index] = index & 1 ? 0x80 : 0x7F;
+    }
+    return bytes;
+}
+
 let Processor = null;
 let lastPort = null;
 class FakePort {
@@ -106,13 +123,50 @@ const garbage = port.messages.findLast((message) => message.type === 'garbageCol
 assert.ok(garbage.collected >= 1, 'the retired engine Arc reached the garbage channel');
 assert.equal(garbage.pending, 0);
 
+const modFixture = syntheticMod();
+port.dispatch({ type: 'loadModule', requestId: 3, bytes: modFixture.slice(), headphoneFriendlyModPanning: false });
+assert.ok(port.messages.some((message) => message.type === 'moduleLoaded' && message.requestId === 3));
+for (let index = 0; index < 3; index += 1) quantum();
+snapshot = Ring.readTelemetry(telemetry);
+assert.deepEqual(snapshot.channels.slice(0, 4).map((channel) => channel.pan), [-32767, 32767, 32767, -32767]);
+
+port.dispatch({ type: 'loadModule', requestId: 4, bytes: modFixture.slice(), headphoneFriendlyModPanning: true });
+assert.ok(port.messages.some((message) => message.type === 'moduleLoaded' && message.requestId === 4));
+for (let index = 0; index < 3; index += 1) quantum();
+snapshot = Ring.readTelemetry(telemetry);
+assert.deepEqual(snapshot.channels.slice(0, 4).map((channel) => channel.pan), [-19660, 19660, 19660, -19660]);
+
 // A malformed file is the one path that carries a string out of wasm, so it is also the
 // one that proves the decoder shim works end to end.
-port.dispatch({ type: 'loadModule', requestId: 3, bytes: new Uint8Array(64).fill(0x41) });
+port.dispatch({ type: 'loadModule', requestId: 5, bytes: new Uint8Array(64).fill(0x41) });
 const rejected = port.messages.findLast((message) => message.type === 'moduleError');
-assert.equal(rejected.requestId, 3);
+assert.equal(rejected.requestId, 5);
 assert.ok(rejected.reason.length > 10, `a readable reason crossed the wasm boundary: ${rejected.reason}`);
 assert.ok(quantum() >= 0, 'the engine still renders after a rejected load');
 
+// Output-channel rebuilds construct a candidate while the live node remains connected.
+// Both processors inhabit one AudioWorkletGlobalScope, but must own independent wasm
+// instances: wasm-bindgen's stock no-modules singleton would reset the first Rust HOST
+// and sometimes grow its memory under the live processor's next callback.
+const secondCommandRing = Ring.createCommandRing();
+const secondTelemetry = Ring.createTelemetry();
+const secondProcessor = new Processor({ processorOptions: {
+    channelCount: 1,
+    mixerMode: 0x0000_0102,
+    wasmModule: new WebAssembly.Module(wasmBytes),
+    commandRing: secondCommandRing.buffer,
+    telemetry: secondTelemetry.buffer,
+} });
+const secondPort = lastPort;
+assert.notEqual(secondProcessor.memory, processor.memory, 'overlapping processors own independent WebAssembly.Memory objects');
+secondPort.dispatch({ type: 'loadModule', requestId: 6, bytes: firstFixture.slice() });
+assert.ok(secondPort.messages.some((message) => message.type === 'moduleLoaded' && message.requestId === 6));
+assert.equal(secondProcessor.process([], [[new Float32Array(128)]]), true);
+assert.equal(Ring.readTelemetry(secondTelemetry).moduleGeneration, 1, 'the candidate has its own Rust HOST');
+quantum();
+assert.equal(Ring.readTelemetry(telemetry).moduleGeneration, 4, 'the live processor retained its Rust HOST');
+assert.equal(port.messages.some((message) => message.type === 'fault'), false, 'the live processor saw no candidate memory growth');
+assert.equal(secondPort.messages.some((message) => message.type === 'fault'), false, 'the candidate stayed stable too');
+
 globalThis.TextDecoder = nodeTextDecoder;
-console.log(`worklet harness: 10 s of real S3M render (peak ${loudest.toFixed(3)}), transport, seek, memory, garbage and bad-file rejection passed`);
+console.log(`worklet harness: 10 s of real S3M render (peak ${loudest.toFixed(3)}), independent overlapping processors, MOD panning, transport, seek, memory, garbage and bad-file rejection passed`);

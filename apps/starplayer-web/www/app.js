@@ -39,7 +39,7 @@ const elements = {
     applyOutputDevice: byId('apply-output-device'), chooseOutputDevice: byId('choose-output-device'), outputDeviceNote: byId('output-device-note'),
     outputChannels: byId('output-channels'), applyChannels: byId('apply-channels'), mixerPath: byId('mixer-path'),
     mixerInterpolator: byId('mixer-interpolator'), mixerDepth: byId('mixer-depth'), mixerDither: byId('mixer-dither'),
-    applyMixer: byId('apply-mixer'),
+    applyMixer: byId('apply-mixer'), modHeadphonePanning: byId('mod-headphone-panning'),
 };
 
 const state = {
@@ -72,6 +72,10 @@ const state = {
     archiveChoices: [],
     archivePickerResolve: null,
     archivePreviousFocus: null,
+    moduleRevision: 0,
+    activeModHeadphonePanning: false,
+    panningReloadInProgress: false,
+    panningReloadRequested: false,
 };
 
 const loaderReady = initLoader().then(loadEffectNames);
@@ -128,6 +132,7 @@ function restorePreferences() {
         selectStoredValue(elements.mixerInterpolator, saved.interpolator ?? 'linear');
         selectStoredValue(elements.mixerDepth, saved.depth ?? 'f32');
         selectStoredValue(elements.mixerDither, saved.dither ?? 'off');
+        elements.modHeadphonePanning.checked = saved.headphoneFriendlyModPanning === true;
         if (typeof saved.sinkId === 'string') elements.outputDevice.dataset.savedSinkId = saved.sinkId;
     } catch (_) {
         // Storage may be disabled or contain data from a broken older development build.
@@ -144,6 +149,7 @@ function persistPreferences() {
             interpolator: elements.mixerInterpolator.value,
             depth: elements.mixerDepth.value,
             dither: elements.mixerDither.value,
+            headphoneFriendlyModPanning: elements.modHeadphonePanning.checked,
         }));
     } catch (_) {
         // A private or storage-blocked page still gets fully working in-memory controls.
@@ -327,9 +333,13 @@ async function loadBuffer(buffer, label) {
         await audio;
         showMessage(`Activating ${moduleLabel}…`);
         const retainedBytes = moduleBuffer.slice(0);
-        const result = await activateModuleOnNode(state.node, moduleBuffer);
+        const revision = ++state.moduleRevision;
+        const headphoneFriendlyModPanning = elements.modHeadphonePanning.checked;
+        const result = await activateModuleOnNode(state.node, moduleBuffer, headphoneFriendlyModPanning);
+        if (revision !== state.moduleRevision) return;
         state.metadata = metadata;
         state.currentModuleBytes = retainedBytes;
+        state.activeModHeadphonePanning = metadata.isMod && headphoneFriendlyModPanning;
         state.activationMemoryBytes = result.memoryBytes;
         state.loadCount += 1;
         renderMetadata();
@@ -422,15 +432,16 @@ function readMetadata(label) {
         channels: Loader.module_channel_count(),
         orders: Loader.module_order_count(),
         patterns: Loader.module_pattern_count(),
+        isMod: Loader.module_is_mod(),
         instruments,
     };
 }
 
-function activateModuleOnNode(node, buffer) {
+function activateModuleOnNode(node, buffer, headphoneFriendlyModPanning = elements.modHeadphonePanning.checked) {
     const requestId = state.nextRequestId++;
     return new Promise((resolve, reject) => {
         state.pendingLoads.set(requestId, { resolve, reject });
-        node.port.postMessage({ type: 'loadModule', requestId, bytes: buffer }, [buffer]);
+        node.port.postMessage({ type: 'loadModule', requestId, bytes: buffer, headphoneFriendlyModPanning }, [buffer]);
     });
 }
 
@@ -530,11 +541,73 @@ function playbackRestoreCommands() {
     const order = state.latest?.order ?? 0;
     const playing = state.latest?.playing ?? state.metadata !== null;
     const volume = Math.round(Number(elements.volume.value) * 65535 / 100);
-    return [
+    const commands = [
         Ring.OPCODE_MASTER_VOLUME, volume, 0,
         Ring.OPCODE_SEEK_ORDER, order, 0,
         playing ? Ring.OPCODE_PLAY : Ring.OPCODE_STOP, 0, 0,
     ];
+    for (const [channel, snapshot] of (state.latest?.channels ?? []).entries()) {
+        if (snapshot.muted) commands.push(Ring.OPCODE_MUTE_CHANNEL, channel, 1);
+    }
+    return commands;
+}
+
+function sendCommandsToCurrentGraph(commands) {
+    for (let index = 0; index < commands.length; index += 3) {
+        queueCommand(commands[index], commands[index + 1], commands[index + 2]);
+    }
+}
+
+async function applyModPanningPreference() {
+    const requested = elements.modHeadphonePanning.checked;
+    if (state.panningReloadInProgress) {
+        // A disabled checkbox cannot normally emit another user change, but keeping this
+        // guard deterministic also covers scripted changes and a racing load interaction.
+        elements.modHeadphonePanning.checked = state.panningReloadRequested;
+        persistPreferences();
+        return;
+    }
+    persistPreferences();
+    if (!state.metadata?.isMod || state.currentModuleBytes === null || state.node === null) {
+        showMessage(requested
+            ? 'Headphone-friendly MOD panning saved for the next MOD load.'
+            : 'Authentic MOD panning saved for the next MOD load.');
+        return;
+    }
+
+    const previous = state.activeModHeadphonePanning;
+    const revision = state.moduleRevision;
+    const node = state.node;
+    const restoreCommands = playbackRestoreCommands();
+    state.panningReloadInProgress = true;
+    state.panningReloadRequested = requested;
+    elements.modHeadphonePanning.disabled = true;
+    clearError();
+    showMessage(`Reloading this MOD with ${requested ? 'S3M-style 60% spacing' : 'authentic hard panning'}…`);
+    try {
+        const activation = await activateModuleOnNode(node, state.currentModuleBytes.slice(0), requested);
+        if (revision !== state.moduleRevision || node !== state.node) return;
+        state.moduleRevision += 1;
+        state.activeModHeadphonePanning = requested;
+        state.activationMemoryBytes = activation.memoryBytes;
+        state.loadCount += 1;
+        sendCommandsToCurrentGraph(restoreCommands);
+        persistPreferences();
+        showMessage(`${requested ? 'Headphone-friendly S3M-style 60% spacing' : 'Authentic hard MOD panning'} applied; playback restored at the sounding order.`);
+        setTimeout(requestGarbageCollection, 100);
+        setTimeout(requestGarbageCollection, 500);
+    } catch (error) {
+        if (revision === state.moduleRevision && node === state.node) {
+            elements.modHeadphonePanning.checked = previous;
+            persistPreferences();
+            showError(`Could not change MOD panning: ${error && error.message ? error.message : error}`);
+            showMessage(`Still playing ${state.metadata.title} with ${previous ? 'headphone-friendly 60% spacing' : 'authentic hard panning'}.`);
+        }
+    } finally {
+        state.panningReloadInProgress = false;
+        state.panningReloadRequested = false;
+        elements.modHeadphonePanning.disabled = false;
+    }
 }
 
 async function rebuildAudioContext() {
@@ -562,7 +635,7 @@ async function rebuildAudioContext() {
         candidateNode = graph.node;
         const activation = state.currentModuleBytes === null
             ? null
-            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0));
+            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), elements.modHeadphonePanning.checked);
         if (oldSinkId && typeof candidateContext.setSinkId === 'function') {
             await candidateContext.setSinkId(oldSinkId).catch((error) => {
                 elements.outputDeviceNote.textContent = `The previous output device could not be restored (${error.name || error.message}).`;
@@ -576,6 +649,7 @@ async function rebuildAudioContext() {
         state.latest = null;
         state.activeModeWire = mixerModeFromControls();
         if (activation) state.activationMemoryBytes = activation.memoryBytes;
+        if (activation && state.metadata?.isMod) state.activeModHeadphonePanning = elements.modHeadphonePanning.checked;
         oldNode.disconnect();
         await oldContext.close().catch(() => {});
         state.requestedSampleRate = requested;
@@ -612,13 +686,14 @@ async function rebuildOutputChannels() {
         candidateNode = graph.node;
         const activation = state.currentModuleBytes === null
             ? null
-            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0));
+            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), elements.modHeadphonePanning.checked);
         graph.node.connect(state.context.destination);
         if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
         installGraph(graph);
         state.latest = null;
         state.activeModeWire = mixerModeFromControls();
         if (activation) state.activationMemoryBytes = activation.memoryBytes;
+        if (activation && state.metadata?.isMod) state.activeModHeadphonePanning = elements.modHeadphonePanning.checked;
         oldNode.disconnect();
         persistPreferences();
         updateOutputPanel();
@@ -1014,6 +1089,7 @@ elements.applyChannels.addEventListener('click', () => rebuildOutputChannels().c
 elements.applyOutputDevice.addEventListener('click', () => applyOutputDevice().catch(showError));
 elements.chooseOutputDevice.addEventListener('click', () => chooseOutputDevice().catch(showError));
 elements.applyMixer.addEventListener('click', applyMixerMode);
+elements.modHeadphonePanning.addEventListener('change', () => applyModPanningPreference().catch(showError));
 // A choice is remembered as it is made, not only when it is applied: the owner's test
 // setup should survive a reload even if the page is reloaded mid-comparison.
 for (const select of [elements.sampleRate, elements.outputChannels, elements.mixerPath, elements.mixerInterpolator, elements.mixerDepth, elements.mixerDither]) {

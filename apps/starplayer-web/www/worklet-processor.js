@@ -12,13 +12,17 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         const module = settings.wasmModule instanceof WebAssembly.Module
             ? settings.wasmModule
             : new WebAssembly.Module(settings.wasmBytes);
-        const wasm = wasm_bindgen.initSync({ module });
+        // The bundle turns wasm-bindgen's no-modules IIFE into a factory. Nodes overlap
+        // while a graph rebuild is prepared, so each processor must own a distinct Rust
+        // HOST and WebAssembly.Memory even though they share one compiled module.
+        this.wasm = createStarPlayerWasmBindings();
+        const wasm = this.wasm.initSync({ module });
 
-        if (!wasm_bindgen.init(sampleRate, settings.mixerMode)) {
+        if (!this.wasm.init(sampleRate, settings.mixerMode)) {
             throw new Error('the requested mixer mode has no web engine arm');
         }
         this.memory = wasm.memory;
-        this.renderQuantum = wasm_bindgen.render_quantum();
+        this.renderQuantum = this.wasm.render_quantum();
         this.channelCount = settings.channelCount;
         this.commandRing = settings.commandRing ? Ring.viewCommandRing(settings.commandRing) : null;
         this.telemetry = settings.telemetry ? Ring.viewTelemetry(settings.telemetry) : null;
@@ -38,7 +42,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             if (opcode === Ring.OPCODE_SET_MIXER_MODE) {
                 this.pendingMixerMode = argument >>> 0;
             } else {
-                wasm_bindgen.enqueue_command(opcode, argument, extra);
+                this.wasm.enqueue_command(opcode, argument, extra);
             }
         };
         this.port.onmessage = (event) => this.onMessage(event.data);
@@ -57,7 +61,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         const requested = this.pendingMixerMode;
         this.pendingMixerMode = null;
         try {
-            const active = wasm_bindgen.set_mixer_mode(requested);
+            const active = this.wasm.set_mixer_mode(requested);
             // Rebuilding typed engine storage may grow wasm memory. Rebase only here,
             // outside process(), exactly as module activation does.
             this.bindViews();
@@ -72,8 +76,8 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
     }
 
     bindViews() {
-        const outputPointer = wasm_bindgen.output_ptr();
-        const channelStride = wasm_bindgen.output_channel_stride();
+        const outputPointer = this.wasm.output_ptr();
+        const channelStride = this.wasm.output_channel_stride();
         this.channelViews = [];
         this.wideChannelViews = [];
         for (let channel = 0; channel < this.channelCount; channel += 1) {
@@ -83,8 +87,8 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         }
         this.telemetryWords = new Int32Array(
             this.memory.buffer,
-            wasm_bindgen.telemetry_ptr(),
-            wasm_bindgen.telemetry_len(),
+            this.wasm.telemetry_ptr(),
+            this.wasm.telemetry_len(),
         );
         this.stableMemoryBytes = this.memory.buffer.byteLength;
     }
@@ -92,7 +96,10 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
     onMessage(message) {
         if (message.type === 'loadModule') {
             try {
-                const generation = wasm_bindgen.load_module(new Uint8Array(message.bytes));
+                const generation = this.wasm.load_module_with_options(
+                    new Uint8Array(message.bytes),
+                    message.headphoneFriendlyModPanning === true,
+                );
                 // Activation may consume more of the pre-reserved heap. Rebind once here,
                 // outside process; any growth after this point is a fatal RT-path defect.
                 this.bindViews();
@@ -118,12 +125,12 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             }
             this.applyPendingMixerMode();
         } else if (message.type === 'collectGarbage') {
-            const collected = wasm_bindgen.collect_garbage();
+            const collected = this.wasm.collect_garbage();
             this.port.postMessage({
                 type: 'garbageCollected',
                 collected,
-                total: wasm_bindgen.retired_modules_collected(),
-                pending: wasm_bindgen.pending_garbage(),
+                total: this.wasm.retired_modules_collected(),
+                pending: this.wasm.pending_garbage(),
             });
         }
     }
@@ -157,7 +164,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             Ring.drainCommands(this.commandRing, this.applyCommand);
         }
 
-        wasm_bindgen.process(frames);
+        this.wasm.process(frames);
         if (this.memory.buffer.byteLength !== this.stableMemoryBytes) {
             this.faulted = `wasm memory grew in process (${this.stableMemoryBytes} → ${this.memory.buffer.byteLength})`;
             this.port.postMessage({ type: 'fault', reason: this.faulted });
@@ -174,9 +181,9 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             }
         }
 
-        const dropped = wasm_bindgen.dropped_commands()
+        const dropped = this.wasm.dropped_commands()
             + (this.commandRing === null ? 0 : Ring.commandOverflows(this.commandRing));
-        const quanta = wasm_bindgen.quanta_rendered();
+        const quanta = this.wasm.quanta_rendered();
         if (this.telemetry !== null) {
             Ring.publishTelemetry(
                 this.telemetry,

@@ -384,8 +384,17 @@ impl Host {
 
     /// Decode, construct and queue a module. Called from the worklet's message handler,
     /// never from `process()`; a failed decode leaves the previous module and source live.
-    fn load_module(&mut self, bytes: &[u8]) -> Result<u32, String> {
-        let loaded = starplayer::load(bytes).map_err(|error| error.to_string())?;
+    fn load_module(&mut self, bytes: &[u8]) -> Result<u32, String> { self.load_module_with_options(bytes, false) }
+
+    fn load_module_with_options(&mut self, bytes: &[u8], headphone_friendly_mod_panning: bool) -> Result<u32, String> {
+        let loaded = match starplayer::probe(bytes) {
+            Some(ModuleFormat::Mod) => starplayer::mod_file::load_with_options(bytes, starplayer::mod_file::LoadOptions {
+                stereo_separation: starplayer::mod_file::StereoSeparation::percent(if headphone_friendly_mod_panning { 60 } else { 100 }),
+            }),
+            Some(ModuleFormat::S3m) => starplayer::s3m::load(bytes),
+            Some(ModuleFormat::Mtm) => starplayer::mtm::load(bytes),
+            _ => Err(starplayer::core::Error::BadMagic),
+        }.map_err(|error| error.to_string())?;
         let module = Arc::new(loaded);
         // A new sequencer's tick clock starts at frame zero, but the engine's musical
         // clock is monotonic and has been running since `init`. Without this the first
@@ -674,6 +683,17 @@ mod exports {
         })
     }
 
+    /// Decode and activate a module with web-player loading preferences. The option is
+    /// deliberately MOD-specific; S3M and MTM continue through their native loaders.
+    #[wasm_bindgen]
+    pub fn load_module_with_options(bytes: &[u8], headphone_friendly_mod_panning: bool) -> Result<u32, JsValue> {
+        HOST.with(|cell| {
+            let mut slot = cell.try_borrow_mut().map_err(|_| JsValue::from_str("the worklet host is busy"))?;
+            let host = slot.as_mut().ok_or_else(|| JsValue::from_str("the worklet host is not initialized"))?;
+            host.load_module_with_options(bytes, headphone_friendly_mod_panning).map_err(|message| JsValue::from_str(&message))
+        })
+    }
+
     /// Decode one SAB/fallback wire record into the wasm-side fixed command ring.
     #[wasm_bindgen]
     pub fn enqueue_command(opcode: u32, argument: u32, extra: u32) -> bool {
@@ -896,6 +916,29 @@ mod tests {
         assert_eq!(host.current_module.as_ref().map(|module| module.header().format), Some(ModuleFormat::Mod));
         assert!((0..20).any(|_| host.process(RENDER_QUANTUM) > 0.0), "the MOD sequencer should trigger sample audio");
         assert!(host.telemetry.read().sequence > 0);
+    }
+
+    #[test]
+    fn mod_headphone_option_changes_only_mod_initial_panning() {
+        let mut host = Host::new(48_000);
+        let mod_bytes = minimal_mod();
+        assert_eq!(host.load_module_with_options(&mod_bytes, false), Ok(1));
+        let hard: Vec<i16> = host.current_module.as_ref().expect("MOD retained").header().default_pan.iter().map(|pan| pan.to_bits()).collect();
+        assert_eq!(hard, [-32_767, 32_767, 32_767, -32_767]);
+        assert_eq!(host.load_module_with_options(&mod_bytes, true), Ok(2));
+        let headphone: Vec<i16> = host.current_module.as_ref().expect("MOD retained").header().default_pan.iter().map(|pan| pan.to_bits()).collect();
+        assert_eq!(headphone, [-19_660, 19_660, 19_660, -19_660]);
+
+        assert_eq!(host.load_module_with_options(FIXTURE, false), Ok(3));
+        let s3m_authentic = host.current_module.as_ref().expect("S3M retained").header().default_pan.to_vec();
+        assert_eq!(host.load_module_with_options(FIXTURE, true), Ok(4));
+        assert_eq!(host.current_module.as_ref().expect("S3M retained").header().default_pan.as_ref(), s3m_authentic.as_slice());
+
+        let mtm_bytes = minimal_mtm();
+        assert_eq!(host.load_module_with_options(&mtm_bytes, false), Ok(5));
+        let mtm_authentic = host.current_module.as_ref().expect("MTM retained").header().default_pan.to_vec();
+        assert_eq!(host.load_module_with_options(&mtm_bytes, true), Ok(6));
+        assert_eq!(host.current_module.as_ref().expect("MTM retained").header().default_pan.as_ref(), mtm_authentic.as_slice());
     }
 
     #[test]

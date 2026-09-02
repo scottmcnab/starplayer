@@ -61,6 +61,11 @@ button:hover:not(:disabled), .button:hover { border-color: #61758c; background: 
 button:disabled, input:disabled { opacity: .38; cursor: not-allowed; }
 button.primary { color: #071512; background: var(--accent); border-color: var(--accent); font-weight: 800; }
 .url-form input { flex: 1; min-width: 12rem; }
+.mod-panning-option { display: flex; align-items: flex-start; gap: 9px; margin-top: 13px; color: var(--muted); cursor: pointer; }
+.mod-panning-option input { margin-top: 3px; accent-color: var(--accent); }
+.mod-panning-option span { display: grid; gap: 1px; }
+.mod-panning-option strong { color: var(--ink); font-weight: 650; }
+.mod-panning-option small { font-size: 12px; }
 .drop-zone { min-height: 112px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 5px; border: 1px dashed #45576c; border-radius: 8px; color: var(--muted); text-align: center; padding: 18px; }
 .drop-zone strong { color: var(--ink); }
 .drop-zone.over { color: var(--accent); border-color: var(--accent); background: #142b2b; }

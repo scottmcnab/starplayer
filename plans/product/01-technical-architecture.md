@@ -745,6 +745,15 @@ as "the node name is not defined". `cargo xtask wasm` now concatenates a small U
 decoder ahead of the glue and fails the build if the glue ever starts wanting to encode as
 well. The Node worklet harness hides Node's own `TextDecoder` so it sees this too.
 
+The no-modules glue has a second worklet-specific trap: its IIFE caches one WASM instance
+for the entire realm. Output-channel rebuilds deliberately overlap the live and candidate
+`AudioWorkletNode` in the same realm, so sharing that cache would make candidate `init`
+replace the live Rust `HOST` and potentially grow its memory under the live callback.
+Packaging therefore wraps the generated IIFE in a factory. Every processor owns an
+independent WASM instance, Rust host, and memory, while all processors reuse the compiled
+`WebAssembly.Module`. The Node harness constructs two processors simultaneously and
+checks both memory identity and independent module generations.
+
 ---
 
 ## 10. Portability

@@ -132,6 +132,28 @@ function buildZip(entries) {
     return Buffer.concat([...localRecords, centralDirectory, end]);
 }
 
+function syntheticMod() {
+    const headerBytes = 1084;
+    const patternBytes = 64 * 4 * 4;
+    const sampleFrames = 256;
+    const bytes = Buffer.alloc(headerBytes + patternBytes * 2 + sampleFrames);
+    bytes.write('headphone test', 0, 'ascii');
+    bytes.writeUInt16BE(sampleFrames / 2, 42);
+    bytes[45] = 64;
+    bytes[950] = 2;
+    bytes[952] = 0;
+    bytes[953] = 1;
+    bytes.write('M.K.', 1080, 'ascii');
+    for (let channel = 0; channel < 4; channel += 1) {
+        bytes.set([0x01, 0xAC, 0x10, 0x00], headerBytes + channel * 4);
+        bytes.set([0x01, 0xAC, 0x10, 0x00], headerBytes + patternBytes + channel * 4);
+    }
+    for (let index = headerBytes + patternBytes * 2; index < bytes.length; index += 1) {
+        bytes[index] = index & 1 ? 0x80 : 0x7F;
+    }
+    return bytes;
+}
+
 async function startDevServer(isolate) {
     const port = await freePort();
     const argv = [DEV_SERVER, '--port', String(port), '--root', DIST];
@@ -313,6 +335,10 @@ const READ_STATE = `
         maxChannelCount: text('max-channel-count'),
         sinkStatus: text('sink-status'),
         workletRate: text('worklet-rate'),
+        pans: [...document.querySelectorAll('#channel-body tr')].map((row) => row.children[4]?.textContent.trim()).filter(Boolean),
+        headphonePanning: document.getElementById('mod-headphone-panning').checked,
+        headphonePanningDisabled: document.getElementById('mod-headphone-panning').disabled,
+        mutes: [...document.querySelectorAll('#channel-body button')].map((button) => button.textContent.trim()),
     };
 `;
 
@@ -375,13 +401,57 @@ async function run(executable, mode) {
             { name: FIRST_MODULE, bytes: firstModuleBytes },
             { name: SECOND_MODULE, bytes: secondModuleBytes },
         ]);
+        const modBytes = syntheticMod();
         await page.waitFor('the page module to attach its listeners', "document.documentElement.dataset.playerReady === 'true'");
+        assert.equal(await page.evaluate("return document.getElementById('mod-headphone-panning').checked;"), false, 'the MOD preference is initially unchecked');
+        await page.evaluate("localStorage.setItem('starplayer.output-and-mixer.v1', JSON.stringify({ path: 'float' })); return true;");
+        await page.send('Page.reload', { ignoreCache: true });
+        await page.waitFor('the reloaded page module', "document.documentElement.dataset.playerReady === 'true'");
+        assert.equal(await page.evaluate("return document.getElementById('mod-headphone-panning').checked;"), false, 'an older v1 preference object restores as unchecked');
         if (mode === 'fallback') {
             await page.evaluate("document.getElementById('force-fallback').checked = true; return true;");
         }
 
         await page.evaluate("document.getElementById('start-audio').click(); return true;");
         await page.waitFor('the AudioWorklet', "document.getElementById('transport-chip').textContent === 'audio ready'");
+
+        // ── headphone-friendly MOD panning ─────────────────────────────────────────
+        await loadFile(page, modBytes, 'headphones.mod');
+        await page.waitFor('the synthetic MOD', "document.getElementById('module-detail').textContent.includes('headphones.mod')");
+        await page.waitFor('the MOD telemetry', "document.querySelectorAll('#channel-body tr').length === 4 && document.getElementById('row').textContent !== '\u2014'");
+        const authenticMod = await page.evaluate(READ_STATE);
+        assert.deepEqual(authenticMod.pans, ['LFT', 'RGT', 'RGT', 'LFT'], 'MOD defaults to authentic hard L-R-R-L panning');
+        await page.evaluate("document.querySelector('#channel-body button').click(); return true;");
+        await page.waitFor('the MOD channel mute', "document.querySelector('#channel-body button').textContent === 'Unmute'");
+        await page.evaluate("document.getElementById('seek-order').value = '1'; document.getElementById('seek-order').dispatchEvent(new Event('change')); return true;");
+        await page.waitFor('the second MOD order', "document.getElementById('order').textContent.startsWith('2/')");
+        const beforeHeadphone = await page.evaluate(READ_STATE);
+        assert.equal(beforeHeadphone.chip, 'playing');
+        const disabledDuringReload = await page.evaluate("const option = document.getElementById('mod-headphone-panning'); option.checked = true; option.dispatchEvent(new Event('change')); return option.disabled;");
+        assert.equal(disabledDuringReload, true, 'the panning option is disabled while its replacement is prepared');
+        await page.waitFor('headphone panning to apply', "document.getElementById('mod-headphone-panning').disabled === false && document.getElementById('message').textContent.includes('60% spacing')");
+        await page.waitFor('60% MOD telemetry', "[...document.querySelectorAll('#channel-body tr')].map((row) => row.children[4].textContent.trim()).join(',') === '3,C,C,3'");
+        const headphoneMod = await page.evaluate(READ_STATE);
+        assert.deepEqual(headphoneMod.pans, ['3', 'C', 'C', '3'], 'the option selects exact S3M-style 60% spacing');
+        assert.equal(headphoneMod.chip, 'playing', 'a live panning reload preserves playing state');
+        assert.match(headphoneMod.order, /^2\//, 'a live panning reload restores the sounding order');
+        assert.equal(headphoneMod.mutes[0], 'Unmute', 'a live panning reload restores channel mute state');
+
+        await page.evaluate("document.getElementById('stop').click(); return true;");
+        await page.waitFor('the synthetic MOD to stop', "document.getElementById('transport-chip').textContent === 'stopped'");
+        await page.evaluate("const option = document.getElementById('mod-headphone-panning'); option.checked = false; option.dispatchEvent(new Event('change')); return true;");
+        await page.waitFor('the stopped panning reload', "document.getElementById('mod-headphone-panning').disabled === false && document.getElementById('transport-chip').textContent === 'stopped'");
+        const stoppedReload = await page.evaluate(READ_STATE);
+        assert.equal(stoppedReload.chip, 'stopped', 'a live panning reload preserves stopped state');
+        assert.match(stoppedReload.order, /^2\//, 'the stopped reload also restores the sounding order');
+        assert.equal(stoppedReload.mutes[0], 'Unmute', 'the stopped reload also restores channel mute state');
+        // A stopped engine intentionally does not dispatch row-zero channel state. Resume
+        // after proving Stop survived, then read the newly loaded header pans from telemetry.
+        await page.evaluate("document.getElementById('play').click(); return true;");
+        await page.waitFor('authentic panning to return', "[...document.querySelectorAll('#channel-body tr')].map((row) => row.children[4].textContent.trim()).join(',') === 'LFT,RGT,RGT,LFT'");
+        const restoredMod = await page.evaluate(READ_STATE);
+        assert.match(await page.evaluate("return localStorage.getItem('starplayer.output-and-mixer.v1');"), /"headphoneFriendlyModPanning":false/, 'the final panning choice is persisted');
+        report.modPanning = `${authenticMod.pans.join('-')} → ${headphoneMod.pans.join('-')} → ${restoredMod.pans.join('-')}`;
 
         await loadFixture(page, FIRST_MODULE);
         await page.waitFor('the first module', "document.getElementById('title').textContent !== 'No module loaded'");

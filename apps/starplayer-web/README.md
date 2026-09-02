@@ -23,6 +23,10 @@ The A4 worklet bundle architecture is preserved: `wasm-bindgen --target no-modul
 glue, `ring.js` and `worklet-processor.js` are concatenated into the one classic script
 an `AudioWorkletGlobalScope` can load without fetching or importing anything itself. The
 compiled wasm module is prepared on the page and structured-cloned to the worklet.
+The packaging step wraps wasm-bindgen's generated no-modules IIFE in a binding factory:
+each `AudioWorkletProcessor` gets its own WASM instance and memory while reusing that
+compiled module. This matters during output-channel rebuilds, when the old and candidate
+nodes intentionally overlap in one `AudioWorkletGlobalScope` until activation succeeds.
 
 `worklet-prelude.js` is concatenated **ahead** of the glue. The worklet realm has no
 `TextDecoder` and the glue builds one the moment the bundle is evaluated, so without it
@@ -67,6 +71,12 @@ table rebuild at tracker-tick rate.
 At phone width the channel and pattern tables scroll horizontally. Collapsing a channel
 row or paginating channels would hide the relationship between instrument, note, VU and
 the English effect name; a deliberate horizontal swipe preserves it.
+
+The load panel's **Headphone-friendly MOD panning** option narrows MOD's authentic hard
+L-R-R-L defaults to the same symmetric 60% positions used by ordinary stereo S3Ms. It
+does not affect S3M, MTM, or later MOD panning effects. Changing it while a MOD is active
+reloads the retained bytes at the sounding order and restores transport, volume, and
+channel mutes; the old module remains live if decoding fails.
 
 ## Output and mixer options
 
@@ -183,7 +193,9 @@ The headless check skips cleanly when no Chromium/Chrome executable is installed
 `CHROME=/path/to/chrome` to point it at one. It drives the browser over the DevTools
 protocol with Node's built-in `WebSocket`, and runs the page three ways — cross-origin
 isolated on shared memory, isolated with the fallback forced, and served without COOP/COEP
-at all. Each run plays a fixture, asserts the quantum is 128 frames and wasm memory does
+at all. Each run first loads a synthetic MOD and observes hard, 60%, then hard L-R-R-L
+panning while checking order, transport, and mute restoration. It then plays a fixture,
+asserts the quantum is 128 frames and wasm memory does
 not move, loads a second module over the top of the first and waits for the retired Arc,
 drops a deliberately broken file and checks that playback survives it, rebuilds the graph
 at 22050 Hz and checks the song comes back at the order that was sounding, switches the
@@ -194,4 +206,6 @@ to 390×844 and asserts nothing overflows horizontally.
 The Node worklet harness does not need a browser: it stubs `AudioWorkletGlobalScope`,
 hides Node's `TextDecoder` so the bundle has to supply its own, loads a real bundled
 fixture, renders ten seconds through the engine, exercises transport, confirms retired Arc
-collection and checks that a bad file is rejected with a readable message.
+collection, inspects synthetic MOD telemetry at both panning settings, proves two
+overlapping processors own independent memories and Rust hosts, and checks that a bad file
+is rejected with a readable message.

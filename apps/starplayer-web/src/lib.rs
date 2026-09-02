@@ -192,6 +192,11 @@ mod exports {
     #[wasm_bindgen]
     pub fn module_instrument_count() -> u32 { with_module(0, |module| module.instruments().len() as u32) }
 
+    /// Whether the retained display module is a native MOD. Page preferences use this
+    /// to avoid reloading S3M and MTM when the MOD-only panning checkbox changes.
+    #[wasm_bindgen]
+    pub fn module_is_mod() -> bool { with_module(false, |module| module.header().format == ModuleFormat::Mod) }
+
     #[wasm_bindgen]
     pub fn instrument_name(index: u32) -> String {
         with_module(String::new(), |module| {
@@ -276,6 +281,7 @@ mod tests {
     #[test]
     fn page_loader_exposes_metadata_and_pattern_cells() {
         assert!(inspect(FIXTURE).is_ok());
+        assert!(!exports::module_is_mod());
         assert!(with_module(0, |module| module.orders().len()) > 0);
         let window = pattern_window_bytes(0, 0, 8);
         assert!(!window.is_empty());
@@ -296,6 +302,7 @@ mod tests {
     fn page_loader_and_pattern_view_dispatch_to_native_mod() {
         assert!(inspect(&minimal_mod()).is_ok());
         assert_eq!(with_module(ModuleFormat::S3m, |module| module.header().format), ModuleFormat::Mod);
+        assert!(exports::module_is_mod());
         assert_eq!(pattern_window_bytes(0, 0, 1).get(..5), Some(&[48, 1, VALUE_NONE, 0xF, 6][..]));
         assert!(effect_name_records().contains("15:-1:set speed/tempo\n"));
     }
@@ -304,6 +311,7 @@ mod tests {
     fn page_loader_and_pattern_view_dispatch_to_native_mtm() {
         assert!(inspect(&minimal_mtm()).is_ok());
         assert_eq!(with_module(ModuleFormat::S3m, |module| module.header().format), ModuleFormat::Mtm);
+        assert!(!exports::module_is_mod());
         assert_eq!(pattern_window_bytes(0, 0, 1).get(..5), Some(&[36, 1, VALUE_NONE, 0xF, 6][..]));
         assert!(effect_name_records().contains("15:-1:set speed/tempo\n"));
     }
@@ -328,12 +336,18 @@ mod tests {
         assert!(index.contains("accept=\".s3m,.mod,.mtm,.zip,audio/s3m,audio/mod,audio/x-mod,audio/mtm,application/zip\""));
         assert!(index.contains("aria-label=\"S3M, MOD, MTM, or ZIP URL\""));
         assert!(index.contains("Drop .s3m, .mod, .mtm, or .zip here"));
+        assert!(index.contains("id=\"mod-headphone-panning\""));
+        assert!(index.contains("Headphone-friendly MOD panning"));
+        assert!(index.contains("S3M-style 60% stereo spacing"));
 
         let app = include_str!("../www/app.js");
         assert!(app.contains("No supported modules were found inside"));
         assert!(app.contains("Choose one of ${entries.length} modules in ${archiveLabel}"));
         assert!(!app.contains("No S3M modules were found inside"));
         assert!(!app.contains("S3M modules in ${archiveLabel}"));
+        assert!(app.contains("saved.headphoneFriendlyModPanning === true"), "missing fields in older v1 objects must restore unchecked");
+        assert!(app.contains("headphoneFriendlyModPanning: elements.modHeadphonePanning.checked"));
+        assert!(app.contains("isMod: Loader.module_is_mod()"));
     }
 
     #[test]

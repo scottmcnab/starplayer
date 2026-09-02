@@ -248,10 +248,13 @@ mod tests {
     }
 
     #[test]
-    fn reduced_separation_is_host_selectable() {
+    fn sixty_percent_separation_is_exact_and_keeps_the_lrrl_assignment() {
         let hard = load(&minimal_mod()).expect("hard");
-        let reduced = load_with_options(&minimal_mod(), LoadOptions { stereo_separation: StereoSeparation::percent(50) }).expect("reduced");
-        assert!(hard.header().channel_pan(0).expect("pan").to_bits().unsigned_abs() > reduced.header().channel_pan(0).expect("pan").to_bits().unsigned_abs());
+        let headphone = load_with_options(&minimal_mod(), LoadOptions { stereo_separation: StereoSeparation::percent(60) }).expect("headphone");
+        let full = bipolar_from_ratio(1, 1);
+        let three_fifths = bipolar_from_ratio(3, 5);
+        assert_eq!((0..4).map(|channel| hard.header().channel_pan(channel).expect("hard pan")).collect::<Vec<_>>(), [-full, full, full, -full]);
+        assert_eq!((0..4).map(|channel| headphone.header().channel_pan(channel).expect("headphone pan")).collect::<Vec<_>>(), [-three_fifths, three_fifths, three_fifths, -three_fifths]);
     }
 
     #[test]
