@@ -287,11 +287,7 @@ impl TraceRecorder {
     }
 
     pub(crate) fn record_param_write(&mut self, voices: &VoicePool, voice: VoiceId, param: VoiceParam) {
-        let flag = match param {
-            VoiceParam::Step(_) | VoiceParam::Filter(_) => DirtyBits::PITCH,
-            VoiceParam::Volume(_) => DirtyBits::VOLUME,
-            VoiceParam::Pan(_) => DirtyBits::PAN,
-        };
+        let Some(flag) = dirty_bit_for(param) else { return };
         self.record_voice_flags(voices, voice, flag);
     }
 
@@ -327,10 +323,11 @@ impl TraceRecorder {
                 entry.state.position = voice.position();
                 entry.state.cutoff = unit_to_scale(voice.params.filter.cutoff.to_bits(), 255);
                 entry.state.resonance = unit_to_scale(voice.params.filter.resonance.to_bits(), 255);
-                entry.state.flags = voice.params.dirty | entry.writes;
-            } else {
-                entry.state.flags = entry.writes;
             }
+            // Only this tick's writes, live voice or not. `voice.params.dirty` is
+            // mixer-lifetime state that survives until the mixer consumes it, so unioning
+            // it in here reported a change on every tick after the one that made it.
+            entry.state.flags = entry.writes;
         }
         let channels = working.channels.into_iter().map(|entry| entry.state).collect();
         self.trace.ticks.push(TraceTick {
@@ -353,6 +350,20 @@ impl TraceRecorder {
     }
 }
 
+/// The dirty bit a parameter write reports, if the v1 trace contract has one for it.
+///
+/// [`VoiceParam::Filter`] has none: the original's `_CHN_*` flag set never had a filter
+/// bit and the version 1 text format has no letter for one, so a filter write reports no
+/// flag rather than borrowing `PITCH` and claiming a pitch change that did not happen.
+pub(crate) const fn dirty_bit_for(param: VoiceParam) -> Option<DirtyBits> {
+    match param {
+        VoiceParam::Step(_) => Some(DirtyBits::PITCH),
+        VoiceParam::Volume(_) => Some(DirtyBits::VOLUME),
+        VoiceParam::Pan(_) => Some(DirtyBits::PAN),
+        VoiceParam::Filter(_) => None,
+    }
+}
+
 fn unit_to_scale(bits: u16, scale: u32) -> u16 {
     ((bits as u32 * scale + u16::MAX as u32 / 2) / u16::MAX as u32) as u16
 }
@@ -364,6 +375,49 @@ fn bipolar_pan_to_u8(bits: i16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use starplayer_core::{FilterParams, VoiceParams};
+    use starplayer_mixer::{SampleRegion, VoiceTag};
+
+    /// One tick with a single live voice on channel zero.
+    fn recorded_tick(writes: &[VoiceParam], preset_dirty: DirtyBits) -> TraceChannel {
+        let mut voices = VoicePool::new(1);
+        let mut channels = ChannelTable::new(1);
+        let params = VoiceParams { dirty: preset_dirty, ..VoiceParams::SILENT };
+        let voice = channels
+            .trigger(ChannelId(0), &mut voices, VoiceTag::default(), SampleRegion::one_shot(0, 8), params, 0)
+            .expect("a fresh pool has a slot");
+
+        let mut recorder = TraceRecorder::default();
+        recorder.begin_tick(Frame::ZERO, SongPosition::default(), 0, 1);
+        for write in writes {
+            if let Some(state) = voices.get_mut(voice) { write.apply(&mut state.params); }
+            recorder.record_param_write(&voices, voice, *write);
+        }
+        recorder.finish_tick(6, 125, &channels, &voices);
+        recorder.take().ticks.remove(0).channels.remove(0)
+    }
+
+    #[test]
+    fn a_filter_write_reports_no_flag_rather_than_a_false_pitch_flag() {
+        assert_eq!(dirty_bit_for(VoiceParam::Step(starplayer_core::Step::ZERO)), Some(DirtyBits::PITCH));
+        assert_eq!(dirty_bit_for(VoiceParam::Volume(starplayer_core::U0F16::MAX)), Some(DirtyBits::VOLUME));
+        assert_eq!(dirty_bit_for(VoiceParam::Pan(starplayer_core::I1F15::ZERO)), Some(DirtyBits::PAN));
+        assert_eq!(dirty_bit_for(VoiceParam::Filter(FilterParams::BYPASS)), None, "the v1 contract has no filter flag to report");
+
+        let channel = recorded_tick(&[VoiceParam::Filter(FilterParams::BYPASS)], DirtyBits::empty());
+        assert_eq!(channel.flags, DirtyBits::empty(), "a filter write is not a pitch write");
+    }
+
+    #[test]
+    fn per_tick_flags_are_this_tick_s_writes_and_not_mixer_lifetime_state() {
+        let quiet = recorded_tick(&[], DirtyBits::VOLUME | DirtyBits::PITCH | DirtyBits::SAMPLE);
+        assert_eq!(quiet.flags, DirtyBits::empty(), "a tick with no writes reports no flags");
+        assert!(quiet.active, "the voice is still live; only its flags are empty");
+
+        let written = recorded_tick(&[VoiceParam::Volume(starplayer_core::U0F16::MAX)], DirtyBits::PITCH);
+        assert_eq!(written.flags, DirtyBits::VOLUME, "only the write that landed this tick is reported");
+    }
 
     #[test]
     fn version_one_text_is_stable_and_line_oriented() {

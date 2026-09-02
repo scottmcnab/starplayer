@@ -132,19 +132,21 @@ function buildZip(entries) {
     return Buffer.concat([...localRecords, centralDirectory, end]);
 }
 
-function syntheticMod() {
+/// A minimal two-pattern MOD. `channels` picks the tag, so the caller can build two
+/// modules that are distinguishable in telemetry by their channel count alone.
+function syntheticMod({ channels = 4, tag = 'M.K.', title = 'headphone test' } = {}) {
     const headerBytes = 1084;
-    const patternBytes = 64 * 4 * 4;
+    const patternBytes = 64 * channels * 4;
     const sampleFrames = 256;
     const bytes = Buffer.alloc(headerBytes + patternBytes * 2 + sampleFrames);
-    bytes.write('headphone test', 0, 'ascii');
+    bytes.write(title, 0, 'ascii');
     bytes.writeUInt16BE(sampleFrames / 2, 42);
     bytes[45] = 64;
     bytes[950] = 2;
     bytes[952] = 0;
     bytes[953] = 1;
-    bytes.write('M.K.', 1080, 'ascii');
-    for (let channel = 0; channel < 4; channel += 1) {
+    bytes.write(tag, 1080, 'ascii');
+    for (let channel = 0; channel < channels; channel += 1) {
         bytes.set([0x01, 0xAC, 0x10, 0x00], headerBytes + channel * 4);
         bytes.set([0x01, 0xAC, 0x10, 0x00], headerBytes + patternBytes + channel * 4);
     }
@@ -452,6 +454,62 @@ async function run(executable, mode) {
         const restoredMod = await page.evaluate(READ_STATE);
         assert.match(await page.evaluate("return localStorage.getItem('starplayer.output-and-mixer.v1');"), /"headphoneFriendlyModPanning":false/, 'the final panning choice is persisted');
         report.modPanning = `${authenticMod.pans.join('-')} → ${headphoneMod.pans.join('-')} → ${restoredMod.pans.join('-')}`;
+
+        // ── the panning toggle must not race a concurrent load (C6a deliverable 4) ──
+        //
+        // The worklet port is a FIFO, so two `loadModule` messages in flight at once are
+        // decided by posting order, not by which handler resolves first. Before the fix
+        // the toggle reused `state.moduleRevision` instead of claiming one, and the load
+        // that resolved second painted its metadata over the module that was sounding:
+        // the page showed the six-channel module while the four-channel one played.
+        //
+        // The toggle is dispatched from inside the page, in the task right after the load
+        // hands its bytes to the worklet, so the window does not depend on round-trip
+        // timing. The six-channel module makes the mismatch observable: the channel table
+        // is sized from telemetry, the module line from the page's own metadata.
+        const raceModule = Buffer.from(syntheticMod({ channels: 6, tag: '6CHN', title: 'race test' })).toString('base64');
+        const disabledDuringLoad = await page.evaluate(`
+            const bytes = Uint8Array.from(atob(${JSON.stringify(raceModule)}), (character) => character.charCodeAt(0));
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([bytes], 'race.mod', { type: 'application/octet-stream' }));
+            const picker = document.getElementById('file-picker');
+            const message = document.getElementById('message');
+            const option = document.getElementById('mod-headphone-panning');
+
+            // "Activating race.mod…" is written in the same task that posts the bytes to
+            // the worklet, and a MutationObserver callback is a microtask at the end of
+            // that task — so the toggle below lands after the post and before the reply
+            // can be delivered, without depending on any timing at all.
+            return await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('the raced load never reached activation')), 15000);
+                const observer = new MutationObserver(() => {
+                    if (!message.textContent.includes('Activating race.mod')) return;
+                    observer.disconnect();
+                    clearTimeout(timer);
+                    const wasDisabled = option.disabled;
+                    option.checked = true;
+                    option.dispatchEvent(new Event('change'));
+                    resolve(wasDisabled);
+                });
+                observer.observe(message, { childList: true, characterData: true, subtree: true });
+                picker.files = transfer.files;
+                picker.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+        `);
+        assert.equal(disabledDuringLoad, true, 'the panning option is unavailable while a module load is in flight');
+        await page.waitFor('the raced load and toggle to settle', "document.getElementById('mod-headphone-panning').disabled === false");
+        // Channel pans only refresh when the reloaded module dispatches its next row,
+        // so wait for telemetry that postdates the race rather than reading what the
+        // pre-race module left behind. Both the fixed and the broken outcome change them.
+        await page.waitFor('telemetry after the raced toggle', "[...document.querySelectorAll('#channel-body tr')].map((row) => row.children[4].textContent.trim()).join(',') !== 'LFT,RGT,RGT,LFT'");
+        const raced = await page.evaluate(READ_STATE);
+        const displayedChannels = Number(raced.moduleDetail.match(/(\d+) channels/)?.[1]);
+        assert.equal(raced.pans.length, displayedChannels, `the sounding module has the ${displayedChannels} channels the page displays`);
+        assert.match(raced.moduleDetail, /headphones\.mod/, 'the page shows the module that is actually sounding, not the one whose load lost the race');
+        assert.equal(raced.headphonePanning, true, 'the toggle that won the race is the one the checkbox shows');
+        assert.deepEqual(raced.pans, ['3', 'C', 'C', '3'], 'the sounding module carries the panning the checkbox claims');
+        assert.equal(raced.errorShown, false, 'a raced toggle is not an error');
+        report.panningRace = `ui ${displayedChannels}ch = audio ${raced.pans.length}ch, toggle ${raced.headphonePanning}`;
 
         await loadFixture(page, FIRST_MODULE);
         await page.waitFor('the first module', "document.getElementById('title').textContent !== 'No module loaded'");

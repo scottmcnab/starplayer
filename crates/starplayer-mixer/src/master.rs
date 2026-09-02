@@ -40,7 +40,9 @@
 
 use starplayer_core::U0F16;
 
-use crate::path::{Stereo, round_shift_nearest};
+use starplayer_dsp::round_shift_nearest;
+
+use crate::path::Stereo;
 
 /// What the master bus does to a whole quantum.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

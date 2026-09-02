@@ -5,5 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-starplayer = { workspace = true, features = ["std", "trace"] }
+starplayer = { workspace = true, features = ["std"] }
 starplayer-offline = { workspace = true }
+
+# The whole testkit is the trace differ and the corpus harness built on it, so the crate
+# compiles to nothing without `trace` rather than carrying a second, trace-free half. See
+# `crates/starplayer-offline/Cargo.toml` for why this may not be an ordinary dependency
+# feature.
+[features]
+default = []
+trace = ["starplayer/trace", "starplayer-offline/trace"]
+
+[[bin]]
+name = "starplayer-conformance"
+required-features = ["trace"]

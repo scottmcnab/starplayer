@@ -53,7 +53,7 @@
 //! a run be split anywhere without changing a sample.
 
 use starplayer_core::{I1F15, U0F16};
-use starplayer_dsp::Interpolate;
+use starplayer_dsp::{Interpolate, round_shift_nearest};
 
 use crate::gain::{GAIN_FRACTION_BITS, GAIN_UNITY, voice_gain_units};
 use crate::master::{MasterSettings, process_fixed, process_float};
@@ -162,21 +162,6 @@ impl MixPath for FixedPath {
             *frame = process_fixed(*frame, settings);
         }
     }
-}
-
-/// Remove fractional bits with the canonical fixed-path rule: nearest, with exact
-/// half-way values rounded away from zero. All callers use products small enough that
-/// adding the half-bit cannot overflow the unsigned magnitude.
-pub(crate) const fn round_shift_nearest(value: i64, fractional_bits: u32) -> i64 {
-    if fractional_bits == 0 {
-        return value;
-    }
-    if fractional_bits >= 64 {
-        return 0;
-    }
-    let half = 1u64 << (fractional_bits - 1);
-    let rounded = value.unsigned_abs().saturating_add(half) >> fractional_bits;
-    if value < 0 { -(rounded as i64) } else { rounded as i64 }
 }
 
 /// Gain units to a float multiplier.

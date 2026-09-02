@@ -86,9 +86,45 @@ Two correctness nits found in the same review: `source.rs:116` and `trace.rs:291
 `params.dirty` into the per-tick flags instead of using `entry.writes`.
 
 All four are tracked by
-[M2-task-C6a](../M2-task-C6a-golden-and-build-hygiene.md) deliverables 1, 2 and 3. The
+[M2-task-C6a](M2-task-C6a-golden-and-build-hygiene.md) deliverables 1, 2 and 3. The
 final verification bullet below ("no measurable difference in render throughput") is
 therefore still outstanding.
+
+### Resolved by C6a — 2026-09-02
+
+**Deliverable 2 is now met, by inspection rather than by timing.** Both
+`report_trace_channels` call sites and both definitions carry `#[cfg(feature = "trace")]`,
+and `starplayer-{mod,s3m,mtm}` gained an optional `trace` feature that forwards to
+`starplayer-engine/trace` so the gate has something to read. `cargo xtask ci --job
+trace-zero-cost` compiles `starplayer-mod` and `starplayer-s3m` twice each at
+`--release --lib` with `--emit=asm,llvm-ir` and counts references to the symbol. Measured
+on the landing commit:
+
+| package | `trace` off | `trace` on |
+|---|---|---|
+| `starplayer-mod` | 0 | 19 |
+| `starplayer-s3m` | 0 | 13 |
+
+The second column is the control: an absent symbol only means something once the same scan
+finds it when the loop is compiled in. A timing benchmark was rejected in favour of this —
+the loop is a handful of instructions per channel per tick, which is below the noise floor
+of any dependency-free wall-clock measurement, so a green benchmark would have proved
+less than the counts above.
+
+**The `trace` feature no longer leaks.** `starplayer-offline` and `starplayer-testkit`
+declare `trace` as an optional feature and put `required-features = ["trace"]` on
+`starplayer-trace` and `starplayer-conformance`; the testkit library itself is
+`#![cfg(feature = "trace")]`, since a `required-features` binary alone leaves the library
+edge unconditional. `cargo xtask ci --job host-tests` now asks `cargo tree --edges
+features --workspace` whether `trace` resolved on, and runs `starplayer-{engine,offline,testkit}`
+a second time with the feature on so the recorder still has test coverage.
+
+**Both correctness nits are fixed.** `VoiceParam::Filter` reports **no** dirty bit —
+`starplayer_engine::trace::dirty_bit_for` returns `Option<DirtyBits>` and is the single
+mapping both call sites use — because the original's `_CHN_*` set has no filter bit and
+the version 1 text format has no letter for one. Per-tick flags are `entry.writes` alone;
+the mixer-lifetime `voice.params.dirty` is no longer unioned in, so a tick with no writes
+reports `fl=-`.
 
 ## Out of scope
 

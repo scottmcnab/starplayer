@@ -11,7 +11,9 @@ use alloc::vec;
 use starplayer_core::fixed::unit_from_ratio;
 use starplayer_core::tables::{PERIOD_TABLE, ST3_FREQUENCY_NUMERATOR, ST3_PERIOD_SCALE, waveform_sample};
 use starplayer_core::{ChannelId, DirtyBits, Frame, InstrumentId, Note, Step, TempoModel, U0F16, VoiceParams};
-use starplayer_engine::{EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TraceChannelState, TrackerProcessor};
+use starplayer_engine::{EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
+#[cfg(any(feature = "trace", test))]
+use starplayer_engine::TraceChannelState;
 use starplayer_mixer::{LoopSpan, SampleRegion, VoiceTag};
 use starplayer_model::{EffectNames, LoopMode, Module, OrderEntry as ModelOrderEntry};
 use starplayer_rt::Arc;
@@ -607,12 +609,19 @@ impl S3mProcessor {
         self.channels[channel_index].pending_dirty = DirtyBits::empty();
     }
 
+    /// Feed the diagnostic per-tick trace.
+    ///
+    /// Gated, not merely a no-op call: the loop walks every channel and resolves each
+    /// one's model sample through an instrument lookup, and that work would otherwise run
+    /// inside `render()` on every tracker tick of a shipping build.
+    #[cfg(feature = "trace")]
     fn report_trace_channels(&self, context: &mut TickContext<'_>) {
         for (channel_index, state) in self.channels.iter().enumerate() {
             context.report_trace_channel(ChannelId(channel_index as u16), self.trace_channel_state(state));
         }
     }
 
+    #[cfg(any(feature = "trace", test))]
     fn trace_channel_state(&self, state: &S3mChannel) -> TraceChannelState {
         let note = (state.current_note != 0).then_some(linear_note(state.current_note));
         let instrument = if state.sample_number == NO_SAMPLE { 0 } else { state.sample_number as u16 };
@@ -663,6 +672,7 @@ impl TrackerProcessor for S3mProcessor {
             self.clip_pitch(channel_index);
         }
         for channel_index in 0..self.channels.len() { self.flush_channel(context, channel_index); }
+        #[cfg(feature = "trace")]
         self.report_trace_channels(context);
         outcome
     }
@@ -675,6 +685,7 @@ impl TrackerProcessor for S3mProcessor {
             self.clip_pitch(channel_index);
             self.flush_channel(context, channel_index);
         }
+        #[cfg(feature = "trace")]
         self.report_trace_channels(context);
         outcome
     }

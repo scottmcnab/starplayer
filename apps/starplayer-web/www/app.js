@@ -441,8 +441,17 @@ function activateModuleOnNode(node, buffer, headphoneFriendlyModPanning = elemen
     const requestId = state.nextRequestId++;
     return new Promise((resolve, reject) => {
         state.pendingLoads.set(requestId, { resolve, reject });
+        updateModPanningAvailability();
         node.port.postMessage({ type: 'loadModule', requestId, bytes: buffer, headphoneFriendlyModPanning }, [buffer]);
     });
+}
+
+/// The panning toggle reloads the module the page is holding. Doing that while another
+/// load is already in flight interleaves two `loadModule` messages on one FIFO port, so
+/// the option is unavailable until the port is quiet again — on the error path too, which
+/// is why this reads the map rather than being set and cleared by hand.
+function updateModPanningAvailability() {
+    elements.modHeadphonePanning.disabled = state.pendingLoads.size > 0 || state.panningReloadInProgress;
 }
 
 function onWorkletMessage(message, node) {
@@ -463,6 +472,7 @@ function onWorkletMessage(message, node) {
         const pending = state.pendingLoads.get(message.requestId);
         if (pending) {
             state.pendingLoads.delete(message.requestId);
+            updateModPanningAvailability();
             if (message.type === 'moduleLoaded') pending.resolve(message);
             else pending.reject(new Error(message.reason));
         }
@@ -576,18 +586,21 @@ async function applyModPanningPreference() {
     }
 
     const previous = state.activeModHeadphonePanning;
-    const revision = state.moduleRevision;
+    // Claim a revision exactly as the load path does. Reusing the current value let a
+    // concurrent load and this reload both believe they were last: the port is a FIFO, so
+    // the module posted second is the one that sounds, and whichever handler ran second
+    // would then paint the other module's metadata over it.
+    const revision = ++state.moduleRevision;
     const node = state.node;
     const restoreCommands = playbackRestoreCommands();
     state.panningReloadInProgress = true;
     state.panningReloadRequested = requested;
-    elements.modHeadphonePanning.disabled = true;
+    updateModPanningAvailability();
     clearError();
     showMessage(`Reloading this MOD with ${requested ? 'S3M-style 60% spacing' : 'authentic hard panning'}…`);
     try {
         const activation = await activateModuleOnNode(node, state.currentModuleBytes.slice(0), requested);
         if (revision !== state.moduleRevision || node !== state.node) return;
-        state.moduleRevision += 1;
         state.activeModHeadphonePanning = requested;
         state.activationMemoryBytes = activation.memoryBytes;
         state.loadCount += 1;
@@ -597,16 +610,19 @@ async function applyModPanningPreference() {
         setTimeout(requestGarbageCollection, 100);
         setTimeout(requestGarbageCollection, 500);
     } catch (error) {
+        // The preference was persisted before the reload was attempted, so it has to be
+        // put back whatever else has happened since — a revision check here would leave a
+        // failed toggle stored as the user's choice for every future session.
+        elements.modHeadphonePanning.checked = previous;
+        persistPreferences();
         if (revision === state.moduleRevision && node === state.node) {
-            elements.modHeadphonePanning.checked = previous;
-            persistPreferences();
             showError(`Could not change MOD panning: ${error && error.message ? error.message : error}`);
             showMessage(`Still playing ${state.metadata.title} with ${previous ? 'headphone-friendly 60% spacing' : 'authentic hard panning'}.`);
         }
     } finally {
         state.panningReloadInProgress = false;
         state.panningReloadRequested = false;
-        elements.modHeadphonePanning.disabled = false;
+        updateModPanningAvailability();
     }
 }
 

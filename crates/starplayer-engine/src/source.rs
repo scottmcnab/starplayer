@@ -111,12 +111,9 @@ impl<'engine> EngineContext<'engine> {
         let Some(state) = self.voices.get_mut(voice) else { return };
         param.apply(&mut state.params);
         #[cfg(feature = "trace")]
-        if let (Some(trace), Some(channel)) = (self.trace.as_deref_mut(), channel) {
-            let flag = match param {
-                VoiceParam::Step(_) | VoiceParam::Filter(_) => starplayer_core::DirtyBits::PITCH,
-                VoiceParam::Volume(_) => starplayer_core::DirtyBits::VOLUME,
-                VoiceParam::Pan(_) => starplayer_core::DirtyBits::PAN,
-            };
+        if let (Some(trace), Some(channel)) = (self.trace.as_deref_mut(), channel)
+            && let Some(flag) = crate::trace::dirty_bit_for(param)
+        {
             trace.record_channel_flags(starplayer_core::ChannelId(channel as u16), flag);
         }
     }

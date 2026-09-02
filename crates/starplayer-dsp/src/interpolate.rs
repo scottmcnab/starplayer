@@ -102,7 +102,13 @@ impl Interpolate for Linear {
 
 /// Remove fractional bits with the canonical fixed-mixer rounding rule: nearest, with
 /// exact half-way values rounded away from zero.
-const fn round_shift_nearest(value: i64, fractional_bits: u32) -> i64 {
+///
+/// This is the single definition of that rule for the whole engine. `starplayer-mixer`
+/// applies it to gains, to the master bus and to every host output conversion; it lives
+/// here, in the lower crate, so the interpolator and the mixer cannot drift apart.
+/// All callers use products small enough that adding the half-bit cannot overflow the
+/// unsigned magnitude.
+pub const fn round_shift_nearest(value: i64, fractional_bits: u32) -> i64 {
     if fractional_bits == 0 {
         return value;
     }

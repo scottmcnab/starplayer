@@ -67,7 +67,7 @@ fixed-mix = ["starplayer-dsp/fixed-mix", "starplayer-mixer/fixed-mix", "starplay
 linear-interp = ["starplayer-dsp/linear-interp", "starplayer-mixer/linear-interp", "starplayer-engine/linear-interp"]
 
 telemetry = ["dep:starplayer-telemetry", "starplayer-engine/telemetry"]
-trace = ["starplayer-engine/trace"]
+trace = ["starplayer-engine/trace", "starplayer-mod?/trace", "starplayer-s3m?/trace", "starplayer-mtm?/trace"]
 
 quirks-starplayer = [
     "starplayer-mod?/quirks-starplayer",

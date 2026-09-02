@@ -40,7 +40,9 @@
 
 use core::marker::PhantomData;
 
-use crate::path::{FixedFrame, FloatFrame, round_shift_nearest};
+use starplayer_dsp::round_shift_nearest;
+
+use crate::path::{FixedFrame, FloatFrame};
 
 /// A 24-bit sample, sign-extended into an `i32`.
 ///

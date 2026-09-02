@@ -11,16 +11,31 @@
 
 use std::fmt;
 
-use starplayer::core::{Error, ExactFixedPoint, Frame, Interpolator};
-use starplayer::dsp::Linear;
-use starplayer::engine::{EndOfSongPolicy, Engine, EngineSettings, EngineWarnings, EventSource, PatternSequencer, SequencerSettings, Trace};
-use starplayer::mixer::{FixedPath, FloatPath, Limiter, MixPath, MonoF32, MonoI16, OutputFormat, StereoI16};
-use starplayer::model::{Module, ModuleFormat};
+use starplayer::core::{Error, ExactFixedPoint, Interpolator};
+use starplayer::dsp::{Interpolate, Linear, Nearest};
+use starplayer::engine::{Engine, EngineSettings, EngineWarnings, EventSource};
+use starplayer::mixer::{FixedPath, FloatPath, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
+use starplayer::model::Module;
 use starplayer::rt::Arc;
+
+// The per-tick trace is a diagnostic build only. Everything it needs sits behind the
+// `trace` feature, so an ordinary `cargo test --workspace` — and every golden render —
+// compiles the engine without the recorder in its render path.
+#[cfg(feature = "trace")]
+use starplayer::core::Frame;
+#[cfg(feature = "trace")]
+use starplayer::engine::{EndOfSongPolicy, PatternSequencer, SequencerSettings, Trace};
+#[cfg(any(feature = "trace", test))]
+use starplayer::mixer::StereoI16;
+#[cfg(feature = "trace")]
+use starplayer::model::ModuleFormat;
 
 use sha2::{Digest, Sha256};
 
+pub mod fixtures;
+
 /// Output rate used by diagnostic traces and the future canonical golden renderer.
+#[cfg(feature = "trace")]
 pub const TRACE_SAMPLE_RATE_HZ: u32 = 44_100;
 
 /// The only rate in the canonical audio-golden contract.
@@ -48,9 +63,11 @@ pub const SEGMENTAL_SNR_FRAMES: usize = 1_024;
 pub const MIN_FLOAT_FIXED_SEGMENTAL_SNR_DB: f64 = 60.0;
 
 /// Guard against a malformed module whose control flow never reaches its end marker.
+#[cfg(feature = "trace")]
 pub const MAX_CAPTURE_TICKS: usize = 1_000_000;
 
 /// Knobs for deterministic trace capture.
+#[cfg(feature = "trace")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TraceOptions {
     /// Stop after this many ticks. `None` follows the module until its end marker.
@@ -59,11 +76,13 @@ pub struct TraceOptions {
     pub host_block_frames: usize,
 }
 
+#[cfg(feature = "trace")]
 impl Default for TraceOptions {
     fn default() -> TraceOptions { TraceOptions { ticks: None, host_block_frames: 128 } }
 }
 
 /// Failure to load or finish a diagnostic trace.
+#[cfg(feature = "trace")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TraceError {
     /// No enabled native loader accepted the input.
@@ -72,23 +91,56 @@ pub enum TraceError {
     TickLimit,
 }
 
+/// A format that has a canonical golden render.
+///
+/// The variant, the loader, the sequencer and the `goldens/<format>/` directory are
+/// chosen together here so a fixture cannot be rendered through the wrong processor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GoldenFormat {
+    Mod,
+    S3m,
+    Mtm,
+}
+
+impl GoldenFormat {
+    /// Every format the golden contract covers.
+    pub const ALL: [GoldenFormat; 3] = [GoldenFormat::Mod, GoldenFormat::S3m, GoldenFormat::Mtm];
+
+    /// The `goldens/<format>/` directory this format's hashes live in.
+    pub const fn directory(self) -> &'static str {
+        match self {
+            GoldenFormat::Mod => "mod",
+            GoldenFormat::S3m => "s3m",
+            GoldenFormat::Mtm => "mtm",
+        }
+    }
+}
+
+impl fmt::Display for GoldenFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(self.directory()) }
+}
+
 /// Failure to produce a canonical audio render.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RenderError {
-    /// The S3M loader rejected the input.
+    /// The format's loader rejected the input.
     Load(Error),
     /// The fresh engine's command queue could not accept its module.
     CommandQueue,
     /// The engine's safety guards fired during the supposedly canonical segment.
     EngineWarnings(EngineWarnings),
+    /// [`GOLDEN_INTERPOLATOR`] names a kernel this build has no implementation for.
+    /// The filename would promise audio the renderer cannot produce, so it refuses.
+    UnimplementedInterpolator(Interpolator),
 }
 
 impl fmt::Display for RenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RenderError::Load(error) => write!(formatter, "could not load S3M module: {error}"),
+            RenderError::Load(error) => write!(formatter, "could not load module: {error}"),
             RenderError::CommandQueue => write!(formatter, "fresh offline engine rejected its module command"),
             RenderError::EngineWarnings(warnings) => write!(formatter, "offline render raised engine warnings: {warnings:?}"),
+            RenderError::UnimplementedInterpolator(kernel) => write!(formatter, "GOLDEN_INTERPOLATOR names {kernel:?}, which has no kernel in this build"),
         }
     }
 }
@@ -99,6 +151,7 @@ impl From<Error> for RenderError {
     fn from(error: Error) -> RenderError { RenderError::Load(error) }
 }
 
+#[cfg(feature = "trace")]
 impl fmt::Display for TraceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -108,36 +161,39 @@ impl fmt::Display for TraceError {
     }
 }
 
+#[cfg(feature = "trace")]
 impl std::error::Error for TraceError {}
 
+#[cfg(feature = "trace")]
 impl From<Error> for TraceError {
     fn from(error: Error) -> TraceError { TraceError::Load(error) }
 }
 
+#[cfg(feature = "trace")]
 type TraceEngine = Engine<FixedPath, Linear, StereoI16, Arc<Module>>;
 
 /// Render the canonical fixed-path segment at an arbitrary host block size.
 ///
-/// The path is exactly the filename contract: fixed-point voice accumulation, linear
-/// interpolation, mono `i16`, 44.1 kHz, no dither, and the nonlinear master limiter
-/// bypassed in favour of a transparent clamp. Per-channel DSP is currently a no-op; when
-/// the graph lands, this entry point remains its explicit bypass boundary.
-pub fn render_s3m_fixed_mono(bytes: &[u8], host_block_frames: usize) -> Result<Vec<i16>, RenderError> {
-    render_s3m::<FixedPath, MonoI16>(bytes, GOLDEN_RENDER_FRAMES, host_block_frames)
+/// The path is exactly the filename contract: fixed-point voice accumulation, the kernel
+/// [`GOLDEN_INTERPOLATOR`] names, mono `i16`, 44.1 kHz, no dither, and the nonlinear
+/// master limiter bypassed in favour of a transparent clamp. Per-channel DSP is currently
+/// a no-op; when the graph lands, this entry point remains its explicit bypass boundary.
+pub fn render_fixed_mono(format: GoldenFormat, bytes: &[u8], host_block_frames: usize) -> Result<Vec<i16>, RenderError> {
+    render_golden::<FixedPath, MonoI16>(format, bytes, GOLDEN_RENDER_FRAMES, host_block_frames)
 }
 
 /// Render the float path with the same rate, duration, interpolation, mono fold-down and
-/// DSP bypass as [`render_s3m_fixed_mono`].
-pub fn render_s3m_float_mono(bytes: &[u8], host_block_frames: usize) -> Result<Vec<f32>, RenderError> {
-    render_s3m::<FloatPath, MonoF32>(bytes, GOLDEN_RENDER_FRAMES, host_block_frames)
+/// DSP bypass as [`render_fixed_mono`].
+pub fn render_float_mono(format: GoldenFormat, bytes: &[u8], host_block_frames: usize) -> Result<Vec<f32>, RenderError> {
+    render_golden::<FloatPath, MonoF32>(format, bytes, GOLDEN_RENDER_FRAMES, host_block_frames)
 }
 
 /// SHA-256 over the canonical samples encoded as little-endian signed PCM words.
 ///
 /// Hashing an explicit byte order, rather than the in-memory representation of `i16`, is
 /// what lets x86-64, aarch64 and wasm32 compare the same digest.
-pub fn canonical_s3m_sha256(bytes: &[u8], host_block_frames: usize) -> Result<[u8; 32], RenderError> {
-    let samples = render_s3m_fixed_mono(bytes, host_block_frames)?;
+pub fn canonical_sha256(format: GoldenFormat, bytes: &[u8], host_block_frames: usize) -> Result<[u8; 32], RenderError> {
+    let samples = render_fixed_mono(format, bytes, host_block_frames)?;
     let mut hasher = Sha256::new();
     for sample in samples {
         hasher.update(sample.to_le_bytes());
@@ -146,6 +202,21 @@ pub fn canonical_s3m_sha256(bytes: &[u8], host_block_frames: usize) -> Result<[u
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&digest);
     Ok(hash)
+}
+
+/// The S3M-only spelling C6 shipped, kept so existing callers and tests read unchanged.
+pub fn render_s3m_fixed_mono(bytes: &[u8], host_block_frames: usize) -> Result<Vec<i16>, RenderError> {
+    render_fixed_mono(GoldenFormat::S3m, bytes, host_block_frames)
+}
+
+/// The S3M-only spelling of [`render_float_mono`].
+pub fn render_s3m_float_mono(bytes: &[u8], host_block_frames: usize) -> Result<Vec<f32>, RenderError> {
+    render_float_mono(GoldenFormat::S3m, bytes, host_block_frames)
+}
+
+/// The S3M-only spelling of [`canonical_sha256`].
+pub fn canonical_s3m_sha256(bytes: &[u8], host_block_frames: usize) -> Result<[u8; 32], RenderError> {
+    canonical_sha256(GoldenFormat::S3m, bytes, host_block_frames)
 }
 
 /// Lower-case hexadecimal representation used by `.sha256` files and cross-target logs.
@@ -217,12 +288,31 @@ pub fn segmental_snr_db(fixed: &[i16], float: &[f32], segment_frames: usize) -> 
     if compared_segments == 0 { None } else { Some(total_db / compared_segments as f64) }
 }
 
-fn render_s3m<Path, Out>(bytes: &[u8], frames: usize, host_block_frames: usize) -> Result<Vec<Out::Sample>, RenderError>
+/// Dispatch the canonical render on [`GOLDEN_INTERPOLATOR`].
+///
+/// This `match` is the whole point of the constant: the same value that names the golden
+/// file selects the kernel that produces its bytes, so the two cannot disagree. Adding a
+/// kernel to `starplayer-dsp` means adding one arm here, and nothing else in this crate
+/// may name an interpolator type.
+fn render_golden<Path, Out>(format: GoldenFormat, bytes: &[u8], frames: usize, host_block_frames: usize) -> Result<Vec<Out::Sample>, RenderError>
 where
     Path: MixPath,
     Out: OutputFormat<Accumulator = Path::Accumulator>,
 {
-    let module = Arc::new(starplayer::s3m::load(bytes)?);
+    match GOLDEN_INTERPOLATOR {
+        Interpolator::None => render_with_kernel::<Path, Nearest, Out>(format, bytes, frames, host_block_frames),
+        Interpolator::Linear => render_with_kernel::<Path, Linear, Out>(format, bytes, frames, host_block_frames),
+        kernel => Err(RenderError::UnimplementedInterpolator(kernel)),
+    }
+}
+
+fn render_with_kernel<Path, Interp, Out>(format: GoldenFormat, bytes: &[u8], frames: usize, host_block_frames: usize) -> Result<Vec<Out::Sample>, RenderError>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let module = Arc::new(load_golden(format, bytes)?);
     let channel_count = module.header().channel_count as usize;
     let settings = EngineSettings {
         sample_rate_hz: GOLDEN_SAMPLE_RATE_HZ,
@@ -230,10 +320,10 @@ where
         voice_capacity: channel_count.max(1),
         ..EngineSettings::default()
     };
-    let mut engine: Engine<Path, Linear, Out, Arc<Module>> = Engine::with_settings(settings);
+    let mut engine: Engine<Path, Interp, Out, Arc<Module>> = Engine::with_settings(settings);
     let mut control = engine.take_control().ok_or(RenderError::CommandQueue)?;
     control.load_module(Arc::clone(&module)).map_err(|_| RenderError::CommandQueue)?;
-    engine.set_source(Box::new(starplayer::s3m::sequencer_for(module, GOLDEN_SAMPLE_RATE_HZ, ExactFixedPoint)));
+    engine.set_source(golden_source(format, module));
     engine.set_limiter(Limiter::Clamp);
 
     let output_samples = frames.saturating_mul(Out::CHANNELS);
@@ -246,27 +336,48 @@ where
     if warnings.any() { Err(RenderError::EngineWarnings(warnings)) } else { Ok(output) }
 }
 
+fn load_golden(format: GoldenFormat, bytes: &[u8]) -> Result<Module, Error> {
+    match format {
+        GoldenFormat::Mod => starplayer::mod_file::load(bytes),
+        GoldenFormat::S3m => starplayer::s3m::load(bytes),
+        GoldenFormat::Mtm => starplayer::mtm::load(bytes),
+    }
+}
+
+fn golden_source(format: GoldenFormat, module: Arc<Module>) -> Box<dyn EventSource> {
+    match format {
+        GoldenFormat::Mod => Box::new(starplayer::mod_file::sequencer_for(module, GOLDEN_SAMPLE_RATE_HZ, ExactFixedPoint)),
+        GoldenFormat::S3m => Box::new(starplayer::s3m::sequencer_for(module, GOLDEN_SAMPLE_RATE_HZ, ExactFixedPoint)),
+        GoldenFormat::Mtm => Box::new(starplayer::mtm::sequencer_for(module, GOLDEN_SAMPLE_RATE_HZ, ExactFixedPoint)),
+    }
+}
+
 /// Autodetect a supported module and capture its stable per-tick trace with that format's
 /// native processor.
+#[cfg(feature = "trace")]
 pub fn trace_module(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
     trace_loaded(Arc::new(starplayer::load(bytes)?), options)
 }
 
 /// Load an S3M and capture its stable per-tick trace.
+#[cfg(feature = "trace")]
 pub fn trace_s3m(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
     trace_loaded(Arc::new(starplayer::s3m::load(bytes)?), options)
 }
 
 /// Load a MOD and capture its stable per-tick trace through the ProTracker processor.
+#[cfg(feature = "trace")]
 pub fn trace_mod(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
     trace_loaded(Arc::new(starplayer::mod_file::load(bytes)?), options)
 }
 
 /// Load an MTM and capture its stable per-tick trace through the MultiTracker processor.
+#[cfg(feature = "trace")]
 pub fn trace_mtm(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
     trace_loaded(Arc::new(starplayer::mtm::load(bytes)?), options)
 }
 
+#[cfg(feature = "trace")]
 fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, TraceError> {
     let channel_count = module.header().channel_count as usize;
     let engine_settings = EngineSettings {
@@ -343,6 +454,7 @@ mod tests {
         ("REFLEX.S3M", REFLEX),
     ];
 
+    #[cfg(feature = "trace")]
     fn minimal_mod() -> Vec<u8> {
         let mut bytes = vec![0; 1084 + 64 * 4 * 4 + 256];
         bytes[..10].copy_from_slice(b"native mod");
@@ -377,6 +489,7 @@ mod tests {
         bytes
     }
 
+    #[cfg(feature = "trace")]
     fn mtm_with_a_mod_tag_collision() -> Vec<u8> {
         const TRACK_COUNT: usize = 5;
         const TRACK_OFFSET: usize = 66 + 128;
@@ -391,6 +504,7 @@ mod tests {
         bytes
     }
 
+    #[cfg(feature = "trace")]
     fn trace_with_block_size(host_block_frames: usize) -> Trace {
         trace_s3m(REFLEX, TraceOptions { ticks: Some(24), host_block_frames }).expect("REFLEX traces")
     }
@@ -414,6 +528,7 @@ mod tests {
         output
     }
 
+    #[cfg(feature = "trace")]
     #[test]
     fn a_trace_is_repeatable_and_host_block_size_independent() {
         let first = trace_with_block_size(128).to_text();
@@ -425,6 +540,7 @@ mod tests {
 
     #[test]
     fn the_canonical_render_and_hash_are_repeatable_at_every_host_block_size() {
+        assert_eq!(GOLDEN_INTERPOLATOR, Interpolator::Linear, "the canonical kernel is the one the filenames name");
         assert_eq!(golden_filename("reflex"), "reflex__i16_mono_44100_linear.sha256");
         assert_eq!(golden_filename_for_interpolator("reflex", Interpolator::Linear), golden_filename("reflex"));
         assert_eq!(golden_filename_for_interpolator("reflex", Interpolator::None), "reflex__i16_mono_44100_nearest.sha256");
@@ -450,6 +566,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "trace")]
     #[test]
     fn native_mod_trace_is_repeatable_and_host_block_size_independent() {
         let module = minimal_mod();
@@ -461,6 +578,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "trace")]
     #[test]
     fn native_mtm_trace_is_repeatable_and_host_block_size_independent() {
         let module = minimal_mtm();
@@ -472,6 +590,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "trace")]
     #[test]
     fn generic_trace_dispatch_prefers_strong_mtm_magic_over_a_mod_tag_collision() {
         let module = mtm_with_a_mod_tag_collision();
@@ -479,6 +598,32 @@ mod tests {
         assert_eq!(starplayer::probe(&module), Some(ModuleFormat::Mtm));
         let options = TraceOptions { ticks: Some(4), host_block_frames: 128 };
         assert_eq!(trace_module(&module, options).expect("generic MTM trace"), trace_mtm(&module, options).expect("native MTM trace"));
+    }
+
+    #[test]
+    fn every_golden_format_renders_audibly_and_hashes_identically_at_every_block_size() {
+        let synthetic_mod = fixtures::synthetic_mod();
+        let synthetic_mtm = fixtures::synthetic_mtm();
+        let corpus: &[(GoldenFormat, &str, &[u8])] = &[
+            (GoldenFormat::Mod, "synthetic", &synthetic_mod),
+            (GoldenFormat::S3m, "REFLEX.S3M", REFLEX),
+            (GoldenFormat::Mtm, "synthetic", &synthetic_mtm),
+        ];
+        for &(format, name, bytes) in corpus {
+            let reference = render_fixed_mono(format, bytes, GOLDEN_HOST_BLOCK_FRAMES).expect("the fixture renders");
+            assert_eq!(reference.len(), GOLDEN_RENDER_FRAMES, "{format} {name}: the canonical segment is ten seconds of mono");
+            assert!(reference.iter().any(|sample| *sample != 0), "{format} {name}: the canonical segment is not silent");
+            let reference_hash = canonical_sha256(format, bytes, GOLDEN_HOST_BLOCK_FRAMES).expect("the fixture hashes");
+            for host_block_frames in [1, 3, 64, 128, 4096, 8191] {
+                assert_eq!(canonical_sha256(format, bytes, host_block_frames).expect("the fixture hashes"), reference_hash, "{format} {name}: host block size {host_block_frames} changed the canonical hash");
+            }
+        }
+    }
+
+    #[test]
+    fn the_golden_formats_and_their_directories_are_distinct() {
+        assert_eq!(GoldenFormat::ALL.map(GoldenFormat::directory), ["mod", "s3m", "mtm"]);
+        assert_eq!(GoldenFormat::S3m.to_string(), "s3m");
     }
 
     #[test]

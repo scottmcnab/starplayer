@@ -7,7 +7,9 @@ use alloc::vec::Vec;
 
 use starplayer_core::fixed::{bipolar_from_ratio, unit_from_ratio};
 use starplayer_core::{ChannelId, DirtyBits, Frame, I1F15, InstrumentId, Note, Step, TempoModel, U0F16, VoiceParams};
-use starplayer_engine::{EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TraceChannelState, TrackerProcessor};
+use starplayer_engine::{EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
+#[cfg(feature = "trace")]
+use starplayer_engine::TraceChannelState;
 use starplayer_mixer::{LoopSpan, SampleRegion, VoiceTag};
 use starplayer_model::{EffectNames, LoopMode, Module, OrderEntry as ModelOrderEntry};
 use starplayer_rt::Arc;
@@ -730,6 +732,9 @@ impl ModProcessor {
         }
     }
 
+    /// Feed the diagnostic per-tick trace. Gated for the same reason as the S3M
+    /// processor's: the loop runs once per channel per tracker tick inside `render()`.
+    #[cfg(feature = "trace")]
     fn report_trace_channels(&self, context: &mut TickContext<'_>) {
         for (channel_index, state) in self.channels.iter().enumerate() {
             let sample = if state.sample_number == NO_SAMPLE { 0 } else { state.sample_number as u16 };
@@ -776,6 +781,7 @@ impl ModProcessor {
         for channel_index in 0..self.channels.len() {
             self.flush_channel(context, channel_index);
         }
+        #[cfg(feature = "trace")]
         self.report_trace_channels(context);
         outcome
     }
@@ -798,6 +804,7 @@ impl TrackerProcessor for ModProcessor {
             self.minor_effect(channel_index, local_tick, repeat_zero);
             self.flush_channel(context, channel_index);
         }
+        #[cfg(feature = "trace")]
         self.report_trace_channels(context);
         outcome
     }
@@ -893,6 +900,7 @@ fn finetune_from_rate(rate: u32) -> u8 {
 }
 
 fn pan_byte(value: u8) -> I1F15 { bipolar_from_ratio(value as i32 * 2 - 255, 255) }
+#[cfg(feature = "trace")]
 fn pan_trace(pan: I1F15) -> u16 {
     let scaled = ((pan.to_bits() as i32 + 32_768) * 255 + 32_767) / 65_535;
     scaled.clamp(0, 255) as u16

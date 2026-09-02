@@ -269,6 +269,6 @@ mod tests {
     fn unity_fits_a_signed_32_bit_gain() {
         assert_eq!(GAIN_UNITY, 2_147_385_345);
         const { assert!(GAIN_UNITY < i32::MAX, "the gain-unit space must not overflow the ramp's i32") };
-        assert_eq!(crate::path::round_shift_nearest(GAIN_UNITY as i64, GAIN_FRACTION_BITS), 32_767, "C6 rounds the full gain-unit range to Q15 unity");
+        assert_eq!(starplayer_dsp::round_shift_nearest(GAIN_UNITY as i64, GAIN_FRACTION_BITS), 32_767, "C6 rounds the full gain-unit range to Q15 unity");
     }
 }

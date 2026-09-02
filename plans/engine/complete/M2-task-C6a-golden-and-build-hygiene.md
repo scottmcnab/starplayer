@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) |
-| Status | Outstanding |
+| Status | Landed |
 | Depends on | C6 (fixed-point mixer, goldens), C1 (trace feature), C3a (web panning toggle) |
 | Blocks | M2 exit (criteria 2 and 4) |
 | Parallel with | C2a, C3b, C9 |
@@ -181,6 +181,44 @@ stated.
 4. Whether the headless web test in deliverable 4 fits the existing web test harness or
    needs a new one. Prefer the existing one.
 
+## Research resolution and implementation contract
+
+1. **`required-features` alone is not enough.** `cargo tree --edges features --workspace`
+   is the check that decides it, and it says so: with `trace` declared as an ordinary
+   dependency feature the default workspace resolution carries nine `feature "trace"`
+   edges; with it optional, zero. But `starplayer-testkit`'s **library** is the trace
+   differ — every item in it names `starplayer::engine::Trace` — so a `required-features`
+   binary would leave the library edge unconditional. The library therefore carries
+   `#![cfg(feature = "trace")]` and compiles to nothing without it.
+   `starplayer-offline` keeps a real trace-free half (the golden renderer), so there the
+   trace items are gated individually. `cargo xtask ci --job host-tests` now runs the
+   `cargo tree` check itself, and runs `starplayer-{engine,offline,testkit}` a second time
+   with `trace` on so the recorder keeps its test coverage.
+2. **Synthesised fixtures, not the pinned corpus.** The corpus route is cheaper, but it
+   binds the golden job to a cached download and to a corpus revision, and the goldens
+   have to run on the ARM64 runner and under Wasmtime where that cache is the awkward part.
+   Committing a generator instead keeps the golden job input-free on all three targets and
+   survives a repin. The cost — the fixtures were never played by a real tracker, so the
+   hashes are a mixer-regression contract rather than an accuracy one — is acceptable
+   because accuracy is the conformance harness's job, and it is recorded in the generator's
+   module comment.
+3. **Nothing contracts, so the flag's effect is not observable — the claim is weakened.**
+   Building `starplayer-mixer` or `starplayer-dsp` at `--release --lib -C target-feature=+fma`
+   with `-fp-contract=off` stripped from `RUSTFLAGS` produces exactly the same output as
+   with it: zero fused mnemonics, the same float multiplies, no `contract` marker. rustc
+   emits no `contract` fast-math flags and LLVM's default policy will not fuse without
+   them. C6's "proves it took effect" has been corrected in
+   `complete/M2-task-C6-fixed-point-mixer.md`. A control that *does* exist replaces it:
+   re-running the audit with `-fp-contract=fast`, which fuses regardless of the IR, must
+   find a fused mnemonic — and does. That separates "no fusion happened" from "the scan is
+   looking in the wrong file".
+4. **The existing headless harness fits.** The new race check is a section of
+   `apps/starplayer-web/test/headless.mjs` and runs in all three of its modes. Making it
+   deterministic needed no new harness, only a different hook: the toggle is dispatched
+   from a `MutationObserver` callback on the status line, which is a microtask at the end
+   of the same task that posts the load to the worklet, so it always lands after the post
+   and before the reply.
+
 ## Verification
 
 - `cargo test --workspace` passes with `trace` **off**, proven by `cargo tree -e features`.
@@ -201,3 +239,28 @@ stated.
 Any effect-accuracy change in any format processor (C3b, C9). Harness comparator repairs
 (C2a). SIMD or new interpolators (M7). Adding new CI targets beyond the three C6 already
 names.
+
+## Post-landing notes (2026-09-02)
+
+All ten deliverables landed on branch `m2-c6a`; `cargo xtask ci` passes every job,
+including the new `trace-zero-cost` job. Where the outcome differed from the text above:
+
+- **Deliverable 7's negative control cannot strip the flag.** Measured on the pinned
+  toolchain, removing `-fp-contract=off` changes nothing: rustc emits no `contract`
+  fast-math flags and LLVM's default policy does not fuse without them. The control
+  instead forces `-fp-contract=fast` on `starplayer-mixer` and requires the scan to find a
+  fused mnemonic, which proves the scan works. C6's "proves the flag took effect" claim
+  is withdrawn in its task file; the flag is defence in depth. `starplayer-dsp` alone
+  codegens no float (all generic), so its pass is scanned but not required to see a
+  multiply.
+- **Deliverable 3**: a filter write reports no flag rather than a new bit, because the
+  v1 text format has no letter for one and adding a bit would bump the format version.
+- **Deliverable 5** took the synthesised-fixture route; the generator is
+  `crates/starplayer-offline/src/fixtures.rs`. The MOD and MTM hashes are regression
+  contracts, not accuracy ones, and will legitimately move when C3b changes ProTracker
+  behaviour those fixtures exercise (vibrato rounding, the loop gate, the Paula floor).
+- **Deliverable 4**: when a file load and a panning toggle genuinely race, the toggle
+  claims the later revision, so the file load is the one discarded. The new checkbox
+  disable makes that unreachable through the UI.
+- The aarch64 golden leg was not run locally (no cross toolchain); the `ubuntu-24.04-arm`
+  CI job remains the authority.

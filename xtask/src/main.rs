@@ -53,7 +53,45 @@ const NO_STD_CRATES: &[&str] = &[
 /// `starplayer-telemetry` edge (architecture §11, M1-B6).
 const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry")];
 
-const JOBS: &[&str] = &["host-tests", "conformance", "goldens", "fma-check", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
+const JOBS: &[&str] = &["host-tests", "conformance", "goldens", "fma-check", "trace-zero-cost", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
+
+/// The LLVM policy `.cargo/config.toml` sets for the float path. Cargo **replaces**
+/// `[build] rustflags` when `RUSTFLAGS` is set rather than merging, so a job or shell that
+/// exports the variable drops this flag without any warning; `assert_rustflags_keep_the_fp_contract_policy`
+/// is what makes that loud.
+const FP_CONTRACT_FLAG: &str = "-fp-contract=off";
+
+/// One crate in the FMA contraction audit.
+///
+/// Trailing `rustc` arguments and `--emit` reach the **final** crate of a `cargo rustc`
+/// invocation only, so one pass audits exactly one crate. C6 had a single
+/// `starplayer-offline` pass and therefore never built the non-generic float master bus
+/// with `+fma` at all.
+struct FmaPass {
+    package: &'static str,
+    /// Whether an optimized build of this crate on its own must contain an `f32` multiply
+    /// for its scan to mean anything.
+    requires_float_multiply: bool,
+}
+
+const FMA_PASSES: &[FmaPass] = &[
+    // Monomorphises the whole float voice path: `FloatPath::mix::<Linear>`,
+    // `Linear::sample_f32`, the master bus and the host output conversions.
+    FmaPass { package: "starplayer-offline", requires_float_multiply: true },
+    // The non-generic float master bus itself — `process_float`, `soft_knee_f32` and
+    // `bound_f32` — which no C6 pass ever compiled with `+fma`.
+    FmaPass { package: "starplayer-mixer", requires_float_multiply: true },
+    // Every float expression in `starplayer-dsp` sits in a generic or trait-impl method,
+    // so the crate's own rlib codegens none of them and this scan finds nothing today;
+    // those instantiations are audited by the two passes above. The pass runs anyway, so
+    // the first non-generic float helper added here is covered from that commit onwards.
+    FmaPass { package: "starplayer-dsp", requires_float_multiply: false },
+];
+
+/// Crates whose tracker processors carry a `#[cfg(feature = "trace")]` per-channel report
+/// loop, and the symbol that loop is compiled into.
+const TRACE_HOOK_PACKAGES: &[&str] = &["starplayer-mod", "starplayer-s3m"];
+const TRACE_HOOK_SYMBOL: &str = "report_trace_channels";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -113,7 +151,9 @@ fn run_trace(arguments: &[String]) -> bool {
         // The parent `cargo xtask` process owns the workspace target-directory lock for
         // as long as xtask runs. A dedicated target dir avoids recursively waiting on our
         // own lock while preserving xtask's dependency-free manifest.
-        .args(["run", "--quiet", "--target-dir", "target/xtask-trace", "-p", "starplayer-offline", "--bin", "starplayer-trace", "--"])
+        // `starplayer-trace` carries `required-features = ["trace"]`: the feature is
+        // optional precisely so an ordinary workspace build never links the recorder.
+        .args(["run", "--quiet", "--target-dir", "target/xtask-trace", "-p", "starplayer-offline", "--features", "trace", "--bin", "starplayer-trace", "--"])
         .args(arguments);
     match command.status() {
         Ok(status) if status.success() => true,
@@ -216,7 +256,7 @@ fn run_conformance(arguments: &[String]) -> bool {
         .current_dir(&root)
         .args([
             "run", "--quiet", "--target-dir", "target/xtask-conformance",
-            "-p", "starplayer-testkit", "--bin", "starplayer-conformance", "--",
+            "-p", "starplayer-testkit", "--features", "trace", "--bin", "starplayer-conformance", "--",
             "--corpus",
         ])
         .arg(corpus.join("test-dev"))
@@ -370,6 +410,10 @@ fn run_ci(arguments: &[String]) -> bool {
         None => JOBS.to_vec(),
     };
 
+    if !assert_rustflags_keep_the_fp_contract_policy() {
+        return false;
+    }
+
     let mut failed_jobs: Vec<&str> = Vec::new();
     for job in &jobs {
         println!("\n=== xtask ci: {job} ===");
@@ -378,6 +422,7 @@ fn run_ci(arguments: &[String]) -> bool {
             "conformance" => job_conformance(),
             "goldens" => run_goldens(&["--check".to_string()]),
             "fma-check" => job_fma_check(),
+            "trace-zero-cost" => job_trace_zero_cost(),
             "wasm-build" => job_wasm_build(),
             "no-std-check" => job_no_std_check(),
             "clippy" => job_clippy(),
@@ -432,107 +477,307 @@ fn parse_job_argument(arguments: &[String]) -> Result<Option<&str>, String> {
 /// engine is embeddable without a UI — so without this line the whole of M1-B6's
 /// engine-side verification would silently never run.
 fn job_host_tests() -> bool {
-    cargo(&["test", "--workspace"])
+    assert_trace_stays_off_the_default_workspace_build()
+        && cargo(&["test", "--workspace"])
         && cargo(&["test", "-p", "starplayer-engine", "--features", "telemetry"])
+        // The recorder, the trace capture path and the trace differ only exist with
+        // `trace` on, so without these three passes nothing would ever test them. They are
+        // the mirror image of the telemetry pass above.
+        && cargo(&["test", "-p", "starplayer-engine", "--features", "trace"])
+        && cargo(&["test", "-p", "starplayer-offline", "--features", "trace"])
+        && cargo(&["test", "-p", "starplayer-testkit", "--features", "trace"])
 }
 
-/// Compile the real offline float renderer for an x86-64 CPU where FMA is explicitly
-/// available, then inspect both optimized LLVM IR and machine code. `.cargo/config.toml`
-/// supplies `-C llvm-args=-fp-contract=off`; seeing ordinary multiply operations but no
-/// contract flag, intrinsic or fused instruction proves the setting took effect rather
-/// than merely being accepted.
-fn job_fma_check() -> bool {
-    let target_directory = std::env::temp_dir().join(format!("starplayer-fma-check-{}", std::process::id()));
-    if !remove_fma_target_directory(&target_directory) {
+/// Resolver 2 unifies features across a workspace build, so one crate declaring
+/// `starplayer = { features = ["trace"] }` as an ordinary dependency puts the per-tick
+/// recorder inside `render()` for every other crate's tests — and for the golden hashes.
+/// `trace` is an optional feature of `starplayer-offline` and `starplayer-testkit` for
+/// exactly that reason; this asks cargo what it actually resolved rather than trusting the
+/// manifests.
+fn assert_trace_stays_off_the_default_workspace_build() -> bool {
+    let arguments = ["tree", "--edges", "features", "--workspace"];
+    println!("     cargo {}", arguments.join(" "));
+
+    let output = match Command::new(cargo_binary()).current_dir(workspace_root()).args(arguments).output() {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("     cargo tree failed to start: {error}");
+            return false;
+        }
+    };
+    if !output.status.success() {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        eprintln!("     cargo tree failed for the default workspace resolution");
         return false;
     }
 
-    let audit_succeeded = run_fma_audit(&target_directory);
-    let cleanup_succeeded = remove_fma_target_directory(&target_directory);
-    audit_succeeded && cleanup_succeeded
+    let tree = String::from_utf8_lossy(&output.stdout);
+    let offenders: Vec<&str> = tree.lines()
+        .map(trim_tree_glyphs)
+        .filter(|line| line.ends_with("feature \"trace\""))
+        .collect();
+    if offenders.is_empty() {
+        println!("     `trace` is off for the default workspace build");
+        return true;
+    }
+    eprintln!("     `trace` leaked into the default workspace build:");
+    for offender in offenders {
+        eprintln!("       {offender}");
+    }
+    eprintln!("     make it an optional feature and put it behind `required-features` on the binary that needs it");
+    false
 }
 
-fn run_fma_audit(target_directory: &Path) -> bool {
-    println!("     cargo rustc -p starplayer-offline --release --lib -- -C target-feature=+fma --emit=asm,llvm-ir");
-    let status = Command::new(cargo_binary())
-        .current_dir(workspace_root())
-        .env("CARGO_TARGET_DIR", target_directory)
-        .args(["rustc", "-p", "starplayer-offline", "--release", "--lib", "--", "-C", "target-feature=+fma", "--emit=asm,llvm-ir"])
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("     FMA audit build exited with {status}");
-            return false;
+/// Cargo replaces `[build] rustflags` when `RUSTFLAGS` is set — it does not merge — so an
+/// exported `RUSTFLAGS` silently drops the float-contraction policy for every job in this
+/// process. Setting it to anything that does not carry the flag is a hard failure rather
+/// than a warning, because the audit downstream would then be testing a configuration
+/// nobody ships.
+fn assert_rustflags_keep_the_fp_contract_policy() -> bool {
+    match std::env::var("RUSTFLAGS") {
+        Err(_) => true,
+        Ok(value) if value.contains(FP_CONTRACT_FLAG) => {
+            println!("xtask ci: RUSTFLAGS carries `{FP_CONTRACT_FLAG}` explicitly");
+            true
         }
-        Err(error) => {
-            eprintln!("     FMA audit build failed to start: {error}");
-            return false;
+        Ok(value) => {
+            eprintln!("xtask ci: RUSTFLAGS is set to `{value}`");
+            eprintln!("          cargo *replaces* `[build] rustflags` from .cargo/config.toml when RUSTFLAGS is set,");
+            eprintln!("          so `-C llvm-args={FP_CONTRACT_FLAG}` is silently dropped from every build in this shell.");
+            eprintln!("          Unset RUSTFLAGS, or add `-C llvm-args={FP_CONTRACT_FLAG}` to it.");
+            false
         }
     }
+}
+
+/// Compile every crate that carries float code for an x86-64 CPU where FMA is explicitly
+/// available, then inspect both optimized LLVM IR and machine code.
+///
+/// # What this proves, and what it does not
+///
+/// The **positive passes** prove the shipped configuration emits ordinary, separately
+/// rounded multiplies: no fused mnemonic, no `llvm.fma`/`llvm.fmuladd` intrinsic and no
+/// contract-marked float operation, on a target where the instruction exists. That is the
+/// property architecture §7.3 needs.
+///
+/// The **negative control** re-runs one pass with `-fp-contract=fast`, which fuses
+/// regardless of what the IR asks for, and requires the scan to find a fused mnemonic. Its
+/// success condition is that the audit *fails*: without it, "we found no fusion" would be
+/// indistinguishable from "the scan looks in the wrong place".
+///
+/// What no available control can show is that `-fp-contract=off` is itself load-bearing.
+/// Measured on this toolchain, stripping it changes nothing: rustc never emits `contract`
+/// fast-math flags, and LLVM's default fusion policy already declines to fuse operations
+/// that do not carry them. The flag is defence in depth against a future default, not the
+/// thing being proven — C6a corrected C6's task file where it claimed otherwise.
+fn job_fma_check() -> bool {
+    let mut all_succeeded = true;
+    for pass in FMA_PASSES {
+        all_succeeded &= run_fma_pass(pass);
+    }
+    all_succeeded & run_fma_negative_control()
+}
+
+fn run_fma_pass(pass: &FmaPass) -> bool {
+    let Some(target_directory) = fresh_audit_directory("fma-check", pass.package) else { return false };
+    let findings = fma_findings(pass.package, &target_directory, None);
+    let succeeded = match findings {
+        Err(message) => {
+            eprintln!("     {message}");
+            false
+        }
+        Ok(findings) => {
+            let mut succeeded = true;
+            for violation in &findings.violations {
+                eprintln!("     {}: {violation}", pass.package);
+                succeeded = false;
+            }
+            if pass.requires_float_multiply && !(findings.saw_assembly_float_multiply && findings.saw_ir_float_multiply) {
+                eprintln!("     {}: audit inconclusive — the optimized build contains no f32 multiply", pass.package);
+                succeeded = false;
+            }
+            if succeeded && findings.saw_assembly_float_multiply {
+                println!("     {}: separate multiply, no contraction marker, intrinsic or fused mnemonic", pass.package);
+            } else if succeeded {
+                println!("     {}: no float codegen of its own; scanned anyway so a future non-generic helper is covered", pass.package);
+            }
+            succeeded
+        }
+    };
+    succeeded & remove_audit_directory(&target_directory)
+}
+
+/// Rebuild one pass with the fusion policy turned all the way on. A fused mnemonic **must**
+/// appear; if it does not, every "no fusion found" above proves nothing and the job fails.
+fn run_fma_negative_control() -> bool {
+    const PACKAGE: &str = "starplayer-mixer";
+    let Some(target_directory) = fresh_audit_directory("fma-control", PACKAGE) else { return false };
+    println!("     negative control: RUSTFLAGS=\"-C llvm-args=-fp-contract=fast\" (a fused mnemonic is required)");
+    let findings = fma_findings(PACKAGE, &target_directory, Some("-C llvm-args=-fp-contract=fast"));
+    let succeeded = match findings {
+        Err(message) => {
+            eprintln!("     {message}");
+            false
+        }
+        Ok(findings) if findings.violations.is_empty() => {
+            eprintln!("     negative control found no fused operation with contraction forced on.");
+            eprintln!("     The audit above therefore proves nothing: fix the scan, or drop the claim.");
+            false
+        }
+        Ok(findings) => {
+            println!("     negative control passed: {} contraction finding(s) with the policy forced on", findings.violations.len());
+            true
+        }
+    };
+    succeeded & remove_audit_directory(&target_directory)
+}
+
+#[derive(Default)]
+struct FmaFindings {
+    /// Every contraction the scan saw, already formatted for a report.
+    violations: Vec<String>,
+    saw_assembly_float_multiply: bool,
+    saw_ir_float_multiply: bool,
+}
+
+fn fma_findings(package: &str, target_directory: &Path, rustflags: Option<&str>) -> Result<FmaFindings, String> {
+    println!("     cargo rustc -p {package} --release --lib -- -C target-feature=+fma --emit=asm,llvm-ir");
+    let mut command = Command::new(cargo_binary());
+    command
+        .current_dir(workspace_root())
+        .env("CARGO_TARGET_DIR", target_directory)
+        .args(["rustc", "-p", package, "--release", "--lib", "--", "-C", "target-feature=+fma", "--emit=asm,llvm-ir"]);
+    if let Some(rustflags) = rustflags {
+        command.env("RUSTFLAGS", rustflags);
+    }
+    match command.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => return Err(format!("FMA audit build for `{package}` exited with {status}")),
+        Err(error) => return Err(format!("FMA audit build for `{package}` failed to start: {error}")),
+    }
+
+    let mut findings = FmaFindings::default();
 
     let mut assembly_paths = Vec::new();
     collect_files_with_extension(target_directory, "s", &mut assembly_paths);
-    let mut saw_float_multiply = false;
     for path in &assembly_paths {
-        let assembly = match std::fs::read_to_string(path) {
-            Ok(assembly) => assembly.to_ascii_lowercase(),
-            Err(error) => {
-                eprintln!("     cannot read FMA audit output `{}`: {error}", path.display());
-                return false;
-            }
-        };
-        saw_float_multiply |= assembly.contains("mulss") || assembly.contains("mulps");
+        let assembly = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read FMA audit output `{}`: {error}", path.display()))?
+            .to_ascii_lowercase();
+        findings.saw_assembly_float_multiply |= assembly.contains("mulss") || assembly.contains("mulps");
         for mnemonic in ["vfmadd", "vfmsub", "vfnmadd", "vfnmsub"] {
             if assembly.contains(mnemonic) {
-                eprintln!("     FMA contraction found in `{}`: mnemonic `{mnemonic}`", path.display());
-                return false;
+                findings.violations.push(format!("fused mnemonic `{mnemonic}` in `{}`", path.display()));
             }
         }
-    }
-    if !saw_float_multiply {
-        eprintln!("     FMA audit was inconclusive: optimized assembly contained no f32 multiply");
-        return false;
     }
 
     let mut llvm_ir_paths = Vec::new();
     collect_files_with_extension(target_directory, "ll", &mut llvm_ir_paths);
-    let mut saw_ir_float_multiply = false;
     for path in &llvm_ir_paths {
-        let llvm_ir = match std::fs::read_to_string(path) {
-            Ok(llvm_ir) => llvm_ir.to_ascii_lowercase(),
-            Err(error) => {
-                eprintln!("     cannot read FMA audit IR `{}`: {error}", path.display());
-                return false;
-            }
-        };
-        saw_ir_float_multiply |= llvm_ir.contains("fmul ");
+        let llvm_ir = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read FMA audit IR `{}`: {error}", path.display()))?
+            .to_ascii_lowercase();
+        findings.saw_ir_float_multiply |= llvm_ir.contains("fmul ");
         if llvm_ir.contains("llvm.fma.") || llvm_ir.contains("llvm.fmuladd.") {
-            eprintln!("     FMA/fmuladd intrinsic found in `{}`", path.display());
-            return false;
+            findings.violations.push(format!("fma/fmuladd intrinsic in `{}`", path.display()));
         }
         if llvm_ir.lines().any(|line| line.contains("contract") && (line.contains("fmul") || line.contains("fadd") || line.contains("fsub"))) {
-            eprintln!("     contract-enabled float operation found in `{}`", path.display());
-            return false;
+            findings.violations.push(format!("contract-enabled float operation in `{}`", path.display()));
         }
     }
-    if !saw_ir_float_multiply {
-        eprintln!("     FMA audit was inconclusive: optimized LLVM IR contained no f32 multiply");
-        return false;
-    }
-    println!("     FMA audit passed: separate multiply in IR/machine code, no contraction marker, intrinsic or fused mnemonic");
-    true
+    Ok(findings)
 }
 
-/// Delete only the exact PID-scoped audit directory. A stale directory would let an
-/// audit inspect artifacts from an earlier process whose PID was reused, so failure to
-/// remove it also fails the job.
-fn remove_fma_target_directory(target_directory: &Path) -> bool {
+/// The `#[cfg(feature = "trace")]` per-channel report loop must leave nothing behind in a
+/// release build with the feature off (C1 deliverable 2).
+///
+/// The scan is only meaningful with its own control, for the same reason the FMA audit
+/// needs one: an absent symbol could equally mean the grep is looking at the wrong file.
+/// Each package is therefore built twice — once as shipped, once with `--features trace` —
+/// and the symbol must be absent from the first and present in the second.
+fn job_trace_zero_cost() -> bool {
+    let mut all_succeeded = true;
+    for package in TRACE_HOOK_PACKAGES {
+        all_succeeded &= run_trace_zero_cost_pass(package, false);
+        all_succeeded &= run_trace_zero_cost_pass(package, true);
+    }
+    all_succeeded
+}
+
+fn run_trace_zero_cost_pass(package: &str, trace: bool) -> bool {
+    let label = if trace { "with-trace" } else { "shipped" };
+    let Some(target_directory) = fresh_audit_directory(&format!("trace-{label}"), package) else { return false };
+    let feature_arguments: &[&str] = if trace { &["--features", "trace"] } else { &[] };
+    let printed_features = if trace { " --features trace" } else { "" };
+    println!("     cargo rustc -p {package} --release --lib{printed_features} -- --emit=asm,llvm-ir");
+    let status = Command::new(cargo_binary())
+        .current_dir(workspace_root())
+        .env("CARGO_TARGET_DIR", &target_directory)
+        .args(["rustc", "-p", package, "--release", "--lib"])
+        .args(feature_arguments)
+        .args(["--", "--emit=asm,llvm-ir"])
+        .status();
+    let built = match status {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("     trace audit build for `{package}` ({label}) exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("     trace audit build for `{package}` ({label}) failed to start: {error}");
+            false
+        }
+    };
+
+    let succeeded = built && match count_symbol_occurrences(&target_directory, TRACE_HOOK_SYMBOL) {
+        Err(message) => {
+            eprintln!("     {message}");
+            false
+        }
+        Ok(occurrences) if trace && occurrences == 0 => {
+            eprintln!("     `{package}` with `trace` on contains no `{TRACE_HOOK_SYMBOL}`, so the shipped-build scan proves nothing");
+            false
+        }
+        Ok(occurrences) if !trace && occurrences != 0 => {
+            eprintln!("     `{package}` still contains {occurrences} reference(s) to `{TRACE_HOOK_SYMBOL}` with `trace` off");
+            false
+        }
+        Ok(occurrences) => {
+            println!("     {package} ({label}): {occurrences} reference(s) to `{TRACE_HOOK_SYMBOL}`");
+            true
+        }
+    };
+    succeeded & remove_audit_directory(&target_directory)
+}
+
+fn count_symbol_occurrences(target_directory: &Path, symbol: &str) -> Result<usize, String> {
+    let mut paths = Vec::new();
+    collect_files_with_extension(target_directory, "s", &mut paths);
+    collect_files_with_extension(target_directory, "ll", &mut paths);
+    let mut occurrences = 0usize;
+    for path in &paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read audit output `{}`: {error}", path.display()))?;
+        occurrences += text.matches(symbol).count();
+    }
+    Ok(occurrences)
+}
+
+/// A PID-scoped, empty target directory for one audit pass. A stale directory would let a
+/// scan inspect artifacts from an earlier process whose PID was reused, so failing to
+/// clear it fails the pass.
+fn fresh_audit_directory(kind: &str, package: &str) -> Option<PathBuf> {
+    let directory = std::env::temp_dir().join(format!("starplayer-{kind}-{package}-{}", std::process::id()));
+    remove_audit_directory(&directory).then_some(directory)
+}
+
+fn remove_audit_directory(target_directory: &Path) -> bool {
     match std::fs::remove_dir_all(target_directory) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => {
-            eprintln!("     cannot remove FMA audit directory `{}`: {error}", target_directory.display());
+            eprintln!("     cannot remove audit directory `{}`: {error}", target_directory.display());
             false
         }
     }

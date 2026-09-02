@@ -76,7 +76,13 @@ The load panel's **Headphone-friendly MOD panning** option narrows MOD's authent
 L-R-R-L defaults to the same symmetric 60% positions used by ordinary stereo S3Ms. It
 does not affect S3M, MTM, or later MOD panning effects. Changing it while a MOD is active
 reloads the retained bytes at the sounding order and restores transport, volume, and
-channel mutes; the old module remains live if decoding fails.
+channel mutes; the old module remains live if decoding fails, and the persisted preference
+is put back whether or not another load has started since.
+
+The option is disabled while any module load is in flight. The worklet port is a FIFO, so
+two `loadModule` messages in the air at once are decided by posting order rather than by
+which promise settles first; the reload also claims a module revision of its own, exactly
+as the load path does, so whichever of the two claimed last is the one that paints the UI.
 
 ## Output and mixer options
 
@@ -194,7 +200,12 @@ The headless check skips cleanly when no Chromium/Chrome executable is installed
 protocol with Node's built-in `WebSocket`, and runs the page three ways — cross-origin
 isolated on shared memory, isolated with the fallback forced, and served without COOP/COEP
 at all. Each run first loads a synthetic MOD and observes hard, 60%, then hard L-R-R-L
-panning while checking order, transport, and mute restoration. It then plays a fixture,
+panning while checking order, transport, and mute restoration. It then races a six-channel
+module load against the panning toggle — the toggle is dispatched from a MutationObserver
+microtask in the same task that hands the load's bytes to the worklet, so the window does
+not depend on timing — and asserts that the panning option was unavailable during the load
+and that the module the page displays is the one that is actually sounding. It then plays a
+fixture,
 asserts the quantum is 128 frames and wasm memory does
 not move, loads a second module over the top of the first and waits for the retired Arc,
 drops a deliberately broken file and checks that playback survives it, rebuilds the graph

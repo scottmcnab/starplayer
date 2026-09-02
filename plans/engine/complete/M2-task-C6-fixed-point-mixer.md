@@ -122,11 +122,14 @@ anywhere in the RT path**, on either mixer. Tables only.
 ## Post-landing notes — 2026-09-02 branch review
 
 **The rounding contract breaks bit-compatibility with M1, and nothing marked it.** C6
-switched the fixed path from truncation to round-to-nearest with ties away from zero
-(`crates/starplayer-mixer/src/path.rs:150-155`,
-`crates/starplayer-dsp/src/interpolate.rs:94-99`,
-`crates/starplayer-mixer/src/master.rs:143` and `:190`,
-`crates/starplayer-mixer/src/output.rs:179` and `:311`). That was the deliberate outcome of
+switched the fixed path from truncation to round-to-nearest with ties away from zero. Every
+signed reduction on that path goes through `starplayer_dsp::round_shift_nearest`: Q0.32
+linear interpolation (`crates/starplayer-dsp/src/interpolate.rs`, `Linear::sample_fixed`),
+Q15 voice gain and voice accumulation (`crates/starplayer-mixer/src/path.rs`,
+`FixedPath::gain` and `FixedPath::mix`), limiter interpolation and master volume
+(`crates/starplayer-mixer/src/master.rs`), and reduced-depth output and mono fold-down
+(`crates/starplayer-mixer/src/output.rs`). Confirmed against the code by C6a. That was the
+deliberate outcome of
 research point 2 — but **fixed-path S3M output now differs from M1's at the least
 significant bit**, and because the S3M goldens were generated *after* the change, no
 committed artefact records the break. Stated here so a future comparison against an M1
@@ -135,30 +138,83 @@ render is not mistaken for a regression.
 **`RUSTFLAGS` discards `[build] rustflags`.** `.cargo/config.toml` carries
 `rustflags = ["-C", "llvm-args=-fp-contract=off"]`. Cargo **replaces** rather than merges
 when the `RUSTFLAGS` environment variable is set, so any CI job or developer shell that
-exports `RUSTFLAGS` silently loses the FMA policy. Nothing in CI sets it today; an
-assertion that it is unset is tracked by
-[M2-task-C6a](../M2-task-C6a-golden-and-build-hygiene.md) deliverable 8.
+exports `RUSTFLAGS` silently loses the FMA policy — an empty `RUSTFLAGS` strips it just as
+completely as a populated one. Nothing in CI sets it. C6a made that loud: every
+`cargo xtask ci` invocation now fails up front unless `RUSTFLAGS` is either unset or
+carries `-fp-contract=off` itself.
 
 **Three gaps in what the deliverables claim, all tracked by C6a:**
 
 - Deliverable 3's "verify it actually took effect": `cargo xtask ci --job fma-check`
-  (`xtask/src/main.rs:441-506`) compiles and scans only `starplayer-offline`'s own
-  codegen — trailing `rustc` arguments and `--emit` apply to the final crate only — so the
-  non-generic float master bus in `starplayer-mixer` and `starplayer-dsp` is never compiled
-  with `+fma` and never inspected. It also has no negative control, and Rust emits no
-  `contract` flag by default, so the absence of fused operations proves nothing about the
-  flag. C6a deliverable 7.
+  compiled and scanned only `starplayer-offline`'s own codegen — trailing `rustc` arguments
+  and `--emit` apply to the final crate only — so the non-generic float master bus in
+  `starplayer-mixer` and `starplayer-dsp` was never compiled with `+fma` and never
+  inspected. It also had no negative control, and Rust emits no `contract` flag by default,
+  so the absence of fused operations proved nothing about the flag. C6a deliverable 7.
 - Deliverable 4: goldens exist for **S3M only**. MOD and MTM, the two formats M2 adds, have
   no cross-target hash check. C6a deliverable 5.
-- `GOLDEN_INTERPOLATOR` (`crates/starplayer-offline/src/lib.rs:39`) names the golden file
-  but does not select the kernel (`:233` hard-codes `Linear`), so the filename contract
-  this deliverable exists to enforce can be broken in either direction without a failure.
-  C6a deliverable 9.
+- `GOLDEN_INTERPOLATOR` named the golden file but did not select the kernel — the render
+  hard-coded `Linear` — so the filename contract this deliverable exists to enforce could
+  be broken in either direction without a failure. C6a deliverable 9.
 
-Also noted: `round_shift_nearest` exists in two independent copies
-(`crates/starplayer-mixer/src/path.rs:170-180` and
-`crates/starplayer-dsp/src/interpolate.rs:105-115`), both commented as "the canonical
-rule". They agree today; C6a deliverable 10 exports one.
+Also noted: `round_shift_nearest` existed in two independent copies, in
+`crates/starplayer-mixer/src/path.rs` and `crates/starplayer-dsp/src/interpolate.rs`, both
+commented as "the canonical rule". They agreed; C6a deliverable 10 exports one.
+
+## Post-landing notes — C6a, 2026-09-02
+
+**Deliverable 3's claim is weaker than C6 stated, and this is the correction.** C6a's
+research point 3 measured whether anything in `starplayer-mixer` or `starplayer-dsp`
+actually contracts when the flag is removed. Nothing does. Building either crate at
+`--release --lib -C target-feature=+fma` with `RUSTFLAGS` set to something that drops
+`-fp-contract=off` produces byte-for-byte the same count of fused mnemonics (zero), float
+multiplies and `contract` markers as the shipped configuration: rustc never emits `contract`
+fast-math flags, and LLVM's default fusion policy already refuses to fuse operations that
+do not carry them. **Stripping the flag therefore cannot be detected, so no control built
+on stripping it can exist**, and C6's "proves it took effect" is not a claim the audit can
+support.
+
+What the audit does now support, and what `cargo xtask ci --job fma-check` asserts:
+
+1. **Three positive passes**, one `cargo rustc` invocation each so the trailing `+fma` and
+   `--emit` actually reach the crate being scanned: `starplayer-offline` (which
+   monomorphises the whole float voice path), `starplayer-mixer` (the non-generic master
+   bus: `process_float`, `soft_knee_f32`, `bound_f32`) and `starplayer-dsp`. Each must
+   contain no fused mnemonic, no `llvm.fma`/`llvm.fmuladd` intrinsic and no
+   contract-marked float operation. The first two must also contain an ordinary `f32`
+   multiply, or the pass is reported as inconclusive. `starplayer-dsp` is exempt from that
+   last requirement and is documented as such in `xtask/src/main.rs`: every float
+   expression it owns lives in a generic or trait-impl method, so its own rlib codegens
+   none of them and its optimized output is empty. The pass runs regardless, so the first
+   non-generic float helper added there is covered from that commit.
+2. **A negative control that does exist.** The audit re-runs the `starplayer-mixer` pass
+   with `RUSTFLAGS="-C llvm-args=-fp-contract=fast"`, which fuses regardless of what the
+   IR asks for, and **requires** a fused mnemonic. It finds one. That is what separates
+   "no fusion happened" from "the scan is looking in the wrong file", and it also shows
+   this code would fuse if the policy allowed it.
+
+So `-fp-contract=off` is defence in depth against a future rustc or LLVM default, not a
+setting whose effect is observable today — and that is now what the tree says.
+
+**Goldens cover all three M2 formats.** MOD and MTM have no licence-safe module to commit,
+so C6a synthesises one fixture each from a committed generator
+(`crates/starplayer-offline/src/fixtures.rs`) rather than hashing renders of the pinned
+libxmp corpus. The trade-off is recorded in that file's module comment: the corpus route is
+cheaper but binds the golden job to a cached download and to a corpus revision, while the
+generator keeps the goldens reproducible on the ARM64 runner and under Wasmtime with no
+inputs at all, and survives a corpus repin. Its cost is that the fixtures were never played
+by a real tracker, so they are a mixer-regression contract and not an accuracy one —
+accuracy stays the conformance harness's job. The five S3M hashes are unchanged by
+everything in C6a.
+
+**`GOLDEN_INTERPOLATOR` now selects the kernel.** `render_golden` matches on the constant
+and instantiates `Nearest` or `Linear` from it, so the filename and the audio move
+together; a kernel the build has no implementation for is `RenderError::UnimplementedInterpolator`
+rather than a silently mislabelled render.
+
+**`round_shift_nearest` has one definition**, `starplayer_dsp::round_shift_nearest`;
+`starplayer-mixer`'s `path`, `master`, `output` and `gain` all import it, and the existing
+rounding assertions are unchanged.
 
 ## Out of scope
 

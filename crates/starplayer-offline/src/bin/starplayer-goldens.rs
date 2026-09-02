@@ -3,20 +3,31 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use starplayer_offline::{GOLDEN_HOST_BLOCK_FRAMES, canonical_s3m_sha256, golden_filename, sha256_hex};
+use starplayer_offline::{GOLDEN_HOST_BLOCK_FRAMES, GoldenFormat, canonical_sha256, fixtures, golden_filename, sha256_hex};
 
 struct Fixture {
+    format: GoldenFormat,
     stem: &'static str,
-    bytes: &'static [u8],
+    bytes: Vec<u8>,
 }
 
-const FIXTURES: &[Fixture] = &[
-    Fixture { stem: "armani", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/ARMANI.S3M") },
-    Fixture { stem: "movement", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M") },
-    Fixture { stem: "nicetune", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/NICETUNE.S3M") },
-    Fixture { stem: "petri", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/PETRI.S3M") },
-    Fixture { stem: "reflex", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/REFLEX.S3M") },
-];
+/// Every fixture in the canonical contract.
+///
+/// The five S3Ms are the repository owner's own modules and are committed as bytes. MOD
+/// and MTM have no licence-safe module to commit, so C6a synthesises theirs from a
+/// committed generator instead — see `starplayer_offline::fixtures` for why that route was
+/// chosen over hashing the pinned libxmp corpus.
+fn fixtures() -> Vec<Fixture> {
+    vec![
+        Fixture { format: GoldenFormat::Mod, stem: "synthetic", bytes: fixtures::synthetic_mod() },
+        Fixture { format: GoldenFormat::Mtm, stem: "synthetic", bytes: fixtures::synthetic_mtm() },
+        Fixture { format: GoldenFormat::S3m, stem: "armani", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/ARMANI.S3M").to_vec() },
+        Fixture { format: GoldenFormat::S3m, stem: "movement", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M").to_vec() },
+        Fixture { format: GoldenFormat::S3m, stem: "nicetune", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/NICETUNE.S3M").to_vec() },
+        Fixture { format: GoldenFormat::S3m, stem: "petri", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/PETRI.S3M").to_vec() },
+        Fixture { format: GoldenFormat::S3m, stem: "reflex", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/REFLEX.S3M").to_vec() },
+    ]
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Mode {
@@ -35,12 +46,12 @@ fn main() -> ExitCode {
     };
 
     let mut succeeded = true;
-    for fixture in FIXTURES {
-        let relative_path = Path::new("goldens").join("s3m").join(golden_filename(fixture.stem));
-        let hash = match canonical_s3m_sha256(fixture.bytes, GOLDEN_HOST_BLOCK_FRAMES) {
+    for fixture in fixtures() {
+        let relative_path = Path::new("goldens").join(fixture.format.directory()).join(golden_filename(fixture.stem));
+        let hash = match canonical_sha256(fixture.format, &fixture.bytes, GOLDEN_HOST_BLOCK_FRAMES) {
             Ok(hash) => sha256_hex(hash),
             Err(error) => {
-                eprintln!("starplayer-goldens: {}: {error}", fixture.stem);
+                eprintln!("starplayer-goldens: {}/{}: {error}", fixture.format, fixture.stem);
                 succeeded = false;
                 continue;
             }

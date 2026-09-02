@@ -75,6 +75,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask ci --job fma-check
 
+  trace-zero-cost:
+    name: trace hook zero-cost audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask ci --job trace-zero-cost
+
   conformance:
     name: conformance corpora
     runs-on: ubuntu-latest

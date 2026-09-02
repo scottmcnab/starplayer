@@ -5,5 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-starplayer = { workspace = true, features = ["std", "trace"] }
+starplayer = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
+
+# `trace` must stay **optional**. Declared as an ordinary dependency feature it would be
+# unified across the whole workspace by resolver 2, so `cargo test --workspace` would
+# build the engine — and the wasm host — with the per-tick recorder compiled into
+# `render()`, and would never test-compile the `cfg(not(feature = "trace"))` arms at all.
+# The golden binary must build without it; only `starplayer-trace` requires it.
+[features]
+default = []
+trace = ["starplayer/trace"]
+
+[[bin]]
+name = "starplayer-trace"
+required-features = ["trace"]

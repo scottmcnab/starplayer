@@ -23,6 +23,11 @@
 //! one-millisecond bound.
 
 #![forbid(unsafe_code)]
+// Everything below reads or compares `starplayer::engine::Trace`, which only exists with
+// the engine's `trace` feature. Gating the whole crate — rather than only the binary —
+// is what keeps `trace` off an ordinary `cargo test --workspace`: a `required-features`
+// binary alone would still leave the library edge unconditional.
+#![cfg(feature = "trace")]
 
 use std::fmt;
 
