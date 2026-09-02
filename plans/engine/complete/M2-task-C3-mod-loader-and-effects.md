@@ -30,9 +30,13 @@ The reference for MOD effect behaviour is ProTracker, not the original assembly.
 ## Deliverables
 
 1. **Loader.** Per analysis §5 (MOD):
-   - ID at offset 1080: `M.K.` / `FLT4` → 4 channels, `6CHN` → 6, `8CHN` / `FLT8` → 8,
-     else a decimal `"ddCH"` up to 32. **31 samples always** — 15-sample MODs are a
+   - ID at offset 1080: `M.K.` / `M!K!` / `FLT4` → 4 channels, `6CHN` → 6, `8CHN` /
+     `FLT8` → 8, else a decimal `"ddCH"` up to 32 or a single-digit `"dCHN"` for 1–9.
+     `M!K!` is what ProTracker itself writes once a module exceeds 64 patterns and is
+     common; libxmp lists it first. **31 samples always** — 15-sample MODs are a
      separate, older layout; decide whether to support them and say so either way.
+     *(Corrected by C3b deliverable 6: the original wording accepted only the DOS
+     original's tag set, which rejected `M!K!` and `[1-9]CHN`.)*
    - Title 20 bytes @0; 31 × 30-byte sample headers @20; song length @950; 128-byte order
      list @952; patterns @1084, each `4 × channels × 64` bytes.
    - Pattern count = (highest order value, ignoring 255) + 1.
@@ -40,8 +44,13 @@ The reference for MOD effect behaviour is ProTracker, not the original assembly.
 2. **Sample headers**, with the two gates that matter:
    - length = BE u16 @22 × 2; volume @25 clamped to 64; loop start = BE u16 @26 × 2
      clamped to length; loop length = BE u16 @28 × 2.
-   - **Loop enabled only if loop length > 4.** A universal MOD convention; getting it
-     wrong makes many modules buzz.
+   - **Loop enabled when the loop length is `>= 4` bytes.** ProTracker loops whenever
+     the repeat length exceeds one word (`n_replen > 1`, so 4 bytes and up); libxmp uses
+     the same rule at `mod_load.c:656`. Getting it wrong makes many modules buzz, and a
+     4-byte loop that plays as a one-shot is audibly wrong.
+     *(Corrected by C3b deliverable 4. This file originally said "loop length > 4" and
+     called it "a universal MOD convention" — that rule came from the original DOS
+     converter, not from ProTracker.)*
    - Finetune from the signed nibble @24 via the **MOD** table:
      ```
      8363,8413,8463,8529,8581,8651,8723,8757,   ; finetune  0..+7
@@ -97,7 +106,8 @@ The reference for MOD effect behaviour is ProTracker, not the original assembly.
 ## Verification
 
 - The libxmp `test-dev/` MOD cases pass, with any exclusion carrying a written reason.
-- The loop-length > 4 gate: a module with a 2-word loop plays as one-shot.
+- The loop gate: a module with a **1-word** loop plays as one-shot, and a module with a
+  2-word (4-byte) loop **loops**. *(Corrected by C3b deliverable 4.)*
 - Finetune: a sample with finetune −1 plays at 8280 Hz reference, not 8413.
 - Amiga limits: a standard-range MOD clamps periods; an extended-range MOD does not.
 - Panning: channel 0 left, 1 right, 2 right, 3 left.

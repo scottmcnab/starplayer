@@ -119,6 +119,47 @@ anywhere in the RT path**, on either mixer. Tables only.
   missing golden rather than a mismatch.
 - The fixed path allocates nothing and produces no NaN/Inf (trivially, but assert it).
 
+## Post-landing notes — 2026-09-02 branch review
+
+**The rounding contract breaks bit-compatibility with M1, and nothing marked it.** C6
+switched the fixed path from truncation to round-to-nearest with ties away from zero
+(`crates/starplayer-mixer/src/path.rs:150-155`,
+`crates/starplayer-dsp/src/interpolate.rs:94-99`,
+`crates/starplayer-mixer/src/master.rs:143` and `:190`,
+`crates/starplayer-mixer/src/output.rs:179` and `:311`). That was the deliberate outcome of
+research point 2 — but **fixed-path S3M output now differs from M1's at the least
+significant bit**, and because the S3M goldens were generated *after* the change, no
+committed artefact records the break. Stated here so a future comparison against an M1
+render is not mistaken for a regression.
+
+**`RUSTFLAGS` discards `[build] rustflags`.** `.cargo/config.toml` carries
+`rustflags = ["-C", "llvm-args=-fp-contract=off"]`. Cargo **replaces** rather than merges
+when the `RUSTFLAGS` environment variable is set, so any CI job or developer shell that
+exports `RUSTFLAGS` silently loses the FMA policy. Nothing in CI sets it today; an
+assertion that it is unset is tracked by
+[M2-task-C6a](../M2-task-C6a-golden-and-build-hygiene.md) deliverable 8.
+
+**Three gaps in what the deliverables claim, all tracked by C6a:**
+
+- Deliverable 3's "verify it actually took effect": `cargo xtask ci --job fma-check`
+  (`xtask/src/main.rs:441-506`) compiles and scans only `starplayer-offline`'s own
+  codegen — trailing `rustc` arguments and `--emit` apply to the final crate only — so the
+  non-generic float master bus in `starplayer-mixer` and `starplayer-dsp` is never compiled
+  with `+fma` and never inspected. It also has no negative control, and Rust emits no
+  `contract` flag by default, so the absence of fused operations proves nothing about the
+  flag. C6a deliverable 7.
+- Deliverable 4: goldens exist for **S3M only**. MOD and MTM, the two formats M2 adds, have
+  no cross-target hash check. C6a deliverable 5.
+- `GOLDEN_INTERPOLATOR` (`crates/starplayer-offline/src/lib.rs:39`) names the golden file
+  but does not select the kernel (`:233` hard-codes `Linear`), so the filename contract
+  this deliverable exists to enforce can be broken in either direction without a failure.
+  C6a deliverable 9.
+
+Also noted: `round_shift_nearest` exists in two independent copies
+(`crates/starplayer-mixer/src/path.rs:170-180` and
+`crates/starplayer-dsp/src/interpolate.rs:105-115`), both commented as "the canonical
+rule". They agree today; C6a deliverable 10 exports one.
+
 ## Out of scope
 
 SIMD (M7). Cubic and sinc interpolation (M7). The embedded build itself (M8).

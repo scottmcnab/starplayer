@@ -2,17 +2,35 @@
 
 These records track executed corpus failures; they are not accepted accuracy-policy
 deviations. Every record blocks the M2 exit until the engine conforms or the documented
-behaviour is deliberately resolved in `plans/product/03-accuracy-policy.md`. The
-exclusions file links each case to one of these stable anchors, and the harness still
-runs every excluded case so a fix makes its exclusion fail as stale.
+behaviour is deliberately resolved in `plans/product/03-accuracy-policy.md`. The harness
+still runs every excluded case, so a fix makes its exclusion fail as stale.
 
-## C2-S3M-001 — pattern-loop compatibility
+**Who owns what.** `plans/engine/M2-task-C9-s3m-conformance-repairs.md` owns every S3M
+record below; each exclusion row names its record id and points at that task file.
+The MOD failures are not recorded here: the ProTracker fidelity repairs and the
+voice-boundary sample swap are `plans/engine/M2-task-C3b-protracker-fidelity-repairs.md`,
+and the harness repairs — trace alignment, loop-aware position comparison, the D18
+adapter projection, the per-field waiver and the tick budget — are
+`plans/engine/M2-task-C2a-conformance-harness-repairs.md`.
 
-The eight libxmp pattern-loop cases take a different active control-flow path in
-StarPlayer. First divergences range from tick 4 to tick 30: StarPlayer revisits row 0 or
-row 2 while the applicable IMF, OpenMPT, ST3.01, or ST3.21 oracle expects another loop
-or its break/jump destination. Resolve the `SBx` loop counter/start-row semantics and
-the same-row `Bxx`/`Cxx` interaction for each compatibility mode.
+Six S3M pattern-loop cases that once sat under C2-S3M-001 are **not** failures against
+StarPlayer's reference: they encode the Imago Orpheus, ModPlug 1.16 and ST3.01 flow modes
+libxmp selects from the `cwtv` field. They are dialect targets of
+`plans/engine/M2-task-C5-quirks-and-tempo-models.md`. One of them,
+`libxmp-s3m-pattern-loop-mpt-breakjump`, additionally reports `trace ended before libxmp
+row 2 frame 0`: that string is the harness exhausting its `oracle.len() + 256` tick budget
+(libxmp emits no line for a silent tick, so the oracle length is only a lower bound), not
+a state divergence. C2a derives the budget from the oracle's last timestamp and reports
+exhaustion as a harness error; the case must be re-run afterwards.
+
+## C2-S3M-001 — ST3.21 pattern-loop control flow
+
+Two cases, `libxmp-s3m-pattern-loop-st321` and `libxmp-s3m-pattern-loop-st321-breakjump`,
+are real ST3.21 bugs inherited from M1: StarPlayer restarts row 0 at tick 30 where ST3.21
+continues the loop, and again at tick 24 where ST3.21 follows the break/jump. Resolve the
+`SBx` loop counter and start-row semantics and the same-row `Bxx`/`Cxx` interaction for
+ST3.21, which is StarPlayer's S3M reference; the other trackers' flow modes are C5
+dialects, not failures.
 
 ## C2-S3M-002 — Amiga period limits
 
@@ -53,19 +71,3 @@ latching semantics during tone portamento.
 `s3m_sample_porta.s3m` leaves StarPlayer on an active row 3 frame 3 when the oracle's
 next active frame is row 16 frame 0. Resolve tone-portamento continuation after an
 instrument change and its resulting voice lifetime.
-
-## C4-MTM-001 — event-boundary one-shot lifetime
-
-`TEMPO.MTM` agrees through row 12 frame 3. StarPlayer's next C1 snapshot is row 12 frame
-4 with the one-shot active at source position 9356; it ends while that tick interval is
-rendered. libxmp's test inspects after `xmp_play_frame` and omits the ended voice, so its
-next active record is row 16 frame 0. Accuracy-policy D18 deliberately keeps the C1
-event-boundary contract.
-
-## C4-MTM-002 — per-tick integer timing drift
-
-`TEMPO2.MTM` agrees on control state, note, period, volume and pan, but at tick 53 its
-libxmp integer source position is 1501 while StarPlayer reports 1503 after projection.
-libxmp truncates every mixer tick to an integer output-frame count; StarPlayer carries
-the exact rational remainder. Accuracy-policy D19 preserves drift-free timing and the
-existing one-source-frame comparison bound.

@@ -70,6 +70,26 @@ survey those first and align the fields where it is sensible to.
 - A release build with `trace` disabled shows no measurable difference in render
   throughput.
 
+## Post-landing note — 2026-09-02 branch review
+
+**Deliverable 2 is not met.** No benchmark and no assembly inspection exists, so the
+"zero cost in release builds" claim is unproven, and it is in fact false as written: the
+`report_trace_channels` loops run unconditionally in S3M
+(`crates/starplayer-s3m/src/processor.rs:610`, including a per-channel instrument lookup)
+and in MOD (`crates/starplayer-mod/src/processor.rs:733`). Separately, the `trace` feature
+leaks into every workspace build through `starplayer-offline` and `starplayer-testkit`
+declaring it as a non-optional dependency feature, so `cargo test --workspace` never
+compiles the `cfg(not(feature = "trace"))` arms at all.
+
+Two correctness nits found in the same review: `source.rs:116` and `trace.rs:291` map
+`VoiceParam::Filter` onto the `PITCH` flag, and `trace.rs:330` unions the mixer-lifetime
+`params.dirty` into the per-tick flags instead of using `entry.writes`.
+
+All four are tracked by
+[M2-task-C6a](../M2-task-C6a-golden-and-build-hygiene.md) deliverables 1, 2 and 3. The
+final verification bullet below ("no measurable difference in render throughput") is
+therefore still outstanding.
+
 ## Out of scope
 
 The conformance corpus itself (C2). Golden WAV hashes (C6). Comparing against the
