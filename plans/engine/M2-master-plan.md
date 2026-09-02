@@ -33,7 +33,7 @@ expected channel state*, which is exactly the shape of our trace format.
 | [C1](complete/M2-task-C1-trace-format.md) ✅ | Per-tick state trace format and the differ | M1 | C6 |
 | [C2](complete/M2-task-C2-conformance-harness.md) ✅ | libxmp `test-dev/` + OpenMPT corpora in CI | C1 | C3, C4 |
 | [C3](complete/M2-task-C3-mod-loader-and-effects.md) ✅ | MOD: loader + ProTracker effect processor | M1 | C4 |
-| [C3a](M2-task-C3a-mod-headphone-panning.md) | Web option for S3M-width MOD headphone panning | C3, C4 | C5, C7 |
+| [C3a](complete/M2-task-C3a-mod-headphone-panning.md) ✅ | Web option for S3M-width MOD headphone panning | C3, C4 | C5, C7 |
 | [C4](complete/M2-task-C4-mtm-loader-and-effects.md) ✅ | MTM: loader + effect processor | M1 | C3 |
 | [C5](M2-task-C5-quirks-and-tempo-models.md) | `QuirkSet` and `TempoModel` wired end to end | C3 | C6 |
 | [C6](complete/M2-task-C6-fixed-point-mixer.md) ✅ | The fixed-point mixer — the bit-exact reference | M1 | C1, C3, C4 |
