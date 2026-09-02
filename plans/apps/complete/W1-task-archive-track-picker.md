@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player maintenance (follows M1-B8 archive support) |
-| Status | In progress |
+| Status | Landed; owner browser check outstanding |
 | Depends on | M1-B8 (ZIP archive support, landed) |
 | Blocks | — |
 | Recommended model | Claude Opus |
