@@ -41,7 +41,7 @@ expected channel state*, which is exactly the shape of our trace format.
 | [C8](M2-task-C8-dos-reference-harness.md) | **Deferred**, pull-driven — see its trigger | — | — |
 | [C2a](complete/M2-task-C2a-conformance-harness-repairs.md) ✅ | Harness repairs, `--strict`, exclusions rewritten from real results | C2 | C6a |
 | [C3b](M2-task-C3b-protracker-fidelity-repairs.md) | ProTracker fidelity + MTM repairs, and the voice-boundary sample swap | C3, C4 | C9, C6a |
-| [C6a](M2-task-C6a-golden-and-build-hygiene.md) | Trace-feature hygiene, MOD/MTM goldens, `fma-check`, the web panning race | C6, C1, C3a | C2a, C3b, C9 |
+| [C6a](complete/M2-task-C6a-golden-and-build-hygiene.md) ✅ | Trace-feature hygiene, MOD/MTM goldens, `fma-check`, the web panning race | C6, C1, C3a | C2a, C3b, C9 |
 | [C9](M2-task-C9-s3m-conformance-repairs.md) | The nine S3M effect bugs the corpus found (M1 inheritance) | C2a | C3b, C6a |
 
 C2a, C3b, C6a and C9 are the follow-ups opened by the 2026-09-02 branch review. C2a comes
@@ -76,14 +76,14 @@ undifferentiated exclusions, eight of them citing an NTSC rate libxmp never sele
 | Exit criterion | Status | Closed by |
 |---|---|---|
 | 1. MOD and MTM native, no S3M conversion | **Met** | C3, C4 |
-| 2. `cargo xtask goldens` regenerates; CI verifies | **Partly** — S3M only | C6a |
+| 2. `cargo xtask goldens` regenerates; CI verifies | **Met** — S3M owner fixtures plus synthesised MOD and MTM fixtures | C6a (landed) |
 | 3. `test-dev/` corpus passes for MOD, S3M, MTM | **Not met** — 10/47 after C2a | C3b (MOD/MTM), C9 (S3M), C5 (dialects) |
-| 4. Cross-target hash equality on the fixed path | **Partly** — S3M fixtures only; MOD and MTM have no goldens at all | C6a |
+| 4. Cross-target hash equality on the fixed path | **Met** for all three formats on x86-64 and wasm32; the ARM64 leg is CI-only | C6a (landed) |
 | 5. Loader fuzzing in CI, no panic or OOM | **Not met** | C7 |
 | 6. Allocator hook proves no allocation in `render()` | **Not met** | C7 |
 | 7. Every new deviation recorded in the accuracy policy | **Met for the current standing** — every exclusion reason records a first divergence the repaired harness observed | C2a (landed) |
 
-Landed: C1, C2, C2a, C3, C3a, C4, C6. Outstanding: C3b, C5, C6a, C7, C9. Deferred: C8.
+Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a. Outstanding: C3b, C5, C7, C9. Deferred: C8.
 
 ## A note on the oracle
 
