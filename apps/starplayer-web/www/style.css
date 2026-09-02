@@ -61,6 +61,7 @@ button:hover:not(:disabled), .button:hover { border-color: #61758c; background: 
 button:disabled, input:disabled { opacity: .38; cursor: not-allowed; }
 button.primary { color: #071512; background: var(--accent); border-color: var(--accent); font-weight: 800; }
 .url-form input { flex: 1; min-width: 12rem; }
+#archive-tracks { min-width: 0; max-width: 100%; }
 .mod-panning-option { display: flex; align-items: flex-start; gap: 9px; margin-top: 13px; color: var(--muted); cursor: pointer; }
 .mod-panning-option input { margin-top: 3px; accent-color: var(--accent); }
 .mod-panning-option span { display: grid; gap: 1px; }
