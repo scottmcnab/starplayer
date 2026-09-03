@@ -17,6 +17,25 @@ from the S3M crate's fixture corpus and appear in the **Bundled fixture** menu. 
 else arrives by file picker, drag-and-drop onto the drop zone, or a URL the remote server
 allows CORS on.
 
+## Controls
+
+The progress slider mirrors the engine's own song timeline rather than a page-side
+estimate: dragging it (an `input` event) only moves the elapsed readout, and releasing it
+(a `change` event) sends one `OPCODE_SEEK_FRAME` command carrying the frame under the
+thumb — continuous drag events are never queued, since the command ring holds only 64
+entries and is drained once per render quantum. The two readouts are `m:ss`, `h:mm:ss`
+once the song runs past an hour, and `--:--` while the song's length is not yet known.
+Elapsed is the engine's own reported position, not compensated for the `AudioContext`'s
+`outputLatency`, so it can read a little ahead of what is actually heard.
+
+**Repeat**, checked by default, sends `OPCODE_AT_END`: checked wraps the song at its loop
+point and the slider wraps with it; unchecked fades the song out over `SONG_FADE_SECONDS`
+(5 seconds) into what would otherwise be its second pass, then stops — the host itself
+rewinds the transport to song frame 0 once the fade lands, and the slider follows it to
+`0:00`. The same command is resent whenever a module is (re)activated and whenever a
+playback-restoring graph rebuild happens (a sample-rate or channel-count change, or the
+MOD panning reload), so the checkbox's choice survives all of them.
+
 ## Architecture
 
 The A4 worklet bundle architecture is preserved: `wasm-bindgen --target no-modules`

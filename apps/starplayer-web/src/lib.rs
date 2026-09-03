@@ -356,6 +356,16 @@ mod tests {
     }
 
     #[test]
+    fn browser_visible_loader_copy_advertises_the_progress_slider_and_repeat() {
+        let index = include_str!("../www/index.html");
+        assert!(index.contains("id=\"elapsed\""));
+        assert!(index.contains("id=\"progress\""));
+        assert!(index.contains("id=\"duration\""));
+        assert!(index.contains("id=\"repeat\""));
+        assert!(index.contains(" Repeat</label>"));
+    }
+
+    #[test]
     fn malformed_input_does_not_replace_the_last_good_module() {
         assert!(inspect(FIXTURE).is_ok());
         let title = with_module(String::new(), |module| module.header().title.to_string());

@@ -341,6 +341,12 @@ const READ_STATE = `
         headphonePanning: document.getElementById('mod-headphone-panning').checked,
         headphonePanningDisabled: document.getElementById('mod-headphone-panning').disabled,
         mutes: [...document.querySelectorAll('#channel-body button')].map((button) => button.textContent.trim()),
+        elapsed: text('elapsed'),
+        duration: text('duration'),
+        progressValue: Number(document.getElementById('progress').value),
+        progressMax: Number(document.getElementById('progress').max),
+        progressDisabled: document.getElementById('progress').disabled,
+        repeatChecked: document.getElementById('repeat').checked,
     };
 `;
 
@@ -528,6 +534,13 @@ async function run(executable, mode) {
         assert.ok(started.instruments > 0, 'the instrument list is populated');
         report.transport = `${started.commandTransport} / ${started.telemetryTransport}`;
 
+        // ── progress slider: the song timeline reaches the page ────────────────────
+        assert.notEqual(started.duration, '0:00', 'the duration reads a nonzero song length');
+        assert.notEqual(started.duration, '--:--', 'the duration is known for a bundled S3M');
+        assert.ok(started.progressMax > 0, 'the progress slider max is the song length in frames');
+        assert.equal(started.progressDisabled, false, 'the slider is enabled once the song length is known');
+        assert.equal(started.repeatChecked, true, 'Repeat defaults to checked');
+
         // ── play ────────────────────────────────────────────────────────────────────
         const seconds = options.seconds;
         const rowsSeen = new Set();
@@ -564,6 +577,8 @@ async function run(executable, mode) {
         assert.ok(playing.patternRows > 0, 'the pattern window is drawn');
         assert.ok(playing.soundingRow !== null, 'a pattern row is highlighted as sounding');
         assert.ok(effectsSeen.size > 0, 'at least one effect was spelled out in English');
+        assert.notEqual(playing.elapsed, started.elapsed, 'the elapsed readout advanced while playing');
+        assert.ok(playing.progressValue > 0, 'the progress slider advanced with playback');
         report.playedSeconds = seconds;
         report.rowChanges = rowChanges;
         report.distinctRows = rowsSeen.size;
@@ -587,6 +602,45 @@ async function run(executable, mode) {
         const resumed = await page.evaluate(READ_STATE);
         assert.notEqual(resumed.row, stopped.row, 'play resumes the row clock');
         report.seekedOrder = resumed.order;
+
+        // ── the progress slider seeks the engine, not just the display ──────────────
+        const beforeSliderSeek = await page.evaluate(READ_STATE);
+        const sliderSeekTarget = Math.floor(beforeSliderSeek.progressMax / 2);
+        await page.evaluate(`
+            const progress = document.getElementById('progress');
+            progress.value = '${sliderSeekTarget}';
+            progress.dispatchEvent(new Event('change'));
+            return true;
+        `);
+        await page.waitFor('the slider seek to move the order', `document.getElementById('order').textContent !== ${JSON.stringify(beforeSliderSeek.order)}`);
+        const afterSliderSeek = await page.evaluate(READ_STATE);
+        await delay(500);
+        const settledSliderSeek = await page.evaluate(READ_STATE);
+        assert.equal(afterSliderSeek.order, settledSliderSeek.order, 'the order the page shows settles at the frame the slider was seeked to');
+        report.sliderSeek = `${beforeSliderSeek.order} → ${settledSliderSeek.order} at frame ${sliderSeekTarget}/${beforeSliderSeek.progressMax}`;
+
+        // ── Repeat off fades out at the loop point and stops, resetting to 0:00 ─────
+        await page.evaluate("const repeat = document.getElementById('repeat'); repeat.checked = false; repeat.dispatchEvent(new Event('change')); return true;");
+        const rate = rateDigits(settledSliderSeek.workletRate);
+        const nearEndFrame = Math.max(0, settledSliderSeek.progressMax - rate);
+        await page.evaluate(`
+            const progress = document.getElementById('progress');
+            progress.value = '${nearEndFrame}';
+            progress.dispatchEvent(new Event('change'));
+            return true;
+        `);
+        await page.waitFor('the transport to stop after the fade-out', "document.getElementById('transport-chip').textContent === 'stopped'", 30_000);
+        const afterFadeStop = await page.evaluate(READ_STATE);
+        assert.equal(afterFadeStop.chip, 'stopped', 'Repeat off fades out and stops at the loop point instead of wrapping');
+        assert.equal(afterFadeStop.elapsed, '0:00', 'elapsed reads 0:00 once the fade-out stop lands');
+        assert.equal(afterFadeStop.progressValue, 0, 'the slider rewinds to 0 once the fade-out stop lands');
+        report.fadeStop = `stopped at ${afterFadeStop.elapsed}`;
+
+        // Leave Repeat checked and the transport playing again, as the rest of this run
+        // (and the next mode's run of the same page) expects.
+        await page.evaluate("const repeat = document.getElementById('repeat'); repeat.checked = true; repeat.dispatchEvent(new Event('change')); return true;");
+        await page.evaluate("document.getElementById('play').click(); return true;");
+        await page.waitFor('playback to resume after the fade-out test', "document.getElementById('transport-chip').textContent === 'playing'");
 
         // ── a single-module ZIP loads straight through the file picker ──────────────
         await loadFile(page, singleModuleZip, 'reflex.zip');
