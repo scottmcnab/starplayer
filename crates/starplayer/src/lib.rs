@@ -131,6 +131,8 @@ pub use sequencer::ModSequencer;
 pub use sequencer::MtmSequencer;
 #[cfg(feature = "s3m")]
 pub use sequencer::S3mSequencer;
+#[cfg(feature = "it")]
+pub use sequencer::ItSequencer;
 
 /// The widest voice pool the engine will build, and what a **persistent** host takes.
 ///
@@ -157,6 +159,10 @@ pub use starplayer_mod as mod_file;
 /// MultiTracker loading, native pattern access and sequencer construction.
 #[cfg(feature = "mtm")]
 pub use starplayer_mtm as mtm;
+
+/// Impulse Tracker loading, native pattern access and sequencer construction.
+#[cfg(feature = "it")]
+pub use starplayer_it as it;
 
 /// One module's scanned song shape and the [`QuirkSet`](core::quirks::QuirkSet) it was
 /// scanned under.
@@ -218,7 +224,7 @@ pub fn scan_song(
 /// With every format feature off there is nothing to scan: `NativeSequencer` is
 /// uninhabited, the `?` above the match never returns, and the whole body is dead. The
 /// `allow` says so, and exists only in that build.
-#[cfg_attr(not(any(feature = "s3m", feature = "mod", feature = "mtm")), allow(unreachable_code, unused_mut, unused_variables))]
+#[cfg_attr(not(any(feature = "s3m", feature = "mod", feature = "mtm", feature = "it")), allow(unreachable_code, unused_mut, unused_variables))]
 fn scan_with(
     module: &starplayer_rt::Arc<starplayer_model::Module>,
     sample_rate_hz: u32,
@@ -237,6 +243,8 @@ fn scan_with(
         NativeSequencer::Mod(ref mut sequencer) => starplayer_engine::scan_timeline(sequencer, limits),
         #[cfg(feature = "mtm")]
         NativeSequencer::Mtm(ref mut sequencer) => starplayer_engine::scan_timeline(sequencer, limits),
+        #[cfg(feature = "it")]
+        NativeSequencer::It(ref mut sequencer) => starplayer_engine::scan_timeline(sequencer, limits),
     };
     Ok(ScannedSong { timeline, quirks })
 }
@@ -256,6 +264,7 @@ pub const fn supports(format: starplayer_model::ModuleFormat) -> bool {
         starplayer_model::ModuleFormat::S3m => cfg!(feature = "s3m"),
         starplayer_model::ModuleFormat::Mod => cfg!(feature = "mod"),
         starplayer_model::ModuleFormat::Mtm => cfg!(feature = "mtm"),
+        starplayer_model::ModuleFormat::It => cfg!(feature = "it"),
         _ => false,
     }
 }
@@ -283,6 +292,8 @@ pub fn recommended_voice_capacity(module: &starplayer_model::Module) -> usize {
         starplayer_model::ModuleFormat::Mod => starplayer_mod::recommended_voice_capacity(channel_count),
         #[cfg(feature = "mtm")]
         starplayer_model::ModuleFormat::Mtm => starplayer_mtm::recommended_voice_capacity(channel_count),
+        #[cfg(feature = "it")]
+        starplayer_model::ModuleFormat::It => starplayer_it::recommended_voice_capacity(channel_count),
         _ => channel_count,
     }
 }
@@ -336,6 +347,8 @@ fn scan_mod_with(
 /// facade. No extension or S3M lowering participates in this decision.
 pub fn probe(bytes: &[u8]) -> Option<starplayer_model::ModuleFormat> {
     let _ = bytes;
+    #[cfg(feature = "it")]
+    if starplayer_it::probe(bytes) { return Some(starplayer_model::ModuleFormat::It); }
     #[cfg(feature = "s3m")]
     if starplayer_s3m::probe(bytes) { return Some(starplayer_model::ModuleFormat::S3m); }
     #[cfg(feature = "mtm")]
@@ -354,6 +367,8 @@ pub fn load(bytes: &[u8]) -> Result<starplayer_model::Module, starplayer_core::E
         Some(starplayer_model::ModuleFormat::Mod) => starplayer_mod::load(bytes),
         #[cfg(feature = "mtm")]
         Some(starplayer_model::ModuleFormat::Mtm) => starplayer_mtm::load(bytes),
+        #[cfg(feature = "it")]
+        Some(starplayer_model::ModuleFormat::It) => starplayer_it::load(bytes),
         _ => Err(starplayer_core::Error::BadMagic),
     }
 }

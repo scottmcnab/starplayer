@@ -256,3 +256,281 @@ commands and results, every policy entry added, the Q3 answer, and anything left
 
 The filter's audio (G2 — this task only writes the params). MIDI output of macros. `.mptm`.
 Changing the S3M/MOD/MTM/XM processors or the shared envelope-free engine design.
+
+## Research resolution
+
+### 1. libxmp's IT dumps — **verdict: background voices *are* dumped, as virtual channels at or above `mod->chn`, and the adapter reproduces libxmp's own numbering**
+
+`test-dev/gen_mixer_data.c` and `compare_mixer_data.c` both loop
+`for (i = 0; i < max_channels; i++)` with `max_channels = p->virt.virt_channels`, and
+`virt_channels = num_tracks + libxmp_mixer_numvoices(ctx, -1)` whenever the format has
+`QUIRK_VIRTUAL` — which IT does. So every column of the dump is a **virtual** channel, and
+an NNA background voice appears under an index at or above the module's channel count.
+
+The numbering is not arbitrary. `libxmp_virt_setpatch` (`src/virtual.c:517-523`) moves the
+*displaced* voice to the lowest free virtual channel at or above `num_tracks`:
+
+```c
+for (chn = p->virt.num_tracks; chn < p->virt.virt_channels &&
+     p->virt.virt_channel[chn++].map > FREE;) ;
+p->virt.voice_array[voc].chn = --chn;
+p->virt.virt_channel[chn].map = voc;
+```
+
+and `libxmp_virt_resetvoice` frees the slot again. That rule is reproducible from trace v2
+alone, so `background_virtual_channels` in `crates/starplayer-testkit/src/conformance.rs`
+assigns each ` vc=` row the lowest free index at or above the channel count, holds it while
+the voice is alive and releases it when the voice goes. The projection then folds those
+rows into the same channel axis the ` ch=` rows use, and every oracle column — background
+ones included — is enforced. Both players walk channels in ascending order and both hand
+out the lowest free slot, so two detachments in one tick are numbered the same way.
+
+**The period domain.** libxmp dumps `xc->info_period`, which is
+`MIN(final_period * 4096, INT_MAX)` with
+`final_period = libxmp_note_to_period_mix(note, bend) = PERIOD_BASE / 2^((note + bend/12800)/12)`
+and `PERIOD_BASE = 13696.0` (`src/period.h:6`). It is a **period** even for a linear-slide
+file: libxmp keeps IT's pitch as a note plus a bend and only converts at the end, where
+StarPlayer — like IT itself — keeps a frequency. The two are related by libxmp's own mixer
+step, `step = C4_PERIOD * c5spd / rate / period` with `C4_PERIOD = 428`, so
+
+> `info_period = 4096 · 428 · C5Speed / frequency`
+
+The IT processor traces exactly `428 · C5Speed / frequency` — libxmp's whole period — and
+`project_period` divides the oracle's Q12 column by 4096, the same projection MOD and MTM
+use, with the existing tolerance of one whole period. Recorded as accuracy-policy entry
+**D64**: the comparison axis is a whole libxmp period, so a pitch difference smaller than
+one period at the sounding note is below the oracle's resolution. That is about 0.23 % at
+C-5 and 1.9 % at C-8; IT's own finest slide step is 1/64 semitone (0.09 %), so the axis
+catches note, octave, direction and accumulated-drift errors but not a single fine-slide
+unit at the top of the keyboard. Tightening it is G6's call, not a silent choice here.
+
+**`cutoff` / `resonance`.** libxmp stores IT's 0..127 file values doubled:
+`apply_midi_macro_effect` does `xc->filter.cutoff = val << 1` and
+`xc->filter.resonance = val << 1`, the channel default is `0xFF`, the filter envelope
+scales it as `cutoff * envelope >> 8`, and `vi->filter.*` is only written while the filter
+is actually engaged — so a voice that never engaged one dumps the `calloc` zero. This fixes
+the `FilterParams` encoding jointly with G2 (its research point 1): `FilterParams::from_it`
+encodes **`value · 2 · 257`**, because `255 · 257 == 65535` exactly. The C1 trace's
+`unit_to_scale(bits, 255)` then reads back libxmp's 0..255 column with no rounding at all,
+and `FilterParams::to_it` — what G2's coefficient code takes — reads back IT's 0..127 pair
+exactly. `from_it_scaled` takes an already-envelope-scaled 0..255 cutoff for the same
+encoding. G2's task file proposed `cutoff · 516`; that round-trips the 0..127 domain but
+disagrees with the oracle's 0..255 column at 63 of its 128 values (cutoff 64 reads 129
+where libxmp says 128), so the agreed encoding is `· 2 · 257`. `is_bypass()` is IT's own
+rule — full cutoff with no resonance is not a filter at all — so `from_it(127, 0)` is
+`BYPASS` and traces as 255, which is what the adapter's `cutoff == 0 → 255` sentinel
+already expects. The projection now also mirrors libxmp's own comparator, which accepts any
+two values at or above 254 as the same fully-open cutoff.
+
+**`volume ×16`.** libxmp's `vi->vol` is `finalvol`, whose maximum is 1024 — sixteen times
+IT's 0..64 scale, and one sixteenth of OpenMPT's 14-bit `nRealVolume`. The existing
+`(volume_x16 + 8) / 16` projection is therefore already the IT projection, and the trace's
+`report_channel` caps `volume` at 64 regardless, so 0..64 is the axis for every format.
+
+**`pan`.** libxmp dumps `vi->pan`, which is `finalpan - 0x80` in −128..127 — *or*
+`PAN_SURROUND` (`0x8000`) for a channel `S91` put into surround (`src/player.c:1408`,
+`src/mixer.h:23`). 48 lines of `SmpInsPanSurround.data` carry it, and the old
+`parse_libxmp_dump` rejected the file outright. The column is now `i32`, the sentinel is
+accepted, and `project_pan` maps it to centre — which is what StarPlayer renders for a
+surround voice (accuracy-policy entry **D66**). Every other IT pan compares as a full byte,
+since IT's 0..64 pan is scaled by four inside the replayer rather than shifted into a
+nibble as S3M's is.
+
+**The manifest.** `audit_pinned_corpus` insists the case manifest is exactly the set of
+`compare_mixer_data*` pairs in the pinned tree for every target extension, so adding `it`
+to `matches_target_extension` brings in **121** IT cases, not the 59 `openmpt/it` ones the
+task named: 59 `openmpt/it` fixtures plus 62 `data/*.it` ones from `test_effect_it_*`,
+`test_player_it_*`, `test_storlek_*` and two fuzzer cases. All 121 are in `cases.tsv`.
+
+### 2. Q3 — OpenMPT's `GetNNAChannel` — **verdict: lowest free background voice first; otherwise the quietest background voice, halved for a looped sample, and never quieter than the note that wants to steal it**
+
+`CSoundFile::GetNNAChannel` (`soundlib/Snd_fx.cpp:2257`) is two passes over the background
+range `[GetNumChannels(), Chn.size())` only — a foreground voice of another channel is
+never a candidate:
+
+1. **A free voice wins outright**, taking the lowest index: `if(c.nLength) continue;` then
+   `return i`.
+2. Otherwise a score `v = (nRealVolume << 9) | nVolume` — the 14-bit post-envelope,
+   post-fadeout mixing volume with the 0..256 note volume as a tie-breaker — is computed
+   for every background voice. `if(c.dwFlags[CHN_LOOP]) v /= 2;` gives a looped sample half
+   priority, because it will ring forever otherwise. A voice that is *playing but fully
+   faded* (`c.nLength && !c.nFadeOutVol`) is returned immediately. The lowest score wins,
+   and on a tie the voice further through its volume envelope — or with no volume envelope
+   at all — wins.
+3. The threshold starts at the **stealing note's own score**
+   (`vol = (srcChn.nRealVolume << 9) | srcChn.nVolume`), so a background voice louder than
+   the note that wants its slot is never stolen and the new note simply does not sound.
+   And if the source channel is itself already fully faded, `CHANNELINDEX_INVALID` is
+   returned before the search: nothing is allocated and the old voice is just dropped.
+
+Schism (`player/effects.c:1640`) agrees on the shape and differs in two details: it folds
+the fadeout into the score explicitly (`v = volume * fadeout_volume` for a fading voice,
+`volume << 16` otherwise) instead of relying on `nRealVolume`, and it uses a fixed 25 %
+threshold rather than the stealing note's own score.
+
+`ItProcessor::steal_background_voice` implements OpenMPT's rule, with Schism's explicit
+fadeout term folded in because StarPlayer's per-voice volume is recomputed from the
+articulation state each tick rather than cached as a 14-bit mixing volume: the score is
+`(voice_volume_14bit << 9) | note_volume`, halved for a looping region, and a voice whose
+fadeout has reached zero is taken at once. The answer is recorded in
+`plans/product/01-technical-architecture.md` §5.2 and the §12 open-question table.
+
+### 3. IT pattern-loop flow — **verdict: four `Cwt/v`-gated profiles, and a `QuirkSet` field was needed after all**
+
+it2play's `InitCommandS` (`it_m_eff.c`, a direct port of IT2's own replayer) is the
+behaviour to reproduce:
+
+```c
+if (val == 0)                    hc->PattLoopStartRow = Song.CurrentRow;
+else if (hc->PattLoopCount == 0) { hc->PattLoopCount = val; Song.ProcessRow = hc->PattLoopStartRow - 1; Song.PatternLooping = true; }
+else if (--hc->PattLoopCount)    { Song.ProcessRow = hc->PattLoopStartRow - 1; Song.PatternLooping = true; }
+else                             hc->PattLoopStartRow = Song.CurrentRow + 1;
+```
+
+— a **per-channel** target and counter, independent across channels, with the target
+advancing past the `SBx` row when the count runs out. `Cxx` is suppressed while a loop is
+running (`if (!Song.PatternLooping)` guards the break) and a pattern break does not reset
+the counters.
+
+The task file's premise of a documented **2.10 versus 2.14** split is not corroborated by
+anything found: OpenMPT gates its pattern-loop behaviours on *OpenMPT* version rather than
+on IT's, and Schism's own abuse-test page describes a single behaviour. But the premise
+was right that a `QuirkSet` field is needed, because libxmp gates on `Cwt/v` at a
+*different* boundary — `src/loaders/it_load.c:394-400`:
+
+```c
+if (ifh->cwt < 0x104)      m->flow_mode = FLOW_MODE_IT_100;
+else if (ifh->cwt < 0x200) m->flow_mode = FLOW_MODE_IT_104;
+else if (ifh->cwt < 0x210) m->flow_mode = FLOW_MODE_IT_200;
+/* else the 0x351 default: FLOW_MODE_IT_210 */
+```
+
+with `FLOW_MODE_IT_100 = GLOBAL | UNSET_BREAK | UNSET_JUMP | JUMP_NO_ROW_SET`,
+`IT_104` the same without `GLOBAL`, `IT_200 = IT_104 | DELAY_BREAK`, and
+`IT_210 = IT_200 | END_ADVANCES` (`src/common.h:380-386`). The pinned corpus carries one
+fixture per profile — `pattern_loop_it100.it`, `pattern_loop_it104.it`,
+`pattern_loop_it200_breakjump.it`, `pattern_loop_it210.it` — which is exactly the corpus
+evidence C5's rule demands before a field may exist.
+
+So this task adds `ItLoopDialect` to `QuirkSet` with the four profiles, three new
+`FormatDialect` variants (`ImpulseTracker200`, `ImpulseTracker104`, `ImpulseTracker100`)
+for the early `Cwt/v` bands, and `ItLoopDialect::flow()` mapping each onto the
+`PatternFlow` the engine's `PatternFlowState` already executes. Every clone — Schism,
+OpenMPT, ModPlug — takes the 2.10 baseline, exactly as libxmp does
+(`it_load.c:351` sets `FLOW_MODE_IT_210` before the `Cwt/v` switch narrows it, and only
+the "Impulse Tracker" branch narrows it). Recorded as accuracy-policy entry **D65**, with
+`the_it_flow_tables_match_libxmps_flow_mode_constants` asserting the four profiles field
+by field against libxmp's constants. The IT loader's `dialect()` was extended to return
+the finer variants, which changed one committed fuzz-seed expectation
+(`old-instruments.it` carries a pre-2.00 `Cwt/v`).
+
+### 4. `ItModern` — **verdict: Impulse Tracker truncates, the IT dialects select it, and the conformance adapter keeps pairing on the oracle's own exact clock**
+
+`ItModern` was a stub equal to `ExactFixedPoint`. It is now
+`(sample_rate · 5) / (2 · bpm)` truncated **once** to a whole output frame, with no
+remainder carried — which is what Impulse Tracker's driver does (it reloads a whole-sample
+gap length every tick), what libxmp does (`src/mixer.c:440`, `ticksize = (int)calc`) and
+what OpenMPT's classic path does. It is *not* `St3Truncating`, which truncates twice
+(`(rate * 10 / bpm) >> 2`); the two agree wherever the quotient is whole and differ by up
+to three frames elsewhere. The pinning test
+`it_modern_is_currently_exact_fixed_point` is replaced by one asserting the truncation.
+
+**Both numbers, measured on the pinned corpus at the same commit and with every other
+change in place.** Under `ExactFixedPoint` the IT set gave **10 passes** with 59 cases
+whose first divergence is `position`; under `ItModern` it gives **13 passes** with the
+same category shrinking, and after the two harness projections below it reaches **39**
+(13 with every field enforced, 26 with `position` waived under **D67**). The reason the
+tempo model shows up as a *position* difference at all is that a voice's sample position
+after N ticks is `step · Σ frames_per_tick`, so a fractional tick length that the engine
+carries and the oracle does not walks the two apart on every module whose BPM does not
+give a whole number of frames per tick.
+
+**The recommendation is `ItModern`, for IT modules only**, selected by
+`FormatDialect::ImpulseTracker*` through `QuirkSet::impulse_tracker()`. MOD, MTM and S3M
+keep `ExactFixedPoint`; the project's drift-free default is unchanged for every format
+whose own program did not truncate. The argument is that for IT the exact clock is not a
+more accurate reading of the same behaviour — it is a different behaviour, audible as a
+different sample position — where for MOD and S3M the truncation is a defect of one
+*player* (the 1990s StarPlayer) rather than of the format, which is why §2 keeps it behind
+`quirks-starplayer` there. **This is the owner's call to confirm**; both numbers are above
+and the change is one line of `QuirkSet::impulse_tracker()`.
+
+One consequence for the harness, and it is worth stating because it is not obvious:
+**libxmp keeps two clocks that disagree with each other.** The number of frames it renders
+per tick is truncated, but the `time` column every dump record carries accumulates the
+exact `time_factor · rrate / bpm` in a `double` (`src/player.c:2171`). The dump's
+timestamps therefore lie on the *exact* timeline and its sample positions on the
+*truncated* one. `tick_end_frames` pairs records by timestamp, so it models libxmp and
+keeps `ExactFixedPoint` for every format including IT; the engine renders on the truncated
+model. Pairing IT on `ItModern` was tried first and pushed the accumulated frame offset
+past the harness's own 45-frame pairing tolerance on traces of eighty ticks or more.
+
+### 5. `S9x` surround, `Xxx` on a surround channel, and the MIDI pitch controller — **verdict: surround renders as centre (D66); `Xxx` and `S8x` cancel surround; the MIDI pitch controller is out of scope and no corpus case observes it**
+
+* **`S91` turns surround on, `S90` off.** `S90` is a ModPlug extension — it2play's
+  `case 0x90` only acts on `val == 1` — but implementing both is harmless and matches
+  every modern replayer. `S9A`/`S9B` (song-global surround mode) and `S9C`–`S9F` are
+  ModPlug extensions; `S9E`/`S9F` (play forward/backward) are not implemented here and are
+  reported through `report_effect` only.
+* **`Xxx` and `S8x` cancel surround.** it2play's `InitCommandX2` writes `sc->Pan` and
+  `sc->PanSet` unconditionally, overwriting the `PAN_SURROUND` sentinel (100); OpenMPT
+  spells the same rule `kITNoSurroundPan` — "Panning and surround are mutually exclusive" —
+  and `kPanOverride` additionally zeroes the pan swing and the panbrello offset. A sample's
+  or instrument's own panning also cancels it (`SmpInsPanSurround.it`), while `Pxy` is a
+  **no-op** on a surround channel in IT2 (OpenMPT slides anyway — a deviation recorded as
+  **D68**, resolved in IT2's favour).
+* **Surround itself is rendered as centre**, accuracy-policy entry **D66**: StarPlayer's
+  voice model carries one `pan: I1F15` and the mixer has no phase-inverted rear channel, so
+  the Dolby Pro-Logic trick IT's software mixer plays (`newRightVol = -newRightVol`) has
+  nowhere to live until the DSP graph grows a surround bus in M7. `SmpInsPanSurround.it` is
+  the corpus case that observes it, and the adapter projects libxmp's `PAN_SURROUND`
+  sentinel onto centre so the rest of that trace stays enforced.
+* **MIDI pitch controller** (`Flags` bit 6, depth `PWD`) only matters for a channel routed
+  to a MIDI instrument. This engine has no MIDI output — the task puts it out of scope —
+  and no `openmpt/it` or `data/*.it` fixture in the pinned corpus uses a MIDI instrument, so
+  nothing observes it. `ItFormatExtra::uses_midi_pitch_controller` stays unread.
+
+## Landing notes
+
+### What deviates from the task file, and why
+
+* **121 corpus cases, not 59.** `audit_pinned_corpus` insists the manifest is exactly the
+  set of `compare_mixer_data*` pairs in the pinned tree for every target extension, so
+  adding `it` to `matches_target_extension` brings the 62 `data/*.it` pairs in with the 59
+  `openmpt/it` ones. Wiring only the 59 would have made the audit fail.
+* **The voice-stealing policy is not a trait** (master-plan deliverable 3 said "policy
+  trait"). Design goal 8 keeps a trait uncommitted until its second real implementation,
+  and XM's allocator is the same heuristic with a different New Note Action set.
+  `ItProcessor::choose_victim` is a concrete policy in `starplayer-it`.
+* **A `QuirkSet` field arrived that the task file did not anticipate**, and one it
+  anticipated arrived differently. `it_pattern_loop` (research point 3) is named by four
+  corpus fixtures, so C5's rule permits it; `tempo_model` on the IT dialects is research
+  point 4's answer and is the owner's to confirm.
+* **`S2x` set finetune is deliberately not implemented.** It was removed in Impulse
+  Tracker 2 (`it2play` falls through to the no-op default; Schism's comment says "no longer
+  implemented"). OpenMPT still implements it for S3M compatibility.
+* **Envelope carry's Compatible-Gxx quirk is not implemented.**
+  `kITCompatGxxCarryPortaWithIns` reads the envelope position back from a global
+  "last moved NNA channel". `ItProcessor` tracks `last_moved_voice` but does not read it;
+  the case that needs it (`CarryCompatGxxPortaWithIns.it`) has no oracle in the pinned
+  corpus. Left for G6.
+* **Ping-pong loop shortening is not implemented.** IT's software mixer plays a ping-pong
+  loop one sample short of the file's; `openmpt-it-bidi-loops` is the fixture for it and is
+  recorded under `G3-IT-008`.
+
+### Overlap with G2 (the resonant filter), which landed on `main` separately
+
+Both tasks needed `FilterParams::from_it` / `to_it`, and research point 1 here settled the
+encoding jointly. **The two agree**: this branch encodes `value · 2 · 257`, which is
+`value · 514`, and G2 landed `514×`. The merge will conflict textually in
+`crates/starplayer-core/src/event.rs` — **keep G2's `from_it` / `to_it`** and take this
+branch's extra `from_it_scaled(cutoff_0_255, resonance_0_127)`, which is the form the
+filter envelope needs (IT scales the cutoff by the envelope *before* the coefficients are
+derived, so the processor has a 0..255 cutoff in hand rather than a 0..127 one). This
+branch's `FilterParams::IT_SCALE`, `saturating_double` and `scale_to_it` helpers exist only
+to support those three functions and can go with whichever copy loses.
+
+G2 also added `Voice::filter_mut().set_extended_range(..)`, which nothing sets. **This
+branch cannot call it** — the method does not exist here — but the value it wants is
+already read: `ItProcessor::has_extended_filter_range()` returns the module's `Flags` bit
+`0x1000`. Wiring the one call is a post-merge line for the reviewer or for G6.

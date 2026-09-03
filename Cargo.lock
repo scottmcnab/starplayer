@@ -487,6 +487,7 @@ version = "0.1.0"
 dependencies = [
  "starplayer-core",
  "starplayer-engine",
+ "starplayer-mixer",
  "starplayer-model",
  "starplayer-rt",
 ]
@@ -545,7 +546,6 @@ version = "0.1.0"
 dependencies = [
  "sha2",
  "starplayer",
- "starplayer-it",
  "starplayer-xm",
 ]
 

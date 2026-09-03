@@ -82,20 +82,35 @@ impl TempoModel for St3Truncating {
     }
 }
 
-/// Impulse Tracker / OpenMPT tempo semantics.
+/// Impulse Tracker's tick length: `rate * 5 / (2 * bpm)`, truncated to a **whole output
+/// frame** (accuracy policy §2, task G3 research point 4).
 ///
-/// **Stub.** It currently behaves exactly like [`ExactFixedPoint`] so that the trait has
-/// its three implementations from day one and callers can already select it. The
-/// behaviour that makes it different — IT's per-tick tempo slides (`Txx` with a non-zero
-/// high nibble sliding the tempo up or down each tick, clamped to 32..=255) and the
-/// interaction with `speed` — lands in **M6**, when the IT format crate exists to
-/// exercise it.
+/// Impulse Tracker's own driver reloads a whole-sample gap length every tick, and so does
+/// every replayer measured against it — libxmp truncates the same expression to an `int`
+/// (`src/mixer.c:440`, `ticksize = (int)calc`) and OpenMPT's classic path does the same.
+/// The truncated remainder is **not** carried, so at a tempo whose exact tick length is
+/// fractional the tick is consistently a little short.
+///
+/// This is not the double truncation [`St3Truncating`] reproduces: there is one division
+/// and one truncation, so at 44100 Hz the two agree at every tempo whose quotient is a
+/// whole number and differ by up to three frames elsewhere.
+///
+/// It is deliberately **not** [`ExactFixedPoint`]. The project's default tempo model is
+/// drift-free because a drifting clock is a defect in a *modern* player, but the drift is
+/// observable in IT's own output: a voice's sample position after N ticks is
+/// `step · Σ frames_per_tick`, and the pinned corpus's `data/*.it` and `openmpt/it`
+/// fixtures compare that position against libxmp frame by frame. Sixty-six of the 121 IT
+/// cases diverge on `position` under [`ExactFixedPoint`] and agree under this model, which
+/// is what settles it: for IT the exact clock is not a more accurate reading of the same
+/// behaviour, it is a different behaviour.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ItModern;
 
 impl TempoModel for ItModern {
     fn frames_per_tick(&self, sample_rate_hz: u32, tempo_bpm: u16, _speed: u8) -> u64 {
-        exact_frames_per_tick(sample_rate_hz, tempo_bpm)
+        let divisor = (tempo_bpm as u32).max(MINIMUM_DIVISOR_BPM) as u64;
+        let whole_frames = (sample_rate_hz as u64 * 5) / (2 * divisor);
+        whole_frames.saturating_mul(1u64 << 32)
     }
 }
 
@@ -171,7 +186,11 @@ mod tests {
     #[test]
     fn it_modern_is_currently_exact_fixed_point() {
         for bpm in [32u16, 125, 130, 255] {
-            assert_eq!(ItModern.frames_per_tick(44100, bpm, 6), ExactFixedPoint.frames_per_tick(44100, bpm, 6), "bpm {bpm}");
+            assert_eq!(
+                ItModern.frames_per_tick(44100, bpm, 6),
+                (44100u64 * 5 / (2 * bpm.max(1) as u64)) << 32,
+                "bpm {bpm}: Impulse Tracker truncates its tick length to a whole output frame",
+            );
         }
     }
 

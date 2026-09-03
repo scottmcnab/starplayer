@@ -27,7 +27,7 @@ starplayer-telemetry = { workspace = true, optional = true }
 # reachable from here, transitively enables `std`. `xtask ci --job no-std-purity`
 # enforces it by compiling this crate's default feature set for a bare-metal target.
 [features]
-default = ["s3m", "mod", "mtm", "float-mix", "linear-interp"]
+default = ["s3m", "mod", "mtm", "it", "float-mix", "linear-interp"]
 
 std = [
     "starplayer-core/std",
@@ -67,7 +67,7 @@ fixed-mix = ["starplayer-dsp/fixed-mix", "starplayer-mixer/fixed-mix", "starplay
 linear-interp = ["starplayer-dsp/linear-interp", "starplayer-mixer/linear-interp", "starplayer-engine/linear-interp"]
 
 telemetry = ["dep:starplayer-telemetry", "starplayer-engine/telemetry"]
-trace = ["starplayer-engine/trace", "starplayer-mod?/trace", "starplayer-s3m?/trace", "starplayer-mtm?/trace"]
+trace = ["starplayer-engine/trace", "starplayer-mod?/trace", "starplayer-s3m?/trace", "starplayer-mtm?/trace", "starplayer-it?/trace"]
 
 quirks-starplayer = [
     "starplayer-core/quirks-starplayer",

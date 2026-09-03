@@ -271,6 +271,59 @@ impl FilterParams {
     /// Whether these parameters leave the signal untouched, so the mixer can skip the
     /// filter entirely for MOD/S3M/MTM.
     pub const fn is_bypass(self) -> bool { self.cutoff.to_bits() == u16::MAX && self.resonance.to_bits() == 0 }
+
+    /// The scale factor that puts Impulse Tracker's 0..=255 mixer domain onto the whole
+    /// `U0F16` range: `255 · 257 == 65535`, so the encoding is lossless in both
+    /// directions and no rounding rule has to be agreed twice.
+    const IT_SCALE: u16 = 257;
+
+    /// Voice filter parameters from Impulse Tracker's own **0..=127** cutoff and
+    /// resonance — an instrument's `IFC`/`IFR` bytes, or a `Zxx` macro's parameter.
+    ///
+    /// IT's replayers work the filter in a 0..=255 domain that is twice the file's
+    /// 0..=127 one (libxmp `player.c` `apply_midi_macro_effect`: `xc->filter.cutoff =
+    /// val << 1`), and that is the domain the conformance oracle dumps and the C1 trace's
+    /// `unit_to_scale(bits, 255)` reads back. Encoding `value · 2 · 257` therefore makes
+    /// the trace field, the oracle column and [`FilterParams::to_it`] all agree exactly.
+    ///
+    /// Cutoff 127 with no resonance is not a filter at all in IT — "resonance is only
+    /// ever applied if the cutoff is not full or the resonance is not zero" (OpenMPT
+    /// `filter-7F.it`) — so it answers [`FilterParams::BYPASS`] rather than a
+    /// nearly-open filter.
+    pub const fn from_it(cutoff: u8, resonance: u8) -> FilterParams {
+        if cutoff >= 127 && resonance == 0 { return FilterParams::BYPASS; }
+        FilterParams::from_it_scaled(saturating_double(cutoff), resonance)
+    }
+
+    /// [`FilterParams::from_it`] with the cutoff already in the replayer's **0..=255**
+    /// domain — what the filter envelope produces, since IT scales the instrument's
+    /// cutoff by the envelope before the coefficients are derived.
+    pub const fn from_it_scaled(cutoff: u8, resonance: u8) -> FilterParams {
+        if cutoff >= 254 && resonance == 0 { return FilterParams::BYPASS; }
+        FilterParams {
+            cutoff: U0F16::from_bits(cutoff as u16 * FilterParams::IT_SCALE),
+            resonance: U0F16::from_bits(saturating_double(resonance) as u16 * FilterParams::IT_SCALE),
+        }
+    }
+
+    /// The Impulse Tracker **0..=127** cutoff and resonance these parameters encode —
+    /// the pair the resonant-filter coefficients are derived from.
+    ///
+    /// The inverse of [`FilterParams::from_it`] for every value it can produce, and a
+    /// rounded nearest answer for parameters some other format wrote.
+    pub const fn to_it(self) -> (u8, u8) {
+        (scale_to_it(self.cutoff.to_bits()), scale_to_it(self.resonance.to_bits()))
+    }
+}
+
+/// `value · 2`, pinned at 255 — IT's 0..=127 domain widened to the replayer's 0..=255 one.
+const fn saturating_double(value: u8) -> u8 {
+    if value >= 128 { 255 } else { value * 2 }
+}
+
+/// A `U0F16` back to Impulse Tracker's 0..=127 domain, rounded to nearest.
+const fn scale_to_it(bits: u16) -> u8 {
+    ((bits as u32 * 127 + u16::MAX as u32 / 2) / u16::MAX as u32) as u8
 }
 
 /// One absolutely-set voice parameter, as carried by [`Event::Param`].
@@ -480,6 +533,35 @@ mod tests {
         assert_eq!(params.filter, filter);
         assert!(!filter.is_bypass());
         assert!(FilterParams::BYPASS.is_bypass());
+    }
+
+    /// The joint G2/G3 encoding: the C1 trace's `unit_to_scale(bits, 255)` must read back
+    /// the oracle's 0..=255 column, and the filter's coefficient inputs must read back
+    /// Impulse Tracker's own 0..=127 pair.
+    #[test]
+    fn the_it_filter_encoding_round_trips_through_both_domains() {
+        fn trace_scale(bits: u16) -> u16 { ((bits as u32 * 255 + 32_767) / 65_535) as u16 }
+
+        for cutoff in 0..=127u8 {
+            for resonance in [0u8, 1, 63, 64, 127] {
+                let params = FilterParams::from_it(cutoff, resonance);
+                if cutoff == 127 && resonance == 0 {
+                    assert!(params.is_bypass(), "IT's full cutoff with no resonance is no filter at all");
+                    continue;
+                }
+                assert_eq!(params.to_it(), (cutoff, resonance), "cutoff {cutoff}, resonance {resonance}");
+                assert_eq!(trace_scale(params.cutoff.to_bits()), cutoff as u16 * 2, "the trace reads libxmp's doubled cutoff");
+                assert_eq!(trace_scale(params.resonance.to_bits()), resonance as u16 * 2, "the trace reads libxmp's doubled resonance");
+            }
+        }
+
+        // An envelope-scaled cutoff keeps the 0..=255 domain exactly.
+        for scaled in 0..=253u8 {
+            let params = FilterParams::from_it_scaled(scaled, 0);
+            assert_eq!(trace_scale(params.cutoff.to_bits()), scaled as u16, "scaled cutoff {scaled}");
+        }
+        assert!(FilterParams::from_it_scaled(254, 0).is_bypass());
+        assert!(!FilterParams::from_it_scaled(254, 1).is_bypass());
     }
 
     #[test]

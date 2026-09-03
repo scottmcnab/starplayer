@@ -144,6 +144,57 @@ pub enum ModLoopDialect {
     DigitalTracker,
 }
 
+/// Which Impulse Tracker's `SBx` pattern-loop and break/jump interaction an IT is played
+/// with (accuracy policy §2, *Tracker dialects*).
+///
+/// libxmp selects the same four profiles from `Cwt/v` at
+/// `src/loaders/it_load.c:394-400`, and the pinned corpus carries one fixture per
+/// profile: `pattern_loop_it100.it`, `pattern_loop_it104.it`,
+/// `pattern_loop_it200_breakjump.it` and `pattern_loop_it210.it`. [`FormatDialect`]
+/// reproduces the predicate and this enum is the behaviour it selects.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ItLoopDialect {
+    /// Impulse Tracker 2.10 and later — the IT default, and what every clone writes.
+    /// Per-channel target and counter, the loop target advances past the `SBx` row when
+    /// the count runs out, a loop jump cancels a break or jump earlier on the row and
+    /// blocks a break later on it, and a `Bxx` never resets a `Cxx`'s destination row.
+    #[default]
+    ImpulseTracker210,
+    /// Impulse Tracker 2.00 to 2.09: as 2.10, without the loop-target advancement ST3 had
+    /// and IT 2.10 reintroduced.
+    ImpulseTracker200,
+    /// Impulse Tracker 1.04 to 1.99: as 2.00, and a loop jump does not block a later
+    /// break either.
+    ImpulseTracker104,
+    /// Impulse Tracker 1.00 to 1.03: one global loop target and counter for the whole
+    /// song, as Scream Tracker 3 has.
+    ImpulseTracker100,
+}
+
+impl ItLoopDialect {
+    /// The flow rules this dialect implies, mirroring libxmp's `FLOW_MODE_IT_*`
+    /// constants (`src/common.h:380-386`).
+    pub const fn flow(self) -> PatternFlow {
+        // `FLOW_MODE_IT_104`, which every IT profile builds on.
+        let base = PatternFlow {
+            unset_break: true,
+            unset_jump: true,
+            jump_keeps_break_row: true,
+            ..PatternFlow::generic()
+        };
+        match self {
+            // FLOW_MODE_IT_210 = FLOW_MODE_IT_200 | FLOW_LOOP_END_ADVANCES
+            ItLoopDialect::ImpulseTracker210 => PatternFlow { delay_break: true, end_advances: true, ..base },
+            // FLOW_MODE_IT_200 = FLOW_MODE_IT_104 | FLOW_LOOP_DELAY_BREAK
+            ItLoopDialect::ImpulseTracker200 => PatternFlow { delay_break: true, ..base },
+            ItLoopDialect::ImpulseTracker104 => base,
+            // FLOW_MODE_IT_100 = FLOW_LOOP_GLOBAL | FLOW_LOOP_UNSET_BREAK
+            //                  | FLOW_LOOP_UNSET_JUMP | FLOW_JUMP_NO_ROW_SET
+            ItLoopDialect::ImpulseTracker100 => PatternFlow { global_target: true, global_count: true, ..base },
+        }
+    }
+}
+
 /// The pattern-loop and break/jump rules one dialect implies.
 ///
 /// Derived data, not a [`QuirkSet`] field: [`S3mLoopDialect::flow`] and
@@ -317,6 +368,12 @@ pub struct QuirkSet {
     /// `libxmp-mod-pattern-loop-octalyser`, `-octalyser-breakjump`,
     /// `libxmp-mod-pattern-loop-dt` and `-dt-breakjump` on the pinned corpus.
     pub mod_pattern_loop: ModLoopDialect,
+    /// Which Impulse Tracker's `SBx` pattern-loop semantics an IT is played with
+    /// (accuracy policy **§2**, *Tracker dialects*; the 2.10 baseline is **D65**).
+    ///
+    /// Flips `libxmp-it-pattern-loop-it100`, `-it104` and `-it200-breakjump` on the
+    /// pinned corpus; `-it210` is the default.
+    pub it_pattern_loop: ItLoopDialect,
     /// Which Paula clock a MOD's Amiga periods are divided by (accuracy policy **D14**).
     ///
     /// No corpus case turns on it — every affected fixture is a PAL four-channel `M.K.`
@@ -369,6 +426,7 @@ impl QuirkSet {
             tempo_model: TempoModelId::ExactFixedPoint,
             s3m_pattern_loop: S3mLoopDialect::ScreamTracker321,
             mod_pattern_loop: ModLoopDialect::ProTracker,
+            it_pattern_loop: ItLoopDialect::ImpulseTracker210,
             mod_paula_clock: PaulaClock::Pal,
             mod_break_parameter: BreakParameter::BinaryCodedDecimal,
             mod_timing: ModTiming::Cia,
@@ -456,6 +514,34 @@ impl QuirkSet {
     pub const fn imago_orpheus() -> QuirkSet {
         QuirkSet { s3m_pattern_loop: S3mLoopDialect::ImagoOrpheus, ..QuirkSet::profile_default() }
     }
+
+    /// Impulse Tracker 2.10 and later — the IT baseline, and what every IT clone writes.
+    ///
+    /// Impulse Tracker truncates its tick length to a whole output frame and does not
+    /// carry the remainder, so the IT dialects take [`TempoModelId::ItModern`] rather than
+    /// the project's drift-free default (accuracy policy §2; task G3 research point 4).
+    pub const fn impulse_tracker() -> QuirkSet {
+        QuirkSet {
+            tempo_model: TempoModelId::ItModern,
+            it_pattern_loop: ItLoopDialect::ImpulseTracker210,
+            ..QuirkSet::profile_default()
+        }
+    }
+
+    /// Impulse Tracker 2.00 to 2.09 (`Cwt/v` `0x0200`..`0x020F`).
+    pub const fn impulse_tracker_200() -> QuirkSet {
+        QuirkSet { it_pattern_loop: ItLoopDialect::ImpulseTracker200, ..QuirkSet::impulse_tracker() }
+    }
+
+    /// Impulse Tracker 1.04 to 1.99 (`Cwt/v` `0x0104`..`0x01FF`).
+    pub const fn impulse_tracker_104() -> QuirkSet {
+        QuirkSet { it_pattern_loop: ItLoopDialect::ImpulseTracker104, ..QuirkSet::impulse_tracker() }
+    }
+
+    /// Impulse Tracker 1.00 to 1.03 (`Cwt/v` below `0x0104`).
+    pub const fn impulse_tracker_100() -> QuirkSet {
+        QuirkSet { it_pattern_loop: ItLoopDialect::ImpulseTracker100, ..QuirkSet::impulse_tracker() }
+    }
 }
 
 /// Which tracker a loader decided wrote a module, from its file header alone.
@@ -534,6 +620,17 @@ pub enum FormatDialect {
     /// combinations; StarPlayer keeps them all as this one variant until an IT corpus case
     /// needs finer detection.
     ImpulseTracker,
+    /// Impulse Tracker 2.00 to 2.09 — IT `Cwt/v` `0x0200`..`0x020F`. Split out from
+    /// [`FormatDialect::ImpulseTracker`] because its `SBx` loop target does not advance
+    /// past the loop row (libxmp `FLOW_MODE_IT_200`, `data/pattern_loop_it200_breakjump.it`).
+    ImpulseTracker200,
+    /// Impulse Tracker 1.04 to 1.99 — IT `Cwt/v` `0x0104`..`0x01FF`. As 2.00, and a loop
+    /// jump does not block a later `Cxx` either (`FLOW_MODE_IT_104`,
+    /// `data/pattern_loop_it104.it`).
+    ImpulseTracker104,
+    /// Impulse Tracker 1.00 to 1.03 — IT `Cwt/v` below `0x0104`. One global loop target
+    /// and counter (`FLOW_MODE_IT_100`, `data/pattern_loop_it100.it`).
+    ImpulseTracker100,
     /// OpenMPT — IT `Cwt/v` `0x5000..=0x5FFF` with the reserved field `OMPT`, or the
     /// `0x0888` `cwtv`/`cmwt` markers OpenMPT 1.17 wrote before it adopted that scheme
     /// (`Load_it.cpp` lines around 469–520).
@@ -566,11 +663,14 @@ impl FormatDialect {
             FormatDialect::FastTracker2
             | FormatDialect::MilkyTracker
             | FormatDialect::ModPlugXm
-            | FormatDialect::OpenMptXm
-            | FormatDialect::ImpulseTracker
-            | FormatDialect::OpenMptIt
-            | FormatDialect::SchismTracker
-            | FormatDialect::ModPlugIt => QuirkSet::profile_default(),
+            | FormatDialect::OpenMptXm => QuirkSet::profile_default(),
+            // libxmp gives every IT `FLOW_MODE_IT_210` and only narrows it for Impulse
+            // Tracker's own early `Cwt/v` values (`src/loaders/it_load.c:351,394-400`),
+            // so every clone lands on the 2.10 baseline.
+            FormatDialect::ImpulseTracker | FormatDialect::OpenMptIt | FormatDialect::SchismTracker | FormatDialect::ModPlugIt => QuirkSet::impulse_tracker(),
+            FormatDialect::ImpulseTracker200 => QuirkSet::impulse_tracker_200(),
+            FormatDialect::ImpulseTracker104 => QuirkSet::impulse_tracker_104(),
+            FormatDialect::ImpulseTracker100 => QuirkSet::impulse_tracker_100(),
         }
     }
 }
@@ -664,20 +764,54 @@ mod tests {
         assert_eq!(FormatDialect::ImagoOrpheus.quirks().s3m_pattern_loop, S3mLoopDialect::ImagoOrpheus);
     }
 
-    /// Task E2: every XM/IT dialect variant is evidence only, with no quirk of its own
-    /// yet — each maps to exactly the same [`QuirkSet`] as [`FormatDialect::Unknown`],
-    /// because no XM or IT corpus case has run to justify a field (task C5's rule).
+    /// Task E2: every XM dialect variant is still evidence only, with no quirk of its own
+    /// — each maps to exactly the same [`QuirkSet`] as [`FormatDialect::Unknown`],
+    /// because no XM corpus case has run to justify a field (task C5's rule).
     #[test]
-    fn every_xm_and_it_dialect_maps_to_the_profile_default_for_now() {
+    fn every_xm_dialect_maps_to_the_profile_default_for_now() {
         let unknown = FormatDialect::Unknown.quirks();
         assert_eq!(FormatDialect::FastTracker2.quirks(), unknown);
         assert_eq!(FormatDialect::MilkyTracker.quirks(), unknown);
         assert_eq!(FormatDialect::ModPlugXm.quirks(), unknown);
         assert_eq!(FormatDialect::OpenMptXm.quirks(), unknown);
-        assert_eq!(FormatDialect::ImpulseTracker.quirks(), unknown);
-        assert_eq!(FormatDialect::OpenMptIt.quirks(), unknown);
-        assert_eq!(FormatDialect::SchismTracker.quirks(), unknown);
-        assert_eq!(FormatDialect::ModPlugIt.quirks(), unknown);
+    }
+
+    /// Task G3: the IT dialects carry two fields, and both are named by a corpus case —
+    /// the truncating tick length (accuracy policy §2, research point 4) and the `SBx`
+    /// pattern-loop profile (**D65**, `data/pattern_loop_it1*.it`). Every clone takes the
+    /// 2.10 baseline, exactly as libxmp does (`src/loaders/it_load.c:351`).
+    #[test]
+    fn the_it_dialects_carry_the_truncating_tick_and_their_pattern_loop_profile() {
+        let baseline = QuirkSet::impulse_tracker();
+        assert_eq!(baseline.tempo_model, TempoModelId::ItModern, "Impulse Tracker truncates its tick length");
+        assert_eq!(baseline.it_pattern_loop, ItLoopDialect::ImpulseTracker210);
+        for dialect in [FormatDialect::ImpulseTracker, FormatDialect::OpenMptIt, FormatDialect::SchismTracker, FormatDialect::ModPlugIt] {
+            assert_eq!(dialect.quirks(), baseline, "{dialect:?} plays as Impulse Tracker 2.10");
+        }
+        assert_eq!(FormatDialect::ImpulseTracker200.quirks().it_pattern_loop, ItLoopDialect::ImpulseTracker200);
+        assert_eq!(FormatDialect::ImpulseTracker104.quirks().it_pattern_loop, ItLoopDialect::ImpulseTracker104);
+        assert_eq!(FormatDialect::ImpulseTracker100.quirks().it_pattern_loop, ItLoopDialect::ImpulseTracker100);
+        // Every IT dialect leaves the MOD and S3M fields exactly as the profile default.
+        let unknown = FormatDialect::Unknown.quirks();
+        assert_eq!(baseline.mod_pattern_loop, unknown.mod_pattern_loop);
+        assert_eq!(baseline.s3m_pattern_loop, unknown.s3m_pattern_loop);
+    }
+
+    /// Field for field against libxmp `src/common.h:380-386`.
+    #[test]
+    fn the_it_flow_tables_match_libxmps_flow_mode_constants() {
+        let it210 = ItLoopDialect::ImpulseTracker210.flow();
+        assert!(it210.unset_break && it210.unset_jump && it210.jump_keeps_break_row && it210.delay_break && it210.end_advances);
+        assert!(!it210.global_target && !it210.global_count && !it210.delay_jump && !it210.one_at_a_time);
+        let it200 = ItLoopDialect::ImpulseTracker200.flow();
+        assert!(!it200.end_advances, "FLOW_MODE_IT_200 is FLOW_MODE_IT_210 without FLOW_LOOP_END_ADVANCES");
+        assert_eq!(PatternFlow { end_advances: true, ..it200 }, it210);
+        let it104 = ItLoopDialect::ImpulseTracker104.flow();
+        assert!(!it104.delay_break, "FLOW_MODE_IT_104 is FLOW_MODE_IT_200 without FLOW_LOOP_DELAY_BREAK");
+        assert_eq!(PatternFlow { delay_break: true, ..it104 }, it200);
+        let it100 = ItLoopDialect::ImpulseTracker100.flow();
+        assert!(it100.global_target && it100.global_count, "FLOW_MODE_IT_100 carries FLOW_LOOP_GLOBAL");
+        assert_eq!(PatternFlow { global_target: false, global_count: false, ..it100 }, it104);
     }
 
     /// Field for field against libxmp `src/common.h:353-443`.

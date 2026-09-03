@@ -57,7 +57,25 @@ default.
 | Quirk | Default | Under `quirks-starplayer` |
 |---|---|---|
 | Tick length `(rate * 10 / bpm) >> 2`, truncating twice — ~1.3 s of drift over a 4-minute song at 130 BPM | `TempoModel::ExactFixedPoint` — `rate * 2.5 / bpm` in Q32.32, accumulated, drift-free | `TempoModel::St3Truncating` |
+| Impulse Tracker's tick length `rate * 5 / (2 * bpm)`, truncated once to a whole output frame and not carried | `TempoModel::ItModern` **for IT modules only** — see below | unchanged |
 | MOD and MTM interpreted through an in-memory S3M conversion | Native per-format effect processors | Not offered — see §4 |
+
+The second row is a **format** decision rather than a profile one, and it is the answer to
+task G3's research point 4. Impulse Tracker reloads a whole-sample gap length every tick
+and does not carry the remainder; so does every replayer measured against it — libxmp
+truncates the same expression to an `int` (`src/mixer.c:440`) and OpenMPT's classic path
+does the same. The project's default tempo model is drift-free because a drifting clock is
+a defect in a *modern* player, but for IT the drift is **observable output**: a voice's
+sample position after N ticks is `step · Σ frames_per_tick`, and the corpus compares that
+position frame by frame. Both numbers were measured on the pinned corpus at the same
+commit: under `ExactFixedPoint` the IT set gives 10 passes and 59 cases whose first
+divergence is `position`; under `ItModern` it gives 13 passes and the same category shrinks
+once the harness pairs on libxmp's own reporting clock. libxmp keeps two clocks that
+disagree with each other — its rendered tick is truncated while the `time` column every
+record carries accumulates the exact value in a `double` — so the conformance adapter pairs
+on the exact model (it is modelling libxmp) while the engine renders on the truncated one
+(it is modelling Impulse Tracker). MOD, MTM and S3M are unaffected: `ItModern` is reached
+only from the four `FormatDialect::ImpulseTracker*` variants.
 
 `QuirkSet::canonical()` and `QuirkSet::starplayer_classic()` differ in exactly the first
 row — the tempo model — and a unit test in `starplayer-core`'s `quirks` module asserts
@@ -201,6 +219,94 @@ left every other result unchanged under `canonical()`. Nine of the ten now pass 
 them with no waiver at all — and the tenth, `libxmp-mod-pattern-loop-dt`, is a harness
 pairing record (`conformance/known-failures.md`, `C2-MOD-001`) rather than a replay
 difference: its complete 488-tick row sequence matches the oracle's.
+
+### D64 — the IT comparison axis is libxmp's whole Amiga period
+
+**Cause.** Impulse Tracker holds a voice's pitch as a **frequency in whole hertz**
+(ITTECH.TXT's `PitchTable` is a 16.16 ratio and `Frequency = (C5Speed · PitchTable[note]) >> 16`),
+and so does StarPlayer. libxmp holds it as a note plus a bend and converts only at the
+mixer: it dumps `xc->info_period = MIN(final_period · 4096, INT_MAX)` with
+`final_period = PERIOD_BASE / 2^((note + bend/12800)/12)` and `PERIOD_BASE = 13696`
+(`src/period.c:205`, `src/player.c:1298`). Its own IT loader additionally folds every
+sample's `C5Speed` into a relative note and a finetune (`libxmp_c2spd_to_note`,
+`src/loaders/it_load.c:906`) and then mixes at the fixed `m->c4rate`, so its period
+numerator is the constant `C4_PERIOD · 8363 = 428 · 8363`.
+
+**Behaviour chosen.** The C1 trace reports `428 · 8363 / frequency` — libxmp's own whole
+period — and `project_period` divides the oracle's Q12 column by 4096, the same projection
+MOD and MTM use, with the existing tolerance of one whole period. The `note` column is
+projected by removing the same relative-note offset libxmp's loader added, so the two sit
+on IT's own note numbering. A pitch difference smaller than one whole period at the
+sounding note is therefore below the oracle's resolution: about 0.23 % at C-5 and 1.9 % at
+C-8, against IT's own finest slide step of 1/64 semitone (0.09 %). The axis catches note,
+octave, slide-direction and accumulated-drift errors; tightening it is a G6 question.
+
+### D65 — the IT pattern-loop baseline is Impulse Tracker 2.10
+
+**Cause.** `SBx` changed three times inside Impulse Tracker's own life: 1.00 kept one
+global loop target and counter as Scream Tracker 3 does, 1.04 made both per channel, 2.00
+made a loop jump block a `Cxx` later on the same row, and 2.10 reintroduced ST3's
+advancement of the loop target past the `SBx` row when the count runs out. libxmp selects
+the same four profiles from `Cwt/v` (`src/loaders/it_load.c:394-400`,
+`FLOW_MODE_IT_100`/`_104`/`_200`/`_210`), and the pinned corpus carries one fixture per
+profile.
+
+**Behaviour chosen.** `ItLoopDialect` with the 2.10 profile as the default, selected by
+`FormatDialect::ImpulseTracker{,200,104,100}` from `Cwt/v`. Every IT clone — Schism,
+OpenMPT, ModPlug — takes the 2.10 baseline, which is what libxmp does with them too.
+Task G3's research point 3 could not corroborate the "2.10 versus 2.14" split the task
+file assumed: OpenMPT gates its loop behaviours on *OpenMPT* version rather than on IT's,
+and no source found describes a change after 2.10.
+
+### D66 — an IT surround channel is rendered at centre
+
+**Cause.** `S91` puts a channel into surround, which Impulse Tracker's software mixer
+renders by inverting the right channel's phase — a Dolby Pro-Logic trick. libxmp models it
+with a `PAN_SURROUND` sentinel (`src/mixer.h:23`) which it dumps verbatim in the pan
+column, and 48 records of `SmpInsPanSurround.data` carry it. StarPlayer's voice carries one
+`pan: I1F15` and the mixer has no phase-inverted rear bus; a surround voice has nowhere to
+go until the DSP graph grows one in M7.
+
+**Behaviour chosen.** Surround is rendered at centre pan, and the conformance adapter
+projects libxmp's sentinel onto centre so the rest of that trace stays enforced. Everything
+*around* surround is implemented: `S90`/`S91` set and clear it, `Xxx`, `S8x` and a
+sample's or instrument's own panning cancel it (`kITNoSurroundPan`, `kPanOverride`), and
+`Pxy` and `Yxy` are no-ops while it is on.
+
+### D67 — a whole-hertz playback rate against libxmp's double-precision period
+
+**Cause.** The consequence of D64 seen from the other side. Impulse Tracker's playback rate
+is an integer number of hertz and every slide multiplies that integer by a Q16.16 ratio,
+so each step rounds; libxmp carries a `double` period end to end. The two rates agree to
+within the rounding of one period — below the resolution of the `period` column — but the
+sample *position* is the running integral of the rate, so the difference accumulates over
+a trace and eventually exceeds libxmp's own one-source-frame position bound.
+
+**Behaviour chosen.** Integer hertz, because that is Impulse Tracker's own arithmetic and
+OpenMPT's (`ModChannel::nPeriod` is a `uint32` holding a frequency for IT). Twenty-six IT
+cases therefore carry `waive=position` and enforce every other field for the whole trace —
+the same shape as D14's ProTracker finetune drift.
+
+### D68 — `Pxy` does nothing on a surround channel
+
+**Cause.** Impulse Tracker's own replayer returns from the panning-slide handler when the
+channel's pan is the surround sentinel (`it2play` `it_m_eff.c`, `InitCommandP`:
+`if (pan == PAN_SURROUND) return;`). OpenMPT slides anyway, and Schism clears the surround
+flag unconditionally.
+
+**Behaviour chosen.** Impulse Tracker's, since `it2play` is a direct port of IT2's own
+code and §0's rule makes the format's own program the reference where OpenMPT's
+compatibility notes do not contradict it. `Yxy` panbrello is skipped on a surround channel
+for the same reason.
+
+### D69 — `Qxy`'s two-thirds and three-halves retrigger volumes
+
+**Cause.** IT's `Qxy` volume table multiplies by exactly 2/3 for `x = 6` and 3/2 for
+`x = E` (`it2play`: `(vol << 1) / 3` and `(vol * 3) >> 1`). OpenMPT approximates both
+through one sixteenths table — `10/16` and `24/16` — so a note at volume 64 comes out at
+40 where Impulse Tracker plays 42.
+
+**Behaviour chosen.** Impulse Tracker's exact arithmetic, for the same reason as D68.
 
 ## 4. Not offered at all
 

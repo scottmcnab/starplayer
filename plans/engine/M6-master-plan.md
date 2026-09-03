@@ -43,6 +43,31 @@ not something to guess. It is architecture open question **Q3**.
 8. **Conformance**: the OpenMPT `test_*.it` cases, which are the most demanding in the
    whole corpus.
 
+## As landed so far
+
+**G1** delivered deliverable 1. **G3** delivered 2, 3, 5, 6, 7 and the wiring half of 8;
+**G2** delivered 4, concurrently. What G3 changed against the plan above:
+
+* Deliverable 3 is **not a trait**. Design goal 8 keeps a trait uncommitted until its
+  second real implementation, and XM's allocator is the same heuristic with a different
+  New Note Action set rather than a different one, so `ItProcessor::choose_victim` is a
+  concrete policy in `starplayer-it`. Q3 is settled and recorded in architecture §5.2 and
+  the §12 table.
+* Deliverable 7 turned out to be a **format** decision rather than a tuning knob:
+  Impulse Tracker truncates its tick length to a whole output frame and does not carry the
+  remainder, so `TempoModelId::ItModern` truncates and the four
+  `FormatDialect::ImpulseTracker*` variants select it. Accuracy policy §2 records both
+  measurements; it is the owner's call to confirm.
+* Deliverable 8 grew: the harness's own completeness audit means wiring `it` brings in
+  **121** cases, not the 59 `openmpt/it` fixtures the task file named — the 62 `data/*.it`
+  `compare_mixer_data` pairs come with them. 39 pass (13 with every field enforced, 26
+  waiving `position` under accuracy-policy D67) and 82 are recorded as `G3-IT-001` …
+  `G3-IT-008` in `conformance/known-failures.md` for **G6**, grouped by the first field
+  that diverges so each group is one piece of work.
+* Two new `QuirkSet` fields, each named by a corpus case: `it_pattern_loop`
+  (`ItLoopDialect`, four `Cwt/v`-gated `SBx` profiles — accuracy policy D65) and the IT
+  dialects' `tempo_model`.
+
 ## Exit criteria
 
 The IT conformance corpus passes with exclusions justified; dense real-world `.it` files

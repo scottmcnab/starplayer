@@ -201,6 +201,7 @@ fn committed_fixtures() -> Vec<Fixture> {
     vec![
         Fixture { name: "mod/synthetic".to_string(), format: GoldenFormat::Mod, extension: "mod", bytes: fixtures::synthetic_mod(), committed: true },
         Fixture { name: "mtm/synthetic".to_string(), format: GoldenFormat::Mtm, extension: "mtm", bytes: fixtures::synthetic_mtm(), committed: true },
+        Fixture { name: "it/synthetic".to_string(), format: GoldenFormat::It, extension: "it", bytes: fixtures::synthetic_it(), committed: true },
         Fixture { name: "s3m/armani".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/ARMANI.S3M").to_vec(), committed: true },
         Fixture { name: "s3m/movement".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M").to_vec(), committed: true },
         Fixture { name: "s3m/nicetune".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/NICETUNE.S3M").to_vec(), committed: true },
@@ -211,7 +212,7 @@ fn committed_fixtures() -> Vec<Fixture> {
 
 /// A `--corpus` module: name the processor by its extension, then read it.
 ///
-/// `Ok(None)` is an extension no `GoldenFormat` covers — an XM or an IT until F4/G5 land.
+/// `Ok(None)` is an extension no `GoldenFormat` covers — an XM until F2 lands.
 /// That is a skip; only an unreadable path is an error.
 fn load_corpus_fixture(path: &Path) -> Result<Option<Fixture>, String> {
     let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
@@ -219,6 +220,7 @@ fn load_corpus_fixture(path: &Path) -> Result<Option<Fixture>, String> {
         "mod" => (GoldenFormat::Mod, "mod"),
         "s3m" => (GoldenFormat::S3m, "s3m"),
         "mtm" => (GoldenFormat::Mtm, "mtm"),
+        "it" => (GoldenFormat::It, "it"),
         _ => return Ok(None),
     };
     let bytes = std::fs::read(path).map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
@@ -363,7 +365,7 @@ mod tests {
     #[test]
     fn every_committed_fixture_names_a_format_and_carries_bytes() {
         let fixtures = committed_fixtures();
-        assert_eq!(fixtures.len(), 7, "the golden contract has seven fixtures");
+        assert_eq!(fixtures.len(), 8, "the golden contract has eight fixtures");
         for fixture in &fixtures {
             assert!(!fixture.bytes.is_empty(), "{} carries bytes", fixture.name);
             assert!(fixture.committed, "{} is a committed fixture", fixture.name);

@@ -102,11 +102,12 @@ pub enum GoldenFormat {
     Mod,
     S3m,
     Mtm,
+    It,
 }
 
 impl GoldenFormat {
     /// Every format the golden contract covers.
-    pub const ALL: [GoldenFormat; 3] = [GoldenFormat::Mod, GoldenFormat::S3m, GoldenFormat::Mtm];
+    pub const ALL: [GoldenFormat; 4] = [GoldenFormat::Mod, GoldenFormat::S3m, GoldenFormat::Mtm, GoldenFormat::It];
 
     /// The `goldens/<format>/` directory this format's hashes live in.
     pub const fn directory(self) -> &'static str {
@@ -114,6 +115,7 @@ impl GoldenFormat {
             GoldenFormat::Mod => "mod",
             GoldenFormat::S3m => "s3m",
             GoldenFormat::Mtm => "mtm",
+            GoldenFormat::It => "it",
         }
     }
 
@@ -128,6 +130,7 @@ impl GoldenFormat {
             GoldenFormat::Mod => ModuleFormat::Mod,
             GoldenFormat::S3m => ModuleFormat::S3m,
             GoldenFormat::Mtm => ModuleFormat::Mtm,
+            GoldenFormat::It => ModuleFormat::It,
         }
     }
 }
@@ -753,6 +756,62 @@ mod tests {
         }
     }
 
+    /// The block-size determinism invariant, with **Impulse Tracker's New Note Actions
+    /// active**.
+    ///
+    /// `starplayer-engine`'s own `block_size_determinism` test cannot reach a format crate
+    /// — the dependency runs the other way — so the IT half of the invariant lives here,
+    /// where the facade is available. `fixtures::synthetic_it()`'s channel zero retriggers
+    /// a `Continue` instrument every four rows, so background voices accumulate and are
+    /// stolen, and every one of them has to advance identically at every host block size.
+    #[test]
+    fn the_synthetic_it_renders_identically_at_every_host_block_size_with_nna_active() {
+        let bytes = fixtures::synthetic_it();
+        let reference = render_fixed_mono(GoldenFormat::It, &bytes, GOLDEN_HOST_BLOCK_FRAMES).expect("the synthetic IT renders");
+        assert!(reference.iter().any(|sample| *sample != 0), "the fixture has to actually make sound");
+        let reference_hash = canonical_sha256(GoldenFormat::It, &bytes, GOLDEN_HOST_BLOCK_FRAMES).expect("the synthetic IT hashes");
+
+        // A `Continue` New Note Action really did leave voices sounding behind their
+        // channel: without that this would only be testing one voice per channel.
+        let module = Arc::new(starplayer::it::load(&bytes).expect("the synthetic IT loads"));
+        assert_eq!(recommended_voice_capacity(&module), starplayer::it::VIRTUAL_CHANNELS);
+        assert!(peak_voices_of(&module) > module.header().channel_count as usize, "the fixture reaches more voices than it has channels");
+
+        for host_block_frames in [1, 3, 64, 128, 4096, 8191] {
+            assert_eq!(
+                render_fixed_mono(GoldenFormat::It, &bytes, host_block_frames).expect("the synthetic IT renders"),
+                reference,
+                "host block size {host_block_frames} changed the IT PCM",
+            );
+            assert_eq!(
+                canonical_sha256(GoldenFormat::It, &bytes, host_block_frames).expect("the synthetic IT hashes"),
+                reference_hash,
+                "host block size {host_block_frames} changed the IT hash",
+            );
+        }
+    }
+
+    /// The largest number of voices sounding at once while `module` plays, foreground and
+    /// New Note Action background alike.
+    fn peak_voices_of(module: &Arc<Module>) -> usize {
+        use starplayer::core::Frame;
+        use starplayer::engine::{ChannelTable, ControlClock, EngineContext, EventSource};
+        use starplayer::mixer::VoicePool;
+        let quirks = QuirkSelection::Override(scanned_song(module, 44_100).expect("it scans").quirks);
+        let mut sequencer = starplayer::it::sequencer_with_quirks(Arc::clone(module), 44_100, quirks);
+        let mut voices = VoicePool::new(starplayer::it::VIRTUAL_CHANNELS);
+        let mut channels = ChannelTable::new((module.header().channel_count as usize).max(1));
+        let mut control = ControlClock::new(44_100, Frame::ZERO);
+        let mut peak = 0usize;
+        for _ in 0..20_000u32 {
+            let Some(frame) = sequencer.next_event_frame() else { break };
+            let mut context = EngineContext::new(frame, &mut voices, &mut channels, &mut control);
+            sequencer.dispatch(frame, &mut context);
+            peak = peak.max(voices.voices_active());
+        }
+        peak
+    }
+
     #[test]
     fn the_float_path_stays_above_the_stated_segmental_snr_on_the_corpus() {
         for &(name, bytes) in GOLDEN_CORPUS {
@@ -802,10 +861,12 @@ mod tests {
     fn every_golden_format_renders_audibly_and_hashes_identically_at_every_block_size() {
         let synthetic_mod = fixtures::synthetic_mod();
         let synthetic_mtm = fixtures::synthetic_mtm();
+        let synthetic_it = fixtures::synthetic_it();
         let corpus: &[(GoldenFormat, &str, &[u8])] = &[
             (GoldenFormat::Mod, "synthetic", &synthetic_mod),
             (GoldenFormat::S3m, "REFLEX.S3M", REFLEX),
             (GoldenFormat::Mtm, "synthetic", &synthetic_mtm),
+            (GoldenFormat::It, "synthetic", &synthetic_it),
         ];
         for &(format, name, bytes) in corpus {
             let reference = render_fixed_mono(format, bytes, GOLDEN_HOST_BLOCK_FRAMES).expect("the fixture renders");
@@ -848,6 +909,7 @@ mod tests {
             (GoldenFormat::Mod, "synthetic", fixtures::synthetic_mod()),
             (GoldenFormat::S3m, "REFLEX.S3M", REFLEX.to_vec()),
             (GoldenFormat::Mtm, "synthetic", fixtures::synthetic_mtm()),
+            (GoldenFormat::It, "synthetic", fixtures::synthetic_it()),
         ]
     }
 
@@ -901,6 +963,7 @@ mod tests {
             GoldenFormat::Mod => drive!(starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks)),
             GoldenFormat::S3m => drive!(starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks)),
             GoldenFormat::Mtm => drive!(starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks)),
+            GoldenFormat::It => drive!(starplayer::it::sequencer_with_quirks(module, sample_rate_hz, quirks)),
         }
     }
 
@@ -1118,6 +1181,7 @@ mod tests {
                 GoldenFormat::Mod => check!(starplayer::mod_file::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
                 GoldenFormat::S3m => check!(starplayer::s3m::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
                 GoldenFormat::Mtm => check!(starplayer::mtm::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
+                GoldenFormat::It => check!(starplayer::it::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
             }
         }
     }
@@ -1147,7 +1211,7 @@ mod tests {
 
     #[test]
     fn the_golden_formats_and_their_directories_are_distinct() {
-        assert_eq!(GoldenFormat::ALL.map(GoldenFormat::directory), ["mod", "s3m", "mtm"]);
+        assert_eq!(GoldenFormat::ALL.map(GoldenFormat::directory), ["mod", "s3m", "mtm", "it"]);
         assert_eq!(GoldenFormat::S3m.to_string(), "s3m");
     }
 

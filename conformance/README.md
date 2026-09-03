@@ -67,6 +67,65 @@ number and dirty flags lack upstream columns and are projected from
 the actual C1 trace. The active-channel set is a union, so extra StarPlayer voices cannot
 disappear during projection.
 
+### Impulse Tracker (task G3)
+
+IT is the first format whose oracle records are not one per pattern channel, and the
+adapter has four IT-specific projections.
+
+**Background voices are dumped, as virtual channels.** Both `gen_mixer_data.c` and
+`compare_mixer_data.c` loop over `p->virt.virt_channels`, which for a format carrying
+`QUIRK_VIRTUAL` — IT does — is `num_tracks` plus the whole mixer voice pool. A New Note
+Action's detached voice therefore appears under a channel index at or above the module's
+channel count. The numbering is reproducible: `libxmp_virt_setpatch` moves the displaced
+voice to the **lowest free virtual channel at or above `num_tracks`**
+(`src/virtual.c:517-523`) and frees the slot when the voice stops. The adapter's
+`background_virtual_channels` replays exactly that rule over trace v2's ` vc=` rows — a
+row that was not there last tick takes the lowest free index and holds it until the voice
+goes — and folds the result into the same channel axis the ` ch=` rows use, so every
+oracle column is enforced, background ones included. Both players walk their channels in
+ascending order and both hand out the lowest free slot, so two detachments in one tick are
+numbered the same way.
+
+**The period domain is libxmp's whole Amiga period, with the sample rate folded into the
+note.** libxmp's IT loader converts each sample's `C5Speed` into a relative note plus a
+finetune (`libxmp_c2spd_to_note`, `src/loaders/it_load.c:906`) and then mixes at the fixed
+`m->c4rate`, so its period numerator is the constant `C4_PERIOD · 8363` and its `note`
+column is the pattern note **plus that relative note**. The C1 trace reports
+`428 · 8363 / frequency`; `project_period` divides the oracle's Q12 column by 4096 as MOD
+and MTM do, and `project_note` removes the same relative-note offset the loader added, so
+the two sit on IT's own note numbering with 60 as the pitch a sample plays at its
+`C5Speed`. Accuracy-policy **D64** records what that axis can and cannot see.
+
+**Positions are compared as floored integers, and the two clocks are kept apart.** libxmp's
+`pos0` discards the mixer's fraction, so IT joins MOD and MTM in flooring StarPlayer's
+Q32.32 position before applying libxmp's one-integer-sample bound — otherwise a voice a
+quarter of a frame ahead of the oracle's *floor* reads as a whole frame out whenever the
+fraction is high. Separately, libxmp keeps **two clocks that disagree with each other**:
+the frames it renders per tick are truncated to a whole frame (`src/mixer.c:440`,
+`ticksize = (int)calc`) while the `time` column accumulates the exact value in a `double`
+(`src/player.c:2171`). Pairing keys off the timestamps, so `tick_end_frames` models the
+*exact* clock for every format including IT; the engine renders IT on the truncated one
+(`TempoModelId::ItModern`, accuracy policy §2), which is what makes the positions
+comparable at all. Residual position drift from IT's integer-hertz playback rate is
+accuracy-policy **D67** and is waived per case.
+
+**Filter and pan.** libxmp stores IT's 0..127 cutoff and resonance doubled
+(`xc->filter.cutoff = val << 1`) and scales the cutoff by the filter envelope before
+dumping it, so the columns are a 0..255 domain. `FilterParams::from_it` encodes
+`value · 2 · 257` — `255 · 257 == 65535` exactly — which makes the C1 trace's
+`unit_to_scale(bits, 255)` read back libxmp's column with no rounding and
+`FilterParams::to_it` read back IT's 0..127 pair for the mixer's coefficients. As libxmp's
+own comparator does, two cutoff values at or above 254 compare equal. The pan column
+carries libxmp's `PAN_SURROUND` sentinel (`0x8000`) verbatim for a channel `S91` put into
+surround; the adapter projects it onto centre, which is what StarPlayer renders
+(accuracy-policy **D66**), and every other IT pan compares as a full byte because IT's
+0..64 pan is scaled by four inside the replayer rather than shifted into a nibble.
+
+**The manifest covers 121 IT cases, not 59.** `audit_pinned_corpus` insists the manifest
+is exactly the set of `compare_mixer_data*` pairs in the pinned tree for every target
+extension, so wiring `it` brings in the 59 `openmpt/it` fixtures **and** the 62 `data/*.it`
+ones from `test_effect_it_*`, `test_player_it_*`, `test_storlek_*` and two fuzzer cases.
+
 ## Scope accounting
 
 At the pinned revision, `test-dev/` contains 138 files with a MOD, S3M or MTM extension:
@@ -134,8 +193,17 @@ in that state.
 
 ## Current standing
 
+Task G3 wired Impulse Tracker in, which took the manifest from 47 cases to **168**: the 121
+IT `compare_mixer_data` pairs join the MOD, S3M and MTM ones. **72 of the 168** pass —
+MOD 16 of 27, S3M 16 of 17, MTM 1 of 3, IT 39 of 121 — with 13 accepted deviations and 83
+known failures, one of them the pre-existing S3M record and 82 of them G3's own
+(`G3-IT-001` … `G3-IT-008` in `conformance/known-failures.md`, grouped by the first field
+that diverges so each group is one piece of work). Thirteen IT cases pass with every field
+enforced and twenty-six more waive `position` under accuracy-policy **D67**. The M2 figures
+below are unchanged by G3 and are the MOD/S3M/MTM half of that total.
+
 After the C2a harness repairs, C3b's ProTracker fidelity repairs, the C9 S3M repairs and
-C5's tracker dialects, **33 of the 47** pinned cases pass: MOD 16 of 27, S3M 16 of 17,
+C5's tracker dialects, **33 of the 47** M2 cases pass: MOD 16 of 27, S3M 16 of 17,
 MTM 1 of 3. Thirteen of the MOD passes and ten of the S3M passes waive one or more fields
 under an accuracy-policy entry and enforce every other field. The remaining 14 split into
 13 accepted deviations and **1** known failure:

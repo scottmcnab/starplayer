@@ -158,6 +158,9 @@ fn repository_root() -> PathBuf {
 
 /// Which loader owns these bytes, decided the way a host's format probe would.
 fn classify(bytes: &[u8]) -> Option<ModuleFormat> {
+    if starplayer::it::probe(bytes) {
+        return Some(ModuleFormat::It);
+    }
     if starplayer::s3m::probe(bytes) {
         return Some(ModuleFormat::S3m);
     }
@@ -203,8 +206,9 @@ fn corpus() -> Vec<CorpusEntry> {
 
     entries.push(CorpusEntry { name: "fixtures::synthetic_mod".to_string(), format: ModuleFormat::Mod, bytes: starplayer_offline::fixtures::synthetic_mod() });
     entries.push(CorpusEntry { name: "fixtures::synthetic_mtm".to_string(), format: ModuleFormat::Mtm, bytes: starplayer_offline::fixtures::synthetic_mtm() });
+    entries.push(CorpusEntry { name: "fixtures::synthetic_it".to_string(), format: ModuleFormat::It, bytes: starplayer_offline::fixtures::synthetic_it() });
 
-    for format in ["mod", "s3m", "mtm"] {
+    for format in ["mod", "s3m", "mtm", "it"] {
         collect_directory(&root.join("fuzz/seeds").join(format), &mut entries);
         collect_directory(&root.join("fuzz/regressions").join(format), &mut entries);
     }
@@ -236,6 +240,7 @@ fn load(format: ModuleFormat, bytes: &[u8]) -> Option<Module> {
         ModuleFormat::Mod => starplayer::mod_file::load(bytes).ok(),
         ModuleFormat::S3m => starplayer::s3m::load(bytes).ok(),
         ModuleFormat::Mtm => starplayer::mtm::load(bytes).ok(),
+        ModuleFormat::It => starplayer::it::load(bytes).ok(),
         _ => None,
     }
 }
@@ -245,6 +250,10 @@ fn source_for(format: ModuleFormat, module: Arc<Module>) -> Option<Box<dyn Event
         ModuleFormat::Mod => Some(Box::new(starplayer::mod_file::sequencer_for(module, SAMPLE_RATE_HZ, ExactFixedPoint))),
         ModuleFormat::S3m => Some(Box::new(starplayer::s3m::sequencer_for(module, SAMPLE_RATE_HZ, ExactFixedPoint))),
         ModuleFormat::Mtm => Some(Box::new(starplayer::mtm::sequencer_for(module, SAMPLE_RATE_HZ, ExactFixedPoint))),
+        // IT is built through `sequencer_with_quirks` rather than `sequencer_for`, because
+        // its tempo model is part of the dialect (accuracy policy §2) rather than the
+        // caller's choice.
+        ModuleFormat::It => Some(Box::new(starplayer::it::sequencer_with_quirks(module, SAMPLE_RATE_HZ, starplayer::core::quirks::QuirkSelection::FromDialect))),
         _ => None,
     }
 }
@@ -258,7 +267,8 @@ fn render_under_the_hook(entry: &CorpusEntry) -> Option<AllocationReport> {
     let settings = EngineSettings {
         sample_rate_hz: SAMPLE_RATE_HZ,
         channel_count,
-        voice_capacity: channel_count.max(1),
+        // IT sounds several voices per channel, so the pool is the format's own answer.
+        voice_capacity: starplayer::recommended_voice_capacity(&module).max(1),
         ..EngineSettings::default()
     };
 
@@ -311,6 +321,63 @@ fn render_allocates_nothing_for_any_module_in_the_corpus() {
 /// The swap is the riskiest moment in the render loop: it releases every voice, forgets
 /// every binding and pushes the retired `Arc<Module>` down the garbage channel. If any of
 /// that allocated or freed, a host that changes tune would glitch.
+/// Task G3's dense-IT check: the pinned corpus's three `data/m/*.it` modules rendered for
+/// thirty seconds each, with the hook armed and the engine's warning flags read at the
+/// end, reporting the peak number of voices sounding at once.
+///
+/// These are real Impulse Tracker songs rather than a fixture, so they are the only thing
+/// in this repository that exercises New Note Actions, the duplicate check and voice
+/// stealing under load. The test is skipped when the pinned corpus is not cached, exactly
+/// as the corpus sweep above is.
+#[test]
+fn the_dense_it_modules_render_for_thirty_seconds_without_allocating() {
+    const SECONDS: usize = 30;
+    let Some(data) = pinned_corpus_directory() else {
+        assert!(std::env::var_os("STARPLAYER_REQUIRE_CORPUS").is_none(), "STARPLAYER_REQUIRE_CORPUS is set but the pinned corpus is not cached");
+        return;
+    };
+    let directory = data.join("m");
+    let Ok(listing) = fs::read_dir(&directory) else { return };
+    let mut paths: Vec<PathBuf> = listing
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("it")))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 3, "the pinned corpus carries three dense IT modules");
+
+    for path in paths {
+        let bytes = fs::read(&path).expect("a listed corpus file is readable");
+        let module = Arc::new(starplayer::it::load(&bytes).expect("the dense IT loads"));
+        let settings = EngineSettings {
+            sample_rate_hz: SAMPLE_RATE_HZ,
+            channel_count: (module.header().channel_count as usize).max(1),
+            voice_capacity: starplayer::recommended_voice_capacity(&module).max(1),
+            ..EngineSettings::default()
+        };
+        let mut engine: CorpusEngine = Engine::with_settings(settings);
+        let mut control = engine.take_control().expect("a fresh engine has its control end");
+        control.load_module(Arc::clone(&module)).expect("a fresh command queue accepts the module");
+        let quirks = starplayer::core::quirks::QuirkSelection::FromDialect;
+        engine.set_source(Box::new(starplayer::it::sequencer_with_quirks(Arc::clone(&module), SAMPLE_RATE_HZ, quirks)));
+
+        let mut block = vec![0i16; 1024 * 2];
+        let blocks = (SECONDS * SAMPLE_RATE_HZ as usize).div_ceil(1024);
+        let (peak, report) = while_watching_for_allocations(|| {
+            let mut peak = 0usize;
+            for _ in 0..blocks {
+                engine.render(&mut block);
+                peak = peak.max(engine.voices().voices_active());
+            }
+            peak
+        });
+        let warnings = engine.warnings();
+        let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        println!("{name}: {} channels, peak {peak} voices over {SECONDS}s", module.header().channel_count);
+        assert!(report.is_clean(), "{name} allocated inside render(): {report:?}");
+        assert!(!warnings.any(), "{name} raised an engine warning: {warnings:?}");
+    }
+}
+
 #[test]
 fn swapping_a_module_inside_render_allocates_nothing() {
     let first = Arc::new(starplayer::mod_file::load(&starplayer_offline::fixtures::synthetic_mod()).expect("the synthesised MOD loads"));

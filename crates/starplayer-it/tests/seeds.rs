@@ -35,7 +35,13 @@ fn every_seed_probes_and_loads() {
         assert!(starplayer_it::probe(bytes), "{name} must probe as an IT");
         let module = starplayer_it::load(bytes);
         assert!(module.is_ok(), "{name} must load: {:?}", module.err());
-        assert_eq!(module.map(|module| module.header().dialect), Ok(FormatDialect::ImpulseTracker), "{name}");
+        // `old-instruments.it` carries a pre-2.00 `Cwt/v`, which is a different `SBx`
+        // pattern-loop dialect (task G3 research point 3); every other seed is 2.14.
+        let expected = match name {
+            "old-instruments.it" => FormatDialect::ImpulseTracker104,
+            _ => FormatDialect::ImpulseTracker,
+        };
+        assert_eq!(module.map(|module| module.header().dialect), Ok(expected), "{name}");
     }
 }
 

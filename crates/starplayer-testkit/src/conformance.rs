@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use starplayer::core::{ExactFixedPoint, Frame, FrameClock, InstrumentId, SampleId};
+use starplayer::core::{Frame, FrameClock, InstrumentId, SampleId, TempoModelId};
 use starplayer::engine::{TRACE_FORMAT_VERSION, Trace, TraceChannel, TraceTick};
 use starplayer::model::Module;
 
@@ -26,22 +26,35 @@ const POSITION_TOLERANCE: u64 = 1u64 << 32;
 const ST3_FREQUENCY_NUMERATOR: u64 = 14_317_056;
 const PAULA_PAL_CLOCK_HZ: u64 = 3_546_895;
 
-/// The formats covered by milestone M2.
+/// libxmp's `PAN_SURROUND` (`src/mixer.h:23`), which its pan column carries verbatim for a
+/// channel IT put into surround.
+const LIBXMP_PAN_SURROUND: i32 = 0x8000;
+
+/// libxmp's IT period numerator, `C4_PERIOD · c4rate` = `428 · 8363`. Its IT loader folds
+/// every sample's `C5Speed` into a relative note and a finetune
+/// (`libxmp_c2spd_to_note`, `src/loaders/it_load.c:906`) and then mixes at the fixed
+/// `m->c4rate`, so the sample's own rate is not part of the period. Only used to predict
+/// how far an IT voice advances across a tick.
+const LIBXMP_IT_PERIOD_NUMERATOR: u64 = 428 * 8363;
+
+/// The formats covered by milestones M2 and M6.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConformanceFormat {
     Mod,
     S3m,
     Mtm,
+    It,
 }
 
 impl ConformanceFormat {
-    pub const ALL: [ConformanceFormat; 3] = [ConformanceFormat::Mod, ConformanceFormat::S3m, ConformanceFormat::Mtm];
+    pub const ALL: [ConformanceFormat; 4] = [ConformanceFormat::Mod, ConformanceFormat::S3m, ConformanceFormat::Mtm, ConformanceFormat::It];
 
     fn parse(value: &str) -> Option<ConformanceFormat> {
         match value {
             "mod" => Some(ConformanceFormat::Mod),
             "s3m" => Some(ConformanceFormat::S3m),
             "mtm" => Some(ConformanceFormat::Mtm),
+            "it" => Some(ConformanceFormat::It),
             _ => None,
         }
     }
@@ -53,6 +66,7 @@ impl fmt::Display for ConformanceFormat {
             ConformanceFormat::Mod => "MOD",
             ConformanceFormat::S3m => "S3M",
             ConformanceFormat::Mtm => "MTM",
+            ConformanceFormat::It => "IT",
         })
     }
 }
@@ -192,8 +206,9 @@ pub fn audit_pinned_corpus(corpus: &Path, cases: &[ConformanceCase]) -> Result<C
     let mut binaries = BTreeSet::new();
     collect_format_binaries(corpus, corpus, &mut binaries)?;
     let oracle_modules: BTreeSet<PathBuf> = upstream_pairs.iter().map(|(module, _)| module.clone()).collect();
-    let openmpt_modules: BTreeSet<&PathBuf> = binaries.iter().filter(|path| path.starts_with("openmpt/mod") || path.starts_with("openmpt/s3m")).collect();
-    let openmpt_oracle_modules = oracle_modules.iter().filter(|path| path.starts_with("openmpt/mod") || path.starts_with("openmpt/s3m")).count();
+    let is_openmpt = |path: &PathBuf| path.starts_with("openmpt/mod") || path.starts_with("openmpt/s3m") || path.starts_with("openmpt/it");
+    let openmpt_modules: BTreeSet<&PathBuf> = binaries.iter().filter(|path| is_openmpt(path)).collect();
+    let openmpt_oracle_modules = oracle_modules.iter().filter(|path| is_openmpt(path)).count();
     Ok(CorpusInventory {
         module_binaries: binaries.len(),
         state_oracle_cases: upstream_pairs.len(),
@@ -268,7 +283,7 @@ fn next_c_string(text: &str, start: usize) -> Option<(String, usize)> {
 
 fn matches_target_extension(path: &str) -> bool {
     Path::new(path).extension().and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "mod" | "s3m" | "mtm"))
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "mod" | "s3m" | "mtm" | "it"))
 }
 
 fn collect_format_binaries(root: &Path, directory: &Path, binaries: &mut BTreeSet<PathBuf>) -> Result<(), String> {
@@ -419,7 +434,7 @@ pub struct LibxmpChannel {
     pub note: u8,
     pub instrument_zero_based: u16,
     pub volume_x16: u16,
-    pub pan_signed: i16,
+    pub pan_signed: i32,
     pub position: u32,
     pub cutoff: Option<u16>,
     pub resonance: Option<u16>,
@@ -459,14 +474,11 @@ pub fn parse_libxmp_dump(text: &str) -> Result<Vec<LibxmpTick>, String> {
             note: unsigned(number(5, "note")?, line_number, "note")?,
             instrument_zero_based: unsigned(number(6, "instrument")?, line_number, "instrument")?,
             volume_x16: unsigned(number(7, "volume")?, line_number, "volume")?,
-            pan_signed: signed_i16(number(8, "pan")?, line_number, "pan")?,
+            pan_signed: signed_pan(number(8, "pan")?, line_number)?,
             position: unsigned(number(9, "position")?, line_number, "position")?,
             cutoff: if fields.len() >= 11 { Some(unsigned(number(10, "cutoff")?, line_number, "cutoff")?) } else { None },
             resonance: if fields.len() >= 12 { Some(unsigned(number(11, "resonance")?, line_number, "resonance")?) } else { None },
         };
-        if !(-128..=127).contains(&channel.pan_signed) {
-            return Err(format!("libxmp dump line {line_number}: pan {} is outside -128..127", channel.pan_signed));
-        }
 
         let key_matches = ticks.last().is_some_and(|tick| tick.time_ms == time_ms && tick.row == row && tick.frame == frame);
         if !key_matches {
@@ -491,8 +503,15 @@ where
     T::try_from(value).map_err(|_| format!("libxmp dump line {line_number}: {name} `{value}` is out of range"))
 }
 
-fn signed_i16(value: i64, line_number: usize, name: &str) -> Result<i16, String> {
-    i16::try_from(value).map_err(|_| format!("libxmp dump line {line_number}: {name} `{value}` is out of range"))
+/// libxmp's pan column: `vi->pan`, which is the final pan minus 0x80 — or the
+/// `PAN_SURROUND` sentinel `0x8000`, which an IT `S91` channel dumps instead of a
+/// position (`libxmp src/mixer.h:23`, `src/player.c:1408`).
+fn signed_pan(value: i64, line_number: usize) -> Result<i32, String> {
+    if (-128..=127).contains(&value) || value == LIBXMP_PAN_SURROUND as i64 {
+        Ok(value as i32)
+    } else {
+        Err(format!("libxmp dump line {line_number}: pan {value} is outside -128..127 and is not the surround sentinel"))
+    }
 }
 
 /// The sample geometry the adapter needs to reason about loop wrap and one-shot ends.
@@ -510,6 +529,10 @@ struct SampleSpan {
     loop_start: u32,
     loop_end: u32,
     looping: bool,
+    /// The sample's own reference rate. Only IT needs it: libxmp's loader folds `C5Speed`
+    /// into a relative note, so the oracle's note column is the pattern note plus that
+    /// offset.
+    reference_rate_hz: u32,
 }
 
 impl SampleGeometry {
@@ -521,7 +544,7 @@ impl SampleGeometry {
     pub fn from_module(format: ConformanceFormat, module: &Module) -> SampleGeometry {
         let count = match format {
             ConformanceFormat::Mod | ConformanceFormat::Mtm => module.instruments().len(),
-            ConformanceFormat::S3m => module.samples().len(),
+            ConformanceFormat::S3m | ConformanceFormat::It => module.samples().len(),
         };
         let spans = (0..=count).map(|number| {
             let index = u16::try_from(number.checked_sub(1)?).ok()?;
@@ -529,13 +552,14 @@ impl SampleGeometry {
                 ConformanceFormat::Mod | ConformanceFormat::Mtm => {
                     module.instrument(InstrumentId(index)).and_then(|instrument| instrument.sample).and_then(|id| module.sample(id))?
                 }
-                ConformanceFormat::S3m => module.sample(SampleId(index))?,
+                ConformanceFormat::S3m | ConformanceFormat::It => module.sample(SampleId(index))?,
             };
             Some(SampleSpan {
                 length_frames: sample.length_frames(),
                 loop_start: sample.loop_start(),
                 loop_end: sample.loop_end(),
                 looping: sample.loop_mode().is_looping(),
+                reference_rate_hz: sample.reference_rate_hz(),
             })
         }).collect();
         SampleGeometry { spans }
@@ -570,8 +594,8 @@ pub fn oracle_end_frame(upstream: &[LibxmpTick]) -> Frame {
 ///
 /// This is a harness defect, never a case result: reporting it as a divergence is exactly
 /// how `libxmp-s3m-pattern-loop-mpt-breakjump` came to be filed as an engine bug.
-pub fn check_tick_budget(upstream: &[LibxmpTick], actual: &Trace, budget: usize) -> Result<(), String> {
-    let reached = tick_end_frames(actual).last().copied().unwrap_or(Frame::ZERO);
+pub fn check_tick_budget(format: ConformanceFormat, upstream: &[LibxmpTick], actual: &Trace, budget: usize) -> Result<(), String> {
+    let reached = tick_end_frames(format, actual).last().copied().unwrap_or(Frame::ZERO);
     let needed = oracle_end_frame(upstream);
     if actual.ticks.len() >= budget && reached.0 + FRAME_TOLERANCE < needed.0 {
         return Err(format!(
@@ -693,7 +717,8 @@ fn project_libxmp_dump(
 ) -> (Trace, Trace) {
     let mut expected_ticks = Vec::with_capacity(upstream.len());
     let mut actual_ticks = Vec::with_capacity(upstream.len());
-    let actual_end_frames = tick_end_frames(actual);
+    let background = background_virtual_channels(format, actual);
+    let actual_end_frames = tick_end_frames(format, actual);
     let pairing = pair_by_time(upstream, actual, &actual_end_frames, waived.contains(&TraceField::Frame));
     let mut fallback_index = 0usize;
 
@@ -715,11 +740,17 @@ fn project_libxmp_dump(
         actual_tick_projection.frame = actual_end_frames[actual_index];
 
         let upstream_by_channel: BTreeMap<u16, &LibxmpChannel> = upstream_tick.channels.iter().map(|channel| (channel.channel, channel)).collect();
+        // The oracle's channel column covers libxmp's *virtual* channels, so for IT it
+        // names background NNA voices too. `background` reproduces libxmp's numbering for
+        // them; every other format contributes an empty map and the axis is unchanged.
+        let actual_by_channel: BTreeMap<u16, TraceChannel> = actual_tick.channels.iter().map(|channel| (channel.channel, channel.clone()))
+            .chain(background.get(actual_index).into_iter().flatten().map(|(virtual_channel, voice)| (*virtual_channel, voice.clone())))
+            .collect();
         let channel_ids: BTreeSet<u16> = upstream_by_channel.keys().copied()
-            .chain(actual_tick.channels.iter().filter(|channel| channel.active).map(|channel| channel.channel))
+            .chain(actual_by_channel.values().filter(|channel| channel.active).map(|channel| channel.channel))
             .collect();
         for channel_id in channel_ids {
-            let raw_actual = actual_tick.channels.iter().find(|channel| channel.channel == channel_id).cloned()
+            let raw_actual = actual_by_channel.get(&channel_id).cloned()
                 .unwrap_or_else(|| TraceChannel { channel: channel_id, ..TraceChannel::default() });
             let mut actual_channel = raw_actual.clone();
             // C1 names the sample reference-rate pitch C-4, one octave above the
@@ -733,7 +764,7 @@ fn project_libxmp_dump(
             let mut expected_channel = actual_channel.clone();
             if let Some(upstream_channel) = upstream_by_channel.get(&channel_id) {
                 expected_channel.active = true;
-                expected_channel.note = project_note(format, upstream_channel.note);
+                expected_channel.note = project_note(format, upstream_channel.note, geometry.span(actual_channel.sample));
                 expected_channel.instrument = upstream_channel.instrument_zero_based.saturating_add(1);
                 expected_channel.volume = (upstream_channel.volume_x16 + 8) / 16;
                 expected_channel.period = project_period(format, upstream_channel.period_q12);
@@ -747,10 +778,15 @@ fn project_libxmp_dump(
                     expected_channel.position = actual_channel.position;
                 }
                 if let Some(cutoff) = upstream_channel.cutoff {
-                    // libxmp uses zero for its disabled-filter sentinel and treats all
-                    // values at or above 254 as equivalent fully-open cutoffs. C1 uses
-                    // 255 for that state. Operative values remain exact.
-                    expected_channel.cutoff = if cutoff == 0 || cutoff >= 254 { 255 } else { cutoff };
+                    // libxmp leaves a voice whose filter was never engaged at zero, which
+                    // is C1's fully-open 255; and its own comparator accepts any two
+                    // values at or above 254 as the same fully-open cutoff
+                    // (`test-dev/compare_mixer_data.c:84-87`). Operative values are exact.
+                    expected_channel.cutoff = match cutoff {
+                        0 => 255,
+                        254.. if actual_channel.cutoff >= 254 => actual_channel.cutoff,
+                        cutoff => cutoff,
+                    };
                 }
                 if let Some(resonance) = upstream_channel.resonance {
                     expected_channel.resonance = resonance;
@@ -778,6 +814,66 @@ fn project_libxmp_dump(
     }
 
     (Trace { version: TRACE_FORMAT_VERSION, ticks: expected_ticks }, Trace { version: actual.version, ticks: actual_ticks })
+}
+
+/// libxmp's virtual-channel number for every background voice of every tick, in trace
+/// order.
+///
+/// The oracle's channel column is a **virtual** channel, and for IT libxmp allocates one
+/// per New Note Action: when a note displaces a sounding voice, the displaced voice is
+/// moved to the lowest free virtual channel at or above `mod->chn` and freed again when
+/// it stops (`libxmp src/virtual.c:517-523`):
+///
+/// ```text
+/// for (chn = p->virt.num_tracks; chn < p->virt.virt_channels &&
+///      p->virt.virt_channel[chn++].map > FREE;) ;
+/// p->virt.voice_array[voc].chn = --chn;
+/// ```
+///
+/// That rule is reproducible from the trace alone: a ` vc=` row that was not there last
+/// tick takes the lowest free index, and one that has gone releases its own. Both players
+/// walk their channels in ascending order, so two detachments in one tick are numbered the
+/// same way as long as the pool hands out slots in ascending order too — which
+/// [`VoicePool::allocate`](starplayer::mixer::VoicePool::allocate) does.
+///
+/// Every other format has no background voices and gets an empty map per tick.
+fn background_virtual_channels(format: ConformanceFormat, actual: &Trace) -> Vec<Vec<(u16, TraceChannel)>> {
+    if format != ConformanceFormat::It {
+        return vec![Vec::new(); actual.ticks.len()];
+    }
+    let channel_count = actual.ticks.first().map(|tick| tick.channels.len()).unwrap_or(0) as u16;
+    // Voice pool slot -> the virtual channel libxmp would be dumping it under.
+    let mut assigned: Vec<(u16, u16)> = Vec::new();
+    actual.ticks.iter().map(|tick| {
+        assigned.retain(|(voice, _)| tick.voices.iter().any(|row| row.voice == *voice));
+        for row in &tick.voices {
+            if assigned.iter().any(|(voice, _)| *voice == row.voice) {
+                continue;
+            }
+            let mut candidate = channel_count;
+            while assigned.iter().any(|(_, virtual_channel)| *virtual_channel == candidate) {
+                candidate += 1;
+            }
+            assigned.push((row.voice, candidate));
+        }
+        tick.voices.iter().filter_map(|row| {
+            let virtual_channel = assigned.iter().find(|(voice, _)| *voice == row.voice).map(|(_, channel)| *channel)?;
+            Some((virtual_channel, TraceChannel {
+                channel: virtual_channel,
+                active: true,
+                note: row.note,
+                instrument: row.instrument,
+                sample: row.sample,
+                volume: row.volume,
+                period: row.period,
+                pan: row.pan,
+                position: row.position,
+                cutoff: row.cutoff,
+                resonance: row.resonance,
+                flags: row.flags,
+            }))
+        }).collect()
+    }).collect()
 }
 
 /// Copy one field from the projected actual tick over the expected tick, so the differ
@@ -844,6 +940,12 @@ fn step_per_output_frame(format: ConformanceFormat, period: u32) -> u128 {
         return 0;
     }
     match format {
+        // IT: `step = C4_PERIOD * c5spd / rate / period` (libxmp `src/mixer.c:584`) with
+        // `c5spd` the fixed `c4rate`, because the IT loader folded the sample's own rate
+        // into the note.
+        ConformanceFormat::It => {
+            ((LIBXMP_IT_PERIOD_NUMERATOR as u128) << 32) / (period as u128 * CONFORMANCE_SAMPLE_RATE_HZ as u128)
+        }
         // MOD and MTM run Paula's exact PAL clock divided by the Amiga period.
         ConformanceFormat::Mod | ConformanceFormat::Mtm => {
             ((PAULA_PAL_CLOCK_HZ as u128) << 32) / (period as u128 * CONFORMANCE_SAMPLE_RATE_HZ as u128)
@@ -877,7 +979,16 @@ fn loop_equivalent(span: Option<SampleSpan>, expected: u64, actual: u64) -> bool
     distance.min(length - distance) <= POSITION_TOLERANCE
 }
 
-fn project_note(format: ConformanceFormat, note: u8) -> Option<u8> {
+fn project_note(format: ConformanceFormat, note: u8, span: Option<SampleSpan>) -> Option<u8> {
+    // libxmp's IT loader converts each sample's `C5Speed` into a relative note plus a
+    // finetune (`libxmp_c2spd_to_note`, `src/loaders/it_load.c:906`) and adds the relative
+    // note to the pattern note, where StarPlayer keeps the pattern note and the rate
+    // apart. Removing the same offset puts the two on one axis; the *finetune* half of the
+    // conversion stays in the period column, which is compared directly.
+    if format == ConformanceFormat::It {
+        let offset = span.map(|span| relative_note_for_rate(span.reference_rate_hz)).unwrap_or(0);
+        return u8::try_from(note as i32 - offset).ok();
+    }
     // The MOD comparison axis is ProTracker's displayed octave: libxmp's mixer is
     // two octaves above it, while C1 (projected above) is one. S3M/MTM compare on
     // C1's axis and therefore remove libxmp's one-octave bias. A note below the
@@ -885,8 +996,18 @@ fn project_note(format: ConformanceFormat, note: u8) -> Option<u8> {
     // rather than clamping it to zero, where it would match every other such note.
     shift_note(note, match format {
         ConformanceFormat::Mod => 24,
-        ConformanceFormat::S3m | ConformanceFormat::Mtm => 12,
+        ConformanceFormat::S3m | ConformanceFormat::Mtm | ConformanceFormat::It => 12,
     })
+}
+
+/// libxmp's `libxmp_c2spd_to_note` relative-note half: `(1536 · log2(rate / 8363)) / 128`,
+/// truncated towards zero exactly as the C integer division does.
+fn relative_note_for_rate(reference_rate_hz: u32) -> i32 {
+    if reference_rate_hz == 0 {
+        return 0;
+    }
+    let units = (1536.0 * (reference_rate_hz as f64 / 8363.0).log2()) as i32;
+    units / 128
 }
 
 fn shift_note(note: u8, semitones_down: i16) -> Option<u8> {
@@ -897,7 +1018,7 @@ fn project_period(format: ConformanceFormat, period_q12: u32) -> u32 {
     // MOD and MTM trace the Amiga-period command domain itself. S3M retains C2's
     // native quarter-period scale, hence its additional factor of four.
     let divisor = match format {
-        ConformanceFormat::Mod | ConformanceFormat::Mtm => 4096,
+        ConformanceFormat::Mod | ConformanceFormat::Mtm | ConformanceFormat::It => 4096,
         ConformanceFormat::S3m => 1024,
     };
     period_q12.saturating_add(divisor / 2) / divisor
@@ -907,24 +1028,47 @@ fn project_actual_position(format: ConformanceFormat, position: u64) -> u64 {
     match format {
         // libxmp's `pos0` deliberately discards the mixer's fraction. Compare formats
         // using the MOD-period mixer domain in that same observable integer domain.
-        ConformanceFormat::Mod | ConformanceFormat::Mtm => position & !(u32::MAX as u64),
+        // libxmp's `pos0` deliberately discards the mixer's fraction, so a format whose
+        // trace carries one compares in that same observable integer domain — otherwise a
+        // voice a quarter of a frame ahead of the oracle's *floor* reads as a whole frame
+        // out whenever the fraction is high.
+        ConformanceFormat::Mod | ConformanceFormat::Mtm | ConformanceFormat::It => position & !(u32::MAX as u64),
         ConformanceFormat::S3m => position,
     }
 }
 
-fn project_pan(format: ConformanceFormat, pan_signed: i16) -> u16 {
-    let pan_u8 = (pan_signed as i32 + 128).clamp(0, 255) as u16;
+fn project_pan(format: ConformanceFormat, pan_signed: i32) -> u16 {
+    // Accuracy policy D66: StarPlayer renders an IT surround channel at centre, so
+    // libxmp's `PAN_SURROUND` sentinel projects onto the centre position the engine
+    // actually writes. Every other pan value stays exact.
+    if pan_signed == LIBXMP_PAN_SURROUND {
+        return 128;
+    }
+    let pan_u8 = (pan_signed + 128).clamp(0, 255) as u16;
     match format {
         // MOD 8xx is a full-byte pan. Keeping every bit here prevents the adapter
-        // from hiding low-nibble differences supplied by the oracle.
-        ConformanceFormat::Mod => pan_u8,
+        // from hiding low-nibble differences supplied by the oracle. IT's pan is a
+        // full byte too — its 0..64 column is scaled by four inside the replayer.
+        ConformanceFormat::Mod | ConformanceFormat::It => pan_u8,
         // libxmp shifts these formats' native four-bit pan into the high nibble.
         ConformanceFormat::S3m | ConformanceFormat::Mtm => (pan_u8 >> 4) * 17,
     }
 }
 
-fn tick_end_frames(trace: &Trace) -> Vec<Frame> {
-    let mut clock = FrameClock::new(ExactFixedPoint, 44_100, Frame::ZERO);
+/// Where each traced tick **ends** on the *oracle's* reporting clock.
+///
+/// This is deliberately the drift-free model for every format, including IT, because it
+/// models libxmp rather than StarPlayer. libxmp keeps two clocks that disagree with each
+/// other: the number of frames it actually renders per tick is truncated to a whole frame
+/// (`src/mixer.c:440`, `ticksize = (int)calc`), while the `time` column every record
+/// carries accumulates the exact `time_factor · rrate / bpm` in a `double`
+/// (`src/player.c:2171`). The dump's timestamps therefore lie on the exact timeline and
+/// its sample positions on the truncated one. Pairing keys off the timestamps, so it keys
+/// off the exact model; `position` is compared against the truncated advance, which
+/// `TempoModelId::ItModern` reproduces inside the engine.
+fn tick_end_frames(format: ConformanceFormat, trace: &Trace) -> Vec<Frame> {
+    let _ = format;
+    let mut clock = FrameClock::new(TempoModelId::ExactFixedPoint, 44_100, Frame::ZERO);
     trace.ticks.iter().map(|tick| clock.advance_tick(tick.bpm, tick.speed)).collect()
 }
 

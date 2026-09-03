@@ -209,7 +209,8 @@ fn golden_format(format: ModuleFormat) -> Option<GoldenFormat> {
         ModuleFormat::Mod => Some(GoldenFormat::Mod),
         ModuleFormat::S3m => Some(GoldenFormat::S3m),
         ModuleFormat::Mtm => Some(GoldenFormat::Mtm),
-        ModuleFormat::Xm | ModuleFormat::It => None,
+        ModuleFormat::It => Some(GoldenFormat::It),
+        ModuleFormat::Xm => None,
     }
 }
 
