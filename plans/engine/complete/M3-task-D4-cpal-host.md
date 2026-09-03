@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M3 ([master plan](M3-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03; owner listening check outstanding |
 | Depends on | D3 landed (`starplayer::NativeSequencer`, `recommended_voice_capacity`, `MAX_VOICE_CAPACITY`) |
 | Blocks | The CLI `play` command (a small follow-up once D5 has landed the CLI skeleton), A1 (TUI) |
 | Parallel with | D5, D6, D7, F1, G1 |
