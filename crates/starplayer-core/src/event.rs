@@ -387,7 +387,8 @@ pub enum Command<ModuleHandle> {
     SetTempoModel(crate::tempo::TempoModelId),
 }
 
-/// What a player does when the song reaches its **detected loop point**.
+/// What a player does when the song **has been heard through once** — at its detected loop
+/// point, or when its order list runs out.
 ///
 /// This is not the same question as
 /// [`EndOfSongPolicy`](https://docs.rs/starplayer-engine): that one says what the *end of
@@ -397,12 +398,16 @@ pub enum Command<ModuleHandle> {
 /// order list.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AtEnd {
-    /// Wrap at the loop point and keep playing. Repeat on, and the default.
+    /// Wrap and keep playing, from the loop point or from the restart order. Repeat on, and
+    /// the default.
     #[default]
     Continue,
-    /// Stop dead at the loop point. Voices ring out; no further ticks.
+    /// Stop dead there. Voices ring out; no further ticks.
     Stop,
-    /// Keep playing past the loop point and let the host fade the transport out.
+    /// Keep playing past the **loop point** and let the host fade the transport out.
+    ///
+    /// A song whose order list simply ran out has no second pass to fade into, so it stops
+    /// there exactly as [`AtEnd::Stop`] does (task D2).
     ///
     /// The engine does not fade: it only reports that the point was passed, through
     /// [`TransportState::end_reached`](https://docs.rs/starplayer-telemetry).

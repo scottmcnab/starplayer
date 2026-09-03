@@ -33,7 +33,8 @@ not fit.
    an hour — and exposes the three knobs that change it: `--repeat N` (extra passes through
    the repeating section), `--fade S` (fade length in seconds) and `--at-end cut|fade`
    (`cut` stops dead on the loop point with no fade). A song that *ends* of its own accord
-   gets no fade whatever is asked for, because there is nothing to fade away from.
+   — a stop marker, or an order list that simply runs out — gets no fade whatever is asked
+   for, because there is nothing to fade away from (task D2).
 4. **`starplayer-offline`** — deterministic rendering to WAV at any rate and depth, with
    the higher-quality interpolators when M7 lands. `song_timeline` and `render_song`
    landed early with task D1, because the web player's progress slider needed the scan.

@@ -30,15 +30,25 @@ Elapsed is the engine's own reported position, not compensated for the `AudioCon
 readout switches the left one between elapsed and the time remaining as `-m:ss`, as VLC
 does; the choice is kept in `localStorage`.
 
-**Repeat**, checked by default, sends `OPCODE_AT_END`: checked wraps the song at its loop
-point and the slider wraps with it; unchecked fades the song out over `SONG_FADE_SECONDS`
-(5 seconds) into what would otherwise be its second pass, then stops — the host itself
-rewinds the transport to song frame 0 once the fade lands, and the slider follows it to
-`0:00`. With Repeat off the slider's length includes those five seconds, so it always
-represents one complete playback; a song that ends of its own accord has no fade and its
-length does not change. The same command is resent whenever a module is (re)activated and whenever a
-playback-restoring graph rebuild happens (a sample-rate or channel-count change, or the
-MOD panning reload), so the checkbox's choice survives all of them.
+**Repeat**, checked by default, sends `OPCODE_AT_END`. Checked, the song comes round again
+— at its loop point, or from the restart order when the order list runs out — and the
+slider wraps with it.
+
+Unchecked, what happens depends on how the song ends, which the scan decides and reports in
+the snapshot's `songFlags`:
+
+* A song that **loops**, because a `Bxx`/`Cxx`/`Dxx` jumps back into music already played,
+  fades out over `SONG_FADE_SECONDS` (5 seconds) into what would otherwise be its second
+  pass, then stops. The slider's length includes those five seconds, so it still represents
+  one complete playback.
+* A song that **ends**, because its order list simply runs out or a stop marker fires,
+  stops on its end frame: no second pass, no fade, and its displayed length is exactly one
+  pass.
+
+Either way the host rewinds the transport to song frame 0 once it stops, and the slider
+follows it to `0:00`. The same command is resent whenever a module is (re)activated and
+whenever a playback-restoring graph rebuild happens (a sample-rate or channel-count change,
+or the MOD panning reload), so the checkbox's choice survives all of them.
 
 ## Architecture
 
