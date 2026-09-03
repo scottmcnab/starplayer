@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M6 ([master plan](M6-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03 |
 | Depends on | M4-lite landed (E1–E3) |
 | Blocks | G3 (IT instrument runtime), G4 (effects), G5 (wiring) |
 | Parallel with | D3, D6, F1 |
