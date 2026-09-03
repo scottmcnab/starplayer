@@ -441,6 +441,12 @@ struct Host {
     fade_frames: u32,
     /// Whether that fade is running, so it is armed once rather than every quantum.
     fading: bool,
+    /// Frames of the fade already rendered. The fade gain is computed from this position
+    /// on every frame rather than accumulated, so it is exact over any length: a
+    /// `GainRamp` is built for 64-frame transport clicks, and over a five-second fade its
+    /// integer increment rounds to zero — the gain would hold at unity and then snap to
+    /// silence, which is what shipped first.
+    fade_elapsed: u32,
     current_module: Option<Arc<Module>>,
     /// The scan for `current_module` at this rate, kept so a mixer-mode rebuild reuses it.
     song_timeline: Option<Rc<SongTimeline>>,
@@ -484,6 +490,7 @@ impl Host {
             at_end: Rc::new(Cell::new(AtEnd::Continue)),
             fade_frames: DEFAULT_FADE_FRAMES,
             fading: false,
+            fade_elapsed: 0,
             current_module: None,
             song_timeline: None,
             active_mode,
@@ -692,10 +699,24 @@ impl Host {
         }
         self.at_end.set(at_end);
         if at_end != AtEnd::FadeOut && self.fading {
-            self.transport_gain.glide_to(TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES);
-            self.pending_engine_stop = false;
+            // Take the fade back from where it has got to, not from unity: the transport
+            // ramp picks up at the faded level and glides home over the usual 64 frames.
+            let faded = self.faded_gain(self.transport_gain.current());
             self.fading = false;
+            self.transport_gain = GainRamp::steady(faded);
+            self.transport_gain.glide_to(TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES);
         }
+    }
+
+    /// `gain` scaled by where the song fade has got to: untouched before the fade starts,
+    /// zero on its last frame, linear in between. Position-based, so it is exact whatever
+    /// the fade length and however the host blocks fall.
+    fn faded_gain(&self, gain: i32) -> i32 {
+        if !self.fading || self.fade_frames == 0 {
+            return gain;
+        }
+        let remaining = self.fade_frames.saturating_sub(self.fade_elapsed) as i64;
+        (gain as i64 * remaining / self.fade_frames as i64) as i32
     }
 
     fn process(&mut self, frames: usize) -> f32 {
@@ -715,14 +736,17 @@ impl Host {
         let snapshot = *self.telemetry.read();
         let transport_running = self.engine.is_playing() && !self.pending_engine_stop;
         if transport_running && snapshot.transport.end_reached && self.at_end.get() == AtEnd::FadeOut && !self.fading {
-            self.transport_gain.glide_to(0, self.fade_frames);
-            self.pending_engine_stop = true;
             self.fading = true;
+            self.fade_elapsed = 0;
         }
 
         let mut peak = 0.0f32;
         for frame in 0..frames {
-            let gain_units = self.transport_gain.advance();
+            let transport_units = self.transport_gain.advance();
+            let gain_units = self.faded_gain(transport_units);
+            if self.fading {
+                self.fade_elapsed = self.fade_elapsed.saturating_add(1);
+            }
             for channel in 0..self.active_mode.channels as usize {
                 let interleaved_index = frame.saturating_mul(self.active_mode.channels as usize).saturating_add(channel);
                 let (output, quantized_i16) = match self.active_mode.path {
@@ -748,15 +772,22 @@ impl Host {
             }
         }
 
+        // The fade has run its course. A song that faded out is over, not paused: stop the
+        // engine and rewind it so the next Play starts from the top rather than from the
+        // silence at the end. The transport gain itself was never touched, so Play needs
+        // no ramp back up.
+        if self.fading && self.fade_elapsed >= self.fade_frames {
+            if self.control.send(Command::Stop).is_ok() {
+                self.fading = false;
+                self.request_seek(SeekKind::Frame(0));
+            } else {
+                self.commands_rejected = self.commands_rejected.saturating_add(1);
+            }
+        }
+
         if self.pending_engine_stop && !self.transport_gain.is_ramping() {
             if self.control.send(Command::Stop).is_ok() {
                 self.pending_engine_stop = false;
-                // A song that faded out is over, not paused: rewind it so the next Play
-                // starts from the top rather than from the silence at the end.
-                if self.fading {
-                    self.fading = false;
-                    self.request_seek(SeekKind::Frame(0));
-                }
             } else {
                 self.commands_rejected = self.commands_rejected.saturating_add(1);
             }
@@ -1325,16 +1356,49 @@ mod tests {
         let mut host = Host::new(48_000);
         assert!(host.load_module(FIXTURE).is_ok());
         host.at_end.set(AtEnd::FadeOut);
-        host.transport_gain.glide_to(0, 48_000);
-        host.pending_engine_stop = true;
         host.fading = true;
+        host.fade_elapsed = host.fade_frames / 2;
+        assert_eq!(host.faded_gain(TRANSPORT_GAIN_UNITY), TRANSPORT_GAIN_UNITY / 2, "half way through, the fade is at half gain");
 
         assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_CONTINUE, extra: 0 }));
         host.process(RENDER_QUANTUM);
         assert_eq!(host.at_end.get(), AtEnd::Continue);
         assert!(!host.fading);
-        assert!(!host.pending_engine_stop, "the queued stop is cancelled");
+        assert!(!host.pending_engine_stop, "no stop is queued");
         assert_eq!(host.transport_gain.target(), TRANSPORT_GAIN_UNITY, "and the gain heads back to unity");
+    }
+
+    #[test]
+    fn the_song_fade_attenuates_the_output_all_the_way_to_silence() {
+        let module = minimal_mod();
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(&module).is_ok());
+        let end_frame = host.song_timeline.as_ref().expect("the module was scanned").end_frame();
+        let fade_frames: u32 = 48_000;
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: fade_frames }));
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+
+        let mut fading_peaks = Vec::new();
+        let mut playing_words = Vec::new();
+        for _ in 0..((end_frame as usize + fade_frames as usize) / RENDER_QUANTUM + 50) {
+            let peak = host.process(RENDER_QUANTUM);
+            if host.fading {
+                fading_peaks.push(peak);
+                playing_words.push(host.telemetry_words[15]);
+            }
+            if !host.engine.is_playing() { break; }
+        }
+        let fade_quanta = fade_frames as usize / RENDER_QUANTUM;
+        assert!(fading_peaks.len() >= fade_quanta - 1 && fading_peaks.len() <= fade_quanta + 1, "the fade ran for its whole length: {} quanta", fading_peaks.len());
+        assert!(playing_words.iter().all(|word| *word == 1), "the transport reports playing for the whole fade");
+
+        let quarter = fading_peaks.len() / 4;
+        let loudest = |peaks: &[f32]| peaks.iter().copied().fold(0.0f32, f32::max);
+        let first = loudest(&fading_peaks[..quarter]);
+        let last = loudest(&fading_peaks[fading_peaks.len() - quarter..]);
+        assert!(first > 0.0, "the fixture makes sound going into the fade");
+        assert!(last < first * 0.3, "the last quarter of the fade is well down on the first: {last} vs {first}");
+        assert!(!host.engine.is_playing(), "and the transport stopped when the fade landed");
     }
 
     #[test]

@@ -1081,7 +1081,10 @@ function updatePattern(snapshot) {
 function updateProgress(snapshot) {
     const rate = state.workletSampleRate;
     const lengthKnown = (snapshot.songFlags & Ring.SONG_FLAG_LENGTH_KNOWN) !== 0;
-    const lengthFrames = lengthKnown ? Math.max(0, snapshot.songLengthFrames) : null;
+    // With Repeat off a looping song plays on past its loop point under the fade, so the
+    // slider covers the fade too: it always represents one complete playback.
+    const fadesAtEnd = !elements.repeat.checked && (snapshot.songFlags & Ring.SONG_FLAG_LOOPS) !== 0;
+    const lengthFrames = lengthKnown ? Math.max(0, snapshot.songLengthFrames) + (fadesAtEnd ? repeatFadeFrames() : 0) : null;
     elements.progress.max = String(lengthFrames ?? 0);
     elements.progress.disabled = !lengthKnown;
     setText(elements.duration, formatTime(lengthFrames, rate));
@@ -1102,9 +1105,8 @@ function updateProgress(snapshot) {
     }
     state.pendingSeekFrame = null;
     if (state.scrubbing) return;
-    const fading = (snapshot.songFlags & Ring.SONG_FLAG_FADING) !== 0;
     let frame = Math.max(0, snapshot.songFrame);
-    if (fading && lengthFrames !== null) frame = Math.min(frame, lengthFrames);
+    if (lengthFrames !== null) frame = Math.min(frame, lengthFrames);
     elements.progress.value = String(frame);
     setText(elements.elapsed, formatTime(frame, rate));
 }
