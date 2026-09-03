@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M6 ([master plan](M6-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-04; owner listening check outstanding |
 | Depends on | G1 (loader), E1–E3, D3 — all landed. G2 (the filter) is concurrent: this task writes `VoiceParam::Filter`; G2 makes it audible |
 | Blocks | G6 (conformance repairs), M6 exit |
 | Parallel with | G2, D4, F2 |
