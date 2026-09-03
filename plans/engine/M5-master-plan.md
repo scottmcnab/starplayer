@@ -57,10 +57,36 @@ scaffolding that never landed).
   run without it: the facade's `xm` arms, `ConformanceFormat::Xm` and `GoldenFormat::Xm`
   all landed here.
 
+* **F5** — the conformance repair pass over F2's twenty records. **87 of the 93 XM cases
+  now pass**, two are accepted deviations and four are known failures.
+
+  Five processor repairs: FastTracker 2's placeholder instrument keeps a fadeout of `0x80`
+  and a channel stays parked on it until a *note* moves the pointer; a delayed key-off with
+  no instrument column swallows the volume column's panning (`kFT2PanWithDelayedNoteOff`);
+  an `E6x` loop jump leaves its target row in the shared break position, so the next
+  pattern to end normally starts there (`kFT2LoopE60Restart`); and the tone-portamento rate
+  a tick applies is now separate from the memory the columns share.
+
+  Four `QuirkSet` fields and their detection, all of them libxmp's one `QUIRK_FT2BUGS` bit
+  taken apart: `xm_pattern_loop` (an `XmLoopDialect` of FastTracker 2, generic, ModPlug
+  1.16 or Skale), `xm_double_portamento_doubles_volume_column_rate`,
+  `xm_offset_past_sample_end_stops_channel` and `xm_loop_target_becomes_next_break_row`.
+  Two new `FormatDialect` variants, `SkaleTracker` and `UnknownXm`, and the loader now
+  recognises a ModPlug Tracker 1.16 file that signs itself `FastTracker v2.00` from its
+  own instrument headers and trailing chunks.
+
+  Five new accuracy-policy entries, **D75–D79**, and five new §1 rows. The MOD, S3M, MTM
+  and IT results and every golden are unchanged.
+
 ## Exit criteria
 
 The XM conformance corpus passes with exclusions justified; several well-known `.xm`
 files sound right to the owner.
+
+`--strict` names two XM records beyond `C2-S3M-009`: `F2-XM-003` and `F2-XM-004`, which
+cannot be settled without a real FastTracker 2, and `F2-XM-009`, which is a sequencer
+question — what a `Bxx`/`Cxx`/`Dxx` past the end of the order list means under
+`EndOfSongPolicy::Stop` — that every format shares and no format crate should answer alone.
 
 ## Out of scope
 

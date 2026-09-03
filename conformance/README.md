@@ -67,7 +67,7 @@ number and dirty flags lack upstream columns and are projected from
 the actual C1 trace. The active-channel set is a union, so extra StarPlayer voices cannot
 disappear during projection.
 
-### XM (task F2)
+### XM (tasks F2 and F5)
 
 Three things about libxmp's XM dumps have to be said before any of the columns make sense,
 and all three were settled from the pinned tree before a line of the processor was written.
@@ -117,14 +117,20 @@ the tick, so XM floors its Q32.32 position the way MOD and MTM do.
 non-zero tolerance, and each of the three is derived rather than chosen: four period units
 for FastTracker 2's sixteen-step finetune against libxmp's continuous one (accuracy policy
 D42), one volume unit and four pan units for FT2's Q8 envelope accumulation against libxmp's
-whole-unit recompute (D44). Everything else is exact.
+whole-unit recompute (D44). Everything else is exact. The four period units are a *linear*
+bound — a sixteenth of a semitone — so an Amiga-mode XM, where the same fraction of a
+semitone is a different number of quarter-units at every pitch, waives `period` per case
+under **D75** rather than widening the tolerance for the four Amiga fixtures that pass with
+it enforced.
 
 **An empty dump is an oracle, not an error.** libxmp writes a line only for a channel with a
 mapped, sounding voice, so a fixture whose point is that nothing ever plays has a zero-byte
 `.data`. The adapter reads that as "no channel may ever be active" and enforces it against
 the whole capture. `openmpt/xm/DelayCombination.data` is exactly that case and passes;
-`openmpt/xm/PanMemory.data` is empty for a module that *does* sound notes, which is recorded
-as `F2-XM-012`.
+`openmpt/xm/PanMemory.data` is empty for a module that *does* sound notes; task F5 confirmed
+that as a gap in the pinned corpus rather than a harness limitation and recorded it as
+accuracy policy **D79**, so the case is an accepted deviation that is still executed on
+every run.
 
 ### Impulse Tracker (task G3)
 

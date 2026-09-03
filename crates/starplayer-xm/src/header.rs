@@ -173,12 +173,16 @@ impl XmHeader {
         HEADER_SIZE_ORIGIN + size as usize
     }
 
+    /// Whether the tracker name is FastTracker 2's own — libxmp's `claims_ft2`
+    /// (`xm_load.c:855-859`), the gate on its ModPlug Tracker 1.16 detection.
+    pub fn claims_fast_tracker_2(&self) -> bool { self.tracker_name.starts_with(b"FastTracker v2.00") }
+
     /// Which tracker wrote this file, from the tracker name and header size alone.
     ///
-    /// Reproduces the classifier at the head of OpenMPT's `CSoundFile::ReadXM`, reduced to
-    /// the four dialects task E2 declared. OpenMPT's further split of the FastTracker 2
-    /// tag into "FT2 generic", "FT2 clone" and PlayerPRO rests on null-padding heuristics
-    /// in the song title, and none of it selects a quirk StarPlayer has, so the one
+    /// Reproduces the classifier at the head of OpenMPT's `CSoundFile::ReadXM` and
+    /// libxmp's `xm_load.c:846-893`. OpenMPT's further split of the FastTracker 2 tag into
+    /// "FT2 generic", "FT2 clone" and PlayerPRO rests on null-padding heuristics in the
+    /// song title, and none of it selects a quirk StarPlayer has, so the one
     /// [`FormatDialect::FastTracker2`] covers all of them — as `quirks.rs` says it does.
     ///
     /// | Tracker name | Extra evidence | Dialect |
@@ -188,7 +192,18 @@ impl XmHeader {
     /// | `FastTracker v 2.00  ` exactly (note the extra space) | — | [`FormatDialect::ModPlugXm`] |
     /// | `FastTracker v2.00   ` exactly | `header_size == 276` | [`FormatDialect::FastTracker2`] |
     /// | `Fasttracker II clone` exactly | — | [`FormatDialect::FastTracker2`] |
-    /// | anything else | — | [`FormatDialect::Unknown`] |
+    /// | `Skale Tracker` or `Sk@le Tracker`, NUL-terminated | — | [`FormatDialect::SkaleTracker`] |
+    /// | anything else | — | [`FormatDialect::UnknownXm`] |
+    ///
+    /// [`FormatDialect::FastTracker2`] is the only answer here that carries FastTracker
+    /// 2's replay bugs, so the fall-through is [`FormatDialect::UnknownXm`] rather than
+    /// [`FormatDialect::Unknown`]: an XM whose tracker name says it was not written by
+    /// FastTracker 2 is evidence, not the absence of it, and libxmp turns its whole
+    /// `QUIRK_FT2BUGS` off on exactly this test.
+    ///
+    /// A ModPlug Tracker 1.16 file that signs itself `FastTracker v2.00   ` cannot be told
+    /// apart here — it takes an instrument header or a trailing chunk to see — so
+    /// [`crate::load_from`] revises that one case after it has read the body.
     pub fn dialect(&self) -> FormatDialect {
         let name = &self.tracker_name;
         if name.starts_with(b"OpenMPT ") {
@@ -206,7 +221,12 @@ impl XmHeader {
         if name == b"FastTracker v2.00   " && self.header_size == FT2_HEADER_SIZE {
             return FormatDialect::FastTracker2;
         }
-        FormatDialect::Unknown
+        // libxmp compares the whole 20-byte field with `strcmp`, so the name has to be
+        // NUL-terminated rather than space-padded — which is what Skale writes.
+        if name.starts_with(b"Skale Tracker ") || name.starts_with(b"Sk@le Tracker ") {
+            return FormatDialect::SkaleTracker;
+        }
+        FormatDialect::UnknownXm
     }
 }
 
@@ -366,15 +386,19 @@ mod tests {
         assert_eq!(dialect_of(b"OpenMPT 1.29.13.00  "), FormatDialect::OpenMptXm);
         assert_eq!(dialect_of(b"MilkyTracker        "), FormatDialect::MilkyTracker);
         assert_eq!(dialect_of(b"MilkyTracker 1.02.00"), FormatDialect::MilkyTracker);
-        assert_eq!(dialect_of(b"MadTracker 2.0\0\0\0\0\0\0"), FormatDialect::Unknown);
-        assert_eq!(dialect_of(b"XpenMPT 1.20.00.39  "), FormatDialect::Unknown, "one letter out is not OpenMPT");
+        assert_eq!(dialect_of(b"MadTracker 2.0\0\0\0\0\0\0"), FormatDialect::UnknownXm);
+        assert_eq!(dialect_of(b"rst's SoundTracker  "), FormatDialect::UnknownXm);
+        assert_eq!(dialect_of(b"Skale Tracker\0\0\0\0\0\0\0"), FormatDialect::SkaleTracker);
+        assert_eq!(dialect_of(b"Sk@le Tracker\0\0\0\0\0\0\0"), FormatDialect::SkaleTracker);
+        assert_eq!(dialect_of(b"Skale Tracker       "), FormatDialect::UnknownXm, "libxmp compares the whole NUL-terminated name");
+        assert_eq!(dialect_of(b"XpenMPT 1.20.00.39  "), FormatDialect::UnknownXm, "one letter out is not OpenMPT");
     }
 
     #[test]
     fn the_fast_tracker_tag_needs_the_header_size_that_goes_with_it() {
         let mut bytes = synthetic_header(b"FastTracker v2.00   ", 0x0104);
         bytes[0x3C..0x40].copy_from_slice(&21u32.to_le_bytes());
-        assert_eq!(XmHeader::parse(&bytes).expect("a valid header").dialect(), FormatDialect::Unknown);
+        assert_eq!(XmHeader::parse(&bytes).expect("a valid header").dialect(), FormatDialect::UnknownXm);
     }
 
     #[test]
