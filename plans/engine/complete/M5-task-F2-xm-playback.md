@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M5 ([master plan](M5-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-04; owner listening check outstanding |
 | Depends on | F1 (loader), E1–E3, D3 — all landed |
 | Blocks | F5 (conformance repairs), M5 exit |
 | Parallel with | D4, D5, G1, G3 |
