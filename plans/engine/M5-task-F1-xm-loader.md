@@ -187,3 +187,189 @@ Report the exact commands run and their results, plus the corpus table. **Do not
 
 The effect processor, envelopes, any playback (F2, F3). Facade `probe`/`load` arms and
 the conformance harness (F4). Golden fixtures (F4).
+
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question. Sources: FastTracker 2's own `xm.txt` (Fredrik Huss / Mr.H of Triton, 1994,
+mirrored at `ftp.modland.com/pub/documents/format_documentation/`), OpenMPT's
+`soundlib/Load_xm.cpp`, `soundlib/XMTools.{h,cpp}` and `soundlib/SampleIO.cpp` on GitHub
+(`OpenMPT/openmpt`, `master`), and libxmp's `src/loaders/xm_load.c` — all fetched, none
+recalled. Every claim about the corpus below was measured against the pinned
+`libxmp-6ec0ba21b1b28f91e22b68a51d59207c6bbf6139` tree.
+
+### 1. Versions `0x0102` / `0x0103` — **supported; the layout difference is two lines**
+
+Not optional: `data/m/dontyou.xm` is version `0x0102` and lives in a directory deliverable
+5 requires to load `Ok`. It is the only pre-`0x0104` file in the corpus (160 of the 161
+XM-signature files are `0x0104`).
+
+The difference is exactly two things, both isolated behind predicates on
+[`XmHeader`](../../crates/starplayer-xm/src/header.rs):
+
+* `patterns_precede_instruments()` — from `0x0104` the patterns come first and each
+  instrument's PCM follows that instrument's sample headers; before it, the instrument and
+  sample *headers* come first, then the patterns, then every sample's PCM in one run at the
+  very end (`Load_xm.cpp`, the `if(fileHeader.version >= 0x0104)` pair around lines 722 and
+  940).
+* `rows_are_a_biased_byte()` — `0x0102` alone stores a pattern's row count as `u8 + 1`, so
+  its pattern header is eight bytes rather than nine and its packed-size field sits two
+  bytes earlier. `0x0103` already uses the `u16` (`Load_xm.cpp`,
+  `if(fileHeader.version == 0x0102) numRows = file.ReadUint8() + 1;`).
+
+The loader collects every instrument's headers into a pending list either way and assigns
+the PCM offsets in a second pass, so the two layouts share all of the decoding. No version
+is rejected: a version below `0x0102` simply takes the older path, which is what OpenMPT
+does.
+
+### 2. Orders past the pattern count — **FastTracker 2's reading: one shared empty pattern**
+
+FastTracker 2 holds 256 pattern slots in memory at all times and the slots a file does not
+store are empty 64-row patterns, so an order naming one plays four bars of silence rather
+than being skipped. The loader appends **one** empty 64-row pattern after the file's own
+when — and only when — some order needs it, and points every such order at it.
+
+Note that deliverable 1 of this task says "an order past the pattern count maps to
+`ORDER_MARKER`-style skipping per research point 2" while research point 2 says to choose
+FastTracker 2's reading. They contradict each other; research point 2 is the explicit
+instruction and is what is implemented. The corpus does not distinguish the two readings —
+no file in it has an out-of-range order — so this is a fidelity choice, not a
+corpus-forced one, and `an_order_past_the_pattern_count_plays_one_shared_empty_pattern`
+pins it.
+
+One related FastTracker 2 behaviour is implemented alongside it, from `Load_xm.cpp`'s
+`verEmptyOrders` handling: a `song_length` of zero becomes a one-entry order list naming
+pattern 0 — the fix for `lamb_-_dark_lighthouse.xm` — **except** in a file whose tracker
+name says OpenMPT, which means an empty order list literally.
+
+### 3. Stereo XM samples — **decoded and downmixed; the corpus has two of them**
+
+The research point says "reject unless the corpus contains one". It does: `data/stereo.xm`
+and `data/test.xm`, both directly under `data/` and therefore both required to load `Ok`,
+carry two stereo samples each — one with `type` `0x21` (loop + stereo) and one with `0x31`
+(loop + 16-bit + stereo). Rejecting the flag would fail deliverable 5.
+
+ModPlug's stereo layout is `stereoSplit`: the left channel's **whole** delta stream, then
+the right channel's, each decoded from its own running accumulator, with `length`,
+`loopStart` and `loopLength` all counting both channels' bytes (OpenMPT
+`XMSample::ConvertToMPT` halves all three again for stereo, on top of the halving for
+16-bit). The engine's sample blob is mono and pan comes from the channel, so the two
+channels are averaged: `(left + right) / 2` per frame. The alternative — keeping the left
+channel only, as `starplayer-s3m` does for S3M's own stereo flag — loses half the signal
+of a genuinely stereo sample, and unlike S3M's case these files really exist.
+
+### 4. `ADPCM4` — **decoded, not rejected; the task's detection description was wrong**
+
+Two findings, and both change the deliverable.
+
+**The detection is not a marker in the data.** OpenMPT's `XMSample::GetSampleFormat`
+(`XMTools.cpp`) reads the sample header's `reserved` byte at offset `0x11`: the sample is
+ADPCM when `reserved == 0xAD` **and** neither the 16-bit nor the stereo flag is set. There
+is no `ADPCM4` string where the PCM would start. libxmp agrees (`xm_load.c` line 704,
+`if (xsh[j].reserved == 0xad) flags = SAMPLE_FLAG_ADPCM;`). FastTracker 2 itself writes the
+sample name's *length* in that byte, which is why the 16-bit/stereo guard is needed.
+
+**Rejecting the file is not available.** `data/m/MRHPx-HBTN LUCiFER.xm` has fourteen ADPCM
+samples and lives under `data/m/`, which deliverable 5 requires to load `Ok`. So the
+`Error::Unsupported("ADPCM-compressed XM sample")` the deliverable asks for would fail the
+corpus test on that file, and there is no exclusion mechanism in a loader-level test.
+
+The decoder is twenty lines and is transcribed from OpenMPT's `SampleIO::ReadSample`: a
+16-byte signed compression table, then two 4-bit table indices per byte, **low nybble
+first**, each added to a running `i8`; the encoded size is `16 + (length + 1) / 2` bytes
+and `length` is a *frame* count rather than a byte count for this encoding alone. This is
+the one place the implementation is deliberately larger in scope than the task file asked
+for; a reviewer who prefers the rejection would also have to add a corpus exclusion for
+that file.
+
+### 5. Instrument count above 128 / sample count above 16 — **both tolerated, with a ceiling on the first**
+
+*Instruments.* `xm.txt` says 128. OpenMPT clamps instead of rejecting —
+`m_nInstruments = std::min(fileHeader.instruments, MAX_INSTRUMENTS - 1)`, i.e. 255. The
+corpus's largest declared instrument count is exactly 128, so nothing forces the question.
+The loader takes OpenMPT's ceiling: 129..=255 loads normally (with a doc note that it is
+out of specification), and above 255 is `Error::TooLarge("more than 255 XM instruments")`.
+A ceiling is needed rather than nothing, because an `InstrumentDef` is around 370 bytes of
+note maps and a `u16` count would let an eighty-byte header ask for 24 MB.
+
+*Samples per instrument.* `xm.txt` implies 16 and OpenMPT's `AllocateXMSamples` caps its
+*slot allocation* at 32 while still reading every declared header; libxmp is stricter and
+**rejects** the whole file above 32 (`XM_MAX_SAMPLES_PER_INST`). The corpus goes past 16:
+`data/m/grass near the house.xm` has an instrument with 23 samples. This loader imposes no
+count limit at all — it reads sample headers until one would run past the end of the file
+and then stops, so the real bound is the file's own size, and there is no cliff at 16 or
+32. A note whose map entry names a local sample the instrument does not have maps to no
+sample rather than to a wrong one.
+
+*Patterns and channels.* Both are refused rather than clamped, because both are engine
+limits rather than tolerances: above 256 patterns is `Error::TooLarge` (the format's own
+maximum, and the order byte cannot name more), and above 64 channels is `Error::TooLarge`
+(`ChannelTable::MAX_CHANNELS`). The corpus's widest file is `data/m/xyce-dans_la_rue.xm`
+at 22 channels — note the odd count, which OpenMPT rounds up to even and this loader does
+not.
+
+### 6. Tracker-name variants — **E2's strings confirmed, with one clause dropped**
+
+Checked against `Load_xm.cpp` lines 618–692 and against every file in the corpus.
+
+| Evidence | Dialect | Corpus files |
+|---|---|---|
+| `OpenMPT ` prefix (8 bytes) | `OpenMptXm` | 70 |
+| `MilkyTracker` prefix (12 bytes — OpenMPT's `memcmp(…, "MilkyTracker ", 12)` compares twelve, so the trailing space is not part of the test) | `MilkyTracker` | 2 |
+| `FastTracker v 2.00  ` exactly, note the extra mid-string space | `ModPlugXm` | 0 |
+| `FastTracker v2.00   ` exactly, with `header_size == 276` | `FastTracker2` | 59 |
+| `Fasttracker II clone` exactly (8bitbubsy's clone, which OpenMPT treats as FT2) | `FastTracker2` | 2 |
+| anything else | `Unknown` | 7 |
+
+The seven `Unknown` files are `MadTracker 2.0`, `Skale Tracker`, `XMLiTE`,
+`rst's SoundTracker`, `*MRHPx produktions*` (×2) and `Fasttracker Too!!11`. OpenMPT
+recognises the first two and adjusts two play behaviours for each; StarPlayer has no
+`QuirkSet` field for either yet, and task C5's rule is that a dialect earns a field only
+when a corpus case justifies one, so they stay `Unknown` — which resolves to the profile
+default, exactly as E2's `quirks.rs` documents for every XM dialect.
+
+Two departures from E2's doc comment, both deliberate:
+
+* **The `version >= 0x0104` clause is dropped from the FastTracker 2 test.** `quirks.rs`
+  describes the tag as "header size 276 and format version `0x0104` or later", but
+  `Load_xm.cpp` sets `verFT2Generic | verConfirmed` for a version *below* `0x0104` with
+  that tag and header size — an old FastTracker 2 file is still a FastTracker 2 file. The
+  loader therefore tests the name and the header size only. `data/m/dontyou.xm`
+  (version `0x0102`) is classified `FastTracker2` because of this; with the version clause
+  it would have been `Unknown`. Since every XM dialect maps to
+  `QuirkSet::profile_default()` today, this changes evidence and not behaviour.
+* **`Fasttracker II clone` is added**, which E2's comment does not mention. It is a
+  distinct 20-byte tag, not one of the null-padding heuristics E2 says StarPlayer folds
+  together, and OpenMPT maps it to FT2 outright. Two corpus files carry it.
+
+`quirks.rs` was not edited: it is outside this task's allowed file list, and its comment is
+prose about detection evidence rather than an executable rule. A reviewer may want to
+reword the `FastTracker2` doc comment when F4 lands.
+
+### 7. Not a research point, but a decision a reviewer will want: `sample_header_size` is not a stride
+
+The deliverable says "Instrument and sample header sizes are honoured, not assumed". The
+instrument header's `size` **is** honoured — trackers genuinely disagree about it (263 from
+FastTracker 2 and OpenMPT, 245 from ModPlug Tracker 1.0 alpha, 33 for an empty FastTracker 2
+instrument, 29 in `4-mat`'s `eternity.xm`), and fields past it read as zero, matching
+OpenMPT's `ReadStructPartial`.
+
+`sample_header_size` is **not** used as a stride. OpenMPT reads a fixed
+`sizeof(XMSample)` = 40 bytes per sample header and only asserts that the field is 0 or 40;
+libxmp likewise seeks by `40 * xih.samples`. Both do so because FastTracker 2 does: early
+Sk@le Tracker writes `0` (`IFULOVE.XM`) and `cybernostra weekend` writes `0x12`, which
+would cut the sample name off, and FastTracker 2 reads the full 40 bytes in both cases.
+Honouring the field would break exactly the files the two reference loaders added the
+workaround for. The field is parsed and exposed on `XmInstrumentHeader` (with 0 and
+anything above 263 normalised to 40) so a later task can use it as evidence; it does not
+move the cursor.
+
+### 8. Not a research point either: one corpus `*.xm` is not an XM
+
+`data/ice21_ambiguous.xm` is an **Ice Tracker** module — `Ice!` at offset 0 — that libxmp
+ships to test format disambiguation, and whose song title happens to begin
+`Extended Modu: Necromanc…`. It has an `.xm` extension and must *not* probe or load as an
+XM. `crates/starplayer-xm/tests/corpus.rs` names it in a `NOT_XM` list and asserts both
+`probe` and `load` refuse it, so the file is checked rather than merely skipped. This is
+why the corpus table below reports 140 modules loaded from 141 `*.xm` files rather than
+141.

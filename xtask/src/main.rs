@@ -121,13 +121,15 @@ const FUZZ_TARGETS: &[(&str, Option<&str>)] = &[
     ("mod_loader", Some("mod")),
     ("s3m_loader", Some("s3m")),
     ("mtm_loader", Some("mtm")),
+    ("xm_loader", Some("xm")),
     ("mod_structured", None),
     ("s3m_structured", None),
     ("mtm_structured", None),
+    ("xm_structured", None),
 ];
 
-/// Seconds each target runs in the per-commit smoke job. Six targets, so the job is a few
-/// minutes including the build — "minutes, not hours", as the task asks.
+/// Seconds each target runs in the per-commit smoke job. Eight targets, so the job is a
+/// few minutes including the build — "minutes, not hours", as the task asks.
 const FUZZ_SMOKE_SECONDS: u32 = 30;
 
 /// Seconds a `cargo xtask fuzz` run gives each target when `--seconds` is not supplied.
@@ -935,10 +937,13 @@ fn copy_seeds_into_corpus(source: &Path, origin: &str, format: &str, destination
 
 /// Which loader owns these bytes, by the same magic values the loaders' own probes read.
 ///
-/// xtask has no dependencies by design — including on the engine — so the three probes are
-/// restated here. They are four-byte comparisons; the risk of drift is real but small, and
-/// a seed that stops being recognised only means a slightly narrower corpus.
+/// xtask has no dependencies by design — including on the engine — so the four probes are
+/// restated here. They are short byte comparisons; the risk of drift is real but small,
+/// and a seed that stops being recognised only means a slightly narrower corpus.
 fn classify_module(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.get(..17) == Some(b"Extended Module: ") && bytes.get(37) == Some(&0x1A) {
+        return Some("xm");
+    }
     if bytes.get(0x2C..0x30) == Some(b"SCRM") {
         return Some("s3m");
     }

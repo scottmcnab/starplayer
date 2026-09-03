@@ -159,6 +159,29 @@ impl EffectNames {
         EffectNames { commands, subcommand_code: 0, subcommands: &[] }
     }
 
+    // ── XM (M5-F1) ──────────────────────────────────────────────────────────────────
+    //
+    // Its own block so the IT table (M6-G1) lands beside it without a merge conflict.
+
+    /// FastTracker 2's effect names and its `E` sub-command names.
+    ///
+    /// Codes are the byte an XM pattern cell stores: `0x0`..=`0xF` for `0`..`9` and
+    /// `A`..`F`, then `0x10`..=`0x21` for `G`..`X`. The names are the ones FastTracker 2's
+    /// own `xm.txt` gives, so `1` is "porta up" rather than "portamento up".
+    pub const XM: EffectNames = EffectNames {
+        commands: XM_COMMAND_NAMES,
+        subcommand_code: 0x0E,
+        subcommands: XM_SUBCOMMAND_NAMES,
+    };
+
+    /// FastTracker 2's **volume column**, keyed by the high nybble of the column byte.
+    ///
+    /// The volume column is a second, parallel effect column with an encoding of its own,
+    /// so it needs a table of its own: look a byte up as
+    /// `EffectNames::XM_VOLUME_COLUMN.name(byte >> 4, byte)`. A byte below `0x10` does
+    /// nothing and has no name.
+    pub const XM_VOLUME_COLUMN: EffectNames = EffectNames::flat(XM_VOLUME_COLUMN_NAMES);
+
     /// The English name for a command, or `None` if the table has no entry for it.
     ///
     /// A command equal to the table's sub-command code (S3M's `S`) is looked up by the
@@ -255,6 +278,92 @@ const MOD_SUBCOMMAND_NAMES: &[(u8, &str)] = &[
     (0xF, "invert loop"),
 ];
 
+// ── XM (M5-F1) ──────────────────────────────────────────────────────────────────────
+//
+// Its own block so the IT tables (M6-G1) land beside it without a merge conflict.
+
+/// The code an XM pattern cell stores for an effect letter: `0`..`9` and `A`..`F` are
+/// `0x0`..=`0xF`, and `G`..`Z` continue at `0x10`. Handy for a loader or a UI that has a
+/// letter and wants the code.
+pub const fn xm_command_code(letter: u8) -> u8 {
+    match letter {
+        b'0'..=b'9' => letter - b'0',
+        b'A'..=b'Z' => letter - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// XM command names, verbatim from FastTracker 2's `xm.txt` "Standard effects" table.
+///
+/// `E` is missing on purpose: it is the sub-command escape and is resolved through
+/// [`XM_SUBCOMMAND_NAMES`] instead.
+const XM_COMMAND_NAMES: &[(u8, &str)] = &[
+    (xm_command_code(b'0'), "arpeggio"),
+    (xm_command_code(b'1'), "porta up"),
+    (xm_command_code(b'2'), "porta down"),
+    (xm_command_code(b'3'), "tone porta"),
+    (xm_command_code(b'4'), "vibrato"),
+    (xm_command_code(b'5'), "tone porta & volume slide"),
+    (xm_command_code(b'6'), "vibrato & volume slide"),
+    (xm_command_code(b'7'), "tremolo"),
+    (xm_command_code(b'8'), "set panning"),
+    (xm_command_code(b'9'), "sample offset"),
+    (xm_command_code(b'A'), "volume slide"),
+    (xm_command_code(b'B'), "position jump"),
+    (xm_command_code(b'C'), "set volume"),
+    (xm_command_code(b'D'), "pattern break"),
+    (xm_command_code(b'F'), "set tempo/BPM"),
+    (xm_command_code(b'G'), "set global volume"),
+    (xm_command_code(b'H'), "global volume slide"),
+    (xm_command_code(b'K'), "key off"),
+    (xm_command_code(b'L'), "set envelope position"),
+    (xm_command_code(b'P'), "panning slide"),
+    (xm_command_code(b'R'), "multi retrig note"),
+    (xm_command_code(b'T'), "tremor"),
+    (xm_command_code(b'X'), "extra fine porta"),
+];
+
+/// XM `Ex` sub-command names, keyed by the high nybble of the parameter.
+///
+/// `E0` and `E8` are absent because `xm.txt` does not list them: FastTracker 2 implements
+/// neither.
+const XM_SUBCOMMAND_NAMES: &[(u8, &str)] = &[
+    (0x1, "fine porta up"),
+    (0x2, "fine porta down"),
+    (0x3, "set gliss control"),
+    (0x4, "set vibrato control"),
+    (0x5, "set finetune"),
+    (0x6, "set loop begin/loop"),
+    (0x7, "set tremolo control"),
+    (0x9, "retrig note"),
+    (0xA, "fine volume slide up"),
+    (0xB, "fine volume slide down"),
+    (0xC, "note cut"),
+    (0xD, "note delay"),
+    (0xE, "pattern delay"),
+];
+
+/// XM volume-column names, keyed by the **high nybble** of the column byte. `$10`..`$50`
+/// all set a volume, so five entries share one name; `$00`..`$0F` do nothing and have
+/// none.
+const XM_VOLUME_COLUMN_NAMES: &[(u8, &str)] = &[
+    (0x1, "set volume"),
+    (0x2, "set volume"),
+    (0x3, "set volume"),
+    (0x4, "set volume"),
+    (0x5, "set volume"),
+    (0x6, "volume slide down"),
+    (0x7, "volume slide up"),
+    (0x8, "fine volume slide down"),
+    (0x9, "fine volume slide up"),
+    (0xA, "set vibrato speed"),
+    (0xB, "vibrato"),
+    (0xC, "set panning"),
+    (0xD, "panning slide left"),
+    (0xE, "panning slide right"),
+    (0xF, "tone portamento"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +402,46 @@ mod tests {
         assert_eq!(EffectNames::MOD.name(0xD, 0x31), Some("pattern break"));
         assert_eq!(EffectNames::MOD.name(0xE, 0xD3), Some("note delay"));
         assert_eq!(EffectNames::MOD.name(0xE, 0xFF), Some("invert loop"));
+    }
+
+    #[test]
+    fn xm_command_codes_follow_the_bytes_the_pattern_format_stores() {
+        assert_eq!(xm_command_code(b'0'), 0x00);
+        assert_eq!(xm_command_code(b'9'), 0x09);
+        assert_eq!(xm_command_code(b'A'), 0x0A);
+        assert_eq!(xm_command_code(b'F'), 0x0F);
+        assert_eq!(xm_command_code(b'G'), 0x10);
+        assert_eq!(xm_command_code(b'X'), 0x21);
+    }
+
+    #[test]
+    fn xm_commands_and_extended_commands_have_fast_tracker_twos_own_names() {
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'0'), 0x37), Some("arpeggio"));
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'4'), 0x42), Some("vibrato"));
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'F'), 0x7D), Some("set tempo/BPM"));
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'G'), 0x40), Some("set global volume"));
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'X'), 0x12), Some("extra fine porta"));
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'E'), 0xD3), Some("note delay"));
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'E'), 0x93), Some("retrig note"));
+    }
+
+    #[test]
+    fn an_xm_command_fast_tracker_two_does_not_implement_has_no_name() {
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'I'), 0), None, "XM has no I command");
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'E'), 0x00), None, "xm.txt does not list E0");
+        assert_eq!(EffectNames::XM.name(xm_command_code(b'E'), 0x80), None, "nor E8");
+    }
+
+    #[test]
+    fn the_xm_volume_column_names_resolve_by_the_high_nybble() {
+        let name = |byte: u8| EffectNames::XM_VOLUME_COLUMN.name(byte >> 4, byte);
+        assert_eq!(name(0x00), None, "an empty volume column");
+        assert_eq!(name(0x0F), None, "and everything below $10 does nothing");
+        assert_eq!(name(0x10), Some("set volume"));
+        assert_eq!(name(0x50), Some("set volume"));
+        assert_eq!(name(0x6A), Some("volume slide down"));
+        assert_eq!(name(0xB4), Some("vibrato"));
+        assert_eq!(name(0xFF), Some("tone portamento"));
     }
 
     #[test]

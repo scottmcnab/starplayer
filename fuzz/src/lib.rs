@@ -1,4 +1,4 @@
-//! Shared support for the six loader fuzz targets: the memory cap, the structured
+//! Shared support for the eight loader fuzz targets: the memory cap, the structured
 //! mutation program, and the post-load walk that proves a produced [`Module`] is
 //! self-consistent.
 //!
@@ -167,6 +167,27 @@ pub fn walk_s3m_cells(module: &Module) {
             for channel in 0..module.header().channel_count {
                 if let Some(cell) = view.cell(row, channel) {
                     let _ = cell.display();
+                }
+            }
+        }
+    }
+}
+
+/// Walk every XM cell of every pattern through the format's own view.
+///
+/// XM patterns do **not** all have the same row count — the format allows 1..=256 and the
+/// loader honours what each pattern's header says — so the row bound comes from the
+/// pattern index rather than from a constant, unlike the three older formats above.
+pub fn walk_xm_cells(module: &Module) {
+    for index in 0..module.patterns().len() {
+        let id = starplayer_model::PatternId(index as u16);
+        let Some(pattern) = module.pattern(id) else { continue };
+        let Some(view) = starplayer_xm::PatternView::new(module, id) else { continue };
+        for row in 0..pattern.rows() {
+            for channel in 0..module.header().channel_count {
+                if let Some(cell) = view.cell(row, channel) {
+                    let _ = cell.display();
+                    let _ = cell.volume_effect_name();
                 }
             }
         }

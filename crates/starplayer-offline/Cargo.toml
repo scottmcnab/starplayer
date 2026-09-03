@@ -24,6 +24,12 @@ trace = ["starplayer/trace"]
 # once without it and once with it.
 telemetry = ["starplayer/telemetry"]
 
+# The XM loader by path, for `tests/fuzz_seeds.rs` only. The facade's `xm` arms are task
+# F4's, so until they land there is no `starplayer::xm` to replay the XM seeds through;
+# a dev-dependency reaches the loader without touching the facade.
+[dev-dependencies]
+starplayer-xm = { workspace = true, features = ["std"] }
+
 [[bin]]
 name = "starplayer-trace"
 required-features = ["trace"]
