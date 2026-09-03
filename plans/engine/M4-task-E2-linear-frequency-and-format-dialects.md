@@ -116,6 +116,132 @@ unchanged: no `QuirkSet` field was added.
 
 Report the exact commands run and their results. **Do not commit** — the reviewer commits.
 
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question.
+
+### 1. Const-evaluated or literal? — **`const fn`**, for the linear-frequency table
+
+FT2-clone's `logTab` is itself not a hand-transcribed literal: `calcMiscReplayerVars`
+(`src/ft2_replayer.c` line 2909) computes it at the real player's own startup with
+`logTab[i] = (uint32_t)round(16777216.0 * exp2(i * (1.0 / 768.0)))`. So "match FT2's
+table" and "match the formula, `f64::exp2`-checked" are the same requirement, not two —
+there is no separate literal FT2 ships that a `const fn` could disagree with at a
+rounding boundary.
+
+A fixed-point Taylor series for `exp` — `2^x = exp(x·ln2)`, evaluated as `Σ zⁿ⁄n!` in
+Q0.60 `i128` arithmetic, the same widening idiom `starplayer-mixer::gain::sin_q30` uses
+for the pan table's sine, just wider — was checked by brute-force search over the term
+count in a throwaway script before being written into `starplayer-core`: eight terms
+leaves 308 of the 768 entries wrong, the count falls fast, and by twelve terms every one
+of the 768 entries matches `round(16777216 · 2^(i/768))` exactly, computed independently
+in arbitrary-precision decimal. `EXP2_SERIES_TERMS` is set to fourteen, two terms of
+margin, since the whole computation happens once, in the const evaluator, and costs
+nothing at run time either way. `exp2_fraction_q60` in `tables.rs` is that series;
+`linear_frequency_table_matches_ft2s_logtab_formula` is the required
+`#[cfg(test)]`/`f64::exp2` check, over all 768 entries, and it passes. No literal table
+was needed for [`LINEAR_FREQUENCY_TABLE`].
+
+### 2. Are OpenMPT's Q16.16 slide tables derivable from the Q8.24 table? — **no; all four are literals**
+
+Fetched `soundlib/Tables.cpp` from `OpenMPT/openmpt` (GitHub, `master`) directly, rather
+than guessing at the values. Two findings, both against the actual table:
+
+* **The derivation the research point names does not work.** `table[4n] >> 8` (truncating)
+  disagrees with `LinearSlideUpTable` at 125 of its 256 entries; even the more generous
+  *rounding* shift `(table[4n] + 128) >> 8` still disagrees at one (`n = 107`: 96437
+  against OpenMPT's 96436). An independent per-entry Taylor-series evaluation (the same
+  `exp2_fraction_q60`, called with denominator 192 instead of 768) reproduces
+  `LinearSlideUpTable`, `LinearSlideDownTable` and `FineLinearSlideUpTable` exactly — so
+  the shift-derivation's mismatch is double rounding (Q8.24's own rounding, then the
+  shift's), not a disagreement about the underlying value — but that still is not the
+  same thing as deriving the Q16.16 tables *from* the already-rounded Q8.24 table.
+* **`FineLinearSlideDownTable` cannot be derived from the formula at all, by any method.**
+  OpenMPT's own source comment above the table reads: "Note that there are a few errors
+  in this table (typos?), but well, this table comes straight from Impulse Tracker's
+  source" — and lists three: entry 0 is `65535` where `round(65536·2^0)` is `65536`
+  (OpenMPT's comment guesses this is deliberate so the value fits 16 bits, and the entry
+  is never read since a zero-step slide changes nothing); entry 11 is `64888` where the
+  formula gives `64889`; entry 15 is `64645` where the formula gives `64655`. These are
+  not OpenMPT's coding defects to fix — accuracy policy §0 already names "the format
+  specifications and OpenMPT's documented compatibility behaviour" as the XM/IT
+  reference, and this table *is* that behaviour, verbatim from real Impulse Tracker.
+  Reproducing the typos is therefore the canonical choice, not a deviation from it, and
+  no `const fn` — a Taylor series or otherwise — can produce a wrong answer on purpose.
+
+So the research point's own instruction applies directly: ship OpenMPT's literals as
+their own tables. All **four** are literal `[u32; N]` arrays transcribed from
+`Tables.cpp` (`LinearSlideUpTable` lines 540–579, `LinearSlideDownTable` lines 583–612,
+`FineLinearSlideUpTable` lines 516–521, `FineLinearSlideDownTable` lines 524–534) — not
+three computed and one pasted — so all four are sourced and auditable the same way, and
+`linear_slide_tables_match_the_formula_except_where_it_documents_a_typo` checks every
+entry of all four against `f64::exp2`, pinning the three typo'd entries by value so a
+future edit cannot silently "correct" them back to the formula.
+
+### 3. XM dialect evidence — recorded from `Load_xm.cpp`'s `madeWith` classification
+
+Fetched `soundlib/Load_xm.cpp` from `OpenMPT/openmpt` (GitHub, `master`). The tracker
+names/markers it distinguishes for XM, and what StarPlayer's four new variants map to:
+
+* **`FastTracker v2.00   `** (20 bytes, space-padded) with header size 276 — genuine FT2
+  or a clone claiming to be one. OpenMPT further splits this by format version
+  (`< 0x0104` is "FT2 generic, confirmed") and by null-padding patterns in the song name
+  into "FT2 generic" versus "FT2 clone" versus PlayerPRO (lines 619–644) — PlayerPRO in
+  particular disguises itself this way rather than writing its own tracker name.
+  StarPlayer's `FastTracker2` keeps all of these as one variant; the behaviours OpenMPT
+  keys off the split are FT2-specific volume-ramping timing (`kFT2VolumeRamping`,
+  version-gated) and mix-level compatibility (`MixLevels::CompatibleFT2`), neither of
+  which StarPlayer models yet.
+* **`FastTracker v 2.00  `** (note the extra mid-string space) — ModPlug Tracker 1.x
+  before it wrote its own name, disguising itself as FT2 with a deliberate typo
+  (line 645, `verOldModPlug`). StarPlayer's `ModPlugXm`.
+* **`MilkyTracker `** prefix (line 659) — `MilkyTracker`. Versions before 0.90.87 leave
+  the rest of the field blank; from 0.90.87 on it also matches FT2's panning scheme,
+  which is the playback behaviour the split exists to key off (not yet modelled).
+* **`OpenMPT `** prefix (line 656) — `OpenMptXm`. Also covers ModPlug Tracker 1.17+,
+  which shares OpenMPT's save code from that version on; OpenMPT keys its own mix-level
+  choice (`Compatible` vs `CompatibleFT2`) off the embedded version number here.
+* Other names it recognises but StarPlayer does not carry a variant for yet: `NitroTracker`
+  (song-name based, line 242), `Fasttracker II clone` (an explicit FT2-clone-confirmed
+  marker, line 667), `MadTracker 2.0` (line 671, further split registered/unregistered),
+  `Skale Tracker` / `Sk@le Tracker` (line 682), `*Converted …-File*` (Digitrakker
+  conversions, line 687). All fall to `FormatDialect::Unknown` (canonical) until an XM
+  corpus case asks for one of them by name.
+* Behaviours OpenMPT gates on `madeWith`, beyond the mix-level/ramping ones above:
+  `kFT2PortaNoNote`, `kFT2Arpeggio` and `kFT2ST3OffsetOutOfRange` are reset (disabled) for
+  MilkyTracker even though it claims FT2 compatibility, and `verEmptyOrders` controls
+  whether an empty order list is accepted (FT2 itself just plays pattern 0) — none of
+  these are `QuirkSet` fields today, per the "no new field without a corpus case" rule;
+  this list is what F5 should check the pinned XM corpus against first.
+
+### IT dialect detection: a correction to the task's own text
+
+Deliverable 2 states `ImpulseTracker — Cwt/v in 0x1000..=0x1FFF from IT itself`. Fetching
+`soundlib/Load_it.cpp` (`OpenMPT/openmpt`, `master`) for the `OpenMptIt` / `SchismTracker`
+/ `ModPlugIt` detection rules the same deliverable asks for turned up that this range is
+wrong — `Load_it.cpp`'s own classifier switches on `cwtv >> 12` (line 1221) and case `1`,
+covering exactly `0x1000..=0x1FFF`, is **Schism Tracker** (`GetSchismTrackerVersion`,
+lines 365–392); case `0`, `0x0000..=0x0FFF`, is genuine Impulse Tracker
+(`GetImpulseTrackerVersion`, lines 344–361) and a handful of small clones OpenMPT
+disambiguates by exact `cwtv`/`cmwt`/`reserved` combinations within that same nibble. The
+two variants' ranges in the task text are swapped relative to the actual source. Since
+deliverable 2 explicitly defers three of the four IT variants to "as OpenMPT's
+`Load_it.cpp` classifies them," the corrected, source-verified mapping was implemented
+for all four rather than the task text's literal (and here incorrect) range:
+
+* `ImpulseTracker` — `Cwt/v` high nibble `0` (`0x0000..=0x0FFF`).
+* `SchismTracker` — `Cwt/v` high nibble `1` (`0x1000..=0x1FFF`).
+* `OpenMptIt` — `Cwt/v` `0x5000..=0x5FFF` with reserved field `OMPT`, or the `0x0888`
+  markers OpenMPT 1.17 wrote before that scheme (lines 469–520).
+* `ModPlugIt` — the `0x5000` nibble *without* the `OMPT` marker, or one of several
+  specific early `cwtv`/`cmwt`/`reserved` combinations for ModPlug 1.09–1.16
+  (lines 503–520, 727–745).
+
+Every doc comment on the eight new `FormatDialect` variants cites the `Load_xm.cpp` /
+`Load_it.cpp` line numbers this research was read from, so F1/G1 can re-check them
+directly against the source rather than against this summary.
+
 ## Out of scope
 
 Any consumer of the table. XM's Amiga-mode finetune period table (it belongs in

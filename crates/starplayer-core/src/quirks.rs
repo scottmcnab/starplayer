@@ -463,6 +463,17 @@ impl QuirkSet {
 /// Stored in the module header by the loader and never revised afterwards. It is the
 /// *evidence*, not the behaviour: [`FormatDialect::quirks`] is the mapping, and a host
 /// that disagrees supplies a [`QuirkSelection::Override`] instead of editing this.
+///
+/// # The XM and IT variants carry no quirks yet
+///
+/// Every variant from [`FormatDialect::FastTracker2`] on maps to
+/// [`QuirkSet::profile_default`], the same as [`FormatDialect::Unknown`] — task E2 lands
+/// the enum variants and their detection evidence ahead of the XM (M5) and IT (M6)
+/// loaders that will produce them, so that both crates share one enum rather than each
+/// growing its own and forcing a merge conflict later. No `QuirkSet` field exists for any
+/// XM or IT behaviour yet: task C5 requires a corpus case to justify one, and no XM or IT
+/// corpus case has run. A field arrives, on this dialect, with the corpus case that names
+/// it — F5 and G4/G6 are where that happens.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FormatDialect {
     /// The file header said nothing this loader recognises. Canonical behaviour.
@@ -499,6 +510,43 @@ pub enum FormatDialect {
     ModPlug116,
     /// Imago Orpheus — `Cwt/v` high nibble 2.
     ImagoOrpheus,
+    /// FastTracker II — XM tracker name `FastTracker v2.00` (20 bytes, space-padded) with
+    /// header size 276 and format version `0x0104` or later (OpenMPT `Load_xm.cpp` lines
+    /// 619–644). OpenMPT further splits this tag into "FT2 generic" versus "FT2 clone" /
+    /// PlayerPRO by null-padding heuristics in the song name; StarPlayer keeps one variant
+    /// for all of them until an XM corpus case needs the split.
+    FastTracker2,
+    /// MilkyTracker — XM tracker name prefix `MilkyTracker ` (`Load_xm.cpp` line 659).
+    MilkyTracker,
+    /// ModPlug Tracker 1.x, from before it started writing `OpenMPT ` — it disguises
+    /// itself as `FastTracker v 2.00  ` (note the extra mid-string space, absent from
+    /// [`FormatDialect::FastTracker2`]'s tag), `Load_xm.cpp` line 645.
+    ModPlugXm,
+    /// OpenMPT, and ModPlug Tracker 1.17 and later, which share OpenMPT's save code — XM
+    /// tracker name prefix `OpenMPT ` (`Load_xm.cpp` line 656).
+    OpenMptXm,
+    /// Impulse Tracker itself — IT `Cwt/v` high nibble `0` (`0x0000..=0x0FFF`),
+    /// reproducing `GetImpulseTrackerVersion` and the `cwtv >> 12 == 0` case of
+    /// `Load_it.cpp`'s classifier (around lines 1219–1300). The same nibble also covers a
+    /// handful of small clones and converters (BeRoTracker, ChibiTracker, CheeseTracker,
+    /// ModPlug Tracker's earliest alpha/beta releases, from before it adopted the `0x5000`
+    /// scheme below) that OpenMPT disambiguates by exact `cwtv` / `cmwt` / `reserved`
+    /// combinations; StarPlayer keeps them all as this one variant until an IT corpus case
+    /// needs finer detection.
+    ImpulseTracker,
+    /// OpenMPT — IT `Cwt/v` `0x5000..=0x5FFF` with the reserved field `OMPT`, or the
+    /// `0x0888` `cwtv`/`cmwt` markers OpenMPT 1.17 wrote before it adopted that scheme
+    /// (`Load_it.cpp` lines around 469–520).
+    OpenMptIt,
+    /// Schism Tracker — IT `Cwt/v` high nibble `1` (`0x1000..=0x1FFF`), reproducing
+    /// `GetSchismTrackerVersion`'s date-epoch decoding (`Load_it.cpp` lines around
+    /// 365–392 and 1300–1334).
+    SchismTracker,
+    /// ModPlug Tracker — the `0x5000` `Cwt/v` nibble without the `OMPT` reserved marker (a
+    /// ModPlug-compatibility export), or one of the specific early `cwtv` / `cmwt` /
+    /// `reserved` combinations `Load_it.cpp` hand-recognises for ModPlug Tracker
+    /// 1.09–1.16 (lines around 503–520 and 727–745).
+    ModPlugIt,
 }
 
 impl FormatDialect {
@@ -515,6 +563,14 @@ impl FormatDialect {
             FormatDialect::ScreamTracker301 => QuirkSet::scream_tracker_301(),
             FormatDialect::ModPlug116 => QuirkSet::modplug_116(),
             FormatDialect::ImagoOrpheus => QuirkSet::imago_orpheus(),
+            FormatDialect::FastTracker2
+            | FormatDialect::MilkyTracker
+            | FormatDialect::ModPlugXm
+            | FormatDialect::OpenMptXm
+            | FormatDialect::ImpulseTracker
+            | FormatDialect::OpenMptIt
+            | FormatDialect::SchismTracker
+            | FormatDialect::ModPlugIt => QuirkSet::profile_default(),
         }
     }
 }
@@ -606,6 +662,22 @@ mod tests {
         assert_eq!(FormatDialect::ScreamTracker301.quirks().s3m_pattern_loop, S3mLoopDialect::ScreamTracker301);
         assert_eq!(FormatDialect::ModPlug116.quirks().s3m_pattern_loop, S3mLoopDialect::ModPlug116);
         assert_eq!(FormatDialect::ImagoOrpheus.quirks().s3m_pattern_loop, S3mLoopDialect::ImagoOrpheus);
+    }
+
+    /// Task E2: every XM/IT dialect variant is evidence only, with no quirk of its own
+    /// yet — each maps to exactly the same [`QuirkSet`] as [`FormatDialect::Unknown`],
+    /// because no XM or IT corpus case has run to justify a field (task C5's rule).
+    #[test]
+    fn every_xm_and_it_dialect_maps_to_the_profile_default_for_now() {
+        let unknown = FormatDialect::Unknown.quirks();
+        assert_eq!(FormatDialect::FastTracker2.quirks(), unknown);
+        assert_eq!(FormatDialect::MilkyTracker.quirks(), unknown);
+        assert_eq!(FormatDialect::ModPlugXm.quirks(), unknown);
+        assert_eq!(FormatDialect::OpenMptXm.quirks(), unknown);
+        assert_eq!(FormatDialect::ImpulseTracker.quirks(), unknown);
+        assert_eq!(FormatDialect::OpenMptIt.quirks(), unknown);
+        assert_eq!(FormatDialect::SchismTracker.quirks(), unknown);
+        assert_eq!(FormatDialect::ModPlugIt.quirks(), unknown);
     }
 
     /// Field for field against libxmp `src/common.h:353-443`.

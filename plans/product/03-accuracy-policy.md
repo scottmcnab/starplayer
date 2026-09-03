@@ -120,6 +120,11 @@ Every other `QuirkSet` field is either a §1 entry above (`mod_break_parameter`,
 `protracker_sample_swap_at_boundary` is D12, `protracker_tremolo_ramp_from_vibrato_phase`
 is D20) or this section's tempo model.
 
+XM and IT have their own dialects too — `FormatDialect::FastTracker2`, `MilkyTracker`,
+`ModPlugXm`, `OpenMptXm`, `ImpulseTracker`, `OpenMptIt`, `SchismTracker` and `ModPlugIt`
+(task E2) — but every one of them maps to `QuirkSet::profile_default()`, the same as
+`Unknown`, pending the M5 (XM) and M6 (IT) corpus evidence that would justify a field.
+
 ## 3. Documented deviations from the reference implementations
 
 Entries D1–D9 and D21–D32 are coding defects in the original assembly and are implemented
