@@ -26,7 +26,9 @@ thumb — continuous drag events are never queued, since the command ring holds 
 entries and is drained once per render quantum. The two readouts are `m:ss`, `h:mm:ss`
 once the song runs past an hour, and `--:--` while the song's length is not yet known.
 Elapsed is the engine's own reported position, not compensated for the `AudioContext`'s
-`outputLatency`, so it can read a little ahead of what is actually heard.
+`outputLatency`, so it can read a little ahead of what is actually heard. Clicking either
+readout switches the left one between elapsed and the time remaining as `-m:ss`, as VLC
+does; the choice is kept in `localStorage`.
 
 **Repeat**, checked by default, sends `OPCODE_AT_END`: checked wraps the song at its loop
 point and the slider wraps with it; unchecked fades the song out over `SONG_FADE_SECONDS`

@@ -579,6 +579,14 @@ async function run(executable, mode) {
         assert.ok(effectsSeen.size > 0, 'at least one effect was spelled out in English');
         assert.notEqual(playing.elapsed, started.elapsed, 'the elapsed readout advanced while playing');
         assert.ok(playing.progressValue > 0, 'the progress slider advanced with playback');
+        // ── clicking a time readout toggles elapsed ↔ remaining, as in VLC ─────────
+        await page.evaluate("document.getElementById('elapsed').click(); return true;");
+        const remaining = await page.evaluate(READ_STATE);
+        assert.ok(remaining.elapsed.startsWith('-'), `the readout shows remaining time after a click: ${remaining.elapsed}`);
+        assert.equal(await page.evaluate("return localStorage.getItem('starplayer.time-display.v1');"), 'remaining', 'the choice is remembered');
+        await page.evaluate("document.getElementById('duration').click(); return true;");
+        const elapsedAgain = await page.evaluate(READ_STATE);
+        assert.ok(!elapsedAgain.elapsed.startsWith('-'), `a second click on either readout goes back to elapsed: ${elapsedAgain.elapsed}`);
         report.playedSeconds = seconds;
         report.rowChanges = rowChanges;
         report.distinctRows = rowsSeen.size;
