@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M3 ([master plan](M3-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03 |
 | Depends on | M2 complete |
 | Blocks | Nothing hard; F4/G5 use it as the second XM/IT oracle |
 | Parallel with | D3, D6, F1, G1 |
