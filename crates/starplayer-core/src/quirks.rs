@@ -195,6 +195,57 @@ impl ItLoopDialect {
     }
 }
 
+/// Which tracker's `E6x` pattern-loop and break/jump interaction an XM is played with
+/// (accuracy policy §2, *Tracker dialects*).
+///
+/// libxmp keeps XM on `FLOW_MODE_GENERIC` and narrows it in exactly two places
+/// (`src/loaders/xm_load.c:889-892` and `:1004-1012`): Skale Tracker gains
+/// `FLOW_JUMP_NO_ROW_SET`, and a file it recognises as ModPlug Tracker 1.16 gets
+/// `FLOW_MODE_MPT_116` whole.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum XmLoopDialect {
+    /// FastTracker 2 and every clone that reproduces its replayer. The default.
+    ///
+    /// `patternLoop` keeps a target row and a counter per channel and neither is cleared
+    /// by a position change, which is libxmp's `FLOW_MODE_GENERIC`. The one addition is
+    /// [`PatternFlow::shared_break`]: FastTracker 2 spells the loop jump, the position
+    /// jump and the pattern break all as writes to one `song.pBreakPos`, so an `E6x` on a
+    /// channel to the *right* of a `Bxx` or `Dxx` overwrites the row that jump chose with
+    /// its own loop target while the jump itself survives in `song.posJumpFlag`. That is
+    /// OpenMPT's `kFT2PatternLoopWithJumps`.
+    #[default]
+    FastTracker2,
+    /// Every other tracker that writes an XM — libxmp's `FLOW_MODE_GENERIC`, which is
+    /// FastTracker 2's rules without the shared break position. MadTracker 2, rst's
+    /// SoundTracker and anything whose tracker name StarPlayer does not recognise land
+    /// here, because `song.pBreakPos` is FastTracker 2's own variable and a tracker that
+    /// does not reproduce its replayer does not reproduce its aliasing either.
+    Generic,
+    /// ModPlug Tracker 1.16 and early OpenMPT — libxmp's `FLOW_MODE_MPT_116`: a channel
+    /// only starts a loop while no other channel is looping, a loop jump both blocks later
+    /// and cancels earlier breaks and jumps on its row, and a `Bxx` keeps the destination
+    /// row a `Dxx` on an earlier channel chose.
+    ModPlug116,
+    /// Skale Tracker — libxmp adds `FLOW_JUMP_NO_ROW_SET` alone, so `Dxx` `Byy` works in
+    /// either order (`data/pattern_jump_skale_break.xm`).
+    SkaleTracker,
+}
+
+impl XmLoopDialect {
+    /// The flow rules this dialect implies.
+    pub const fn flow(self) -> PatternFlow {
+        match self {
+            XmLoopDialect::FastTracker2 => PatternFlow { shared_break: true, ..PatternFlow::generic() },
+            XmLoopDialect::Generic => PatternFlow::generic(),
+            XmLoopDialect::ModPlug116 => {
+                let flow = PatternFlow { one_at_a_time: true, jump_keeps_break_row: true, ..PatternFlow::generic() };
+                flow.with_no_break_jump()
+            }
+            XmLoopDialect::SkaleTracker => PatternFlow { jump_keeps_break_row: true, ..PatternFlow::generic() },
+        }
+    }
+}
+
 /// The pattern-loop and break/jump rules one dialect implies.
 ///
 /// Derived data, not a [`QuirkSet`] field: [`S3mLoopDialect::flow`] and
@@ -374,6 +425,55 @@ pub struct QuirkSet {
     /// Flips `libxmp-it-pattern-loop-it100`, `-it104` and `-it200-breakjump` on the
     /// pinned corpus; `-it210` is the default.
     pub it_pattern_loop: ItLoopDialect,
+    /// Whose `E6x` pattern-loop semantics an XM is played with (accuracy policy **§2**,
+    /// *Tracker dialects*).
+    ///
+    /// Flips `libxmp-xm-pattern-jump-mpt-break`, `libxmp-xm-pattern-jump-skale-break`,
+    /// `libxmp-xm-pattern-loop-mpt` and `-mpt-breakjump` on the pinned corpus.
+    pub xm_pattern_loop: XmLoopDialect,
+    /// Whether a cell carrying both a volume-column `Mx` and an effect-column `3xx` runs
+    /// FastTracker 2's double tone portamento (accuracy policy **§1**, *XM `Mx` + `3xx`*).
+    ///
+    /// On, `3xx`'s own parameter is discarded and the `Mx` rate is applied **twice** in a
+    /// tick — FastTracker 2's `getNewNote` never latches the effect column's parameter
+    /// once the volume column has claimed the row, and libxmp reaches the same place by
+    /// zeroing `ev.fxp` so that `EFFECT_MEMORY_SETONLY` refills it from the shared
+    /// portamento memory (`src/read_event.c:522-529`). Off, each column contributes its
+    /// own rate and the sum is applied once, which is what libxmp plays for ModPlug
+    /// Tracker, MadTracker 2 and rst's SoundTracker.
+    ///
+    /// Flips `libxmp-xm-mpt-xm-double-toneporta`, `-mt2-xm-double-toneporta` and
+    /// `libxmp-xm-rstst-double-toneporta` on the pinned corpus.
+    pub xm_double_portamento_doubles_volume_column_rate: bool,
+    /// Whether a `9xx` past the end of the sample stops the channel (accuracy policy
+    /// **§1**, *XM `9xx` past the sample end*; OpenMPT `kFT2ST3OffsetOutOfRange`).
+    ///
+    /// On for FastTracker 2. Skale Tracker does not emulate it — Armada Tanks' music
+    /// breaks if it is applied — so libxmp turns it off with the rest of `QUIRK_FT2BUGS`
+    /// (`src/read_event.c:714-726`) and OpenMPT resets `kFT2ST3OffsetOutOfRange` by name
+    /// (`Load_xm.cpp:682-687`).
+    ///
+    /// Flips `openmpt-xm-3xx-no-old-samp-noft` on the pinned corpus.
+    pub xm_offset_past_sample_end_stops_channel: bool,
+    /// Whether an `E6x` loop jump leaves its target row in the shared break position, so
+    /// that the **next** pattern to end normally starts on that row (accuracy policy
+    /// **§1**, *XM `E6x` restart*; OpenMPT `kFT2LoopE60Restart`).
+    ///
+    /// FastTracker 2 spells the pattern loop, the position jump and the pattern break as
+    /// writes to one `song.pBreakPos`; `patternLoop` writes the loop target into it and
+    /// `getNextPos` clears it only in the branch a position change takes, so the target
+    /// outlives the pattern it was set in (`ft2_replayer.c` `patternLoop` and `getNextPos`;
+    /// OpenMPT `Snd_fx.cpp:6351` and `Sndmix.cpp:805-817`). libxmp reaches almost the same
+    /// place from the other end, writing `f->jumpline = row` on the `E60` that *sets* the
+    /// target (`src/flow.c:66-70`).
+    ///
+    /// The two pinned fixtures that exercise it, `openmpt/xm/PatLoop-Break.xm` and
+    /// `PatLoop-Weird.xm`, are blocked behind a different gap — see
+    /// `conformance/known-failures.md` `F2-XM-009` — so this field is observed by
+    /// `starplayer-xm`'s own tests rather than by the corpus. It is here rather than
+    /// unconditional because it is one of the three `QUIRK_FT2BUGS` behaviours the same
+    /// dialect detection turns off together, and the other two each flip a corpus case.
+    pub xm_loop_target_becomes_next_break_row: bool,
     /// Which Paula clock a MOD's Amiga periods are divided by (accuracy policy **D14**).
     ///
     /// No corpus case turns on it — every affected fixture is a PAL four-channel `M.K.`
@@ -427,6 +527,10 @@ impl QuirkSet {
             s3m_pattern_loop: S3mLoopDialect::ScreamTracker321,
             mod_pattern_loop: ModLoopDialect::ProTracker,
             it_pattern_loop: ItLoopDialect::ImpulseTracker210,
+            xm_pattern_loop: XmLoopDialect::FastTracker2,
+            xm_double_portamento_doubles_volume_column_rate: true,
+            xm_offset_past_sample_end_stops_channel: true,
+            xm_loop_target_becomes_next_break_row: true,
             mod_paula_clock: PaulaClock::Pal,
             mod_break_parameter: BreakParameter::BinaryCodedDecimal,
             mod_timing: ModTiming::Cia,
@@ -513,6 +617,37 @@ impl QuirkSet {
     /// Imago Orpheus (`Cwt/v` high nibble 2).
     pub const fn imago_orpheus() -> QuirkSet {
         QuirkSet { s3m_pattern_loop: S3mLoopDialect::ImagoOrpheus, ..QuirkSet::profile_default() }
+    }
+
+    /// FastTracker 2 — the XM baseline, and what every clone that reproduces its replayer
+    /// gets. Every XM quirk field is on, which is what [`QuirkSet::canonical`] already
+    /// says, so this exists to be named rather than to change anything.
+    pub const fn fast_tracker_2() -> QuirkSet {
+        QuirkSet { xm_pattern_loop: XmLoopDialect::FastTracker2, ..QuirkSet::profile_default() }
+    }
+
+    /// An XM whose tracker name is not FastTracker 2, one of its bug-compatible clones or
+    /// OpenMPT — libxmp's `QUIRK_FT2BUGS` off (`src/loaders/xm_load.c:855-885`).
+    pub const fn other_xm_tracker() -> QuirkSet {
+        QuirkSet {
+            xm_pattern_loop: XmLoopDialect::Generic,
+            xm_double_portamento_doubles_volume_column_rate: false,
+            xm_offset_past_sample_end_stops_channel: false,
+            xm_loop_target_becomes_next_break_row: false,
+            ..QuirkSet::profile_default()
+        }
+    }
+
+    /// ModPlug Tracker 1.0 to 1.16 writing an XM, whether it signed itself
+    /// `FastTracker v 2.00  ` or disguised itself as FastTracker 2 and left its own
+    /// chunks behind.
+    pub const fn modplug_xm() -> QuirkSet {
+        QuirkSet { xm_pattern_loop: XmLoopDialect::ModPlug116, ..QuirkSet::other_xm_tracker() }
+    }
+
+    /// Skale Tracker / `Sk@le Tracker`.
+    pub const fn skale_tracker() -> QuirkSet {
+        QuirkSet { xm_pattern_loop: XmLoopDialect::SkaleTracker, ..QuirkSet::other_xm_tracker() }
     }
 
     /// Impulse Tracker 2.10 and later — the IT baseline, and what every IT clone writes.
@@ -611,6 +746,22 @@ pub enum FormatDialect {
     /// OpenMPT, and ModPlug Tracker 1.17 and later, which share OpenMPT's save code — XM
     /// tracker name prefix `OpenMPT ` (`Load_xm.cpp` line 656).
     OpenMptXm,
+    /// Skale Tracker — XM tracker name `Skale Tracker` or `Sk@le Tracker`, exactly
+    /// (libxmp `src/loaders/xm_load.c:889-892`, OpenMPT `Load_xm.cpp:682-687`). Split out
+    /// from [`FormatDialect::UnknownXm`] because `Dxx` `Byy` works in either order for it,
+    /// which is `data/pattern_jump_skale_break.xm`.
+    SkaleTracker,
+    /// An XM whose tracker name is none of the above — MadTracker 2, rst's SoundTracker,
+    /// Digitrakker, a `MED2XM` conversion, or a name StarPlayer has never seen. libxmp's
+    /// `QUIRK_FT2BUGS` is off for every one of them, so none of FastTracker 2's replay
+    /// bugs applies (`data/mt2_xm_double_toneporta.xm`,
+    /// `data/rstst_double_toneporta.xm`, `openmpt/xm/3xx-no-old-samp-noft.xm`).
+    ///
+    /// OpenMPT splits this finer — MadTracker 2 keeps every FastTracker 2 behaviour but
+    /// `kFT2PortaNoNote` and `kFT2Arpeggio`, Skale Tracker keeps every one but
+    /// `kFT2ST3OffsetOutOfRange` and `kFT2Arpeggio` — and a corpus case that turns on one
+    /// of those would justify its own variant. None does yet.
+    UnknownXm,
     /// Impulse Tracker itself — IT `Cwt/v` high nibble `0` (`0x0000..=0x0FFF`),
     /// reproducing `GetImpulseTrackerVersion` and the `cwtv >> 12 == 0` case of
     /// `Load_it.cpp`'s classifier (around lines 1219–1300). The same nibble also covers a
@@ -660,10 +811,15 @@ impl FormatDialect {
             FormatDialect::ScreamTracker301 => QuirkSet::scream_tracker_301(),
             FormatDialect::ModPlug116 => QuirkSet::modplug_116(),
             FormatDialect::ImagoOrpheus => QuirkSet::imago_orpheus(),
-            FormatDialect::FastTracker2
-            | FormatDialect::MilkyTracker
-            | FormatDialect::ModPlugXm
-            | FormatDialect::OpenMptXm => QuirkSet::profile_default(),
+            // MilkyTracker is a deliberate FastTracker 2 clone and OpenMPT keeps every
+            // `kFT2*` behaviour for it (`Load_xm.cpp:658-663` changes only the mix
+            // levels); libxmp turns `QUIRK_FT2BUGS` off only because its test matches the
+            // exact FastTracker 2 name. Neither of the two MilkyTracker corpus cases turns
+            // on the difference, so StarPlayer follows OpenMPT here.
+            FormatDialect::FastTracker2 | FormatDialect::MilkyTracker | FormatDialect::OpenMptXm => QuirkSet::fast_tracker_2(),
+            FormatDialect::ModPlugXm => QuirkSet::modplug_xm(),
+            FormatDialect::SkaleTracker => QuirkSet::skale_tracker(),
+            FormatDialect::UnknownXm => QuirkSet::other_xm_tracker(),
             // libxmp gives every IT `FLOW_MODE_IT_210` and only narrows it for Impulse
             // Tracker's own early `Cwt/v` values (`src/loaders/it_load.c:351,394-400`),
             // so every clone lands on the 2.10 baseline.
@@ -764,16 +920,51 @@ mod tests {
         assert_eq!(FormatDialect::ImagoOrpheus.quirks().s3m_pattern_loop, S3mLoopDialect::ImagoOrpheus);
     }
 
-    /// Task E2: every XM dialect variant is still evidence only, with no quirk of its own
-    /// — each maps to exactly the same [`QuirkSet`] as [`FormatDialect::Unknown`],
-    /// because no XM corpus case has run to justify a field (task C5's rule).
+    /// Task F5: the XM dialects carry four fields, and every one of them is named by a
+    /// corpus case — the `Mx` + `3xx` double portamento
+    /// (`data/{mpt_xm,mt2_xm,rstst}_double_toneporta.xm`), the `9xx`-past-the-sample-end
+    /// stop (`openmpt/xm/3xx-no-old-samp-noft.xm`), the `E60` restart
+    /// (`openmpt/xm/PatLoop-{Break,Weird}.xm`) and the flow profile
+    /// (`data/pattern_{jump,loop}_{mpt,skale}*.xm`). FastTracker 2's own values are the
+    /// canonical profile, so a MOD, S3M or IT never sees any of them change.
     #[test]
-    fn every_xm_dialect_maps_to_the_profile_default_for_now() {
-        let unknown = FormatDialect::Unknown.quirks();
-        assert_eq!(FormatDialect::FastTracker2.quirks(), unknown);
-        assert_eq!(FormatDialect::MilkyTracker.quirks(), unknown);
-        assert_eq!(FormatDialect::ModPlugXm.quirks(), unknown);
-        assert_eq!(FormatDialect::OpenMptXm.quirks(), unknown);
+    fn the_xm_dialects_carry_the_fasttracker_2_replay_bugs_and_their_flow_profile() {
+        let fast_tracker_2 = FormatDialect::FastTracker2.quirks();
+        assert_eq!(fast_tracker_2, QuirkSet::canonical(), "FastTracker 2 is the XM baseline");
+        for dialect in [FormatDialect::MilkyTracker, FormatDialect::OpenMptXm] {
+            assert_eq!(dialect.quirks(), fast_tracker_2, "{dialect:?} reproduces FastTracker 2's replayer");
+        }
+        for dialect in [FormatDialect::ModPlugXm, FormatDialect::SkaleTracker, FormatDialect::UnknownXm] {
+            let quirks = dialect.quirks();
+            assert!(!quirks.xm_double_portamento_doubles_volume_column_rate, "{dialect:?} is not FastTracker 2");
+            assert!(!quirks.xm_offset_past_sample_end_stops_channel, "{dialect:?} is not FastTracker 2");
+            assert!(!quirks.xm_loop_target_becomes_next_break_row, "{dialect:?} is not FastTracker 2");
+            assert_eq!(quirks.mod_pattern_loop, fast_tracker_2.mod_pattern_loop, "{dialect:?} leaves the MOD fields alone");
+            assert_eq!(quirks.s3m_pattern_loop, fast_tracker_2.s3m_pattern_loop, "{dialect:?} leaves the S3M fields alone");
+            assert_eq!(quirks.it_pattern_loop, fast_tracker_2.it_pattern_loop, "{dialect:?} leaves the IT fields alone");
+            assert_eq!(quirks.tempo_model, fast_tracker_2.tempo_model, "{dialect:?} keeps the drift-free tick");
+        }
+        assert_eq!(FormatDialect::ModPlugXm.quirks().xm_pattern_loop, XmLoopDialect::ModPlug116);
+        assert_eq!(FormatDialect::SkaleTracker.quirks().xm_pattern_loop, XmLoopDialect::SkaleTracker);
+        assert_eq!(FormatDialect::UnknownXm.quirks().xm_pattern_loop, XmLoopDialect::Generic);
+    }
+
+    /// The four XM flow profiles are libxmp's, bit for bit: `FLOW_MODE_GENERIC` plus
+    /// FastTracker 2's shared break position, `FLOW_MODE_MPT_116`, and
+    /// `FLOW_JUMP_NO_ROW_SET` on its own for Skale Tracker.
+    #[test]
+    fn the_xm_flow_profiles_are_libxmps() {
+        assert_eq!(XmLoopDialect::Generic.flow(), PatternFlow::generic());
+        assert_eq!(XmLoopDialect::FastTracker2.flow(), PatternFlow { shared_break: true, ..PatternFlow::generic() });
+        assert_eq!(XmLoopDialect::SkaleTracker.flow(), PatternFlow { jump_keeps_break_row: true, ..PatternFlow::generic() });
+        let modplug = XmLoopDialect::ModPlug116.flow();
+        assert_eq!(modplug, PatternFlow {
+            one_at_a_time: true, jump_keeps_break_row: true,
+            delay_break: true, delay_jump: true, unset_break: true, unset_jump: true,
+            ..PatternFlow::generic()
+        });
+        assert!(!modplug.shared_break, "the shared break position is FastTracker 2's own");
+        assert_eq!(modplug, S3mLoopDialect::ModPlug116.flow(), "one ModPlug 1.16, two formats, one `FLOW_MODE_MPT_116`");
     }
 
     /// Task G3: the IT dialects carry two fields, and both are named by a corpus case —

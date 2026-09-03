@@ -96,8 +96,8 @@ use alloc::vec::Vec;
 use starplayer_core::fixed::{bipolar_from_ratio, unit_from_ratio};
 use starplayer_core::{Error, U0F16};
 use starplayer_model::{
-    InstrumentDef, LoopMode, Module, ModuleBuilder, ModuleFlags, ModuleFormat, ModuleHeader,
-    ModuleReader, SampleSpec,
+    FormatDialect, InstrumentDef, LoopMode, Module, ModuleBuilder, ModuleFlags, ModuleFormat,
+    ModuleHeader, ModuleReader, SampleSpec,
 };
 
 use crate::header::{self, XmFormatExtra, XmHeader};
@@ -205,7 +205,8 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
     if file_header.patterns_precede_instruments() {
         cursor = load_patterns(&source, &file_header, channel_count, cursor, &mut builder)?;
     }
-    let mut instruments = read_instrument_headers(&source, &file_header, &mut cursor)?;
+    let mut modplug_tell = false;
+    let mut instruments = read_instrument_headers(&source, &file_header, &mut cursor, &mut modplug_tell)?;
     if !file_header.patterns_precede_instruments() {
         cursor = load_patterns(&source, &file_header, channel_count, cursor, &mut builder)?;
         // The PCM of every sample of every instrument, in order, in one run after the
@@ -222,9 +223,23 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
         add_instrument(&source, pending, &mut builder)?;
     }
 
+    // A ModPlug Tracker 1.16 XM signs itself `FastTracker v2.00   `, so the tracker name
+    // alone reads as FastTracker 2 and the file has to be caught by what it leaves behind:
+    // an unused instrument's zero-filled header, or one of the extension chunks it appends
+    // after the sample data. libxmp `xm_load.c:936-1013` (`is_mpt_116`), and OpenMPT
+    // reaches the same place through `m_dwLastSavedWithVersion && !madeWith[verOpenMPT]`,
+    // which resets every `kFT2*` behaviour (`Load_xm.cpp:1046-1050`).
+    let dialect = match dialect == FormatDialect::FastTracker2
+        && file_header.claims_fast_tracker_2()
+        && (modplug_tell || has_modplug_extension_chunk(&source, cursor))
+    {
+        true => FormatDialect::ModPlugXm,
+        false => dialect,
+    };
+
     let declared_patterns = file_header.pattern_count as usize;
     let orders = source.with_slice(header::FIXED_HEADER_LENGTH, file_header.song_length as usize, <[u8]>::to_vec)?;
-    let orders = match orders.is_empty() && dialect != starplayer_model::FormatDialect::OpenMptXm {
+    let orders = match orders.is_empty() && dialect != FormatDialect::OpenMptXm {
         // `lamb_-_dark_lighthouse.xm` declares no orders at all and FastTracker 2 plays
         // pattern 0; OpenMPT's own files mean an empty order list literally.
         true => vec![0u8],
@@ -253,8 +268,44 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
     builder.build()
 }
 
+/// The instrument-header size ModPlug Tracker writes for a slot it never used.
+const MODPLUG_INSTRUMENT_HEADER_SIZE: usize = 0x107;
+
+/// The four-byte tags libxmp counts as "this file was saved by ModPlug Tracker".
+const MODPLUG_CHUNK_TAGS: [&[u8; 4]; 6] = [b"text", b"MIDI", b"PNAM", b"CNAM", b"CHFX", b"XTPM"];
+
+/// `FX` in the top two bytes — libxmp's plugin-definition test, kept as the bitwise `and`
+/// it writes rather than the prefix comparison it reads like.
+const MODPLUG_PLUGIN_TAG_BITS: u32 = u32::from_be_bytes([b'F', b'X', 0, 0]);
+
+/// How many trailing chunks the scan will step over before giving up. libxmp has no such
+/// bound; a real file carries a handful, and this stops a crafted one from turning the
+/// walk into one `read_at` per eight bytes of the file.
+const MODPLUG_CHUNK_SCAN_LIMIT: usize = 256;
+
+/// Whether the bytes after the sample data carry one of ModPlug Tracker's own chunks.
+///
+/// libxmp `xm_load.c:936-995`: it walks `tag`/`size` pairs from the end of the module to
+/// the end of the file and stops at the first one it recognises, at the `XTPM` terminator,
+/// or when the file runs out.
+fn has_modplug_extension_chunk<R: ModuleReader + ?Sized>(source: &Source<'_, R>, mut cursor: usize) -> bool {
+    for _ in 0..MODPLUG_CHUNK_SCAN_LIMIT {
+        let Ok(bytes) = source.array::<8>(cursor) else { return false };
+        let tag = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        let size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if size > i32::MAX as u32 {
+            return false;
+        }
+        if MODPLUG_CHUNK_TAGS.contains(&&tag) || u32::from_be_bytes(tag) & MODPLUG_PLUGIN_TAG_BITS == MODPLUG_PLUGIN_TAG_BITS {
+            return true;
+        }
+        cursor = cursor.saturating_add(8).saturating_add(size as usize);
+    }
+    false
+}
+
 /// Build the format-neutral [`ModuleHeader`] out of the file header.
-fn song_header<R: ModuleReader + ?Sized>(source: &Source<'_, R>, file_header: &XmHeader, channel_count: u8, dialect: starplayer_model::FormatDialect) -> Result<ModuleHeader, Error> {
+fn song_header<R: ModuleReader + ?Sized>(source: &Source<'_, R>, file_header: &XmHeader, channel_count: u8, dialect: FormatDialect) -> Result<ModuleHeader, Error> {
     let title = source.with_slice(header::TITLE_OFFSET, header::TITLE_LENGTH, text)?;
 
     let extra = XmFormatExtra { restart_position: file_header.restart_position, flags: file_header.flags };
@@ -368,7 +419,7 @@ struct PendingInstrument {
 /// Read every instrument header and its sample headers, advancing `cursor` past
 /// everything read — including each instrument's PCM, for version `0x0104` and later,
 /// where it follows that instrument's sample headers.
-fn read_instrument_headers<R: ModuleReader + ?Sized>(source: &Source<'_, R>, file_header: &XmHeader, cursor: &mut usize) -> Result<Vec<PendingInstrument>, Error> {
+fn read_instrument_headers<R: ModuleReader + ?Sized>(source: &Source<'_, R>, file_header: &XmHeader, cursor: &mut usize, modplug_tell: &mut bool) -> Result<Vec<PendingInstrument>, Error> {
     let inline_sample_data = file_header.patterns_precede_instruments();
     let mut instruments = Vec::with_capacity(file_header.instrument_count as usize);
 
@@ -389,6 +440,16 @@ fn read_instrument_headers<R: ModuleReader + ?Sized>(source: &Source<'_, R>, fil
         let visible = core::cmp::min(declared, raw.len());
         let header = XmInstrumentHeader::parse(raw.get(..visible).unwrap_or_default());
         let name = instrument::name(&raw, instrument::NAME_OFFSET, instrument::NAME_LENGTH);
+        // libxmp `xm_load.c:486-492`: ModPlug Tracker saves a huge zero-filled instrument
+        // header for a slot it never used, which is how a file signed `FastTracker v2.00`
+        // gives itself away. `XmInstrumentHeader` normalises a zero sample-header size to
+        // forty, so the raw field is read here instead.
+        let raw_sample_header_size = raw.get(0x1D..0x21)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_le_bytes);
+        if declared == MODPLUG_INSTRUMENT_HEADER_SIZE && header.sample_count == 0 && raw_sample_header_size == Some(0) {
+            *modplug_tell = true;
+        }
 
         *cursor = start.saturating_add(declared);
 
@@ -551,7 +612,7 @@ impl<R: ModuleReader + ?Sized> Source<'_, R> {
 mod tests {
     use super::*;
     use crate::pattern::{PatternView, XmCell};
-    use starplayer_model::{AutoVibratoWaveform, FormatDialect, PatternId};
+    use starplayer_model::{AutoVibratoWaveform, PatternId};
 
     /// A builder for synthetic XMs: enough of one to exercise every branch of the loader
     /// without a fixture file.
@@ -763,6 +824,35 @@ mod tests {
         assert_eq!(module.patterns().len(), 1);
         assert_eq!(module.orders(), &[0]);
         assert_eq!(XmFormatExtra::from_header(module.header()), XmFormatExtra { restart_position: 0, flags: 1 });
+    }
+
+    #[test]
+    fn modplug_tracker_hiding_behind_the_fast_tracker_tag_is_found_from_the_body() {
+        // libxmp `xm_load.c:936-1013`: ModPlug Tracker 1.16 signs itself `FastTracker
+        // v2.00   `, so the file has to be recognised from what it leaves behind — one of
+        // its own chunks after the sample data, or a zero-filled `0x107`-byte header for an
+        // instrument slot it never used.
+        let plain = XmFile::minimal().bytes();
+        assert_eq!(load(&plain).expect("a valid XM").header().dialect, FormatDialect::FastTracker2);
+
+        let mut with_comment = plain.clone();
+        with_comment.extend_from_slice(b"text");
+        with_comment.extend_from_slice(&3u32.to_le_bytes());
+        with_comment.extend_from_slice(b"hi!");
+        assert_eq!(load(&with_comment).expect("a valid XM").header().dialect, FormatDialect::ModPlugXm);
+
+        // An unrecognised chunk is stepped over rather than accepted.
+        let mut with_other = plain.clone();
+        with_other.extend_from_slice(b"junk");
+        with_other.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(load(&with_other).expect("a valid XM").header().dialect, FormatDialect::FastTracker2);
+
+        // The same chunk under a tracker name that never claimed to be FastTracker 2 is
+        // not evidence of anything: libxmp gates `is_mpt_116` on `claims_ft2`.
+        let mut skale = XmFile { tracker: *b"Skale Tracker\0\0\0\0\0\0\0", ..XmFile::minimal() }.bytes();
+        skale.extend_from_slice(b"text");
+        skale.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(load(&skale).expect("a valid XM").header().dialect, FormatDialect::SkaleTracker);
     }
 
     #[test]

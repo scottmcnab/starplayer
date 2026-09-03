@@ -91,134 +91,98 @@ MOD cases pass under per-field waivers naming accuracy-policy D15, D19, D36, D37
 the new D40. Every one of those is a representation or timeline difference against the
 oracle, not an engine gap.
 
-## M5 — XM (task F2)
+## M5 — XM (tasks F2 and F5)
 
 Task F2 landed the XM effect processor and wired all 93 XM cases the pinned tree's
-`compare_mixer_data*` calls name. Seventy-two pass, one is an accepted deviation
-(`libxmp-xm-reverse-xm`, accuracy policy D45) and the twelve records below cover the
-remaining twenty cases. None of them is a *silent* failure: every one is executed on every
-run, and its exclusion row quotes the first divergence the harness observed.
+`compare_mixer_data*` calls name; 72 passed and twenty were recorded here as `F2-XM-001`
+through `F2-XM-012`. Task F5 settled them: **87 of the 93 now pass**, two are accepted
+deviations (`libxmp-xm-reverse-xm` under D45 and `openmpt-xm-panmemory` under D79) and the
+four cases below are what is left.
 
-The XM conformance loop's accepted deviations are accuracy policy **D42–D47**; the records
-here are what F2 could **not** settle, and they are task F5's list.
-
-## F2-XM-001 — the `Mx` + `3xx` double tone portamento under a non-FT2 dialect
-
-`libxmp-xm-mpt-xm-double-toneporta`, `libxmp-xm-mt2-xm-double-toneporta` and
-`libxmp-xm-rstst-double-toneporta`. libxmp gives ModPlug Tracker, MadTracker 2 and rst
-SoundTracker their own rate rules for a cell carrying both a volume-column `Mx` and an
-effect-column `3xx`; StarPlayer plays every XM with FastTracker 2's, which ignores the
-`3xx` parameter and uses the `Mx` rate twice. The FastTracker 2 fixture of the same family,
-`libxmp-xm-ft2-double-toneporta`, **passes**, so this is a missing `QuirkSet` field and a
-missing `FormatDialect` detection rather than a defect in the processor — C5's rules apply,
-and the field needs its own corpus case, policy entry and test.
-
-First divergence: tick 5 channel 0 field period, expected 4464 against actual 4480 (4288 for
-the rst SoundTracker variant).
-
-## F2-XM-002 — ModPlug and Skale pattern-flow dialects
-
-`libxmp-xm-pattern-jump-mpt-break`, `libxmp-xm-pattern-jump-skale-break`,
-`libxmp-xm-pattern-loop-mpt` and `libxmp-xm-pattern-loop-mpt-breakjump`. The same shape as
-F2-XM-001, one layer up: libxmp resolves `Bxx` and `Dxx` against `E6x` differently for
-those two trackers, where StarPlayer uses FastTracker 2's `PatternFlow` for every XM. The
-FastTracker 2 members of both families pass. First divergence: tick 12 field row, expected 4
-against actual 0.
+| Record | Disposition |
+|---|---|
+| `F2-XM-001` — `Mx` + `3xx` under a non-FastTracker-2 dialect | **Fixed.** `QuirkSet::xm_double_portamento_doubles_volume_column_rate`, off for `FormatDialect::ModPlugXm` and `UnknownXm`. All three cases pass with every field enforced |
+| `F2-XM-002` — ModPlug and Skale pattern flow | **Fixed.** `QuirkSet::xm_pattern_loop` (`XmLoopDialect`), plus the loader's ModPlug Tracker 1.16 detection. All four cases pass; two of them waive `position` for D19 and D75 |
+| `F2-XM-003` — a key-off whose sustain point is point zero | **Sharpened.** `data/ft2_note_off_sustain.xm` passes — it was the placeholder-instrument fadeout, not the key-off — and `libxmp-xm-ft2-kxx` remains, below |
+| `F2-XM-004` — `Lxx` after an envelope loop | **Sharpened.** Five of the fixture's six orders now agree; the one that lands exactly on the loop end remains, below |
+| `F2-XM-005` — the instrument-fade update rule | **Fixed.** FastTracker 2 parks the channel on its placeholder instrument, whose fadeout is `0x80`, and an instrument-without-note row reads that stale pointer. Accuracy policy §1 |
+| `F2-XM-006` — the volume column under a delayed note-off | **Fixed.** `kFT2PanWithDelayedNoteOff`. Both cases pass, `openmpt-xm-panoff` waiving `position` for D42 |
+| `F2-XM-007` — the Skale Tracker offset dialect | **Fixed.** `QuirkSet::xm_offset_past_sample_end_stops_channel`, off for every tracker that is not FastTracker 2. The case waives `position` and `active` for D42 |
+| `F2-XM-008` — the vibrato ramp amplitude | **Accuracy policy D76.** The amplitudes were never the problem: the two tables are the same values, and libxmp applies its vibrato on a row's tick zero where FastTracker 2 does not |
+| `F2-XM-009` — FastTracker 2's stale `song.pBreakPos` | **Half fixed, half sharpened.** `kFT2LoopE60Restart` is implemented and unit-tested; both fixtures are blocked behind the order-list wrap, below |
+| `F2-XM-010` — `ED0` is not a rogue note delay | **Accuracy policy D77.** `ED0` was never wrong: libxmp defers a delayed row's volume column to the delay tick and FastTracker 2 does not |
+| `F2-XM-011` — a looping envelope after 240 ticks | **Accuracy policy D78.** The tick a key-off resumes a sustained envelope on |
+| `F2-XM-012` — a zero-byte oracle | **Accuracy policy D79.** Confirmed as the corpus, not the harness: `PanMemory.data` is missing where `DelayCombination.data` is deliberately empty, and the case is now an accepted record rather than a failure |
 
 ## F2-XM-003 — a key-off whose sustain point is the envelope's first point
 
-`libxmp-xm-ft2-kxx` and `libxmp-xm-ft2-note-off-sustain`. `ft2_replayer.c`'s `keyOff`
-clamps `volEnvTick` back to `points[volEnvPos].tick - 1`, which for a sustain point at
-index 0 wraps a `uint16_t` to 65535; the next envelope tick therefore re-evaluates point 0
-and replays the segment leaving sustain from its start, so the sustain value survives one
-tick longer than libxmp's envelope, which has already run past the last point and reads
-zero. StarPlayer follows `ft2_replayer.c` line for line, and the difference was traced by
-hand through both implementations, but it was not settled against a real FastTracker 2, so
-it is recorded rather than declared a deviation.
+`libxmp-xm-ft2-kxx`, and **four records of 192**: tick 1 of the two rows whose `Kxx`
+releases a volume envelope whose sustain point is point **zero**. `ft2_replayer.c`'s
+`keyOff` clamps `volEnvTick` back to `points[volEnvPos].tick - 1`, which for a sustain point
+at tick 0 wraps a `uint16_t` to 65535; the next envelope tick therefore reaches 0 again,
+re-evaluates point 0 and replays the segment leaving sustain from its start, so the sustain
+value survives one tick longer than libxmp's envelope, which has already run past the last
+point and reads zero. StarPlayer follows `ft2_replayer.c` line for line and the difference
+was traced by hand through both implementations, but it was not settled against a real
+FastTracker 2.
 
-First divergence: tick 131 channel 0 field volume, expected 0 against actual 56
-(`ft2_kxx.xm`); tick 65 channel 0 field volume, expected 16 against actual 14
-(`ft2_note_off_sustain.xm`).
+First divergence: tick 131 channel 0 field volume, expected 0 against actual 56.
 
-## F2-XM-004 — `Lxx` after an envelope loop
+**What would settle it:** a capture from a real FastTracker 2, or `ft2-clone` upstream
+confirming that `keyOff`'s clamp is what the disassembly says. `data/ft2_note_off_sustain.xm`,
+which F2 filed under the same record, turned out to be the placeholder-instrument fadeout
+(`F2-XM-005`) and now passes with every field enforced.
 
-`libxmp-xm-lxx-after-loop`. StarPlayer's port of `setEnvelopePos` reaches a different point
-index from libxmp's on the row after a looped envelope, so a fresh note starts at the
-envelope's first value where libxmp starts at zero. First divergence: tick 144 channel 0
-field volume, expected 0 against actual 64.
+## F2-XM-004 — an `Lxx` that lands exactly on an envelope's loop end
 
-## F2-XM-005 — the instrument-fade update rule
+`libxmp-xm-lxx-after-loop`. The fixture plays six orders, each a different `Lxx` landing,
+and its own ModPlug comment says all of them should produce the same long volume ramp.
+Orders 0, 1, 3, 4 and 5 now agree; **order 2** — `L0C` on an instrument whose loop end is
+point 1 at tick 12 — does not.
 
-`libxmp-xm-ft2-instrument-fade-update`. StarPlayer resets the fadeout wherever
-`triggerInstrument` runs; libxmp gates it on `ev.ins && key != XMP_KEY_OFF`, plus its
-delayed-row case. The two differ on the rows this fixture isolates. First divergence: tick
-108 channel 0 field volume, expected 64 against actual 56.
+`ft2_replayer.c`'s `setEnvelopePos` walks the points until `tick` falls short of one, then
+subtracts that point's tick; when the remainder is exactly zero it breaks *without*
+advancing the point index and without writing a value or a delta, leaving `volEnvPos` at the
+lower point and `volEnvTick` at `param - 1`. `updateVolPanAutoVib`'s very next tick then
+finds `volEnvTick` equal to that point's own tick, sees it is the loop end and jumps back to
+the loop start. OpenMPT stores `Lxx` as a *position* and derives the value from it, so its
+envelope simply continues past the loop; libxmp does the same and the oracle follows.
 
-## F2-XM-006 — the volume column under a delayed note-off
+First divergence: tick 144 channel 0 field volume, expected 0 against actual 64 — the value
+at the loop start against the value at the loop end.
 
-`libxmp-xm-ft2-delay-volume-column` and `openmpt-xm-panoff`. OpenMPT's
-`kFT2PanWithDelayedNoteOff`: a note-off next to a note delay makes the volume column's
-`Cxx` panning be ignored. StarPlayer applies it when the delay fires. First divergence:
-tick 29 channel 0 field pan, expected 255 against actual 0; tick 27 channel 0 field pan,
-expected 128 against actual 0.
+**What would settle it:** a real FastTracker 2. Both readings are defensible from the
+sources available: ft2-clone's is a line-for-line disassembly and OpenMPT's is a model, and
+they disagree only when the remainder is exactly zero.
 
-## F2-XM-007 — the Skale Tracker offset dialect
+## F2-XM-009 — the order list running out is not the end of an XM
 
-`openmpt-xm-3xx-no-old-samp-noft`. The fixture carries a non-FastTracker 2 tracker name and
-libxmp switches the "`9xx` past the sample end stops the channel" quirk **off** for it,
-because Skale Tracker does not emulate it and Armada Tanks' music breaks if it is applied.
-`FormatDialect` has no Skale variant, so StarPlayer stops the channel. The FastTracker 2
-twin, `openmpt-xm-3xx-no-old-samp`, passes. First divergence: tick 48 channel 0 field
-active, expected true against actual false.
+`openmpt-xm-patloop-break` and `openmpt-xm-patloop-weird`. FastTracker 2's own
+`kFT2LoopE60Restart` — an `E6x` loop jump leaving its target row in `song.pBreakPos`, so the
+next pattern to end normally starts there — **is** implemented, is accuracy policy §1, and is
+pinned by `starplayer-xm`'s `a_pattern_loops_target_row_starts_the_next_pattern`. It is not
+what these two fixtures need.
 
-## F2-XM-008 — the vibrato ramp amplitude
+Both of them run off the end of the order list. `PatLoop-Weird.xm` has a single order and a
+`D03` on row 0; `PatLoop-Break.xm` has two and its second pattern simply ends. FastTracker
+2's `getNextPos` wraps in both cases — `if (++song.songPos >= song.songLength) song.songPos
+= song.songLoopStart;` — and the oracle records three passes of each. StarPlayer's sequencer
+treats the order list running out as the end of the song under `EndOfSongPolicy::Stop`
+(`PatternSequencer::move_to_order`), which is task D2's deliberate rule and the reason a
+song that simply ends no longer scans as looping, so the capture stops after the first pass.
 
-`openmpt-xm-vibratowaveforms`. StarPlayer reads FastTracker 2's 32-entry
-`floor(255 * sin(i * PI / 32))` quarter table and scales it `>> 5`; libxmp reads its own
-64-entry LFO table and scales it `>> 9`. The waveform *shapes* — sign inversion included,
-which is what the fixture is named for — agree; the amplitudes are eleven native period
-units apart at the same phase, well beyond D42's four-unit finetune bound. First
-divergence: tick 12 channel 0 field period, expected 4664 against actual 4653.
+First divergence: tick 8 channel 1 field position for `PatLoop-Break.xm`, tick 1 channel 0
+for `PatLoop-Weird.xm` — both of them the D42 finetune drift rather than the flow, which is
+what makes the record legible: hand-simulating `PatLoop-Weird.xm` against `ft2_replayer.c`
+reproduces the oracle's whole `0 3 1 0 3 1 2 3 1 2 3 1 2` row sequence once the wrap is
+assumed, and needs no other change.
 
-## F2-XM-009 — FastTracker 2's stale `song.pBreakPos`
-
-`openmpt-xm-patloop-break` and `openmpt-xm-patloop-weird`. FastTracker 2 spells its pattern
-loop, its position jump and its pattern break as writes to one `song.pBreakPos`, and
-`getNextPos` clears that variable only inside the branch a jump takes — so a loop jump
-leaves it holding the loop's target row, and the **next** pattern that ends normally starts
-on that row instead of row 0. OpenMPT calls it `kFT2LoopE60Restart`. StarPlayer's
-`PatternFlowState` always begins the next pattern at row 0, so the two take different paths
-through the song. Reproducing it needs a `Jump` the processor emits at the end of a pattern
-rather than a flow-state field, which is a design decision F5 should take rather than F2.
-
-First divergence: tick 136 field frame, expected 6174 against actual 120834; tick 2 field
-frame, expected 3440 against actual 10335.
-
-## F2-XM-010 — `ED0` is not a rogue note delay
-
-`openmpt-xm-delay3`. FastTracker 2 treats `EDx` with `x > 0` as if the last played note sat
-next to it, and `ED0` as nothing at all. StarPlayer keeps a voice sounding where libxmp has
-silenced it. Its two siblings, `openmpt-xm-delay1` and `openmpt-xm-delay2`, pass. First
-divergence: tick 13 channel 0 field volume, expected 0 against actual 15.
-
-## F2-XM-011 — a looping envelope after 240 ticks
-
-`openmpt-xm-envloops`. The two implementations' envelope values are two units apart after
-240 ticks of a looping volume envelope, which is one unit more than D44's
-recompute-versus-accumulate bound accounts for. Every sustain, loop and release combination
-this fixture exists to test agrees until then. First divergence: tick 240 channel 0 field
-volume, expected 61 against actual 63.
-
-## F2-XM-012 — a zero-byte oracle
-
-`openmpt-xm-panmemory`. The pinned corpus ships an **empty** `openmpt/xm/PanMemory.data`
-while the module itself sounds two notes at row 4, so there is no expectation to compare
-against; the harness's reading of an empty dump — no channel may ever be active — is the
-only one available and StarPlayer fails it by playing the module. The sibling
-`openmpt-xm-panmemory2`, which OpenMPT calls a more thorough check of the same pan memory,
-passes. `openmpt/xm/DelayCombination.data` is empty too and *is* a real expectation — that
-fixture's whole point is that no note triggers — and it passes. Resolving this needs a
-decision about whether the harness should treat a zero-byte dump as an oracle at all.
+**What would settle it:** a decision, in `starplayer-engine` rather than in `starplayer-xm`,
+about what a `Bxx`/`Cxx`/`Dxx` past the end of the order list means under
+`EndOfSongPolicy::Stop`. Every format has the same gap — ProTracker, Scream Tracker 3 and
+Impulse Tracker all wrap too — so it belongs to a sequencer task with its own effect on
+scanned song lengths, not to the XM processor. F5 deliberately did not reach for it: making
+the XM crate wrap on its own would give one format a rule the other four do not have.
 
 ## M6 — IT (task G3)
 

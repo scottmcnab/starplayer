@@ -56,6 +56,11 @@ These are load-bearing. Removing any of them changes how real modules sound.
 | XM `Rxy` retriggers on tick **zero** when the volume column reduces to zero after the tick-zero volume handlers have run — so a volume column of `$10` makes `Rxy` fire immediately | `ft2_replayer.c` `handleEffects_TickZero` (the `newVolCol` copy) | FastTracker 2 behaviour, and the reason `Rxy`'s tick-zero handler takes a *copy* of the volume column |
 | XM `Lxx` sets the **panning** envelope position only when the *volume* envelope's sustain flag is set | `ft2_replayer.c` `setEnvelopePos` (`FT2 logic bug: should've been ins->panEnvFlags`); OpenMPT `kFT2SetPanEnvPos` | FastTracker 2 behaviour (`openmpt/xm/SetEnvPos.xm`) |
 | XM's volume-column pan slide left of zero sets the pan to zero outright | `ft2_replayer.c` `v_PanSlideLeft` (`includes an FT2 bug`) | FastTracker 2 behaviour |
+| A cell carrying both a volume-column `Mx` and an effect-column `3xx` **discards** the `3xx` parameter and applies the `Mx` rate twice in a tick | `ft2_replayer.c` `getNewNote` (the volume-column branch returns before the effect column's parameter is read); libxmp `read_event.c:522-529`; OpenMPT `GetVolCmdTonePorta` (`vol *= 2`, `clearEffectColumn`) | FastTracker 2 behaviour (`data/ft2_double_toneporta.xm`). ModPlug Tracker, MadTracker 2 and rst's SoundTracker give each column its own rate and apply the sum once, which is the `QuirkSet` field `xm_double_portamento_doubles_volume_column_rate` |
+| An XM `9xx` that points past the end of the sample **stops** the channel, and the note is not picked up by a later portamento | `ft2_replayer.c` `triggerNote` (`smpStartPos`) with the mixer's own bounds test; OpenMPT `kFT2ST3OffsetOutOfRange`; libxmp `read_event.c:714-726` | FastTracker 2 behaviour (`openmpt/xm/3xx-no-old-samp.xm`). Skale Tracker does not emulate it — Armada Tanks' music breaks if it is applied — which is the `QuirkSet` field `xm_offset_past_sample_end_stops_channel` |
+| An `E6x` loop jump leaves its **target row** in the shared break position, so the next pattern to end normally starts on that row rather than row zero | `ft2_replayer.c` `patternLoop` (`song.pBreakPos`) and `getNextPos`, which clears it only in the branch a position change takes; OpenMPT `kFT2LoopE60Restart` (`Snd_fx.cpp:6351`, `Sndmix.cpp:805-817`) | FastTracker 2 behaviour, and the `QuirkSet` field `xm_loop_target_becomes_next_break_row` for the trackers that do not have it. `openmpt/xm/PatLoop-Break.xm` and `PatLoop-Weird.xm` cannot see it yet — `conformance/known-failures.md` `F2-XM-009` — so `starplayer-xm`'s own tests pin it |
+| A note delay next to a **key-off** with no instrument column swallows the volume column's `Cxx` panning | `ft2_replayer.c` `noteDelay` writes `ch->outPan` without raising `CS_UPDATE_PAN`, and neither `triggerNote` (which returns early for a key-off) nor `resetVolumes` (which an instrument column would have run) raises it either; OpenMPT `kFT2PanWithDelayedNoteOff`; libxmp `read_event.c:511-518` | FastTracker 2 behaviour (`openmpt/xm/PanOff.xm`, `data/ft2_delay_volume_column.xm`). StarPlayer suppresses the write where FastTracker 2 suppresses only its visibility; the two could differ only on a channel whose panning envelope raises the flag every tick, and no corpus case has one |
+| An instrument number naming a slot the file does not hold still reloads a fadeout — the placeholder instrument's `0x80` — and the channel keeps that placeholder until a **note** moves it | `ft2_replayer.c` `triggerNote` (`ins = instr[0]`), `triggerInstrument` (`ch->fadeoutSpeed = ins->fadeout`), `allocateInstr` → `setStdEnvelope`; libxmp `read_event.c:580-583` ("unused instruments have fade 0x80") | FastTracker 2 behaviour, and the reason an instrument-without-note row after an out-of-range one fades at the placeholder's rate rather than its own (`data/ft2_instrument_fade_update.xm`) |
 | XM `Xxy` is restricted to `X1x` and `X2x`; every other sub-command is ignored | `ft2_replayer.c` `extraFinePitchSlide`; OpenMPT `kFT2RestrictXCommand` | FastTracker 2 behaviour. ModPlug's `X9E`/`X9F` extension is deviation D45 |
 
 ## 2. Deliberate quirks reproduced only under `quirks-starplayer`
@@ -121,6 +126,9 @@ a `QuirkSelection::Override`, the same route any other host decision takes.
 | `s3m_pattern_loop` | S3M `Cwt/v` (`0x28`), reproducing libxmp `src/loaders/s3m_load.c:390-432` | `ScreamTracker321` (default), `ScreamTracker301` (`< 0x1303`), `ModPlug116` (`0x1320` with libxmp's ModPlug fingerprint), `ImagoOrpheus` (high nibble 2, but not `0x2013`, which is PlayerPRO byte-swapped) |
 | `mod_pattern_loop` | the MOD tag at offset 1080 | `ProTracker` (default), `Octalyser` (`CD61`, `CD81`), `DigitalTracker` (`FA04`, `FA06`, `FA08`) |
 | `mod_timing` | the MOD tag (`M&K!` / `N.T.` are VBlank-only), then the pattern cells, then — where those are ambiguous — a comparison of the song's length under both timings, reproducing libxmp `src/loaders/mod_load.c:816-950` and `src/scan.c:50` and `:671-708` | `Cia` (default), `VBlank` |
+| `it_pattern_loop` | IT `Cwt/v`, reproducing libxmp `src/loaders/it_load.c:394-400` | `ImpulseTracker210` (default), `ImpulseTracker200`, `ImpulseTracker104`, `ImpulseTracker100` |
+| `xm_pattern_loop` | the XM tracker name, plus ModPlug Tracker's own tells, reproducing libxmp `src/loaders/xm_load.c:846-893` and `:936-1013` | `FastTracker2` (default), `Generic`, `ModPlug116`, `SkaleTracker` |
+| `xm_double_portamento_doubles_volume_column_rate`, `xm_offset_past_sample_end_stops_channel`, `xm_loop_target_becomes_next_break_row` | the same tracker name: on for FastTracker 2, its bug-compatible clones and OpenMPT, off for everything else — libxmp's one `QUIRK_FT2BUGS` bit (`src/loaders/xm_load.c:855-885`), and OpenMPT's `m_playBehaviour.reset()` for a ModPlug-made XM (`Load_xm.cpp:1046-1050`) | `true` (default), `false` |
 
 The first two map to a `PatternFlow` — fifteen named booleans whose meanings are libxmp's
 `FLOW_LOOP_*` bits, because the pinned oracle dumps were generated by exactly that code —
@@ -142,16 +150,37 @@ CIA, and if one pass runs eight minutes or longer, or the scan ran out its budge
 again as VBlank and keep the shorter, ties to CIA. A deliberately slow short song is
 therefore never sped up. D41 records what the original DOS player did instead.
 
-The three dialect fields are `s3m_pattern_loop`, `mod_pattern_loop` and `mod_timing`.
-Every other `QuirkSet` field is either a §1 entry above (`mod_break_parameter`,
-`mod_f00_stops_song`), a §3 deviation (`mod_paula_clock` is D14,
-`protracker_sample_swap_at_boundary` is D12, `protracker_tremolo_ramp_from_vibrato_phase`
-is D20) or this section's tempo model.
+The dialect fields are `s3m_pattern_loop`, `mod_pattern_loop`, `mod_timing`,
+`it_pattern_loop`, `xm_pattern_loop` and the three XM booleans above. Every other
+`QuirkSet` field is either a §1 entry above (`mod_break_parameter`, `mod_f00_stops_song`),
+a §3 deviation (`mod_paula_clock` is D14, `protracker_sample_swap_at_boundary` is D12,
+`protracker_tremolo_ramp_from_vibrato_phase` is D20) or this section's tempo model.
 
-XM and IT have their own dialects too — `FormatDialect::FastTracker2`, `MilkyTracker`,
-`ModPlugXm`, `OpenMptXm`, `ImpulseTracker`, `OpenMptIt`, `SchismTracker` and `ModPlugIt`
-(task E2) — but every one of them maps to `QuirkSet::profile_default()`, the same as
-`Unknown`, pending the M5 (XM) and M6 (IT) corpus evidence that would justify a field.
+The XM detection, in libxmp's order: the tracker name at offset `0x26` is compared whole.
+`OpenMPT ` and `MilkyTracker` prefixes, `Fasttracker II clone`, and `FastTracker v2.00   `
+with a header size of 276 are FastTracker 2 and its bug-compatible clones; `Skale Tracker`
+and `Sk@le Tracker` — NUL-terminated, as libxmp's `strcmp` requires — are their own dialect;
+`FastTracker v 2.00  `, with the extra mid-string space, is ModPlug Tracker 1.0; and
+everything else is `FormatDialect::UnknownXm`, which carries none of FastTracker 2's replay
+bugs. One case the name cannot settle is a ModPlug Tracker 1.16 file that signs itself
+`FastTracker v2.00   `, so the loader revises that one answer after reading the body, from
+the two tells libxmp's `is_mpt_116` uses: an unused instrument's zero-filled `0x107`-byte
+header, or one of ModPlug's own `text` / `MIDI` / `PNAM` / `CNAM` / `CHFX` / `XTPM` chunks
+after the sample data.
+
+`FormatDialect::MilkyTracker` is the one place StarPlayer follows OpenMPT rather than
+libxmp: libxmp turns `QUIRK_FT2BUGS` off for it only because its test matches the exact
+FastTracker 2 name, while OpenMPT keeps every `kFT2*` behaviour and changes only the mix
+levels (`Load_xm.cpp:658-663`). MilkyTracker is a deliberate FastTracker 2 clone, and
+neither of the two MilkyTracker corpus cases turns on the difference.
+
+`FormatDialect::UnknownXm` covers MadTracker 2 and rst's SoundTracker as well as an
+unrecognised name. OpenMPT splits those two finer — MadTracker keeps every FastTracker 2
+behaviour but `kFT2PortaNoNote` and `kFT2Arpeggio`, Skale Tracker keeps every one but
+`kFT2ST3OffsetOutOfRange` and `kFT2Arpeggio` — and a corpus case that turned on one of
+those would justify its own variant. None does: the three fixtures that name these
+trackers, `data/mt2_xm_double_toneporta.xm`, `data/rstst_double_toneporta.xm` and
+`openmpt/xm/3xx-no-old-samp-noft.xm`, all agree with libxmp's single bit.
 
 ## 3. Documented deviations from the reference implementations
 
@@ -161,11 +190,13 @@ disagreements about Scream Tracker 3, D40 is a disagreement between the original
 both secondary oracles that no available reference can settle, and D41 is a MOD boundary
 the original got wrong in a way that happened to help. The rest record deliberate
 determinism/architecture choices or visible conformance gaps; none may be hidden behind
-an accuracy claim. D42–D47 are M5's XM entries and have the same shape as D33–D39: they
-are places where **libxmp**, the conformance oracle, represents or computes something
+an accuracy claim. D42–D47 and D75–D79 are M5's XM entries and have the same shape as D33–D39:
+they are places where **libxmp**, the conformance oracle, represents or computes something
 differently from FastTracker 2, and the accuracy policy's own rule for XM — "the format
 specifications and OpenMPT's documented compatibility behaviour are the reference" — makes
-FastTracker 2, read through `ft2-clone`'s `src/ft2_replayer.c`, the thing to match.
+FastTracker 2, read through `ft2-clone`'s `src/ft2_replayer.c`, the thing to match. D79 is
+the exception: it is a gap in the pinned corpus rather than a disagreement about
+FastTracker 2.
 
 | # | Defect | Where | What we do instead |
 |---|---|---|---|
@@ -332,6 +363,89 @@ through one sixteenths table — `10/16` and `24/16` — so a note at volume 64 
 40 where Impulse Tracker plays 42.
 
 **Behaviour chosen.** Impulse Tracker's exact arithmetic, for the same reason as D68.
+
+### D75 — FastTracker 2's Amiga period table against libxmp's continuous formula
+
+**Cause.** An XM whose header flag 0 is clear plays in *Amiga* mode, where FastTracker 2
+reads a 96-entry integer table (`amigaPeriodLUT`, `ft2_tables.c`) exactly as Scream Tracker
+3 does, and the comparison axis is four times ProTracker's period. libxmp evaluates
+`13696 / 2^(n/12)` continuously and reports the result at Q12 (`src/period.c:205`), so
+`F#3` is FastTracker 2's 604 against libxmp's 605.25 — five quarter-units on the
+comparison axis. This is the XM twin of **D36**, and the reason it shows here and not on
+the four other Amiga-mode fixtures is that D43's four-unit XM tolerance was derived in the
+**linear** domain, where four units is a sixteenth of a semitone; in the Amiga domain the
+same fraction of a semitone is a different number of units at every pitch.
+
+**Behaviour chosen.** Keep FastTracker 2's table, as D36 keeps Scream Tracker 3's and D14
+keeps ProTracker's, and waive `period` and `position` on `libxmp-xm-pattern-loop-mpt` —
+the one Amiga-mode fixture whose notes land where the two disagree by more than four
+quarter-units. Widening the tolerance for Amiga-mode XM was rejected: it would loosen the
+four fixtures that currently pass with the period enforced.
+
+### D76 — libxmp applies an XM vibrato on tick zero of a row
+
+**Cause.** FastTracker 2's `doVibrato` reaches the period only from
+`JumpTab_TickNonZero[4]`: on a row's first tick the channel keeps the `outPeriod` the
+previous tick left, and the LFO neither reads nor advances. libxmp computes and applies its
+vibrato on every frame including the first (`src/player.c:1184-1199`; only
+`QUIRK_PROTRACK`, which XM does not have, suppresses it), using the phase the previous row
+left un-advanced. The two tables agree — FastTracker 2's 32-entry `vibratoTab` is the first
+half of libxmp's 64-entry `sine_wave`, value for value, and the inverted ramp
+`get_lfo_ft2` implements is `doVibrato`'s `~tmpVib` — so the *shapes* never differ; the
+positions do, by one tick, at a row boundary.
+
+**Behaviour chosen.** FastTracker 2's. `openmpt-xm-vibratowaveforms` waives `period` and
+`position`: sixteen records of 768 differ, every one of them a row's tick zero, and the
+largest difference is one full vibrato amplitude on a square-wave row. This is the same
+shape as `C2-S3M-009`'s second part, where libxmp applies the S3M tremolo on tick zero too.
+
+### D77 — libxmp defers a delayed row's volume column to the delay tick
+
+**Cause.** `getNewNote` latches `ch->volColumnVol = p->vol` **before** it returns for an
+`ED1`..`EDF` note delay, so FastTracker 2 runs the volume column's effect from tick one
+whether or not the note has fired; OpenMPT models the same thing as `kFT2VolColDelay`
+(`Snd_fx.cpp:3229-3236`, which is false only on tick zero and on the delayed tick when the
+row also carries an instrument number). libxmp instead copies the **whole event** into
+`xc->delayed_event` and reads none of it until the delay expires (`src/player.c:779-812`,
+`:1619-1622`), so a volume-column slide next to an `EDx` starts one tick late and stays one
+tick behind for the rest of the row.
+
+**Behaviour chosen.** FastTracker 2's, which OpenMPT agrees with. `openmpt-xm-delay3`
+waives `volume` — with `position` and `active` for D42's finetune drift — and the `ED0`
+rows the fixture exists to test, 18 to 28 of both patterns, agree exactly.
+
+### D78 — the envelope tick a key-off resumes on
+
+**Cause.** FastTracker 2's envelope is an accumulator with a point cursor: on the tick the
+key-off releases a sustained envelope, `updateVolPanAutoVib` finds `volEnvTick` equal to the
+sustain point's own tick, reloads the exact point value, recomputes the segment's Q8 delta
+and sets `envDidInterpolate`, which **suppresses** the accumulate for that tick. libxmp
+recomputes `y0 + (y1 - y0)·(x - x0)/(x1 - x0)` from a position that is already one step into
+the segment, and its division truncates toward zero. On `EnvLoops.xm`'s falling release the
+two are 64 and 62 of 64 on the same tick, which is D44's mechanism plus one whole step of
+phase.
+
+**Behaviour chosen.** FastTracker 2's. `openmpt-xm-envloops` waives `volume` and
+`position`; the difference is at most three steps of the 0..64 axis and only while a
+released segment is running.
+
+### D79 — a zero-byte oracle for a module that sounds notes
+
+**Cause.** libxmp's `compare_mixer_data` writes one line per tick per *sounding* channel, so
+a fixture whose whole point is that nothing plays legitimately has a zero-byte `.data` —
+`openmpt/xm/DelayCombination.data` is exactly that and passes with every field enforced.
+`openmpt/xm/PanMemory.data` is zero bytes too, but `PanMemory.xm` sounds two notes at row 4
+and its own comment says they "should be panned hard right". The dump is missing from the
+pinned tree rather than empty on purpose, and the harness's only available reading of a
+zero-byte file — no channel may ever be active — is one the module cannot satisfy.
+
+**Behaviour chosen.** Record it, keep executing it, and leave the reading of an empty dump
+alone: relaxing it would silently disarm `DelayCombination`, which is a real expectation.
+`openmpt-xm-panmemory` is an accepted deviation rather than a known failure because nothing
+about StarPlayer is wrong; the sibling `openmpt-xm-panmemory2`, which OpenMPT calls a more
+thorough check of the same pan memory, passes with every field enforced. Regenerating the
+dump would need libxmp built and run against the pinned tree, which the corpus pin exists to
+avoid.
 
 ## 4. Not offered at all
 

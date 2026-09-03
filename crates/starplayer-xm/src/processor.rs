@@ -45,14 +45,14 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use starplayer_core::quirks::{PatternFlow, QuirkSelection, QuirkSet};
+use starplayer_core::quirks::{QuirkSelection, QuirkSet};
 use starplayer_core::tables::linear_frequency_q24;
 use starplayer_core::{ChannelId, DirtyBits, Frame, I1F15, InstrumentId, Note, SampleId, Step, TempoModel, TempoModelId, U0F16, VoiceParams};
-use starplayer_engine::{EndOfSongPolicy, PatternFlowState, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
+use starplayer_engine::{EndOfSongPolicy, Jump, PatternFlowState, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
 #[cfg(any(feature = "trace", test))]
 use starplayer_engine::TraceChannelState;
 use starplayer_mixer::{LoopSpan, SampleRegion, VoiceTag};
-use starplayer_model::{AutoVibratoWaveform, EffectNames, Envelope, EnvelopePoint, InstrumentDef, LoopMode, Module};
+use starplayer_model::{AutoVibratoWaveform, EffectNames, Envelope, EnvelopePoint, InstrumentDef, LoopMode, Module, PatternId};
 use starplayer_rt::Arc;
 
 use crate::data::XmPatternData;
@@ -63,6 +63,12 @@ use crate::tables::{amiga_period, linear_period, ARPEGGIO_TICK_TABLE, AUTO_VIBRA
 /// Highest instrument number FastTracker 2 will latch. A larger number is read as "no
 /// instrument at all", which is `getNewNote`'s `inst = 0`.
 const MAX_INSTRUMENT: u8 = 128;
+
+/// The fadeout FastTracker 2's placeholder instrument carries — `config.stdFadeout[0]`,
+/// which `allocateInstr` writes into every slot the user never edited (`ft2_replayer.c`
+/// 2718 through `setStdEnvelope`). libxmp names the same number as "unused instruments
+/// have fade 0x80" (`src/read_event.c:580-583`, doubled there for its own 0x10000 range).
+const PLACEHOLDER_FADEOUT: u16 = 0x80;
 
 /// FastTracker 2's fadeout domain. The XM specification says 0..65536; the replayer uses
 /// half of it (`triggerInstrument`: "final fadeout range is in fact 0..32768").
@@ -122,8 +128,18 @@ pub struct XmChannel {
     pub final_period: u16,
     /// `portamentoTargetPeriod`.
     pub portamento_target_period: u16,
-    /// `portamentoSpeed` — already multiplied by four, as FT2 stores it.
+    /// `portamentoSpeed` — already multiplied by four, as FT2 stores it. libxmp calls the
+    /// same thing `xc->porta.memory`: the last non-zero rate either column supplied.
     pub portamento_speed: u16,
+    /// libxmp's `xc->porta.slide` — the rate a tick actually moves the period by.
+    ///
+    /// FastTracker 2 has no such variable: it applies `portamentoSpeed` once for each
+    /// column that asked for a portamento, so the two are always equal there. They differ
+    /// only under
+    /// [`QuirkSet::xm_double_portamento_doubles_volume_column_rate`](starplayer_core::quirks::QuirkSet::xm_double_portamento_doubles_volume_column_rate)
+    /// being off, where a cell's `Mx` and `3xx` each contribute their own rate and the sum
+    /// is applied once.
+    pub portamento_slide: u16,
     /// `portamentoDirection` — 0 arrived, 1 upwards in period, 2 downwards.
     pub portamento_direction: u8,
     /// `semitonePortaMode` — `E3x` glissando.
@@ -278,6 +294,7 @@ impl XmChannel {
             final_period: 0,
             portamento_target_period: 0,
             portamento_speed: 0,
+            portamento_slide: 0,
             portamento_direction: 0,
             glissando: false,
             sample_volume: 0,
@@ -338,18 +355,6 @@ impl XmChannel {
     }
 }
 
-/// FastTracker 2's pattern-loop rules, in the shared [`PatternFlowState`]'s vocabulary.
-///
-/// `patternLoop` keeps a target row and a counter **per channel** and neither is cleared by
-/// a position change, which is libxmp's `FLOW_MODE_GENERIC`. The one addition is
-/// `shared_break`: FT2 spells the loop jump, the position jump and the pattern break all as
-/// writes to the same `song.pBreakPos`, so an `E6x` on a channel to the *right* of a `Bxx`
-/// or `Dxx` overwrites the row that jump chose with its own loop target, while the jump
-/// itself survives in `song.posJumpFlag`. That is `kFT2PatternLoopWithJumps`.
-const fn fast_tracker_flow() -> PatternFlow {
-    PatternFlow { shared_break: true, ..PatternFlow::generic() }
-}
-
 /// The stateful FastTracker 2 effect processor.
 pub struct XmProcessor {
     module: Arc<Module>,
@@ -362,6 +367,17 @@ pub struct XmProcessor {
     /// The replay behaviour this module was loaded with. Resolved once, at construction.
     quirks: QuirkSet,
     flow: PatternFlowState,
+    /// FastTracker 2's `song.pBreakPos` as it survives the pattern it was written in —
+    /// libxmp's `f->jumpline`, which `next_order` consumes and only `next_order` clears.
+    ///
+    /// The pattern loop, the position jump and the pattern break all write one variable in
+    /// FastTracker 2, and `getNextPos` zeroes it only inside the branch a position change
+    /// takes. `patternLoop` writes the **loop target** into it whenever the loop actually
+    /// jumps, so the next pattern that ends *normally* starts on the row an `E60` marked
+    /// rather than at row zero — OpenMPT's `kFT2LoopE60Restart`. Every other writer of that
+    /// variable is followed by a position change on the same row, which consumes and clears
+    /// it, so this field only ever carries a loop target.
+    carried_break_row: u16,
 }
 
 impl XmProcessor {
@@ -386,7 +402,8 @@ impl XmProcessor {
             channels: channels.into_boxed_slice(),
             sample_rate_hz,
             quirks,
-            flow: PatternFlowState::new(fast_tracker_flow(), channel_count),
+            flow: PatternFlowState::new(quirks.xm_pattern_loop.flow(), channel_count),
+            carried_break_row: 0,
         }
     }
 
@@ -470,6 +487,20 @@ impl XmProcessor {
                 if parameter > 0 {
                     self.channels[channel_index].portamento_speed = (parameter as u16) << 6;
                 }
+                let mut slide = self.channels[channel_index].portamento_speed;
+                // A cell carrying both `Mx` and `3xx` never reaches the effect column's
+                // parameter in FastTracker 2 — this branch returns first — so the `Mx`
+                // rate is what both portamento calls of the tick use. ModPlug Tracker,
+                // MadTracker 2 and rst's SoundTracker instead give each column its own
+                // rate and add the two, which libxmp spells as `xc->porta.slide +=` twice
+                // over one shared memory (`src/effects.c:222-229`).
+                if !self.quirks.xm_double_portamento_doubles_volume_column_rate && cell.effect == 3 {
+                    if cell.parameter > 0 {
+                        self.channels[channel_index].portamento_speed = cell.parameter as u16 * 4;
+                    }
+                    slide = slide.saturating_add(self.channels[channel_index].portamento_speed);
+                }
+                self.channels[channel_index].portamento_slide = slide;
                 self.prepare_portamento(channel_index, cell, instrument_column);
                 self.handle_effects_tick_zero(context, channel_index, outcome, row);
                 return;
@@ -478,6 +509,7 @@ impl XmProcessor {
                 if cell.effect != 5 && cell.parameter != 0 {
                     self.channels[channel_index].portamento_speed = cell.parameter as u16 * 4;
                 }
+                self.channels[channel_index].portamento_slide = self.channels[channel_index].portamento_speed;
                 self.prepare_portamento(channel_index, cell, instrument_column);
                 self.handle_effects_tick_zero(context, channel_index, outcome, row);
                 return;
@@ -514,6 +546,40 @@ impl XmProcessor {
         }
 
         self.handle_effects_tick_zero(context, channel_index, outcome, row);
+    }
+
+    /// FastTracker 2's `getNextPos`, in the part the shared [`PatternFlowState`] cannot
+    /// express: what happens when a pattern simply runs out of rows.
+    ///
+    /// `song.pBreakPos` is cleared only where the order advances, so the loop target a
+    /// preceding `E6x` wrote into it is still there when the pattern ends on its own — and
+    /// the next pattern starts on that row. `Jump::break_to_row` is exactly "the next
+    /// order, at this row", so the whole quirk is one jump the processor emits where it
+    /// would otherwise emit none.
+    fn carried_jump(&mut self, jump: Option<Jump>, row: RowRef<'_>) -> Option<Jump> {
+        if !self.quirks.xm_loop_target_becomes_next_break_row {
+            return jump;
+        }
+        match jump {
+            // A pattern loop stays inside the pattern, so nothing consumes the position.
+            Some(jump) if jump.within_pattern => Some(jump),
+            // A break or a position jump carries its own row and clears the variable.
+            Some(jump) => {
+                self.carried_break_row = 0;
+                Some(jump)
+            }
+            None => {
+                let rows = self.module.pattern(PatternId(row.pattern)).map_or(0, |pattern| pattern.rows());
+                if row.row.saturating_add(1) < rows {
+                    return None;
+                }
+                let carried = core::mem::take(&mut self.carried_break_row);
+                match carried {
+                    0 => None,
+                    row => Some(Jump::break_to_row(row)),
+                }
+            }
+        }
     }
 
     /// `preparePortamento` (`ft2_replayer.c` 1315).
@@ -637,10 +703,16 @@ impl XmProcessor {
         self.channels[channel_index].tremor_position = 0;
         self.channels[channel_index].key_off = false;
 
-        let Some(instrument) = self.instrument_of(channel_index) else { return };
-        let volume_enabled = instrument.volume_envelope.is_some();
-        let panning_enabled = instrument.panning_envelope.is_some();
-        let fadeout = instrument.fadeout;
+        // FastTracker 2 never has a null instrument pointer: `triggerNote` parks the
+        // channel on `instr[0]`, the placeholder `allocateInstr` fills with the standard
+        // envelope defaults, whenever the instrument number names a slot the file did not
+        // store. So an out-of-range instrument column still reloads a fadeout — the
+        // placeholder's — and `ft2_instrument_fade_update.xm` is the fixture that sees it,
+        // because the *next* row's instrument-without-note reads the same stale pointer.
+        let instrument = self.instrument_of(channel_index);
+        let volume_enabled = instrument.is_some_and(|instrument| instrument.volume_envelope.is_some());
+        let panning_enabled = instrument.is_some_and(|instrument| instrument.panning_envelope.is_some());
+        let fadeout = instrument.map_or(PLACEHOLDER_FADEOUT, |instrument| instrument.fadeout);
         let auto_vibrato = self.channels[channel_index].sample
             .and_then(|id| self.module.sample(id))
             .map(|sample| sample.auto_vibrato())
@@ -791,11 +863,13 @@ impl XmProcessor {
             // `Bxx` position jump. FT2 stores `param - 1` and lets `getNextPos` increment
             // it, so the destination order is the parameter itself.
             11 => {
+                self.carried_break_row = 0;
                 self.flow.pattern_jump(parameter as u16);
             }
             // `Dxx` pattern break. The parameter is decimal, and one past 63 breaks to row 0.
             13 => {
                 let target = (parameter >> 4) as u16 * 10 + (parameter & 0x0F) as u16;
+                self.carried_break_row = 0;
                 self.flow.pattern_break(if target <= 63 { target } else { 0 });
             }
             // `Exy` — the tick-zero half of the extended commands.
@@ -860,7 +934,16 @@ impl XmProcessor {
                 state.waveform_control = (state.waveform_control & 0xF0) | value;
             }
             // `E6x` pattern loop.
-            6 => self.flow.pattern_loop(channel_index, row, value),
+            6 => {
+                let already_looping = self.flow.looped_this_row();
+                self.flow.pattern_loop(channel_index, row, value);
+                // A loop that actually jumps writes its target into the shared break
+                // position and nothing clears it until the next position change, so the
+                // pattern that ends *after* the loop starts on the loop's target row.
+                if self.quirks.xm_loop_target_becomes_next_break_row && !already_looping && self.flow.looped_this_row() {
+                    self.carried_break_row = self.flow.start(channel_index);
+                }
+            }
             // `E7x` tremolo waveform.
             7 => {
                 let state = &mut self.channels[channel_index];
@@ -1002,6 +1085,11 @@ impl XmProcessor {
             0 => self.arpeggio(channel_index, parameter, speed as u16 - tick),
             1 => self.pitch_slide_up(channel_index, parameter),
             2 => self.pitch_slide_down(channel_index, parameter),
+            // The volume column has already run one portamento this tick. FastTracker 2
+            // runs a second at the same rate — the doubling `Mx` + `3xx` is named for —
+            // where the trackers that give `3xx` its own rate apply the sum once.
+            3 if !self.quirks.xm_double_portamento_doubles_volume_column_rate
+                && self.channels[channel_index].volume_column & 0xF0 == 0xF0 => {}
             3 => self.portamento(channel_index),
             4 => self.vibrato(channel_index, parameter),
             5 => {
@@ -1054,23 +1142,32 @@ impl XmProcessor {
             }
             // `EDx` note delay.
             0xD if tick == value => {
-                {
-                    let latched = self.channels[channel_index].delayed_instrument_and_note;
-                    self.trigger_note(channel_index, (latched & 0xFF) as u8, 0, 0);
-                    if latched >> 8 > 0 {
-                        self.reset_volumes(channel_index);
-                    }
-                    self.trigger_instrument(channel_index);
+                let latched = self.channels[channel_index].delayed_instrument_and_note;
+                let delayed_note = (latched & 0xFF) as u8;
+                let delayed_instrument = (latched >> 8) as u8;
+                self.trigger_note(channel_index, delayed_note, 0, 0);
+                if delayed_instrument > 0 {
+                    self.reset_volumes(channel_index);
+                }
+                self.trigger_instrument(channel_index);
 
-                    let volume_column = self.channels[channel_index].volume_column;
-                    if (0x10..=0x50).contains(&volume_column) {
-                        let volume = volume_column - 16;
-                        let state = &mut self.channels[channel_index];
-                        state.out_volume = volume;
-                        state.real_volume = volume;
-                    } else if (0xC0..=0xCF).contains(&volume_column) {
-                        self.channels[channel_index].out_pan = (volume_column & 0x0F) << 4;
-                    }
+                let volume_column = self.channels[channel_index].volume_column;
+                if (0x10..=0x50).contains(&volume_column) {
+                    let volume = volume_column - 16;
+                    let state = &mut self.channels[channel_index];
+                    state.out_volume = volume;
+                    state.real_volume = volume;
+                } else if (0xC0..=0xCF).contains(&volume_column) && !(delayed_note == NOTE_KEY_OFF && delayed_instrument == 0) {
+                    // `kFT2PanWithDelayedNoteOff`. FastTracker 2 writes `ch->outPan` here
+                    // without raising `CS_UPDATE_PAN`, so the write only becomes audible
+                    // if something else on the same tick raised it — `triggerNote` for a
+                    // real note, `resetVolumes` for an instrument column. A delayed
+                    // key-off with neither leaves the pan where it was, which is what both
+                    // OpenMPT (`Snd_fx.cpp:2802`) and libxmp (`read_event.c:511-518`)
+                    // model by deleting the volume column outright. The one place the two
+                    // spellings could still disagree is a channel whose panning envelope
+                    // raises the flag every tick; no corpus case has one.
+                    self.channels[channel_index].out_pan = (volume_column & 0x0F) << 4;
                 }
             }
             _ => {}
@@ -1240,13 +1337,13 @@ impl XmProcessor {
         }
         let state = &mut self.channels[channel_index];
         if state.portamento_direction > 1 {
-            state.real_period = state.real_period.wrapping_sub(state.portamento_speed);
+            state.real_period = state.real_period.wrapping_sub(state.portamento_slide);
             if (state.real_period as i16) <= (state.portamento_target_period as i16) {
                 state.portamento_direction = 1;
                 state.real_period = state.portamento_target_period;
             }
         } else {
-            state.real_period = state.real_period.wrapping_add(state.portamento_speed);
+            state.real_period = state.real_period.wrapping_add(state.portamento_slide);
             if state.real_period >= state.portamento_target_period {
                 state.portamento_direction = 1;
                 state.real_period = state.portamento_target_period;
@@ -1643,7 +1740,8 @@ impl XmProcessor {
                 let offset = self.channels[channel_index].sample_start_frame;
                 // `kFT2ST3OffsetOutOfRange`: a `9xx` past the end of the sample stops the
                 // channel outright, and the note is not picked up by a later portamento.
-                if offset >= sample.length_frames() {
+                // Skale Tracker does not emulate it, which is the `QuirkSet` field.
+                if self.quirks.xm_offset_past_sample_end_stops_channel && offset >= sample.length_frames() {
                     self.channels[channel_index].note_number = 0;
                     self.channels[channel_index].sounding_instrument = 0;
                     context.stop_channel(channel_id);
@@ -1907,7 +2005,7 @@ impl TrackerProcessor for XmProcessor {
             self.update_volume_pan_auto_vibrato(channel_index);
             self.flush_channel(context, channel_index);
         }
-        outcome.jump = self.flow.jump();
+        outcome.jump = self.carried_jump(self.flow.jump(), row);
         #[cfg(feature = "trace")]
         self.report_trace_channels(context);
         outcome
@@ -1942,6 +2040,7 @@ impl TrackerProcessor for XmProcessor {
             *channel = XmChannel::new();
         }
         self.flow.reset();
+        self.carried_break_row = 0;
     }
 }
 
@@ -1982,7 +2081,7 @@ mod tests {
     use super::*;
     use alloc::vec;
     use starplayer_core::{Frame, RowClock};
-    use starplayer_engine::{ChannelTable, Jump, SongPosition};
+    use starplayer_engine::{ChannelTable, SongPosition};
     use starplayer_mixer::VoicePool;
     use starplayer_model::{
         AutoVibrato, AutoVibratoWaveform, EnvelopeSpan, InstrumentDef, ModuleBuilder, ModuleFlags, ModuleFormat, ModuleHeader, NOTE_MAP_LENGTH, SampleSpec,
@@ -2318,6 +2417,98 @@ mod tests {
             let outcome = harness.row(&[effect(0x0E, 0x62), XmCell::EMPTY]);
             assert_eq!(outcome.jump == Some(Jump::within_pattern_to_row(2)), expected);
         }
+    }
+
+    #[test]
+    fn a_pattern_loops_target_row_starts_the_next_pattern() {
+        // `kFT2LoopE60Restart`: `patternLoop` writes the loop target into the same
+        // `song.pBreakPos` a pattern break writes, and `getNextPos` clears it only in the
+        // branch a position change takes — so the pattern that ends *after* a loop begins
+        // on the loop's target row instead of row zero.
+        let mut harness = Harness::new(processor());
+        harness.row = 1;
+        let _ = harness.row(&[effect(0x0E, 0x60), XmCell::EMPTY]);
+        harness.row = 2;
+        assert_eq!(harness.row(&[effect(0x0E, 0x61), XmCell::EMPTY]).jump, Some(Jump::within_pattern_to_row(1)), "the loop itself jumps inside the pattern");
+        harness.row = 3;
+        assert_eq!(harness.row(&[XmCell::EMPTY, XmCell::EMPTY]).jump, Some(Jump::break_to_row(1)), "the last row hands the loop target to the next pattern");
+        assert_eq!(harness.row(&[XmCell::EMPTY, XmCell::EMPTY]).jump, None, "and the position change consumed it");
+    }
+
+    #[test]
+    fn a_break_clears_the_carried_loop_target_and_another_tracker_never_sets_it() {
+        let mut harness = Harness::new(processor());
+        harness.row = 1;
+        let _ = harness.row(&[effect(0x0E, 0x60), XmCell::EMPTY]);
+        harness.row = 2;
+        let _ = harness.row(&[effect(0x0E, 0x61), XmCell::EMPTY]);
+        harness.row = 3;
+        assert_eq!(harness.row(&[effect(0x0D, 0x00), XmCell::EMPTY]).jump, Some(Jump::break_to_row(0)), "`Dxx` writes the same variable");
+        assert_eq!(harness.row(&[XmCell::EMPTY, XmCell::EMPTY]).jump, None, "so the loop target is gone");
+
+        let quirks = QuirkSelection::Override(QuirkSet::other_xm_tracker());
+        let mut harness = Harness::new(XmProcessor::with_quirks(plain_module(), 44_100, quirks));
+        harness.row = 1;
+        let _ = harness.row(&[effect(0x0E, 0x60), XmCell::EMPTY]);
+        harness.row = 2;
+        let _ = harness.row(&[effect(0x0E, 0x61), XmCell::EMPTY]);
+        harness.row = 3;
+        assert_eq!(harness.row(&[XmCell::EMPTY, XmCell::EMPTY]).jump, None, "no `QUIRK_FT2BUGS`, no carried break position");
+    }
+
+    #[test]
+    fn a_volume_column_portamento_next_to_a_3xx_doubles_only_for_fast_tracker_two() {
+        let porta = XmCell { note: 61, instrument: 0, volume: 0xF1, effect: 3, parameter: 0x14 };
+        let mut harness = Harness::new(processor());
+        let _ = harness.row(&[note(49, 1), XmCell::EMPTY]);
+        let _ = harness.row(&[porta, XmCell::EMPTY]);
+        assert_eq!(harness.channel(0).portamento_slide, 64, "`M1` alone — one shifted left by six — and the `3xx` parameter never reaches the channel");
+        let _ = harness.tick();
+        assert_eq!(harness.channel(0).real_period, 4608 - 2 * 64, "FastTracker 2 applies the `Mx` rate once per column");
+
+        let quirks = QuirkSelection::Override(QuirkSet::other_xm_tracker());
+        let mut harness = Harness::new(XmProcessor::with_quirks(plain_module(), 44_100, quirks));
+        let _ = harness.row(&[note(49, 1), XmCell::EMPTY]);
+        let _ = harness.row(&[porta, XmCell::EMPTY]);
+        assert_eq!(harness.channel(0).portamento_slide, 64 + 0x14 * 4, "each column contributes its own rate");
+        assert_eq!(harness.channel(0).portamento_speed, 0x14 * 4, "and the shared memory keeps the last non-zero parameter");
+        let _ = harness.tick();
+        assert_eq!(harness.channel(0).real_period, 4608 - (64 + 0x14 * 4), "applied once");
+    }
+
+    #[test]
+    fn a_delayed_key_off_next_to_a_volume_column_pan_leaves_the_pan_alone() {
+        // `kFT2PanWithDelayedNoteOff`: `noteDelay` writes `ch->outPan` without raising
+        // `CS_UPDATE_PAN`, and a key-off reaches neither `triggerNote` nor `resetVolumes`,
+        // which are the two things that would have raised it.
+        let mut harness = Harness::new(processor());
+        let _ = harness.row(&[note(49, 1), XmCell::EMPTY]);
+        let before = harness.channel(0).out_pan;
+        let _ = harness.row(&[XmCell { note: NOTE_KEY_OFF, instrument: 0, volume: 0xC8, effect: 0x0E, parameter: 0xD1 }, XmCell::EMPTY]);
+        let _ = harness.tick();
+        assert_eq!(harness.channel(0).out_pan, before, "the delayed key-off swallows the volume column's pan");
+
+        let mut harness = Harness::new(processor());
+        let _ = harness.row(&[note(49, 1), XmCell::EMPTY]);
+        let _ = harness.row(&[XmCell { note: NOTE_KEY_OFF, instrument: 1, volume: 0xC8, effect: 0x0E, parameter: 0xD1 }, XmCell::EMPTY]);
+        let _ = harness.tick();
+        assert_eq!(harness.channel(0).out_pan, 0x80, "an instrument column raises the flag again, so the pan lands");
+    }
+
+    #[test]
+    fn an_out_of_range_instrument_reloads_the_placeholders_fadeout() {
+        // `ft2_instrument_fade_update.xm`: `triggerNote` parks the channel on `instr[0]`
+        // when the instrument number names a slot the file does not hold, and the *next*
+        // instrument-without-note row reads that stale pointer rather than its own number.
+        let mut harness = Harness::new(XmProcessor::new(module(None, None, 4095, AutoVibrato::default()), 44_100));
+        let _ = harness.row(&[note(49, 1), XmCell::EMPTY]);
+        assert_eq!(harness.channel(0).fadeout_speed, 4095, "the module's own instrument");
+        let _ = harness.row(&[note(49, 19), XmCell::EMPTY]);
+        assert_eq!(harness.channel(0).fadeout_speed, PLACEHOLDER_FADEOUT, "instrument 19 does not exist");
+        let _ = harness.row(&[XmCell { instrument: 1, ..XmCell::EMPTY }, XmCell::EMPTY]);
+        assert_eq!(harness.channel(0).fadeout_speed, PLACEHOLDER_FADEOUT, "an instrument column with no note keeps the stale pointer");
+        let _ = harness.row(&[note(49, 1), XmCell::EMPTY]);
+        assert_eq!(harness.channel(0).fadeout_speed, 4095, "a note is what moves the pointer");
     }
 
     #[test]
