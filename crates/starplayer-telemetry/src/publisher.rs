@@ -3,7 +3,7 @@
 use starplayer_core::{ChannelId, I1F15, Note, U0F16, VoiceId};
 use starplayer_rt::{DEFAULT_SNAPSHOT_DEPTH, SnapshotPublisher, SnapshotReader, snapshot_channel};
 
-use crate::snapshot::{EffectDisplay, MAX_CHANNELS, Snapshot, TransportState, WarningFlags};
+use crate::snapshot::{EffectDisplay, MAX_CHANNELS, Snapshot, SongEnd, TransportState, WarningFlags};
 use crate::vu::VuMeter;
 
 /// One channel's live state for one tick, as the engine reads it off the voice pool.
@@ -111,6 +111,18 @@ impl TelemetryPublisher {
     pub fn set_timing(&mut self, speed: u8, tempo_bpm: u16) {
         self.working.transport.speed = speed;
         self.working.transport.tempo_bpm = tempo_bpm;
+    }
+
+    /// The song clock: elapsed frames into this pass, the length of a pass, how the song
+    /// ends, and whether the loop point has been passed.
+    ///
+    /// All four come from the sequencer's scanned [`SongTimeline`](https://docs.rs/starplayer-engine);
+    /// with no timeline installed they are zero, zero, [`SongEnd::Unknown`] and false.
+    pub fn set_song_clock(&mut self, song_frame: u64, song_length_frames: u64, song_end: SongEnd, end_reached: bool) {
+        self.working.transport.song_frame = song_frame;
+        self.working.transport.song_length_frames = song_length_frames;
+        self.working.transport.song_end = song_end;
+        self.working.transport.end_reached = end_reached;
     }
 
     /// The module's global volume (`Vxx`).
@@ -287,13 +299,29 @@ mod tests {
 
         publisher.set_position(2, 7, 13, 4);
         publisher.set_timing(6, 125);
+        publisher.set_song_clock(88_200, 1_764_000, SongEnd::Loops, false);
         publisher.set_channel_count(4);
         publisher.set_voices_active(3);
         assert!(publisher.publish());
 
         let snapshot = reader.read();
         assert_eq!(snapshot.sequence, 1);
-        assert_eq!(snapshot.transport, TransportState { order: 2, pattern: 7, row: 13, tick: 4, speed: 6, tempo_bpm: 125, global_volume: U0F16::MAX });
+        assert_eq!(
+            snapshot.transport,
+            TransportState {
+                order: 2,
+                pattern: 7,
+                row: 13,
+                tick: 4,
+                speed: 6,
+                tempo_bpm: 125,
+                global_volume: U0F16::MAX,
+                song_frame: 88_200,
+                song_length_frames: 1_764_000,
+                song_end: SongEnd::Loops,
+                end_reached: false,
+            }
+        );
         assert_eq!(snapshot.channel_count, 4);
         assert_eq!(snapshot.voices_active, 3);
         assert_eq!(snapshot.active_channels().len(), 4);

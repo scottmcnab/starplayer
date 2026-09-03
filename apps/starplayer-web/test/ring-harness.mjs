@@ -11,13 +11,17 @@ assert.equal(Ring.pushCommand(commands, Ring.OPCODE_PLAY, 0, 0), true);
 assert.equal(Ring.pushCommand(commands, Ring.OPCODE_SEEK_ORDER, 17, 0), true);
 assert.equal(Ring.pushCommand(commands, Ring.OPCODE_MASTER_VOLUME, 32768, 0), true);
 assert.equal(Ring.pushCommand(commands, Ring.OPCODE_SET_MIXER_MODE, 0x0000_0261, 0), true);
+assert.equal(Ring.pushCommand(commands, Ring.OPCODE_SEEK_FRAME, 441000, 0), true);
+assert.equal(Ring.pushCommand(commands, Ring.OPCODE_AT_END, Ring.AT_END_FADE_OUT, 480000), true);
 const received = [];
-assert.equal(Ring.drainCommands(commands, (...record) => received.push(record)), 4);
+assert.equal(Ring.drainCommands(commands, (...record) => received.push(record)), 6);
 assert.deepEqual(received, [
     [Ring.OPCODE_PLAY, 0, 0],
     [Ring.OPCODE_SEEK_ORDER, 17, 0],
     [Ring.OPCODE_MASTER_VOLUME, 32768, 0],
     [Ring.OPCODE_SET_MIXER_MODE, 0x0000_0261, 0],
+    [Ring.OPCODE_SEEK_FRAME, 441000, 0],
+    [Ring.OPCODE_AT_END, Ring.AT_END_FADE_OUT, 480000],
 ]);
 
 const sourceWords = new Int32Array(Ring.SNAPSHOT_WORDS);
@@ -32,13 +36,17 @@ sourceWords[9] = 125;
 sourceWords[16] = 40000;
 sourceWords[17] = 2;
 sourceWords[18] = 0x0000_0261;
-sourceWords[19] = 48;
-sourceWords[20] = 1;
-sourceWords[21] = 65535;
-sourceWords[23] = 8;
-sourceWords[24] = 0x42;
-sourceWords[25] = 50000;
-sourceWords[26] = 1;
+sourceWords[19] = 441000;
+sourceWords[20] = 8_820_000;
+sourceWords[21] = Ring.SONG_FLAG_LENGTH_KNOWN | Ring.SONG_FLAG_LOOPS;
+// The first channel's eight words start straight after the 22-word header.
+sourceWords[22] = 48;
+sourceWords[23] = 1;
+sourceWords[24] = 65535;
+sourceWords[26] = 8;
+sourceWords[27] = 0x42;
+sourceWords[28] = 50000;
+sourceWords[29] = 1;
 
 const telemetry = Ring.createTelemetry();
 Ring.publishTelemetry(telemetry, sourceWords, 18_000_000, 128, 0, 99);
@@ -50,6 +58,12 @@ assert.equal(snapshot.row, 12);
 assert.equal(snapshot.masterPeak, 40000);
 assert.equal(snapshot.retiredCollected, 2);
 assert.equal(snapshot.mixerModeWire, 0x0000_0261);
+assert.equal(snapshot.songFrame, 441000);
+assert.equal(snapshot.songLengthFrames, 8_820_000);
+assert.equal(snapshot.songFlags & Ring.SONG_FLAG_LENGTH_KNOWN, Ring.SONG_FLAG_LENGTH_KNOWN);
+assert.equal(snapshot.songFlags & Ring.SONG_FLAG_LOOPS, Ring.SONG_FLAG_LOOPS);
+assert.equal(snapshot.songFlags & Ring.SONG_FLAG_END_REACHED, 0);
+assert.equal(snapshot.songFlags & Ring.SONG_FLAG_FADING, 0);
 assert.equal(snapshot.channels[0].note, 48);
 assert.equal(snapshot.channels[0].effectCode, 8);
 assert.equal(snapshot.memoryBytes, 18_000_000);

@@ -180,6 +180,7 @@ bitflags! {
 // (3) Control plane. SPSC, its own enum, never on the timeline.
 pub enum Command {
     LoadModule(Arc<Module>), Play, Stop, SeekOrder(u16), SeekRow(u16),
+    SeekFrame(u64), SetAtEnd(AtEnd),
     SetMasterVolume(U0F16), MuteChannel { channel: ChannelId, muted: bool },
     SetInterpolator(Interpolator), SetTempoModel(TempoModelId),
 }
@@ -363,6 +364,61 @@ where every cross-format bug would live.
 `Axx` mid-row changes `speed` while `tick_in_row` is already past it. The wrap rule is
 stated explicitly per format rather than falling out of modulo arithmetic by accident.
 
+### 4.1 How long is a song? The loop detector and the song clock (M3-D1)
+
+A module does not declare its length, and no arithmetic over the file can recover one:
+order lists wrap, `Bxx` jumps backwards, `SBx`/`E6x` revisit rows, `Txx`/`Axx` change how
+long a tick lasts mid-song. The only way to know is to play it.
+
+`starplayer-engine::timeline` therefore plays it, **with the real sequencer and the real
+format processor and no mixing**. `scan_timeline` drives a throwaway `PatternSequencer`
+tick by tick and records a `RowMark { order, pattern, row, frame, speed, tempo_bpm }` the
+first time each row is reached; the result is a `SongTimeline` — the marks in play order,
+a per-order index, the length of one pass, and *how* it ends (`Looped { target }`,
+`Stopped`, `Budget`). The comparison is OpenMPT's `GetLength`/`RowVisitor` and libxmp's
+`scan_module`, both of which run a *simplified* replay; running the real one instead means
+the timeline is correct by construction under every quirk, dialect and tempo model, with
+no second player to drift out of step.
+
+The same `LoopDetector` then rides in the **live** sequencer, so "the song has been heard
+once through" fires on exactly the frame the scan predicted. It is a bitset over
+`(order, row)` sized when the sequencer is built — never in `dispatch` — consulted once at
+the first tick of every row, before the tick runs:
+
+* the sequencer records **how** it reached the row (`RowArrival`: `Start`, `Sequential`,
+  `NextOrder`, `Jump`, `PatternLoop`, `Wrapped`);
+* `PatternLoop` sets `inside_loop`, every arrival but `Sequential` clears it;
+* every row is **marked**, but the "have I been here before?" question is only **asked**
+  when not inside a pattern loop. That is what lets an `E6x` body repeat four times
+  without ending the song while a `Bxx` back to an earlier order ends it immediately;
+* a pattern-loop arrival budget catches the constructions that loop for ever inside one
+  pattern, including a stuck ProTracker counter.
+
+**`EndOfSongPolicy` and `AtEnd` answer different questions**, and conflating them is the
+mistake this split exists to avoid. `EndOfSongPolicy` says what *the end of the order
+list* means, which is a property of the module and its format: a MOD wraps, an S3M's
+`0xFF` is a real end. `AtEnd { Continue, Stop, FadeOut }` says what the *host* wants once
+the song has been heard through once — the media player's repeat button — and it is
+answered by the loop detector, not by the order list. `AtEnd` is inert until a host
+installs a timeline, so a sequencer without one behaves exactly as it did before any of
+this existed.
+
+The **song clock** is one signed offset, `song_origin`, and `song_frame(now) = now −
+song_origin`. Wrapping under `Continue` rebases the origin onto the loop point rather than
+resetting a counter, so elapsed time drops back to the top of the repeating section and
+the progress slider stays honest across a loop. It is signed because seeking to the middle
+of a song on an engine whose monotonic clock has only just started puts the origin before
+frame zero, and a saturating `Frame` would quietly report that seek as "at the beginning".
+
+`seek_frame(song_frame, now)` resolves a frame to a row through the timeline's binary
+search, seeks there, and restores that row's **speed and tempo** — and nothing else. Global
+volume (`Vxx`), effect memories and sample positions are whatever `TrackerProcessor::reset`
+leaves them. That is a deliberate, documented limitation and not an oversight: OpenMPT's
+`eAdjust` replays global state up to the seek target, and matching it is a separate piece
+of work. On seek the detector is reset and every row the scan reached *before* the target
+is re-marked, so the loop point after a seek is the canonical one rather than wherever the
+seek happened to land.
+
 ---
 
 ## 5. Channels, voices, instruments
@@ -525,8 +581,10 @@ applied with the mixer's own `HostSample` conversions and `Dither` after the out
 and before the buffer the audio callback reads. That gives five depths on every arm without
 forty instantiations, and leaves the fixed path's native `i16` untouched at `I16` depth, so
 the golden bit-exact path stays bit-exact. Switching mode is a rebuild performed off the
-render path, keeping the same `Arc<Module>`, seeking the rebuilt sequencer to the order that
-was sounding and restarting its clock at the new engine's frame.
+render path, keeping the same `Arc<Module>` and the scan of it (§4.1 — a song timeline
+depends on the output rate and the module's dialect, not on the mixer mode), seeking the
+rebuilt sequencer to the song frame that was sounding and restarting its clock at the new
+engine's frame.
 
 SIMD (via `core::simd` behind a feature) is an optimisation *inside* the monomorphised
 loop, never a semantic change. A scalar-equivalence test gates it.
@@ -760,8 +818,10 @@ A4 carried one command (`SetFrequency`) and one scalar back. B7 kept both transp
 both shapes and widened them, without changing the decisions above.
 
 **Commands** are fixed three-word records — opcode, argument, extra — in the same SPSC
-ring, covering play, stop, seek order, seek row, master volume, channel mute and
-`SET_MIXER_MODE` (opcode 7, argument = `MixerMode::to_wire()`). The worklet decodes each
+ring, covering play, stop, seek order, seek row, master volume, channel mute,
+`SET_MIXER_MODE` (opcode 7, argument = `MixerMode::to_wire()`), `SEEK_FRAME` (opcode 8,
+argument = a song frame) and `AT_END` (opcode 9, argument `0` fade out / `1` continue /
+`2` stop, `extra` = the fade length in frames). The worklet decodes each
 record into a `starplayer_core::Command` and stages it in a fixed-capacity queue drained
 immediately before `Engine::render`, so the JavaScript edge never touches the engine's own
 control ring. On the fallback path the page batches every control change made during one
@@ -771,10 +831,13 @@ rebuilding a typed engine allocates (§7.1), so whichever drain sees it only ret
 scalar, and the rebuild runs in a worklet message task — the page follows a ring push with
 a `flushCommands` message to provide one.
 
-**Snapshots** cross as a flat `Int32Array`: a 19-word header (sequence, dropped publishes,
+**Snapshots** cross as a flat `Int32Array`: a 22-word header (sequence, dropped publishes,
 channel count, voices, order, pattern, row, tick, speed, BPM, global volume, warning bits,
 engine frame, pending garbage, module generation, playing, master peak, retired modules,
-**active mixer mode**) then eight words per channel for all 64. The mode word is what the
+**active mixer mode**, song frame, song length in frames, song flags) then eight words per
+channel for all 64. The last three arrived with the song timeline (§4.1): the song flags
+are bit 0 length known, bit 1 ends by looping, bit 2 loop point reached, bit 3 transport
+fading. The mode word is what the
 host actually built rather than what was requested, so the page can show the difference. The seqlock is the page's; the worklet copies the
 whole block between an odd and an even sequence store. What does **not** cross is
 `EffectDisplay::name` — a `&'static str` has no meaning in another address space, let alone

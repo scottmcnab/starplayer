@@ -68,6 +68,7 @@ pub mod sequencer;
 pub mod source;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
+pub mod timeline;
 #[cfg(feature = "trace")]
 pub mod trace;
 
@@ -84,10 +85,14 @@ pub use engine::{
 pub use mixer_mode::{MixPathKind, MixerMode, OutputDepth};
 pub use ring::OutputRing;
 pub use sequencer::{
-    EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, SequencerSettings, SongPosition,
-    TickContext, TickOutcome, TraceChannelState, TrackerProcessor,
+    EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, RowVisit, SequencerSettings,
+    SongPosition, TickContext, TickOutcome, TraceChannelState, TrackerProcessor,
 };
 pub use source::{EngineContext, EventSource, ScriptedAction, ScriptedSource, SilentSource, SourceMux, SourceSlot};
+pub use timeline::{
+    EndReason, LoopDetector, MAX_PATTERN_LOOP_ARRIVALS, MAX_ROWS_PER_ORDER, RowArrival, RowMark, ScanLimits,
+    SongTimeline, Visit, scan_timeline,
+};
 #[cfg(feature = "trace")]
 pub use trace::{TRACE_FORMAT_VERSION, Trace, TraceChannel, TraceTick};
 

@@ -34,11 +34,12 @@
 //! *decoding* is not here either: the sequencer hands the processor the row's packed bytes
 //! in the format's own encoding and never looks inside them.
 
-use starplayer_core::{ChannelId, DirtyBits, Frame, FrameClock, Note, RowAdvance, RowClock, TempoModel, U0F16, VoiceId, VoiceParam, VoiceParams};
+use starplayer_core::{AtEnd, ChannelId, DirtyBits, Frame, FrameClock, Note, RowAdvance, RowClock, TempoModel, U0F16, VoiceId, VoiceParam, VoiceParams};
 use starplayer_mixer::{SampleRegion, VoicePool, VoiceTag};
 
 use crate::channel::ChannelTable;
 use crate::source::{EngineContext, EventSource};
+use crate::timeline::{LoopDetector, RowArrival, RowMark, SongTimeline, Visit};
 
 // ── the module's pattern data, abstractly ───────────────────────────────────────────
 
@@ -493,6 +494,12 @@ pub trait TrackerProcessor {
 // ── the sequencer ───────────────────────────────────────────────────────────────────
 
 /// What happens when the order list runs out.
+///
+/// A property of the **module and its format**: MOD and MTM order lists wrap, an S3M's
+/// `0xFF` marker is a real end. It is not the same question as
+/// [`AtEnd`](starplayer_core::AtEnd), which says what the *host* wants once the song has
+/// been heard through once — that one is answered by the loop detector rather than by the
+/// order list, and it is what a media player's repeat button sets.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EndOfSongPolicy {
     /// Go back to the restart order and keep playing, raising
@@ -562,6 +569,45 @@ pub struct PatternSequencer<Tempo: TempoModel, Processor: TrackerProcessor, Data
     sounding_position: SongPosition,
     /// The `_MActualTick` half of the same snapshot: the tick within that row.
     sounding_tick: u16,
+    /// The (order, row) bitset that answers "has this song been heard through once?".
+    /// Allocated here, never in `dispatch`.
+    detector: LoopDetector,
+    /// The scanned shape of the song, when a host has installed one.
+    timeline: Option<SongTimeline>,
+    /// The engine frame the current pass through the song started at. `song_frame` is
+    /// measured from here, so wrapping at the loop point rebases it rather than resetting
+    /// any clock.
+    ///
+    /// Signed, and deliberately so: seeking to the middle of a song on an engine whose
+    /// monotonic clock has only just started puts the origin *before* frame zero, and a
+    /// saturating `Frame` would quietly report the seek as "at the beginning".
+    song_origin: i64,
+    /// What the host wants to happen at the detected loop point.
+    at_end: AtEnd,
+    /// Whether the loop point has been passed. Cleared at the next row under
+    /// [`AtEnd::Continue`], sticky until a seek otherwise.
+    end_reached: bool,
+    /// How the current row was reached — what the detector needs to tell a pattern loop
+    /// from the song coming round again.
+    last_arrival: RowArrival,
+    /// What the detector made of the row that started on this tick, for the scan to
+    /// record. Cleared at the top of every dispatch.
+    last_row_visit: Option<RowVisit>,
+}
+
+/// What the loop detector made of one row, and the mark that describes it.
+///
+/// [`scan_timeline`](crate::timeline::scan_timeline) reads this after each dispatch; it is
+/// the only channel between the live detector and the scan, so the two cannot disagree
+/// about where a song ends.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RowVisit {
+    /// What the detector decided.
+    pub visit: Visit,
+    /// How the row was reached.
+    pub arrival: RowArrival,
+    /// The row, its song frame, and the timing it began with.
+    pub mark: RowMark,
 }
 
 impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternSequencer<Tempo, Processor, Data> {
@@ -570,6 +616,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// If the order list has no playable entry at all the sequencer starts stopped, which
     /// is the only safe answer for a module that a fuzzer produced.
     pub fn new(tempo_model: Tempo, data: Data, processor: Processor, settings: SequencerSettings) -> PatternSequencer<Tempo, Processor, Data> {
+        let detector = LoopDetector::new(&data);
         let mut sequencer = PatternSequencer {
             clock: FrameClock::new(tempo_model, settings.sample_rate_hz, settings.first_tick_frame),
             processor,
@@ -584,11 +631,21 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             song_looped: false,
             sounding_position: SongPosition::default(),
             sounding_tick: 0,
+            detector,
+            timeline: None,
+            song_origin: settings.first_tick_frame.0 as i64,
+            at_end: AtEnd::default(),
+            end_reached: false,
+            last_arrival: RowArrival::Start,
+            last_row_visit: None,
         };
         if !sequencer.move_to_order(settings.restart_order, 0) {
             sequencer.state = SequencerState::Stopped;
         }
         sequencer.song_looped = false;
+        // `move_to_order` may have reported a wrap on the way in; a song that has not
+        // started yet has not come round again.
+        sequencer.last_arrival = RowArrival::Start;
         sequencer
     }
 
@@ -648,8 +705,54 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// The module's pattern data.
     pub const fn data(&self) -> &Data { &self.data }
 
+    /// The output rate the tick clock converts against.
+    pub fn sample_rate_hz(&self) -> u32 { self.clock.sample_rate_hz() }
+
     /// Stop the song. No further ticks; sounding voices ring out.
     pub fn stop(&mut self) { self.state = SequencerState::Stopped; }
+
+    // ── the song clock ──────────────────────────────────────────────────────────────
+
+    /// Install the scanned shape of this song.
+    ///
+    /// Everything the song clock reports — elapsed position, total length, the loop point
+    /// — comes from here, so a sequencer without one behaves exactly as it did before this
+    /// existed. Off the audio thread: the timeline owns heap vectors, and replacing one
+    /// drops the old.
+    pub fn set_timeline(&mut self, timeline: SongTimeline) { self.timeline = Some(timeline); }
+
+    /// The installed timeline, if any.
+    pub const fn timeline(&self) -> Option<&SongTimeline> { self.timeline.as_ref() }
+
+    /// Choose what happens at the detected loop point.
+    pub const fn set_at_end(&mut self, at_end: AtEnd) { self.at_end = at_end; }
+
+    /// What happens at the detected loop point.
+    pub const fn at_end(&self) -> AtEnd { self.at_end }
+
+    /// How far into the song `now` is, in frames — the elapsed position a progress slider
+    /// draws. Clamped at zero, so a frame before the current pass reads as its start.
+    pub const fn song_frame(&self, now: Frame) -> u64 {
+        let elapsed = (now.0 as i64).saturating_sub(self.song_origin);
+        if elapsed < 0 { 0 } else { elapsed as u64 }
+    }
+
+    /// One pass of the song in frames, when a timeline says how long that is.
+    pub fn song_length_frames(&self) -> Option<u64> { self.timeline.as_ref().map(SongTimeline::end_frame) }
+
+    /// Whether the song has passed its detected loop point.
+    ///
+    /// Cleared at the next row under [`AtEnd::Continue`]; sticky until a seek under
+    /// [`AtEnd::FadeOut`], which is what lets a host arm a multi-second fade from it.
+    pub const fn end_reached(&self) -> bool { self.end_reached }
+
+    /// How the current row was reached.
+    pub const fn last_arrival(&self) -> RowArrival { self.last_arrival }
+
+    /// What the loop detector made of the row that started on the tick just dispatched, or
+    /// `None` if that tick did not start a row. Read by
+    /// [`scan_timeline`](crate::timeline::scan_timeline).
+    pub const fn last_row_visit(&self) -> Option<RowVisit> { self.last_row_visit }
 
     /// Jump to an order-list index, from its first row, and resume if stopped.
     ///
@@ -657,13 +760,43 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// resolve **leaves the cursor where it was** and does not apply the end-of-song
     /// policy: a host asking for order 99 of a twelve-order module has made a mistake, and
     /// silently looping the song back to the start would hide it.
-    pub fn seek_order(&mut self, order: u16) -> bool {
-        let Some((order, pattern)) = self.resolve_order(order) else { return false };
-        self.set_position(order, pattern, 0);
-        self.pending_jump = None;
-        self.processor.reset();
-        self.state = SequencerState::Ready;
+    pub fn seek_order(&mut self, order: u16) -> bool { self.seek_order_row(order, 0) }
+
+    /// [`PatternSequencer::seek_order`], and rebase the song clock so that the elapsed
+    /// position at `now` is the one the scan recorded for that order.
+    ///
+    /// The two are separate because the sequencer does not know what "now" is: `now` is a
+    /// frame on the engine's monotonic timeline, which only the host holds. An order the
+    /// scan never reached — an unreachable "hidden" order — seeks fine and starts the
+    /// elapsed clock from zero.
+    pub fn seek_order_at(&mut self, order: u16, now: Frame) -> bool {
+        if !self.seek_order_row(order, 0) {
+            return false;
+        }
+        self.song_origin = self.rebased_origin(now, self.position.order, self.position.row);
         true
+    }
+
+    /// Seek to an elapsed position in the song, in frames from the start of the current
+    /// pass, and report the row that lands on.
+    ///
+    /// Needs a timeline: without one there is nothing that maps a frame to a row, and the
+    /// seek fails rather than guessing. `now` is the frame on the engine's monotonic
+    /// timeline the seek takes effect at — the host follows this with
+    /// [`PatternSequencer::restart_clock_at`] at the same frame.
+    ///
+    /// **What is restored is the speed and the tempo, and nothing else.** The row's
+    /// effects re-run from its first tick, but global volume (`Vxx`), effect memories and
+    /// sample positions are whatever a fresh
+    /// [`TrackerProcessor::reset`] leaves them — this is not OpenMPT's `eAdjust` full
+    /// state replay.
+    pub fn seek_frame(&mut self, song_frame: u64, now: Frame) -> Option<RowMark> {
+        let mark = *self.timeline.as_ref()?.mark_at_frame(song_frame)?;
+        if !self.seek_order_row(mark.order, mark.row) {
+            return None;
+        }
+        self.song_origin = (now.0 as i64).saturating_sub(mark.frame as i64);
+        Some(mark)
     }
 
     /// Jump to a row of the pattern already playing, and resume if stopped.
@@ -674,6 +807,41 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         self.pending_jump = None;
         self.processor.reset();
         self.state = SequencerState::Ready;
+        self.begin_seeked_row();
+    }
+
+    /// The shared body of every seek that names an order: resolve it, reposition, drop the
+    /// replay state a discontinuity must not carry, and restore the scanned timing.
+    fn seek_order_row(&mut self, order: u16, row: u16) -> bool {
+        let Some((order, pattern)) = self.resolve_order(order) else { return false };
+        self.set_position(order, pattern, row);
+        self.pending_jump = None;
+        self.processor.reset();
+        self.state = SequencerState::Ready;
+        self.begin_seeked_row();
+        true
+    }
+
+    /// What every seek does once the cursor has moved: the song starts afresh from here,
+    /// the loop detector forgets everything after here, and the row begins with the timing
+    /// the scan saw.
+    fn begin_seeked_row(&mut self) {
+        self.last_arrival = RowArrival::Start;
+        self.end_reached = false;
+        self.detector.reset();
+        let Some(timeline) = self.timeline.take() else { return };
+        if let Some(mark) = timeline.mark_at(self.position.order, self.position.row).copied() {
+            self.tempo_bpm = mark.tempo_bpm;
+            self.row_clock.start_row(mark.speed);
+            self.detector.reset_marking_before(&timeline, mark.frame);
+        }
+        self.timeline = Some(timeline);
+    }
+
+    /// The song origin that puts `(order, row)` at the elapsed position the scan gave it.
+    fn rebased_origin(&self, now: Frame, order: u16, row: u16) -> i64 {
+        let scanned = self.timeline.as_ref().and_then(|timeline| timeline.frame_at(order, row)).unwrap_or(0);
+        (now.0 as i64).saturating_sub(scanned as i64)
     }
 
     /// Restart the tick clock at `frame`, keeping the song position.
@@ -767,7 +935,16 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             self.pending_jump = outcome.jump;
         }
         if outcome.stop {
-            self.state = SequencerState::Stopped;
+            // Read the timing off before the restart moves it: the tick that ends the song
+            // is still the tick that was playing, whatever the song restarts at.
+            let (final_tempo_bpm, final_speed) = (self.tempo_bpm, self.row_clock.speed);
+            if !self.end_naturally() {
+                self.state = SequencerState::Stopped;
+                return;
+            }
+            self.clock.advance_tick(final_tempo_bpm, final_speed);
+            self.restart_song_clock();
+            self.state = SequencerState::Ready;
             return;
         }
 
@@ -776,11 +953,112 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         if self.row_clock.advance() == RowAdvance::NextRow {
             let jump = self.pending_jump.take();
             if !self.begin_next_row(jump) {
-                self.state = SequencerState::Stopped;
-                return;
+                if !self.end_naturally() {
+                    self.state = SequencerState::Stopped;
+                    return;
+                }
+                self.restart_song_clock();
             }
         }
         self.state = SequencerState::Ready;
+    }
+
+    /// Consult the loop detector at the **first tick of a row, before the tick runs**.
+    ///
+    /// Once per row, not once per pattern-delay repeat: `is_first_tick_of_row` is true only
+    /// at absolute tick 0, so an `SEx` repeat is the same row and is not re-counted.
+    ///
+    /// Returns whether the tick may run — `false` only when the song has been heard through
+    /// once and [`AtEnd::Stop`] says to stop dead on that row.
+    ///
+    /// Nothing here allocates: the detector's bitset was sized when the sequencer was
+    /// built, and the timeline is only read.
+    fn begin_row(&mut self, frame: Frame) -> bool {
+        let arrival = self.last_arrival;
+        let visit = self.detector.visit(self.position, arrival);
+        let mark = RowMark {
+            order: self.position.order,
+            pattern: self.position.pattern,
+            row: self.position.row,
+            frame: self.song_frame(frame),
+            speed: self.row_clock.speed,
+            tempo_bpm: self.tempo_bpm,
+        };
+        self.last_row_visit = Some(RowVisit { visit, arrival, mark });
+
+        // Under `Continue` the flag marks the one tick the song came round on, so a host
+        // polling at UI rate sees a pulse rather than a latch.
+        if matches!(self.at_end, AtEnd::Continue) {
+            self.end_reached = false;
+        }
+        if !matches!(visit, Visit::Looped | Visit::Budget) {
+            return true;
+        }
+        self.end_reached = true;
+
+        match self.at_end {
+            AtEnd::Continue => {
+                self.wrap_at_loop_point(frame);
+                true
+            }
+            AtEnd::Stop => false,
+            // Play straight on: the elapsed clock runs past the total and the host, which
+            // is the only thing that can fade, decides when to stop. Deliberately no
+            // rebase — a fade wants to hear the second pass, not restart the counter.
+            AtEnd::FadeOut => true,
+        }
+    }
+
+    /// The song has come round again and the host wants it to keep playing: rebase the
+    /// elapsed clock onto the loop point and re-arm the detector against the same point.
+    fn wrap_at_loop_point(&mut self, frame: Frame) {
+        let position = self.position;
+        let Some(timeline) = self.timeline.take() else {
+            self.song_origin = frame.0 as i64;
+            self.detector.reset();
+            return;
+        };
+        match timeline.frame_at(position.order, position.row) {
+            Some(target_frame) => {
+                self.song_origin = (frame.0 as i64).saturating_sub(target_frame as i64);
+                self.detector.reset_marking_before(&timeline, target_frame);
+                // The loop target is playing *now*. Re-marking stops short of it, so mark
+                // it here or the next pass sails straight through the loop point.
+                self.detector.mark_visited(position);
+            }
+            None => {
+                self.song_origin = frame.0 as i64;
+                self.detector.reset();
+            }
+        }
+        self.timeline = Some(timeline);
+    }
+
+    /// The order list ran out under [`EndOfSongPolicy::Stop`], or a stop marker fired: a
+    /// **natural** end, not the detected loop point.
+    ///
+    /// Returns whether the song was restarted instead of stopping.
+    fn end_naturally(&mut self) -> bool {
+        self.end_reached = true;
+        // Without a timeline the host has not opted into song-clock semantics at all, and
+        // the end of the order list means exactly what it has always meant here.
+        if self.timeline.is_none() {
+            return false;
+        }
+        match self.at_end {
+            AtEnd::Continue => self.seek_order_row(self.restart_order, 0),
+            // There is nothing to fade into, so this stops like `Stop` — but the flag tells
+            // the host why, so it can fade the tail rather than cut it.
+            AtEnd::FadeOut | AtEnd::Stop => false,
+        }
+    }
+
+    /// Put the elapsed clock back to zero for a song that just restarted from its natural
+    /// end. The restarted pass begins on the tick the clock is now pointing at.
+    fn restart_song_clock(&mut self) {
+        self.song_origin = self.clock.pending_tick_frame().0 as i64;
+        self.detector.reset();
+        self.last_arrival = RowArrival::Start;
     }
 
     /// Move to the row that follows the one just finished. Returns `false` if the song is
@@ -792,6 +1070,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             Some(jump) if jump.within_pattern => {
                 self.position.row = self.clamped_row(self.position.pattern, jump.row.unwrap_or(0));
                 self.row_clock.start_row(speed);
+                self.last_arrival = RowArrival::PatternLoop;
                 true
             }
             // `Bxx`, `Cxx`, or both: a named order and/or a named row. `Cxx` alone means
@@ -799,6 +1078,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             // by the caller.
             Some(jump) => {
                 let order = jump.order.unwrap_or_else(|| self.position.order.saturating_add(1));
+                self.last_arrival = RowArrival::Jump;
                 self.move_to_order(order, jump.row.unwrap_or(0))
             }
             // The ordinary case: the next row, or the next order if the pattern is over.
@@ -808,8 +1088,10 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
                 if next_row < rows {
                     self.position.row = next_row;
                     self.row_clock.start_row(speed);
+                    self.last_arrival = RowArrival::Sequential;
                     true
                 } else {
+                    self.last_arrival = RowArrival::NextOrder;
                     self.move_to_order(self.position.order.saturating_add(1), 0)
                 }
             }
@@ -827,6 +1109,9 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             EndOfSongPolicy::Stop => false,
             EndOfSongPolicy::Loop => {
                 self.song_looped = true;
+                // The order list came round. Whatever arrival got us here, *this* is the
+                // one the detector must see: it is what turns a wrap into the loop point.
+                self.last_arrival = RowArrival::Wrapped;
                 // One retry, never a loop: if the restart point is itself unplayable the
                 // song stops rather than spinning inside the audio callback.
                 match self.resolve_order(self.restart_order) {
@@ -887,6 +1172,16 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         let sounding = self.sounding_position;
         telemetry.set_position(sounding.order, sounding.pattern, sounding.row, self.sounding_tick);
         telemetry.set_timing(self.row_clock.speed, self.tempo_bpm);
+        telemetry.set_song_clock(
+            self.song_frame(context.frame),
+            self.timeline.as_ref().map_or(0, SongTimeline::end_frame),
+            match self.timeline.as_ref().map(SongTimeline::end) {
+                None => starplayer_telemetry::SongEnd::Unknown,
+                Some(crate::timeline::EndReason::Stopped) => starplayer_telemetry::SongEnd::Stops,
+                Some(crate::timeline::EndReason::Looped { .. } | crate::timeline::EndReason::Budget) => starplayer_telemetry::SongEnd::Loops,
+            },
+            self.end_reached,
+        );
         crate::telemetry::capture_channels(telemetry, context.channels, context.voices);
         // The table has however many lanes the host sized it with; the UI wants the
         // *song's* channels, which only the pattern data knows.
@@ -915,9 +1210,20 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> EventSou
             return;
         }
         self.state = SequencerState::Processing;
+        self.last_row_visit = None;
 
         // A tracker tick *is* the control tick (architecture §5.4).
         context.control.tick_from_tracker(frame);
+
+        if self.row_clock.is_first_tick_of_row() && !self.begin_row(frame) {
+            // The song has been heard through once and the host asked to stop there. The
+            // tick does not run; the voices already sounding ring out, exactly as any other
+            // stop leaves them.
+            self.state = SequencerState::Stopped;
+            #[cfg(feature = "telemetry")]
+            self.publish_telemetry(context);
+            return;
+        }
 
         let outcome = self.run_tick(frame, context);
         self.commit(outcome);

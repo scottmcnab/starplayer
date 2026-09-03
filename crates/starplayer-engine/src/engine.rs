@@ -502,7 +502,12 @@ where
             // Switching path or interpolator at run time is a re-instantiation of the
             // engine's type parameters, not a field write. Both arrive with transport
             // control in B6; flagged rather than ignored so the gap is visible.
-            Command::SeekOrder(_) | Command::SeekRow(_) | Command::SetInterpolator(_) | Command::SetTempoModel(_) => {
+            Command::SeekOrder(_)
+            | Command::SeekRow(_)
+            | Command::SeekFrame(_)
+            | Command::SetAtEnd(_)
+            | Command::SetInterpolator(_)
+            | Command::SetTempoModel(_) => {
                 self.warnings.unsupported_command = true;
             }
         }

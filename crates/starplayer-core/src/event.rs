@@ -370,6 +370,13 @@ pub enum Command<ModuleHandle> {
     SeekOrder(u16),
     /// Jump to a row within the current pattern.
     SeekRow(u16),
+    /// Jump to an elapsed position in the song, in frames from the song's start.
+    ///
+    /// Needs a scanned song timeline to resolve the frame to a row; a host without one
+    /// has nothing to seek against.
+    SeekFrame(u64),
+    /// Choose what happens when the song reaches its detected loop point.
+    SetAtEnd(AtEnd),
     /// Set the master volume.
     SetMasterVolume(U0F16),
     /// Mute or unmute one channel.
@@ -378,6 +385,28 @@ pub enum Command<ModuleHandle> {
     SetInterpolator(Interpolator),
     /// Change the tempo model.
     SetTempoModel(crate::tempo::TempoModelId),
+}
+
+/// What a player does when the song reaches its **detected loop point**.
+///
+/// This is not the same question as
+/// [`EndOfSongPolicy`](https://docs.rs/starplayer-engine): that one says what the *end of
+/// the order list* means, which is a property of the module and its format. This one says
+/// what the *host* wants to happen once the song has been heard once through — the media
+/// player's repeat button — and it is answered by the loop detector rather than by the
+/// order list.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AtEnd {
+    /// Wrap at the loop point and keep playing. Repeat on, and the default.
+    #[default]
+    Continue,
+    /// Stop dead at the loop point. Voices ring out; no further ticks.
+    Stop,
+    /// Keep playing past the loop point and let the host fade the transport out.
+    ///
+    /// The engine does not fade: it only reports that the point was passed, through
+    /// [`TransportState::end_reached`](https://docs.rs/starplayer-telemetry).
+    FadeOut,
 }
 
 /// Which resampling kernel the mixer uses (architecture §7.1).

@@ -63,7 +63,7 @@ pub mod snapshot;
 pub mod vu;
 
 pub use publisher::{ChannelUpdate, TelemetryPublisher, TelemetryReader, telemetry_channel, telemetry_channel_with_depth};
-pub use snapshot::{ChannelState, EffectDisplay, MAX_CHANNELS, Snapshot, TransportState, WarningFlags};
+pub use snapshot::{ChannelState, EffectDisplay, MAX_CHANNELS, Snapshot, SongEnd, TransportState, WarningFlags};
 pub use vu::VuMeter;
 
 /// Snapshots in flight before the writer starts dropping them.
