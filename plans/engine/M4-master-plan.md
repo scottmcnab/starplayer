@@ -4,8 +4,9 @@
 |---|---|
 | Goal | MIDI in, SMF playback, keyboard triggering, source multiplexing |
 | Estimate | 1.5u |
-| Depends on | M3 |
-| Blocks | M5, M9 |
+| Depends on | M2 for M4-lite; M3 for M4-full |
+| Blocks | M5, M6 (M4-lite); M9 (M4-full) |
+| Status | **Split 2026-09-03** — M4-lite in progress ([concurrency plan](M3-M6-concurrency-plan.md)); M4-full deferred |
 
 ## Why here and not earlier
 
@@ -17,6 +18,32 @@ in M0**. That is the "no trait until its second implementation exists" rule
 It is also the milestone that turns StarPlayer from a module player into an engine. The
 architecture has been built for it throughout — `EventSource`, the two-way event
 vocabulary, the control clock — but nothing has exercised the non-tracker path yet.
+
+## M4-lite and M4-full (owner decision, 2026-09-03)
+
+M4 is split so that XM (M5) and IT (M6) can be built concurrently, without waiting for
+MIDI. **M4-lite** is only the shared machinery those two formats need; **M4-full** is
+everything below that plays MIDI, and it stays deferred until the owner pulls it.
+
+The decision that shapes M4-lite: **no `trait Instrument` yet.** Architecture §5.3's
+sketch has one consumer that cannot call concrete code — a MIDI-driven sample player — and
+that consumer is M4-full's. XM and IT are tracker processors that already write voice
+parameters through `TickContext`, so each keeps its own per-voice articulation state
+(envelope positions, fadeout, key-off, auto-vibrato phase) in a parallel array indexed by
+`VoiceId` and advances it inside its own `tick()`. The engine never runs an envelope, and
+no cross-format envelope branch exists. The trait is extracted in M4-full with the MIDI
+sample player as its non-tracker implementation, which is the moment its second real
+implementation exists (§10.1).
+
+| M4-lite task | Deliverable |
+|---|---|
+| [E1](M4-task-E1-instrument-and-sample-model.md) | The XM+IT instrument and sample model in `starplayer-model`, designed against both specs at once; sample sustain loops; ping-pong guard frames; the shared xorshift32 |
+| [E2](M4-task-E2-linear-frequency-and-format-dialects.md) | The `2^(n/768)` linear-frequency table; XM/IT `FormatDialect` variants |
+| [E3](M4-task-E3-voice-lifecycle-and-trace-v2.md) | `VoicePool::iter_mut`, `ChannelTable::detach_foreground`, `VoiceTag.sample: u16`, single-sourced voice capacity, trace format v2 with per-voice lines |
+
+Deliverables 1–8 below are M4-full, except that deliverable 1's "extract `Instrument`" now
+reads "extract `Instrument` from `XmProcessor`, `ItProcessor` and the MIDI sample player".
+`SourceMux` already landed at M1-B3; its acceptance case is M4-full's.
 
 ## Deliverables
 
