@@ -43,6 +43,7 @@ expected channel state*, which is exactly the shape of our trace format.
 | [C3b](complete/M2-task-C3b-protracker-fidelity-repairs.md) ✅ | ProTracker fidelity + MTM repairs, and the voice-boundary sample swap | C3, C4 | C9, C6a |
 | [C6a](complete/M2-task-C6a-golden-and-build-hygiene.md) ✅ | Trace-feature hygiene, MOD/MTM goldens, `fma-check`, the web panning race | C6, C1, C3a | C2a, C3b, C9 |
 | [C9](complete/M2-task-C9-s3m-conformance-repairs.md) ✅ | The nine S3M effect bugs the corpus found (M1 inheritance) | C2a | C3b, C6a |
+| [C10](complete/M2-task-C10-mod-vblank-timing.md) ✅ | MOD VBlank timing: the `mod_timing` quirk and its detection | C5, D1 | — |
 
 C2a, C3b, C6a and C9 are the follow-ups opened by the 2026-09-02 branch review. C2a comes
 first: it changes which cases actually fail, so C3b and C9 must not be diagnosed against
@@ -62,7 +63,7 @@ until that trigger fires.
 6. The allocator hook proves no allocation inside `render()` across the whole corpus.
 7. Every new deviation found is recorded in `plans/product/03-accuracy-policy.md` §3.
 
-## Status (2026-09-02 review, updated after C2a)
+## Status — complete (owner accepted 2026-09-03)
 
 Honest position, so that nothing downstream plans against a number that is not true.
 
@@ -84,8 +85,10 @@ undifferentiated exclusions, eight of them citing an NTSC rate libxmp never sele
 | 6. Allocator hook proves no allocation in `render()` | **Met** — `cargo xtask ci --job rt-safety`, over every module the repository can reach, at three host block sizes and across a `LoadModule` swap | C7 (landed) |
 | 7. Every new deviation recorded in the accuracy policy | **Met for the current standing** — every exclusion reason records a first divergence the repaired harness observed | C2a (landed) |
 
-Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a, C3b, C9, C7, C5. Outstanding: none. Deferred: C8.
-Owner acceptance (the M2 listening check) is what remains before M3.
+Landed: C1, C2, C2a, C3, C3a, C4, C6, C6a, C3b, C9, C7, C5, C10. Outstanding: none. Deferred: C8.
+**M2 is complete**: the owner accepted it on 2026-09-03. C8 (the DOS reference harness)
+stays deferred and pull-driven; `C2-S3M-009` stays the one known conformance failure,
+recorded with its reason, and `--strict` stays off in CI until it is decided.
 
 ## A note on the oracle
 

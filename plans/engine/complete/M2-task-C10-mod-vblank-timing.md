@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M2 ([master plan](M2-master-plan.md)) — MOD accuracy follow-up |
-| Status | Landed 2026-09-03; owner listening check of `K-P-K.MOD` outstanding |
+| Status | Landed 2026-09-03; M2 accepted by the owner 2026-09-03 |
 | Depends on | C5 (`QuirkSet` / `FormatDialect`), D1 (`scan_timeline` / `SongTimeline`) |
 | Blocks | Owner listening check of `K-P-K.MOD` (Klisje paa klisje) |
 | Parallel with | anything not touching `starplayer-core::quirks`, the MOD processor's `Fxx`, or the hosts' scan/build functions |
