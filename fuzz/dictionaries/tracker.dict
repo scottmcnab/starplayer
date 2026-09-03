@@ -73,6 +73,21 @@ xm_chunk_xtpm="XTPM"
 xm_pattern_mask_all="\x9f"
 xm_note_key_off="\x61"
 
+# ── IT ──────────────────────────────────────────────────────────────────────────────
+it_magic="IMPM"
+it_sample_magic="IMPS"
+it_instrument_magic="IMPI"
+# `Cmwt` below 0x200 selects the pre-2.00 instrument layout; 0x0214 is the modern one.
+it_cmwt_old="\x06\x01"
+it_version_214="\x14\x02"
+# `Cwt/v` nibbles: Schism Tracker's, and OpenMPT's 0x5000 scheme.
+it_cwtv_schism="\x20\x10"
+it_cwtv_openmpt="\x00\x50"
+it_openmpt_reserved="OMPT"
+# The extension chunks that follow an OpenMPT-written pattern block.
+it_chunk_stpm="STPM"
+it_chunk_xtpm="XTPM"
+
 # ── order-list markers shared by the formats ────────────────────────────────────────
 order_end="\xff"
 order_skip="\xfe"

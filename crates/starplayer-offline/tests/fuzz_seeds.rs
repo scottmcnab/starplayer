@@ -1,5 +1,5 @@
 //! The stable-toolchain half of M2-C7: every committed fuzz seed and every committed
-//! crash regression walked through all three loaders.
+//! crash regression walked through all four loaders.
 //!
 //! `cargo fuzz` needs a nightly toolchain and libFuzzer, so the coverage-guided run lives
 //! in its own CI job. This file is what `cargo test --workspace` runs on the pinned
@@ -18,12 +18,14 @@
 //! XM goes through `starplayer_xm` directly rather than through the facade: task F4 adds
 //! the `starplayer::xm` arms, and this file is meant to be checking the loader from the
 //! commit that introduces it.
+//! IT reaches its loader through `starplayer-it` directly rather than through the facade:
+//! the facade's IT arm is task G5, and the seeds are worth replaying before it lands.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The native loaders, by the directory name their inputs live under.
-const FORMATS: [&str; 4] = ["mod", "s3m", "mtm", "xm"];
+const FORMATS: [&str; 5] = ["mod", "s3m", "mtm", "xm", "it"];
 
 fn fuzz_directory(kind: &str, format: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz").join(kind).join(format)
@@ -47,10 +49,12 @@ fn every_loader_survives(bytes: &[u8]) {
     let _ = starplayer::s3m::probe(bytes);
     let _ = starplayer::mtm::probe(bytes);
     let _ = starplayer_xm::probe(bytes);
+    let _ = starplayer_it::probe(bytes);
     let _ = starplayer::mod_file::load(bytes);
     let _ = starplayer::s3m::load(bytes);
     let _ = starplayer::mtm::load(bytes);
     let _ = starplayer_xm::load(bytes);
+    let _ = starplayer_it::load(bytes);
 }
 
 fn load_for(format: &str, bytes: &[u8]) -> Result<starplayer::model::Module, starplayer::core::Error> {
@@ -59,6 +63,7 @@ fn load_for(format: &str, bytes: &[u8]) -> Result<starplayer::model::Module, sta
         "s3m" => starplayer::s3m::load(bytes),
         "mtm" => starplayer::mtm::load(bytes),
         "xm" => starplayer_xm::load(bytes),
+        "it" => starplayer_it::load(bytes),
         other => panic!("unknown fuzz corpus format `{other}`"),
     }
 }

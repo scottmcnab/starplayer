@@ -154,6 +154,17 @@ impl EffectNames {
         subcommands: MOD_SUBCOMMAND_NAMES,
     };
 
+    /// Impulse Tracker's command and `Sx` sub-command names.
+    pub const IT: EffectNames = EffectNames {
+        commands: IT_COMMAND_NAMES,
+        subcommand_code: IT_SUBCOMMAND_CODE,
+        subcommands: IT_SUBCOMMAND_NAMES,
+    };
+
+    /// Impulse Tracker's **volume-column** effect names, keyed by the first raw byte of
+    /// each range — see [`IT_VOLUME_COLUMN_NAMES`].
+    pub const IT_VOLUME: EffectNames = EffectNames::flat(IT_VOLUME_COLUMN_NAMES);
+
     /// A table for a format whose commands carry no sub-command nybble.
     pub const fn flat(commands: &'static [(u8, &'static str)]) -> EffectNames {
         EffectNames { commands, subcommand_code: 0, subcommands: &[] }
@@ -364,6 +375,84 @@ const XM_VOLUME_COLUMN_NAMES: &[(u8, &str)] = &[
     (0xF, "tone portamento"),
 ];
 
+// ── Impulse Tracker (task G1) ───────────────────────────────────────────────────────
+
+/// The command code the IT pattern format uses for a command letter: 1..=26 for `A`..`Z`,
+/// the same numbering S3M uses (ITTECH.TXT: "Valid ranges from 0->31 (0=no effect, 1=A,
+/// 2=B, 3=C, etc.)"). Named separately so an IT loader need not mention S3M.
+pub const fn it_command_code(letter: u8) -> u8 { letter.wrapping_sub(b'A').wrapping_add(1) }
+
+/// IT command code for `S`, the sub-command escape.
+const IT_SUBCOMMAND_CODE: u8 = it_command_code(b'S');
+
+/// Impulse Tracker command names. Codes are 1..=26 for `A`..`Z`.
+const IT_COMMAND_NAMES: &[(u8, &str)] = &[
+    (it_command_code(b'A'), "set speed"),
+    (it_command_code(b'B'), "jump to order"),
+    (it_command_code(b'C'), "break to row"),
+    (it_command_code(b'D'), "volume slide"),
+    (it_command_code(b'E'), "portamento down"),
+    (it_command_code(b'F'), "portamento up"),
+    (it_command_code(b'G'), "tone portamento"),
+    (it_command_code(b'H'), "vibrato"),
+    (it_command_code(b'I'), "tremor"),
+    (it_command_code(b'J'), "arpeggio"),
+    (it_command_code(b'K'), "vibrato & vol. slide"),
+    (it_command_code(b'L'), "porta & vol. slide"),
+    (it_command_code(b'M'), "set channel volume"),
+    (it_command_code(b'N'), "channel volume slide"),
+    (it_command_code(b'O'), "sample offset"),
+    (it_command_code(b'P'), "pan slide"),
+    (it_command_code(b'Q'), "note retrigger"),
+    (it_command_code(b'R'), "tremolo"),
+    (it_command_code(b'T'), "set tempo"),
+    (it_command_code(b'U'), "fine vibrato"),
+    (it_command_code(b'V'), "global volume"),
+    (it_command_code(b'W'), "global volume slide"),
+    (it_command_code(b'X'), "channel pan"),
+    (it_command_code(b'Y'), "panbrello"),
+    (it_command_code(b'Z'), "MIDI macro"),
+];
+
+/// IT `Sx` sub-command names, keyed by the high nybble of the parameter.
+const IT_SUBCOMMAND_NAMES: &[(u8, &str)] = &[
+    (0x1, "glissando control"),
+    (0x2, "set finetune"),
+    (0x3, "set vibrato waveform"),
+    (0x4, "set tremolo waveform"),
+    (0x5, "set panbrello waveform"),
+    (0x6, "fine pattern delay"),
+    (0x7, "note & envelope control"),
+    (0x8, "channel pan"),
+    (0x9, "sound control"),
+    (0xA, "high sample offset"),
+    (0xB, "pattern loop"),
+    (0xC, "note cut"),
+    (0xD, "note delay"),
+    (0xE, "pattern delay"),
+    (0xF, "set active macro"),
+];
+
+/// IT volume-column effect names, keyed by the **first raw byte of each range** — 0 for
+/// `0..=64` set volume, 65 for `65..=74` fine volume up, and so on. A format crate maps a
+/// raw volume byte to its range base and looks the name up with that.
+///
+/// The ranges are ITTECH.TXT's *Impulse Pattern Format* section, plus OpenMPT's
+/// `223..=232` sample-offset extension (`Load_it.cpp`, `VOLCMD_OFFSET`).
+pub const IT_VOLUME_COLUMN_NAMES: &[(u8, &str)] = &[
+    (0, "set volume"),
+    (65, "fine volume up"),
+    (75, "fine volume down"),
+    (85, "volume slide up"),
+    (95, "volume slide down"),
+    (105, "pitch slide down"),
+    (115, "pitch slide up"),
+    (128, "set panning"),
+    (193, "portamento to"),
+    (203, "vibrato depth"),
+    (223, "sample offset"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +531,29 @@ mod tests {
         assert_eq!(name(0x6A), Some("volume slide down"));
         assert_eq!(name(0xB4), Some("vibrato"));
         assert_eq!(name(0xFF), Some("tone portamento"));
+    }
+
+    #[test]
+    fn it_commands_and_sub_commands_have_their_own_names() {
+        assert_eq!(EffectNames::IT.name(it_command_code(b'A'), 0x06), Some("set speed"));
+        assert_eq!(EffectNames::IT.name(it_command_code(b'M'), 0x20), Some("set channel volume"), "S3M has no M command; IT does");
+        assert_eq!(EffectNames::IT.name(it_command_code(b'Y'), 0x42), Some("panbrello"));
+        assert_eq!(EffectNames::IT.name(it_command_code(b'Z'), 0x80), Some("MIDI macro"));
+        assert_eq!(EffectNames::IT.name(IT_SUBCOMMAND_CODE, 0x5F), Some("set panbrello waveform"));
+        assert_eq!(EffectNames::IT.name(IT_SUBCOMMAND_CODE, 0xA3), Some("high sample offset"));
+        assert_eq!(EffectNames::IT.name(IT_SUBCOMMAND_CODE, 0x00), None, "S0x is not an IT command");
+        assert_eq!(EffectNames::IT.name(0, 0), None, "code 0 is an empty effect column");
+        assert_eq!(EffectNames::IT.name(27, 0), None, "IT's codes stop at Z");
+    }
+
+    #[test]
+    fn it_volume_column_effects_are_named_by_the_first_byte_of_their_range() {
+        assert_eq!(EffectNames::IT_VOLUME.name(0, 0), Some("set volume"));
+        assert_eq!(EffectNames::IT_VOLUME.name(65, 0), Some("fine volume up"));
+        assert_eq!(EffectNames::IT_VOLUME.name(128, 0), Some("set panning"));
+        assert_eq!(EffectNames::IT_VOLUME.name(203, 0), Some("vibrato depth"));
+        assert_eq!(EffectNames::IT_VOLUME.name(223, 0), Some("sample offset"));
+        assert_eq!(EffectNames::IT_VOLUME.name(213, 0), None, "213..=222 was velocity and is unused");
     }
 
     #[test]

@@ -28,6 +28,7 @@ starplayer-mod = { path = "../crates/starplayer-mod" }
 starplayer-s3m = { path = "../crates/starplayer-s3m" }
 starplayer-mtm = { path = "../crates/starplayer-mtm" }
 starplayer-xm = { path = "../crates/starplayer-xm" }
+starplayer-it = { path = "../crates/starplayer-it" }
 
 [lib]
 path = "src/lib.rs"
@@ -93,8 +94,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "it_loader"
+path = "fuzz_targets/it_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "xm_structured"
 path = "fuzz_targets/xm_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "it_structured"
+path = "fuzz_targets/it_structured.rs"
 test = false
 doc = false
 bench = false
