@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M3 ([master plan](M3-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03; owner listening check outstanding |
 | Depends on | E3 (`TrackerProcessor::recommended_voice_capacity`, `MAX_VOICE_CAPACITY`) |
 | Blocks | D4 (cpal host), D5 (CLI), F4 (XM wiring), G5 (IT wiring) |
 | Parallel with | D6, D7, and the M5/M6 loader and runtime tasks |
