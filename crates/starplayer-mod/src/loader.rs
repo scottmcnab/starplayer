@@ -434,7 +434,7 @@ mod tests {
         let params = starplayer_core::VoiceParams { step: starplayer_core::Step::ONE, volume: U0F16::MAX, ..starplayer_core::VoiceParams::SILENT };
         voices.allocate(starplayer_mixer::VoiceTag::default(), region, params, 0).expect("slot 0");
         let mut destination = [starplayer_mixer::FixedFrame::default(); 64];
-        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut destination);
+        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut destination, 44_100);
         assert_eq!(voices.voices_active(), 1, "a four-byte loop wraps instead of ending the voice");
 
         let mut one_shot = minimal_mod();

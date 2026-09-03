@@ -1185,7 +1185,7 @@ mod tests {
         /// processor only queued actually arrives.
         fn render(&mut self, module: &Module, frames: usize) {
             let mut output = vec![starplayer_mixer::FixedFrame::default(); frames];
-            self.voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut output);
+            self.voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut output, 44_100);
         }
     }
 
@@ -1773,7 +1773,7 @@ mod tests {
         while produced < frames {
             let next = sequencer.next_event_frame().map(|frame| frame.0 as usize).unwrap_or(frames).min(frames);
             if next > produced {
-                voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut output[produced..next]);
+                voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(module.pcm(), &mut output[produced..next], 44_100);
                 produced = next;
                 continue;
             }
@@ -1889,7 +1889,7 @@ mod tests {
             while written < output.len() {
                 let end = (written + chunk).min(output.len());
                 if let (Some(window), Some(voice)) = (output.get_mut(written..end), harness.voices.get_mut(voice)) {
-                    let _ = starplayer_mixer::accumulate_voice::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(voice, module.pcm(), window);
+                    let _ = starplayer_mixer::accumulate_voice::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(voice, module.pcm(), window, 44_100);
                 }
                 written = end;
             }

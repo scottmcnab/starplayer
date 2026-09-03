@@ -3,8 +3,8 @@
 use alloc::vec;
 use alloc::boxed::Box;
 
-use starplayer_core::{DirtyBits, VoiceId, VoiceParams};
-use starplayer_dsp::{GainRamp, Interpolate};
+use starplayer_core::{DirtyBits, FilterParams, VoiceId, VoiceParams};
+use starplayer_dsp::{FilterCoefficients, GainRamp, Interpolate};
 
 use crate::gain::{RAMP_FRAMES, voice_gain_units};
 use crate::kernel::{VoiceStatus, accumulate_voice};
@@ -35,6 +35,110 @@ pub struct VoiceTag {
     pub note: u8,
 }
 
+/// One mixing path's half of a voice's resonant filter: the delay line, and the
+/// coefficients it is currently being spent with.
+///
+/// `state` is `[y[n−1], y[n−2]]`, in whatever the path's
+/// [`Mono`](crate::path::MixPath::Mono) type is — on the fixed path it is kept
+/// pre-amplified (`starplayer_dsp::FILTER_PREAMP_BITS`), which is why it is `i32` rather
+/// than `i16`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PathFilter<Sample> {
+    /// The two-pole delay line, most recent first.
+    pub state: [Sample; 2],
+    /// What [`VoiceFilter::refresh`] last computed for this path.
+    pub coefficients: FilterCoefficients<Sample>,
+}
+
+impl Default for PathFilter<f32> {
+    fn default() -> PathFilter<f32> { PathFilter { state: [0.0; 2], coefficients: FilterCoefficients::<f32>::PASS_THROUGH } }
+}
+
+impl Default for PathFilter<i32> {
+    fn default() -> PathFilter<i32> { PathFilter { state: [0; 2], coefficients: FilterCoefficients::<i32>::PASS_THROUGH } }
+}
+
+/// One voice's resonant low-pass state (IT; architecture §7.2).
+///
+/// # Why both paths are carried at once
+///
+/// A [`Voice`] is not generic over the mixing path — one pool serves whichever path the
+/// engine was built with — so the struct holds a delay line and a coefficient set for
+/// each and [`MixPath::path_filter`] picks. The unused
+/// half costs twenty bytes and is never touched: in particular `refresh` computes only
+/// the coefficients of the path that asked, so a bare-metal fixed-path build never
+/// evaluates a float expression here.
+///
+/// # Why there is no dirty bit
+///
+/// A filter write raises [`DirtyBits::PITCH`] today and the trace deliberately reports no
+/// flag for one (`dirty_bit_for`). Rather than add a bit — which would change the trace's
+/// flag column and every golden that carries it — this compares the four bytes of
+/// [`FilterParams`] against what the coefficients were computed from. That is cheaper
+/// than a bit test, cannot be missed by an owner that forgets to raise it, and covers a
+/// sample-rate change as well.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct VoiceFilter {
+    /// The float path's delay line and coefficients.
+    pub float: PathFilter<f32>,
+    /// The fixed path's delay line and coefficients.
+    pub fixed: PathFilter<i32>,
+    /// What the coefficients were computed from.
+    source: FilterParams,
+    /// The sample rate they were computed at. Zero means "nothing computed yet", which no
+    /// real rate is.
+    source_sample_rate_hz: u32,
+    /// The IT header's extended filter range (OpenMPT's `SONG_EXFILTERRANGE`).
+    extended_range: bool,
+    /// Whether the filter is doing anything at all.
+    active: bool,
+}
+
+impl VoiceFilter {
+    /// Whether the kernel has to run the filter for this voice.
+    pub const fn is_active(&self) -> bool { self.active }
+
+    /// Whether this voice's cutoff law uses IT's extended filter range.
+    pub const fn has_extended_range(&self) -> bool { self.extended_range }
+
+    /// Select the extended filter range, invalidating any cached coefficients.
+    ///
+    /// A module-level property that only the format's own processor knows, so the owner
+    /// of the voice sets it; it defaults to off, which is what every module without the
+    /// IT header bit wants.
+    pub const fn set_extended_range(&mut self, extended_range: bool) {
+        self.extended_range = extended_range;
+        self.source_sample_rate_hz = 0;
+    }
+
+    /// Zero the delay line — a new note, not a change of parameters.
+    pub const fn reset_state(&mut self) {
+        self.float.state = [0.0; 2];
+        self.fixed.state = [0; 2];
+    }
+
+    /// Recompute `Path`'s coefficients if, and only if, something they depend on moved.
+    ///
+    /// In practice this is once per tracker tick for a voice whose filter is being swept
+    /// and never again for one that is not — never per frame, which is the whole point of
+    /// caching them on the voice.
+    pub fn refresh<Path: MixPath>(&mut self, filter: FilterParams, sample_rate_hz: u32) {
+        if self.source == filter && self.source_sample_rate_hz == sample_rate_hz {
+            return;
+        }
+        self.source = filter;
+        self.source_sample_rate_hz = sample_rate_hz;
+        // IT's own rule, from `SetupChannelFilter`: a fully open cutoff with no resonance
+        // is not a filter at all. `FilterParams::from_it` maps exactly that pair onto
+        // `FilterParams::BYPASS`, so one comparison answers it.
+        self.active = !filter.is_bypass();
+        if self.active {
+            let (cutoff, resonance) = filter.to_it();
+            Path::path_filter(self).coefficients = Path::coefficients(cutoff, resonance, sample_rate_hz, self.extended_range);
+        }
+    }
+}
+
 /// One sounding sample.
 ///
 /// # The ramp state lives here
@@ -57,6 +161,9 @@ pub struct Voice {
     position: u64,
     /// Left/right gain, in the units of [`voice_gain_units`], mid-ramp.
     gains: Stereo<GainRamp>,
+    /// IT's per-voice resonant low-pass: the delay line, the coefficients, and what they
+    /// were computed from. Bypassed — and therefore free — for MOD, S3M and MTM.
+    filter: VoiceFilter,
     /// Whether a ping-pong loop is currently travelling backwards.
     reverse: bool,
     /// Whether the voice is fading out towards release.
@@ -89,6 +196,9 @@ impl Voice {
             region,
             position: (offset_frames as u64) << 32,
             gains: Stereo::new(GainRamp::steady(0), GainRamp::steady(0)),
+            // A new note starts the filter from silence, the way `HandleNoteChangeFilter`
+            // calls `SetupChannelFilter(chn, true)` only when `chn.triggerNote` is set.
+            filter: VoiceFilter::default(),
             reverse: false,
             stopping: false,
             pending_region: None,
@@ -127,8 +237,17 @@ impl Voice {
         self.gains.left.frames_remaining().max(self.gains.right.frames_remaining())
     }
 
-    /// The ramps themselves, for the render kernel to advance.
-    pub(crate) fn gains_mut(&mut self) -> &mut Stereo<GainRamp> { &mut self.gains }
+    /// Everything one bounded run mutates that is not the position: the gain ramps to
+    /// advance and the filter to spend. Handed out as one pair because the kernel needs
+    /// both at once and they are disjoint fields.
+    pub(crate) fn run_state_mut(&mut self) -> (&mut Stereo<GainRamp>, &mut VoiceFilter) { (&mut self.gains, &mut self.filter) }
+
+    /// This voice's resonant filter.
+    pub const fn filter(&self) -> &VoiceFilter { &self.filter }
+
+    /// This voice's resonant filter, for its owner to configure — the extended filter
+    /// range is the one thing about it that comes from outside the mixer.
+    pub const fn filter_mut(&mut self) -> &mut VoiceFilter { &mut self.filter }
 
     /// Whether a stopped voice has finished fading and may be released.
     pub(crate) fn finished_ramping_out(&self) -> bool { self.stopping && !self.is_ramping() }
@@ -177,6 +296,11 @@ impl Voice {
 
     /// Point this voice at a different sample without disturbing its position — what
     /// `Gxx` tone portamento and IT's sample-swap semantics need in M1.
+    ///
+    /// The resonant filter's delay line is **not** reset. This is a swap in the middle of
+    /// a sounding note, not a new note: OpenMPT resets the filter only under
+    /// `chn.triggerNote` (`HandleNoteChangeFilter`), and `FilterPortaSmpChange.it` is the
+    /// case that pins it. See accuracy policy D73.
     pub fn set_region(&mut self, region: SampleRegion) {
         self.region = region;
         self.pending_region = None;
@@ -211,6 +335,11 @@ impl Voice {
         if let Some(region) = self.pending_region.take() { self.region = region; }
         self.position = (offset_frames as u64) << 32;
         self.reverse = false;
+        // A restart is a new note, and OpenMPT resets the filter's delay line on one
+        // (`HandleNoteChangeFilter` → `SetupChannelFilter(chn, true)`). Carrying the two
+        // delay values across a jump to a different part of the waveform would ring the
+        // filter with a discontinuity that was never in the signal.
+        self.filter.reset_state();
         self.params.dirty.insert(DirtyBits::SAMPLE);
     }
 
@@ -409,8 +538,13 @@ impl VoicePool {
     /// Voices are accumulated in **slot order**, which is what makes the float path's
     /// summation order — and therefore its exact `f32` result — independent of the host's
     /// block size.
-    pub fn accumulate<Path: MixPath, Interp: Interpolate>(&mut self, pcm: &[i16], destination: &mut [Path::Accumulator]) {
-        self.accumulate_masked::<Path, Interp>(pcm, destination, &mut [], |_| false);
+    ///
+    /// `sample_rate_hz` is the mixer's output rate. Nothing but IT's resonant filter reads
+    /// it — the resample step is already a ratio and knows nothing about absolute time —
+    /// but the filter's cutoff is a real frequency, so its coefficients cannot be derived
+    /// without it.
+    pub fn accumulate<Path: MixPath, Interp: Interpolate>(&mut self, pcm: &[i16], destination: &mut [Path::Accumulator], sample_rate_hz: u32) {
+        self.accumulate_masked::<Path, Interp>(pcm, destination, &mut [], sample_rate_hz, |_| false);
     }
 
     /// [`VoicePool::accumulate`], with the voices whose `tag.channel` satisfies `is_muted`
@@ -423,11 +557,18 @@ impl VoicePool {
     /// `destination`; if it is shorter, muted voices are skipped for this call and their
     /// state does not advance, which is the lesser evil next to a panic on the audio
     /// thread.
+    ///
+    /// A muted voice's **filter runs too**, for exactly the reason its position and ramps
+    /// do: the filter is a two-pole recursion whose output depends on the two frames
+    /// before it, so skipping it would leave the delay line holding whatever was there
+    /// when the channel was muted and unmuting would ring it. Muting is a discard at the
+    /// bus, not a shortcut through the voice.
     pub fn accumulate_masked<Path: MixPath, Interp: Interpolate>(
         &mut self,
         pcm: &[i16],
         destination: &mut [Path::Accumulator],
         discard: &mut [Path::Accumulator],
+        sample_rate_hz: u32,
         is_muted: impl Fn(u8) -> bool,
     ) {
         let mut free_head = self.free_head;
@@ -440,11 +581,11 @@ impl VoicePool {
             }
             let status = if is_muted(slot.voice.tag.channel) {
                 match discard.as_deref_mut() {
-                    Some(discard) => accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, discard),
+                    Some(discard) => accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, discard, sample_rate_hz),
                     None => VoiceStatus::Sounding,
                 }
             } else {
-                accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, destination)
+                accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, destination, sample_rate_hz)
             };
             if status == VoiceStatus::Finished {
                 slot.active = false;
@@ -561,10 +702,10 @@ mod tests {
         let voice = pool.allocate(VoiceTag::default(), region, sounding_params(), 0).expect("slot 0");
 
         let mut destination = [FixedFrame::default(); 3];
-        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination, 44_100);
         assert_eq!(pool.voices_active(), 1, "three of four frames rendered");
 
-        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination, 44_100);
         assert_eq!(pool.voices_active(), 0);
         assert!(pool.get(voice).is_none(), "the handle went stale when the voice ended");
     }
@@ -581,13 +722,13 @@ mod tests {
         }
 
         let mut destination = [FixedFrame::default(); RAMP_FRAMES as usize / 2];
-        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination, 44_100);
         assert_eq!(pool.voices_active(), 1, "half a ramp in, the voice is still fading");
         let first = destination.first().map(|frame| frame.left).unwrap_or(0);
         let last = destination.last().map(|frame| frame.left).unwrap_or(0);
         assert!(first != 0 && last.abs() < first.abs(), "the fade got somewhere: {first} then {last}");
 
-        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination, 44_100);
         assert_eq!(pool.voices_active(), 0, "and the voice is released the moment the fade lands");
         assert!(pool.get(voice).is_none(), "the handle went stale");
     }
@@ -600,7 +741,7 @@ mod tests {
         pool.get_mut(voice).expect("the voice is live").stop();
 
         let mut destination = [FixedFrame::default(); 4];
-        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination, 44_100);
         assert_eq!(pool.voices_active(), 0, "there is nothing to fade");
         assert_eq!(destination, [FixedFrame::default(); 4]);
     }
@@ -614,7 +755,7 @@ mod tests {
         pool.allocate(VoiceTag::default(), region, sounding_params(), 0).expect("slot 0");
 
         let mut destination = [FixedFrame::default(); RAMP_FRAMES as usize * 2];
-        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination, 44_100);
         let first = destination.first().map(|frame| frame.left).unwrap_or(0);
         let settled = destination.last().map(|frame| frame.left).unwrap_or(0);
         assert!(first.abs() * 8 < settled.abs(), "the first frame is a fraction of the settled gain: {first} then {settled}");
@@ -630,7 +771,7 @@ mod tests {
         pool.allocate(VoiceTag::default(), region, sounding_params(), 0).expect("slot 0");
 
         let mut destination = [FixedFrame::default(); 100];
-        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination);
+        pool.accumulate::<FixedPath, Linear>(&blob, &mut destination, 44_100);
         assert_eq!(pool.voices_active(), 1);
     }
 
@@ -651,7 +792,7 @@ mod tests {
             while written < output.len() {
                 let end = (written + chunk_length).min(output.len());
                 if let Some(window) = output.get_mut(written..end) {
-                    pool.accumulate::<FixedPath, Linear>(&blob, window);
+                    pool.accumulate::<FixedPath, Linear>(&blob, window, 44_100);
                 }
                 written = end;
             }

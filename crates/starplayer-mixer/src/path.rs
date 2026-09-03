@@ -51,12 +51,27 @@
 //! hoisted out of the run. Both are the same arithmetic, so a ramp that has just landed on
 //! its target produces exactly the frame the hoisted path would have — which is what lets
 //! a run be split anywhere without changing a sample.
+//!
+//! # The mono seam, and why `mix` is now two halves (M6-G2)
+//!
+//! IT's resonant filter is a *voice*-level effect that runs on the interpolated value
+//! **before** the pan gains (architecture §7.2), so the trait exposes
+//! [`MixPath::interpolate`] and [`MixPath::accumulate`] separately and
+//! [`MixPath::filter`] between them. [`MixPath::mix`] is the two halves composed, kept as
+//! a provided method because most callers want exactly that and because writing it that
+//! way is the proof that the unfiltered kernel does the same arithmetic it always did.
+//! [`MixPath::Mono`] — `f32` or `i32`, both on the raw `i16` scale — is the type that seam
+//! is written in.
 
 use starplayer_core::{I1F15, U0F16};
-use starplayer_dsp::{Interpolate, round_shift_nearest};
+use starplayer_dsp::{
+    FilterCoefficients, Interpolate, resonant_low_pass_f32, resonant_low_pass_fixed, resonate_f32, resonate_fixed,
+    round_shift_nearest,
+};
 
 use crate::gain::{GAIN_FRACTION_BITS, GAIN_UNITY, voice_gain_units};
 use crate::master::{MasterSettings, process_fixed, process_float};
+use crate::voice::{PathFilter, VoiceFilter};
 
 /// A left/right pair of whatever the path uses for gain or for accumulated signal.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -87,18 +102,56 @@ pub trait MixPath {
     /// One channel's gain, in whatever form the path multiplies by.
     type Gain: Copy;
 
+    /// One interpolated source frame, **before** the pan gains: the mono value IT's
+    /// per-voice filter operates on (architecture §7.2).
+    ///
+    /// `f32` on the float path and `i32` on the fixed path, both on the raw `i16` scale
+    /// the interpolators produce — normalisation stays folded into the gain, where it
+    /// costs nothing.
+    type Mono: Copy;
+
     /// Convert a gain from the shared ramping space (`0 ..= GAIN_UNITY`) into this path's
     /// multiplier.
     fn gain(units: i32) -> Self::Gain;
 
+    /// Resample one source frame.
+    fn interpolate<Interp: Interpolate>(frames: &[i16], index: usize, fraction_bits: u32) -> Self::Mono;
+
+    /// Pan one mono value and add it to `destination`.
+    fn accumulate(destination: &mut Self::Accumulator, value: Self::Mono, gains: Stereo<Self::Gain>);
+
+    /// One two-pole step of IT's resonant low-pass, on the interpolated value and before
+    /// the pan gains.
+    ///
+    /// `state` is the voice's own delay line, `[y[n−1], y[n−2]]`, and is advanced here.
+    fn filter(value: Self::Mono, state: &mut [Self::Mono; 2], coefficients: &FilterCoefficients<Self::Mono>) -> Self::Mono;
+
+    /// The filter coefficients for IT's seven-bit `cutoff` and `resonance`, in this
+    /// path's arithmetic.
+    fn coefficients(cutoff: u8, resonance: u8, sample_rate_hz: u32, extended_range: bool) -> FilterCoefficients<Self::Mono>;
+
+    /// This path's half of a voice's [`VoiceFilter`].
+    ///
+    /// A [`Voice`](crate::Voice) is not generic over the path — one pool serves whichever
+    /// path the engine was built with — so it carries a delay line and a coefficient set
+    /// for each, and the path picks its own. The unused half costs twenty bytes per
+    /// voice and is never read, written or recomputed.
+    fn path_filter(filter: &mut VoiceFilter) -> &mut PathFilter<Self::Mono>;
+
     /// Interpolate one source frame and add it to `destination`.
+    ///
+    /// The unfiltered shape, kept because most callers — and every path-agnostic test —
+    /// want exactly this. The kernel spells the two halves out separately so it can put
+    /// the filter between them.
     fn mix<Interp: Interpolate>(
         destination: &mut Self::Accumulator,
         frames: &[i16],
         index: usize,
         fraction_bits: u32,
         gains: Stereo<Self::Gain>,
-    );
+    ) {
+        Self::accumulate(destination, Self::interpolate::<Interp>(frames, index, fraction_bits), gains);
+    }
 
     /// Master volume and limiting, over a whole `RENDER_QUANTUM` (architecture §1.4 — the
     /// master bus never sees a ragged segment).
@@ -122,14 +175,28 @@ pub struct FloatPath;
 impl MixPath for FloatPath {
     type Accumulator = FloatFrame;
     type Gain = f32;
+    type Mono = f32;
 
     fn gain(units: i32) -> f32 { units as f32 * FLOAT_GAIN_SCALE }
 
-    fn mix<Interp: Interpolate>(destination: &mut FloatFrame, frames: &[i16], index: usize, fraction_bits: u32, gains: Stereo<f32>) {
-        let value = Interp::sample_f32(frames, index, fraction_bits);
+    fn interpolate<Interp: Interpolate>(frames: &[i16], index: usize, fraction_bits: u32) -> f32 {
+        Interp::sample_f32(frames, index, fraction_bits)
+    }
+
+    fn accumulate(destination: &mut FloatFrame, value: f32, gains: Stereo<f32>) {
         destination.left += value * gains.left;
         destination.right += value * gains.right;
     }
+
+    fn filter(value: f32, state: &mut [f32; 2], coefficients: &FilterCoefficients<f32>) -> f32 {
+        resonate_f32(value, state, coefficients)
+    }
+
+    fn coefficients(cutoff: u8, resonance: u8, sample_rate_hz: u32, extended_range: bool) -> FilterCoefficients<f32> {
+        resonant_low_pass_f32(cutoff, resonance, sample_rate_hz, extended_range)
+    }
+
+    fn path_filter(filter: &mut VoiceFilter) -> &mut PathFilter<f32> { &mut filter.float }
 
     fn master(quantum: &mut [FloatFrame], settings: MasterSettings) {
         for frame in quantum.iter_mut() {
@@ -146,16 +213,33 @@ impl MixPath for FixedPath {
     type Accumulator = FixedFrame;
     /// Q15 gain: `32767` is unity.
     type Gain = i32;
+    /// The raw `i16` scale, in an `i32` — the filter can overshoot past full scale and
+    /// the accumulator saturates it back.
+    type Mono = i32;
 
     /// Round to nearest, ties away from zero. C6 makes this rule part of the golden
     /// contract for every fixed-path precision reduction.
     fn gain(units: i32) -> i32 { round_shift_nearest(units as i64, GAIN_FRACTION_BITS) as i32 }
 
-    fn mix<Interp: Interpolate>(destination: &mut FixedFrame, frames: &[i16], index: usize, fraction_bits: u32, gains: Stereo<i32>) {
-        let value = Interp::sample_fixed(frames, index, fraction_bits) as i64;
+    fn interpolate<Interp: Interpolate>(frames: &[i16], index: usize, fraction_bits: u32) -> i32 {
+        Interp::sample_fixed(frames, index, fraction_bits)
+    }
+
+    fn accumulate(destination: &mut FixedFrame, value: i32, gains: Stereo<i32>) {
+        let value = value as i64;
         destination.left = destination.left.saturating_add(round_shift_nearest(value * gains.left as i64, 15) as i32);
         destination.right = destination.right.saturating_add(round_shift_nearest(value * gains.right as i64, 15) as i32);
     }
+
+    fn filter(value: i32, state: &mut [i32; 2], coefficients: &FilterCoefficients<i32>) -> i32 {
+        resonate_fixed(value, state, coefficients)
+    }
+
+    fn coefficients(cutoff: u8, resonance: u8, sample_rate_hz: u32, extended_range: bool) -> FilterCoefficients<i32> {
+        resonant_low_pass_fixed(cutoff, resonance, sample_rate_hz, extended_range)
+    }
+
+    fn path_filter(filter: &mut VoiceFilter) -> &mut PathFilter<i32> { &mut filter.fixed }
 
     fn master(quantum: &mut [FixedFrame], settings: MasterSettings) {
         for frame in quantum.iter_mut() {

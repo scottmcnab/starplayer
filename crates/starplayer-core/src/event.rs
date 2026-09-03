@@ -271,6 +271,54 @@ impl FilterParams {
     /// Whether these parameters leave the signal untouched, so the mixer can skip the
     /// filter entirely for MOD/S3M/MTM.
     pub const fn is_bypass(self) -> bool { self.cutoff.to_bits() == u16::MAX && self.resonance.to_bits() == 0 }
+
+    /// The largest cutoff or resonance an IT module can name. Both are seven-bit, whether
+    /// they come from the instrument header or from a `Zxx` MIDI macro.
+    pub const IT_SCALE_MAX: u8 = 127;
+
+    /// [`FilterParams`] from IT's seven-bit cutoff and resonance.
+    ///
+    /// # The encoding, fixed jointly by M6 tasks G2 and G3
+    ///
+    /// One definition, used by the IT processor that writes the parameters and by the
+    /// mixer that turns them back into filter coefficients, so the two cannot drift.
+    /// Three things have to hold at once:
+    ///
+    /// 1. [`FilterParams::to_it`] round-trips every one of the 128 values exactly.
+    /// 2. The trace's `unit_to_scale(bits, 255)` reproduces libxmp's own field, which is
+    ///    the IT value **doubled** (`xc->filter.cutoff = val << 1`, libxmp `player.c`).
+    ///    `514 = 2 × 257` and `65535 = 255 × 257`, so `unit_to_scale(514·v, 255)` is
+    ///    exactly `2·v`, with no rounding anywhere.
+    /// 3. A fully open cutoff is the *same value* [`FilterParams::BYPASS`] carries, so
+    ///    [`FilterParams::is_bypass`] recognises IT's own "cutoff 127 with resonance 0 is
+    ///    no filter at all" rule without a second spelling of it.
+    ///
+    /// (3) is why cutoff 127 maps to [`U0F16::MAX`] rather than to `514 × 127 = 65278`:
+    /// the top of the cutoff range is a *sentinel* as well as a value. The oracle stays
+    /// happy because libxmp's comparator — and the conformance adapter after it — treat
+    /// 254 and 255 as the same fully-open cutoff. Resonance has no such sentinel, so its
+    /// top value stays on the linear `514 ×` scale and reports libxmp's own 254.
+    pub const fn from_it(cutoff: u8, resonance: u8) -> FilterParams {
+        let cutoff = if cutoff >= FilterParams::IT_SCALE_MAX {
+            U0F16::MAX
+        } else {
+            U0F16::from_bits(cutoff as u16 * IT_SCALE_STEP)
+        };
+        let clamped_resonance = if resonance > FilterParams::IT_SCALE_MAX { FilterParams::IT_SCALE_MAX } else { resonance };
+        FilterParams { cutoff, resonance: U0F16::from_bits(clamped_resonance as u16 * IT_SCALE_STEP) }
+    }
+
+    /// IT's seven-bit cutoff and resonance back out, rounded to nearest — the exact
+    /// inverse of [`FilterParams::from_it`] on every value it produces.
+    pub const fn to_it(self) -> (u8, u8) { (unit_to_it_scale(self.cutoff), unit_to_it_scale(self.resonance)) }
+}
+
+/// One IT filter step in [`U0F16`] bits. See [`FilterParams::from_it`] for why it is 514.
+const IT_SCALE_STEP: u16 = 514;
+
+/// A unit scalar back to IT's `0..=127`, rounded to nearest.
+const fn unit_to_it_scale(value: U0F16) -> u8 {
+    ((value.to_bits() as u32 * FilterParams::IT_SCALE_MAX as u32 + u16::MAX as u32 / 2) / u16::MAX as u32) as u8
 }
 
 /// One absolutely-set voice parameter, as carried by [`Event::Param`].
@@ -480,6 +528,44 @@ mod tests {
         assert_eq!(params.filter, filter);
         assert!(!filter.is_bypass());
         assert!(FilterParams::BYPASS.is_bypass());
+    }
+
+    /// M6-G2 research point 1, and the contract G3 writes against.
+    #[test]
+    fn the_it_filter_encoding_round_trips_every_seven_bit_value() {
+        for cutoff in 0..=127u8 {
+            for resonance in [0u8, 1, 63, 64, 126, 127] {
+                let params = FilterParams::from_it(cutoff, resonance);
+                assert_eq!(params.to_it(), (cutoff, resonance), "cutoff {cutoff}, resonance {resonance}");
+            }
+        }
+    }
+
+    /// The trace scales the same bits to libxmp's `0..255` field with
+    /// `(bits · 255 + 32767) / 65535`, and libxmp stores the IT value doubled
+    /// (`xc->filter.cutoff = val << 1`).
+    #[test]
+    fn the_it_filter_encoding_reproduces_libxmps_doubled_field() {
+        let to_libxmp = |value: U0F16| (value.to_bits() as u32 * 255 + 32_767) / 65_535;
+        for value in 0..=126u8 {
+            let params = FilterParams::from_it(value, value);
+            assert_eq!(to_libxmp(params.cutoff), 2 * value as u32, "cutoff {value}");
+            assert_eq!(to_libxmp(params.resonance), 2 * value as u32, "resonance {value}");
+        }
+        // libxmp's own 254 and the trace's 255 are the same fully-open cutoff, which the
+        // conformance adapter already folds together; resonance carries no sentinel.
+        let open = FilterParams::from_it(127, 127);
+        assert_eq!(to_libxmp(open.cutoff), 255);
+        assert_eq!(to_libxmp(open.resonance), 254);
+    }
+
+    #[test]
+    fn a_fully_open_it_filter_is_the_bypass_the_mixer_already_knows() {
+        assert_eq!(FilterParams::from_it(127, 0), FilterParams::BYPASS);
+        assert!(FilterParams::from_it(127, 0).is_bypass());
+        assert!(!FilterParams::from_it(127, 1).is_bypass(), "resonance alone still filters");
+        assert!(!FilterParams::from_it(126, 0).is_bypass());
+        assert_eq!(FilterParams::from_it(200, 200), FilterParams::from_it(127, 127), "out-of-range values clamp");
     }
 
     #[test]

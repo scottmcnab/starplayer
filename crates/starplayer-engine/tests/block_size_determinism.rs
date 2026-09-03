@@ -16,7 +16,7 @@
 //! Samples are compared as **bit patterns**, never with `==` on floats: `==` would accept
 //! `0.0 == -0.0` and reject two identical NaNs, and byte identity is the actual claim.
 
-use starplayer_core::{ExactFixedPoint, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
+use starplayer_core::{ExactFixedPoint, FilterParams, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
 use starplayer_dsp::{Interpolate, Linear, Nearest};
 use starplayer_engine::demo::{
     DEMO_BREAK_ROW, DEMO_NOTE_CUT, DEMO_ORDER_JUMP, DEMO_PATTERN_DELAY, DEMO_SET_SPEED, DEMO_SET_TEMPO, DemoCell,
@@ -194,6 +194,81 @@ fn nearest_interpolation_is_byte_identical_at_every_host_block_size() {
 #[test]
 fn mono_output_is_byte_identical_at_every_host_block_size() {
     assert_block_size_independent::<FixedPath, Linear, MonoI16>("fixed / linear / mono i16");
+}
+
+// ── the same invariant, with IT's per-voice resonant filter live (M6-G2) ────────────
+
+/// When the filter sweeps. Deliberately not a multiple of `RENDER_QUANTUM` and not equal
+/// to [`EVENT_FRAME`], so the coefficient refresh lands mid-quantum and on a different
+/// frame from the volume change.
+const FILTER_EVENT_FRAME: u64 = 5_000 + 41;
+
+const _: () = assert!(!FILTER_EVENT_FRAME.is_multiple_of(RENDER_QUANTUM as u64), "the filter event must not sit on a quantum boundary");
+
+/// A near-closed, strongly resonant filter, and the wide-open-but-still-resonant one it
+/// sweeps to. Both are far enough apart to be audible in one sample, and neither is
+/// `FilterParams::BYPASS`, so the filtered arm of the kernel runs for the whole render.
+const FILTER_BEFORE: FilterParams = FilterParams::from_it(24, 112);
+const FILTER_AFTER: FilterParams = FilterParams::from_it(96, 40);
+
+/// The filtered scenario: the same looping voice, with a filter on it from the first frame
+/// and a `Zxx`-shaped sweep part way through.
+fn render_filtered_at_block_size<Path, Interp, Out>(block_frames: usize) -> Vec<Out::Sample>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let (blob, region) = looping_blob();
+    let mut engine: Engine<Path, Interp, Out> = Engine::new(VOICE_CAPACITY);
+    engine.set_pcm(blob);
+
+    let tag = VoiceTag { channel: 0, instrument: 1, sample: 1, note: 60 };
+    let params = VoiceParams { filter: FILTER_BEFORE, ..voice_params() };
+    let voice = engine.voices_mut().allocate(tag, region, params, 0).expect("a fresh pool has room");
+    engine.set_source(Box::new(ScriptedSource::new(vec![
+        ScriptedAction::new(Frame(EVENT_FRAME), voice, VoiceParam::Volume(VOLUME_AFTER)),
+        ScriptedAction::new(Frame(FILTER_EVENT_FRAME), voice, VoiceParam::Filter(FILTER_AFTER)),
+    ])));
+
+    let mut output = vec![Out::Sample::default(); TOTAL_FRAMES * Out::CHANNELS];
+    let mut written = 0;
+    while written < output.len() {
+        let end = (written + block_frames * Out::CHANNELS).min(output.len());
+        engine.render(&mut output[written..end]);
+        written = end;
+    }
+    output
+}
+
+fn assert_filtered_block_size_independent<Path, Interp, Out>(what: &str)
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: BitPattern + Default,
+{
+    let reference = render_filtered_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM);
+    let unfiltered = render_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM, true);
+    assert!(first_difference(&reference, &unfiltered).is_some(), "{what}: the filter has to actually change the sound");
+
+    for block_frames in BLOCK_SIZES {
+        let output = render_filtered_at_block_size::<Path, Interp, Out>(block_frames);
+        let difference = first_difference(&output, &reference);
+        assert_eq!(difference, None, "{what}: block size {block_frames} changed the output at sample {difference:?}");
+        assert_eq!(byte_image(&output), byte_image(&reference), "{what}: block size {block_frames} is not byte-identical");
+    }
+}
+
+/// The filter is a two-pole *recursion*, so it is the one thing in the voice path whose
+/// output depends on where the previous segment ended. If a coefficient refresh or a delay
+/// line were ever driven by the host's block size rather than by the voice's own state,
+/// this is where it would show.
+#[test]
+fn a_filtered_voice_is_byte_identical_at_every_host_block_size() {
+    assert_filtered_block_size_independent::<FloatPath, Linear, StereoF32>("float / linear / stereo f32, filtered");
+    assert_filtered_block_size_independent::<FixedPath, Linear, StereoI16>("fixed / linear / stereo i16, filtered");
+    assert_filtered_block_size_independent::<FixedPath, Nearest, MonoI16>("fixed / nearest / mono i16, filtered");
 }
 
 /// The same scenario as [`render_at_block_size`], on an engine sized by `settings` rather

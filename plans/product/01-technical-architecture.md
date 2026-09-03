@@ -671,8 +671,57 @@ loop, never a semantic change. A scalar-equivalence test gates it.
 ### 7.2 DSP graph
 
 Per-channel insert chains and a master bus, both operating on whole `RENDER_QUANTUM`
-blocks (§1.4). Effects: reverb, chorus, delay, compressor, EQ, plus IT's resonant
-filter, which is a *voice*-level filter rather than an insert.
+blocks (§1.4). Effects: reverb, chorus, delay, compressor, EQ.
+
+#### IT's resonant filter is a *voice*-level filter, not an insert (M6-G2, landed)
+
+It sits inside the render kernel, between the resampler and the pan gains — which is where
+Impulse Tracker puts it and where OpenMPT's `SampleLoop` runs it
+(`interpolate(); filter(); mix();`). Two voices of the same instrument on the same channel
+filter independently, which an insert on a channel bus could not do, and which IT needs
+because a New Note Action leaves the old voice sounding with a cutoff of its own.
+
+**The law**, from OpenMPT's `CSoundFile::SetupChannelFilter` (`soundlib/Snd_flt.cpp`) on
+the `kITFilterBehaviour` branch every IT module takes:
+
+```text
+frequency = 110 · 2^(0.25 + cutoff/24) Hz, clamped to [120, 20000] and then to sr/2
+r         = sr / (2π · frequency)
+damping   = 10^(−resonance · (24/128) / 20)
+d         = damping·r + damping − 1;   e = r²
+y[n] = x[n]/(1+d+e) + y[n−1]·(d+2e)/(1+d+e) − y[n−2]·e/(1+d+e)
+```
+
+With IT's extended filter range the exponent's divisor is 20 rather than 24 (a top cutoff
+of 10670 Hz instead of 5124 Hz) and `d` comes from OpenMPT's other branch,
+`d = (2·damping − min((1 − 2·damping)/r, 2)) · r`.
+
+**Two tables, no transcendental** (§7.3). `2^(0.25 + cutoff/24)` is `2^(n/768)` at
+`n = 192 + 32·cutoff`, an exact integer index into `LINEAR_FREQUENCY_TABLE`; the extended
+range's index falls on a fifth of a table step, so it interpolates between two neighbouring
+entries. `10^(−resonance·(24/128)/20)` is `IT_RESONANCE_TABLE_Q24`, Schism Tracker's
+`resonance_table` transcribed as Q0.24 integers so the fixed path never touches a float.
+
+**Two arms in the kernel.** `mix_run` carries a `const FILTERED: bool` alongside its
+existing `RAMPING`/`REVERSE`, so the unfiltered body is textually the code that was there
+before and every MOD, S3M and MTM golden is byte-identical across the change. The
+coefficients are cached on the voice and recomputed only when `FilterParams` or the sample
+rate moves — at tick rate in practice, never per frame — with no dirty bit, because
+comparing the four bytes of `FilterParams` is cheaper than a bit test and cannot be missed
+by an owner who forgets to raise one. `FilterParams::BYPASS` *is* IT's own "cutoff 127 with
+resonance 0 is no filter at all", so a format without a filter pays one comparison per
+voice per segment and nothing else.
+
+**Fixed-point format**: coefficients in Q8.24 `i32` (OpenMPT's own
+`MIXING_FILTER_PRECISION`), the delay line pre-amplified by 256 so that a quiet sample at a
+low cutoff does not quantise to silence, and clamped to twice the input range before it is
+fed back. See D70–D74 in the accuracy policy for where the fixed path's quantisation is
+known to differ from OpenMPT's float.
+
+**The reset rule**: a new note zeroes the delay line (`Voice::new`, `Voice::retrigger`); a
+mid-note sample swap under tone portamento does not (D73). A muted voice's filter keeps
+running, for the same reason its position does — the filter is a recursion, and a gap in it
+would ring on unmute.
 
 ### 7.3 Cross-target determinism
 

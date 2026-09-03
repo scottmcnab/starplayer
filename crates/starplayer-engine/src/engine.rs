@@ -182,6 +182,10 @@ where
     frame: Frame,
     source_frame: Frame,
     playing: bool,
+    /// The rate the mixer renders at. The only thing that reads it is IT's per-voice
+    /// resonant filter, whose cutoff is an absolute frequency; everything else in the
+    /// audio path works in ratios and in frames.
+    sample_rate_hz: u32,
     master_volume: U0F16,
     limiter: Limiter,
     warnings: EngineWarnings,
@@ -248,6 +252,7 @@ where
             frame: Frame::ZERO,
             source_frame: Frame::ZERO,
             playing: true,
+            sample_rate_hz: settings.sample_rate_hz,
             master_volume: U0F16::MAX,
             limiter: Limiter::SoftKnee,
             warnings: EngineWarnings::default(),
@@ -472,7 +477,7 @@ where
                     let scratch = self.muted_scratch.get_mut(offset..end).unwrap_or(&mut []);
                     let channels = &self.channels;
                     let is_muted = |channel: u8| channels.get(ChannelId(channel as u16)).is_some_and(|lane| lane.muted);
-                    self.voices.accumulate_masked::<Path, Interp>(pcm, window, scratch, is_muted);
+                    self.voices.accumulate_masked::<Path, Interp>(pcm, window, scratch, self.sample_rate_hz, is_muted);
                 }
             }
 

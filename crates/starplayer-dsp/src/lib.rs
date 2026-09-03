@@ -12,8 +12,13 @@
 
 extern crate alloc;
 
+pub mod filter;
 pub mod interpolate;
 pub mod ramp;
 
+pub use filter::{
+    FILTER_FRACTION_BITS, FILTER_PREAMP_BITS, FilterCoefficients, IT_RESONANCE_TABLE_Q24, resonant_low_pass_f32,
+    resonant_low_pass_fixed, resonate_f32, resonate_fixed,
+};
 pub use interpolate::{Interpolate, Linear, Nearest, round_shift_nearest};
 pub use ramp::GainRamp;
