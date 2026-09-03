@@ -32,7 +32,9 @@ Elapsed is the engine's own reported position, not compensated for the `AudioCon
 point and the slider wraps with it; unchecked fades the song out over `SONG_FADE_SECONDS`
 (5 seconds) into what would otherwise be its second pass, then stops — the host itself
 rewinds the transport to song frame 0 once the fade lands, and the slider follows it to
-`0:00`. The same command is resent whenever a module is (re)activated and whenever a
+`0:00`. With Repeat off the slider's length includes those five seconds, so it always
+represents one complete playback; a song that ends of its own accord has no fade and its
+length does not change. The same command is resent whenever a module is (re)activated and whenever a
 playback-restoring graph rebuild happens (a sample-rate or channel-count change, or the
 MOD panning reload), so the checkbox's choice survives all of them.
 

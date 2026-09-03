@@ -622,6 +622,9 @@ async function run(executable, mode) {
         // ── Repeat off fades out at the loop point and stops, resetting to 0:00 ─────
         await page.evaluate("const repeat = document.getElementById('repeat'); repeat.checked = false; repeat.dispatchEvent(new Event('change')); return true;");
         const rate = rateDigits(settledSliderSeek.workletRate);
+        await page.waitFor('the slider to grow by the fade with Repeat off', `Number(document.getElementById('progress').max) > ${settledSliderSeek.progressMax}`);
+        const repeatOff = await page.evaluate(READ_STATE);
+        assert.equal(repeatOff.progressMax, settledSliderSeek.progressMax + 5 * rate, 'with Repeat off the slider covers the five-second fade as well');
         const nearEndFrame = Math.max(0, settledSliderSeek.progressMax - rate);
         await page.evaluate(`
             const progress = document.getElementById('progress');
