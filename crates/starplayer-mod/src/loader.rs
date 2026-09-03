@@ -153,6 +153,7 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
             loop_end: if loops { loop_end as u32 } else { 0 },
             default_volume: unit_from_ratio(volume as u32, 64),
             reference_rate_hz: FINETUNE_REFERENCE_RATES[finetune as usize],
+            ..SampleSpec::default()
         };
         let sample = builder.add_sample(&pcm, specification)?;
         builder.add_instrument(InstrumentDef::from_sample(&name, sample, U0F16::MAX))?;
@@ -185,6 +186,8 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
         flags: ModuleFlags { amiga_limits, linear_slides: false, fast_volume_slides: false, stereo: options.stereo_separation.get() != 0 },
         dialect: layout.dialect,
         format_extra: encode_evidence(evidence),
+        default_channel_volume: Vec::new().into_boxed_slice(),
+        format_data: Vec::new().into_boxed_slice(),
     });
     builder.build()
 }

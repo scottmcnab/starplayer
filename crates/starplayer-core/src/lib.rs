@@ -37,6 +37,7 @@ pub mod fixed;
 pub mod frame;
 pub mod note;
 pub mod quirks;
+pub mod random;
 pub mod row_clock;
 pub mod sample;
 pub mod tables;
@@ -55,6 +56,7 @@ pub use quirks::{
     BreakParameter, FormatDialect, ModLoopDialect, PatternFlow, PaulaClock, QuirkSelection,
     QuirkSet, S3mLoopDialect,
 };
+pub use random::Xorshift32;
 pub use row_clock::{RowAdvance, RowClock};
 pub use sample::GUARD_FRAMES;
 pub use tables::{PERIOD_TABLE, ST3_C4_SPEED, ST3_FREQUENCY_NUMERATOR, ST3_PERIOD_SCALE};

@@ -241,3 +241,63 @@ Report the exact commands run and their results. **Do not commit** — the revie
 
 Reading any of these fields. No envelope runs, no sustain loop is played, no filter exists.
 XM and IT loaders (F1, G1). The linear-frequency table (E2). Voice lifecycle (E3).
+
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question.
+
+### 1. Auto-vibrato units — **a single `u8` per field, confirmed from both formats' own headers**
+
+Fetched OpenMPT's `ITTools.h` directly rather than relying on memory: `struct ITSample`
+carries `C5Speed` (`uint32le`) followed by `vis`/`vid`/`vir`/`vit` — rate, depth, sweep,
+type — each `uint8le`, one byte apiece, matching `ITTECH.TXT`'s own field widths. `xm.txt`
+(fetched from `aluigi.altervista.org/mymusic/xm.txt`) gives the extended instrument header
+the same shape: vibrato type, sweep, depth and rate are each a single byte, immediately
+after the panning envelope's loop points. `AutoVibrato { waveform, sweep: u8, depth: u8,
+rate: u8 }` as specified needs no widening in either direction.
+
+The two formats' `sweep` fields are confirmed to mean different things and are left
+unnormalised, exactly as instructed: XM's is a tick count to reach full depth (`xm.txt`
+gives no explicit units, but FT2's own runtime — and every player that has reverse
+engineered it — treats it as a linear ramp-up tick counter), while OpenMPT's IT loader
+comments describe `VibratoSweep` as the rate depth ramps in at, a per-tick increment
+rather than a target tick count. `AutoVibrato::sweep`'s doc comment states both meanings
+and defers to each format's own effect processor (G3/F2) to consume it correctly; no
+behaviour is implemented here.
+
+### 2. IT `C5Speed` above `u32`? — **no, confirmed**
+
+`ITSample::C5Speed` is `uint32le` in `ITTools.h`, matching `ITTECH.TXT`. It maps straight
+onto `SampleSpec::reference_rate_hz: u32` with no truncation, unlike S3M's C2SPD (D7),
+which the original truncated to 16 bits on read; IT's own tools always read all 32.
+
+### 3. Note map width — **confirmed: XM needs `u16`, IT's global sample numbers fit comfortably**
+
+`xm.txt` gives the "number of samples in instrument" field as a word and the practical
+FT2 ceiling (matching this task's framing) is 16 samples per instrument; 128 instruments ×
+16 samples is 2048, past `u8::MAX` (255), so `InstrumentDef::note_sample_map` is `u16` as
+specified. `ITTools.h`'s `ITOldInstrument::nos` (samples in the old 554-byte instrument
+header) is itself a single `uint8le`, and the fetched IT loader code's own validation
+(`fileHeader.smpnum > 0xFF`) confirms a plain `.it` file's global sample count stays at or
+under 255 — comfortably inside `u16`, with OpenMPT's own `.mptm` extension (more than 255
+samples) explicitly out of scope per the task text.
+
+### 4. Ping-pong guard arithmetic — **the `Linear` kernel reads the guard with zero weight; the builder matches the mixer's arithmetic regardless**
+
+Read `LoopSpan::ping_pong_frame` and `fold_ping_pong` in
+`crates/starplayer-mixer/src/{sample,kernel}.rs`. The traversal turns *on* the two real
+frames `start` and `end - 1`, never between them, so `run_limit` in `kernel.rs` stops a
+forward run at `ping_pong_turn_bits(span).saturating_add(1)` — one Q32.32 tick past the
+turning frame — and a reverse run at `frames_to_bits(span.start())`. `Linear`
+interpolation's largest read offset is `index + 1`, and the position never advances past
+the turning frame before the boundary handler folds it, so in practice the guard past
+`end - 1` is read only at the exact frame where its interpolation weight is zero (the
+concurrency-plan critique's claim, confirmed rather than merely assumed — `mix_run`'s
+`Path::mix::<Interp>` call is fed a position whose fractional part is `0` on the turning
+frame itself, per `frames_to_bits`/`Q32.32` alignment of both turning points). `Cubic` and
+`Sinc` (M7) will read two to four frames past the turn with real, non-zero weight, which
+is exactly why `ModuleBuilder::add_sample` was written to match
+`starplayer_mixer::sample::append_guarded_sample`'s reflection frame for frame rather than
+leaving the ping-pong guard silent — `builder::tests::a_ping_pong_guard_matches_the_mixers_own_arithmetic`
+builds one sample through both and diffs the two blobs byte for byte.

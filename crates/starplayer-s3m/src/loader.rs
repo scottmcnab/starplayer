@@ -236,6 +236,8 @@ fn song_header<R: ModuleReader + ?Sized>(source: &Source<'_, R>, file_header: &S
         },
         dialect: file_header.dialect(),
         format_extra: extra.encode(),
+        default_channel_volume: Vec::new().into_boxed_slice(),
+        format_data: Vec::new().into_boxed_slice(),
     })
 }
 
@@ -298,6 +300,7 @@ fn load_instrument<R: ModuleReader + ?Sized>(source: &Source<'_, R>, header_offs
             0 => FALLBACK_C2SPD,
             rate => rate,
         },
+        ..SampleSpec::default()
     };
 
     let sample_id = builder.add_sample(&pcm, specification)?;

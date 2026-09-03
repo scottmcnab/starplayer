@@ -7,6 +7,15 @@ rust-version.workspace = true
 [dependencies]
 starplayer-core = { workspace = true }
 
+[dev-dependencies]
+# Test-only, and deliberately not a normal dependency: `starplayer-model` does not depend
+# on `starplayer-mixer` (the edges are model → core and mixer → core, dsp). This lets
+# `builder::tests::a_ping_pong_guard_matches_the_mixers_own_arithmetic` build the same
+# sample through both `ModuleBuilder::add_sample` and
+# `starplayer_mixer::sample::append_guarded_sample` and assert the guard frames agree —
+# the ping-pong guard contract the builder has to honour (task E1).
+starplayer-mixer = { workspace = true }
+
 [features]
 default = []
 std = ["starplayer-core/std"]

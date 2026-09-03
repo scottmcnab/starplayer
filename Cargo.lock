@@ -403,6 +403,7 @@ name = "starplayer-model"
 version = "0.1.0"
 dependencies = [
  "starplayer-core",
+ "starplayer-mixer",
 ]
 
 [[package]]

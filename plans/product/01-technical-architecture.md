@@ -530,13 +530,16 @@ Decide this now, not later:
 pub struct Module {
     blob: Box<[u8]>,               // decoded pattern data and everything non-sample
     pcm: Box<[i16]>,               // all samples decoded + delta-decoded, concatenated,
-                                   //   each with N guard frames appended (loop-wrapped
-                                   //   or zeroed) so interpolators need no branches
-    samples: Box<[SampleIndex]>,   // { pcm_offset: u32, len: u32, loop_start, loop_end, .. }
+                                   //   each with N guard frames appended (loop-wrapped,
+                                   //   reflected, or zeroed) so interpolators need no
+                                   //   branches
+    samples: Box<[SampleIndex]>,   // { pcm_offset: u32, len: u32, loop_start, loop_end,
+                                   //   sustain_loop: Option<SustainLoop>, .. }
     patterns: Box<[PatternIndex]>, // { blob_offset: u32, rows: u16, channels: u8 }
     orders: Box<[u16]>,
     instruments: Box<[InstrumentDef]>,
-    header: ModuleHeader,
+    header: ModuleHeader,          // .. format_data: Box<[u8]>, format-owned bytes the
+                                   //    engine never interprets
 }
 ```
 
@@ -549,8 +552,13 @@ pub struct Module {
 - no pointer chasing in the mixer inner loop.
 
 **Guard frames** are the other half: appending N frames to each sample's PCM (loop-
-wrapped for looping samples, zeroed otherwise) lets the interpolator read past the loop
-point without a branch in the inner loop.
+wrapped for a forward loop, reflected for a ping-pong loop, or zeroed for a one-shot or a
+sample with a sustain loop) lets the interpolator read past the loop point without a
+branch in the inner loop. A sample with a sustain loop (IT, task E1) stores its whole body
+rather than truncating at a loop end, because the ordinary loop and the sustain loop may
+each lie anywhere inside it; its guard is silence, and one frame of `Linear`
+interpolation reads real PCM past a loop end there instead of a wrapped or reflected
+copy — accepted for now, left for M7's kernels to reconsider.
 
 Format crates keep their **native** pattern bytes in `blob`. The shared model covers
 samples, envelopes, instrument definitions and a **display-only** `PatternCell` view for
