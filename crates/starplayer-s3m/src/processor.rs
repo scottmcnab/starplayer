@@ -844,6 +844,14 @@ impl TrackerProcessor for S3mProcessor {
     }
 }
 
+/// How many voices an S3M module of `channel_count` channels wants in the pool.
+///
+/// The same answer [`S3mProcessor`]'s [`TrackerProcessor::recommended_voice_capacity`] gives,
+/// available without building a processor — which is what a host sizing an engine from a
+/// module header alone has. S3M sounds exactly one voice per pattern channel and
+/// never creates a background voice, so the two are the channel count.
+pub const fn recommended_voice_capacity(channel_count: usize) -> usize { channel_count }
+
 /// Build the public S3M sequencer with header speed, tempo, global volume and pan state.
 ///
 /// The quirks come from the [`FormatDialect`](starplayer_core::quirks::FormatDialect) the

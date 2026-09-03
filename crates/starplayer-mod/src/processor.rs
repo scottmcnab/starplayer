@@ -926,6 +926,14 @@ impl TrackerProcessor for ModProcessor {
     }
 }
 
+/// How many voices a MOD module of `channel_count` channels wants in the pool.
+///
+/// The same answer [`ModProcessor`]'s [`TrackerProcessor::recommended_voice_capacity`] gives,
+/// available without building a processor — which is what a host sizing an engine from a
+/// module header alone has. MOD sounds exactly one voice per pattern channel and
+/// never creates a background voice, so the two are the channel count.
+pub const fn recommended_voice_capacity(channel_count: usize) -> usize { channel_count }
+
 /// Build a public MOD sequencer using ProTracker timing and native period semantics.
 ///
 /// The quirks come from the [`FormatDialect`](starplayer_core::quirks::FormatDialect) the

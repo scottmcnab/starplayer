@@ -17,6 +17,11 @@ not fit.
 
 ## Deliverables
 
+0. **`starplayer::NativeSequencer`** (task D3) — one format dispatch in the facade,
+   lifted from the wasm host's private enum, so the cpal host, the CLI, the offline
+   renderer, the trace path and the conformance harness all turn a `Module` into a playing
+   sequencer through the same code. A prerequisite for D4 and D5, and for M5's and M6's
+   wiring tasks; see [the concurrency plan](M3-M6-concurrency-plan.md).
 1. **`starplayer-audio` host abstraction** — the trait a backend implements, plus device
    enumeration, sample-rate and buffer-size negotiation, and stream lifecycle. The WASM
    backend is retrofitted behind it, which is the test of whether the abstraction is

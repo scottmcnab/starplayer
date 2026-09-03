@@ -341,6 +341,13 @@ fit comes for free without contaminating the tracker path.
 | `ExternalEventQueue` | live MIDI, keyboard, plugin host events |
 | `SourceMux` | merges several sources with the §3.1.3 tie-break — "play a module and jam over it". Landed at **M1-B3** rather than M4: it is a hundred lines, and the tie-break rule is only testable once two real sources can collide |
 
+`starplayer::NativeSequencer` (M3-D3) is the host-side dispatch above them: one enum, one
+arm per format crate compiled in, that turns a runtime `ModuleFormat` into the typed
+`PatternSequencer` for it and forwards the seek and song-clock surface. `Engine` still
+stores `Box<dyn EventSource>` and still cannot seek from its command handler (§1.2) — the
+enum is what every host owns *outside* the engine, so a format is wired up once rather than
+once per host, and a new host consumes one type.
+
 ---
 
 ## 4. The row clock

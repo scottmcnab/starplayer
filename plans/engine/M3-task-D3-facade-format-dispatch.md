@@ -177,3 +177,151 @@ Report the exact commands run and their results. **Do not commit** — the revie
 
 Making `Engine` handle `Command::Seek*` itself. The cpal host (D4), the CLI (D5), XM and IT
 arms (F4, G5). Changing any golden, trace or conformance result.
+
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question.
+
+### 0. Two deviations from the spec, both deliberate
+
+**`recommended_voice_capacity` is a `pub const fn`, not a `pub const`.** The task asks for
+"the format's constant, so give each format crate a `pub const`". A bare constant can only
+express a per-channel *multiplier* — `VOICES_PER_CHANNEL: usize = 1` — and IT, whose whole
+reason for `TrackerProcessor::recommended_voice_capacity` existing is that its answer is
+not a multiple of the channel count, could not be written that way when G5 adds its arm.
+Each format crate therefore exports
+
+```rust
+pub const fn recommended_voice_capacity(channel_count: usize) -> usize { channel_count }
+```
+
+which is still const-evaluable, still builds nothing, and takes exactly the argument E3's
+trait method takes. `starplayer::recommended_voice_capacity(&Module)` matches on
+`ModuleFormat` and calls it. The two answers are pinned together by
+`the_facade_voice_capacity_convenience_agrees_with_the_processor_that_plays_the_module` in
+`crates/starplayer-offline/src/lib.rs`, which builds a real `NativeSequencer` for each of
+the three fixture formats and asserts the free function equals
+`NativeSequencer::recommended_voice_capacity`. Nothing else could keep them together: they
+live in different crates and neither calls the other.
+
+**`starplayer::supports(ModuleFormat) -> bool` was added, unasked.** Deliverable 4 requires
+that "a format the facade cannot build reports `GATED` exactly as a missing entry does
+today". Once the conformance registry stops naming per-format `load_*`/`capture_*`
+functions there is nothing left for `#[cfg]` to remove from it — the testkit cannot see the
+facade's feature flags — so the registry has to *ask*. `supports` is that question, one
+`match` over `cfg!`, and `ConformanceFormat::ALL` is filtered through it when the map is
+built. D5's `info` wants the same answer for "can this build play the file you handed me".
+
+### 1. Trace path equivalence — **proven identical; one behaviour change outside the default feature set**
+
+`cargo xtask conformance --offline` was captured before the change and after it and the two
+files are **character-identical** (`diff` reports nothing), 33 of 47 passing, MOD 16/27,
+S3M 16/17, MTM 1/3, 13 accepted deviations, 1 known failure, 0 gated. `cargo xtask goldens
+--check` reports all seven hashes `ok`.
+
+Why they agree, so the diff is a confirmation rather than the whole argument:
+
+* `XProcessor::new` **is** `with_quirks(QuirkSelection::FromDialect)` for all three formats.
+  S3M and MTM say so directly; MOD's `new` calls `with_semantics(.., ProTracker)`, whose
+  first act is `let quirks = QuirkSelection::FromDialect`. `NativeSequencer::with_settings`
+  passes `Override(FromDialect.resolve(dialect))`, and `QuirkSelection::resolve` is
+  `FromDialect => dialect.quirks()`, `Override(q) => q` — so resolving twice is resolving
+  once. MTM resolves against `FormatDialect::MultiTracker` rather than the header in both
+  the old and the new path, which is what `starplayer_mtm::sequencer_with_quirks` does.
+* `ExactFixedPoint` versus `TempoModelId::ExactFixedPoint`: `impl TempoModel for
+  TempoModelId` forwards `ExactFixedPoint => ExactFixedPoint.frames_per_tick(..)`. Same
+  arithmetic, one `match` earlier.
+* Under the **default** feature set every dialect's `QuirkSet` carries
+  `tempo_model: ExactFixedPoint`, because `QuirkSet::canonical()` does and every
+  `FormatDialect` profile is built `..QuirkSet::canonical()`. So the model the dialect
+  resolves to is the model the old code hard-coded.
+
+**The one place they differ.** With `quirks-starplayer` on, `QuirkSet::profile_default()`
+is `starplayer_classic()` and every dialect answers `TempoModelId::St3Truncating`. The old
+trace ignored that and always ran `ExactFixedPoint`; the new one follows the dialect, so a
+`quirks-starplayer` build now traces the tick length it would actually *play*. That is the
+better behaviour — a trace that disagrees with playback is a trace of nothing — and it is
+unreachable from CI: `quirks-starplayer` appears nowhere in `xtask/` or the workflow, and
+`cargo xtask conformance` builds `starplayer-testkit --features trace`.
+
+Both capture files are in `/tmp` (`d3-conformance-before.txt`, `d3-conformance-after.txt`),
+deliberately not in the repository.
+
+### 2. Feature matrix — **all eight subsets build; the empty enum needs two tricks**
+
+`cargo check -p starplayer --no-default-features --features float-mix,linear-interp` plus
+each of `s3m`, `mod`, `mtm`, `s3m,mod`, `s3m,mtm`, `mod,mtm` and the default set compile
+with no warnings, and `cargo clippy … -- -D warnings` passes on the zero-format build.
+`cargo xtask ci --job no-std-purity`, which builds the facade last for a bare-metal target,
+passes.
+
+Two things the zero-arm build needs, both documented at the macros in
+`crates/starplayer/src/sequencer.rs`:
+
+* **`match *self`, never `match self`.** With no arms `NativeSequencer` is uninhabited, and
+  an arm-less match is accepted only on a place expression of an uninhabited type — never
+  on a *reference* to one, which the compiler still treats as inhabited. The same applies
+  to `scan_with`, which matches the sequencer by value.
+* **The parameters have to be consumed.** A method body that expands to nothing leaves its
+  arguments unused, so both `forward!` macros take a parenthesised argument list whose only
+  job is `let _ = &argument;`. `scan_with` is entirely dead in that build — the `?` on
+  `NativeSequencer::new` never returns — so it carries a `#[cfg_attr(not(any(feature =
+  "s3m", feature = "mod", feature = "mtm")), allow(unreachable_code, unused_mut,
+  unused_variables))]` that exists only there.
+
+Clippy did fire once on real code: `supports` is `match_like_matches_macro`-shaped in the
+default build and only there, so it carries an `#[allow]` with the reason written next to it.
+
+### 3. What D4 and D5 need — **the surface is complete; three methods deliberately left off**
+
+The wasm host, which is the most demanding consumer today, calls exactly nine:
+`next_event_frame`, `advance_to`, `dispatch` (the `EventSource` impl), `seek_row`,
+`seek_order_at`, `seek_frame`, `restart_clock_at`, `set_timeline`, `set_at_end`. All nine
+are on the enum.
+
+D4 (cpal) owns its sequencer the way the worklet does — `Engine::Command::Seek*` stays
+unsupported — so it needs the same nine and nothing more. D5 (CLI) adds:
+
+| Method | Why the CLI wants it |
+|---|---|
+| `format()` | `info` prints it, and `play` chooses an extension filter from it |
+| `sample_rate_hz()` | `render`'s WAV header, and a check that the negotiated device rate is the one the sequencer was built at |
+| `recommended_voice_capacity()` | `play` builds one engine per file, so it sizes the pool per module rather than taking `MAX_VOICE_CAPACITY` |
+| `song_frame(now)` / `song_length_frames()` | the `play` progress line, without linking telemetry |
+| `end_reached()` | when `play` stops, and when `render` stops writing (tasks D1 and D2) |
+
+All present. Three `PatternSequencer` methods were **not** forwarded, and each is a
+decision rather than an omission:
+
+* `stop()` — the transport is the engine's `Command::Stop`; no host stops a sequencer
+  directly.
+* `take_song_looped()` — the D1/D2 surface a host reads is `end_reached()` plus the
+  timeline's `EndReason`, which is what `song_looped`'s own documentation says.
+* `sounding_position()` / `sounding_tick()` / `row_clock()` / `tempo_bpm()` — the display
+  cursor, published by telemetry (`Snapshot::transport`), which is where every host already
+  reads it. Adding forwarding methods with no caller would be surface before need.
+
+They are three lines each the day a host wants them.
+
+## Verification run
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | pass — 58 `test result: ok`, no failures |
+| `cargo xtask goldens --check` | pass — all seven hashes `ok` |
+| `cargo xtask conformance --offline` | pass — output **character-identical** to the pre-change capture; 33/47 |
+| `cargo xtask ci --job wasm-build` | pass |
+| `cargo xtask wasm` | pass — packaged into `apps/starplayer-web/dist` |
+| `node apps/starplayer-web/test/worklet-harness.mjs` | pass — peak `0.731`, the same figure E3 recorded |
+| `node apps/starplayer-web/test/ring-harness.mjs` | pass |
+| `cargo xtask ci --job no-std-check` | pass |
+| `cargo xtask ci --job no-std-purity` | pass |
+| `cargo xtask ci --job clippy` | pass |
+| `cargo check -p starplayer --no-default-features --features s3m,float-mix,linear-interp` | pass |
+
+`node apps/starplayer-web/test/headless.mjs` fails, identically to before the change:
+`timed out waiting for the slider to grow by the fade with Repeat off`. Out of scope here.
+
+Outstanding: the owner's listening check — `NICETUNE.S3M`, `K-P-K.MOD` and an MTM in the
+web player, seek by slider, prev/next order, Repeat on and off.

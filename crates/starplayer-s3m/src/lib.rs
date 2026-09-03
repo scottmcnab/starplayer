@@ -89,7 +89,7 @@ pub use loader::{load, load_from, probe, probe_reader};
 pub use pattern::{
     COMMAND_NONE, INSTRUMENT_NONE, NOTE_CUT, NOTE_NONE, PatternView, ROWS, S3mCell, VOLUME_NONE, unpack,
 };
-pub use processor::{S3mChannel, S3mPatternData, S3mProcessor, sequencer_for, sequencer_with_quirks};
+pub use processor::{S3mChannel, S3mPatternData, S3mProcessor, recommended_voice_capacity, sequencer_for, sequencer_with_quirks};
 pub use sample::S3mSampleHeader;
 
 // Re-exported so a host can name every type it needs from this one crate.
