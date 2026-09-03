@@ -11,13 +11,14 @@
 
 use std::fmt;
 
-use starplayer::core::quirks::QuirkSelection;
-use starplayer::core::{AtEnd, Error, ExactFixedPoint, Interpolator};
+use starplayer::core::quirks::{QuirkSelection, QuirkSet};
+use starplayer::core::{AtEnd, Error, Interpolator};
 use starplayer::dsp::{Interpolate, Linear, Nearest};
-use starplayer::engine::{EndReason, Engine, EngineSettings, EngineWarnings, EventSource, ScanLimits, SongTimeline, scan_timeline};
+use starplayer::engine::{EndReason, Engine, EngineSettings, EngineWarnings, EventSource, ScanLimits, SongTimeline};
 use starplayer::mixer::{FixedPath, FloatPath, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
-use starplayer::model::{Module, ModuleFormat};
+use starplayer::model::Module;
 use starplayer::rt::Arc;
+use starplayer::{ScannedSong, scan_song};
 
 // The per-tick trace is a diagnostic build only. Everything it needs sits behind the
 // `trace` feature, so an ordinary `cargo test --workspace` — and every golden render —
@@ -26,6 +27,10 @@ use starplayer::rt::Arc;
 use starplayer::core::Frame;
 #[cfg(feature = "trace")]
 use starplayer::engine::{EndOfSongPolicy, PatternSequencer, SequencerSettings, Trace};
+#[cfg(any(feature = "trace", test))]
+use starplayer::core::ExactFixedPoint;
+#[cfg(feature = "trace")]
+use starplayer::model::ModuleFormat;
 #[cfg(any(feature = "trace", test))]
 use starplayer::mixer::StereoI16;
 use sha2::{Digest, Sha256};
@@ -205,23 +210,29 @@ pub fn canonical_sha256(format: GoldenFormat, bytes: &[u8], host_block_frames: u
 /// Scan a loaded module and report the shape of its song: every row it plays, when, how
 /// long one pass is, and whether it loops or ends.
 ///
-/// Built through the same `sequencer_with_quirks(module, rate, QuirkSelection::FromDialect)`
-/// the browser host uses, so an offline length and a browser progress slider cannot
-/// disagree. The scan runs a **throwaway** sequencer; callers build a second one to play.
+/// A thin wrapper over [`starplayer::scan_song`], which is what the browser host calls
+/// too, so an offline length and a browser progress slider cannot disagree. The scan runs
+/// a **throwaway** sequencer; callers build a second one to play, from the quirks
+/// [`scanned_song`] hands back.
 pub fn song_timeline(module: &Arc<Module>, sample_rate_hz: u32) -> Result<SongTimeline, RenderError> {
     song_timeline_with_limits(module, sample_rate_hz, ScanLimits::for_rate(sample_rate_hz))
 }
 
 /// [`song_timeline`] with explicit limits, for a test that wants a short leash.
 pub fn song_timeline_with_limits(module: &Arc<Module>, sample_rate_hz: u32, limits: ScanLimits) -> Result<SongTimeline, RenderError> {
-    let quirks = QuirkSelection::FromDialect;
-    let module = Arc::clone(module);
-    Ok(match module.header().format {
-        ModuleFormat::S3m => scan_timeline(&mut starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
-        ModuleFormat::Mod => scan_timeline(&mut starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
-        ModuleFormat::Mtm => scan_timeline(&mut starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
-        _ => return Err(RenderError::Load(Error::Invalid("format has no offline native processor"))),
-    })
+    Ok(scanned_song_with_limits(module, sample_rate_hz, limits)?.timeline)
+}
+
+/// The scan *and* the quirks it ran under — what every render path here builds its
+/// playback sequencer from. A MOD's `mod_timing` is decided by this call and by nothing
+/// else, so nothing renders with unknown timing.
+pub fn scanned_song(module: &Arc<Module>, sample_rate_hz: u32) -> Result<ScannedSong, RenderError> {
+    scanned_song_with_limits(module, sample_rate_hz, ScanLimits::for_rate(sample_rate_hz))
+}
+
+/// [`scanned_song`] with explicit limits.
+pub fn scanned_song_with_limits(module: &Arc<Module>, sample_rate_hz: u32, limits: ScanLimits) -> Result<ScannedSong, RenderError> {
+    scan_song(module, sample_rate_hz, limits).map_err(RenderError::Load)
 }
 
 /// How much of a song an offline render should produce.
@@ -310,8 +321,8 @@ where
     Out::Sample: FadeSample,
 {
     let module = Arc::new(load_golden(format, bytes)?);
-    let timeline = song_timeline(&module, sample_rate_hz)?;
-    let (total_frames, fade_frames) = length.frames_for(&timeline);
+    let scanned = scanned_song(&module, sample_rate_hz)?;
+    let (total_frames, fade_frames) = length.frames_for(&scanned.timeline);
 
     let channel_count = module.header().channel_count as usize;
     let settings = EngineSettings {
@@ -323,7 +334,7 @@ where
     let mut engine: Engine<Path, Interp, Out, Arc<Module>> = Engine::with_settings(settings);
     let mut control = engine.take_control().ok_or(RenderError::CommandQueue)?;
     control.load_module(Arc::clone(&module)).map_err(|_| RenderError::CommandQueue)?;
-    engine.set_source(playback_source(format, module, sample_rate_hz, timeline));
+    engine.set_source(playback_source(format, module, sample_rate_hz, scanned));
     engine.set_limiter(Limiter::Clamp);
 
     let output_samples = total_frames.saturating_mul(Out::CHANNELS);
@@ -368,10 +379,11 @@ where
     }
 }
 
-/// A playback sequencer for `format` with `timeline` installed and the loop point set to
-/// wrap rather than stop.
-fn playback_source(format: GoldenFormat, module: Arc<Module>, sample_rate_hz: u32, timeline: SongTimeline) -> Box<dyn EventSource> {
-    let quirks = QuirkSelection::FromDialect;
+/// A playback sequencer for `format` with the scan's timeline installed, the scan's own
+/// quirks resolved into it, and the loop point set to wrap rather than stop.
+fn playback_source(format: GoldenFormat, module: Arc<Module>, sample_rate_hz: u32, scanned: ScannedSong) -> Box<dyn EventSource> {
+    let ScannedSong { timeline, quirks } = scanned;
+    let quirks = QuirkSelection::Override(quirks);
     match format {
         GoldenFormat::Mod => {
             let mut sequencer = starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks);
@@ -513,7 +525,8 @@ where
     let mut engine: Engine<Path, Interp, Out, Arc<Module>> = Engine::with_settings(settings);
     let mut control = engine.take_control().ok_or(RenderError::CommandQueue)?;
     control.load_module(Arc::clone(&module)).map_err(|_| RenderError::CommandQueue)?;
-    engine.set_source(golden_source(format, module));
+    let quirks = scanned_song(&module, GOLDEN_SAMPLE_RATE_HZ)?.quirks;
+    engine.set_source(golden_source(format, module, quirks));
     engine.set_limiter(Limiter::Clamp);
 
     let output_samples = frames.saturating_mul(Out::CHANNELS);
@@ -534,11 +547,15 @@ fn load_golden(format: GoldenFormat, bytes: &[u8]) -> Result<Module, Error> {
     }
 }
 
-fn golden_source(format: GoldenFormat, module: Arc<Module>) -> Box<dyn EventSource> {
+/// The canonical golden render's source. It takes the scan's quirks like every other
+/// render path here: the fixed-length hash is a regression contract, and a MOD whose
+/// timing the scan resolves differently must be hashed the way it would be played.
+fn golden_source(format: GoldenFormat, module: Arc<Module>, quirks: QuirkSet) -> Box<dyn EventSource> {
+    let quirks = QuirkSelection::Override(quirks);
     match format {
-        GoldenFormat::Mod => Box::new(starplayer::mod_file::sequencer_for(module, GOLDEN_SAMPLE_RATE_HZ, ExactFixedPoint)),
-        GoldenFormat::S3m => Box::new(starplayer::s3m::sequencer_for(module, GOLDEN_SAMPLE_RATE_HZ, ExactFixedPoint)),
-        GoldenFormat::Mtm => Box::new(starplayer::mtm::sequencer_for(module, GOLDEN_SAMPLE_RATE_HZ, ExactFixedPoint)),
+        GoldenFormat::Mod => Box::new(starplayer::mod_file::sequencer_with_quirks(module, GOLDEN_SAMPLE_RATE_HZ, quirks)),
+        GoldenFormat::S3m => Box::new(starplayer::s3m::sequencer_with_quirks(module, GOLDEN_SAMPLE_RATE_HZ, quirks)),
+        GoldenFormat::Mtm => Box::new(starplayer::mtm::sequencer_with_quirks(module, GOLDEN_SAMPLE_RATE_HZ, quirks)),
     }
 }
 
@@ -837,10 +854,11 @@ mod tests {
     /// start of a song still leaves a positive origin.
     const SEEK_TEST_ORIGIN: u64 = 1 << 40;
 
-    fn last_live_tick_frame(format: GoldenFormat, module: &Arc<Module>, sample_rate_hz: u32, timeline: &SongTimeline, seek_to: Option<u64>) -> Option<u64> {
+    fn last_live_tick_frame(format: GoldenFormat, module: &Arc<Module>, sample_rate_hz: u32, scanned: &ScannedSong, seek_to: Option<u64>) -> Option<u64> {
         use starplayer::core::Frame;
         use starplayer::engine::{ChannelTable, ControlClock, EngineContext, PatternData};
         use starplayer::mixer::VoicePool;
+        let timeline = &scanned.timeline;
 
         macro_rules! drive {
             ($sequencer:expr) => {{
@@ -870,7 +888,9 @@ mod tests {
             }};
         }
 
-        let quirks = starplayer::core::quirks::QuirkSelection::FromDialect;
+        // The playback sequencer is built from the scan's own quirks, exactly as every
+        // host does it, so the live run and the scan cannot disagree about `mod_timing`.
+        let quirks = QuirkSelection::Override(scanned.quirks);
         let module = Arc::clone(module);
         match format {
             GoldenFormat::Mod => drive!(starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks)),
@@ -883,16 +903,17 @@ mod tests {
     fn a_scanned_timeline_describes_a_song_the_live_sequencer_plays_the_same_way() {
         for (format, name, bytes) in song_corpus() {
             let module = Arc::new(load_golden(format, &bytes).expect("the fixture loads"));
-            let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+            let scanned = scanned_song(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+            let timeline = &scanned.timeline;
             assert!(timeline.end_frame() > 0, "{format} {name}: a playable module is longer than nothing");
             assert!(!timeline.marks().is_empty(), "{format} {name}: the scan recorded rows");
 
-            let live = last_live_tick_frame(format, &module, GOLDEN_SAMPLE_RATE_HZ, &timeline, None);
+            let live = last_live_tick_frame(format, &module, GOLDEN_SAMPLE_RATE_HZ, &scanned, None);
             assert_eq!(live, Some(timeline.end_frame()), "{format} {name}: the live detector fired somewhere else");
 
             // …and again from halfway in, which is what a progress-slider drag does.
             let halfway = timeline.end_frame() / 2;
-            let seeked = last_live_tick_frame(format, &module, GOLDEN_SAMPLE_RATE_HZ, &timeline, Some(halfway));
+            let seeked = last_live_tick_frame(format, &module, GOLDEN_SAMPLE_RATE_HZ, &scanned, Some(halfway));
             assert_eq!(seeked, Some(timeline.end_frame()), "{format} {name}: the loop point moved after a seek");
         }
     }
@@ -962,7 +983,8 @@ mod tests {
 
         for (format, name, bytes) in song_corpus() {
             let module = Arc::new(load_golden(format, &bytes).expect("the fixture loads"));
-            let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+            let scanned = scanned_song(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+            let timeline = &scanned.timeline;
 
             macro_rules! check {
                 ($sequencer:expr) => {{
@@ -1000,7 +1022,7 @@ mod tests {
                 }};
             }
 
-            let quirks = QuirkSelection::FromDialect;
+            let quirks = QuirkSelection::Override(scanned.quirks);
             let handle = Arc::clone(&module);
             match format {
                 GoldenFormat::Mod => check!(starplayer::mod_file::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),

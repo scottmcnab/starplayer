@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use starplayer_core::fixed::{bipolar_from_ratio, unit_from_ratio};
-use starplayer_core::quirks::{BreakParameter, PaulaClock, QuirkSelection, QuirkSet};
+use starplayer_core::quirks::{BreakParameter, ModTiming, PaulaClock, QuirkSelection, QuirkSet};
 use starplayer_core::{ChannelId, DirtyBits, Frame, I1F15, InstrumentId, Note, Step, TempoModel, TempoModelId, U0F16, VoiceParams};
 use starplayer_engine::{EndOfSongPolicy, OrderEntry, PatternData, PatternFlowState, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
 #[cfg(feature = "trace")]
@@ -414,7 +414,12 @@ impl ModProcessor {
                 self.clear_command(channel_index);
             }
             0xF if cell.param == 0 => self.clear_command(channel_index),
-            0xF if cell.param < 32 => {
+            // A VBlank-timed MOD has no CIA timer to latch a BPM into, so every non-zero
+            // `Fxx` is ticks per row whatever its value — libxmp's `QUIRK_NOBPM`
+            // (`src/effects.c:463-472`). The tempo and the deferred latch are both left
+            // alone. `EffectSemantics::MultiTracker` never reaches here with VBlank set:
+            // MTM is always CIA and its quirks say so.
+            0xF if cell.param < 32 || self.quirks.mod_timing == ModTiming::VBlank => {
                 outcome.speed = cell.param;
                 if matches!(self.semantics, EffectSemantics::MultiTracker { reset_counterpart: true }) {
                     outcome.tempo_bpm = 125;
@@ -1100,6 +1105,18 @@ mod tests {
         ModProcessor::new(Arc::new(builder.build().expect("module")), 44_100)
     }
 
+    /// The same module as `processor_with_sample`, played under an explicit quirk set.
+    fn processor_with_quirks(quirks: QuirkSet) -> ModProcessor {
+        let mut builder = ModuleBuilder::new();
+        builder.add_pattern(&vec![0; 64 * CELL_BYTES], 64, 1).expect("pattern");
+        let sample = builder.add_sample(&vec![0; 1024], SampleSpec::one_shot("sample")).expect("sample");
+        builder.add_instrument(InstrumentDef::from_sample("sample", sample, U0F16::MAX)).expect("instrument");
+        builder.set_orders(&[0, starplayer_model::ORDER_END]);
+        builder.set_header(ModuleHeader::new(ModuleFormat::Mod, 1));
+        let module = Arc::new(builder.build().expect("module"));
+        ModProcessor::with_semantics_and_quirks(module, 44_100, EffectSemantics::ProTracker, QuirkSelection::Override(quirks))
+    }
+
     fn process_row(processor: &mut ModProcessor, cell: ModCell) -> TickOutcome {
         let mut voices = VoicePool::new(2);
         let mut channels = ChannelTable::new(1);
@@ -1324,6 +1341,31 @@ mod tests {
         assert_eq!(process_row(&mut processor, ModCell { effect: 0xF, param: 32, ..ModCell::EMPTY }).tempo_bpm, 125);
         assert_eq!(process_tick(&mut processor, 1, 0).tempo_bpm, 32);
         assert!(process_row(&mut processor, ModCell { effect: 0xF, param: 0, ..ModCell::EMPTY }).stop);
+    }
+
+    /// C10 deliverable 2: under `ModTiming::VBlank` there is no CIA timer, so `F20` and
+    /// `F30` are 32- and 48-tick rows and the tempo is never touched.
+    #[test]
+    fn under_vblank_every_non_zero_fxx_is_a_speed_and_no_tempo_is_latched() {
+        let mut processor = processor_with_quirks(QuirkSet { mod_timing: ModTiming::VBlank, ..QuirkSet::canonical() });
+        let fermata = process_row(&mut processor, ModCell { effect: 0xF, param: 0x20, ..ModCell::EMPTY });
+        assert_eq!(fermata.speed, 32, "F20 is a 32-tick row on the vertical blank");
+        assert_eq!(fermata.tempo_bpm, 125, "no BPM is set");
+        assert!(processor.pending_tempo.is_none(), "the CIA latch is never armed under VBlank");
+        assert_eq!(process_tick(&mut processor, 1, 0).tempo_bpm, 125, "and nothing arrives a tick later either");
+
+        assert_eq!(process_row(&mut processor, ModCell { effect: 0xF, param: 0x30, ..ModCell::EMPTY }).speed, 48);
+        assert_eq!(process_row(&mut processor, ModCell { effect: 0xF, param: 0x7D, ..ModCell::EMPTY }).speed, 125, "even F7D is a speed");
+        assert_eq!(process_row(&mut processor, ModCell { effect: 0xF, param: 0x04, ..ModCell::EMPTY }).speed, 4, "a low Fxx is unchanged");
+        assert!(process_row(&mut processor, ModCell { effect: 0xF, param: 0, ..ModCell::EMPTY }).stop, "F00 keeps its stop-marker rule");
+    }
+
+    /// And the CIA profile the same module would otherwise get is untouched.
+    #[test]
+    fn under_cia_a_high_fxx_is_still_a_deferred_tempo() {
+        let mut processor = processor_with_quirks(QuirkSet::canonical());
+        assert_eq!(process_row(&mut processor, ModCell { effect: 0xF, param: 0x20, ..ModCell::EMPTY }).tempo_bpm, 125);
+        assert_eq!(process_tick(&mut processor, 1, 0).tempo_bpm, 32, "the CIA latch is adopted at the next tracker event");
     }
 
     #[test]

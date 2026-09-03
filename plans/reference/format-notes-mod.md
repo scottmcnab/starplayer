@@ -56,7 +56,8 @@ channel count:
 | Tag | Channels | Dialect |
 |---|---|---|
 | `M.K.`, `M!K!` | 4 | `ProTracker` |
-| `M&K!`, `N.T.`, `LARD`, `NSMS` | 4 | `ProTracker3` |
+| `M&K!`, `N.T.` | 4 | `Noisetracker` |
+| `LARD`, `NSMS` | 4 | `ProTracker3` |
 | `FLT4` | 4 | `Startrekker` |
 | `FLT8` | 8, paired halves | `Startrekker` |
 | `CD61`, `CD81` | 6, 8 | `Octalyser` |
@@ -67,7 +68,11 @@ channel count:
 and libxmp lists it first — and the single-digit `dCHN` form is used by several trackers;
 C3b added both. C5 added the rest. The `ProTracker3` and `FastTracker` dialects play
 exactly as ProTracker does; they are recorded because libxmp's own timing heuristics key
-off them and M5 may need to.
+off them and M5 may need to. `Noisetracker` is the one that does not: C10 split `M&K!`
+and `N.T.` out of `ProTracker3` because libxmp calls exactly those two
+`TRACKER_NOISETRACKER`, a tracker with no CIA timer, so the dialect carries
+`mod_timing: VBlank` — see *VBlank timing* below. `LARD` and `NSMS` are an *unknown*
+tracker to libxmp and stayed where they were.
 
 `CD61` and `FA04` / `FA06` were held back by C3 for a reason, and C5 accepted them **in
 the same change** that gave them their pattern-loop dialect: accepting the tag alone would
@@ -139,6 +144,51 @@ When `EEx` shares a row with `Dxx`, PT spends the delayed repeats and then skips
 break target row. The processor advances the target once more, including the row-63 case
 which continues at row zero of the following order. A later-channel `Bxx` still cancels
 an earlier `Dxx`; a later `Dxx` combines its BCD row with the selected order.
+
+### VBlank timing
+
+The CIA boundary above only exists on a CIA-clocked replayer. ProTracker could also run its
+interrupt off the 50 Hz vertical blank, and NoiseTracker and SoundTracker had nothing
+*but* that; on the vertical blank there is no timer to program, so every non-zero `Fxx`
+is ticks per row whatever its value. Nothing in the file header distinguishes the two for
+an `M.K.` module.
+
+`K-P-K.MOD` ("Klisje paa klisje", 4-channel `M.K.`, 93 orders, June 1993) is the case
+that forced the issue. Its relevant cells, decoded from the file:
+
+| Order | Pattern | Row | Channel | Cell |
+|---|---|---|---|---|
+| 31 | 32 | 63 | 4 | note 428, instrument 11, `F20` — with a four-note chord on the row |
+| 32 | 20 | 0 | 1 | `F04` |
+| 82 | 59 | 63 | — | `F30` |
+
+No row anywhere in the file carries both an `Fxx` below `0x20` and one of `0x20` or more,
+and there is one `Bxx`/`Dxx` in the whole song. Read as CIA the song is **29.1 minutes**;
+read as VBlank it is **10.7**. Both high values sit on the last row of a section under a
+chord with the next pattern restoring `F04` immediately: they are fermatas — a 32-tick
+and a 48-tick hold — written on a tracker where `Fxx` was only ever ticks per row. The
+file is third-party and is not in this repository.
+
+The rules implemented, from libxmp `src/loaders/mod_load.c:816-950` and `src/scan.c:50`
+and `:671-708` (M2-C10; the quirk field is `mod_timing`, resolved by
+`starplayer::scan_song`):
+
+* The tags `M&K!` and `N.T.` are NoiseTracker, which has no CIA mode: VBlank outright,
+  from the header alone. `LARD` and `NSMS` are an *unknown* tracker to libxmp, not
+  NoiseTracker, and get neither the shortcut nor the detection below.
+* Detection from pattern evidence runs for the `M.K.` and `M!K!` tags only, and is turned
+  off again by a sample header declaring 32768 words or more — no Amiga tracker could
+  write one, so the file is an OpenMPT module and its timing is not in doubt.
+* A row carrying both a low and a high `Fxx` is a CIA tracker: two different meanings for
+  the same command byte on one row is only possible where the byte has two meanings.
+* At least eight orders, every high `Fxx` confined to a pattern only the last two orders
+  play, and the last such value not `0x7D` (125, the CIA default, which means the file was
+  written or converted to play as CIA): VBlank, no comparison. This is the
+  silence-at-the-end-of-a-module idiom.
+* Otherwise, a high `Fxx` anywhere asks for a **length comparison**: scan the song as CIA,
+  and if one pass is at least eight minutes — or the scan ran out its budget — scan it
+  again as VBlank and keep the shorter, ties to CIA. A deliberately slow short song is
+  therefore never sped up.
 
 ## Vibrato output and the Paula period floor
 

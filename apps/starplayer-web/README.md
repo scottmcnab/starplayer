@@ -175,8 +175,10 @@ fixed path's native `i16` output bit-exact at `I16` depth — the golden path M2
 A mode switch happens in the worklet's message handler, never in `process()`. It rebuilds
 the engine at the same sample rate, hands it the `Arc<Module>` the host already holds — no
 bytes cross again and nothing is retired — rebuilds the sequencer with
-`sequencer_with_quirks` under `QuirkSelection::FromDialect`, so the file's own tracker
-dialect and tempo model survive the switch, seeks it to the order that was sounding,
+`sequencer_with_quirks` under `QuirkSelection::Override` of the cached scan's own quirks,
+so the file's tracker dialect, tempo model and resolved MOD timing all survive the switch
+(the scan, not the UI, is where that override comes from — see `starplayer::scan_song`),
+seeks it to the order that was sounding,
 restarts its clock at the new engine's frame, and restores master volume, channel mutes
 and the play/stop state.
 

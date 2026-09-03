@@ -10,6 +10,7 @@ use starplayer_model::{InstrumentDef, LoopMode, Module, ModuleBuilder, ModuleFla
 
 use crate::pattern::{CELL_BYTES, ROWS};
 use crate::tables::{AMIGA_CHANNEL_MAP, FINETUNE_REFERENCE_RATES};
+use crate::timing::{ModTimingEvidence, encode_evidence, high_fxx_only_at_end};
 
 const HEADER_BYTES: usize = 1084;
 const MAGIC_OFFSET: usize = 1080;
@@ -83,6 +84,11 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
     let mut builder = ModuleBuilder::new();
     let pattern_body = source.with_slice(pattern_data_offset, pattern_bytes, <[u8]>::to_vec)?;
     let pattern_stride = ROWS as usize * channels as usize * CELL_BYTES;
+    // libxmp's `pat_high_fxx[]` and `samerow_fxx`, gathered on the same walk that stores
+    // the patterns (`mod_load.c:816-840`). Cheap enough for a fuzz target: one compare
+    // per cell over bytes already in cache.
+    let mut last_high_fxx: Vec<u8> = Vec::with_capacity(pattern_count);
+    let mut mixed_row = false;
     if layout.paired_four_channel_patterns {
         // Startrekker FLT8 stores channels 0..3 for all 64 rows, then channels 4..7
         // for all 64 rows. Keep the model's native MOD cells but reorder each logical
@@ -97,21 +103,35 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
                 pattern[target..target + 4 * CELL_BYTES].copy_from_slice(&stored[first..first + 4 * CELL_BYTES]);
                 pattern[target + 4 * CELL_BYTES..target + 8 * CELL_BYTES].copy_from_slice(&stored[second..second + 4 * CELL_BYTES]);
             }
+            let (high, mixed) = scan_timing_evidence(&pattern, channels);
+            last_high_fxx.push(high);
+            mixed_row |= mixed;
             builder.add_pattern(&pattern, ROWS, channels)?;
         }
     } else {
-        for pattern in pattern_body.chunks_exact(pattern_stride) { builder.add_pattern(pattern, ROWS, channels)?; }
+        for pattern in pattern_body.chunks_exact(pattern_stride) {
+            let (high, mixed) = scan_timing_evidence(pattern, channels);
+            last_high_fxx.push(high);
+            mixed_row |= mixed;
+            builder.add_pattern(pattern, ROWS, channels)?;
+        }
     }
 
     let amiga_limits = pattern_body.chunks_exact(CELL_BYTES).filter_map(crate::pattern::ModCell::from_bytes)
         .all(|cell| cell.period == 0 || (113..=856).contains(&cell.period));
 
+    // libxmp reads a sample of 32768 words or more as proof of an OpenMPT file and turns
+    // timing detection off for it (`mod_load.c:637-642`); no Amiga tracker could write
+    // one. This is the long-sample gate OpenMPT's own loader applies for the same reason.
+    let mut oversized_sample = false;
     let mut declared_sample_offset = sample_data_offset;
     for index in 0..SAMPLE_COUNT {
         let header_offset = 20 + index * SAMPLE_HEADER_BYTES;
         let header = fixed.get(header_offset..header_offset + SAMPLE_HEADER_BYTES).ok_or(Error::Truncated { offset: header_offset, needed: SAMPLE_HEADER_BYTES })?;
         let name = starplayer_model::decode_cp437(header.get(..22).unwrap_or(&[]));
-        let declared_length = be_u16(header, 22)? as usize * 2;
+        let declared_words = be_u16(header, 22)?;
+        oversized_sample |= declared_words >= 0x8000;
+        let declared_length = declared_words as usize * 2;
         let finetune = header.get(24).copied().unwrap_or(0) & 15;
         let volume = header.get(25).copied().unwrap_or(0).min(64);
         let loop_start = (be_u16(header, 26)? as usize * 2).min(declared_length);
@@ -138,6 +158,17 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
         builder.add_instrument(InstrumentDef::from_sample(&name, sample, U0F16::MAX))?;
     }
 
+    // The order list as libxmp's `mod->xxo[0..len]` sees it: raw pattern numbers, with no
+    // end marker, because the end-silence rule indexes `pat_high_fxx[]` with them.
+    let played_orders: Vec<u16> = order_bytes.iter().take(song_length).map(|order| logical_order(*order, layout) as u16).collect();
+    let evidence = ModTimingEvidence {
+        timing_detection: matches!(layout.dialect, FormatDialect::ProTracker) && !oversized_sample,
+        vblank_only_tag: matches!(layout.dialect, FormatDialect::Noisetracker),
+        has_high_fxx: last_high_fxx.iter().any(|value| *value != 0),
+        mixed_row,
+        high_fxx_only_at_end: high_fxx_only_at_end(&played_orders, &last_high_fxx),
+    };
+
     let mut orders: Vec<u16> = order_bytes.iter().take(song_length)
         .map(|order| if *order == 255 { ORDER_END } else { logical_order(*order, layout) as u16 }).collect();
     if orders.last().copied() != Some(ORDER_END) { orders.push(ORDER_END); }
@@ -153,9 +184,36 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
         default_pan: default_pan(channels, options.stereo_separation),
         flags: ModuleFlags { amiga_limits, linear_slides: false, fast_volume_slides: false, stereo: options.stereo_separation.get() != 0 },
         dialect: layout.dialect,
-        format_extra: 0,
+        format_extra: encode_evidence(evidence),
     });
     builder.build()
+}
+
+/// One pattern's contribution to the CIA/VBlank evidence: the **last** `Fxx` parameter of
+/// `0x20` or more it contains, in cell order, and whether any of its rows carries both a
+/// low and a high `Fxx`.
+///
+/// libxmp writes `pat_high_fxx[i] = mod_event[3]` on every high `Fxx`, so the value that
+/// survives is the last one in the pattern; the end-silence rule reads exactly that.
+fn scan_timing_evidence(pattern: &[u8], channels: u8) -> (u8, bool) {
+    let mut last_high = 0;
+    let mut mixed_row = false;
+    for row in pattern.chunks_exact(channels as usize * CELL_BYTES) {
+        let mut low_present = false;
+        let mut high_present = false;
+        for cell in row.chunks_exact(CELL_BYTES) {
+            let Some(cell) = crate::pattern::ModCell::from_bytes(cell) else { continue };
+            if cell.effect != 0xF { continue; }
+            if cell.param >= 0x20 {
+                last_high = cell.param;
+                high_present = true;
+            } else {
+                low_present = true;
+            }
+        }
+        mixed_row |= low_present && high_present;
+    }
+    (last_high, mixed_row)
 }
 
 /// What one accepted four-byte tag says about a file: how many channels it has, how its
@@ -186,9 +244,13 @@ fn layout(magic: &[u8]) -> Option<ModLayout> {
     match magic {
         // `M!K!` is what ProTracker itself writes once a module exceeds 64 patterns.
         b"M.K." | b"M!K!" => Some(ModLayout::plain(4, FormatDialect::ProTracker)),
-        // Noisetracker and the ProTracker 3.x family. Played as ProTracker; the dialect is
-        // recorded because libxmp's timing heuristics key off it.
-        b"M&K!" | b"N.T." | b"LARD" | b"NSMS" => Some(ModLayout::plain(4, FormatDialect::ProTracker3)),
+        // NoiseTracker, which has no CIA timer at all: libxmp's `tracker_is_vblank`
+        // gives these two tags `QUIRK_NOBPM` outright, and the dialect carries it.
+        b"M&K!" | b"N.T." => Some(ModLayout::plain(4, FormatDialect::Noisetracker)),
+        // The ProTracker 3.x family. Played as ProTracker; libxmp calls these an
+        // *unknown* tracker (`mod_magic[]`), so they get neither the VBlank shortcut nor
+        // the pattern-evidence detection that `M.K.` and `M!K!` do.
+        b"LARD" | b"NSMS" => Some(ModLayout::plain(4, FormatDialect::ProTracker3)),
         b"FLT4" => Some(ModLayout::plain(4, FormatDialect::Startrekker)),
         b"FLT8" => Some(ModLayout { channels: 8, paired_four_channel_patterns: true, extra_header_bytes: 0, dialect: FormatDialect::Startrekker }),
         b"6CHN" => Some(ModLayout::plain(6, FormatDialect::FastTracker)),
@@ -409,9 +471,9 @@ mod tests {
         let mut protracker3 = minimal_mod();
         protracker3[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(b"M&K!");
         assert!(probe(&protracker3));
-        let loaded = load(&protracker3).expect("a Noisetracker / ProTracker 3 tag");
+        let loaded = load(&protracker3).expect("a Noisetracker tag");
         assert_eq!(loaded.header().channel_count, 4);
-        assert_eq!(loaded.header().dialect, FormatDialect::ProTracker3);
+        assert_eq!(loaded.header().dialect, FormatDialect::Noisetracker);
     }
 
     /// C5 deliverable 2: one loading test per accepted tag, asserting channel count and
@@ -422,8 +484,8 @@ mod tests {
         for (tag, channels, dialect) in [
             (b"M.K.", 4u8, FormatDialect::ProTracker),
             (b"M!K!", 4, FormatDialect::ProTracker),
-            (b"M&K!", 4, FormatDialect::ProTracker3),
-            (b"N.T.", 4, FormatDialect::ProTracker3),
+            (b"M&K!", 4, FormatDialect::Noisetracker),
+            (b"N.T.", 4, FormatDialect::Noisetracker),
             (b"LARD", 4, FormatDialect::ProTracker3),
             (b"NSMS", 4, FormatDialect::ProTracker3),
             (b"FLT4", 4, FormatDialect::Startrekker),
@@ -467,6 +529,80 @@ mod tests {
         let module = load(&bytes).expect("Digital Tracker MOD");
         let pattern = crate::PatternView::new(&module, starplayer_model::PatternId(0)).expect("pattern 0");
         assert_eq!(pattern.cell(0, 0).map(|cell| cell.period), Some(428), "the pattern data starts at 1088, not 1084");
+    }
+
+    // ── C10: CIA-versus-VBlank evidence ────────────────────────────────────────────
+
+    /// A four-channel MOD with an explicit tag, order list and pattern count, plus cells
+    /// placed at `(pattern, row, channel)`. Everything else is the `minimal_mod` shape.
+    fn mod_with(tag: &[u8; 4], orders: &[u8], patterns: usize, cells: &[(usize, usize, usize, ModCell)]) -> Vec<u8> {
+        let pattern_stride = ROWS as usize * 4 * CELL_BYTES;
+        let mut bytes = vec![0; HEADER_BYTES + patterns * pattern_stride];
+        bytes[SONG_LENGTH_OFFSET] = orders.len() as u8;
+        bytes[ORDER_OFFSET..ORDER_OFFSET + orders.len()].copy_from_slice(orders);
+        bytes[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(tag);
+        for (pattern, row, channel, cell) in cells {
+            let offset = HEADER_BYTES + pattern * pattern_stride + (row * 4 + channel) * CELL_BYTES;
+            bytes[offset..offset + CELL_BYTES].copy_from_slice(&cell.to_bytes());
+        }
+        bytes
+    }
+
+    fn verdict(bytes: &[u8]) -> crate::timing::TimingVerdict {
+        crate::timing::timing_verdict_for(&load(bytes).expect("a loadable MOD")).expect("a MOD")
+    }
+
+    fn speed(param: u8) -> ModCell { ModCell { effect: 0xF, param, ..ModCell::EMPTY } }
+
+    #[test]
+    fn a_noisetracker_tag_is_vblank_and_an_unknown_tag_is_not() {
+        assert_eq!(verdict(&mod_with(b"M&K!", &[0], 1, &[(0, 0, 0, speed(0x30))])), crate::timing::TimingVerdict::VBlank);
+        assert_eq!(verdict(&mod_with(b"N.T.", &[0], 1, &[])), crate::timing::TimingVerdict::VBlank, "the tag alone decides, with no evidence at all");
+        assert_eq!(verdict(&mod_with(b"LARD", &[0], 1, &[(0, 0, 0, speed(0x30))])), crate::timing::TimingVerdict::Cia, "libxmp calls LARD an unknown tracker, so no detection and no VBlank");
+        assert_eq!(verdict(&mod_with(b"FLT4", &[0], 1, &[(0, 0, 0, speed(0x30))])), crate::timing::TimingVerdict::Cia, "a Startrekker file is never timing-detected");
+    }
+
+    #[test]
+    fn a_row_carrying_both_a_low_and_a_high_fxx_is_cia() {
+        let mixed = mod_with(b"M.K.", &[0], 1, &[(0, 3, 0, speed(0x06)), (0, 3, 2, speed(0x7D))]);
+        assert_eq!(verdict(&mixed), crate::timing::TimingVerdict::Cia);
+        assert!(crate::timing::timing_evidence(&load(&mixed).expect("MOD")).expect("MOD").mixed_row);
+
+        // The same two bytes on different rows are not a mixed row.
+        let split = mod_with(b"M.K.", &[0], 1, &[(0, 3, 0, speed(0x06)), (0, 4, 2, speed(0x7D))]);
+        assert_eq!(verdict(&split), crate::timing::TimingVerdict::CompareLengths);
+    }
+
+    /// libxmp's end-silence rule, through the loader: eight orders, the only high `Fxx` in
+    /// a pattern the last order plays.
+    #[test]
+    fn a_high_fxx_only_in_the_last_orders_is_vblank_without_a_comparison() {
+        let orders = [0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(verdict(&mod_with(b"M.K.", &orders, 2, &[(1, 0, 0, speed(0x30))])), crate::timing::TimingVerdict::VBlank);
+        // 0x7D as the last high value means the file was made to play as CIA.
+        assert_eq!(verdict(&mod_with(b"M.K.", &orders, 2, &[(1, 0, 0, speed(0x7D))])), crate::timing::TimingVerdict::CompareLengths);
+        // Seven orders is below libxmp's `mod->len >= 8`.
+        assert_eq!(verdict(&mod_with(b"M.K.", &[0, 0, 0, 0, 0, 0, 1], 2, &[(1, 0, 0, speed(0x30))])), crate::timing::TimingVerdict::CompareLengths);
+        // A high Fxx before the final two orders disqualifies the rule.
+        assert_eq!(verdict(&mod_with(b"M.K.", &[1, 0, 0, 0, 0, 0, 0, 1], 2, &[(1, 0, 0, speed(0x30))])), crate::timing::TimingVerdict::CompareLengths);
+    }
+
+    #[test]
+    fn no_high_fxx_at_all_is_cia_and_a_bare_one_asks_for_a_comparison() {
+        assert_eq!(verdict(&mod_with(b"M.K.", &[0], 1, &[(0, 0, 0, speed(0x06))])), crate::timing::TimingVerdict::Cia);
+        assert_eq!(verdict(&mod_with(b"M.K.", &[0], 1, &[(0, 0, 0, speed(0x20))])), crate::timing::TimingVerdict::CompareLengths);
+    }
+
+    /// libxmp reads a sample of 32768 words or more as an OpenMPT file and stops detecting
+    /// timing for it; so does this loader.
+    #[test]
+    fn a_sample_no_amiga_tracker_could_write_turns_detection_off() {
+        let mut bytes = mod_with(b"M.K.", &[0], 1, &[(0, 0, 0, speed(0x30))]);
+        assert_eq!(verdict(&bytes), crate::timing::TimingVerdict::CompareLengths);
+        bytes[42..44].copy_from_slice(&0x8000u16.to_be_bytes());
+        let evidence = crate::timing::timing_evidence(&load(&bytes).expect("MOD")).expect("MOD");
+        assert!(!evidence.timing_detection);
+        assert_eq!(crate::timing::timing_verdict(evidence), crate::timing::TimingVerdict::Cia);
     }
 
     #[test]
