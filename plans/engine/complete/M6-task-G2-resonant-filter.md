@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M6 ([master plan](M6-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03 |
 | Depends on | D6 landed (the scope tap is in place, so `kernel.rs` is free), E2 (the `2^(n/768)` table) |
 | Blocks | M6 exit (IT modules with `Zxx` and filter envelopes sound wrong without it) |
 | Parallel with | G3, D4, F2 |
