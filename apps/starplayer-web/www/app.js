@@ -6,6 +6,7 @@ const WORKLET_URL = 'starplayer-worklet.js';
 const PROCESSOR_NAME = 'starplayer-player';
 const MIXER_STORAGE_KEY = 'starplayer.output-and-mixer.v1';
 const DEFAULT_MIXER_MODE = 0x0000_0202;
+const SONG_FADE_SECONDS = 5;
 const PATTERN_WINDOW_ROWS = 13;
 const PATTERN_CELL_BYTES = 5;
 
@@ -25,6 +26,7 @@ const elements = {
     moduleDetail: byId('module-detail'), order: byId('order'), pattern: byId('pattern'), row: byId('row'),
     speed: byId('speed'), bpm: byId('bpm'), previous: byId('previous'), play: byId('play'), stop: byId('stop'),
     next: byId('next'), seekOrder: byId('seek-order'), volume: byId('volume'), volumeValue: byId('volume-value'),
+    progress: byId('progress'), elapsed: byId('elapsed'), duration: byId('duration'), repeat: byId('repeat'),
     voices: byId('voices'), masterPeak: byId('master-peak'), channelBody: byId('channel-body'), patternTable: byId('pattern-table'),
     instrumentCount: byId('instrument-count'), instrumentList: byId('instrument-list'), commandTransport: byId('command-transport'),
     telemetryTransport: byId('telemetry-transport'), quantum: byId('quantum'), memory: byId('memory'),
@@ -78,6 +80,9 @@ const state = {
     activeModHeadphonePanning: false,
     panningReloadInProgress: false,
     panningReloadRequested: false,
+    scrubbing: false,
+    pendingSeekFrame: null,
+    pendingSeekSequence: 0,
 };
 
 const loaderReady = initLoader().then(loadEffectNames);
@@ -164,6 +169,20 @@ function formatRate(value) {
 
 function formatLatency(value) {
     return Number.isFinite(value) ? `${(value * 1000).toFixed(2)} ms` : 'unavailable';
+}
+
+/// `m:ss`, or `h:mm:ss` once the song runs past an hour. `--:--` covers both a song whose
+/// length is not yet known (`frames` is `null`) and a worklet that has not reported its
+/// sample rate yet.
+function formatTime(frames, rate) {
+    if (frames === null || frames === undefined || !Number.isFinite(rate) || rate <= 0) return '--:--';
+    const totalSeconds = Math.max(0, Math.floor(frames / rate));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return hours > 0
+        ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+        : `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
 function updateOutputPanel() {
@@ -359,6 +378,7 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
     renderMetadata();
     setControlsEnabled(true);
     queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(Number(elements.volume.value) * 65535 / 100), 0);
+    queueRepeatCommand();
     queueCommand(Ring.OPCODE_PLAY, 0, 0);
     showMessage(`Playing ${metadata.title || moduleLabel}.`);
 
@@ -589,6 +609,16 @@ function queueCommand(opcode, argument = 0, extra = 0) {
     }
 }
 
+function repeatFadeFrames() {
+    return Math.round(SONG_FADE_SECONDS * (state.workletSampleRate || 44100));
+}
+
+/// Sent on `#repeat` `change`, on activating a module, and from `playbackRestoreCommands()`
+/// — the three moments the engine's at-end policy needs to (re)match the checkbox.
+function queueRepeatCommand() {
+    queueCommand(Ring.OPCODE_AT_END, elements.repeat.checked ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT, repeatFadeFrames());
+}
+
 function flushFallbackCommands() {
     if (state.node === null || state.fallbackCommands.length === 0) return;
     if (state.commandRing !== null) {
@@ -623,12 +653,19 @@ function sendCommandsToGraph(graph, commands) {
 }
 
 function playbackRestoreCommands() {
-    const order = state.latest?.order ?? 0;
     const playing = state.latest?.playing ?? state.metadata !== null;
     const volume = Math.round(Number(elements.volume.value) * 65535 / 100);
+    // A rebuilt graph starts its module from the top. Put it back where the ear left it:
+    // by song frame when the timeline is known, which lands mid-pattern, and by order
+    // otherwise.
+    const lengthKnown = ((state.latest?.songFlags ?? 0) & Ring.SONG_FLAG_LENGTH_KNOWN) !== 0;
+    const seek = lengthKnown
+        ? [Ring.OPCODE_SEEK_FRAME, Math.max(0, state.latest?.songFrame ?? 0), 0]
+        : [Ring.OPCODE_SEEK_ORDER, state.latest?.order ?? 0, 0];
     const commands = [
         Ring.OPCODE_MASTER_VOLUME, volume, 0,
-        Ring.OPCODE_SEEK_ORDER, order, 0,
+        ...seek,
+        Ring.OPCODE_AT_END, elements.repeat.checked ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT, repeatFadeFrames(),
         playing ? Ring.OPCODE_PLAY : Ring.OPCODE_STOP, 0, 0,
     ];
     for (const [channel, snapshot] of (state.latest?.channels ?? []).entries()) {
@@ -911,7 +948,7 @@ function renderMetadata() {
 }
 
 function setControlsEnabled(enabled) {
-    for (const control of [elements.previous, elements.play, elements.stop, elements.next, elements.seekOrder, elements.volume]) {
+    for (const control of [elements.previous, elements.play, elements.stop, elements.next, elements.seekOrder, elements.volume, elements.progress, elements.repeat]) {
         control.disabled = !enabled;
     }
 }
@@ -1036,6 +1073,42 @@ function updatePattern(snapshot) {
     }
 }
 
+/// Mirrors the engine's song timeline onto the slider and its two time readouts. A seek in
+/// flight keeps showing the frame it targeted until a snapshot published after the seek was
+/// queued proves the engine caught up — otherwise a slow SAB or fallback tick would snap the
+/// slider back to the pre-seek position for a frame or two. `state.scrubbing` short-circuits
+/// all of it: while the user is dragging, only the `input` handler touches the display.
+function updateProgress(snapshot) {
+    const rate = state.workletSampleRate;
+    const lengthKnown = (snapshot.songFlags & Ring.SONG_FLAG_LENGTH_KNOWN) !== 0;
+    const lengthFrames = lengthKnown ? Math.max(0, snapshot.songLengthFrames) : null;
+    elements.progress.max = String(lengthFrames ?? 0);
+    elements.progress.disabled = !lengthKnown;
+    setText(elements.duration, formatTime(lengthFrames, rate));
+
+    const endReachedStopped = (snapshot.songFlags & Ring.SONG_FLAG_END_REACHED) !== 0 && !snapshot.playing;
+    if (endReachedStopped) {
+        state.pendingSeekFrame = null;
+        if (state.scrubbing) return;
+        elements.progress.value = '0';
+        setText(elements.elapsed, '0:00');
+        return;
+    }
+    if (state.pendingSeekFrame !== null && snapshot.sequence <= state.pendingSeekSequence) {
+        if (state.scrubbing) return;
+        elements.progress.value = String(state.pendingSeekFrame);
+        setText(elements.elapsed, formatTime(state.pendingSeekFrame, rate));
+        return;
+    }
+    state.pendingSeekFrame = null;
+    if (state.scrubbing) return;
+    const fading = (snapshot.songFlags & Ring.SONG_FLAG_FADING) !== 0;
+    let frame = Math.max(0, snapshot.songFrame);
+    if (fading && lengthFrames !== null) frame = Math.min(frame, lengthFrames);
+    elements.progress.value = String(frame);
+    setText(elements.elapsed, formatTime(frame, rate));
+}
+
 function updateSnapshot(snapshot) {
     if (!snapshot || snapshot.sequence === 0 || !state.metadata) return;
     state.latest = snapshot;
@@ -1046,6 +1119,7 @@ function updateSnapshot(snapshot) {
     setText(elements.speed, String(snapshot.speed));
     setText(elements.bpm, String(snapshot.bpm));
     elements.seekOrder.value = String(snapshot.order);
+    updateProgress(snapshot);
     elements.transportChip.textContent = snapshot.playing ? 'playing' : 'stopped';
     elements.transportChip.classList.toggle('live', snapshot.playing);
     elements.voices.textContent = `${snapshot.voicesActive} ${snapshot.voicesActive === 1 ? 'voice' : 'voices'}`;
@@ -1170,6 +1244,20 @@ elements.stop.addEventListener('click', () => queueCommand(Ring.OPCODE_STOP));
 elements.previous.addEventListener('click', () => queueCommand(Ring.OPCODE_SEEK_ORDER, Math.max(0, (state.latest?.order || 0) - 1)));
 elements.next.addEventListener('click', () => queueCommand(Ring.OPCODE_SEEK_ORDER, Math.min((state.metadata?.orders || 1) - 1, (state.latest?.order || 0) + 1)));
 elements.seekOrder.addEventListener('change', () => queueCommand(Ring.OPCODE_SEEK_ORDER, Number(elements.seekOrder.value)));
+// Continuous `input` events while dragging never reach the command ring — it holds only
+// 64 entries and is drained once per render quantum — only the released `change` does.
+elements.progress.addEventListener('input', () => {
+    state.scrubbing = true;
+    setText(elements.elapsed, formatTime(Number(elements.progress.value), state.workletSampleRate));
+});
+elements.progress.addEventListener('change', () => {
+    const frame = Number(elements.progress.value);
+    queueCommand(Ring.OPCODE_SEEK_FRAME, frame);
+    state.pendingSeekFrame = frame;
+    state.pendingSeekSequence = state.latest?.sequence ?? 0;
+    state.scrubbing = false;
+});
+elements.repeat.addEventListener('change', queueRepeatCommand);
 elements.volume.addEventListener('input', () => {
     const percent = Number(elements.volume.value);
     elements.volumeValue.value = `${percent}%`;
