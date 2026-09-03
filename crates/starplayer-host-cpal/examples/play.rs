@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use starplayer::core::AtEnd;
 use starplayer::engine::MixerMode;
-use starplayer_host::{AudioSpec, DeviceInfo, HostError, Player};
+use starplayer_host::{AudioSpec, DeviceInfo, HostError, Player, format_seconds};
 use starplayer_host_cpal::{CpalBackend, all_devices};
 
 /// How long the loop sleeps between polls of the telemetry.
@@ -154,7 +154,7 @@ fn run() -> Result<ExitCode, String> {
     player.load(&bytes).map_err(describe)?;
     let module_title = player.module().map(|module| String::from(module.header().title.as_ref())).unwrap_or_default();
     let song_length = player.song_length().unwrap_or(0);
-    println!("module  {module_path}: {module_title:?}, {} frames ({})", song_length, seconds(song_length, spec.sample_rate_hz));
+    println!("module  {module_path}: {module_title:?}, {} frames ({})", song_length, format_seconds(song_length, spec.sample_rate_hz));
 
     player.set_fade_frames(LOOP_FADE_SECONDS.saturating_mul(spec.sample_rate_hz)).map_err(describe)?;
     // FadeOut covers both endings: a song that runs out of order list stops where it ends,
@@ -233,8 +233,8 @@ fn report(player: &mut Player, sample_rate_hz: u32) {
     let transport = snapshot.transport;
     println!(
         "{:>8} / {:<8}  order {:>3} pattern {:>3} row {:>3}  speed {:>2} bpm {:>3}  voices {:>3}  peak {:>5.3}",
-        seconds(transport.song_frame, sample_rate_hz),
-        seconds(transport.song_length_frames, sample_rate_hz),
+        format_seconds(transport.song_frame, sample_rate_hz),
+        format_seconds(transport.song_length_frames, sample_rate_hz),
         transport.order,
         transport.pattern,
         transport.row,
@@ -256,14 +256,6 @@ fn print_devices(devices: &[DeviceInfo]) {
         let rates = if rates.is_empty() { String::from("(unadvertised)") } else { rates.join(", ") };
         println!("{marker} [{}] {}\n    rates: {rates}", device.backend, device.name);
     }
-}
-
-fn seconds(frames: u64, sample_rate_hz: u32) -> String {
-    if sample_rate_hz == 0 {
-        return String::from("--:--");
-    }
-    let total = frames / sample_rate_hz as u64;
-    std::format!("{}:{:02}", total / 60, total % 60)
 }
 
 fn describe(error: HostError) -> String { std::format!("{error}") }

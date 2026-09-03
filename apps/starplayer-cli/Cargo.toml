@@ -14,11 +14,16 @@ starplayer = { workspace = true, features = ["std"] }
 # enables the `trace` command; without it the command explains how to get it.
 starplayer-offline = { workspace = true }
 starplayer-archive = { workspace = true }
+# `play` (task D8): the backend-neutral controller and the cpal driver behind it.
+starplayer-host = { workspace = true }
+starplayer-host-cpal = { workspace = true }
 clap = { workspace = true }
 # `render` prints the SHA-256 of its PCM payload (task D5 deliverable 2), in the same
 # little-endian encoding `starplayer-offline` hashes goldens with. The integration tests
 # reuse it too, so there is no separate `[dev-dependencies]` entry.
 sha2 = { workspace = true }
+# `play`'s Ctrl-C handling: a click-free stop rather than the process dying mid-ramp.
+ctrlc = { workspace = true }
 
 [features]
 default = []

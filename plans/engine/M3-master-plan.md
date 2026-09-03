@@ -52,8 +52,12 @@ not fit.
    original argument surface: the general length knobs cannot always reproduce a
    committed golden bit-for-bit (a song shorter than the ten-second golden window is a
    counterexample — `MOVEMENT.S3M`), so `--golden` calls the golden-generation functions
-   directly instead; see task D5's research resolution. `play` is still a stub naming
-   task D4, which this task depends on.
+   directly instead; see task D5's research resolution. `play` (task D8 — **landed**)
+   plays a file through `starplayer-host-cpal`: negotiate a device, open a `Player`,
+   print the title and negotiated spec once, then order/pattern/row/speed/BPM/voices/
+   peak on one updating line once a second; stop at the natural end or the loop-point
+   fade (five seconds, the D1/D2 rule the web player uses) unless `--repeat`; `Ctrl-C`
+   stops the transport click-free. See task D8's research resolution.
 4. **`starplayer-offline`** — deterministic rendering to WAV at any rate and depth, with
    the higher-quality interpolators when M7 lands. `song_timeline` and `render_song`
    landed early with task D1, because the web player's progress slider needed the scan.
@@ -67,9 +71,11 @@ not fit.
 
 ## Exit criteria
 
-`starplayer play foo.s3m` works on Linux; `starplayer render foo.mod -o out.wav`
-produces a file byte-identical to the browser's output at the same settings; scope data
-reaches a consumer without blocking the audio thread.
+`starplayer play foo.s3m` works on Linux — **met** (task D8: `cargo run -p
+starplayer-cli -- play crates/starplayer-s3m/tests/fixtures/NICETUNE.S3M` plays audibly
+through the PulseAudio RDP sink and exits 0 at the song's end); `starplayer render
+foo.mod -o out.wav` produces a file byte-identical to the browser's output at the same
+settings; scope data reaches a consumer without blocking the audio thread.
 
 ## Out of scope
 

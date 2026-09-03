@@ -51,6 +51,7 @@
 mod backend;
 mod depth;
 mod engine;
+mod format;
 mod manual;
 mod player;
 mod source;
@@ -59,6 +60,7 @@ mod transport;
 pub use backend::{AudioBackend, AudioSpec, DeviceInfo, HostError, RenderCallback, Stream, StreamControl, StreamHealth};
 pub use depth::{DITHER_SEED, dither_for, quantize_fixed_sample, quantize_float_sample};
 pub use engine::{HostEngine, MAX_FRAMES_PER_RENDER, SUPPORTED_DEPTHS, supported_modes};
+pub use format::format_seconds;
 pub use manual::{MANUAL_DEVICE_NAME, MANUAL_RATES, ManualBackend, ManualDriver};
 pub use player::{CONTROL_CADENCE_FRAMES, HOST_COMMAND_CAPACITY, Player, RETIRED_CAPACITY, TELEMETRY_DEPTH};
 pub use source::{

@@ -24,26 +24,32 @@
 //! starplayer trace <file> [--ticks N]
 //!     Print a per-tick diagnostic trace of the sequencer's state to stdout.
 //!
-//! starplayer play <file>
-//!     Not yet implemented here — needs the cpal host (task D4).
+//! starplayer play <file> [--entry N] [--device NAME] [--rate HZ] [--buffer FRAMES]
+//!                         [--repeat] [--list-devices]
+//!     Play a module on an audio output device through starplayer-host-cpal. Prints
+//!     the title and the negotiated stream spec once, then order/pattern/row/speed/
+//!     BPM/voices/peak on one updating line once a second. Stops at the song's natural
+//!     end or a detected loop's fade unless --repeat keeps it looping; Ctrl-C stops the
+//!     transport click-free and exits 0. --list-devices prints every output device on
+//!     every backend this build can reach, instead of playing anything.
 //! ```
 //!
 //! A ZIP archive is accepted anywhere a module file is. With more than one recognised
 //! module inside, pass `--entry N` naming the entry — `starplayer info` on the archive
 //! lists them.
 //!
-//! Apps depend only on the facade, plus the two `std` helper crates this binary needs:
-//! `starplayer-offline` for rendering and tracing, and `starplayer-archive` for ZIP
-//! entries.
+//! Apps depend only on the facade, plus the `std` helper crates this binary needs:
+//! `starplayer-offline` for rendering and tracing, `starplayer-archive` for ZIP entries,
+//! and `starplayer-host` / `starplayer-host-cpal` for `play`.
 
 #![forbid(unsafe_code)]
 
 mod archive;
 mod info;
+mod play;
 mod render;
 mod trace;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -67,15 +73,8 @@ enum Command {
     Render(render::RenderArgs),
     /// Print a per-tick diagnostic trace to stdout.
     Trace(trace::TraceArgs),
-    /// Play a module through the default output device (not yet implemented).
-    Play(PlayArgs),
-}
-
-#[derive(clap::Args, Debug)]
-struct PlayArgs {
-    /// Module or archive to play.
-    #[allow(dead_code)]
-    file: PathBuf,
+    /// Play a module through an audio output device.
+    Play(play::PlayArgs),
 }
 
 fn main() -> ExitCode {
@@ -85,10 +84,7 @@ fn main() -> ExitCode {
         Command::Info(args) => info::run(args),
         Command::Render(args) => render::run(args),
         Command::Trace(args) => trace::run(args),
-        Command::Play(_) => {
-            eprintln!("starplayer: playback needs the cpal host from task D4");
-            return ExitCode::from(2);
-        }
+        Command::Play(args) => play::run(args),
     };
 
     match result {
