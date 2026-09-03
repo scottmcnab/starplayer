@@ -52,8 +52,9 @@
 //! no compare-and-swap anywhere on this path, and `riscv32imc-unknown-none-elf` does not
 //! have to reach for `portable-atomic/critical-section` to publish telemetry.
 //!
-//! M3 revisits this when the scope rings arrive (architecture §9(b)); those are lossy
-//! per-channel taps with a `Relaxed` write index and want a different shape entirely.
+//! The scope rings of architecture §9(b) arrived in M3-D6 and are a different shape
+//! entirely, as expected: lossy per-channel taps with a `Relaxed` write index and no
+//! coherence guarantee at all. See [`crate::tap`].
 
 use crate::spsc::{Consumer, Producer, channel};
 

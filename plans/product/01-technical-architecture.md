@@ -786,13 +786,18 @@ per-channel note, instrument, volume, pan, active effect (~1 KB). Published thro
 triple buffer or seqlock. The UI needs this internally consistent — a row number from
 one tick with a note from another would render wrong.
 
-**(b) Lossy audio taps** — scope waveform and VU peaks. Per-channel fixed ring; the
-audio thread stores a `Relaxed` write index; the UI may read torn data. **Tearing is
-invisible on a scope.** Downsample in the audio thread (peak-per-16-frames) so it ships
-32 frames per quantum, not 4096.
+**(b) Lossy audio taps** — scope waveform. Per-channel fixed ring; the audio thread
+stores a `Relaxed` write index; the UI may read torn data. **Tearing is invisible on a
+scope.** Downsample in the audio thread so it ships 32 values per quantum, not 4096. This
+landed in M3-D6; §9.3 is what it landed as.
 
 VU behaviour follows the original: peak-hold set on a new note or a volume-column write,
 decayed by a fixed amount per tick (`__UpdateTracker` decays `_VUBarLevel` by 2/tick).
+**The VU level stays in (a)**, contrary to the M1-B6 note that said it would move here at
+M3: it is one scalar per channel, it already rides the snapshot at no cost, and every
+consumer — the web player, the TUI, the wire header — reads it there. Moving it would
+rewrite the 22-word wire header and every reader to buy nothing. Recorded as the D6
+decision.
 
 On WASM, (b) wants `SharedArrayBuffer`, which needs COOP/COEP headers — a `postMessage`
 fallback path is planned from the start.
@@ -939,6 +944,54 @@ Packaging therefore wraps the generated IIFE in a factory. Every processor owns 
 independent WASM instance, Rust host, and memory, while all processors reuse the compiled
 `WebAssembly.Module`. The Node harness constructs two processors simultaneously and
 checks both memory identity and independent module generations.
+
+### 9.3 What (b) landed as (M3-D6)
+
+**The tap does not read the mix.** There are no per-channel buses: `VoicePool::accumulate_masked`
+sums every voice into one accumulator in slot order, and that order is what makes the float
+path block-size independent and what the golden hashes fingerprint. Accumulating per
+channel to get a scope signal would change it. So the tap samples **voice state** and
+never touches the accumulator, which is why `cargo xtask goldens --check` is byte-identical
+with the taps compiled in.
+
+**The sampling rule.** `Engine::render_quantum` already splits each 128-frame quantum into
+segments at event boundaries. Immediately *before* each segment's accumulation, the engine
+walks every sounding voice; for each tap bucket whose first frame `4·b` (for `b` in `0..32`)
+lies inside that segment, it reads one PCM frame at the voice's position advanced by
+`4·b − offset` steps — folded through the voice's region by the render kernel's own
+`normalise_position`, exposed as `starplayer_mixer::folded_frame` so there is one loop rule
+and not two — scales it by the voice's `params.volume`, and **sums it, saturating**, into
+the ring of channel `voice.tag.channel`. A bucket's first frame lies in exactly one segment,
+so each bucket is written exactly once per quantum and its value is a pure function of the
+quantum and the engine state, never of the host's block size. `tests/block_size_determinism.rs`
+asserts that at block sizes 1, 3, 64, 128, 4096 and 8191, against independently computed
+expected values.
+
+The tap deliberately ignores interpolation, the gain ramps, pan, the master bus and (from
+M6) the per-voice filter — §9(b) tolerates exactly that; it is a picture, not the audio. A
+**muted** channel is still tapped, because muting is a mixer-side discard and a per-channel
+scope exists precisely to show a channel's own signal. A voice whose `tag.channel` is past
+the ring count is skipped: the rings are sized once, at engine construction.
+
+**The primitive.** `starplayer_rt::tap`: `TAP_BUCKET_FRAMES = 4` (so 32 buckets per
+quantum), `TAP_RING_BUCKETS = 1024` (~93 ms at 44.1 kHz, a power of two), one
+`Arc<[AtomicI16]>` plus one `Arc<AtomicU32>` write index per channel, allocated in
+`TapRing::new` and never again. `Relaxed` everywhere, no compare-and-swap — so `riscv32imc`
+does not reach for `portable-atomic/critical-section` to draw a scope — and no seqlock:
+a reader may see a torn window, and that is the design. `Engine::scope_readers` hands the
+reader halves out once, like `Engine::telemetry_reader`. 64 channels cost 128 KiB, once.
+
+**The transports.** Unlike the snapshot, the scope block is its **own** `SharedArrayBuffer`,
+so the 22-word snapshot header and its seqlock are untouched. The wasm host keeps a flat
+`[64][256]` `i16` block plus one write-index word per channel, refreshed from the readers
+every four quanta (~94 Hz at 48 kHz) for the *active* channels only, and exports it as
+`scope_ptr` / `scope_len` / `scope_window_buckets` / `scope_bucket_frames` /
+`scope_index_ptr` / `scope_generation` / `scope_channels`. The worklet views that block and
+publishes it once per refresh rather than once per quantum. On the `postMessage` fallback
+the same window rides the batched telemetry message the snapshot already goes in, trimmed
+to the active channels — one copy per posted message, which is the copy the fallback path
+already accepts. The page reads the shared window **in place**, with no copy at animation
+frame rate, and reports which transport is live in the Engine panel.
 
 ---
 

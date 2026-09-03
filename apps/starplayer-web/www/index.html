@@ -122,8 +122,8 @@
              would hide that relationship, while a deliberate swipe keeps it intact. -->
         <div class="table-scroll">
             <table class="channel-table">
-                <thead><tr><th>Ch</th><th>Instrument</th><th>Note</th><th>Vol</th><th>Pan</th><th>VU</th><th>Current effect</th><th></th></tr></thead>
-                <tbody id="channel-body"><tr><td colspan="8" class="empty">Waiting for a module.</td></tr></tbody>
+                <thead><tr><th>Ch</th><th>Instrument</th><th>Note</th><th>Vol</th><th>Pan</th><th>VU</th><th class="scope-column">Scope</th><th>Current effect</th><th></th></tr></thead>
+                <tbody id="channel-body"><tr><td colspan="9" class="empty">Waiting for a module.</td></tr></tbody>
             </table>
         </div>
     </section>
@@ -151,6 +151,7 @@
             <dl>
                 <div><dt>Commands</dt><dd id="command-transport">—</dd></div>
                 <div><dt>Telemetry</dt><dd id="telemetry-transport">—</dd></div>
+                <div><dt title="Architecture section 9(b): per-channel scope taps, sampled from voice state rather than from the mix.">Scopes</dt><dd id="scope-transport">—</dd></div>
                 <div><dt>Render quantum</dt><dd id="quantum">—</dd></div>
                 <div><dt>Wasm memory</dt><dd id="memory">—</dd></div>
                 <div><dt title="Loading a module allocates on the worklet instance; that growth happens in a message task, outside process(). Only growth during playback is a defect.">Measured</dt><dd>across playback, not across loads</dd></div>

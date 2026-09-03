@@ -42,7 +42,7 @@ use starplayer::engine::{
 };
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
-use starplayer::rt::Arc;
+use starplayer::rt::{Arc, TAP_BUCKET_FRAMES, TapReader};
 use starplayer::telemetry::{SongEnd, Snapshot, TelemetryReader};
 use starplayer::{MAX_VOICE_CAPACITY, NativeSequencer, ScannedSong};
 
@@ -89,6 +89,32 @@ const TELEMETRY_HEADER_WORDS: usize = 22;
 const TELEMETRY_CHANNEL_WORDS: usize = 8;
 const TELEMETRY_CHANNELS: usize = 64;
 const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
+
+/// Scope taps (architecture §9(b)): the newest window of each channel's tap ring, copied
+/// out of the engine's rings into one contiguous block the worklet can view.
+///
+/// # Why a window rather than the whole ring
+///
+/// The engine's rings are one `Arc<[AtomicI16]>` per channel, so they are neither
+/// contiguous nor addressable from JavaScript. The worklet needs one pointer, and it has
+/// to *copy* whatever it publishes into the `SharedArrayBuffer` anyway — the render
+/// instance's `WebAssembly.Memory` is not shared with the page (see this module's
+/// preamble). So the host keeps its own flat block and refreshes it from the readers.
+///
+/// 256 buckets is 1024 output frames, ~21 ms at 48 kHz: comfortably more than one
+/// animation frame, and a trace wide enough to fill a 128-pixel canvas twice over. The
+/// whole block is 64 × 256 × 2 bytes = 32 KiB, allocated once with everything else.
+const SCOPE_CHANNELS: usize = TELEMETRY_CHANNELS;
+const SCOPE_WINDOW_BUCKETS: usize = 256;
+const SCOPE_VALUES: usize = SCOPE_CHANNELS * SCOPE_WINDOW_BUCKETS;
+
+/// Quanta between refreshes of the scope block.
+///
+/// A refresh copies 256 buckets per *active* channel, and four quanta is 128 new buckets —
+/// half the window, so nothing is ever missed — at about 94 Hz on a 48 kHz context. That
+/// is faster than any display refreshes and an eighth of the copying a per-quantum refresh
+/// would do inside `process()`.
+const SCOPE_REFRESH_QUANTA: u64 = 4;
 
 /// Everything module activation hands back: the source the engine plays, the two cells the
 /// host writes transport requests into, and the scan the source is playing against.
@@ -152,6 +178,12 @@ macro_rules! define_web_engine {
                 match self {
                     $(WebEngine::$variant(engine) => render_web_arm!($buffer, engine, frames, float_interleaved, fixed_interleaved, $channels),)+
                 }
+            }
+
+            /// The per-channel scope tap readers, claimed once per engine
+            /// (architecture §9(b)). `None` if they have already been taken.
+            fn scope_readers(&mut self) -> Option<Box<[TapReader]>> {
+                match self { $(WebEngine::$variant(engine) => engine.scope_readers(),)+ }
             }
 
             fn frame(&self) -> Frame { match self { $(WebEngine::$variant(engine) => engine.frame(),)+ } }
@@ -366,6 +398,20 @@ struct Host {
     quantized_i16: Vec<i16>,
     planar: Vec<f32>,
     telemetry_words: Box<[i32]>,
+    /// The reading half of one scope tap ring per channel (architecture §9(b)). Taken
+    /// from the engine at construction, and again whenever the engine is rebuilt.
+    scopes: Box<[TapReader]>,
+    /// The newest [`SCOPE_WINDOW_BUCKETS`] buckets of each channel, oldest first, laid out
+    /// channel-major. The worklet views this and copies it onward.
+    scope_values: Box<[i16]>,
+    /// Each channel's tap write index as of the last refresh, so the page can tell a
+    /// stalled channel from a silent one.
+    scope_indices: Box<[i32]>,
+    /// Bumped on every refresh, so the worklet publishes a window once rather than once
+    /// per quantum.
+    scope_generation: u32,
+    /// Channels the last refresh actually filled.
+    scope_channels: u32,
     transport_gain: GainRamp,
     pending_engine_stop: bool,
     /// Whether the queued engine stop is the end of the song rather than the Stop button,
@@ -397,7 +443,8 @@ impl Host {
             channel_count: ChannelTable::MAX_CHANNELS,
             ..EngineSettings::default()
         };
-        let (engine, control, telemetry) = WebEngine::build(active_mode, settings)?;
+        let (mut engine, control, telemetry) = WebEngine::build(active_mode, settings)?;
+        let scopes = engine.scope_readers().expect("a new engine owns its scope readers");
         Ok(Host {
             engine,
             sample_rate_hz,
@@ -417,6 +464,11 @@ impl Host {
             quantized_i16: vec![0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
             planar: vec![0.0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
             telemetry_words: vec![0; TELEMETRY_WORDS].into_boxed_slice(),
+            scopes,
+            scope_values: vec![0; SCOPE_VALUES].into_boxed_slice(),
+            scope_indices: vec![0; SCOPE_CHANNELS].into_boxed_slice(),
+            scope_generation: 0,
+            scope_channels: 0,
             transport_gain: GainRamp::steady(TRANSPORT_GAIN_UNITY),
             pending_engine_stop: false,
             pending_end_rewind: false,
@@ -514,6 +566,7 @@ impl Host {
             control.send(Command::Stop).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
         }
 
+        self.scopes = engine.scope_readers().expect("a rebuilt engine owns its scope readers");
         self.engine = engine;
         self.control = control;
         self.telemetry = telemetry;
@@ -756,7 +809,35 @@ impl Host {
         // reads as silence.
         self.last_peak = peak.max(self.last_peak * MASTER_PEAK_DECAY_PER_QUANTUM);
         self.pack_telemetry(snapshot);
+        if self.quanta_rendered.is_multiple_of(SCOPE_REFRESH_QUANTA) {
+            self.refresh_scopes(snapshot.channel_count as usize);
+        }
         peak
+    }
+
+    /// Copy the newest window of each active channel's tap ring into the flat block the
+    /// worklet views (architecture §9(b)).
+    ///
+    /// Only `channel_count` channels: the engine's channel table is always at its maximum
+    /// here (the worklet builds one engine and plays every module through it), so copying
+    /// all 64 would copy 60 rings of silence for a four-channel MOD.
+    ///
+    /// No allocation: both the readers' copy and the destination already exist. The window
+    /// may be torn — the engine is writing into the same rings — which is what §9(b)'s
+    /// lossy tap is for.
+    fn refresh_scopes(&mut self, channel_count: usize) {
+        let channels = channel_count.min(self.scopes.len()).min(SCOPE_CHANNELS);
+        for index in 0..channels {
+            let Some(reader) = self.scopes.get(index) else { continue };
+            let base = index * SCOPE_WINDOW_BUCKETS;
+            let Some(window) = self.scope_values.get_mut(base..base + SCOPE_WINDOW_BUCKETS) else { continue };
+            let write_index = reader.latest(window);
+            if let Some(slot) = self.scope_indices.get_mut(index) {
+                *slot = write_index as i32;
+            }
+        }
+        self.scope_channels = channels as u32;
+        self.scope_generation = self.scope_generation.wrapping_add(1);
     }
 
     fn pack_telemetry(&mut self, snapshot: Snapshot) {
@@ -926,6 +1007,37 @@ mod exports {
     #[wasm_bindgen]
     pub fn telemetry_len() -> u32 { TELEMETRY_WORDS as u32 }
 
+    /// The scope block: `scope_len()` `i16` values, channel-major, each channel's
+    /// `scope_window_buckets()` buckets oldest first (architecture §9(b)).
+    #[wasm_bindgen]
+    pub fn scope_ptr() -> u32 { with_host(0, |host| host.scope_values.as_ptr() as usize as u32) }
+
+    #[wasm_bindgen]
+    pub fn scope_len() -> u32 { SCOPE_VALUES as u32 }
+
+    /// Buckets per channel in the block above.
+    #[wasm_bindgen]
+    pub fn scope_window_buckets() -> u32 { SCOPE_WINDOW_BUCKETS as u32 }
+
+    /// Output frames one bucket covers, so a page can label the time axis.
+    #[wasm_bindgen]
+    pub fn scope_bucket_frames() -> u32 { TAP_BUCKET_FRAMES as u32 }
+
+    /// One `i32` write index per channel, as of the last refresh.
+    #[wasm_bindgen]
+    pub fn scope_index_ptr() -> u32 { with_host(0, |host| host.scope_indices.as_ptr() as usize as u32) }
+
+    #[wasm_bindgen]
+    pub fn scope_index_len() -> u32 { SCOPE_CHANNELS as u32 }
+
+    /// Bumped on every refresh of the block, so the worklet publishes each window once.
+    #[wasm_bindgen]
+    pub fn scope_generation() -> u32 { with_host(0, |host| host.scope_generation) }
+
+    /// Channels the last refresh filled.
+    #[wasm_bindgen]
+    pub fn scope_channels() -> u32 { with_host(0, |host| host.scope_channels) }
+
     #[wasm_bindgen]
     pub fn render_quantum() -> u32 { RENDER_QUANTUM as u32 }
 
@@ -1000,6 +1112,50 @@ mod tests {
         bytes[PATTERN_TABLE..PATTERN_TABLE + 2].copy_from_slice(&1u16.to_le_bytes());
         for (index, byte) in bytes[SAMPLE_DATA..].iter_mut().enumerate() { *byte = if index & 1 == 0 { 0xFF } else { 0x00 }; }
         bytes
+    }
+
+    #[test]
+    fn the_scope_block_fills_from_the_engines_tap_rings() {
+        let mut host = Host::new(48_000);
+        assert_eq!(host.scope_generation, 0, "nothing is refreshed before the first quanta");
+        assert!(host.load_module(FIXTURE).is_ok());
+
+        // Enough quanta for several refreshes, and for REFLEX to actually strike a note.
+        for _ in 0..(SCOPE_REFRESH_QUANTA as usize * 40) {
+            host.process(RENDER_QUANTUM);
+        }
+
+        assert!(host.scope_generation >= 40, "the block refreshed once every {SCOPE_REFRESH_QUANTA} quanta");
+        assert!(host.scope_channels > 0, "and filled the module's channels");
+        assert_eq!(host.scope_values.len(), SCOPE_VALUES);
+        assert_eq!(host.scope_indices.len(), SCOPE_CHANNELS);
+
+        let active = host.scope_channels as usize;
+        let filled = host.scope_values[..active * SCOPE_WINDOW_BUCKETS].iter().any(|value| *value != 0);
+        assert!(filled, "the tap carries a signal for the sounding channels");
+        assert!(host.scope_indices[..active].iter().all(|index| *index > 0), "each active channel published buckets");
+        assert!(
+            host.scope_values[active * SCOPE_WINDOW_BUCKETS..].iter().all(|value| *value == 0),
+            "channels the module does not use are never refreshed and stay silent",
+        );
+    }
+
+    #[test]
+    fn a_mixer_mode_rebuild_takes_the_new_engines_scope_readers() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        for _ in 0..64 { host.process(RENDER_QUANTUM); }
+        let before = host.scope_indices[0];
+        assert!(before > 0);
+
+        let rebuilt = mode(MixPathKind::Fixed, Interpolator::Linear, OutputDepth::I16, false, 2);
+        assert!(host.set_mixer_mode(rebuilt).is_ok());
+        for _ in 0..64 { host.process(RENDER_QUANTUM); }
+        assert!(host.scope_indices[0] > 0, "the rebuilt engine's rings are the ones being read");
+        assert!(
+            host.scope_values[..SCOPE_WINDOW_BUCKETS].iter().any(|value| *value != 0),
+            "and they carry a signal rather than the retired engine's silence",
+        );
     }
 
     fn mode(path: MixPathKind, interpolator: Interpolator, depth: OutputDepth, dither: bool, channels: u8) -> MixerMode {

@@ -192,6 +192,13 @@ where
     /// The UI's half, held until [`Engine::telemetry_reader`] claims it.
     #[cfg(feature = "telemetry")]
     telemetry_reader: Option<starplayer_telemetry::TelemetryReader>,
+    /// The audio thread's half of the per-channel scope taps (architecture §9(b)).
+    /// Sampled once per render segment, published once per quantum.
+    #[cfg(feature = "telemetry")]
+    scope_taps: crate::scope::ScopeTaps,
+    /// The UI's halves, held until [`Engine::scope_readers`] claims them.
+    #[cfg(feature = "telemetry")]
+    scope_readers: Option<alloc::boxed::Box<[starplayer_rt::TapReader]>>,
     /// Diagnostic per-tick trace. The field does not exist in shipping builds.
     #[cfg(feature = "trace")]
     trace: crate::trace::TraceRecorder,
@@ -220,6 +227,10 @@ where
         let (garbage, collector) = garbage_channel(settings.garbage_capacity);
         #[cfg(feature = "telemetry")]
         let (telemetry, telemetry_reader) = starplayer_telemetry::telemetry_channel();
+        // One scope ring per control lane, allocated here with everything else. A ring is
+        // ~2 KB, so even IT's 64 channels cost 128 KB once, never in `render()`.
+        #[cfg(feature = "telemetry")]
+        let (scope_taps, scope_readers) = crate::scope::ScopeTaps::new(settings.channel_count);
 
         Engine {
             voices: VoicePool::new(settings.voice_capacity),
@@ -244,6 +255,10 @@ where
             telemetry,
             #[cfg(feature = "telemetry")]
             telemetry_reader: Some(telemetry_reader),
+            #[cfg(feature = "telemetry")]
+            scope_taps,
+            #[cfg(feature = "telemetry")]
+            scope_readers: Some(scope_readers),
             #[cfg(feature = "trace")]
             trace: crate::trace::TraceRecorder::default(),
             interpolator: core::marker::PhantomData,
@@ -263,6 +278,21 @@ where
     #[cfg(feature = "telemetry")]
     pub fn telemetry_reader(&mut self) -> Option<starplayer_telemetry::TelemetryReader> {
         self.telemetry_reader.take()
+    }
+
+    /// Claim the per-channel scope readers, once (architecture §9(b)).
+    ///
+    /// One [`TapReader`](starplayer_rt::TapReader) per channel, in channel order, held by
+    /// the engine until taken for the same reason [`Engine::telemetry_reader`] is: a host
+    /// that draws nothing never has to think about them, and a host that does must take
+    /// them **before** the engine goes to the audio thread.
+    ///
+    /// Each ring carries [`TAP_RING_BUCKETS`](starplayer_rt::TAP_RING_BUCKETS) buckets of
+    /// [`TAP_BUCKET_FRAMES`](starplayer_rt::TAP_BUCKET_FRAMES) frames each, newest last.
+    /// The values are voice state sampled per segment, not the mix — see [`crate::scope`].
+    #[cfg(feature = "telemetry")]
+    pub fn scope_readers(&mut self) -> Option<alloc::boxed::Box<[starplayer_rt::TapReader]>> {
+        self.scope_readers.take()
     }
 
     /// Ticks captured so far in a diagnostic trace build.
@@ -396,6 +426,12 @@ where
             *accumulated = Path::Accumulator::default();
         }
 
+        // The scope taps sum into this quantum's buckets, so they start at zero. Done
+        // before the segment loop for the same reason the accumulator is: a quantum is
+        // the unit a bucket belongs to (architecture §9(b)).
+        #[cfg(feature = "telemetry")]
+        self.scope_taps.begin_quantum();
+
         let mut offset = 0usize;
         let mut events_this_quantum = 0u32;
 
@@ -426,6 +462,12 @@ where
                     Some(module) => module.pcm(),
                     None => &self.pcm,
                 };
+                // Before the accumulation, not after: the tap reads the positions this
+                // segment is about to render from. It never touches the accumulator, so
+                // the mixer's output is unchanged — which is what
+                // `cargo xtask goldens --check` proves.
+                #[cfg(feature = "telemetry")]
+                self.scope_taps.sample_segment(&self.voices, pcm, offset, span);
                 if let Some(window) = self.accumulator.get_mut(offset..end) {
                     let scratch = self.muted_scratch.get_mut(offset..end).unwrap_or(&mut []);
                     let channels = &self.channels;
@@ -441,6 +483,11 @@ where
             }
             offset = end;
         }
+
+        // Publish the quantum's 32 buckets per channel. One `Relaxed` store per channel;
+        // a reader racing it sees a torn window, which is invisible on a scope.
+        #[cfg(feature = "telemetry")]
+        self.scope_taps.end_quantum();
 
         // A voice that ended during the quantum leaves a stale handle behind; clearing it
         // here is what makes `ChannelTable::is_sounding` — the original's `_ActiveFlag`,

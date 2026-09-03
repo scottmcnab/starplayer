@@ -47,6 +47,13 @@
 //!   [`Snapshot`](starplayer_telemetry::Snapshot) published per tracker tick, and
 //!   [`Engine::telemetry_reader`] as the UI's way in.
 //!
+//! # What M3 adds (task D6)
+//!
+//! * [`scope`] — behind the same feature: telemetry (b), the per-channel oscilloscope
+//!   taps. Voice state sampled once per render segment into a lossy
+//!   [`TapRing`](starplayer_rt::TapRing) per channel, 32 buckets per quantum, claimed
+//!   through [`Engine::scope_readers`]. It does **not** read the mix; see that module.
+//!
 //! Not here yet: effect interpretation (B4), instruments (M4), the DSP graph, and
 //! background voices (M6).
 
@@ -64,6 +71,8 @@ pub mod engine;
 pub mod flow;
 pub mod mixer_mode;
 pub mod ring;
+#[cfg(feature = "telemetry")]
+pub mod scope;
 pub mod sequencer;
 pub mod source;
 #[cfg(feature = "telemetry")]
@@ -84,6 +93,8 @@ pub use engine::{
 };
 pub use mixer_mode::{MixPathKind, MixerMode, OutputDepth};
 pub use ring::OutputRing;
+#[cfg(feature = "telemetry")]
+pub use scope::ScopeTaps;
 pub use sequencer::{
     EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, RowVisit, SequencerSettings,
     SongPosition, TickContext, TickOutcome, TraceChannelState, TrackerProcessor,

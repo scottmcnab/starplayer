@@ -26,6 +26,11 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         this.channelCount = settings.channelCount;
         this.commandRing = settings.commandRing ? Ring.viewCommandRing(settings.commandRing) : null;
         this.telemetry = settings.telemetry ? Ring.viewTelemetry(settings.telemetry) : null;
+        this.scope = settings.scope ? Ring.viewScope(settings.scope) : null;
+        this.scopeBucketFrames = this.wasm.scope_bucket_frames();
+        // The wasm scope block is refreshed every few quanta, not every one, so this is
+        // what keeps the publish (or the fallback copy) to one per refresh.
+        this.publishedScopeGeneration = -1;
         this.quantaSinceFallback = 0;
         this.reportedQuantum = false;
         this.faulted = null;
@@ -53,6 +58,9 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             initialMemoryBytes: this.initialMemoryBytes,
             commandTransport: this.commandRing ? 'SharedArrayBuffer' : 'postMessage',
             telemetryTransport: this.telemetry ? 'SharedArrayBuffer' : 'postMessage',
+            scopeTransport: this.scope ? 'SharedArrayBuffer' : 'postMessage',
+            scopeBucketFrames: this.scopeBucketFrames,
+            scopeWindowBuckets: this.wasm.scope_window_buckets(),
         });
     }
 
@@ -90,6 +98,11 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             this.wasm.telemetry_ptr(),
             this.wasm.telemetry_len(),
         );
+        // The scope taps (architecture §9(b)). Two more views over blocks the Rust host
+        // allocated at construction; like every view here they are rebound outside
+        // process(), because module activation may have grown wasm memory.
+        this.scopeValues = new Int16Array(this.memory.buffer, this.wasm.scope_ptr(), this.wasm.scope_len());
+        this.scopeIndices = new Int32Array(this.memory.buffer, this.wasm.scope_index_ptr(), this.wasm.scope_index_len());
         this.stableMemoryBytes = this.memory.buffer.byteLength;
     }
 
@@ -184,6 +197,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         const dropped = this.wasm.dropped_commands()
             + (this.commandRing === null ? 0 : Ring.commandOverflows(this.commandRing));
         const quanta = this.wasm.quanta_rendered();
+        const scopeGeneration = this.wasm.scope_generation();
         if (this.telemetry !== null) {
             Ring.publishTelemetry(
                 this.telemetry,
@@ -193,6 +207,19 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                 dropped,
                 quanta,
             );
+            // Once per refresh of the wasm block, not once per quantum: the taps are
+            // downsampled in the engine and the block only moves every few quanta.
+            if (this.scope !== null && scopeGeneration !== this.publishedScopeGeneration) {
+                this.publishedScopeGeneration = scopeGeneration;
+                Ring.publishScope(
+                    this.scope,
+                    this.scopeValues,
+                    this.scopeIndices,
+                    this.wasm.scope_channels(),
+                    this.scopeBucketFrames,
+                    scopeGeneration,
+                );
+            }
         } else {
             this.quantaSinceFallback += 1;
             if (this.quantaSinceFallback >= Ring.TELEMETRY_FALLBACK_QUANTA) {
@@ -205,6 +232,18 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                     quanta,
                 );
                 snapshot.type = 'telemetry';
+                // The scope rides the snapshot's own batched message rather than a
+                // second post, so "no postMessage per interaction" still holds. This is
+                // the one copy the fallback path accepts, and it is the same copy the
+                // snapshot object above already is.
+                this.publishedScopeGeneration = scopeGeneration;
+                snapshot.scope = Ring.decodeWorkletScope(
+                    this.scopeValues,
+                    this.scopeIndices,
+                    this.wasm.scope_channels(),
+                    this.scopeBucketFrames,
+                    scopeGeneration,
+                );
                 this.port.postMessage(snapshot);
             }
         }
