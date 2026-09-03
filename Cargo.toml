@@ -52,6 +52,11 @@ clap = { version = "4.6", features = ["derive"] }
 # says so out loud.
 cpal = { version = "0.18.2", default-features = false, features = ["pulseaudio"] }
 
+# The CLI's `play` command's Ctrl-C handling (task D8): install once, from the one
+# thread that also owns the player's command ring, and turn the signal into a flag the
+# polling loop checks — never a call into the player from the handler's own thread.
+ctrlc = { version = "3.5.2" }
+
 # The real-time plumbing's three dependencies, all `no_std` and none enabling `std` at
 # the feature set selected here. See `crates/starplayer-rt/src/lib.rs` for why each one
 # is needed rather than hand-written.
