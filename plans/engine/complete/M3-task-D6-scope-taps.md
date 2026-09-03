@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M3 ([master plan](M3-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03; owner visual check outstanding |
 | Depends on | M4-lite landed (E1–E3) |
 | Blocks | G2 (IT filter — same mixer files; land this first), A1 (TUI oscilloscopes) |
 | Parallel with | D3, F1, G1 |
