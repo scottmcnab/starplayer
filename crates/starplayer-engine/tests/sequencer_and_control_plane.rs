@@ -5,10 +5,8 @@
 //! The block-size determinism invariant itself lives in `block_size_determinism.rs`, which
 //! now includes a sequencer-driven variant.
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc as StdArc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use starplayer_core::{Command, ExactFixedPoint, Frame, Step, U0F16, VoiceParams};
 use starplayer_dsp::Linear;
@@ -38,18 +36,55 @@ fn looping_blob() -> (Vec<i16>, SampleRegion) {
     (blob, region)
 }
 
+/// What a `Send` test source shares with the test that built it.
+///
+/// `EventSource` is `Send` because the engine carries its sources to the host's audio
+/// thread, so `Rc<RefCell<..>>` is no longer a shareable log. Atomics rather than a
+/// `Mutex`, because a test double that took a lock inside `dispatch` would be modelling
+/// exactly the thing `render()` may never do (design goal 5).
+struct DispatchLog {
+    values: [AtomicU64; DispatchLog::CAPACITY],
+    written: AtomicUsize,
+}
+
+impl DispatchLog {
+    const CAPACITY: usize = 512;
+
+    fn new() -> StdArc<DispatchLog> {
+        StdArc::new(DispatchLog { values: [const { AtomicU64::new(0) }; DispatchLog::CAPACITY], written: AtomicUsize::new(0) })
+    }
+
+    fn push(&self, value: u64) {
+        let index = self.written.fetch_add(1, Ordering::Relaxed);
+        if let Some(slot) = self.values.get(index) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    fn values(&self) -> Vec<u64> {
+        let written = self.written.load(Ordering::Relaxed).min(DispatchLog::CAPACITY);
+        self.values.iter().take(written).map(|slot| slot.load(Ordering::Relaxed)).collect()
+    }
+
+    fn frames(&self) -> Vec<Frame> { self.values().into_iter().map(Frame).collect() }
+
+    fn marks(&self) -> Vec<u8> { self.values().into_iter().map(|value| value as u8).collect() }
+
+    fn is_empty(&self) -> bool { self.written.load(Ordering::Relaxed) == 0 }
+}
+
 /// Wraps a source and records the frame of every dispatch, so the render loop's timing can
 /// be asserted from outside without reaching into a boxed `dyn EventSource`.
 struct Recording<Source> {
     inner: Source,
-    log: Rc<RefCell<Vec<Frame>>>,
+    log: StdArc<DispatchLog>,
 }
 
 impl<Source: EventSource> EventSource for Recording<Source> {
     fn next_event_frame(&self) -> Option<Frame> { self.inner.next_event_frame() }
     fn advance_to(&mut self, frame: Frame) { self.inner.advance_to(frame) }
     fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
-        self.log.borrow_mut().push(frame);
+        self.log.push(frame.0);
         self.inner.dispatch(frame, context);
     }
 }
@@ -59,7 +94,7 @@ struct MarkingSource {
     frames: Vec<Frame>,
     next: usize,
     mark: u8,
-    log: Rc<RefCell<Vec<u8>>>,
+    log: StdArc<DispatchLog>,
 }
 
 impl EventSource for MarkingSource {
@@ -67,7 +102,7 @@ impl EventSource for MarkingSource {
     fn advance_to(&mut self, _frame: Frame) {}
     fn dispatch(&mut self, frame: Frame, _context: &mut EngineContext<'_>) {
         while self.frames.get(self.next).is_some_and(|due| *due <= frame) {
-            self.log.borrow_mut().push(self.mark);
+            self.log.push(self.mark as u64);
             self.next += 1;
         }
     }
@@ -106,7 +141,7 @@ fn a_tempo_change_moves_the_next_tick_to_an_exact_frame_at_any_block_size() {
     .to_vec();
 
     for block_frames in [1usize, 3, 128, 8191] {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = DispatchLog::new();
         let (blob, region) = looping_blob();
 
         let mut data = DemoPatternData::new(1, 4, 1);
@@ -122,7 +157,7 @@ fn a_tempo_change_moves_the_next_tick_to_an_exact_frame_at_any_block_size() {
 
         let mut engine: TestEngine = Engine::new(8);
         engine.set_pcm(blob);
-        engine.set_source(Box::new(Recording { inner: sequencer, log: Rc::clone(&log) }));
+        engine.set_source(Box::new(Recording { inner: sequencer, log: StdArc::clone(&log) }));
 
         // Enough frames to reach the fourth tick of row 1.
         let total_frames = (row_one_tick_zero + 4 * FRAMES_PER_TICK_AT_250) as usize;
@@ -134,7 +169,7 @@ fn a_tempo_change_moves_the_next_tick_to_an_exact_frame_at_any_block_size() {
             written = end;
         }
 
-        let dispatched = log.borrow().clone();
+        let dispatched = log.frames();
         assert_eq!(&dispatched[..expected.len()], &expected[..], "block size {block_frames}: ticks did not land on their exact frames");
         assert!(!engine.warnings().any(), "block size {block_frames}: a well-behaved sequencer raises no warnings");
     }
@@ -174,16 +209,16 @@ fn the_sequencer_takes_the_control_clock_over_from_the_synthesised_one() {
 #[test]
 fn two_sources_at_the_same_frame_dispatch_in_the_same_order_every_run_and_every_block_size() {
     fn run(block_frames: usize) -> Vec<u8> {
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = DispatchLog::new();
         let coincident = vec![Frame(100), Frame(300), Frame(300), Frame(1_000)];
 
         let mut engine: TestEngine = Engine::new(4);
         engine
-            .add_source(Box::new(MarkingSource { frames: coincident.clone(), next: 0, mark: b'A', log: Rc::clone(&log) }))
+            .add_source(Box::new(MarkingSource { frames: coincident.clone(), next: 0, mark: b'A', log: StdArc::clone(&log) }))
             .map_err(|_| "slot 0")
             .expect("slot 0");
         engine
-            .add_source(Box::new(MarkingSource { frames: coincident, next: 0, mark: b'B', log: Rc::clone(&log) }))
+            .add_source(Box::new(MarkingSource { frames: coincident, next: 0, mark: b'B', log: StdArc::clone(&log) }))
             .map_err(|_| "slot 1")
             .expect("slot 1");
 
@@ -194,8 +229,7 @@ fn two_sources_at_the_same_frame_dispatch_in_the_same_order_every_run_and_every_
             engine.render(&mut output[written..end]);
             written = end;
         }
-        let dispatched = log.borrow();
-        dispatched.clone()
+        log.marks()
     }
 
     let reference = run(RENDER_QUANTUM);
@@ -210,15 +244,15 @@ fn two_sources_at_the_same_frame_dispatch_in_the_same_order_every_run_and_every_
 
 #[test]
 fn removing_a_source_does_not_renumber_the_others() {
-    let log = Rc::new(RefCell::new(Vec::new()));
+    let log = DispatchLog::new();
     let mut engine: TestEngine = Engine::new(4);
 
     let first = engine
-        .add_source(Box::new(MarkingSource { frames: vec![Frame(10)], next: 0, mark: b'0', log: Rc::clone(&log) }))
+        .add_source(Box::new(MarkingSource { frames: vec![Frame(10)], next: 0, mark: b'0', log: StdArc::clone(&log) }))
         .map_err(|_| "slot 0")
         .expect("slot 0");
     engine
-        .add_source(Box::new(MarkingSource { frames: vec![Frame(10), Frame(20)], next: 0, mark: b'1', log: Rc::clone(&log) }))
+        .add_source(Box::new(MarkingSource { frames: vec![Frame(10), Frame(20)], next: 0, mark: b'1', log: StdArc::clone(&log) }))
         .map_err(|_| "slot 1")
         .expect("slot 1");
     assert_eq!(engine.sources().len(), 2);
@@ -232,7 +266,7 @@ fn removing_a_source_does_not_renumber_the_others() {
 
 #[test]
 fn a_stuck_source_alongside_a_healthy_one_is_forced_forward_rather_than_hanging() {
-    let log = Rc::new(RefCell::new(Vec::new()));
+    let log = DispatchLog::new();
     let (blob, region) = looping_blob();
 
     let mut engine: TestEngine = Engine::new(8);
@@ -242,7 +276,7 @@ fn a_stuck_source_alongside_a_healthy_one_is_forced_forward_rather_than_hanging(
 
     engine.add_source(Box::new(StuckSource)).map_err(|_| "slot 0").expect("slot 0");
     engine
-        .add_source(Box::new(MarkingSource { frames: vec![Frame(50), Frame(150)], next: 0, mark: b'H', log: Rc::clone(&log) }))
+        .add_source(Box::new(MarkingSource { frames: vec![Frame(50), Frame(150)], next: 0, mark: b'H', log: StdArc::clone(&log) }))
         .map_err(|_| "slot 1")
         .expect("slot 1");
 
@@ -255,7 +289,7 @@ fn a_stuck_source_alongside_a_healthy_one_is_forced_forward_rather_than_hanging(
     assert!(warnings.event_limit_reached, "128 frames x {} dispatches also passes the per-block cap", MAX_ZERO_ADVANCE + 1);
     assert_eq!(engine.frame(), Frame(2 * RENDER_QUANTUM as u64), "the clock advanced a full frame at a time");
     assert!(output.iter().any(|sample| *sample != 0), "and audio was still produced throughout");
-    assert_eq!(*log.borrow(), b"HH".to_vec(), "the healthy source still got both of its events");
+    assert_eq!(log.marks(), b"HH".to_vec(), "the healthy source still got both of its events");
 }
 
 // ── the garbage channel ─────────────────────────────────────────────────────────────
@@ -402,13 +436,13 @@ fn loading_a_module_releases_every_voice_the_previous_module_was_playing() {
 
 #[test]
 fn stopping_freezes_the_musical_clock_without_stopping_the_output_clock() {
-    let log = Rc::new(RefCell::new(Vec::new()));
+    let log = DispatchLog::new();
     let mut engine: TestEngine = Engine::new(4);
     engine.set_source(Box::new(MarkingSource {
         frames: vec![Frame(64), Frame(300)],
         next: 0,
         mark: b'x',
-        log: Rc::clone(&log),
+        log: StdArc::clone(&log),
     }));
     let mut control = engine.take_control().expect("the handle");
 
@@ -419,11 +453,11 @@ fn stopping_freezes_the_musical_clock_without_stopping_the_output_clock() {
     assert!(!engine.is_playing());
     assert_eq!(engine.frame(), Frame(4 * RENDER_QUANTUM as u64), "the output clock never stops");
     assert_eq!(engine.source_frame(), Frame::ZERO, "the musical clock did");
-    assert!(log.borrow().is_empty(), "so nothing was dispatched, and nothing will be replayed in a burst on resume");
+    assert!(log.is_empty(), "so nothing was dispatched, and nothing will be replayed in a burst on resume");
 
     control.send(Command::Play).map_err(|_| "queued").expect("the ring has room");
     engine.render(&mut output);
-    assert_eq!(*log.borrow(), b"xx".to_vec(), "resuming picks up where the musical clock stopped, running frames 0..512");
+    assert_eq!(log.marks(), b"xx".to_vec(), "resuming picks up where the musical clock stopped, running frames 0..512");
     assert_eq!(engine.source_frame(), Frame(4 * RENDER_QUANTUM as u64), "512 musical frames, after 512 silent ones");
     assert_eq!(engine.frame(), Frame(8 * RENDER_QUANTUM as u64), "and 1024 output frames in total");
 }

@@ -22,12 +22,18 @@ not fit.
    renderer, the trace path and the conformance harness all turn a `Module` into a playing
    sequencer through the same code. A prerequisite for D4 and D5, and for M5's and M6's
    wiring tasks; see [the concurrency plan](M3-M6-concurrency-plan.md).
-1. **`starplayer-audio` host abstraction** — the trait a backend implements, plus device
-   enumeration, sample-rate and buffer-size negotiation, and stream lifecycle. The WASM
-   backend is retrofitted behind it, which is the test of whether the abstraction is
-   honest.
-2. **`starplayer-host-cpal`** — ALSA and PulseAudio are both present on the dev machine;
-   Windows and macOS come free via cpal.
+1. **`starplayer-host` abstraction** (task D4 — **landed**; named `starplayer-host`
+   rather than `starplayer-audio` to match the two backend crates) — `AudioBackend`, the
+   trait a backend implements, plus device enumeration, sample-rate and buffer-size
+   negotiation, and stream lifecycle; and `Player`, the backend-neutral controller that
+   owns the engine, the transport and the seek mailbox. The WASM backend is **not** yet
+   retrofitted behind `AudioBackend` — the owner deferred that (2026-09-03) so cpal, the
+   CLI and the TUI were not blocked on the riskier half — but it already shares the seek
+   mailbox, the repeat slot and the output-depth post-stage, which is the part that had to
+   move when `EventSource` became `Send`. The retrofit, which is the real test of whether
+   the abstraction is honest, is a follow-up task.
+2. **`starplayer-host-cpal`** (task D4 — **landed**) — ALSA and PulseAudio are both
+   present on the dev machine; Windows and macOS come free via cpal.
 3. **`apps/starplayer-cli`** — play a file, render to WAV, dump a trace, print module
    info. Argument surface deliberately echoes the original's where it still makes sense
    (`plans/reference/original-star-ui.md` §7): a mixing rate, a buffer size, a device

@@ -1278,7 +1278,19 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     }
 }
 
-impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> EventSource for PatternSequencer<Tempo, Processor, Data> {
+/// The engine renders on the host's audio thread, so every source it holds has to be able
+/// to travel there with it: [`EventSource`] is `Send`, and a sequencer is `Send` exactly
+/// when its three type parameters are. Every tempo model, processor and pattern decoder in
+/// this repository is plain data over an `Arc<Module>`, so the bound costs nothing — and it
+/// is spelled here rather than as a supertrait of the three traits because it belongs to
+/// *playing* a sequencer, not to being one: [`scan_timeline`](crate::scan_timeline) repeats
+/// it only because it drives one through the same trait, off the audio thread.
+impl<Tempo, Processor, Data> EventSource for PatternSequencer<Tempo, Processor, Data>
+where
+    Tempo: TempoModel + Send,
+    Processor: TrackerProcessor + Send,
+    Data: PatternData + Send,
+{
     fn next_event_frame(&self) -> Option<Frame> {
         match self.state {
             SequencerState::Ready => Some(self.clock.pending_tick_frame()),

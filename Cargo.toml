@@ -35,6 +35,19 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # offline crate; no digest code or dependency enters the real-time graph.
 sha2 = { version = "0.10", default-features = false }
 
+# Native audio output for `starplayer-host-cpal`. A `std` crate, reachable only from the
+# host crates and never from the engine, so it cannot threaten design goal 4.
+#
+# `pulseaudio` adds cpal's pure-Rust PulseAudio host alongside the ALSA one it always
+# builds on Linux. It costs no system dependency — the `pulseaudio` crate speaks the
+# protocol itself rather than binding `libpulse` — and it is the only host that finds a
+# device on a machine whose ALSA has no card, which is every WSL2 box and most containers.
+# Its sibling `pipewire` feature is deliberately off: it binds `libpipewire`, which is a
+# system dependency, and PulseAudio reaches a PipeWire server through its own compatibility
+# socket anyway. cpal's own default feature set is empty, so `default-features = false` only
+# says so out loud.
+cpal = { version = "0.18.2", default-features = false, features = ["pulseaudio"] }
+
 # The real-time plumbing's three dependencies, all `no_std` and none enabling `std` at
 # the feature set selected here. See `crates/starplayer-rt/src/lib.rs` for why each one
 # is needed rather than hand-written.
@@ -67,6 +80,7 @@ starplayer-xm = { path = "crates/starplayer-xm" }
 starplayer-it = { path = "crates/starplayer-it" }
 starplayer-midi = { path = "crates/starplayer-midi" }
 starplayer-telemetry = { path = "crates/starplayer-telemetry" }
+starplayer-host = { path = "crates/starplayer-host" }
 starplayer-host-cpal = { path = "crates/starplayer-host-cpal" }
 starplayer-host-wasm = { path = "crates/starplayer-host-wasm" }
 starplayer-archive = { path = "crates/starplayer-archive" }

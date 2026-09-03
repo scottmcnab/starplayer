@@ -26,9 +26,10 @@
 
 mod command;
 
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use std::boxed::Box;
 use std::rc::Rc;
+use std::sync::Arc as SharedSlot;
 use std::vec;
 use std::vec::Vec;
 
@@ -37,14 +38,22 @@ use starplayer::core::quirks::QuirkSelection;
 use starplayer::core::{AtEnd, ChannelId, Command, Frame, Interpolator, U0F16};
 use starplayer::dsp::{GainRamp, Interpolate, Linear, Nearest};
 use starplayer::engine::{
-    ChannelTable, Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode,
-    OutputDepth, RENDER_QUANTUM, ScanLimits,
+    ChannelTable, Engine, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode, RENDER_QUANTUM,
+    ScanLimits,
 };
-use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
+use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, MixPath, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::Arc;
 use starplayer::telemetry::{SongEnd, Snapshot, TelemetryReader};
 use starplayer::{MAX_VOICE_CAPACITY, NativeSequencer, ScannedSong};
+// Lifted out of this file by task D4, because none of it was ever browser-specific. The
+// seek mailbox had to move: `EventSource` is `Send` now, so the `Rc<Cell<..>>` this host
+// used cannot be what a live source holds. The depth post-stage moved with it because it
+// was the same code twice.
+use starplayer_host::{
+    AtEndSlot, SeekKind, SeekMailbox, SeekRequest, SeekableModuleSource, dither_for, quantize_fixed_sample,
+    quantize_float_sample,
+};
 
 pub use command::COMMAND_RING_CAPACITY;
 
@@ -90,16 +99,14 @@ const TELEMETRY_CHANNEL_WORDS: usize = 8;
 const TELEMETRY_CHANNELS: usize = 64;
 const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
 
-/// Everything module activation hands back: the source the engine plays, the two cells the
+/// Everything module activation hands back: the source the engine plays, the two slots the
 /// host writes transport requests into, and the scan the source is playing against.
 struct BuiltSource {
     source: Box<dyn EventSource>,
-    seek_request: Rc<Cell<SeekRequest>>,
-    at_end: Rc<Cell<AtEnd>>,
+    seek_request: SharedSlot<SeekMailbox>,
+    at_end: SharedSlot<AtEndSlot>,
     scanned: Rc<ScannedSong>,
 }
-
-const DITHER_SEED: u32 = 0x5354_4152;
 
 /// What building one typed arm hands back: the engine, its control handle, its reader.
 type BuiltEngine<Path, Interp, Out> = (Engine<Path, Interp, Out, Arc<Module>>, EngineHandle<Arc<Module>>, TelemetryReader);
@@ -178,108 +185,6 @@ define_web_engine! {
     FixedLinearStereo => (MixPathKind::Fixed, Interpolator::Linear, 2, FixedPath, Linear, FixedOut<i16, 2>, fixed),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SeekKind {
-    #[default]
-    None,
-    Order(u16),
-    Row(u16),
-    /// An elapsed position in the song, in frames from the start of the current pass.
-    Frame(u64),
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SeekRequest {
-    kind: SeekKind,
-    frame: Frame,
-}
-
-/// A format-native tracker source with a host-owned seek mailbox.
-///
-/// `Engine` intentionally stores `dyn EventSource`, so its generic command handler cannot
-/// downcast to `PatternSequencer`. This wrapper is the safe host-specific bridge: the
-/// command remains a typed `Command`, but order/row seeks become one fixed-size mailbox
-/// write. The wrapper consumes it at an event boundary and restarts the sequencer clock
-/// on the engine's monotonic source timeline. No allocation occurs in `process()`.
-struct SeekableModuleSource {
-    sequencer: NativeSequencer,
-    request: Rc<Cell<SeekRequest>>,
-    /// The host's repeat setting, read at each event boundary rather than written straight
-    /// into the sequencer: the page can change it while `process()` is between quanta.
-    at_end: Rc<Cell<AtEnd>>,
-    applied_at_end: AtEnd,
-}
-
-impl EventSource for SeekableModuleSource {
-    fn next_event_frame(&self) -> Option<Frame> {
-        let request = self.request.get();
-        match request.kind {
-            SeekKind::None => self.sequencer.next_event_frame(),
-            _ => Some(match self.sequencer.next_event_frame() {
-                Some(next) => core::cmp::min(next, request.frame),
-                None => request.frame,
-            }),
-        }
-    }
-
-    fn advance_to(&mut self, frame: Frame) { self.sequencer.advance_to(frame); }
-
-    fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
-        let at_end = self.at_end.get();
-        if at_end != self.applied_at_end {
-            self.sequencer.set_at_end(at_end);
-            self.applied_at_end = at_end;
-        }
-        let request = self.request.get();
-        if !matches!(request.kind, SeekKind::None) && frame >= request.frame {
-            self.request.set(SeekRequest::default());
-            // An order the module does not have, or a frame past the end of the scan, is
-            // a page-side mistake and not something the audio realm can report: the
-            // sequencer stays where it was, which is the only answer that keeps playing.
-            match request.kind {
-                SeekKind::Order(order) => { let _ = self.sequencer.seek_order_at(order, frame); }
-                SeekKind::Row(row) => self.sequencer.seek_row(row),
-                SeekKind::Frame(song_frame) => { let _ = self.sequencer.seek_frame(song_frame, frame); }
-                SeekKind::None => {}
-            }
-            self.sequencer.restart_clock_at(frame);
-        }
-        if self.sequencer.next_event_frame().is_some_and(|next| next <= frame) {
-            self.sequencer.dispatch(frame, context);
-        }
-    }
-}
-
-fn dither_for(mode: MixerMode) -> Dither {
-    if mode.dither { Dither::seeded(DITHER_SEED) } else { Dither::OFF }
-}
-
-fn quantize_float_sample(value: f32, depth: OutputDepth, dither: &mut Dither) -> (f32, Option<i16>) {
-    match depth {
-        OutputDepth::F32 => (<f32 as HostSample>::from_unit_f32(value, dither), None),
-        OutputDepth::I32 => (<i32 as HostSample>::from_unit_f32(value, dither) as f32 * (1.0 / 2_147_483_520.0), None),
-        OutputDepth::I24 => (<I24 as HostSample>::from_unit_f32(value, dither).0 as f32 * (1.0 / 8_388_607.0), None),
-        OutputDepth::I16 => {
-            let quantized = <i16 as HostSample>::from_unit_f32(value, dither);
-            (quantized as f32 * (1.0 / 32_767.0), Some(quantized))
-        }
-        OutputDepth::I8 => (<i8 as HostSample>::from_unit_f32(value, dither) as f32 * (1.0 / 127.0), None),
-    }
-}
-
-fn quantize_fixed_sample(value: i32, depth: OutputDepth, dither: &mut Dither) -> (f32, Option<i16>) {
-    match depth {
-        OutputDepth::F32 => (<f32 as HostSample>::from_i16_scale(value, dither), None),
-        OutputDepth::I32 => (<i32 as HostSample>::from_i16_scale(value, dither) as f32 * (1.0 / 2_147_483_520.0), None),
-        OutputDepth::I24 => (<I24 as HostSample>::from_i16_scale(value, dither).0 as f32 * (1.0 / 8_388_607.0), None),
-        OutputDepth::I16 => {
-            let quantized = <i16 as HostSample>::from_i16_scale(value, dither);
-            (quantized as f32 * (1.0 / 32_767.0), Some(quantized))
-        }
-        OutputDepth::I8 => (<i8 as HostSample>::from_i16_scale(value, dither) as f32 * (1.0 / 127.0), None),
-    }
-}
-
 /// Scan a module on a throwaway sequencer, so the playback one never has to be rewound.
 ///
 /// Runs in the worklet's message task, never in `process()` — like module decoding, which
@@ -320,14 +225,9 @@ fn source_for(
         SeekKind::None => { let _ = sequencer.seek_order_at(0, frame); }
     }
     sequencer.restart_clock_at(frame);
-    let request = Rc::new(Cell::new(SeekRequest::default()));
-    let at_end_cell = Rc::new(Cell::new(at_end));
-    let source = SeekableModuleSource {
-        sequencer,
-        request: Rc::clone(&request),
-        at_end: Rc::clone(&at_end_cell),
-        applied_at_end: at_end,
-    };
+    let request = SeekMailbox::new();
+    let at_end_cell = AtEndSlot::new(at_end);
+    let source = SeekableModuleSource::new(sequencer, SharedSlot::clone(&request), SharedSlot::clone(&at_end_cell));
     Ok(BuiltSource { source: Box::new(source), seek_request: request, at_end: at_end_cell, scanned })
 }
 
@@ -340,10 +240,10 @@ struct Host {
     control: EngineHandle<Arc<Module>>,
     telemetry: TelemetryReader,
     commands: CommandRing,
-    seek_request: Option<Rc<Cell<SeekRequest>>>,
+    seek_request: Option<SharedSlot<SeekMailbox>>,
     /// The repeat setting, shared with the live source so a change lands at the next event
     /// boundary rather than inside a render.
-    at_end: Rc<Cell<AtEnd>>,
+    at_end: SharedSlot<AtEndSlot>,
     /// How long the transport fade lasts when the song reaches its loop point.
     fade_frames: u32,
     /// Whether that fade is running, so it is armed once rather than every quantum.
@@ -405,7 +305,7 @@ impl Host {
             telemetry,
             commands: CommandRing::new(),
             seek_request: None,
-            at_end: Rc::new(Cell::new(AtEnd::Continue)),
+            at_end: AtEndSlot::new(AtEnd::Continue),
             fade_frames: DEFAULT_FADE_FRAMES,
             fading: false,
             fade_elapsed: 0,
@@ -487,7 +387,7 @@ impl Host {
         let (mut engine, mut control, telemetry) = WebEngine::build(mode, settings)?;
         let mut seek_request = None;
 
-        let mut at_end_cell = Rc::clone(&self.at_end);
+        let mut at_end_cell = SharedSlot::clone(&self.at_end);
         if let Some(module) = self.current_module.as_ref() {
             let built = source_for(
                 Arc::clone(module),
@@ -613,7 +513,7 @@ impl Host {
 
     fn request_seek(&mut self, kind: SeekKind) {
         if let Some(request) = &self.seek_request {
-            request.set(SeekRequest { kind, frame: self.engine.source_frame() });
+            request.request(SeekRequest { kind, frame: self.engine.source_frame() });
         } else {
             self.commands_rejected = self.commands_rejected.saturating_add(1);
         }
@@ -950,6 +850,7 @@ mod exports {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starplayer::engine::OutputDepth;
     use std::collections::BTreeSet;
 
     const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
@@ -1293,7 +1194,7 @@ mod tests {
         let stopped_at = stopped_at.expect("the transport stopped once the fade finished");
         assert!(stopped_at as u64 * RENDER_QUANTUM as u64 >= end_frame, "it did not stop before the loop point");
         assert!(!host.fading, "the fade is finished, not stuck");
-        assert_eq!(host.seek_request.as_ref().map(|request| request.get().kind), Some(SeekKind::Frame(0)), "a faded-out song rewinds for the next Play");
+        assert_eq!(host.seek_request.as_ref().map(|request| request.peek().kind), Some(SeekKind::Frame(0)), "a faded-out song rewinds for the next Play");
     }
 
     /// Task D2, the owner's case: with Repeat off, a song whose order list simply runs out
@@ -1325,7 +1226,7 @@ mod tests {
         assert!(stopped_frame >= end_frame, "it did not stop before the end of the song");
         // The 64-frame transport glide plus the quantum the arming decision is taken in.
         assert!(stopped_frame < end_frame + 4 * RENDER_QUANTUM as u64, "and it stopped there, not five seconds later: {stopped_frame} vs {end_frame}");
-        assert_eq!(host.seek_request.as_ref().map(|request| request.get().kind), Some(SeekKind::Frame(0)), "a song that ended rewinds for the next Play");
+        assert_eq!(host.seek_request.as_ref().map(|request| request.peek().kind), Some(SeekKind::Frame(0)), "a song that ended rewinds for the next Play");
 
         // A stopped engine whose snapshot still says `end_reached` must not stop again.
         let rejected = host.dropped_commands();
@@ -1340,7 +1241,7 @@ mod tests {
         for _ in 0..8 { host.process(RENDER_QUANTUM); }
         assert!(host.engine.is_playing(), "the song plays again");
         assert_eq!(host.transport_gain.target(), TRANSPORT_GAIN_UNITY, "at unity, not at the faded-out level");
-        assert_eq!(host.seek_request.as_ref().map(|request| request.get().kind), Some(SeekKind::None), "the rewind was consumed");
+        assert_eq!(host.seek_request.as_ref().map(|request| request.peek().kind), Some(SeekKind::None), "the rewind was consumed");
         assert_eq!(host.telemetry_words[21] & 0b100, 0, "and the sticky end flag went with it");
         assert!((host.telemetry_words[19] as u64) < end_frame / 4, "it restarted from the top, not from the end");
     }

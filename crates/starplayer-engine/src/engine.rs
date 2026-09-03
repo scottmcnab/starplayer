@@ -300,6 +300,27 @@ where
         let _ = self.sources.insert(source);
     }
 
+    /// Install `source` in place of the one already there and hand the retired one **back**
+    /// rather than dropping it.
+    ///
+    /// [`Engine::set_source`] drops what it replaces, which is a `free()`: fine from a
+    /// worklet message task, forbidden inside an audio callback (architecture §8). A native
+    /// host has no choice about where it swaps — once the stream is open, the callback is
+    /// the only place a `&mut Engine` exists — so it swaps here and sends the retired source
+    /// down a garbage channel, exactly as a retired module handle already goes.
+    ///
+    /// Only the lowest-slot source is handed back. A host that has merged others alongside
+    /// it keeps them, in their slots, and takes them out itself with
+    /// [`Engine::remove_source`].
+    pub fn replace_source(&mut self, source: Box<dyn EventSource>) -> Option<Box<dyn EventSource>> {
+        let retired = self.sources.take_first();
+        self.control.resume_synthesis(self.source_frame);
+        // The take above freed the lowest occupied slot, so this insert lands in that slot
+        // and can only fail for a mux built with no capacity at all.
+        let _ = self.sources.insert(source);
+        retired
+    }
+
     /// Add a source alongside whatever is already installed, or hand it back if the mux is
     /// full. Off the audio thread.
     pub fn add_source(&mut self, source: Box<dyn EventSource>) -> Result<SourceSlot, Box<dyn EventSource>> {
