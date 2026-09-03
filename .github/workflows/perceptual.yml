@@ -1,0 +1,73 @@
+# The nightly perceptual comparison against libopenmpt (roadmap T10, M3-task-D7).
+#
+# The hashes in `ci.yml` are exact and the conformance harness diffs per-tick state; what
+# neither can express is "this sounds wrong". This workflow renders every fixture through
+# StarPlayer's float path and through `openmpt123` — libopenmpt's own renderer, built here
+# from a checksum-pinned source tarball — normalises the two to equal RMS and scores them
+# with a segmental SNR and a log-spectral distance.
+#
+# It is deliberately **not** in `ci.yml` and deliberately **not** a gate. A score never
+# fails this job; only a tooling failure does. The numbers are a trend a human reads, and
+# `report.tsv` is uploaded so consecutive nights can be compared.
+#
+# On the measured baseline, `--threshold-snr 20` names every fixture: at 2026-09-03 the
+# committed fixtures score between −3 and 15 dB, because StarPlayer's canonical exact tick
+# length and libopenmpt's ST3-style truncated one drift apart by a fraction of a frame per
+# tick, and a sample-domain SNR is unforgiving of even a quarter-millisecond of
+# misalignment. The log-spectral distance is the metric that is actually stable
+# (4–7 dB for the S3Ms). See the research resolution in
+# `plans/engine/complete/M3-task-D7-perceptual-comparison.md` before changing the
+# threshold — the noise is a property of the two engines, not of this job.
+
+name: perceptual
+
+on:
+  schedule:
+    # 04:23 UTC, after the fuzz cron, off the hour so it does not queue behind everyone
+    # else's midnight jobs.
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      threshold_snr:
+        description: "Advisory segmental SNR threshold in dB"
+        required: false
+        default: "20"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perceptual:
+    name: perceptual comparison
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      # Keyed on the tarball checksum, so repinning libopenmpt is what invalidates it and
+      # nothing else does. The cache holds the downloaded source and the built binary;
+      # none of it is ever committed.
+      - name: Restore the pinned libopenmpt build
+        id: openmpt-cache
+        uses: actions/cache@v4
+        with:
+          path: target/openmpt
+          key: openmpt-5366db541b4ac59906a3af526e5bed54033519005814d08bccc73fdb0d58abb3
+      - name: Build openmpt123 from the pinned source
+        if: steps.openmpt-cache.outputs.cache-hit != 'true'
+        run: cargo xtask openmpt
+
+      # `--offline` refuses to download: on a cache hit there is nothing to fetch, and on
+      # a miss the step above has already fetched it.
+      - name: Compare
+        run: cargo xtask perceptual --offline --threshold-snr ${{ github.event.inputs.threshold_snr || '20' }}
+
+      - name: Upload the score table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perceptual-report
+          path: target/perceptual/report.tsv
+          if-no-files-found: warn

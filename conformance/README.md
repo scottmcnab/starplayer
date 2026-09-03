@@ -193,6 +193,44 @@ remain documented-only). This keeps every byte under one immutable archive pin a
 a second, unlicensed download, but it is a scoped deviation from the task as written, not
 a completed deliverable.
 
+## Perceptual comparison against libopenmpt
+
+`cargo xtask perceptual` is roadmap T10: the check that hashes and per-tick traces cannot
+express, "does it sound like libopenmpt". It is a **nightly report with a tolerance, not a
+gate** — `.github/workflows/perceptual.yml` runs it, `ci.yml` does not, and no score can
+fail a build. `--threshold-snr DB` adds an advisory line naming the fixtures below it.
+
+The oracle is `openmpt123`, the renderer inside libopenmpt's own source tree.
+`cargo xtask openmpt` downloads the pinned tarball, verifies its SHA-256 and builds it
+with `make` and every optional backend switched off (`NO_ZLIB`, `NO_MPG123`, `NO_OGG`,
+`NO_VORBIS`, `NO_VORBISFILE`, `NO_FLAC`, `NO_SNDFILE`, `NO_PORTAUDIO`, `NO_PORTAUDIOCPP`,
+`NO_PULSEAUDIO`, `NO_SDL2`, plus `EXAMPLES=0 TEST=0 SHARED_LIB=0 DYNLINK=0`), so it needs
+nothing but a C++17 compiler. The version, URL and checksum are constants in
+`xtask/src/main.rs`; a version marker in `target/openmpt/` skips a current build.
+`--fetch-only` prepares the source cache, `--offline` refuses to download.
+
+Both renders are 44 100 Hz stereo 32-bit float with linear interpolation
+(`openmpt123 --filter 2`), unity gain, no dithering and no repeat; StarPlayer's side is
+`render_song` with `RenderLength::default_for(44_100)`. They are aligned at frame zero,
+trimmed to the shorter, normalised to equal RMS, and scored with a segmental SNR over
+4096-frame segments and a log-spectral distance (Hann, 4096-frame frames, 50 % overlap).
+The RMS ratio before normalisation is reported too, because a level mismatch is itself a
+finding. The table goes to `target/perceptual/report.tsv`, and both renders are kept
+beside it as headerless interleaved float — `openmpt123`'s WAV writer needs libsndfile,
+which the dependency-free build deliberately does not have.
+
+Read the research resolution in
+`plans/engine/complete/M3-task-D7-perceptual-comparison.md` before reacting to a number.
+The measured baseline is low by design: StarPlayer's canonical exact tick length and
+libopenmpt's ST3-style truncated one diverge by a fraction of a frame per tick, which a
+sample-domain SNR punishes and a spectral distance does not.
+
+### Licensing
+
+libopenmpt is BSD-3-Clause. Its source is downloaded into the ignored build cache
+`target/openmpt/`, exactly like the libxmp corpus, and **nothing of it is committed** —
+no source, no binary, and none of the WAV or raw renders under `target/perceptual/`.
+
 ## Licensing finding (decision deferred)
 
 - libxmp source and its associated documentation declare the MIT licence in

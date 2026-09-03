@@ -182,7 +182,7 @@ Ordered by value per unit of effort. Detail and rationale in `03-accuracy-policy
 | T7 | **Loader fuzzing** (`cargo-fuzz`) — never panic, never OOM, always `Err` | M2, per format thereafter |
 | T8 | **RT-safety** — allocator hook panicking on any allocation inside `render()` | M2 |
 | T9 | **Properties** — no NaN/Inf; voice pool returns to zero active after song end; `next_event_frame()` never returns the past; the zero-advance guard never trips on the corpus | M2 |
-| T10 | **Perceptual comparison vs libopenmpt** on the float path — spectral distance / segmental SNR with tolerance. Nightly, not a gate | M3 |
+| T10 | **Perceptual comparison vs libopenmpt** on the float path — spectral distance / segmental SNR with tolerance. Nightly, not a gate. `cargo xtask perceptual`: `openmpt123` built from a checksum-pinned libopenmpt source tarball into `target/openmpt/`, both renders RMS-normalised, segmental SNR and log-spectral distance per fixture into `target/perceptual/report.tsv`; `.github/workflows/perceptual.yml` runs it nightly and uploads the table | M3 |
 
 Golden WAVs stay **out of the repo**; only their hashes are committed, and
 `cargo xtask goldens` regenerates them.

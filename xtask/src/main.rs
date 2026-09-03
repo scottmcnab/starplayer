@@ -25,6 +25,45 @@ const LIBXMP_CORPUS_URL: &str = "https://codeload.github.com/libxmp/libxmp/tar.g
 const CONFORMANCE_MANIFEST: &str = "conformance/cases.tsv";
 const CONFORMANCE_EXCLUSIONS: &str = "conformance/exclusions.tsv";
 
+// ── the perceptual oracle (M3-D7) ───────────────────────────────────────────────────
+
+/// The pinned libopenmpt release `openmpt123` is built from.
+///
+/// `openmpt123` is the renderer shipped inside the libopenmpt source tree, and building it
+/// from a checksum-pinned tarball is how the perceptual comparison gets a libopenmpt onto
+/// a machine with no root and no distribution package. It is pinned for the same reason
+/// the libxmp corpus is: an oracle that moves underneath a trend line is not an oracle.
+const LIBOPENMPT_VERSION: &str = "0.7.21";
+const LIBOPENMPT_SHA256: &str = "5366db541b4ac59906a3af526e5bed54033519005814d08bccc73fdb0d58abb3";
+const LIBOPENMPT_URL: &str = "https://lib.openmpt.org/files/libopenmpt/src/libopenmpt-0.7.21%2Brelease.makefile.tar.gz";
+
+/// The `make` variables that leave a renderer with no optional dependency at all.
+///
+/// What survives them needs nothing but a C++17 compiler and its standard library: no
+/// zlib, no audio device, no file-format libraries. `DYNLINK=0` with `STATIC_LIB=1` links
+/// `openmpt123` against the static archive, so the binary runs out of `target/openmpt/bin`
+/// with no install step and no `LD_LIBRARY_PATH`.
+const LIBOPENMPT_MAKE_FLAGS: &[&str] = &[
+    "CONFIG=gcc",
+    "EXAMPLES=0",
+    "TEST=0",
+    "SHARED_LIB=0",
+    "STATIC_LIB=1",
+    "DYNLINK=0",
+    "OPENMPT123=1",
+    "NO_ZLIB=1",
+    "NO_MPG123=1",
+    "NO_OGG=1",
+    "NO_VORBIS=1",
+    "NO_VORBISFILE=1",
+    "NO_FLAC=1",
+    "NO_SNDFILE=1",
+    "NO_PORTAUDIO=1",
+    "NO_PORTAUDIOCPP=1",
+    "NO_PULSEAUDIO=1",
+    "NO_SDL2=1",
+];
+
 /// Every crate that must stay `no_std`. The facade is last so a purity failure inside it
 /// is reported after the crate that actually caused it.
 const NO_STD_CRATES: &[&str] = &[
@@ -165,6 +204,8 @@ fn main() -> ExitCode {
         Some("conformance") => run_conformance(&arguments[1..]),
         Some("fuzz") => run_fuzz(&arguments[1..]),
         Some("goldens") => run_goldens(&arguments[1..]),
+        Some("openmpt") => run_openmpt(&arguments[1..]),
+        Some("perceptual") => run_perceptual(&arguments[1..]),
         Some("trace") => run_trace(&arguments[1..]),
         Some("wasm") => run_wasm(&arguments[1..]),
         Some("serve") => run_serve(&arguments[1..]),
@@ -191,6 +232,9 @@ fn print_usage() {
     println!("  fuzz [--seed] [--target NAME] [--seconds N]   seed the loader corpora and run cargo-fuzz over them");
     println!("                     needs a nightly toolchain and `cargo install cargo-fuzz`; see fuzz/README.md");
     println!("  goldens [--check]  regenerate canonical SHA-256 renders, or verify them");
+    println!("  openmpt [--offline|--fetch-only]   build the pinned libopenmpt's openmpt123 into target/openmpt");
+    println!("  perceptual [--corpus PATH]... [--threshold-snr DB] [--offline]");
+    println!("                     score the float render against libopenmpt's; nightly report, never a gate");
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
     println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
     println!("  serve [--port N] [--host ADDR]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
@@ -365,10 +409,10 @@ fn acquire_conformance_corpus(root: &Path, corpus: &Path, supplied_archive: Opti
     }
     let cached_archive = downloads.join(format!("libxmp-{LIBXMP_CORPUS_REVISION}.tar.gz"));
     let archive = supplied_archive.unwrap_or(&cached_archive);
-    if supplied_archive.is_none() && !archive.is_file() && !download_corpus_archive(archive) {
+    if supplied_archive.is_none() && !archive.is_file() && !download_archive(LIBXMP_CORPUS_URL, archive, "conformance") {
         return false;
     }
-    if !verify_sha256(archive, LIBXMP_CORPUS_SHA256) {
+    if !verify_sha256(archive, LIBXMP_CORPUS_SHA256, "conformance") {
         if supplied_archive.is_none() {
             let _ = std::fs::remove_file(archive);
         }
@@ -424,47 +468,355 @@ fn acquire_conformance_corpus(root: &Path, corpus: &Path, supplied_archive: Opti
     true
 }
 
-fn download_corpus_archive(destination: &Path) -> bool {
-    let partial = destination.with_extension("tar.gz.partial");
+/// Download `url` into `destination` through a `.partial` file, so an interrupted transfer
+/// can never be mistaken for a cached archive. `label` names the subcommand in messages.
+fn download_archive(url: &str, destination: &Path, label: &str) -> bool {
+    let partial = partial_path(destination);
     let _ = std::fs::remove_file(&partial);
-    println!("     curl {LIBXMP_CORPUS_URL}");
+    println!("     curl {url}");
     let status = Command::new("curl")
         .args(["--fail", "--location", "--retry", "3", "--output"])
         .arg(&partial)
-        .arg(LIBXMP_CORPUS_URL)
+        .arg(url)
         .status();
     if !matches!(status, Ok(status) if status.success()) {
-        eprintln!("xtask conformance: failed to download the pinned libxmp archive");
+        eprintln!("xtask {label}: failed to download {url}");
         let _ = std::fs::remove_file(&partial);
         return false;
     }
     if let Err(error) = std::fs::rename(&partial, destination) {
-        eprintln!("xtask conformance: cannot cache `{}`: {error}", destination.display());
+        eprintln!("xtask {label}: cannot cache `{}`: {error}", destination.display());
         let _ = std::fs::remove_file(&partial);
         return false;
     }
     true
 }
 
-fn verify_sha256(path: &Path, expected: &str) -> bool {
+/// `path` with `.partial` appended, whatever extensions it already carries.
+fn partial_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
+fn verify_sha256(path: &Path, expected: &str, label: &str) -> bool {
     println!("     sha256sum {}", path.display());
     let output = Command::new("sha256sum").arg(path).output();
     let Ok(output) = output else {
-        eprintln!("xtask conformance: `sha256sum` is required to verify the corpus archive");
+        eprintln!("xtask {label}: `sha256sum` is required to verify a pinned archive");
         return false;
     };
     if !output.status.success() {
-        eprintln!("xtask conformance: sha256sum failed for `{}`", path.display());
+        eprintln!("xtask {label}: sha256sum failed for `{}`", path.display());
         return false;
     }
     let actual = String::from_utf8_lossy(&output.stdout).split_whitespace().next().unwrap_or("").to_string();
     if actual != expected {
-        eprintln!("xtask conformance: checksum mismatch for `{}`", path.display());
+        eprintln!("xtask {label}: checksum mismatch for `{}`", path.display());
         eprintln!("                   expected {expected}");
         eprintln!("                   actual   {actual}");
         return false;
     }
     true
+}
+
+// ── the perceptual oracle (M3-D7) ───────────────────────────────────────────────────
+
+/// `cargo xtask openmpt` — build the pinned libopenmpt's `openmpt123` into
+/// `target/openmpt/`.
+///
+/// libopenmpt is not a distribution package this repository may assume, there is no root
+/// on the development machine, and FFI bindings would need `unsafe` in a crate that
+/// forbids it. So the oracle is the command-line renderer from libopenmpt's own source
+/// tree, built from a checksum-pinned tarball into the ignored build directory — exactly
+/// how `cargo xtask conformance` pins and caches the libxmp corpus. Nothing about
+/// libopenmpt is committed.
+///
+/// `--fetch-only` prepares the source cache without compiling. `--offline` refuses to
+/// download; it still builds from an already-cached tarball, which is what the nightly
+/// workflow does after restoring its cache.
+fn run_openmpt(arguments: &[String]) -> bool {
+    let mut offline = false;
+    let mut fetch_only = false;
+    let mut index = 0usize;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--offline" => { offline = true; index += 1; }
+            "--fetch-only" => { fetch_only = true; index += 1; }
+            other => {
+                eprintln!("xtask openmpt: unexpected argument `{other}`");
+                return false;
+            }
+        }
+    }
+
+    let root = workspace_root();
+    if !ensure_openmpt(&root, offline, fetch_only) {
+        return false;
+    }
+    if fetch_only {
+        println!("xtask openmpt: source cache ready at {}", openmpt_source_directory(&root).display());
+        return true;
+    }
+    report_openmpt_version(&root)
+}
+
+/// `target/openmpt`, the whole cache: the downloaded tarball, the unpacked source, the
+/// built binary and the version marker.
+fn openmpt_directory(root: &Path) -> PathBuf { root.join("target/openmpt") }
+
+fn openmpt_source_directory(root: &Path) -> PathBuf { openmpt_directory(root).join("src") }
+
+/// The binary every caller of this oracle runs.
+fn openmpt123_path(root: &Path) -> PathBuf { openmpt_directory(root).join("bin/openmpt123") }
+
+/// The marker naming the version the cached binary was built from.
+fn openmpt_marker_path(root: &Path) -> PathBuf { openmpt_directory(root).join(".starplayer-version") }
+
+fn openmpt_is_built(root: &Path) -> bool {
+    let marker = std::fs::read_to_string(openmpt_marker_path(root));
+    matches!(marker, Ok(value) if value.trim() == LIBOPENMPT_VERSION) && openmpt123_path(root).is_file()
+}
+
+/// Acquire the pinned source if needed and build `openmpt123` from it, unless the cached
+/// build is already the pinned version.
+fn ensure_openmpt(root: &Path, offline: bool, fetch_only: bool) -> bool {
+    if !fetch_only && openmpt_is_built(root) {
+        println!("xtask openmpt: libopenmpt {LIBOPENMPT_VERSION} already built at {}", openmpt123_path(root).display());
+        return true;
+    }
+
+    let source = openmpt_source_directory(root);
+    if !source.join("Makefile").is_file() && !acquire_openmpt_source(root, &source, offline) {
+        return false;
+    }
+    if fetch_only {
+        return true;
+    }
+    build_openmpt(root, &source)
+}
+
+/// Download, verify and unpack the pinned tarball into `source`.
+fn acquire_openmpt_source(root: &Path, source: &Path, offline: bool) -> bool {
+    let downloads = openmpt_directory(root).join("downloads");
+    if let Err(error) = std::fs::create_dir_all(&downloads) {
+        eprintln!("xtask openmpt: cannot create `{}`: {error}", downloads.display());
+        return false;
+    }
+    let archive = downloads.join(format!("libopenmpt-{LIBOPENMPT_VERSION}.makefile.tar.gz"));
+    if !archive.is_file() {
+        if offline {
+            eprintln!("xtask openmpt: pinned libopenmpt {LIBOPENMPT_VERSION} is not cached at `{}`", archive.display());
+            eprintln!("               run `cargo xtask openmpt --fetch-only` during acquisition");
+            return false;
+        }
+        if !download_archive(LIBOPENMPT_URL, &archive, "openmpt") {
+            return false;
+        }
+    }
+    if !verify_sha256(&archive, LIBOPENMPT_SHA256, "openmpt") {
+        let _ = std::fs::remove_file(&archive);
+        return false;
+    }
+
+    let partial = openmpt_directory(root).join(".src.partial");
+    if partial.exists() && let Err(error) = std::fs::remove_dir_all(&partial) {
+        eprintln!("xtask openmpt: cannot clear partial extraction `{}`: {error}", partial.display());
+        return false;
+    }
+    if let Err(error) = std::fs::create_dir_all(&partial) {
+        eprintln!("xtask openmpt: cannot create `{}`: {error}", partial.display());
+        return false;
+    }
+    println!("     tar -xzf {}", archive.display());
+    let status = Command::new("tar")
+        .args(["-xzf"])
+        .arg(&archive)
+        .args(["-C"])
+        .arg(&partial)
+        .arg("--strip-components=1")
+        .status();
+    if !matches!(status, Ok(status) if status.success()) {
+        eprintln!("xtask openmpt: failed to extract `{}`", archive.display());
+        let _ = std::fs::remove_dir_all(&partial);
+        return false;
+    }
+    if source.exists() && let Err(error) = std::fs::remove_dir_all(source) {
+        eprintln!("xtask openmpt: cannot replace stale source `{}`: {error}", source.display());
+        let _ = std::fs::remove_dir_all(&partial);
+        return false;
+    }
+    if let Err(error) = std::fs::rename(&partial, source) {
+        eprintln!("xtask openmpt: cannot install source at `{}`: {error}", source.display());
+        let _ = std::fs::remove_dir_all(&partial);
+        return false;
+    }
+    true
+}
+
+/// `make -j` with every optional backend off, then install the binary and the marker.
+fn build_openmpt(root: &Path, source: &Path) -> bool {
+    let jobs = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1);
+    println!("     make -j{jobs} {} (in {})", LIBOPENMPT_MAKE_FLAGS.join(" "), source.display());
+    let status = Command::new("make")
+        .current_dir(source)
+        .arg(format!("-j{jobs}"))
+        .args(LIBOPENMPT_MAKE_FLAGS)
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("xtask openmpt: make exited with {status}");
+            return false;
+        }
+        Err(error) => {
+            eprintln!("xtask openmpt: `make` failed to start: {error}");
+            eprintln!("               a C++17 compiler and GNU make are all this needs; nothing else");
+            return false;
+        }
+    }
+
+    let built = source.join("bin/openmpt123");
+    let installed = openmpt123_path(root);
+    let Some(parent) = installed.parent() else {
+        eprintln!("xtask openmpt: the install path has no parent");
+        return false;
+    };
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        eprintln!("xtask openmpt: cannot create `{}`: {error}", parent.display());
+        return false;
+    }
+    if let Err(error) = std::fs::copy(&built, &installed) {
+        eprintln!("xtask openmpt: cannot install `{}`: {error}", built.display());
+        return false;
+    }
+    if let Err(error) = std::fs::write(openmpt_marker_path(root), format!("{LIBOPENMPT_VERSION}\n")) {
+        eprintln!("xtask openmpt: cannot write the version marker: {error}");
+        return false;
+    }
+    true
+}
+
+/// Print the banner line the built binary reports for itself, which is the record of what
+/// the scores were measured against.
+fn report_openmpt_version(root: &Path) -> bool {
+    let binary = openmpt123_path(root);
+    let output = Command::new(&binary).arg("--version").output();
+    let Ok(output) = output else {
+        eprintln!("xtask openmpt: cannot run `{}`", binary.display());
+        return false;
+    };
+    if !output.status.success() {
+        eprintln!("xtask openmpt: `{} --version` exited with {}", binary.display(), output.status);
+        return false;
+    }
+    let banner = String::from_utf8_lossy(&output.stdout);
+    println!("xtask openmpt: {}", banner.lines().next().unwrap_or("").trim());
+    true
+}
+
+/// `cargo xtask perceptual` — the T10 nightly comparison.
+///
+/// Builds the oracle if it is not cached, renders every fixture through both engines and
+/// prints the score table. `--threshold-snr` adds an advisory summary naming the fixtures
+/// below it. **The exit status never depends on a score**: T10 is a report with a
+/// tolerance, not a gate, so only a tooling failure fails this command.
+fn run_perceptual(arguments: &[String]) -> bool {
+    let mut offline = false;
+    let mut threshold_snr_db: Option<f64> = None;
+    let mut corpus: Vec<String> = Vec::new();
+    let mut index = 0usize;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--offline" => { offline = true; index += 1; }
+            "--corpus" => {
+                let Some(path) = arguments.get(index + 1) else {
+                    eprintln!("xtask perceptual: `--corpus` needs a path");
+                    return false;
+                };
+                corpus.push(path.clone());
+                index += 2;
+            }
+            "--threshold-snr" => {
+                let Some(value) = arguments.get(index + 1) else {
+                    eprintln!("xtask perceptual: `--threshold-snr` needs a value in dB");
+                    return false;
+                };
+                let Ok(threshold) = value.parse::<f64>() else {
+                    eprintln!("xtask perceptual: `--threshold-snr {value}` is not a number");
+                    return false;
+                };
+                threshold_snr_db = Some(threshold);
+                index += 2;
+            }
+            other => {
+                eprintln!("xtask perceptual: unexpected argument `{other}`");
+                return false;
+            }
+        }
+    }
+
+    let root = workspace_root();
+    if !ensure_openmpt(&root, offline, false) || !report_openmpt_version(&root) {
+        return false;
+    }
+
+    let output_directory = root.join("target/perceptual");
+    let mut command = Command::new(cargo_binary());
+    command
+        .current_dir(&root)
+        // Release, because the comparison renders every fixture twice and then runs a
+        // 4096-point FFT over both; a debug build turns half a minute into many. A
+        // dedicated target directory avoids waiting on the parent cargo's own lock.
+        .args(["run", "--release", "--quiet", "--target-dir", "target/xtask-perceptual", "-p", "starplayer-testkit", "--bin", "starplayer-perceptual", "--", "--openmpt"])
+        .arg(openmpt123_path(&root))
+        .arg("--output")
+        .arg(&output_directory);
+    for path in &corpus {
+        command.arg("--corpus").arg(path);
+    }
+    match command.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("xtask perceptual: the comparison driver exited with {status}");
+            return false;
+        }
+        Err(error) => {
+            eprintln!("xtask perceptual: the comparison driver failed to start: {error}");
+            return false;
+        }
+    }
+
+    if let Some(threshold) = threshold_snr_db {
+        summarise_perceptual_report(&output_directory.join("report.tsv"), threshold);
+    }
+    true
+}
+
+/// Name every fixture whose segmental SNR is below `threshold_snr_db`.
+///
+/// Advisory by construction: this prints and returns, and nothing about it reaches the
+/// exit status. A score is something a human reads.
+fn summarise_perceptual_report(report: &Path, threshold_snr_db: f64) {
+    let Ok(text) = std::fs::read_to_string(report) else {
+        eprintln!("xtask perceptual: cannot read `{}` for the threshold summary", report.display());
+        return;
+    };
+    let mut below: Vec<String> = Vec::new();
+    for line in text.lines().skip(1) {
+        let mut columns = line.split('\t');
+        let (Some(module), Some(_frames), Some(segmental_snr_db)) = (columns.next(), columns.next(), columns.next()) else { continue };
+        let Ok(segmental_snr_db) = segmental_snr_db.parse::<f64>() else { continue };
+        if segmental_snr_db < threshold_snr_db {
+            below.push(format!("{module} ({segmental_snr_db:.2} dB)"));
+        }
+    }
+    if below.is_empty() {
+        println!("xtask perceptual: every fixture is at or above {threshold_snr_db:.1} dB segmental SNR");
+    } else {
+        println!("xtask perceptual: below {threshold_snr_db:.1} dB segmental SNR: {}", below.join(", "));
+        println!("                  advisory only — T10 is a nightly report with a tolerance, not a gate");
+    }
 }
 
 /// `cargo xtask fuzz` — seed the loader corpora, then run `cargo fuzz` over them.

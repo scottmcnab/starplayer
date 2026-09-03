@@ -239,7 +239,15 @@ Ordered by value per unit of effort. Full detail in `02-roadmap.md`.
 6. **Cross-target hash equality** — x86-64, aarch64 and wasm32 must agree bit-for-bit
    on the fixed-point path.
 7. **Perceptual comparison vs libopenmpt** on the float path — spectral distance /
-   segmental SNR with a tolerance. Nightly, not a gate.
+   segmental SNR with a tolerance. Nightly, not a gate. `cargo xtask perceptual` builds
+   `openmpt123` from a checksum-pinned libopenmpt source tarball into `target/openmpt/`
+   (no root, no package, no FFI), renders every fixture through both engines at 44.1 kHz
+   stereo with linear interpolation, normalises both to equal RMS, and reports a segmental
+   SNR and a log-spectral distance per fixture. Nothing about libopenmpt is committed.
+   The scores are a **trend**, not a threshold: the two engines' tick lengths differ by
+   design — §2's `tempo_model` row — so a sample-domain SNR drifts on any module whose BPM
+   does not give a whole number of frames per tick, while the spectral distance does not.
+   A score never fails a build.
 
 A **contingency**: if a specific effect's behaviour cannot be settled from the assembly,
 `plans/engine/M2-task-C8-dos-reference-harness.md` describes reconstructing a buildable
