@@ -234,10 +234,21 @@ dependencies = [
  "arbitrary",
  "libfuzzer-sys",
  "starplayer-core",
+ "starplayer-it",
  "starplayer-mod",
  "starplayer-model",
  "starplayer-mtm",
  "starplayer-s3m",
+]
+
+[[package]]
+name = "starplayer-it"
+version = "0.1.0"
+dependencies = [
+ "starplayer-core",
+ "starplayer-engine",
+ "starplayer-model",
+ "starplayer-rt",
 ]
 
 [[package]]

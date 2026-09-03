@@ -6,12 +6,13 @@ and none should be.
 
 `cargo xtask fuzz --seed` copies these into the git-ignored working corpus, together with
 the owner's S3Ms from `crates/starplayer-s3m/tests/fixtures/` and — when the conformance
-cache is present — the MOD, S3M and MTM files of the pinned libxmp corpus. That last set
+cache is present — the MOD, S3M, MTM and IT files of the pinned libxmp corpus. That last set
 is **not ours to commit**, which is why seeding happens at run time out of the cache the
 conformance job already maintains rather than by checking bytes in here.
 
 `crates/starplayer-offline/tests/fuzz_seeds.rs` asserts on every commit that each file
-below still loads as its own format, so a seed cannot rot into a file that only tests the
+below still loads as its own format, and `crates/starplayer-it/tests/seeds.rs` additionally
+asserts that each IT seed still loads as the *shape* it was synthesised to be, so a seed cannot rot into a file that only tests the
 rejection path.
 
 ## `mod/`
@@ -53,3 +54,19 @@ live in `crates/starplayer-s3m/tests/fixtures/` and the seeder copies them from 
 | `no-samples.mtm` | a module with no sample headers at all |
 | `dmp-tempo-split.mtm` | both `Fxx` halves in one row, which selects the Dual Module Player tempo model over MultiTracker's (C4) |
 | `thirty-two-channels.mtm` | the widest channel count the format allows |
+
+## `it/`
+
+Every file is synthesised by task G1; there is no third-party or owner-written IT in the
+tree. `crates/starplayer-it/tests/seeds.rs` pins what each one is for.
+
+| File | What it pins |
+|---|---|
+| `minimal.it` | sample mode: two channels, one 8-bit sample, one packed pattern, an order list ending in `0xFF` |
+| `instrument-mode.it` | instrument mode with all three envelopes (loop, sustain, carry, the pitch envelope's filter bit), a note-fade NNA, a duplicate check, a filter and linear slides |
+| `compressed-8bit.it` | an IT 2.14 compressed 8-bit sample: the block header, the bit-width state machine and the single integrator |
+| `compressed-16bit.it` | an IT 2.15 compressed 16-bit sample — `Cvt` bit 2 with the compressed flag, which selects the double integrator |
+| `sustain-ping-pong.it` | a ping-pong sustain loop over a ping-pong ordinary loop, which is the one sample shape the builder stores whole |
+| `midi-macros.it` | `Special` bit 3 and the 4896-byte embedded MIDI configuration that `Zxx` and `SFx` read |
+| `maximum-counts.it` | 64 channels, 200-row patterns and a long order list with `+++` markers — the widest and longest shape the loader accepts |
+| `old-instruments.it` | the pre-2.00 instrument layout (`Cmwt < 0x200`): one volume envelope, `(tick, value)` nodes with an `0xFF` terminator, and the half-scale fadeout |

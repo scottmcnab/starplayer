@@ -186,3 +186,130 @@ Report the exact commands run and their results, plus the corpus table. **Do not
 
 NNA, envelopes, the filter, any playback (G2, G3, G4). Facade arms and the conformance
 harness (G5). `TempoModel::ItModern` (G4).
+
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question. Corpus figures are from the pinned libxmp `test-dev` tree
+(`6ec0ba21b1b28f91e22b68a51d59207c6bbf6139`): 85 files under `data/`, 3 under `data/m/`,
+119 under `openmpt/it/` and 25 under `data/f/`.
+
+### 1. Old-format instruments (`Cmwt < 0x200`) — **supported, and the corpus needs it**
+
+Supported, in `instrument::ItInstrument::parse_old`, at 46 lines of body. The conversion is
+small because ITTECH.TXT's 200-byte `volenv[200]` table at `0x130` **is not read**: it is a
+pre-interpolated copy of the envelope whose 25 `(tick, value)` node pairs sit right behind
+it at `0x1F8`, and OpenMPT's `ITOldInstrument::ConvertToMPT` ignores it for exactly that
+reason. So the whole difference from the IT 2.xx layout is: one envelope instead of three;
+its flag byte, loop points and sustain points come from the *instrument* header (`0x11`
+through `0x15`) rather than from an envelope structure; its nodes are two-byte
+`(tick, value)` pairs terminated by a tick of `0xFF` rather than three-byte
+`(value, tick)` triples with a count; `NNA` and the duplicate-check flag sit at `0x1A`/`0x1B`
+rather than `0x11`/`0x12`; and there is no panning envelope, pitch envelope, filter,
+pitch/pan separation, instrument global volume, random variation or duplicate-check
+*action*. Those absent fields take the values `ITOldInstrument::ConvertToMPT` gives them —
+full global volume, no instrument pan, `Cut` on a duplicate.
+
+The one thing that is *not* a straight copy is the fadeout. ITTECH.TXT gives the old
+format a 0..64 fadeout against a count of 512 and the new one a 0..128 fadeout against a
+count of 1024, so the same raw value fades twice as fast in the old layout; OpenMPT spells
+the same ratio as `fadeout << 6` against `fadeout << 5`. The model stores one fadeout in
+"the source format's own units", so the loader multiplies an old fadeout by 2 and G3 has a
+single scale to interpret. `instrument::OLD_FADEOUT_SCALE` is that constant.
+
+**The corpus has seven files with `Cmwt < 0x200`**: `data/pattern_loop_it100.it`,
+`pattern_loop_it100_breakjump.it`, `pattern_loop_it104.it`, `pattern_loop_it200_breakjump.it`,
+`pattern_loop_it210.it`, `data/m/Fight2.it` and `data/f/play_it_reverse_past_end.it`. Six of
+those declare no instruments at all (they are sample-mode pattern-flow fixtures), but
+**`data/m/Fight2.it` is instrument mode with ten old-layout instruments**, so returning
+`Unsupported` would have cost a real module. `fuzz/seeds/it/old-instruments.it` is the
+synthesised seed and `crates/starplayer-it/tests/seeds.rs` pins the conversion.
+
+### 2. IT 2.15 delta compression — **confirmed: `Cvt` bit 2 *with* the compressed flag**
+
+Confirmed from `ITSample::GetSampleFormat`, which reads
+`sampleIO |= (cvt & ITSample::cvtDelta) ? SampleIO::IT215 : SampleIO::IT214` **inside** the
+`flags & sampleCompressed` arm. So `Cvt` bit 2 means two different things depending on the
+compressed flag: with it, the double-integrator variant; without it, ordinary delta-coded
+PCM. `sample::decode_frames` handles the second and `compression::decompress`'s `is_215`
+argument the first, and `sample.rs`'s `CONVERT_DELTA` documents the split.
+
+The difference in the decoder is one line — `ITDecompression::Write` stores `mem2` rather
+than `mem1`, where `mem2 += mem1` on every sample — but it is the whole waveform, so it is
+tested three ways: `compression::tests::the_it_215_variant_integrates_twice` drives the same
+residuals through both variants and asserts the two running sums (`1, 2, 0` against
+`1, 3, 3`); `fuzz/seeds/it/compressed-16bit.it` is a synthesised 16-bit IT 2.15 sample; and
+`crates/starplayer-it/tests/seeds.rs` asserts it decodes to its declared 64 frames of
+non-silence. The corpus has only two IT 2.15 samples and both are in `data/f/`
+(`load_it_invalid_compressed.it`, `play_it_extreme_filter.it`), which is why the synthesised
+seed matters.
+
+One further detail worth recording, because it is not in ITTECH.TXT at all: the compressed
+stream's **block size is in bytes, not samples**. `ITCompression::blockSize` is `0x8000` and
+`Uncompress` takes `blockSize / sizeof(sample_t)`, so a block holds up to 0x8000 samples of
+8-bit data and 0x4000 of 16-bit, and the two integrators reset at every block boundary.
+
+### 3. Used channel count — **OpenMPT's rule, and this is accuracy-policy entry D61**
+
+OpenMPT (`Load_it.cpp`'s pre-scan) counts a channel as used only when an event's mask
+**low nybble** is non-zero — that is, when the stream really writes a note, an instrument,
+a volume or a command there — and it does *not* mask the channel byte to six bits.
+libxmp (`it_load.c`'s `max_ch` scan) counts any channel an event names, whether or not the
+event writes anything, and masks the channel with `& 63`.
+
+Picked: **OpenMPT's**, clamped to the format's 64 columns and floored at 1, in
+`pattern::used_channels`. Two consequences, both recorded as **D61** in
+`plans/product/03-accuracy-policy.md`:
+
+* a pattern that names a channel with an all-memory mask (low nybble zero) does not widen
+  the song, where libxmp's rule would;
+* a channel byte above 64 is parsed against its own memories and then discarded, where
+  libxmp wraps it into `0..63`. This can only arise in a file no Impulse Tracker wrote,
+  since IT's own unpacker masks; the per-channel memory arrays are sized for OpenMPT's full
+  `0..126` range so such an event cannot alias channel 0's memory on its way past.
+
+A channel the header **disables** (`ChnPan` bit 7) still counts, because ITTECH.TXT is
+explicit that "effects in muted channels are still processed"; the disabled and surround
+flags are carried verbatim in `format_data` so G4 can mute the notes without the trace and
+telemetry channel counts changing under it.
+
+Loading is a two-pass walk because of this: `loader::scan_patterns` counts without
+allocating, and only then does `pattern::unpack` run at the fixed stride the scan produced.
+That is also what makes the decoded-pattern budget exact before a byte of it is allocated.
+
+### 4. `Cwt/v` beyond IT and the trailing extension chunks — **ignored, and nothing needs them**
+
+Ignored. The loader stops at the last thing the offset tables point at and never looks for
+`STPM`, `XTPM`, `PNAM`, `CNAM` or a plugin chunk, all of which OpenMPT writes *after* the
+pattern data and reads only for editor state (pattern names, channel names, plugin
+assignments, extended instrument/song properties).
+
+Confirmed against the corpus by scanning for the two chunk tags: they are present in 40
+files — 27 `STPM` and 9 `XTPM` under `data/`, one of each under `openmpt/it/`, and 12
+`STPM` / 3 `XTPM` under `data/f/` — and **every one of the 207 files in the three required
+directories loads `Ok` without them**. Nothing in a chunk is needed to *load* a file; what
+lives there that playback would eventually want (OpenMPT's extended song properties, its
+per-channel settings above 64 channels) belongs to a later task, not to G1.
+
+The `Cwt/v` values themselves are read, for the dialect: the pinned corpus's 207 loadable
+files come out as 118 `ImpulseTracker`, 39 `SchismTracker`, 27 `OpenMptIt` and 23
+`ModPlugIt`, and `data/format_it_schism.it` reports `SchismTracker` as the deliverable asks.
+
+### 5. Pattern rows above 200 — **256 accepted, anything else becomes an empty 64-row pattern**
+
+Confirmed and implemented as `pattern::MAX_ROWS = 256`. ITTECH.TXT says 32..200; libxmp's
+own comment records the three real limits — "Impulse Tracker and Schism Tracker allow up to
+200 rows, ModPlug Tracker 1.16 allows 256 rows, OpenMPT allows 1024 rows" — and its
+`num_rows > 1024` guard is for `.mptm`, not `.it`.
+
+**Clamping is the wrong word for what happens**, which is worth recording because the task
+file says "clamp": a pattern whose row count is outside `1..=256` is *skipped* and becomes an
+empty 64-row pattern, exactly as OpenMPT (`numRows < 1 || numRows > MAX_PATTERN_ROWS →
+continue`) and libxmp (`pp_pat[i] = 0`) both do. Truncating a 1024-row pattern to 256 would
+silently reinterpret its packed stream, since the row terminators past row 255 would be read
+as channel bytes; dropping it keeps the pattern numbering and plays silence.
+
+The corpus needs the 256 acceptance: `data/bidi_sync.it` and `data/m/another life.it` each
+contain a 256-row pattern, and both are in the must-load set. At the other end
+`data/f/load_it_dca_3.it` declares row counts of 65281, 43028, 36607, 35721, 19467 and 6230,
+which is exactly the population the skip is for.

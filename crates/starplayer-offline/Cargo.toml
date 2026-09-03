@@ -24,6 +24,13 @@ trace = ["starplayer/trace"]
 # once without it and once with it.
 telemetry = ["starplayer/telemetry"]
 
+# `tests/fuzz_seeds.rs` replays the IT seeds and regressions, and the facade has no IT arm
+# yet — that is task G5. Naming the loader crate directly here keeps the replay on every
+# commit without waiting for the facade, and it is a dev-dependency so nothing a host links
+# changes.
+[dev-dependencies]
+starplayer-it = { workspace = true }
+
 [[bin]]
 name = "starplayer-trace"
 required-features = ["trace"]

@@ -173,6 +173,26 @@ pub fn walk_s3m_cells(module: &Module) {
     }
 }
 
+/// Walk every IT cell of every pattern through the format's own view.
+///
+/// IT patterns do not all have the same number of rows, unlike the other three formats',
+/// so the row bound comes from each pattern's own index rather than from a constant.
+pub fn walk_it_cells(module: &Module) {
+    for index in 0..module.patterns().len() {
+        let id = starplayer_model::PatternId(index as u16);
+        let Some(view) = starplayer_it::PatternView::new(module, id) else { continue };
+        for row in 0..view.rows() {
+            for channel in 0..view.channels() {
+                if let Some(cell) = view.cell(row, channel) {
+                    let _ = cell.display();
+                    let _ = cell.tracker_notation();
+                    let _ = cell.volume_command().name();
+                }
+            }
+        }
+    }
+}
+
 // ── the structured mutation program (M2-C7 deliverable 3) ───────────────────────────
 
 /// One byte written over a base module.
