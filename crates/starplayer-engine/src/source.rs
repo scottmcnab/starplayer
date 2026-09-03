@@ -134,7 +134,7 @@ impl<'engine> EngineContext<'engine> {
 }
 
 /// Something that produces events at absolute frames.
-pub trait EventSource {
+pub trait EventSource: Send {
     /// Absolute frame of the next event, or `None` if idle.
     ///
     /// Must never return a frame earlier than the engine clock. The engine tolerates one
@@ -323,6 +323,23 @@ impl SourceMux {
         Err(source)
     }
 
+    /// Take the lowest-slot source back out without dropping it, for a caller that does
+    /// not hold its [`SourceSlot`].
+    ///
+    /// The half of [`SourceMux::remove`] that [`Engine::replace_source`](crate::Engine::replace_source)
+    /// needs: a host swapping sources **inside** the audio callback has no handle to quote
+    /// and may not drop what it replaces.
+    pub fn take_first(&mut self) -> Option<Box<dyn EventSource>> {
+        for slot in self.slots.iter_mut() {
+            let source = slot.source.take();
+            if source.is_some() {
+                slot.generation = slot.generation.wrapping_add(1);
+                return source;
+            }
+        }
+        None
+    }
+
     /// Take a source back out. Returns `None` for a handle whose slot has been reused.
     pub fn remove(&mut self, slot: SourceSlot) -> Option<Box<dyn EventSource>> {
         let entry = self.slots.get_mut(slot.index as usize)?;
@@ -383,25 +400,54 @@ impl core::fmt::Debug for SourceMux {
 mod tests {
     use super::*;
     use crate::control::ControlClock;
-    use alloc::rc::Rc;
     use alloc::vec;
-    use core::cell::RefCell;
+    use starplayer_rt::Arc;
+    use starplayer_rt::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     /// Records the order in which sources were dispatched, so the tie-break can be
-    /// observed rather than inferred. `Rc` rather than a borrow because
-    /// `Box<dyn EventSource>` is `'static`.
-    type DispatchLog = Rc<RefCell<Vec<u8>>>;
+    /// observed rather than inferred.
+    ///
+    /// Atomics rather than an `Rc<RefCell<..>>`: [`EventSource`] is `Send`, so a shared log
+    /// has to be one the engine could genuinely have carried to an audio thread. A fixed
+    /// array, because a test double that allocated while being dispatched would be the one
+    /// thing `render()` is not allowed to do.
+    struct DispatchLog {
+        marks: [AtomicU8; DispatchLog::CAPACITY],
+        written: AtomicUsize,
+    }
+
+    impl DispatchLog {
+        const CAPACITY: usize = 64;
+
+        fn new() -> Arc<DispatchLog> {
+            Arc::new(DispatchLog { marks: [const { AtomicU8::new(0) }; DispatchLog::CAPACITY], written: AtomicUsize::new(0) })
+        }
+
+        fn push(&self, mark: u8) {
+            let index = self.written.fetch_add(1, Ordering::Relaxed);
+            if let Some(slot) = self.marks.get(index) {
+                slot.store(mark, Ordering::Relaxed);
+            }
+        }
+
+        fn marks(&self) -> Vec<u8> {
+            let written = self.written.load(Ordering::Relaxed).min(DispatchLog::CAPACITY);
+            self.marks.iter().take(written).map(|slot| slot.load(Ordering::Relaxed)).collect()
+        }
+
+        fn clear(&self) { self.written.store(0, Ordering::Relaxed); }
+    }
 
     struct MarkingSource {
         frames: Vec<Frame>,
         next: usize,
         mark: u8,
-        log: DispatchLog,
+        log: Arc<DispatchLog>,
     }
 
     impl MarkingSource {
-        fn boxed(mark: u8, frames: Vec<Frame>, log: &DispatchLog) -> Box<dyn EventSource> {
-            Box::new(MarkingSource { frames, next: 0, mark, log: Rc::clone(log) })
+        fn boxed(mark: u8, frames: Vec<Frame>, log: &Arc<DispatchLog>) -> Box<dyn EventSource> {
+            Box::new(MarkingSource { frames, next: 0, mark, log: Arc::clone(log) })
         }
     }
 
@@ -410,7 +456,7 @@ mod tests {
         fn advance_to(&mut self, _frame: Frame) {}
         fn dispatch(&mut self, frame: Frame, _context: &mut EngineContext<'_>) {
             while self.frames.get(self.next).is_some_and(|due| *due <= frame) {
-                self.log.borrow_mut().push(self.mark);
+                self.log.push(self.mark);
                 self.next = self.next.saturating_add(1);
             }
         }
@@ -434,7 +480,7 @@ mod tests {
 
     #[test]
     fn the_next_frame_is_the_earliest_across_every_source() {
-        let log: DispatchLog = Rc::new(RefCell::new(Vec::new()));
+        let log = DispatchLog::new();
         let mut mux = SourceMux::new(4);
         assert!(mux.is_empty());
         assert_eq!(mux.next_event_frame(), None, "an empty mux is idle");
@@ -447,13 +493,13 @@ mod tests {
 
     #[test]
     fn sources_at_the_same_frame_dispatch_in_slot_order_not_insertion_order() {
-        let log: DispatchLog = Rc::new(RefCell::new(Vec::new()));
+        let log = DispatchLog::new();
         let mut mux = SourceMux::new(4);
         let first = mux.insert(MarkingSource::boxed(b'0', vec![Frame(10)], &log)).ok();
         assert!(mux.insert(MarkingSource::boxed(b'1', vec![Frame(10), Frame(20)], &log)).is_ok());
 
         drive(&mut mux, Frame(10));
-        assert_eq!(*log.borrow(), vec![b'0', b'1'], "ascending slot index");
+        assert_eq!(log.marks(), vec![b'0', b'1'], "ascending slot index");
 
         let slot = first.expect("slot 0");
         assert!(mux.contains(slot));
@@ -461,15 +507,15 @@ mod tests {
         assert!(!mux.contains(slot), "the handle went stale with the slot's generation");
         assert!(mux.remove(slot).is_none(), "removing twice is a no-op, not a corruption");
 
-        log.borrow_mut().clear();
+        log.clear();
         assert!(mux.insert(MarkingSource::boxed(b'2', vec![Frame(20)], &log)).is_ok());
         drive(&mut mux, Frame(100));
-        assert_eq!(*log.borrow(), vec![b'2', b'1'], "the replacement took slot 0 and therefore dispatches first");
+        assert_eq!(log.marks(), vec![b'2', b'1'], "the replacement took slot 0 and therefore dispatches first");
     }
 
     #[test]
     fn a_full_mux_hands_the_source_back() {
-        let log: DispatchLog = Rc::new(RefCell::new(Vec::new()));
+        let log = DispatchLog::new();
         let mut mux = SourceMux::new(1);
         assert!(mux.insert(MarkingSource::boxed(b'a', Vec::new(), &log)).is_ok());
         assert!(mux.insert(MarkingSource::boxed(b'b', Vec::new(), &log)).is_err());

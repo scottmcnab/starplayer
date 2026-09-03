@@ -156,3 +156,165 @@ on this machine. **Do not commit** — the reviewer commits.
 
 The wasm retrofit behind `AudioBackend` (follow-up task). The CLI (D5). Windows and macOS
 testing (A2). MIDI input (M4-full).
+
+## Research resolution
+
+### 1. What is host-neutral in the wasm host? — **five things moved, two stayed, and one had to move**
+
+Read end to end, the browser host divided cleanly.
+
+**Moved to `starplayer-host`:**
+
+| what | where it lives now | why it is not browser-specific |
+|---|---|---|
+| `SeekKind`, `SeekRequest` | `starplayer_host::source` | a seek is a seek |
+| the seek mailbox (`Rc<Cell<SeekRequest>>` → `SeekMailbox`) | `starplayer_host::SeekMailbox` | latest-wins single-slot delivery is the answer to a question every host asks |
+| the repeat cell (`Rc<Cell<AtEnd>>` → `AtEndSlot`) | `starplayer_host::AtEndSlot` | same |
+| `SeekableModuleSource` | `starplayer_host::SeekableModuleSource` | it exists because `Engine` stores `dyn EventSource` and so cannot downcast to seek — a property of the engine, not of the browser |
+| `dither_for`, `quantize_float_sample`, `quantize_fixed_sample`, `DITHER_SEED` | `starplayer_host::depth` | pure arithmetic over `HostSample`; the two copies were identical |
+| `scan_for` / `source_for` | `starplayer_host::{scan_module, build_source}` | the recipe in the facade's crate docs, with `Rc` swapped for `Arc` |
+
+**Stayed in the browser host:** `WebEngine` and `pending_engine_stop`/`fading`/`fade_elapsed`
+— i.e. the engine-arm enum and the transport. Both live *inside* `process()`, and lifting
+them is a rewrite of that function rather than a re-import; `starplayer-host` has its own
+`HostEngine` and `Transport`, which are the same shapes generalised. Deleting the browser
+copies is the deferred `AudioBackend` retrofit, not this task.
+
+**One of them had to move rather than merely deserved to.** `EventSource` is now `Send`
+(see below), so `SeekableModuleSource` could not keep holding `Rc<Cell<..>>`: the browser
+host stopped compiling the moment the bound landed. That is why the wasm-host diff is not
+zero. It is confined to deleting the five moved items, importing them, and renaming three
+call sites (`request.get()` → `.peek()`, `request.set(..)` → `.request(..)`,
+`request.set(default())` → `.clear()`); `AtEndSlot` kept `get`/`set` so those sites are
+untouched. Nothing about the worklet's structure changed — the handles are still built per
+module there, which a single-threaded realm can afford.
+
+**Engine edits, and which survived.** Three were in the working tree; all three are kept,
+and each is load-bearing:
+
+* **`EventSource: Send`** (`source.rs`) — the reason the task exists. A native host builds
+  the sequencer on the control thread and the engine that holds it renders on cpal's audio
+  thread, so the whole `Engine` — and therefore every source in it — must be `Send`. It is
+  spelled as a supertrait rather than on `Engine` so the failure is reported at the source
+  that is not `Send`. `PatternSequencer`'s impl grew `Tempo/Processor/Data: Send` bounds and
+  `scan_timeline` repeats them because it drives a sequencer through the same trait; every
+  tempo model, processor and pattern decoder in the repository is plain data over an
+  `Arc<Module>`, so the bound costs nothing. The `rt-safety` job confirms the render path is
+  unchanged.
+* **`SourceMux::take_first`** and **`Engine::replace_source`** — `Engine::set_source` *drops*
+  what it replaces. That is a `free()`, which is fine in a worklet message task and
+  forbidden in an audio callback (architecture §8). A native host has no choice about where
+  it swaps: once the stream is open, the callback is the only place a `&mut Engine` exists.
+  `replace_source` therefore hands the retired source back, and `Player` sends it down the
+  same retirement ring a retired `Arc<Module>` already travels on, to be dropped on the
+  control thread. `take_first` is the mux half of that — `remove` needs a `SourceSlot`
+  handle, which the callback does not hold.
+
+The one further edit was to two engine **tests** whose `Rc<RefCell<Vec<_>>>` dispatch logs
+are no longer `Send`. They are now fixed-size atomic logs — deliberately not a `Mutex`,
+because a test double that took a lock inside `dispatch` would model the one thing
+`render()` may never do.
+
+### 2. cpal version and Linux backends — **0.18.2, `default-features = false, features = ["pulseaudio"]`; ALSA headers needed; WSLg has a PulseAudio sink and no ALSA card**
+
+`cpal 0.18.2` is the newest stable (`cargo search cpal`), pinned once in
+`[workspace.dependencies]`. On Linux cpal **always** builds its ALSA host — it is not
+behind a feature — so the build needs the ALSA *headers* and `alsa.pc` regardless of which
+host is used at run time. The normal route is `sudo apt install libasound2-dev` (or
+`alsa-lib-devel`), and that is what CI takes.
+
+The `pulseaudio` feature adds cpal's second Linux host. It costs no system dependency —
+the `pulseaudio` crate speaks the protocol itself rather than binding `libpulse` — and it
+is the only host that finds a real device on a machine with no sound card, which is every
+container and every WSL2 box. Its sibling `pipewire` feature is left off: it binds
+`libpipewire`, which *is* a system dependency, and a PipeWire server answers on the
+PulseAudio socket anyway. cpal 0.18's own default feature set is empty, so
+`default-features = false` only says so out loud. On Linux `cpal::default_host()` therefore
+resolves to PulseAudio when a server is reachable and ALSA otherwise.
+
+**This machine (WSL2 + WSLg), measured.** `$PULSE_SERVER` is `unix:/mnt/wslg/PulseServer`
+and it is reachable. `cargo run -p starplayer-host-cpal --example play -- --list-devices`
+prints:
+
+```
+* [PulseAudio] RDP Sink
+    rates: 8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000
+  [ALSA] Discard all samples (playback) or generate zero samples (capture)
+    rates: 8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000
+```
+
+So: a real device exists, `cpal::default_host()` picks PulseAudio, and the acceptance run
+is the real one — `play` renders `NICETUNE.S3M` to its end and exits 0. ALSA alone would
+have found only `null`, which is exactly why `pulseaudio` is compiled in.
+
+**Building without root.** The headers are not installed here and there is no root, so
+`alsa-lib` 1.2.11 was built from its release tarball (it ships `configure`; no autoconf
+needed) into `target/alsa-lib`, and cargo is pointed at it with
+
+```sh
+PKG_CONFIG_PATH="$PWD/target/alsa-lib/lib/pkgconfig" cargo test -p starplayer-host-cpal
+```
+
+`PKG_CONFIG_PATH` is *prepended* to pkg-config's own path, so exporting it is harmless on a
+machine that has the system package. It is deliberately **not** committed to
+`.cargo/config.toml` or any other file: it names a build output that exists only where
+somebody built it. The crate docs carry both routes.
+
+**A finding worth recording: the WSLg sink's default block is 96 000 frames — two seconds.**
+Asking for no particular buffer size gets that, and with it two seconds of latency on every
+stop, seek and telemetry reading. The rendered audio is identical either way (design goal 3
+holds, and the tests prove it at 1, 3, 64, 128, 4096 and 8191), but the *latency* is not, so
+`examples/play.rs` asks for 1024 frames by default and `--buffer 0` restores the device's
+own. This is also why `RenderState::render` publishes telemetry once per **callback** rather
+than once per quantum: a per-quantum publish was tried and is strictly worse, because the
+snapshot ring keeps the oldest three when it fills, so a callback publishing a hundred
+snapshots leaves the reader holding the one from the *start* of the block. The reasoning is
+recorded on `RenderState::render` so it is not re-tried.
+
+### 3. Block-size independence on a real device — **proved at 1, 3, 64, 128, 4096 and 8191, on both paths and across the end of the song**
+
+`crates/starplayer-host/tests/player.rs` drives the callback directly through
+`ManualBackend`, so no device is involved:
+
+* `the_same_song_renders_byte_identically_at_every_block_size` — float path, 44.1 kHz,
+  25 600 frames, compared bit-for-bit (`f32::to_bits`) against the 128-frame render;
+* `the_fixed_path_is_block_size_independent_too` — the same on the canonical fixed path,
+  where one differing bit is a real difference rather than a rounding one;
+* `a_song_played_past_its_end_still_renders_identically_at_every_block_size` — the case the
+  quantum alignment in `RenderState::render` exists for: the end-of-song decision has to
+  land on the same frame at every block size, or a stop starts up to a whole block late.
+
+The mechanism is that the callback walks the block aligned to **frames emitted**, not to the
+block, so the control plane is drained and the end of the song armed on a multiple of
+`RENDER_QUANTUM` whatever length the device asked for — the cadence the browser worklet gets
+for free by always being called with 128 frames.
+
+Allocation is proved separately, in `crates/starplayer-host/tests/callback_allocation.rs`,
+with the allocator-hook pattern from `starplayer-offline`: the callback allocates nothing on
+any of the eight engine arms at any of the five depths, and swapping a module inside the
+callback allocates nothing **and drops nothing** there.
+
+### 4. Sample rate and the timeline — **`Player::open` negotiates first and scans at the answer; `Player::reopen` rebuilds and rescans**
+
+`AudioBackend::negotiate` is a separate call from `open` precisely because its answer
+decides two things that cannot be corrected afterwards: the rate the engine's voice pool and
+control clock are built for, and the rate every module is scanned at (architecture §4.1).
+`Player::open` negotiates, builds the engine at the negotiated rate, opens the stream, and
+then refuses the stream if the backend opened something other than what it agreed to.
+`Player::load` scans at `self.spec.sample_rate_hz`, which is the negotiated rate and never
+the requested one.
+
+`Player::reopen` closes the stream, builds a new player at the new rate and **re-scans** the
+loaded module rather than carrying the timeline over: a song timeline is measured in frames
+at one output rate, and installing a 44.1 kHz timeline in a 48 kHz sequencer leaves the
+progress slider, the loop point and the audio disagreeing about where the song is. Master
+volume and the repeat setting are restored; per-channel mutes are not, because the caller
+owns those.
+
+Two tests: `the_song_is_scanned_at_the_rate_the_device_agreed_to_not_the_rate_that_was_asked_for`
+(ask for a rate the backend does not have, and check the scanned length is the negotiated
+rate's) and `reopening_at_another_rate_rebuilds_the_engine_and_rescans_the_module`.
+
+The one place a scan is *reused* is a mixer-mode rebuild, which changes nothing the scan
+depends on — the timeline is a function of the output rate and the module's dialect and of
+nothing the mixer chooses — so `build_source` takes an optional cached scan.

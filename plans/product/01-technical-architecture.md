@@ -1077,8 +1077,11 @@ crates/
   starplayer-telemetry  snapshot types shared by every UI             → core, rt
   starplayer            facade: re-exports + format autodetect. THE public crate.
   # ── std ─────────────────────────────────────────────────────────────────────
-  starplayer-host-cpal  native audio output                       → starplayer, cpal
-  starplayer-host-wasm  AudioWorklet glue                → starplayer, wasm-bindgen
+  starplayer-host       AudioBackend trait, AudioSpec/DeviceInfo/Stream, the
+                        backend-neutral Player: engine + transport + seek
+                        mailbox + output depth.                   → starplayer
+  starplayer-host-cpal  native audio output          → starplayer, starplayer-host, cpal
+  starplayer-host-wasm  AudioWorklet glue  → starplayer, starplayer-host, wasm-bindgen
   starplayer-archive    zip (later: lha/rar?) container support   → model, zip
   starplayer-offline    WAV writer, deterministic render, trace dump
   starplayer-testkit    golden compare, libxmp/openmpt diff harness, trace differ
@@ -1108,6 +1111,13 @@ resolves the name.
 semantics and effect semantics are inseparable — one crate, one feature flag, one
 dependency edge. This is the concrete lesson from the original: it converted MOD and MTM
 to S3M *before* the player saw them, and that is why its MOD playback was inaccurate.
+
+`starplayer-host` is the one crate a *host* may depend on besides the facade, and it is
+still a host: it holds what is true of every backend — what a device is, what a stream is,
+and the `Player` that turns a file into sound through one — so that adding a backend is
+"implement `AudioBackend`" rather than "reimplement the transport" (task D4). The wasm host
+shares its seek mailbox, repeat slot and output-depth post-stage today; putting it fully
+behind `AudioBackend` is a deferred follow-up.
 
 Dependency edges are strictly one-directional. Apps depend only on the facade.
 Extracting `starplayer` for crates.io later is a manifest change, not a refactor.

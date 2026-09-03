@@ -418,11 +418,14 @@ impl Default for ScanLimits {
 ///
 /// Off the audio thread: it allocates a throwaway voice pool and channel table, and the
 /// timeline's vectors.
+/// The three `Send` bounds are not the scan's own requirement — it never leaves this
+/// thread — but [`EventSource`](crate::EventSource) is `Send`, and the scan drives the
+/// sequencer through that trait.
 pub fn scan_timeline<Tempo, Processor, Data>(sequencer: &mut PatternSequencer<Tempo, Processor, Data>, limits: ScanLimits) -> SongTimeline
 where
-    Tempo: TempoModel,
-    Processor: TrackerProcessor,
-    Data: PatternData,
+    Tempo: TempoModel + Send,
+    Processor: TrackerProcessor + Send,
+    Data: PatternData + Send,
 {
     let sample_rate_hz = sequencer.sample_rate_hz();
     let channel_count = (sequencer.data().channel_count() as usize).max(1);

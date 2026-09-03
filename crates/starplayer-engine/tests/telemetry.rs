@@ -53,7 +53,7 @@ impl Harness {
         }
     }
 
-    fn tick<Processor: TrackerProcessor>(&mut self, sequencer: &mut TestSequencer<Processor>) -> Option<Frame> {
+    fn tick<Processor: TrackerProcessor + Send>(&mut self, sequencer: &mut TestSequencer<Processor>) -> Option<Frame> {
         let frame = sequencer.next_event_frame()?;
         let mut context = EngineContext::new(frame, &mut self.voices, &mut self.channels, &mut self.control);
         context.set_telemetry(&mut self.publisher);
