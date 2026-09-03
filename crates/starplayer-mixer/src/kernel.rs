@@ -34,6 +34,15 @@
 //! frames into two calls therefore produces exactly the byte sequence one call would have,
 //! which is the invariant the block-size determinism test exists to protect.
 //!
+//! # IT's resonant filter, and why it costs the other formats nothing
+//!
+//! The filter is a *voice*-level effect that runs between the resampler and the pan gains
+//! (architecture §7.2), so it lives inside [`mix_run`] behind a `const FILTERED: bool`
+//! rather than anywhere downstream. With `FILTERED` false the body is textually the code
+//! that was there before the filter existed — which is what `cargo xtask goldens --check`
+//! proves — and a MOD, S3M or MTM voice reaches it through one comparison of
+//! `FilterParams` against `FilterParams::BYPASS`, taken once per voice per segment.
+//!
 //! # Real-time safety
 //!
 //! No allocation, no locks, no panic and no `dyn` call. Every slice access goes through
@@ -65,6 +74,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     voice: &mut Voice,
     pcm: &[i16],
     destination: &mut [Path::Accumulator],
+    sample_rate_hz: u32,
 ) -> VoiceStatus {
     let Some(mut sample) = SampleData::resolve(pcm, voice.region()) else {
         return VoiceStatus::Finished;
@@ -76,6 +86,18 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     if voice.retarget_gains() == VoiceStatus::Finished {
         return VoiceStatus::Finished;
     }
+
+    // The one filter decision, taken once per voice per segment rather than per frame:
+    // the coefficients are recomputed only if the parameters or the sample rate moved,
+    // and `filtered` then selects between two separately compiled inner loops. For MOD,
+    // S3M and MTM the parameters are `FilterParams::BYPASS` from the moment the voice is
+    // allocated, so this costs one four-byte comparison and nothing else.
+    let filter_params = voice.params.filter;
+    let filtered = {
+        let (_, filter) = voice.run_state_mut();
+        filter.refresh::<Path>(filter_params, sample_rate_hz);
+        filter.is_active()
+    };
 
     let step = voice.params.step.to_bits();
     let mut reverse = voice.is_reversed();
@@ -109,12 +131,19 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
 
         // ── the run itself ──────────────────────────────────────────────────────────
         let frames = sample.frames();
-        let gains = voice.gains_mut();
-        match (ramp_frames > 0, reverse) {
-            (false, false) => mix_run::<Path, Interp, false, false>(window, frames, position, step, gains),
-            (false, true) => mix_run::<Path, Interp, false, true>(window, frames, position, step, gains),
-            (true, false) => mix_run::<Path, Interp, true, false>(window, frames, position, step, gains),
-            (true, true) => mix_run::<Path, Interp, true, true>(window, frames, position, step, gains),
+        let (gains, filter) = voice.run_state_mut();
+        let path_filter = Path::path_filter(filter);
+        let coefficients = path_filter.coefficients;
+        let state = &mut path_filter.state;
+        match (filtered, ramp_frames > 0, reverse) {
+            (false, false, false) => mix_run::<Path, Interp, false, false, false>(window, frames, position, step, gains, state, &coefficients),
+            (false, false, true) => mix_run::<Path, Interp, false, false, true>(window, frames, position, step, gains, state, &coefficients),
+            (false, true, false) => mix_run::<Path, Interp, false, true, false>(window, frames, position, step, gains, state, &coefficients),
+            (false, true, true) => mix_run::<Path, Interp, false, true, true>(window, frames, position, step, gains, state, &coefficients),
+            (true, false, false) => mix_run::<Path, Interp, true, false, false>(window, frames, position, step, gains, state, &coefficients),
+            (true, false, true) => mix_run::<Path, Interp, true, false, true>(window, frames, position, step, gains, state, &coefficients),
+            (true, true, false) => mix_run::<Path, Interp, true, true, false>(window, frames, position, step, gains, state, &coefficients),
+            (true, true, true) => mix_run::<Path, Interp, true, true, true>(window, frames, position, step, gains, state, &coefficients),
         }
 
         // ── the boundary, handled once per run ──────────────────────────────────────
@@ -267,15 +296,20 @@ fn run_limit(sample: SampleData<'_>, reverse: bool) -> u64 {
 
 /// One bounded run of frames, with no boundary test and no `dyn` call in it.
 ///
-/// `RAMPING` and `REVERSE` are `const` parameters rather than locals so that the four
-/// shapes of this loop are four separate bodies: the steady forward case — the one that
-/// runs 99.9% of the time — has neither a direction test nor a gain update in it.
-fn mix_run<Path: MixPath, Interp: Interpolate, const RAMPING: bool, const REVERSE: bool>(
+/// `FILTERED`, `RAMPING` and `REVERSE` are `const` parameters rather than locals so that
+/// the eight shapes of this loop are eight separate bodies: the steady forward unfiltered
+/// case — the one that runs 99.9% of the time, and every frame of every MOD, S3M and MTM
+/// — has no direction test, no gain update and no filter in it at all. That is what keeps
+/// `cargo xtask goldens --check` byte-identical across this change: with `FILTERED` false
+/// the body is the code that was here before, one expression at a time.
+fn mix_run<Path: MixPath, Interp: Interpolate, const FILTERED: bool, const RAMPING: bool, const REVERSE: bool>(
     destination: &mut [Path::Accumulator],
     frames: &[i16],
     start_position: u64,
     step: u64,
     gains: &mut Stereo<starplayer_dsp::GainRamp>,
+    filter_state: &mut [Path::Mono; 2],
+    coefficients: &starplayer_dsp::FilterCoefficients<Path::Mono>,
 ) {
     let mut position = start_position;
     let steady = Stereo::new(Path::gain(gains.left.current()), Path::gain(gains.right.current()));
@@ -286,7 +320,11 @@ fn mix_run<Path: MixPath, Interp: Interpolate, const RAMPING: bool, const REVERS
         } else {
             steady
         };
-        Path::mix::<Interp>(accumulator, frames, (position >> 32) as usize, position as u32, frame_gains);
+        let value = Path::interpolate::<Interp>(frames, (position >> 32) as usize, position as u32);
+        // Between the resampler and the pan gains, which is where IT puts it: OpenMPT's
+        // `SampleLoop` runs `interpolate(); filter(); mix();` in that order.
+        let value = if FILTERED { Path::filter(value, filter_state, coefficients) } else { value };
+        Path::accumulate(accumulator, value, frame_gains);
         position = if REVERSE { position.wrapping_sub(step) } else { position.wrapping_add(step) };
     }
 }
@@ -461,7 +499,7 @@ mod tests {
         // between two source frames — including halfway across the wrap.
         let mut voice = voice_for(region, Step::from_bits(1u64 << 31));
         let mut output = [FixedFrame::default(); 18];
-        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Sounding);
+        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Sounding);
 
         // The frame straddling the wrap is halfway between f[7] = 8000 and f[0] = 1000.
         let midpoint = output.get(15).copied().expect("18 frames were rendered");
@@ -478,7 +516,7 @@ mod tests {
         let (blob, region) = blob_with(&pcm, LoopSpan::new(0, 64));
         let mut voice = voice_for(region, Step::from_ratio(7, 3));
         let mut output = [FixedFrame::default(); 512];
-        accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output);
+        accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100);
 
         let deltas: Vec<i32> = output.windows(2)
             .filter_map(|pair| match pair {
@@ -498,7 +536,7 @@ mod tests {
         let (blob, region) = blob_with(&pcm, LoopSpan::ping_pong(0, 8));
         let mut voice = voice_for(region, Step::ONE);
         let mut output = [FixedFrame::default(); 24];
-        accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output);
+        accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output, 44_100);
 
         let played: Vec<i32> = output.iter().map(|frame| (frame.left as i64 * 32_768 / 32_766) as i32).collect();
         let expected: Vec<i32> = [
@@ -520,7 +558,7 @@ mod tests {
         let (blob, region) = blob_with(&pcm, LoopSpan::ping_pong(4, 8));
         let mut voice = voice_for(region, Step::ONE);
         let mut output = [FixedFrame::default(); 12];
-        accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output);
+        accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output, 44_100);
 
         let played: Vec<i32> = output.iter().map(|frame| (frame.left as i64 * 32_768 / 32_766) as i32).collect();
         // Frames 0..7 straight through, then the loop turns on frame 8 and comes back.
@@ -536,7 +574,7 @@ mod tests {
         let (blob, region) = blob_with(&pcm, LoopSpan::ping_pong(0, 4));
         let mut voice = voice_for(region, Step::from_ratio(13, 1));
         let mut output = [FixedFrame::default(); 32];
-        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Sounding);
+        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Sounding);
         assert!(output.iter().all(|frame| frame.left.abs() <= 4_100), "every frame stayed inside the sample");
     }
 
@@ -552,7 +590,7 @@ mod tests {
                 while written < output.len() {
                     let end = (written + chunk).min(output.len());
                     if let Some(window) = output.get_mut(written..end) {
-                        accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, window);
+                        accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, window, 44_100);
                     }
                     written = end;
                 }
@@ -577,7 +615,7 @@ mod tests {
             while written < output.len() {
                 let end = (written + chunk).min(output.len());
                 if let Some(window) = output.get_mut(written..end) {
-                    accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, window);
+                    accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, window, 44_100);
                 }
                 written = end;
             }
@@ -594,8 +632,8 @@ mod tests {
         let (blob, region) = blob_with(&[100, 200, 300, 400], None);
         let mut voice = voice_for(region, Step::ONE);
         let mut output = [FixedFrame::default(); 3];
-        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Sounding);
-        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Finished);
+        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Sounding);
+        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Finished);
     }
 
     #[test]
@@ -604,24 +642,24 @@ mod tests {
         let (blob, region) = blob_with(&[], None);
         let mut voice = voice_for(region, Step::ONE);
         let mut output = [FixedFrame::default(); 8];
-        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Finished);
+        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Finished);
         assert_eq!(output, [FixedFrame::default(); 8]);
 
         // A zero step: a stalled voice holds its frame rather than spinning or ending.
         let (blob, region) = blob_with(&[1_234, 5_678], None);
         let mut voice = voice_for(region, Step::ZERO);
         let mut output = [FixedFrame::default(); 8];
-        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Sounding);
+        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Sounding);
         assert!(output.iter().all(|frame| frame.left == output.first().map(|first| first.left).unwrap_or(0)));
 
         // A step longer than the sample: one frame, then the end.
         let mut voice = voice_for(region, Step::from_ratio(99, 1));
         let mut output = [FixedFrame::default(); 8];
-        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Finished);
+        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Finished);
 
         // An unresolvable region — a corrupt module — ends the voice rather than faulting.
         let mut voice = voice_for(SampleRegion::one_shot(9_999, 64), Step::ONE);
-        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Finished);
+        assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Finished);
     }
 
     #[test]
@@ -631,7 +669,7 @@ mod tests {
             let (blob, region) = blob_with(&pcm, span);
             let mut voice = voice_for(region, Step::MAX);
             let mut output = [FixedFrame::default(); 64];
-            assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output), VoiceStatus::Sounding);
+            assert_eq!(accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Sounding);
             assert!(voice.position() < frames_to_bits(16), "the position stayed inside the sample");
         }
     }
@@ -649,7 +687,7 @@ mod tests {
         let mut voice = voice_for(first, Step::ONE);
         voice.queue_region(second);
         let mut output = [FixedFrame::default(); 12];
-        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output), VoiceStatus::Sounding);
+        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Sounding);
         assert_eq!(voice.region(), second, "the wrap adopted the queued region");
         assert_eq!(voice.pending_region(), None, "and cleared the slot");
 
@@ -671,7 +709,7 @@ mod tests {
         let mut voice = voice_for(first, Step::ONE);
         voice.queue_region(second);
         let mut output = [FixedFrame::default(); 8];
-        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output), VoiceStatus::Sounding, "the one-shot's end is a swap, not an end");
+        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Sounding, "the one-shot's end is a swap, not an end");
         assert_eq!(voice.region(), second);
         let played: Vec<i32> = output.iter().map(|frame| (frame.left as i64 * 32_768 / 32_766) as i32).collect();
         let expected = [1_000, 1_001, 1_002, 1_003, 5_002, 5_003, 5_004, 5_005];
@@ -690,13 +728,13 @@ mod tests {
         let mut voice = voice_for(one_shot, Step::ONE);
         voice.queue_region(other_one_shot);
         let mut output = [FixedFrame::default(); 8];
-        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output), VoiceStatus::Finished, "Paula has no loop registers to reload");
+        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Finished, "Paula has no loop registers to reload");
 
         // The same queue behind a looping voice is ProTracker's null sample only when the
         // replacement is empty.
         let mut voice = voice_for(looping, Step::ONE);
         voice.queue_region(SampleRegion::default());
-        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output), VoiceStatus::Finished);
+        assert_eq!(accumulate_voice::<FixedPath, Nearest>(&mut voice, &blob, &mut output, 44_100), VoiceStatus::Finished);
     }
 
     #[test]
@@ -735,7 +773,7 @@ mod tests {
             while written < output.len() {
                 let end = (written + chunk).min(output.len());
                 if let Some(window) = output.get_mut(written..end) {
-                    accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, window);
+                    accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, window, 44_100);
                 }
                 written = end;
             }

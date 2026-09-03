@@ -49,4 +49,4 @@ pub use master::{Limiter, MasterSettings};
 pub use output::{Dither, FixedOut, FloatOut, HostSample, I24, MonoF32, MonoI16, OutputFormat, StereoF32, StereoI16};
 pub use path::{FixedFrame, FixedPath, FloatFrame, FloatPath, MixPath, Stereo};
 pub use sample::{GUARD_FRAMES, LoopMode, LoopSpan, SampleData, SampleRegion, append_guarded_sample};
-pub use voice::{Voice, VoicePool, VoiceTag};
+pub use voice::{PathFilter, Voice, VoiceFilter, VoicePool, VoiceTag};

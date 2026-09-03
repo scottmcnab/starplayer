@@ -252,7 +252,7 @@ mod tests {
         assert!(!processor.channel(0).expect("channel").offset_past_end);
 
         let mut output = [FixedFrame::default(); 4];
-        let status = accumulate_voice::<FixedPath, Linear>(voices.get_mut(voice_id).expect("live voice"), module.pcm(), &mut output);
+        let status = accumulate_voice::<FixedPath, Linear>(voices.get_mut(voice_id).expect("live voice"), module.pcm(), &mut output, 44_100);
         assert_eq!(status, VoiceStatus::Finished);
         assert_eq!(output, [FixedFrame::default(); 4]);
     }
@@ -268,7 +268,7 @@ mod tests {
         assert!(!processor.channel(0).expect("channel").offset_past_end);
 
         let mut output = [FixedFrame::default(); 1];
-        let status = accumulate_voice::<FixedPath, Linear>(voices.get_mut(voice_id).expect("live voice"), module.pcm(), &mut output);
+        let status = accumulate_voice::<FixedPath, Linear>(voices.get_mut(voice_id).expect("live voice"), module.pcm(), &mut output, 44_100);
         assert_eq!(status, VoiceStatus::Sounding);
         let normalized = voices.get(voice_id).expect("looping voice").position();
         assert!((128u64 << 32..384u64 << 32).contains(&normalized), "the mixer wrapped the absolute offset into the loop");

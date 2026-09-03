@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(voices.voices_active(), 1);
 
         let mut destination = [starplayer_mixer::FixedFrame::default(); 8];
-        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(&blob, &mut destination);
+        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(&blob, &mut destination, 44_100);
         assert_eq!(voices.voices_active(), 1, "an accumulation pass does not reclaim it — nothing asked it to stop");
 
         assert_eq!(channels.detach_foreground(ChannelId(1)), None, "detaching an unowned channel is a no-op");
@@ -315,7 +315,7 @@ mod tests {
         assert!(voices.get(voice).is_some_and(|voice| voice.wants_stop()), "the voice is flagged, not yet reclaimed");
 
         let mut destination = [starplayer_mixer::FixedFrame::default(); 8];
-        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(&blob, &mut destination);
+        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(&blob, &mut destination, 44_100);
         assert_eq!(voices.voices_active(), 0, "the pool reclaims it at the next accumulation pass");
         assert!(!channels.stop(ChannelId(0), &mut voices), "stopping a silent channel is a no-op");
     }
@@ -331,7 +331,7 @@ mod tests {
         channels.trigger(ChannelId(0), &mut voices, VoiceTag::default(), region, sounding(), 0).expect("slot 0");
 
         let mut destination = [starplayer_mixer::FixedFrame::default(); 8];
-        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(&blob, &mut destination);
+        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(&blob, &mut destination, 44_100);
         assert!(!channels.is_sounding(ChannelId(0), &voices), "a finished one-shot is not sounding");
 
         channels.release_finished(&voices);
