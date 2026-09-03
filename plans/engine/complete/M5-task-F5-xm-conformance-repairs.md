@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M5 ([master plan](M5-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready — dispatch after G3 lands (one worker at a time) |
+| Status | Landed 2026-09-04; owner listening check outstanding |
 | Depends on | F2 landed (72 of 93 XM cases pass; 20 recorded as `F2-XM-001`..`F2-XM-012` in `conformance/known-failures.md`) |
 | Blocks | M5 exit (`--strict` must name no XM known failure that is not a documented dialect gap) |
 | Parallel with | G3 (different crates), the G6 IT repairs |
