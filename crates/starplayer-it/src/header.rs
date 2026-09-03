@@ -254,7 +254,15 @@ impl ItHeader {
             return FormatDialect::ModPlugIt;
         }
         match self.tracker_version >> 12 {
-            0 => FormatDialect::ImpulseTracker,
+            // Impulse Tracker itself, split by the `Cwt/v` values whose `SBx` pattern-loop
+            // semantics differ (libxmp `src/loaders/it_load.c:394-400`; task G3 research
+            // point 3). Every later IT and every clone is the 2.10 baseline.
+            0 => match self.tracker_version {
+                0x0000..=0x0103 => FormatDialect::ImpulseTracker100,
+                0x0104..=0x01FF => FormatDialect::ImpulseTracker104,
+                0x0200..=0x020F => FormatDialect::ImpulseTracker200,
+                _ => FormatDialect::ImpulseTracker,
+            },
             1 => FormatDialect::SchismTracker,
             _ => FormatDialect::Unknown,
         }

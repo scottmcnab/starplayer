@@ -78,6 +78,7 @@ pub mod header;
 pub mod instrument;
 pub mod loader;
 pub mod pattern;
+pub mod processor;
 pub mod sample;
 
 pub use header::{
@@ -86,6 +87,10 @@ pub use header::{
 };
 pub use instrument::{ItEnvelope, ItInstrument};
 pub use loader::{load, load_from, probe, probe_reader};
+pub use processor::{
+    ItChannel, ItEnvelopeState, ItProcessor, ItVoiceState, VIRTUAL_CHANNELS, recommended_voice_capacity,
+    sequencer_for, sequencer_with_quirks,
+};
 pub use pattern::{
     COMMAND_NONE, DEFAULT_ROWS, INSTRUMENT_NONE, ItCell, ItPatternData, ItVolumeCommand, MAX_ROWS,
     NOTE_CUT, NOTE_FADE, NOTE_NONE, NOTE_OFF, PatternView, VOLUME_NONE, normalise_note, unpack,

@@ -311,10 +311,33 @@ impl FilterParams {
     /// IT's seven-bit cutoff and resonance back out, rounded to nearest — the exact
     /// inverse of [`FilterParams::from_it`] on every value it produces.
     pub const fn to_it(self) -> (u8, u8) { (unit_to_it_scale(self.cutoff), unit_to_it_scale(self.resonance)) }
+
+    /// [`FilterParams::from_it`] with the cutoff already in the replayer's **0..=255**
+    /// domain — what the filter envelope produces, since IT scales the instrument's
+    /// cutoff by the envelope before the coefficients are derived. Resonance stays on
+    /// IT's own `0..=127` scale, exactly as [`FilterParams::from_it`] takes it.
+    ///
+    /// A fully open scaled cutoff hands straight back to [`FilterParams::from_it`], so
+    /// the sentinel that makes [`FilterParams::is_bypass`] recognise IT's "cutoff 127
+    /// with resonance 0 is no filter at all" rule has a single spelling.
+    pub const fn from_it_scaled(cutoff: u8, resonance: u8) -> FilterParams {
+        if cutoff >= 2 * FilterParams::IT_SCALE_MAX {
+            return FilterParams::from_it(FilterParams::IT_SCALE_MAX, resonance);
+        }
+        let clamped_resonance = if resonance > FilterParams::IT_SCALE_MAX { FilterParams::IT_SCALE_MAX } else { resonance };
+        FilterParams {
+            cutoff: U0F16::from_bits(cutoff as u16 * IT_SCALED_STEP),
+            resonance: U0F16::from_bits(clamped_resonance as u16 * IT_SCALE_STEP),
+        }
+    }
 }
 
 /// One IT filter step in [`U0F16`] bits. See [`FilterParams::from_it`] for why it is 514.
 const IT_SCALE_STEP: u16 = 514;
+
+/// One step of the replayer's doubled `0..=255` cutoff domain: half [`IT_SCALE_STEP`],
+/// and `255 · 257 == 65535`, so the scaled encoding is exact in both directions.
+const IT_SCALED_STEP: u16 = IT_SCALE_STEP / 2;
 
 /// A unit scalar back to IT's `0..=127`, rounded to nearest.
 const fn unit_to_it_scale(value: U0F16) -> u8 {
@@ -566,6 +589,21 @@ mod tests {
         assert!(!FilterParams::from_it(127, 1).is_bypass(), "resonance alone still filters");
         assert!(!FilterParams::from_it(126, 0).is_bypass());
         assert_eq!(FilterParams::from_it(200, 200), FilterParams::from_it(127, 127), "out-of-range values clamp");
+    }
+
+    /// The envelope-scaled half of the same encoding, from M6-G3: a cutoff already in the
+    /// replayer's `0..=255` domain survives the C1 trace's `unit_to_scale(bits, 255)`
+    /// unchanged, because `255 · 257 == 65535`.
+    #[test]
+    fn an_envelope_scaled_it_cutoff_keeps_the_replayers_255_domain() {
+        fn trace_scale(bits: u16) -> u16 { ((bits as u32 * 255 + 32_767) / 65_535) as u16 }
+
+        for scaled in 0..=253u8 {
+            let params = FilterParams::from_it_scaled(scaled, 0);
+            assert_eq!(trace_scale(params.cutoff.to_bits()), scaled as u16, "scaled cutoff {scaled}");
+        }
+        assert!(FilterParams::from_it_scaled(254, 0).is_bypass(), "a fully open scaled cutoff is the bypass");
+        assert!(!FilterParams::from_it_scaled(254, 1).is_bypass(), "resonance alone still filters");
     }
 
     #[test]

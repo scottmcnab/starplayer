@@ -24,13 +24,6 @@ trace = ["starplayer/trace"]
 # once without it and once with it.
 telemetry = ["starplayer/telemetry"]
 
-# The IT loader by path, for `tests/fuzz_seeds.rs` only. The facade's `it` arm is task G5;
-# until it lands there is no `starplayer::it` to replay the seeds through, and a
-# dev-dependency reaches the loader without touching the facade or anything a host links.
-# XM no longer needs one: task F2 landed `starplayer::xm`.
-[dev-dependencies]
-starplayer-it = { workspace = true }
-
 [[bin]]
 name = "starplayer-trace"
 required-features = ["trace"]

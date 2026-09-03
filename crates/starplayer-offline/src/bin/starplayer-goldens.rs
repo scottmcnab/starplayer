@@ -24,6 +24,7 @@ fn fixtures() -> Vec<Fixture> {
         Fixture { format: GoldenFormat::Mod, stem: "synthetic", bytes: fixtures::synthetic_mod() },
         Fixture { format: GoldenFormat::Mtm, stem: "synthetic", bytes: fixtures::synthetic_mtm() },
         Fixture { format: GoldenFormat::Xm, stem: "synthetic", bytes: fixtures::synthetic_xm() },
+        Fixture { format: GoldenFormat::It, stem: "synthetic", bytes: fixtures::synthetic_it() },
         Fixture { format: GoldenFormat::S3m, stem: "armani", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/ARMANI.S3M").to_vec() },
         Fixture { format: GoldenFormat::S3m, stem: "movement", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M").to_vec() },
         Fixture { format: GoldenFormat::S3m, stem: "nicetune", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/NICETUNE.S3M").to_vec() },

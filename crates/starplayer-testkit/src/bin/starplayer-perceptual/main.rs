@@ -201,6 +201,7 @@ fn committed_fixtures() -> Vec<Fixture> {
     vec![
         Fixture { name: "mod/synthetic".to_string(), format: GoldenFormat::Mod, extension: "mod", bytes: fixtures::synthetic_mod(), committed: true },
         Fixture { name: "mtm/synthetic".to_string(), format: GoldenFormat::Mtm, extension: "mtm", bytes: fixtures::synthetic_mtm(), committed: true },
+        Fixture { name: "it/synthetic".to_string(), format: GoldenFormat::It, extension: "it", bytes: fixtures::synthetic_it(), committed: true },
         Fixture { name: "s3m/armani".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/ARMANI.S3M").to_vec(), committed: true },
         Fixture { name: "s3m/movement".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M").to_vec(), committed: true },
         Fixture { name: "s3m/nicetune".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/NICETUNE.S3M").to_vec(), committed: true },
@@ -211,7 +212,7 @@ fn committed_fixtures() -> Vec<Fixture> {
 
 /// A `--corpus` module: name the processor by its extension, then read it.
 ///
-/// `Ok(None)` is an extension no `GoldenFormat` covers — an IT until G5 lands.
+/// `Ok(None)` is an extension no `GoldenFormat` covers.
 /// That is a skip; only an unreadable path is an error.
 fn load_corpus_fixture(path: &Path) -> Result<Option<Fixture>, String> {
     let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
@@ -220,6 +221,7 @@ fn load_corpus_fixture(path: &Path) -> Result<Option<Fixture>, String> {
         "s3m" => (GoldenFormat::S3m, "s3m"),
         "mtm" => (GoldenFormat::Mtm, "mtm"),
         "xm" => (GoldenFormat::Xm, "xm"),
+        "it" => (GoldenFormat::It, "it"),
         _ => return Ok(None),
     };
     let bytes = std::fs::read(path).map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
@@ -364,7 +366,7 @@ mod tests {
     #[test]
     fn every_committed_fixture_names_a_format_and_carries_bytes() {
         let fixtures = committed_fixtures();
-        assert_eq!(fixtures.len(), 7, "the golden contract has seven fixtures");
+        assert_eq!(fixtures.len(), 8, "the golden contract has eight fixtures");
         for fixture in &fixtures {
             assert!(!fixture.bytes.is_empty(), "{} carries bytes", fixture.name);
             assert!(fixture.committed, "{} is a committed fixture", fixture.name);
@@ -374,9 +376,10 @@ mod tests {
 
     #[test]
     fn an_unsupported_corpus_extension_is_skipped_rather_than_guessed() {
-        // Skipped before the file is even read, so an IT the corpus names cannot fail the
-        // run just because this checkout has no processor for it yet.
-        assert!(matches!(load_corpus_fixture(Path::new("does-not-exist.it")), Ok(None)));
+        // Skipped before the file is even read, so a module in a format this checkout has
+        // no processor for cannot fail the run just because the corpus names it. XM and IT
+        // are both covered now, so the case needs a format neither milestone reached.
+        assert!(matches!(load_corpus_fixture(Path::new("does-not-exist.669")), Ok(None)));
     }
 
     #[test]

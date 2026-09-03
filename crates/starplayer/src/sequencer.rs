@@ -21,9 +21,9 @@ use starplayer_engine::{EngineContext, EventSource, RowMark, SequencerSettings, 
 use starplayer_model::{Module, ModuleFormat};
 use starplayer_rt::Arc;
 
-#[cfg(any(feature = "s3m", feature = "mod", feature = "mtm", feature = "xm"))]
+#[cfg(any(feature = "s3m", feature = "mod", feature = "mtm", feature = "xm", feature = "it"))]
 use starplayer_core::TempoModelId;
-#[cfg(any(feature = "s3m", feature = "mod", feature = "mtm", feature = "xm"))]
+#[cfg(any(feature = "s3m", feature = "mod", feature = "mtm", feature = "xm", feature = "it"))]
 use starplayer_engine::{PatternData, PatternSequencer, TrackerProcessor};
 
 /// The S3M playback sequencer, exactly as [`starplayer_s3m::sequencer_with_quirks`] builds it.
@@ -38,6 +38,9 @@ pub type MtmSequencer = PatternSequencer<TempoModelId, starplayer_mtm::MtmProces
 /// The XM playback sequencer, exactly as [`starplayer_xm::sequencer_with_quirks`] builds it.
 #[cfg(feature = "xm")]
 pub type XmSequencer = PatternSequencer<TempoModelId, starplayer_xm::XmProcessor, starplayer_xm::XmPatternData>;
+/// The IT playback sequencer, exactly as [`starplayer_it::sequencer_with_quirks`] builds it.
+#[cfg(feature = "it")]
+pub type ItSequencer = PatternSequencer<TempoModelId, starplayer_it::ItProcessor, starplayer_it::ItPatternData>;
 
 /// A playing sequencer for whichever format the module turned out to be.
 ///
@@ -62,7 +65,9 @@ pub enum NativeSequencer {
     /// FastTracker 2.
     #[cfg(feature = "xm")]
     Xm(XmSequencer),
-    // The IT arm arrives with M6-G5.
+    /// Impulse Tracker.
+    #[cfg(feature = "it")]
+    It(ItSequencer),
 }
 
 /// The error every unsupported format reports, worded as [`crate::scan_song`] has always
@@ -90,6 +95,8 @@ macro_rules! forward {
             NativeSequencer::Mtm(ref $sequencer) => $body,
             #[cfg(feature = "xm")]
             NativeSequencer::Xm(ref $sequencer) => $body,
+            #[cfg(feature = "it")]
+            NativeSequencer::It(ref $sequencer) => $body,
         }
     }};
 }
@@ -106,6 +113,8 @@ macro_rules! forward_mut {
             NativeSequencer::Mtm(ref mut $sequencer) => $body,
             #[cfg(feature = "xm")]
             NativeSequencer::Xm(ref mut $sequencer) => $body,
+            #[cfg(feature = "it")]
+            NativeSequencer::It(ref mut $sequencer) => $body,
         }
     }};
 }
@@ -130,6 +139,11 @@ impl NativeSequencer {
             ModuleFormat::Mtm => Ok(NativeSequencer::Mtm(starplayer_mtm::sequencer_with_quirks(module, sample_rate_hz, quirks))),
             #[cfg(feature = "xm")]
             ModuleFormat::Xm => Ok(NativeSequencer::Xm(starplayer_xm::sequencer_with_quirks(module, sample_rate_hz, quirks))),
+            #[cfg(feature = "it")]
+            ModuleFormat::It => Ok(NativeSequencer::It(starplayer_it::sequencer_with_quirks(module, sample_rate_hz, quirks))),
+            // Every `ModuleFormat` now has an arm, so this is dead in the default build
+            // and live only where a format feature is off.
+            #[allow(unreachable_patterns)]
             _ => Err(NO_NATIVE_PROCESSOR),
         }
     }
@@ -181,6 +195,16 @@ impl NativeSequencer {
                 let data = starplayer_xm::XmPatternData(module);
                 Ok(NativeSequencer::Xm(PatternSequencer::new(resolved.tempo_model, data, processor, settings)))
             }
+            #[cfg(feature = "it")]
+            ModuleFormat::It => {
+                let resolved = quirks.resolve(module.header().dialect);
+                let processor = starplayer_it::ItProcessor::with_quirks(Arc::clone(&module), rate, QuirkSelection::Override(resolved));
+                let data = starplayer_it::ItPatternData(module);
+                Ok(NativeSequencer::It(PatternSequencer::new(resolved.tempo_model, data, processor, settings)))
+            }
+            // Every `ModuleFormat` now has an arm, so this is dead in the default build
+            // and live only where a format feature is off.
+            #[allow(unreachable_patterns)]
             _ => Err(NO_NATIVE_PROCESSOR),
         }
     }
@@ -196,6 +220,8 @@ impl NativeSequencer {
             NativeSequencer::Mtm(_) => ModuleFormat::Mtm,
             #[cfg(feature = "xm")]
             NativeSequencer::Xm(_) => ModuleFormat::Xm,
+            #[cfg(feature = "it")]
+            NativeSequencer::It(_) => ModuleFormat::It,
         }
     }
 

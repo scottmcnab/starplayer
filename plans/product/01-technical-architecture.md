@@ -489,6 +489,27 @@ MOD/S3M/MTM simply never create a background voice. `NewNoteAction::Cut` +
 `DuplicateCheck::Off` early-outs the whole DCT matching loop. Cost to the simple path:
 four bytes per voice and one branch.
 
+**As landed (M6-G3).** The shape held. `VoiceTag` gained a sixteen-bit `sample` so the
+Duplicate Check can never see two different samples compare equal through a byte clamp,
+and the per-voice articulation is **format-owned** rather than a field of the pool: the IT
+processor keeps a `Box<[ItVoiceState]>` of `VIRTUAL_CHANNELS` (256) entries indexed by
+`VoiceId::index()` and validated by the stored `VoiceId`, allocated once in the constructor
+and cleared in `reset()`. Each entry holds the voice's instrument and sample, its root
+channel, three envelope positions with their sustain and loop state, its fadeout, its
+key-off and note-fade flags, its auto-vibrato phase and sweep, its per-note random volume
+and pan swing, its filter cutoff and resonance, and the New Note Action it will be detached
+with. `tick()` walks the pool once and advances every owned voice — foreground or
+background — through one code path, which is what makes an NNA voice keep sounding
+correctly rather than by a second copy of the envelope code.
+
+One rule turned out to be worth stating: **`NewNoteAction::Cut` allocates nothing.**
+OpenMPT does move a cut voice to a background channel so its volume ramp can bleed out, but
+libxmp frees a background voice the moment its volume reaches zero
+(`libxmp_virt_setvol`), and the engine's own mixer already ramps a released voice, so a cut
+note never occupies a virtual channel here. That keeps the sounding voice set the same
+shape as the oracle's, which the conformance adapter depends on to number background
+voices at all.
+
 ### 5.2 One global pool, generational handles
 
 Not per-instrument sub-pools — those fragment, and IT needs global stealing across all
@@ -508,8 +529,37 @@ instrument must tolerate a stale handle. Silently getting the wrong voice is a
 multi-day debugging session; `Option` makes it impossible.
 
 IT's voice-stealing heuristic is **audible** on dense modules — which note gets cut is
-part of the output. It is a policy trait with real time budgeted against it, matched to
-libopenmpt, not guessed.
+part of the output. It is matched to libopenmpt, not guessed.
+
+**Q3, settled in M6-G3.** OpenMPT's `CSoundFile::GetNNAChannel`
+(`soundlib/Snd_fx.cpp:2257`) is two passes over the *background* range only — a foreground
+voice of another channel is never a candidate:
+
+1. **A free voice wins outright**, taking the lowest index: `if(c.nLength) continue;` then
+   `return i`. There is no round-robin.
+2. Otherwise every background voice is scored `v = (nRealVolume << 9) | nVolume` — the
+   14-bit post-envelope, post-fadeout mixing volume with the 0..256 note volume as a
+   tie-breaker — and the **lowest score wins**. `if(c.dwFlags[CHN_LOOP]) v /= 2;` gives a
+   looped sample half priority, because it will ring for ever otherwise. A voice that is
+   playing but fully faded (`c.nLength && !c.nFadeOutVol`) is returned immediately, and on
+   a tie the voice further through its volume envelope — or with no volume envelope at all
+   — wins.
+3. The threshold starts at the **stealing note's own score**, so a background voice louder
+   than the note that wants its slot is never stolen and the new note simply does not
+   sound. If the source channel is itself already fully faded, nothing is allocated and the
+   old voice is dropped.
+
+Schism (`player/effects.c:1640`) agrees on the shape and differs in two details: it folds
+the fadeout into the score explicitly (`v = volume * fadeout_volume` for a fading voice,
+`volume << 16` otherwise) rather than relying on a cached mixing volume, and it uses a
+fixed 25 % threshold instead of the stealing note's own score.
+
+`ItProcessor::choose_victim` implements OpenMPT's rule with Schism's explicit fadeout term
+folded in, because StarPlayer recomputes a voice's volume from its articulation each tick
+rather than caching a 14-bit mixing volume. It is **a concrete policy in `starplayer-it`,
+not a trait**: design goal 8 keeps a trait uncommitted until its second real
+implementation, and XM's is the same allocator with a different NNA set rather than a
+different heuristic.
 
 ### 5.3 The instrument surface
 
@@ -1207,6 +1257,6 @@ Recorded rather than guessed. Each has a milestone where it must be settled.
 |---|---|---|
 | Q1 | Does `SharedArrayBuffer` + COOP/COEP work well enough for scope telemetry, or is `postMessage` the practical default? | **Settled in M0-A4 — see §9** |
 | Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | M8 |
-| Q3 | Which voice-stealing heuristic does libopenmpt actually use, exactly? | M6 |
+| Q3 | Which voice-stealing heuristic does libopenmpt actually use, exactly? | **Settled in M6-G3 — see §5.2** |
 | Q4 | Does the `Instrument` trait survive contact with a non-sample instrument (FM), or does it need a second tier? | M10 |
 | Q5 | CLAP first with a VST3 wrapper, or nih-plug for both? | M9 |

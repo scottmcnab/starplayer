@@ -53,8 +53,8 @@ pub use fixed::{I1F15, Q32_32, Step, U0F16};
 pub use frame::Frame;
 pub use note::{Note, Period};
 pub use quirks::{
-    BreakParameter, FormatDialect, ModLoopDialect, PatternFlow, PaulaClock, QuirkSelection,
-    QuirkSet, S3mLoopDialect,
+    BreakParameter, FormatDialect, ItLoopDialect, ModLoopDialect, PatternFlow, PaulaClock,
+    QuirkSelection, QuirkSet, S3mLoopDialect,
 };
 pub use random::Xorshift32;
 pub use row_clock::{RowAdvance, RowClock};

@@ -105,7 +105,7 @@ pub use instrument::{
 };
 pub use module::{Module, ORDER_END, ORDER_MARKER, OrderEntry};
 pub use pattern::{
-    EffectCell, EffectNames, NoteCell, PatternCell, PatternId, PatternIndex, s3m_command_code,
+    EffectCell, EffectNames, NoteCell, PatternCell, PatternId, PatternIndex, it_command_code, s3m_command_code,
     xm_command_code,
 };
 pub use reader::ModuleReader;

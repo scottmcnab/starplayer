@@ -220,3 +220,90 @@ passes. `openmpt/xm/DelayCombination.data` is empty too and *is* a real expectat
 fixture's whole point is that no note triggers — and it passes. Resolving this needs a
 decision about whether the harness should treat a zero-byte dump as an oracle at all.
 
+## M6 — IT (task G3)
+
+Task G3 landed IT playback: the effect processor, instrument articulation, New Note
+Actions, duplicate checks and voice stealing, wired into 121 pinned corpus cases. Thirteen
+pass with every field enforced and twenty-six more pass with `position` waived under
+accuracy-policy entry **D67**. The eighty-two records below are the remainder, grouped by
+the first field that diverges once `position` is set aside, so each group is one piece of
+work rather than one case. They belong to **G6** (`plans/engine/M6-task-G6-*`), the
+conformance-repair task M6 exits through; none of them is an accepted deviation, and every
+excluded case is still executed on every run, so a fix makes its exclusion fail as stale.
+
+The categories were measured at the same commit as the exclusion rows. A case appears in
+exactly one group — the one its *first* divergence names — so fixing a group will move
+cases into another group before it moves them into the pass column.
+
+## G3-IT-001
+
+**The volume chain's last bit — 24 cases.** The first difference is one or two steps of
+the trace's 0..64 volume axis, usually while an envelope is attacking or a fadeout is
+running. StarPlayer implements OpenMPT's chain (`Vol · VEV · NFC · CV · SV · IV · GV`
+folded as `muldiv(vol14 · GV256, CV · insVol, 1 << 20)`); libxmp folds the sample and
+instrument global volumes in *after* the envelope and the fadeout
+(`QUIRK_INSVOL`, `src/player.c:1102`) and divides by different powers of two on the way.
+The quantisation to six bits then turns a sub-percent difference into a whole step. G6
+should settle which order Impulse Tracker itself uses — `it2play`'s `Music_*` volume code
+is the authority — and either match it or record the difference as a deviation with a
+one-step tolerance.
+
+## G3-IT-002
+
+**The filter envelope and the `Zxx` cutoff — 16 cases.** The first difference is two or
+three steps of the 0..255 cutoff axis while a filter envelope is running. Both players
+compute the same product — OpenMPT's `cutoff · (envModifier + 256) / 256` and libxmp's
+`filter.cutoff · filter.envelope >> 8` are algebraically identical — so the difference is
+the *envelope interpolation*: libxmp interpolates node values pre-multiplied by four
+(`src/loaders/it_load.c:664`) and StarPlayer interpolates the model's −32..32 values scaled
+by eight. libxmp's own `ZxxSecrets` test comment records that its filter-envelope handling
+is wrong ("libxmp right shifting the cutoff by the filter envelope range instead of
+deriving coefficients off of the product"), so G6 must decide this against OpenMPT rather
+than against the oracle, and may have to record it as a deviation.
+
+## G3-IT-003
+
+**The sounding voice set — 12 cases.** The first difference is a channel or a virtual
+channel that one player has sounding and the other does not: a New Note Action that should
+not have allocated a background voice, a voice that should have been freed when its fadeout
+reached zero, or a duplicate check that should have killed one. The virtual-channel
+numbering the adapter reproduces (research point 1) is only as good as the set of voices it
+is numbering, so a difference here also shifts every later background row.
+
+## G3-IT-004
+
+**Note and sample selection — 10 cases.** The first difference is the note or the sample a
+channel is playing: the empty-note-map-slot rules (`kITEmptyNoteMapSlot`,
+`kITEmptyNoteMapSlotIgnoreCell`), the lone-instrument-number rules
+(`kITInstrWithoutNote`, `kITMultiSampleInstrumentNumber`), and the portamento sample-swap
+rules (`kITPortamentoInstrument`, `kITPortamentoSwapResetsPos`) interact, and G3 implements
+them from OpenMPT's description rather than from a per-case reading.
+
+## G3-IT-005
+
+**Pitch — 8 cases.** The first difference is the `period` column by more than one whole
+period, so it is a real pitch error rather than D64's axis resolution: a slide that ran on
+the wrong tick, a portamento target that was not consumed, or an arpeggio phase that is out
+of step.
+
+## G3-IT-006
+
+**Row flow and the tick budget — 8 cases.** The first difference is `row`, `tick-in-row` or
+`frame`: a pattern loop, break or jump that resolved differently, or a row whose tick
+budget differs because `SEx`, `S6x` or a `Txx` tempo slide was counted differently. The
+four `pattern_loop_it*` fixtures that exercise D65's dialects are **not** in this group —
+three of them pass with the D67 waiver — so this is the `Cxx`/`Bxx`/`SBx` interaction
+rather than the dialect selection.
+
+## G3-IT-007
+
+**Panning — 1 case.** The first difference is the pan column outside surround, so it is the
+pan envelope's asymmetric scaling, pitch/pan separation, or the pan swing.
+
+## G3-IT-008
+
+**Sample position beyond the D67 waiver — 3 cases.** Two cases diverge on `position` by
+more than the accumulated-rounding difference D67 covers, so something other than the
+frequency's last bit moved the voice. The third, `openmpt-it-bidi-loops`, is the fixture
+that exists to test it: Impulse Tracker's software mixer plays a ping-pong loop **one
+sample short** of the file's, which OpenMPT emulates and G3 did not implement.

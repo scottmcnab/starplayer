@@ -3,7 +3,7 @@ name = "starplayer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Real-time, event-driven tracked-music engine (MOD / S3M / MTM / XM)."
+description = "Real-time, event-driven tracked-music engine (MOD / S3M / MTM / XM / IT)."
 
 [dependencies]
 starplayer-core = { workspace = true }
@@ -27,7 +27,7 @@ starplayer-telemetry = { workspace = true, optional = true }
 # reachable from here, transitively enables `std`. `xtask ci --job no-std-purity`
 # enforces it by compiling this crate's default feature set for a bare-metal target.
 [features]
-default = ["s3m", "mod", "mtm", "xm", "float-mix", "linear-interp"]
+default = ["s3m", "mod", "mtm", "xm", "it", "float-mix", "linear-interp"]
 
 std = [
     "starplayer-core/std",
@@ -67,7 +67,7 @@ fixed-mix = ["starplayer-dsp/fixed-mix", "starplayer-mixer/fixed-mix", "starplay
 linear-interp = ["starplayer-dsp/linear-interp", "starplayer-mixer/linear-interp", "starplayer-engine/linear-interp"]
 
 telemetry = ["dep:starplayer-telemetry", "starplayer-engine/telemetry"]
-trace = ["starplayer-engine/trace", "starplayer-mod?/trace", "starplayer-s3m?/trace", "starplayer-mtm?/trace", "starplayer-xm?/trace"]
+trace = ["starplayer-engine/trace", "starplayer-mod?/trace", "starplayer-s3m?/trace", "starplayer-mtm?/trace", "starplayer-xm?/trace", "starplayer-it?/trace"]
 
 quirks-starplayer = [
     "starplayer-core/quirks-starplayer",

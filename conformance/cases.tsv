@@ -143,3 +143,127 @@ openmpt-xm-tremor	openmpt	xm	openmpt/xm/Tremor.xm	openmpt/xm/Tremor.data	The tre
 openmpt-xm-tremorinstr	openmpt	xm	openmpt/xm/TremorInstr.xm	openmpt/xm/TremorInstr.data	Instrument numbers reset tremor count.
 openmpt-xm-tremorrecover	openmpt	xm	openmpt/xm/TremorRecover.xm	openmpt/xm/TremorRecover.data	Even if a tremor effect muted the sample on a previous row, volume commands should be able to override this effect. Instrument numbers should reset the tremor effect as well. Currently, OpenMPT only supports the latter.
 openmpt-xm-vibratowaveforms	openmpt	xm	openmpt/xm/VibratoWaveforms.xm	openmpt/xm/VibratoWaveforms.data	Fasttracker 2 tries to be inconsistent where possible, so you have to duplicate a lot of code or add conditions to behave exactly like Fasttracker. Yeah! Okay, seriously: Generally the vibrato and tremolo tables are...
+
+# ── M6: IT, task G3. Every pinned `.it` case in the two corpora, which
+# `audit_pinned_corpus` requires to be complete.
+openmpt-it-autovibrato-reset	openmpt	it	openmpt/it/Autovibrato-Reset.it	openmpt/it/Autovibrato-Reset.data	Impulse Tracker auto-vibrato sweep survives a tone portamento
+openmpt-it-bidi-loops	openmpt	it	openmpt/it/Bidi-Loops.it	openmpt/it/Bidi-Loops.data	Impulse Tracker software-mixer ping-pong loops are one sample short
+openmpt-it-carry-nna	openmpt	it	openmpt/it/CarryNNA.it	openmpt/it/CarryNNA.data	Impulse Tracker envelope carry across a New Note Action
+openmpt-it-cut-carry	openmpt	it	openmpt/it/cut-carry.it	openmpt/it/cut-carry.data	Impulse Tracker envelope carry cannot resume after a note cut
+openmpt-it-empty-slot	openmpt	it	openmpt/it/emptyslot.it	openmpt/it/emptyslot.data	Impulse Tracker ignores an empty note-to-sample map slot
+openmpt-it-envelope-loop-escape	openmpt	it	openmpt/it/EnvLoopEscape.it	openmpt/it/EnvLoopEscape.data	Impulse Tracker envelope escaping its sustain loop on note-off
+openmpt-it-envelope-loops	openmpt	it	openmpt/it/EnvLoops.it	openmpt/it/EnvLoops.data	Impulse Tracker sustain-point and loop combinations, and pre-increment envelope position
+openmpt-it-envelope-off-length	openmpt	it	openmpt/it/EnvOffLength.it	openmpt/it/EnvOffLength.data	Impulse Tracker sustain loop ending on the note-off tick releases one loop later
+openmpt-it-envelope-reset	openmpt	it	openmpt/it/EnvReset.it	openmpt/it/EnvReset.data	Impulse Tracker envelope reset conditions
+openmpt-it-extreme-filter	openmpt	it	openmpt/it/extreme-filter-test-1.it	openmpt/it/extreme-filter-test-1.data	Impulse Tracker resonant filter edge cases without integer scratching
+openmpt-it-fade-portamento	openmpt	it	openmpt/it/Fade-Porta.it	openmpt/it/Fade-Porta.data	Impulse Tracker ignores tone portamento onto a stopped note
+openmpt-it-filter-7f	openmpt	it	openmpt/it/filter-7F.it	openmpt/it/filter-7F.data	Impulse Tracker full cutoff with no resonance leaves the filter off
+openmpt-it-filter-nna	openmpt	it	openmpt/it/filter-nna.it	openmpt/it/filter-nna.data	Impulse Tracker filter reset does not disturb NNA background voices
+openmpt-it-filter-reset	openmpt	it	openmpt/it/filter-reset.it	openmpt/it/filter-reset.data	Impulse Tracker Z7F next to a note without portamento disables the filter
+openmpt-it-filter-reset-carry	openmpt	it	openmpt/it/filter-reset-carry.it	openmpt/it/filter-reset-carry.data	Impulse Tracker filter reset with envelope carry
+openmpt-it-filter-envelope-reset	openmpt	it	openmpt/it/FilterEnvReset.it	openmpt/it/FilterEnvReset.data	Impulse Tracker keeps a zero instrument cutoff when the filter envelope is on
+openmpt-it-fine-volume-column-slide	openmpt	it	openmpt/it/FineVolColSlide.it	openmpt/it/FineVolColSlide.data	Impulse Tracker volume-column fine slides run on the first tick only
+openmpt-it-filter-envelope-carry	openmpt	it	openmpt/it/flt-env-carry.it	openmpt/it/flt-env-carry.data	Impulse Tracker filter envelope carry
+openmpt-it-filter-macro	openmpt	it	openmpt/it/fltmacro.it	openmpt/it/fltmacro.data	Impulse Tracker custom MIDI macro driving cutoff from instrument volume
+openmpt-it-frequency-reset-no-instrument	openmpt	it	openmpt/it/freqreset-noins.it	openmpt/it/freqreset-noins.data	Impulse Tracker updates C5Speed when a bare note changes sample through the map
+openmpt-it-global-volume-invalid	openmpt	it	openmpt/it/globalvol-invalid.it	openmpt/it/globalvol-invalid.data	Impulse Tracker ignores out-of-range Vxx global volume
+openmpt-it-gxx-sample-map	openmpt	it	openmpt/it/gxsmp.it	openmpt/it/gxsmp.data	Impulse Tracker tone portamento across an empty sample map slot
+openmpt-it-gxx-sample-map-change	openmpt	it	openmpt/it/gxsmp2.it	openmpt/it/gxsmp2.data	Impulse Tracker tone portamento that also changes the sample
+openmpt-it-gxx-test	openmpt	it	openmpt/it/gxxtest.it	openmpt/it/gxxtest.data	Impulse Tracker tone portamento and sample map interaction
+openmpt-it-instrument-filter-portamento-reset	openmpt	it	openmpt/it/ins-flt-porta-reset.it	openmpt/it/ins-flt-porta-reset.data	Impulse Tracker skips instrument filter settings under tone portamento
+openmpt-it-instrument-number-change	openmpt	it	openmpt/it/InstrumentNumberChange.it	openmpt/it/InstrumentNumberChange.data	Impulse Tracker instrument mode keeps sounding on an invalid instrument number
+openmpt-it-linear-slides	openmpt	it	openmpt/it/LinearSlides.it	openmpt/it/LinearSlides.data	Impulse Tracker linear slides operate on frequency, not period
+openmpt-it-macro-extended-parameter	openmpt	it	openmpt/it/MacroExtendedParam.it	openmpt/it/MacroExtendedParam.data	Impulse Tracker fixed macros substitute the raw parameter for z
+openmpt-it-macro-last-note	openmpt	it	openmpt/it/macro-lastnote.it	openmpt/it/macro-lastnote.data	Impulse Tracker MIDI macro letter n is the last triggered note
+openmpt-it-multi-zxx	openmpt	it	openmpt/it/MultiZxx.it	openmpt/it/MultiZxx.data	Impulse Tracker macro carrying more than one MIDI message
+openmpt-it-no-map	openmpt	it	openmpt/it/NoMap.it	openmpt/it/NoMap.data	Impulse Tracker New Note Action on an invalid sample mapping
+openmpt-it-note-off-two	openmpt	it	openmpt/it/noteoff2.it	openmpt/it/noteoff2.data	Impulse Tracker note-off and sample change interaction
+openmpt-it-note-off-three	openmpt	it	openmpt/it/noteoff3.it	openmpt/it/noteoff3.data	Impulse Tracker note-off with old effects never fades out
+openmpt-it-note-off-instrument	openmpt	it	openmpt/it/NoteOffInstr.it	openmpt/it/NoteOffInstr.data	Impulse Tracker note cut stops the sample rather than zeroing its volume
+openmpt-it-off-portamento	openmpt	it	openmpt/it/Off-Porta.it	openmpt/it/Off-Porta.data	Impulse Tracker key-off survives a tone portamento without compatible Gxx
+openmpt-it-off-portamento-compatible-gxx	openmpt	it	openmpt/it/Off-Porta-CompatGxx.it	openmpt/it/Off-Porta-CompatGxx.data	Impulse Tracker compatible Gxx clears key-off on a tone portamento
+openmpt-it-pan-reset	openmpt	it	openmpt/it/PanReset.it	openmpt/it/PanReset.data	Impulse Tracker resets default pan on a note, not on a lone instrument
+openmpt-it-portamento-offset	openmpt	it	openmpt/it/porta-offset.it	openmpt/it/porta-offset.data	Impulse Tracker ignores tone portamento next to a sample offset
+openmpt-it-portamento-instrument-number	openmpt	it	openmpt/it/PortaInsNum.it	openmpt/it/PortaInsNum.data	Impulse Tracker portamento across samples plays the new sample
+openmpt-it-portamento-instrument-number-compatible	openmpt	it	openmpt/it/PortaInsNumCompat.it	openmpt/it/PortaInsNumCompat.data	Impulse Tracker compatible Gxx portamento keeps the old sample
+openmpt-it-portamento-just-stopped-note	openmpt	it	openmpt/it/PortaJustStoppedNote.it	openmpt/it/PortaJustStoppedNote.data	Impulse Tracker portamento onto a note stopped on the previous tick
+openmpt-it-portamento-reset	openmpt	it	openmpt/it/PortaReset.it	openmpt/it/PortaReset.data	Impulse Tracker resets the portamento target on every non-portamento note
+openmpt-it-portamento-sample	openmpt	it	openmpt/it/PortaSample.it	openmpt/it/PortaSample.data	Impulse Tracker portamento with an instrument change and Gxx off
+openmpt-it-portamento-sample-compatible	openmpt	it	openmpt/it/PortaSampleCompat.it	openmpt/it/PortaSampleCompat.data	Impulse Tracker compatible Gxx portamento does not switch sample
+openmpt-it-retrigger	openmpt	it	openmpt/it/retrig.it	openmpt/it/retrig.data	Impulse Tracker Qxy retrigger with instrument envelopes
+openmpt-it-retrigger-short	openmpt	it	openmpt/it/retrig-short.it	openmpt/it/retrig-short.data	Impulse Tracker will not retrigger a note shorter than one tick
+openmpt-it-s77	openmpt	it	openmpt/it/s77.it	openmpt/it/s77.data	Impulse Tracker S77-S7C pause and resume envelopes in place
+openmpt-it-s7x-instrument-number	openmpt	it	openmpt/it/s7xinsnum.it	openmpt/it/s7xinsnum.data	Impulse Tracker S7x NNA override is reset by a note, not an instrument
+openmpt-it-sample-number-change	openmpt	it	openmpt/it/SampleNumberChange.it	openmpt/it/SampleNumberChange.data	Impulse Tracker sample mode cuts on an invalid sample number
+openmpt-it-scx	openmpt	it	openmpt/it/scx.it	openmpt/it/scx.data	Impulse Tracker SCx cuts the note the way a note cut does
+openmpt-it-sample-instrument-pan-surround	openmpt	it	openmpt/it/SmpInsPanSurround.it	openmpt/it/SmpInsPanSurround.data	Impulse Tracker sample and instrument panning override channel surround
+openmpt-it-stopped-instrument-swap	openmpt	it	openmpt/it/StoppedInstrSwap.it	openmpt/it/StoppedInstrSwap.data	Impulse Tracker remembers a lone instrument number after playback stopped
+openmpt-it-sustain-after-loop	openmpt	it	openmpt/it/SusAfterLoop.it	openmpt/it/SusAfterLoop.data	Impulse Tracker position fixup when a sustain loop behind a normal loop is released
+openmpt-it-swap-test	openmpt	it	openmpt/it/swaptest.it	openmpt/it/swaptest.data	Impulse Tracker sample playback position when swapping samples on the fly
+openmpt-it-volume-envelope-carry	openmpt	it	openmpt/it/vol-env-carry.it	openmpt/it/vol-env-carry.data	Impulse Tracker volume envelope carry
+openmpt-it-volume-column-memory	openmpt	it	openmpt/it/VolColMemory.it	openmpt/it/VolColMemory.data	Impulse Tracker volume-column slide memory is separate from Dxy
+openmpt-it-volume-macro-letters	openmpt	it	openmpt/it/Volume-Macro-Letters.it	openmpt/it/Volume-Macro-Letters.data	Impulse Tracker Zxx macros are parsed on tick zero after the note columns
+openmpt-it-note-off-portamento	openmpt	it	openmpt/it/wnoteoff.it	openmpt/it/wnoteoff.data	Impulse Tracker note-off combined with instrument and portamento
+openmpt-it-zxx-secrets	openmpt	it	openmpt/it/ZxxSecrets.it	openmpt/it/ZxxSecrets.data	Impulse Tracker undocumented MIDI macro letters h, o and m
+libxmp-it-finevolrowdelaymultiple	libxmp	it	data/FineVolRowDelayMultiple.it	data/FineVolRowDelayMultiple.data	Impulse Tracker volume-column fine slide under a repeated row delay
+libxmp-it-g00-nosuck	libxmp	it	data/G00_nosuck.it	data/G00_nosuck.data	Impulse Tracker G00 reuses the portamento memory instead of stopping
+libxmp-it-l00-nosuck	libxmp	it	data/L00_nosuck.it	data/L00_nosuck.data	Impulse Tracker L00 reuses the portamento and volume-slide memories
+libxmp-it-multi-retrigger	libxmp	it	data/it_multi_retrigger.it	data/it_multi_retrigger.data	Impulse Tracker Qxy retrigger repeated within one row
+libxmp-it-smooth-macro	libxmp	it	data/it_smooth_macro.it	data/it_smooth_macro.data	Impulse Tracker smooth MIDI macro parameter updates
+libxmp-it-pattern-jump-it-break	libxmp	it	data/pattern_jump_it_break.it	data/pattern_jump_it_break.data	Impulse Tracker position jump and pattern break interaction
+libxmp-it-pattern-jump-it-samepos	libxmp	it	data/pattern_jump_it_samepos.it	data/pattern_jump_it_samepos.data	Impulse Tracker position jump back to the order already playing
+libxmp-it-pattern-jump-it-samepos-2	libxmp	it	data/pattern_jump_it_samepos_2.it	data/pattern_jump_it_samepos.data	Impulse Tracker repeated position jump to the same order
+libxmp-it-pattern-jump-mpt-break	libxmp	it	data/pattern_jump_mpt_break.it	data/pattern_jump_mpt_break_it.data	OpenMPT-compatible IT position jump and break interaction
+libxmp-it-pattern-loop-it100	libxmp	it	data/pattern_loop_it100.it	data/pattern_loop_it100.data	Impulse Tracker 1.00 pattern loop
+libxmp-it-pattern-loop-it100-breakjump	libxmp	it	data/pattern_loop_it100_breakjump.it	data/pattern_loop_it100_breakjump.data	Impulse Tracker 1.00 pattern loop with break and jump
+libxmp-it-pattern-loop-it104	libxmp	it	data/pattern_loop_it104.it	data/pattern_loop_it104.data	Impulse Tracker 1.04 pattern loop
+libxmp-it-pattern-loop-it200-breakjump	libxmp	it	data/pattern_loop_it200_breakjump.it	data/pattern_loop_it200_breakjump.data	Impulse Tracker 2.00 pattern loop with break and jump
+libxmp-it-pattern-loop-it210	libxmp	it	data/pattern_loop_it210.it	data/pattern_loop_it210.data	Impulse Tracker 2.10 pattern loop
+libxmp-it-pattern-loop-mpt-breakjump	libxmp	it	data/pattern_loop_mpt_breakjump.it	data/pattern_loop_mpt_breakjump_it.data	OpenMPT-compatible IT pattern loop with break and jump
+libxmp-it-pattern-loop-mpt	libxmp	it	data/pattern_loop_mpt.it	data/pattern_loop_mpt_it.data	OpenMPT-compatible IT pattern loop
+libxmp-it-reverse-it	libxmp	it	data/reverse_it.it	data/reverse_it.data	Impulse Tracker sample reverse playback
+libxmp-it-play-it-globalvol-marker	libxmp	it	data/f/play_it_globalvol_marker.it	data/f/play_it_globalvol_marker.data	Fuzzed IT global volume across an order-list marker
+libxmp-it-play-it-vol-clamp	libxmp	it	data/f/play_it_vol_clamp.it	data/f/play_it_vol_clamp.data	Fuzzed IT volume clamping
+libxmp-it-channel-filter	libxmp	it	data/it_channel_filter.it	data/it_channel_filter.data	Impulse Tracker per-channel resonant filter state
+libxmp-it-cut-invalid-ins	libxmp	it	data/it_cut_invalid_ins.it	data/it_cut_invalid_ins.data	Impulse Tracker note with an invalid instrument number
+libxmp-it-default-volume	libxmp	it	data/default_volume.it	data/default_volume_it.data	Impulse Tracker default sample and instrument volume
+libxmp-it-double-toneporta	libxmp	it	data/it_double_toneporta.it	data/it_double_toneporta.data	Impulse Tracker tone portamento in both columns of one cell
+libxmp-it-duplicate-check-transpose	libxmp	it	data/duplicate_check_transpose.it	data/duplicate_check_transpose.data	Impulse Tracker duplicate check across a transposed sample map
+libxmp-it-fade-env-reset	libxmp	it	data/it_fade_env_reset.it	data/it_fade_env_reset.data	Impulse Tracker envelope reset on a faded note
+libxmp-it-fade-env-reset-carry	libxmp	it	data/it_fade_env_reset_carry.it	data/it_fade_env_reset_carry.data	Impulse Tracker envelope reset on a faded note with carry
+libxmp-it-high-offset-memory	libxmp	it	data/it_high_offset_memory.it	data/it_high_offset_memory.data	Impulse Tracker SAy high-offset memory
+libxmp-it-high-offset-memory-oldfx	libxmp	it	data/it_high_offset_memory_oldfx.it	data/it_high_offset_memory_oldfx.data	Impulse Tracker SAy high-offset memory with old effects
+libxmp-it-instrument-memory-default	libxmp	it	data/it_instrument_memory_default.it	data/it_instrument_memory_default.data	Impulse Tracker lone instrument number reapplies volume and pan
+libxmp-it-test-keyoff	libxmp	it	data/test_keyoff.it	data/test_keyoff.data	Impulse Tracker key-off handling
+libxmp-it-note-after-cut	libxmp	it	data/note_after_cut.it	data/note_after_cut.data	Impulse Tracker note following a note cut
+libxmp-it-note-delay-nna	libxmp	it	data/it_note_delay_nna.it	data/it_note_delay_nna.data	Impulse Tracker SDx note delay with a New Note Action
+libxmp-it-noteoff-nosuck	libxmp	it	data/NoteOff_nosuck.it	data/NoteOff_nosuck.data	Impulse Tracker note-off keeps the sample sounding
+libxmp-it-portamento-after-cut-fade	libxmp	it	data/portamento_after_cut_fade.it	data/portamento_after_cut_fade.data	Impulse Tracker tone portamento after a cut and fade
+libxmp-it-portamento-after-cut-fade-cg	libxmp	it	data/portamento_after_cut_fade_cg.it	data/portamento_after_cut_fade_cg.data	Impulse Tracker tone portamento after a cut and fade with compatible Gxx
+libxmp-it-portamento-after-keyoff	libxmp	it	data/portamento_after_keyoff.it	data/portamento_after_keyoff.data	Impulse Tracker tone portamento after a key-off
+libxmp-it-portamento-after-keyoff-cg	libxmp	it	data/portamento_after_keyoff_cg.it	data/portamento_after_keyoff_cg.data	Impulse Tracker tone portamento after a key-off with compatible Gxx
+libxmp-it-portamento-envelope-reset	libxmp	it	data/it_portamento_envelope_reset.it	data/it_portamento_envelope_reset.data	Impulse Tracker envelope reset under tone portamento
+libxmp-it-portamento-envelope-reset-cg	libxmp	it	data/it_portamento_envelope_reset_cg.it	data/it_portamento_envelope_reset_cg.data	Impulse Tracker envelope reset under compatible-Gxx tone portamento
+libxmp-it-portamento-nna-sample	libxmp	it	data/portamento_nna_sample.it	data/portamento_nna_sample.data	Impulse Tracker tone portamento with a New Note Action sample change
+libxmp-it-portamento-offset	libxmp	it	data/portamento_offset.it	data/portamento_offset.data	Impulse Tracker tone portamento next to a sample offset
+libxmp-it-portamento-sustain	libxmp	it	data/portamento_sustain.it	data/portamento_sustain.data	Impulse Tracker tone portamento into a sustain loop
+libxmp-it-sample-porta	libxmp	it	data/it_sample_porta.it	data/it_sample_porta.data	Impulse Tracker instrument change during tone portamento
+libxmp-it-sus-after-loop-bidi	libxmp	it	data/it_sus_after_loop_bidi.it	data/it_sus_after_loop_bidi.data	Impulse Tracker bidirectional sustain loop released into a normal loop
+libxmp-it-mpt-it-double-toneporta	libxmp	it	data/mpt_it_double_toneporta.it	data/mpt_it_double_toneporta.data	OpenMPT-compatible IT tone portamento in both columns
+libxmp-it-sample-sync	libxmp	it	data/sample_sync.it	data/sample_sync.data	Impulse Tracker sample position sync on an instrument swap
+libxmp-it-storlek-01	libxmp	it	data/storlek_01.it	data/storlek_01.data	Storlek 01: arpeggio and pitch slide
+libxmp-it-storlek-02	libxmp	it	data/storlek_02.it	data/storlek_02.data	Storlek 02: arpeggio with no parameter
+libxmp-it-storlek-03	libxmp	it	data/storlek_03.it	data/storlek_03.data	Storlek 03: compatible Gxx disabled
+libxmp-it-storlek-04	libxmp	it	data/storlek_04.it	data/storlek_04.data	Storlek 04: compatible Gxx enabled
+libxmp-it-storlek-05	libxmp	it	data/storlek_05.it	data/storlek_05.data	Storlek 05: Gxx and fine slide memory
+libxmp-it-storlek-06	libxmp	it	data/storlek_06.it	data/storlek_06.data	Storlek 06: volume column and fine slides
+libxmp-it-storlek-07	libxmp	it	data/storlek_07.it	data/storlek_07.data	Storlek 07: note cut with a sample
+libxmp-it-storlek-08	libxmp	it	data/storlek_08.it	data/storlek_08.data	Storlek 08: out-of-range note and pattern delays
+libxmp-it-storlek-10	libxmp	it	data/storlek_10.it	data/storlek_10.data	Storlek 10: pattern loop
+libxmp-it-storlek-17	libxmp	it	data/storlek_17.it	data/storlek_17.data	Storlek 17: pattern row delay
+libxmp-it-storlek-18	libxmp	it	data/storlek_18.it	data/storlek_18.data	Storlek 18: sample number with a new note
+libxmp-it-storlek-21	libxmp	it	data/storlek_21.it	data/storlek_21.data	Storlek 21: pitch slide limits
+libxmp-it-storlek-22	libxmp	it	data/storlek_22.it	data/storlek_22.data	Storlek 22: zero note cut and delay
+libxmp-it-storlek-23	libxmp	it	data/storlek_23.it	data/storlek_23.data	Storlek 23: portamento with no note
+libxmp-it-storlek-24	libxmp	it	data/storlek_24.it	data/storlek_24.data	Storlek 24: short envelope loops
+libxmp-it-storlek-25	libxmp	it	data/storlek_25.it	data/storlek_25.data	Storlek 25: portamento and pitch slide
