@@ -392,6 +392,7 @@ impl Host {
             }),
             Some(ModuleFormat::S3m) => starplayer::s3m::load(bytes),
             Some(ModuleFormat::Mtm) => starplayer::mtm::load(bytes),
+            Some(ModuleFormat::Xm) => starplayer::xm::load(bytes),
             _ => Err(starplayer::core::Error::BadMagic),
         }.map_err(|error| error.to_string())?;
         let module = Arc::new(loaded);

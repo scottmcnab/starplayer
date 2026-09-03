@@ -1168,7 +1168,6 @@ dependencies = [
  "sha2",
  "starplayer",
  "starplayer-it",
- "starplayer-xm",
 ]
 
 [[package]]
@@ -1232,6 +1231,7 @@ version = "0.1.0"
 dependencies = [
  "starplayer-core",
  "starplayer-engine",
+ "starplayer-mixer",
  "starplayer-model",
  "starplayer-rt",
 ]

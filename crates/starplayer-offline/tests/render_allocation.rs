@@ -164,6 +164,9 @@ fn classify(bytes: &[u8]) -> Option<ModuleFormat> {
     if starplayer::mtm::probe(bytes) {
         return Some(ModuleFormat::Mtm);
     }
+    if starplayer::xm::probe(bytes) {
+        return Some(ModuleFormat::Xm);
+    }
     if starplayer::mod_file::probe(bytes) {
         return Some(ModuleFormat::Mod);
     }
@@ -203,8 +206,9 @@ fn corpus() -> Vec<CorpusEntry> {
 
     entries.push(CorpusEntry { name: "fixtures::synthetic_mod".to_string(), format: ModuleFormat::Mod, bytes: starplayer_offline::fixtures::synthetic_mod() });
     entries.push(CorpusEntry { name: "fixtures::synthetic_mtm".to_string(), format: ModuleFormat::Mtm, bytes: starplayer_offline::fixtures::synthetic_mtm() });
+    entries.push(CorpusEntry { name: "fixtures::synthetic_xm".to_string(), format: ModuleFormat::Xm, bytes: starplayer_offline::fixtures::synthetic_xm() });
 
-    for format in ["mod", "s3m", "mtm"] {
+    for format in ["mod", "s3m", "mtm", "xm"] {
         collect_directory(&root.join("fuzz/seeds").join(format), &mut entries);
         collect_directory(&root.join("fuzz/regressions").join(format), &mut entries);
     }
@@ -236,6 +240,7 @@ fn load(format: ModuleFormat, bytes: &[u8]) -> Option<Module> {
         ModuleFormat::Mod => starplayer::mod_file::load(bytes).ok(),
         ModuleFormat::S3m => starplayer::s3m::load(bytes).ok(),
         ModuleFormat::Mtm => starplayer::mtm::load(bytes).ok(),
+        ModuleFormat::Xm => starplayer::xm::load(bytes).ok(),
         _ => None,
     }
 }
@@ -245,6 +250,7 @@ fn source_for(format: ModuleFormat, module: Arc<Module>) -> Option<Box<dyn Event
         ModuleFormat::Mod => Some(Box::new(starplayer::mod_file::sequencer_for(module, SAMPLE_RATE_HZ, ExactFixedPoint))),
         ModuleFormat::S3m => Some(Box::new(starplayer::s3m::sequencer_for(module, SAMPLE_RATE_HZ, ExactFixedPoint))),
         ModuleFormat::Mtm => Some(Box::new(starplayer::mtm::sequencer_for(module, SAMPLE_RATE_HZ, ExactFixedPoint))),
+        ModuleFormat::Xm => Some(Box::new(starplayer::xm::sequencer_for(module, SAMPLE_RATE_HZ, ExactFixedPoint))),
         _ => None,
     }
 }

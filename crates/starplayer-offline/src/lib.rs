@@ -102,11 +102,12 @@ pub enum GoldenFormat {
     Mod,
     S3m,
     Mtm,
+    Xm,
 }
 
 impl GoldenFormat {
     /// Every format the golden contract covers.
-    pub const ALL: [GoldenFormat; 3] = [GoldenFormat::Mod, GoldenFormat::S3m, GoldenFormat::Mtm];
+    pub const ALL: [GoldenFormat; 4] = [GoldenFormat::Mod, GoldenFormat::S3m, GoldenFormat::Mtm, GoldenFormat::Xm];
 
     /// The `goldens/<format>/` directory this format's hashes live in.
     pub const fn directory(self) -> &'static str {
@@ -114,6 +115,7 @@ impl GoldenFormat {
             GoldenFormat::Mod => "mod",
             GoldenFormat::S3m => "s3m",
             GoldenFormat::Mtm => "mtm",
+            GoldenFormat::Xm => "xm",
         }
     }
 
@@ -128,6 +130,7 @@ impl GoldenFormat {
             GoldenFormat::Mod => ModuleFormat::Mod,
             GoldenFormat::S3m => ModuleFormat::S3m,
             GoldenFormat::Mtm => ModuleFormat::Mtm,
+            GoldenFormat::Xm => ModuleFormat::Xm,
         }
     }
 }
@@ -593,6 +596,12 @@ pub fn trace_mtm(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceErro
     trace_loaded(Arc::new(starplayer::mtm::load(bytes)?), options)
 }
 
+/// Load an XM and capture its stable per-tick trace through the FastTracker 2 processor.
+#[cfg(feature = "trace")]
+pub fn trace_xm(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
+    trace_loaded(Arc::new(starplayer::xm::load(bytes)?), options)
+}
+
 #[cfg(feature = "trace")]
 fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, TraceError> {
     let engine_settings = EngineSettings {
@@ -802,10 +811,12 @@ mod tests {
     fn every_golden_format_renders_audibly_and_hashes_identically_at_every_block_size() {
         let synthetic_mod = fixtures::synthetic_mod();
         let synthetic_mtm = fixtures::synthetic_mtm();
+        let synthetic_xm = fixtures::synthetic_xm();
         let corpus: &[(GoldenFormat, &str, &[u8])] = &[
             (GoldenFormat::Mod, "synthetic", &synthetic_mod),
             (GoldenFormat::S3m, "REFLEX.S3M", REFLEX),
             (GoldenFormat::Mtm, "synthetic", &synthetic_mtm),
+            (GoldenFormat::Xm, "synthetic", &synthetic_xm),
         ];
         for &(format, name, bytes) in corpus {
             let reference = render_fixed_mono(format, bytes, GOLDEN_HOST_BLOCK_FRAMES).expect("the fixture renders");
@@ -848,6 +859,7 @@ mod tests {
             (GoldenFormat::Mod, "synthetic", fixtures::synthetic_mod()),
             (GoldenFormat::S3m, "REFLEX.S3M", REFLEX.to_vec()),
             (GoldenFormat::Mtm, "synthetic", fixtures::synthetic_mtm()),
+            (GoldenFormat::Xm, "synthetic", fixtures::synthetic_xm()),
         ]
     }
 
@@ -901,6 +913,7 @@ mod tests {
             GoldenFormat::Mod => drive!(starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks)),
             GoldenFormat::S3m => drive!(starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks)),
             GoldenFormat::Mtm => drive!(starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks)),
+            GoldenFormat::Xm => drive!(starplayer::xm::sequencer_with_quirks(module, sample_rate_hz, quirks)),
         }
     }
 
@@ -1118,6 +1131,7 @@ mod tests {
                 GoldenFormat::Mod => check!(starplayer::mod_file::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
                 GoldenFormat::S3m => check!(starplayer::s3m::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
                 GoldenFormat::Mtm => check!(starplayer::mtm::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
+                GoldenFormat::Xm => check!(starplayer::xm::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
             }
         }
     }
@@ -1147,7 +1161,7 @@ mod tests {
 
     #[test]
     fn the_golden_formats_and_their_directories_are_distinct() {
-        assert_eq!(GoldenFormat::ALL.map(GoldenFormat::directory), ["mod", "s3m", "mtm"]);
+        assert_eq!(GoldenFormat::ALL.map(GoldenFormat::directory), ["mod", "s3m", "mtm", "xm"]);
         assert_eq!(GoldenFormat::S3m.to_string(), "s3m");
     }
 

@@ -56,7 +56,7 @@ use clap::{Parser, Subcommand};
 
 /// StarPlayer's command-line player and offline renderer.
 ///
-/// Plays, renders and inspects MOD/S3M/MTM modules — see the module-level docs
+/// Plays, renders and inspects MOD/S3M/MTM/XM modules — see the module-level docs
 /// (`starplayer --help` after any subcommand shows that subcommand's own flags).
 #[derive(Parser, Debug)]
 #[command(name = "starplayer", version, about, long_about = None)]
