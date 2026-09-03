@@ -15,9 +15,6 @@
 //! a host that probes formats in the wrong order must not be able to crash a loader with
 //! another format's bytes.
 //!
-//! XM goes through `starplayer_xm` directly rather than through the facade: task F4 adds
-//! the `starplayer::xm` arms, and this file is meant to be checking the loader from the
-//! commit that introduces it.
 //! IT reaches its loader through `starplayer-it` directly rather than through the facade:
 //! the facade's IT arm is task G5, and the seeds are worth replaying before it lands.
 
@@ -48,12 +45,12 @@ fn every_loader_survives(bytes: &[u8]) {
     let _ = starplayer::mod_file::probe(bytes);
     let _ = starplayer::s3m::probe(bytes);
     let _ = starplayer::mtm::probe(bytes);
-    let _ = starplayer_xm::probe(bytes);
+    let _ = starplayer::xm::probe(bytes);
     let _ = starplayer_it::probe(bytes);
     let _ = starplayer::mod_file::load(bytes);
     let _ = starplayer::s3m::load(bytes);
     let _ = starplayer::mtm::load(bytes);
-    let _ = starplayer_xm::load(bytes);
+    let _ = starplayer::xm::load(bytes);
     let _ = starplayer_it::load(bytes);
 }
 
@@ -62,7 +59,7 @@ fn load_for(format: &str, bytes: &[u8]) -> Result<starplayer::model::Module, sta
         "mod" => starplayer::mod_file::load(bytes),
         "s3m" => starplayer::s3m::load(bytes),
         "mtm" => starplayer::mtm::load(bytes),
-        "xm" => starplayer_xm::load(bytes),
+        "xm" => starplayer::xm::load(bytes),
         "it" => starplayer_it::load(bytes),
         other => panic!("unknown fuzz corpus format `{other}`"),
     }

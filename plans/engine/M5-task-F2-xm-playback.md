@@ -259,3 +259,157 @@ commits.
 
 NNA and anything IT (M6). MIDI. Changing the S3M/MOD/MTM processors or the shared engine
 envelope-free design. Fixing the pre-existing `headless.mjs` failure.
+
+## Research resolution
+
+### 1. What libxmp's XM dumps contain — **verdict: an Amiga-style mixer period, not XM's linear one; the projection converts the oracle into FastTracker 2's domain**
+
+Settled from the pinned tree before any effect code was written, and written into
+`conformance/README.md` §"XM (task F2)".
+
+`test-dev/compare_mixer_data.c:60-98` is the authority on the columns: `time row frame chan
+xc->info_period vi->note vi->ins vi->vol vi->pan vi->pos0 [cutoff [resonance]]`, one line per
+tick per channel with a mapped, sounding voice.
+
+* **`period`.** `xc->info_period = MIN(final_period * 4096, INT_MAX)` where
+  `final_period = libxmp_note_to_period_mix(xc->note, linear_bend)` is
+  `13696 / 2^((note + bend/12800)/12)` (`src/player.c:1276-1298`, `src/period.c:205-209`).
+  That is the **same continuous Amiga-style quantity libxmp reports for every format**; XM's
+  linear period lives only in `xc->period` and is never dumped. FastTracker 2's linear period
+  is `7744 - 64 * note - 4 * (finetune >> 3)`, so the adapter converts the *oracle* into FT2's
+  domain — `ft2_period = 8448 + 768 * log2(mix_period / 13696)` — rather than the reverse.
+  The direction matters: in FT2's domain a finetune-sized pitch difference is a fixed handful
+  of period units at every pitch, where in libxmp's it is hundreds of Q12 units at a low
+  period and a fraction of one at a high one, so no single tolerance would work. The anchor
+  constant is FT2's own period at libxmp's `PERIOD_BASE`: libxmp note 60 is C-4, mixer period
+  428, FT2 period 4608, and `4608 + 768 * log2(13696 / 428) == 8448`. **Amiga**-mode XM needs
+  no logarithm at all — FT2's Amiga period is four times ProTracker's, so it divides by 1024
+  exactly as S3M does — and which of the two applies is read from the loaded module's
+  `linear_slides` flag through `SampleGeometry`, for the same reason the loop spans are.
+* **`note`.** `vi->note`, set only by `libxmp_virt_setpatch`, and built as
+  `(XM note byte - 1) + 12 + relative_note` (`src/read_event.c:549-598`, folding `sub->xpo`;
+  `map[].xpo` is always zero for XM). `XmProcessor` traces the same "real note" FastTracker 2
+  computes — the pattern's note byte plus the sample's relative note, zero-based from C-0 —
+  so `project_note` is the same one-octave subtraction S3M and MTM already use. It reports the
+  note the **sounding voice** started on rather than the latched note byte, because FT2 latches
+  a note and then rejects a transposed value outside C-0..B-9 while leaving the previous note
+  playing (`XmChannel::sounding_note`).
+* **`volume`.** `vi->vol`, 0..1024, post-tremolo, post-fadeout, post-envelope,
+  post-global-volume, post-track-volume and post-tremor, with truncations at `>> 6` and
+  `>> 18` (`src/player.c:1061-1119`). The adapter's existing `(x + 8) / 16` lands it on the
+  trace's 0..64, so the processor keeps its own final volume in a 0..65536 integer domain and
+  **rounds** into 64 — truncating disagreed by one wherever the discarded bits were ≥ 8.
+* **`pan`.** Signed −128..+127, post pan-envelope. XM keeps the whole byte, as MOD does,
+  because an XM panning envelope moves it one unit at a time.
+* **`position`.** `vi->pos0` is the truncated integer source position at the *start* of the
+  tick (`src/mixer.c:543-553`), so XM floors its Q32.32 position the way MOD and MTM do and
+  then applies libxmp's own one-integer-frame bound.
+* **`step_per_output_frame`.** For XM the harness predicts a one-shot's end from
+  `8363 * 2^((4608 - period) / 768)`, in `f64` — this is the comparison harness, not the
+  engine, whose own path is `starplayer-core`'s table.
+* **An empty dump is an oracle.** libxmp writes a line only for a mapped, sounding channel, so
+  a fixture whose whole point is that nothing plays has a zero-byte `.data`.
+  `parse_libxmp_dump` no longer rejects that, and `diff_libxmp_dump` reads it as "no channel
+  may ever be active" and enforces it against the whole capture rather than comparing two
+  empty projections. `openmpt/xm/DelayCombination.data` is exactly that and passes;
+  `openmpt/xm/PanMemory.data` is empty for a module that *does* sound notes, which is
+  `F2-XM-012`.
+
+### 2. Integer Hz — **verdict: the premise is a UI function, not the replayer; the real drift is FastTracker 2's sixteen-step finetune, and it is accuracy policy D42**
+
+`linearPeriod2Hz` in the task description is `getSampleC4Hz` (`ft2_replayer.c:286-311`), which
+FT2 uses to *display* a sample's mid-C rate in the instrument editor. The **replayer** never
+materialises a frequency in hertz at all: `period2Ft2Delta` (line 239) goes straight from the
+period to a Q16.16 mixer delta through `logTab`, with no integer-hertz step anywhere. There is
+therefore nothing to record about integer-hertz truncation, and StarPlayer's
+`step_for_period` reads the same shared Q8.24 table with the same shift idiom and divides once
+by the output rate, so its only rounding is the table's own.
+
+What the research point was reaching for is real, but it is one layer up. FastTracker 2
+quantises a sample's **finetune** to sixteen steps: its 1936-entry period table is indexed
+`note * 16 + ((finetune >> 3) + 16)` (`triggerNote`, and OpenMPT's `kFT2FinetunePrecision`),
+where libxmp interpolates `finetune / 128` continuously (`src/period.c:184-188`). The two
+therefore play the same pattern note up to `finetune/2 - 4 * (finetune >> 3)` native period
+units apart — at most 3.5 — and the source position drifts from the very first tick.
+
+**Measured on the corpus:** of the 93 XM cases, **38** carry at least one sample whose
+finetune is not a multiple of eight, and every one of those 38 diverges on `position` and on
+nothing else. They are all OpenMPT fixtures, and 37 of them use finetune −28. The engine was
+**not** changed to match libxmp, exactly as D14 keeps ProTracker's sixteen integer finetune
+tables against the same continuous formula; the harness compares XM periods with a four-unit
+tolerance, which is that bound rounded up, and the 38 cases waive `position`. Two consequences
+are recorded with them: where glissando rounds the sliding period to a note the two can land a
+whole semitone apart (`openmpt-xm-glissando`), and where a one-shot sample runs out the 0.18 %
+pitch difference moves the tick it ends on, so five cases additionally waive `active`.
+
+A **second**, unrelated position family turned up in the same sweep: 14 cases whose finetunes
+are all multiples of eight still drift, and there the cause is D19 — libxmp truncates every
+mixer tick to `(int)(rate * 2.5 / bpm)` where StarPlayer carries the rational remainder. That
+is the entry MTM already uses, reused rather than duplicated.
+
+### 3. Which `kFT2*` behaviours the cases exercise — **verdict: catalogued before implementing; nine are reproduced by design and named in accuracy policy §1**
+
+The 50 `openmpt/xm` fixtures with oracles were catalogued from their `test_openmpt_xm_*.c`
+comments before the processor was written, and the 43 `data/ft2_*.xm` fixtures with them (see
+research point 5). Grouped by mechanism, with the `Snd_defs.h` names checked against the
+OpenMPT tree rather than guessed:
+
+| Mechanism | Behaviours | Fixtures |
+|---|---|---|
+| Note delay | `kFT2NoteDelayWithoutInstr`, `kFT2OutOfRangeDelay`, `kFT2RetrigWithNoteDelay`, `kFT2PanWithDelayedNoteOff`, `kFT2VolColDelay` | `delay1`..`delay3`, `DelayCombination`, `envretrig`, `OffDelay`, `PanOff`, `delaycut`, the five `ft2_delay_*` |
+| Note-off / key-off | `kFT2KeyOff`, `kFT2NoteOffFlags`, `kFT2ReloadSampleSettings` | `key_off`, `KeyOff2`, `NoteOff`, `NoteOff2`, `NoteOffVolume`, `NoteOffFade`, `keyoff+instr`, `ft2_kxx`, `ft2_k00_*` |
+| Envelopes | `kFT2EnvelopeEscape`, `kFT2SetPanEnvPos` | `EnvLoops`, `EnvOff`, `SetEnvPos`, `Pickup`, `3xxins`, `ft2_envelope_*` |
+| Tone portamento | `kFT2PortaIgnoreInstr`, `kFT2PortaUpDownMemory`, `kFT2VolColMemory` | `porta-offset`, `Porta-Pickup`, `Porta-LinkMem`(`_old`), `TonePortamentoMemory`, `ft2_double_toneporta` |
+| Offset | `kFT2ST3OffsetOutOfRange`, `kFT2OffsetMemoryRequiresNote` | `OffsetRange`, `3xx-no-old-samp`(`-noft`), `ft2_offset_memory` |
+| Arpeggio and periods | `kFT2Arpeggio`, `kFT2Periods`, `kFT2FinetunePrecision` | `Arpeggio`, `ArpeggioClamp_old`, `ArpSlide_old`, `finetune`, `FreqWraparound` |
+| Waveforms | `kFT2MODTremoloRampWaveform` | `TremoloWaveforms`, `VibratoWaveforms` |
+| Tremor | `kFT2Tremor` | `Tremor`, `TremorInstr`, `TremorRecover`, `ft2_tremor_*` |
+| Panning | `kFT2PanSlide`, `kFT2VolColMemory` | `PanSlideMem`, `PanMemory`, `PanMemory2` |
+| Pattern flow | `kFT2PatternLoopWithJumps`, `kFT2LoopE60Restart`, `kFT2RestrictXCommand` | `PatLoop-Break`, `PatLoop-Weird`, `PatternDelays`, `PatternDelaysRetrig` |
+| Note range | `kFT2Transpose` | `NoteLimit`, `NoteLimit2`, `ft2_note_range*` |
+| Retrigger | `kFT2Retrigger` | `E90`, `ft2_*retrig*` |
+
+Nine of these are now rows in `plans/product/03-accuracy-policy.md` §1 — the arpeggio table
+overrun, the tremolo ramp's vibrato sign, the pattern-loop/jump interaction, the finetune
+quantisation, the out-of-range transpose, the invalid-sample cut, `Rxy`'s tick-zero
+retrigger, `Lxx`'s panning-envelope gate, the volume-column pan slide of zero, and the `Xxy`
+restriction — because each is a behaviour StarPlayer reproduces on purpose and would
+otherwise look like a bug. Three of the twelve `F2-XM-*` records name a quirk that is **not**
+reproduced yet: `kFT2LoopE60Restart` (`F2-XM-009`), the Skale offset dialect (`F2-XM-007`)
+and the ModPlug/MadTracker/rst double tone portamento (`F2-XM-001`).
+
+### 4. FastTracker 2's volume ramping — **verdict: a mixer property; no oracle field depends on it, and the mixer's 64-frame ramp is untouched**
+
+FT2's `CS_USE_QUICK_VOLRAMP` selects a ramp length in its own mixer
+(`calcReplayerVars`: `quickVolRampSamples = audioFreq / (refFreq / (refFreq / 200))`), and
+`ft2-clone` applies it in `ft2_mix.c`, not in the replayer. Nothing in the replayer's state
+depends on it.
+
+On the oracle side the dumped `vol` is `vi->vol`, which `libxmp_mixer_setvol` assigns
+directly (`src/mixer.c:946-955`) — libxmp's own ramp lives in `vi->old_vl`/`vi->vol` deltas
+computed inside `libxmp_mixer_softmixer` and is never dumped. So neither implementation's
+ramp is observable through the comparison, and `starplayer-mixer`'s `RAMP_FRAMES` was not
+touched. The one place a ramp *is* visible is the advisory perceptual comparison, where it is
+part of the audio rather than of the state.
+
+### 5. The `data/*.xm` inline expectations — **verdict: the task file's premise was wrong; 43 of them already carry `.data` oracles, and adding XM to the audit made them mandatory**
+
+The task file expected the `data/*.xm` player fixtures to state their expectations inline in
+`test_player_ft2_*.c`. They do not: 37 of the 40 XM player tests are a bare
+`compare_mixer_data("data/ft2_X.xm", "data/ft2_X.data")` against a `.data` file in **exactly
+the format** the OpenMPT fixtures use. So there is no second oracle type to consider and
+nothing to convert — the whole corpus shares one schema.
+
+That changed the scope of deliverable 1. `audit_pinned_corpus` requires the manifest to be
+the complete set of `compare_mixer_data*` calls whose module has a target extension, so the
+moment `matches_target_extension` gained `"xm"` **every** XM call had to appear in
+`cases.tsv`, not only the `openmpt/xm` ones. The manifest therefore grew by 93 rows — 50
+OpenMPT and 43 libxmp — rather than the 50 the task file anticipated, and all 93 are executed,
+compared and accounted for. Leaving the libxmp ones out was not an option: the audit is a hard
+error, and it is the check that stops the corpus quietly shrinking.
+
+Three of the 40 XM player tests are bespoke and have no fixture at all —
+`test_player_ft2_note_noins_after_invalid_ins`, `test_player_ft2_note_noins_after_keyoff` and
+`test_player_xm_envelope_zero_loop` build a module in memory and assert on `mixer_voice`
+fields directly. They are not convertible without hand-porting, and this task did not build a
+second oracle type for them, as instructed.

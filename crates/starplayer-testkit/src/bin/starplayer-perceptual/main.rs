@@ -211,7 +211,7 @@ fn committed_fixtures() -> Vec<Fixture> {
 
 /// A `--corpus` module: name the processor by its extension, then read it.
 ///
-/// `Ok(None)` is an extension no `GoldenFormat` covers — an XM or an IT until F4/G5 land.
+/// `Ok(None)` is an extension no `GoldenFormat` covers — an IT until G5 lands.
 /// That is a skip; only an unreadable path is an error.
 fn load_corpus_fixture(path: &Path) -> Result<Option<Fixture>, String> {
     let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
@@ -219,6 +219,7 @@ fn load_corpus_fixture(path: &Path) -> Result<Option<Fixture>, String> {
         "mod" => (GoldenFormat::Mod, "mod"),
         "s3m" => (GoldenFormat::S3m, "s3m"),
         "mtm" => (GoldenFormat::Mtm, "mtm"),
+        "xm" => (GoldenFormat::Xm, "xm"),
         _ => return Ok(None),
     };
     let bytes = std::fs::read(path).map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
@@ -373,9 +374,9 @@ mod tests {
 
     #[test]
     fn an_unsupported_corpus_extension_is_skipped_rather_than_guessed() {
-        // Skipped before the file is even read, so an XM the corpus names cannot fail the
-        // run just because this checkout has no loader for it yet.
-        assert!(matches!(load_corpus_fixture(Path::new("does-not-exist.xm")), Ok(None)));
+        // Skipped before the file is even read, so an IT the corpus names cannot fail the
+        // run just because this checkout has no processor for it yet.
+        assert!(matches!(load_corpus_fixture(Path::new("does-not-exist.it")), Ok(None)));
     }
 
     #[test]

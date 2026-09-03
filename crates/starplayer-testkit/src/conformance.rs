@@ -26,22 +26,41 @@ const POSITION_TOLERANCE: u64 = 1u64 << 32;
 const ST3_FREQUENCY_NUMERATOR: u64 = 14_317_056;
 const PAULA_PAL_CLOCK_HZ: u64 = 3_546_895;
 
-/// The formats covered by milestone M2.
+/// libxmp's `PERIOD_BASE` (`src/period.h:6`), the Amiga period it calls C-0.
+const LIBXMP_PERIOD_BASE: f64 = 13_696.0;
+
+/// The FastTracker 2 linear period that libxmp's `PERIOD_BASE` corresponds to.
+///
+/// libxmp dumps `xc->info_period`, which for **every** format is the continuous Amiga-style
+/// mixer period `13696 / 2^(note/12)` in Q20.12 (`src/player.c:1276-1298`) — it never
+/// materialises XM's linear period at all. FT2's linear period runs the other way, `7744 -
+/// 64 * note - 4 * (finetune >> 3)`, so converting one into the other is
+/// `ft2_period = 8448 + 768 * log2(mix_period / 13696)`. The constant is FT2's own period
+/// for libxmp's note 0: libxmp note 60 is C-4, mix period 428, FT2 period 4608, and
+/// `4608 + 768 * log2(13696 / 428) == 8448`.
+const FT2_PERIOD_AT_LIBXMP_BASE: f64 = 8_448.0;
+
+/// The reference rate every XM sample plays C-4 at.
+const XM_REFERENCE_RATE_HZ: f64 = 8_363.0;
+
+/// The formats the corpus harness compares — M2's three plus M5's XM.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConformanceFormat {
     Mod,
     S3m,
     Mtm,
+    Xm,
 }
 
 impl ConformanceFormat {
-    pub const ALL: [ConformanceFormat; 3] = [ConformanceFormat::Mod, ConformanceFormat::S3m, ConformanceFormat::Mtm];
+    pub const ALL: [ConformanceFormat; 4] = [ConformanceFormat::Mod, ConformanceFormat::S3m, ConformanceFormat::Mtm, ConformanceFormat::Xm];
 
     fn parse(value: &str) -> Option<ConformanceFormat> {
         match value {
             "mod" => Some(ConformanceFormat::Mod),
             "s3m" => Some(ConformanceFormat::S3m),
             "mtm" => Some(ConformanceFormat::Mtm),
+            "xm" => Some(ConformanceFormat::Xm),
             _ => None,
         }
     }
@@ -53,6 +72,7 @@ impl fmt::Display for ConformanceFormat {
             ConformanceFormat::Mod => "MOD",
             ConformanceFormat::S3m => "S3M",
             ConformanceFormat::Mtm => "MTM",
+            ConformanceFormat::Xm => "XM",
         })
     }
 }
@@ -151,7 +171,7 @@ const UNWAIVABLE_FIELDS: [TraceField; 4] = [
 /// Scope accounting for the pinned snapshot.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CorpusInventory {
-    /// Every MOD/S3M/MTM binary present, including malformed loader/fuzzer seeds.
+    /// Every MOD/S3M/MTM/XM binary present, including malformed loader/fuzzer seeds.
     pub module_binaries: usize,
     /// Calls to libxmp's frame-state comparator (manifest rows).
     pub state_oracle_cases: usize,
@@ -159,7 +179,7 @@ pub struct CorpusInventory {
     pub state_oracle_modules: usize,
     /// Binaries which are useful seeds but do not ship a frame-state oracle.
     pub without_state_oracle: usize,
-    /// All MOD/S3M resources under libxmp's OpenMPT snapshot.
+    /// All MOD/S3M/XM resources under libxmp's OpenMPT snapshot.
     pub openmpt_modules: usize,
     /// OpenMPT modules with at least one generated frame-state oracle.
     pub openmpt_oracle_modules: usize,
@@ -192,8 +212,9 @@ pub fn audit_pinned_corpus(corpus: &Path, cases: &[ConformanceCase]) -> Result<C
     let mut binaries = BTreeSet::new();
     collect_format_binaries(corpus, corpus, &mut binaries)?;
     let oracle_modules: BTreeSet<PathBuf> = upstream_pairs.iter().map(|(module, _)| module.clone()).collect();
-    let openmpt_modules: BTreeSet<&PathBuf> = binaries.iter().filter(|path| path.starts_with("openmpt/mod") || path.starts_with("openmpt/s3m")).collect();
-    let openmpt_oracle_modules = oracle_modules.iter().filter(|path| path.starts_with("openmpt/mod") || path.starts_with("openmpt/s3m")).count();
+    let is_openmpt = |path: &PathBuf| path.starts_with("openmpt/mod") || path.starts_with("openmpt/s3m") || path.starts_with("openmpt/xm");
+    let openmpt_modules: BTreeSet<&PathBuf> = binaries.iter().filter(|path| is_openmpt(path)).collect();
+    let openmpt_oracle_modules = oracle_modules.iter().filter(|path| is_openmpt(path)).count();
     Ok(CorpusInventory {
         module_binaries: binaries.len(),
         state_oracle_cases: upstream_pairs.len(),
@@ -268,7 +289,7 @@ fn next_c_string(text: &str, start: usize) -> Option<(String, usize)> {
 
 fn matches_target_extension(path: &str) -> bool {
     Path::new(path).extension().and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "mod" | "s3m" | "mtm"))
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "mod" | "s3m" | "mtm" | "xm"))
 }
 
 fn collect_format_binaries(root: &Path, directory: &Path, binaries: &mut BTreeSet<PathBuf>) -> Result<(), String> {
@@ -478,9 +499,12 @@ pub fn parse_libxmp_dump(text: &str) -> Result<Vec<LibxmpTick>, String> {
         }
         tick.channels.push(channel);
     }
-    if ticks.is_empty() {
-        return Err("libxmp dump contains no channel records".to_string());
-    }
+    // An **empty** dump is a legitimate oracle, not a malformed one: libxmp writes a line
+    // only for a channel that has a mapped, sounding voice, so a fixture whose whole point
+    // is that nothing ever plays — `openmpt/xm/DelayCombination.data` and
+    // `openmpt/xm/PanMemory.data` are both zero bytes — has no records at all. The
+    // comparison turns that into "no channel may ever be active"; see
+    // [`diff_libxmp_dump`].
     Ok(ticks)
 }
 
@@ -502,6 +526,11 @@ fn signed_i16(value: i64, line_number: usize, name: &str) -> Result<i16, String>
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SampleGeometry {
     spans: Vec<Option<SampleSpan>>,
+    /// XM only: whether the module asked for linear frequencies, which decides how
+    /// [`project_period`] converts libxmp's continuous mixer period into FastTracker 2's
+    /// own domain. It is read from the loaded `Module` for the same reason the spans are —
+    /// the trace format must not grow a field for a comparison-only concern.
+    linear_periods: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -521,7 +550,9 @@ impl SampleGeometry {
     pub fn from_module(format: ConformanceFormat, module: &Module) -> SampleGeometry {
         let count = match format {
             ConformanceFormat::Mod | ConformanceFormat::Mtm => module.instruments().len(),
-            ConformanceFormat::S3m => module.samples().len(),
+            // Both processors resolve their instrument slot down to a model sample id
+            // before tracing it, so the sample table is what the trace numbers index.
+            ConformanceFormat::S3m | ConformanceFormat::Xm => module.samples().len(),
         };
         let spans = (0..=count).map(|number| {
             let index = u16::try_from(number.checked_sub(1)?).ok()?;
@@ -529,7 +560,7 @@ impl SampleGeometry {
                 ConformanceFormat::Mod | ConformanceFormat::Mtm => {
                     module.instrument(InstrumentId(index)).and_then(|instrument| instrument.sample).and_then(|id| module.sample(id))?
                 }
-                ConformanceFormat::S3m => module.sample(SampleId(index))?,
+                ConformanceFormat::S3m | ConformanceFormat::Xm => module.sample(SampleId(index))?,
             };
             Some(SampleSpan {
                 length_frames: sample.length_frames(),
@@ -538,7 +569,7 @@ impl SampleGeometry {
                 looping: sample.loop_mode().is_looping(),
             })
         }).collect();
-        SampleGeometry { spans }
+        SampleGeometry { spans, linear_periods: module.header().flags.linear_slides }
     }
 
     fn span(&self, sample_number: u16) -> Option<SampleSpan> {
@@ -596,17 +627,92 @@ pub fn diff_libxmp_dump(
     geometry: &SampleGeometry,
     waived: &[TraceField],
 ) -> TraceDiff {
+    if upstream.is_empty() {
+        // The oracle says the module never sounds a note. Enforce exactly that against the
+        // whole capture rather than comparing two empty projections, which would pass on
+        // any behaviour at all.
+        return diff_traces(&silent_projection(actual), actual, &TraceTolerances::default());
+    }
     let (expected, actual) = project_libxmp_dump(format, upstream, actual, geometry, waived);
     // libxmp's own mixer-data comparator permits one integer source frame and one
     // millisecond of time. MOD and MTM first project C1's fraction away below, then
     // apply that same whole-frame bound; S3M compares the unfloored Q32.32 value.
     let tolerances = TraceTolerances {
         frame: FRAME_TOLERANCE,
-        period: 1,
+        period: period_tolerance(format),
+        volume: volume_tolerance(format),
+        pan: pan_tolerance(format),
         position: POSITION_TOLERANCE,
         ..TraceTolerances::default()
     };
     diff_traces(&expected, &actual, &tolerances)
+}
+
+/// How far apart the two representations of the same pitch may legitimately be.
+///
+/// One native unit for MOD, S3M and MTM, whose period domains are the same integer
+/// quantities libxmp derives its continuous ones from. **Four** for XM, and every one of
+/// those four is finetune: FastTracker 2 indexes its period table with
+/// `(finetune >> 3) + 16`, sixteen steps of eight, while libxmp interpolates `finetune /
+/// 128` continuously (`src/period.c:184`). The two therefore differ by
+/// `finetune / 2 - 4 * (finetune >> 3)`, which is `0` at every multiple of eight and at
+/// most `3.5` between them — accuracy policy D43. Nothing else in the XM pitch chain is
+/// approximate: the periods themselves are integers on both sides.
+const fn period_tolerance(format: ConformanceFormat) -> u32 {
+    match format {
+        ConformanceFormat::Mod | ConformanceFormat::S3m | ConformanceFormat::Mtm => 1,
+        ConformanceFormat::Xm => 4,
+    }
+}
+
+/// How far apart the two implementations' idea of the same channel volume may be.
+///
+/// Exact for MOD, S3M and MTM, which have no envelope. **One** for XM, and the unit is the
+/// envelope's: FastTracker 2 interpolates its volume envelope in Q8 and accumulates a Q8
+/// per-tick delta (`ft2_replayer.c` `updateVolPanAutoVib`, `volEnvDelta = (yDiff << 8) /
+/// xDiff`), where libxmp recomputes `y1 + (y2 - y1) * (x - x1) / (x2 - x1)` in whole
+/// envelope units with a division that truncates towards zero (`src/player.c:118`). On a
+/// falling envelope libxmp is therefore up to one whole unit high — accuracy policy D44.
+/// Every other term of the volume is integer and identical on both sides.
+const fn volume_tolerance(format: ConformanceFormat) -> u16 {
+    match format {
+        ConformanceFormat::Mod | ConformanceFormat::S3m | ConformanceFormat::Mtm => 0,
+        ConformanceFormat::Xm => 1,
+    }
+}
+
+/// The same envelope-domain allowance as [`volume_tolerance`], for the panning envelope,
+/// scaled by the pan multiplier that envelope is applied through.
+///
+/// FastTracker 2 forms its pan offset as `((envelope - 32 * 256) * panMul) >> 16` from a
+/// Q8 envelope value, where `panMul = (128 - |pan - 128|) << 3` reaches 1024 at the centre;
+/// libxmp forms `(envelope - 32) * (128 - |pan - 128|) / 32` from its whole-unit one. One
+/// envelope unit of disagreement is `(256 * 1024) >> 16 == 4` pan units at the widest, so
+/// four is the derived bound rather than a chosen one. A channel with **no** panning
+/// envelope is compared exactly on both sides, which is what the `PanMemory` and
+/// `PanSlideMem` fixtures test — accuracy policy D44.
+const fn pan_tolerance(format: ConformanceFormat) -> u16 {
+    match format {
+        ConformanceFormat::Mod | ConformanceFormat::S3m | ConformanceFormat::Mtm => 0,
+        ConformanceFormat::Xm => 4,
+    }
+}
+
+/// The trace an empty libxmp dump asserts: this capture with every channel silent.
+///
+/// Every other field is copied from the capture, so the one thing the comparison can
+/// report is a channel that sounded when the oracle says none ever does.
+fn silent_projection(actual: &Trace) -> Trace {
+    let ticks = actual.ticks.iter().map(|tick| {
+        let mut expected = tick.clone();
+        for channel in &mut expected.channels {
+            channel.active = false;
+        }
+        // The libxmp adapter never produces ` vc=` rows, and XM has no background voices
+        // to produce them from, so the voice list is left exactly as the capture has it.
+        expected
+    }).collect();
+    Trace { version: actual.version, ticks }
 }
 
 fn expected_frame(time_ms: u64) -> Frame {
@@ -736,7 +842,7 @@ fn project_libxmp_dump(
                 expected_channel.note = project_note(format, upstream_channel.note);
                 expected_channel.instrument = upstream_channel.instrument_zero_based.saturating_add(1);
                 expected_channel.volume = (upstream_channel.volume_x16 + 8) / 16;
-                expected_channel.period = project_period(format, upstream_channel.period_q12);
+                expected_channel.period = project_period(format, geometry, upstream_channel.period_q12);
                 expected_channel.pan = project_pan(format, upstream_channel.pan_signed);
                 expected_channel.position = (upstream_channel.position as u64) << 32;
                 if loop_equivalent(geometry.span(actual_channel.sample), expected_channel.position, actual_channel.position) {
@@ -852,6 +958,14 @@ fn step_per_output_frame(format: ConformanceFormat, period: u32) -> u128 {
         ConformanceFormat::S3m => {
             (((ST3_FREQUENCY_NUMERATOR / period as u64) as u128) << 32) / CONFORMANCE_SAMPLE_RATE_HZ as u128
         }
+        // FastTracker 2's linear period, `8363 * 2^((4608 - period) / 768)`. This is the
+        // harness, not the engine, so the exponential is an ordinary `f64` one; the engine's
+        // own path is the table in `starplayer-core`.
+        ConformanceFormat::Xm => {
+            let frequency = XM_REFERENCE_RATE_HZ * ((4608.0 - period as f64) / 768.0).exp2();
+            let step = frequency / CONFORMANCE_SAMPLE_RATE_HZ as f64;
+            if step <= 0.0 { 0 } else { (step * 4_294_967_296.0) as u128 }
+        }
     }
 }
 
@@ -885,7 +999,11 @@ fn project_note(format: ConformanceFormat, note: u8) -> Option<u8> {
     // rather than clamping it to zero, where it would match every other such note.
     shift_note(note, match format {
         ConformanceFormat::Mod => 24,
-        ConformanceFormat::S3m | ConformanceFormat::Mtm => 12,
+        // libxmp's XM note is `(pattern note - 1) + 12 + relative_note` (`read_event.c`
+        // 549-598 with `sub->xpo`), and the XM processor traces exactly the same "real
+        // note" FastTracker 2 computes, zero-based from C-0 — so the two differ by the
+        // same one octave S3M and MTM do.
+        ConformanceFormat::S3m | ConformanceFormat::Mtm | ConformanceFormat::Xm => 12,
     })
 }
 
@@ -893,12 +1011,27 @@ fn shift_note(note: u8, semitones_down: i16) -> Option<u8> {
     u8::try_from(note as i16 - semitones_down).ok()
 }
 
-fn project_period(format: ConformanceFormat, period_q12: u32) -> u32 {
+fn project_period(format: ConformanceFormat, geometry: &SampleGeometry, period_q12: u32) -> u32 {
     // MOD and MTM trace the Amiga-period command domain itself. S3M retains C2's
-    // native quarter-period scale, hence its additional factor of four.
+    // native quarter-period scale, hence its additional factor of four. XM's Amiga mode
+    // shares S3M's: FastTracker 2's own Amiga period is four times ProTracker's, and
+    // 1712 is what its table holds for C-4.
     let divisor = match format {
         ConformanceFormat::Mod | ConformanceFormat::Mtm => 4096,
         ConformanceFormat::S3m => 1024,
+        ConformanceFormat::Xm if !geometry.linear_periods => 1024,
+        // A linear-frequency XM is the one case where the two domains are not the same
+        // quantity scaled: libxmp still reports the continuous Amiga-style mixer period,
+        // and FastTracker 2's linear period is its logarithm. See
+        // [`FT2_PERIOD_AT_LIBXMP_BASE`].
+        ConformanceFormat::Xm => {
+            if period_q12 == 0 {
+                return 0;
+            }
+            let mix_period = period_q12 as f64 / 4096.0;
+            let period = FT2_PERIOD_AT_LIBXMP_BASE + 768.0 * (mix_period / LIBXMP_PERIOD_BASE).log2();
+            return period.round().clamp(0.0, u32::MAX as f64) as u32;
+        }
     };
     period_q12.saturating_add(divisor / 2) / divisor
 }
@@ -906,8 +1039,10 @@ fn project_period(format: ConformanceFormat, period_q12: u32) -> u32 {
 fn project_actual_position(format: ConformanceFormat, position: u64) -> u64 {
     match format {
         // libxmp's `pos0` deliberately discards the mixer's fraction. Compare formats
-        // using the MOD-period mixer domain in that same observable integer domain.
-        ConformanceFormat::Mod | ConformanceFormat::Mtm => position & !(u32::MAX as u64),
+        // using the MOD-period mixer domain in that same observable integer domain, and XM
+        // likewise: its own mixer period is continuous, so the fraction it keeps is not a
+        // quantity libxmp ever reports.
+        ConformanceFormat::Mod | ConformanceFormat::Mtm | ConformanceFormat::Xm => position & !(u32::MAX as u64),
         ConformanceFormat::S3m => position,
     }
 }
@@ -915,9 +1050,10 @@ fn project_actual_position(format: ConformanceFormat, position: u64) -> u64 {
 fn project_pan(format: ConformanceFormat, pan_signed: i16) -> u16 {
     let pan_u8 = (pan_signed as i32 + 128).clamp(0, 255) as u16;
     match format {
-        // MOD 8xx is a full-byte pan. Keeping every bit here prevents the adapter
-        // from hiding low-nibble differences supplied by the oracle.
-        ConformanceFormat::Mod => pan_u8,
+        // MOD `8xx` and XM `8xx` are both full-byte pans, and XM's panning envelope moves
+        // the byte a unit at a time. Keeping every bit here prevents the adapter from
+        // hiding low-nibble differences supplied by the oracle.
+        ConformanceFormat::Mod | ConformanceFormat::Xm => pan_u8,
         // libxmp shifts these formats' native four-bit pan into the high nibble.
         ConformanceFormat::S3m | ConformanceFormat::Mtm => (pan_u8 >> 4) * 17,
     }

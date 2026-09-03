@@ -13,14 +13,17 @@ struct Fixture {
 
 /// Every fixture in the canonical contract.
 ///
-/// The five S3Ms are the repository owner's own modules and are committed as bytes. MOD
-/// and MTM have no licence-safe module to commit, so C6a synthesises theirs from a
+/// The five S3Ms are the repository owner's own modules and are committed as bytes. MOD,
+/// MTM and XM have no licence-safe module to commit, so C6a synthesises theirs from a
 /// committed generator instead — see `starplayer_offline::fixtures` for why that route was
-/// chosen over hashing the pinned libxmp corpus.
+/// chosen over hashing the pinned libxmp corpus. Task F2 added the XM one, whose fixture
+/// covers the envelopes, the key-off, the fadeout and the ping-pong loop no other golden
+/// can reach.
 fn fixtures() -> Vec<Fixture> {
     vec![
         Fixture { format: GoldenFormat::Mod, stem: "synthetic", bytes: fixtures::synthetic_mod() },
         Fixture { format: GoldenFormat::Mtm, stem: "synthetic", bytes: fixtures::synthetic_mtm() },
+        Fixture { format: GoldenFormat::Xm, stem: "synthetic", bytes: fixtures::synthetic_xm() },
         Fixture { format: GoldenFormat::S3m, stem: "armani", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/ARMANI.S3M").to_vec() },
         Fixture { format: GoldenFormat::S3m, stem: "movement", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M").to_vec() },
         Fixture { format: GoldenFormat::S3m, stem: "nicetune", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/NICETUNE.S3M").to_vec() },

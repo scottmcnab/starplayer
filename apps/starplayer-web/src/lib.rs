@@ -13,6 +13,7 @@ use std::vec::Vec;
 use starplayer::model::{EffectNames, Module, ModuleFormat, NoteCell, PatternCell, PatternId, s3m_command_code};
 use starplayer::mod_file::PatternView as ModPatternView;
 use starplayer::mtm::PatternView as MtmPatternView;
+use starplayer::xm::PatternView as XmPatternView;
 use starplayer::s3m::PatternView as S3mPatternView;
 use starplayer_archive::{ArchiveError, extract, is_zip, list_modules};
 
@@ -81,6 +82,21 @@ fn effect_name_records() -> String {
                     }
                 }
             }
+            ModuleFormat::Xm => {
+                // XM names its commands `0`..`9`, `A`..`F` and then `G`..`X`, and its `Exy`
+                // sub-commands the way MOD does.
+                for code in 0..=0x21u8 {
+                    if code == 0xE {
+                        for nybble in 0..=0x0Fu8 {
+                            if let Some(name) = EffectNames::XM.name(code, nybble << 4) {
+                                records.push_str(&format!("{code}:{nybble}:{name}\n"));
+                            }
+                        }
+                    } else if let Some(name) = EffectNames::XM.name(code, 1) {
+                        records.push_str(&format!("{code}:-1:{name}\n"));
+                    }
+                }
+            }
             _ => {}
         }
         records
@@ -94,7 +110,7 @@ fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
         Err(error) => return Err(error),
     };
     let mut records = String::new();
-    for entry in entries.into_iter().filter(|entry| matches!(entry.format, ModuleFormat::S3m | ModuleFormat::Mod | ModuleFormat::Mtm)) {
+    for entry in entries.into_iter().filter(|entry| matches!(entry.format, ModuleFormat::S3m | ModuleFormat::Mod | ModuleFormat::Mtm | ModuleFormat::Xm)) {
         let safe_name = entry.name.replace(['\t', '\r', '\n'], " ");
         records.push_str(&format!("{}\t{}\t{}\n", entry.index, safe_name, entry.size));
     }
@@ -123,6 +139,14 @@ fn pattern_window_bytes(pattern: u16, first_row: u16, row_count: u16) -> Vec<u8>
             }
             ModuleFormat::Mtm => {
                 let Some(view) = MtmPatternView::new(module, PatternId(pattern)) else { return output };
+                let rows = row_count.min(view.rows().saturating_sub(first_row));
+                output.reserve(rows as usize * view.channels() as usize * DISPLAY_CELL_BYTES);
+                for row in first_row..first_row.saturating_add(rows) {
+                    for channel in 0..view.channels() { append_display(&mut output, view.cell(row, channel).map(|cell| cell.display()).unwrap_or_default()); }
+                }
+            }
+            ModuleFormat::Xm => {
+                let Some(view) = XmPatternView::new(module, PatternId(pattern)) else { return output };
                 let rows = row_count.min(view.rows().saturating_sub(first_row));
                 output.reserve(rows as usize * view.channels() as usize * DISPLAY_CELL_BYTES);
                 for row in first_row..first_row.saturating_add(rows) {
@@ -327,15 +351,15 @@ mod tests {
     }
 
     #[test]
-    fn browser_visible_loader_copy_accepts_and_advertises_mod_and_mtm() {
+    fn browser_visible_loader_copy_accepts_and_advertises_every_playable_format() {
         let index = include_str!("../www/index.html");
         assert!(index.contains("S3M, MOD and MTM modules"));
         assert!(index.contains("drop an S3M, MOD, MTM, or ZIP"));
         assert!(index.contains("Choose a module"));
         assert!(index.contains("Load an S3M, MOD, MTM, or ZIP"));
-        assert!(index.contains("accept=\".s3m,.mod,.mtm,.zip,audio/s3m,audio/mod,audio/x-mod,audio/mtm,application/zip\""));
-        assert!(index.contains("aria-label=\"S3M, MOD, MTM, or ZIP URL\""));
-        assert!(index.contains("Drop .s3m, .mod, .mtm, or .zip here"));
+        assert!(index.contains("accept=\".s3m,.mod,.mtm,.xm,.zip,audio/s3m,audio/mod,audio/x-mod,audio/mtm,audio/xm,application/zip\""));
+        assert!(index.contains("aria-label=\"S3M, MOD, MTM, XM, or ZIP URL\""));
+        assert!(index.contains("Drop .s3m, .mod, .mtm, .xm, or .zip here"));
         assert!(index.contains("id=\"archive-tracks\""));
         assert!(index.contains("aria-label=\"Track from the last ZIP\""));
         assert!(index.contains("id=\"load-archive-track\""));

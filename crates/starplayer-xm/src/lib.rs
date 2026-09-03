@@ -17,9 +17,12 @@
 //! | [`sample`] | the 40-byte sample header and the delta / stereo / ADPCM decoding |
 //! | [`pattern`] | [`XmCell`], the pattern unpacker, and [`PatternView`] |
 //! | [`data`] | [`XmPatternData`], the engine's read side over a loaded module |
+//! | [`processor`] | [`XmProcessor`] — FastTracker 2's effects, envelopes and volume column |
+//! | [`tables`] | FastTracker 2's own replay tables, transcribed from its binary |
 //!
-//! The effect processor is task F3 and the instrument runtime task F2; neither is here
-//! yet, so nothing in this crate plays a note.
+//! The processor half is task F2. Its reference is **FastTracker 2 itself**, read through
+//! `8bitbubsy/ft2-clone`'s `src/ft2_replayer.c`, because the original DOS StarPlayer never
+//! supported XM; see [`processor`] for what that means in practice.
 //!
 //! # The cell format
 //!
@@ -81,7 +84,9 @@ pub mod header;
 pub mod instrument;
 pub mod loader;
 pub mod pattern;
+pub mod processor;
 pub mod sample;
+pub mod tables;
 
 pub use data::XmPatternData;
 pub use header::{
@@ -89,6 +94,9 @@ pub use header::{
 };
 pub use instrument::{XmEnvelope, XmInstrumentHeader};
 pub use loader::{load, load_from, probe, probe_reader};
+pub use processor::{
+    XmChannel, XmProcessor, recommended_voice_capacity, sequencer_for, sequencer_with_quirks,
+};
 pub use pattern::{
     CELL_BYTES, DEFAULT_ROWS, INSTRUMENT_NONE, MAX_ROWS, NOTE_KEY_OFF, NOTE_NONE, PatternView,
     VOLUME_NONE, XmCell, unpack,

@@ -53,7 +53,7 @@ ScreamTracker3/FastTracker/TakeTracker/ModsGrave ids or more than four channels 
 residual MOD position differences are libxmp's continuous finetuned periods and its
 rounded integer C-4 rate, recorded as accuracy-policy D14, not a PAL/NTSC clock split.
 S3M and MTM retain C2's one-octave subtraction and division by 1024 into their native
-quarter-period scale. MOD pan preserves the full unsigned byte so `8xx` low bits remain
+quarter-period scale. XM's projection is set out in its own section below. MOD pan preserves the full unsigned byte so `8xx` low bits remain
 observable; S3M and MTM pan decode libxmp's high-nibble representation onto their native
 4-bit grid. Period is allowed one native unit. libxmp's `pos0` is the integer source
 position before mixing, so for the two formats compared in the MOD-period mixer domain —
@@ -66,6 +66,65 @@ Cutoff zero is libxmp's disabled-filter sentinel and maps to C1's equivalent ful
 number and dirty flags lack upstream columns and are projected from
 the actual C1 trace. The active-channel set is a union, so extra StarPlayer voices cannot
 disappear during projection.
+
+### XM (task F2)
+
+Three things about libxmp's XM dumps have to be said before any of the columns make sense,
+and all three were settled from the pinned tree before a line of the processor was written.
+
+**The `period` column is never XM's linear period.** `xc->info_period` is
+`libxmp_note_to_period_mix(xc->note, linear_bend) * 4096` (`src/player.c:1276-1298`), which
+is `13696 / 2^((note + bend/12800)/12)` — the *same* continuous Amiga-style mixer period
+libxmp reports for MOD, S3M and MTM. libxmp's linear period lives only in `xc->period` and
+is never dumped. FastTracker 2's linear period runs the other way,
+`7744 - 64 * note - 4 * (finetune >> 3)`, so the adapter converts the oracle into FT2's
+domain rather than the reverse:
+
+```text
+ft2_period = 8448 + 768 * log2(mix_period / 13696)
+```
+
+The constant is FastTracker 2's own period at libxmp's `PERIOD_BASE`: libxmp note 60 is
+C-4, mixer period 428, FT2 period 4608, and `4608 + 768 * log2(13696 / 428) == 8448`.
+Converting this way keeps the comparison's error **additive in period units** — a
+finetune-sized pitch difference is a handful of units at every pitch — where converting
+StarPlayer's period into libxmp's continuous domain would make the same difference hundreds
+of Q12 units at a low period and a fraction of one at a high one. An **Amiga**-mode XM needs
+no logarithm: FastTracker 2's Amiga period is four times ProTracker's, so it divides by 1024
+exactly as S3M does. Which of the two applies is read from the loaded module's
+`linear_slides` flag through `SampleGeometry`, for the same reason the loop spans are: the
+committed trace format must not grow a field for a comparison-only concern.
+
+**The `note` column is `xc->note`**, which libxmp builds as
+`(XM note byte - 1) + 12 + relative_note` (`src/read_event.c:549-598`, folding `sub->xpo`).
+The XM processor traces the same "real note" FastTracker 2 computes — the pattern's note
+byte plus the sample's relative note, zero-based from C-0 — so the projection is the same
+one-octave subtraction S3M and MTM use. It reports the note the **sounding voice** was
+started on, not the pattern's latched note byte, because FastTracker 2 latches a note and
+*then* rejects a transposed value outside C-0..B-9 while leaving the previous note playing.
+
+**The `volume` column is 0..1024** and is post-tremolo, post-fadeout, post-envelope,
+post-global-volume and post-tremor, with two integer truncations inside it (`>> 6` then
+`>> 18`, `src/player.c:1061-1119`). The adapter's existing `(x + 8) / 16` projection lands it
+on the trace's 0..64 domain, so the XM processor keeps its own final volume in a 0..65536
+integer domain and **rounds** into the trace's 64, rather than truncating — truncating would
+disagree by one wherever the discarded bits are at least eight. `pan` is signed −128..+127
+and post-envelope; XM keeps every bit of it, like MOD, because an XM panning envelope moves
+the byte one unit at a time. `pos0` is the truncated integer source position at the start of
+the tick, so XM floors its Q32.32 position the way MOD and MTM do.
+
+**Tolerances.** XM is the one format that compares `period`, `volume` and `pan` with a
+non-zero tolerance, and each of the three is derived rather than chosen: four period units
+for FastTracker 2's sixteen-step finetune against libxmp's continuous one (accuracy policy
+D42), one volume unit and four pan units for FT2's Q8 envelope accumulation against libxmp's
+whole-unit recompute (D44). Everything else is exact.
+
+**An empty dump is an oracle, not an error.** libxmp writes a line only for a channel with a
+mapped, sounding voice, so a fixture whose point is that nothing ever plays has a zero-byte
+`.data`. The adapter reads that as "no channel may ever be active" and enforces it against
+the whole capture. `openmpt/xm/DelayCombination.data` is exactly that case and passes;
+`openmpt/xm/PanMemory.data` is empty for a module that *does* sound notes, which is recorded
+as `F2-XM-012`.
 
 ## Scope accounting
 
@@ -126,16 +185,24 @@ count: libxmp writes no line for a tick with no mapped active voice, so the reco
 is only a lower bound. Exhausting the budget is reported as a harness error that fails the
 run, never as a case result.
 
-All three formats are now registered through their own native trace paths — MOD by C3,
-MTM by C4, S3M from M1 — so the runner's pending-integration table is empty and its
-`gated` column is always zero. Every pinned case therefore executes and reports a pass or
+All four formats are now registered through their own native trace paths — MOD by C3,
+MTM by C4, S3M from M1, XM by F2 — so the runner's pending-integration table is empty and
+its `gated` column is always zero. Every pinned case therefore executes and reports a pass or
 a named exclusion; a missing loader would be a gate, never an exclusion, but no format is
 in that state.
 
 ## Current standing
 
+Task F2 added XM, and with it every `compare_mixer_data*` call in the pinned tree whose
+module is an `.xm` — 50 OpenMPT fixtures and 43 of libxmp's own — so the manifest grew from
+47 cases to 140. **105 of the 140** pass: MOD 16 of 27, S3M 16 of 17, MTM 1 of 3, XM 72 of
+93. The M2 formats' results are unchanged. Of the XM cases, one is an accepted deviation
+(`libxmp-xm-reverse-xm`, accuracy policy D45) and twenty are recorded in
+`known-failures.md` under `F2-XM-001` to `F2-XM-012`; the paragraph below describes the M2
+standing it replaced.
+
 After the C2a harness repairs, C3b's ProTracker fidelity repairs, the C9 S3M repairs and
-C5's tracker dialects, **33 of the 47** pinned cases pass: MOD 16 of 27, S3M 16 of 17,
+C5's tracker dialects, **33 of the 47** M2 cases pass: MOD 16 of 27, S3M 16 of 17,
 MTM 1 of 3. Thirteen of the MOD passes and ten of the S3M passes waive one or more fields
 under an accuracy-policy entry and enforce every other field. The remaining 14 split into
 13 accepted deviations and **1** known failure:

@@ -95,11 +95,11 @@ fn run() -> Result<bool, String> {
     validate_mtm_reference_module(&corpus)?;
     let inventory = audit_pinned_corpus(&corpus, &cases)?;
     println!(
-        "corpus inventory: {} MOD/S3M/MTM binaries; {} frame-state cases over {} unique modules; {} seed/documentation binaries without a state oracle",
+        "corpus inventory: {} MOD/S3M/MTM/XM binaries; {} frame-state cases over {} unique modules; {} seed/documentation binaries without a state oracle",
         inventory.module_binaries, inventory.state_oracle_cases, inventory.state_oracle_modules, inventory.without_state_oracle,
     );
     println!(
-        "OpenMPT inventory: {} MOD/S3M modules; {} with frame-state oracles; {} documented-only",
+        "OpenMPT inventory: {} MOD/S3M/XM modules; {} with frame-state oracles; {} documented-only",
         inventory.openmpt_modules, inventory.openmpt_oracle_modules, inventory.openmpt_documented_only,
     );
 
@@ -136,7 +136,7 @@ fn run() -> Result<bool, String> {
         totals.pass_rate_percent(),
     );
     println!(
-        "gated is {} because every M2 format registers a native trace capture; a format without one would be gated, never excluded",
+        "gated is {} because every format in the manifest registers a native trace capture; a format without one would be gated, never excluded",
         totals.gated,
     );
 
@@ -318,6 +318,7 @@ const fn module_format(format: ConformanceFormat) -> ModuleFormat {
         ConformanceFormat::Mod => ModuleFormat::Mod,
         ConformanceFormat::S3m => ModuleFormat::S3m,
         ConformanceFormat::Mtm => ModuleFormat::Mtm,
+        ConformanceFormat::Xm => ModuleFormat::Xm,
     }
 }
 
