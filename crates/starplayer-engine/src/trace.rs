@@ -691,7 +691,7 @@ mod tests {
         recorder.finish_tick(6, 125, &channels, &voices);
         let tick = recorder.take().ticks.remove(0);
         assert!(tick.voices.is_empty(), "a foreground voice is described by its channel row, not a voice row");
-        assert!(tick.channels[0].active);
+        assert!(tick.channels.first().expect("one channel row").active);
     }
 
     #[test]
@@ -712,13 +712,15 @@ mod tests {
 
         let tick = recorder.take().ticks.remove(0);
         assert_eq!(tick.voices.len(), 1, "the detached voice is listed once");
-        assert_eq!(tick.voices[0].voice, voice.index());
-        assert_eq!(tick.voices[0].root, 1, "`root` is the channel that triggered it, which `trigger` wrote into the tag");
-        assert_eq!(tick.voices[0].sample, 300, "a sample number past 255 survives the widened tag");
-        assert_eq!(tick.voices[0].instrument, 2);
-        assert_eq!(tick.voices[0].flags, DirtyBits::VOLUME);
-        assert!(!tick.channels[1].active, "the channel it left owns nothing");
-        assert_eq!(tick.channels[1].flags, DirtyBits::empty(), "and the write did not land on its row");
+        let row = tick.voices.first().expect("the detached voice's row");
+        assert_eq!(row.voice, voice.index());
+        assert_eq!(row.root, 1, "`root` is the channel that triggered it, which `trigger` wrote into the tag");
+        assert_eq!(row.sample, 300, "a sample number past 255 survives the widened tag");
+        assert_eq!(row.instrument, 2);
+        assert_eq!(row.flags, DirtyBits::VOLUME);
+        let channel = tick.channels.get(1).expect("channel 1's row");
+        assert!(!channel.active, "the channel it left owns nothing");
+        assert_eq!(channel.flags, DirtyBits::empty(), "and the write did not land on its row");
     }
 
     #[test]

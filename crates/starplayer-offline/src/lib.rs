@@ -15,7 +15,7 @@ use starplayer::core::quirks::{QuirkSelection, QuirkSet};
 use starplayer::core::{AtEnd, Error, Interpolator};
 use starplayer::dsp::{Interpolate, Linear, Nearest};
 use starplayer::engine::{EndReason, Engine, EngineSettings, EngineWarnings, EventSource, ScanLimits, SongTimeline};
-use starplayer::mixer::{FixedPath, FloatPath, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
+use starplayer::mixer::{FixedPath, FloatPath, I24, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::Arc;
 use starplayer::{NativeSequencer, ScannedSong, recommended_voice_capacity, scan_song};
@@ -34,6 +34,7 @@ use starplayer::mixer::StereoI16;
 use sha2::{Digest, Sha256};
 
 pub mod fixtures;
+pub mod wav;
 
 /// Output rate used by diagnostic traces and the future canonical golden renderer.
 #[cfg(feature = "trace")]
@@ -315,6 +316,17 @@ impl FadeSample for i16 {
 
 impl FadeSample for f32 {
     fn scaled_q16(self, gain_q16: u32) -> f32 { self * (gain_q16 as f32 / 65_536.0) }
+}
+
+/// The CLI's `--depth 24` render (task D5): the same Q16.16 integer scale as `i16`'s
+/// impl, applied to `I24`'s inner value rather than reaching for a float.
+impl FadeSample for I24 {
+    fn scaled_q16(self, gain_q16: u32) -> I24 { I24(((self.0 as i64 * gain_q16 as i64) >> 16) as i32) }
+}
+
+/// The CLI's `--depth 32` render (task D5).
+impl FadeSample for i32 {
+    fn scaled_q16(self, gain_q16: u32) -> i32 { ((self as i64 * gain_q16 as i64) >> 16) as i32 }
 }
 
 /// Render a whole song rather than a fixed segment: scan it, play it for as long as
@@ -994,6 +1006,27 @@ mod tests {
         let loop_length = timeline.loop_length_frames().expect("a looping song has a loop length");
         assert_eq!(repeated.len() as u64, timeline.end_frame() + loop_length);
         assert_eq!(repeated.get(..cut.len()).expect("the repeat contains the first pass"), cut.as_slice(), "a repeat appends rather than changing the first pass");
+    }
+
+    /// Task D5: the CLI's `--depth 24` and `--depth 32` renders need [`FadeSample`] on
+    /// [`I24`] and `i32`, which nothing before this task exercised. A fade that reaches
+    /// silence at both depths is the same claim `a_faded_render_ends_in_silence_and_a_cut_
+    /// one_ends_on_the_loop_point` already makes for `i16`.
+    #[test]
+    fn a_faded_render_reaches_silence_at_24_and_32_bit_depth_too() {
+        use starplayer::mixer::FixedOut;
+
+        let bytes = looping_synthetic_mod();
+        let timeline = song_timeline(&Arc::new(starplayer::mod_file::load(&bytes).expect("the fixture loads")), GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+        let length = RenderLength { repeat_count: 0, at_end: AtEnd::FadeOut, fade_frames: GOLDEN_SAMPLE_RATE_HZ as u64, max_frames: GOLDEN_SAMPLE_RATE_HZ as u64 * 60 };
+
+        let twenty_four_bit = render_song::<FixedPath, Linear, FixedOut<I24, 1>>(GoldenFormat::Mod, &bytes, GOLDEN_SAMPLE_RATE_HZ, GOLDEN_HOST_BLOCK_FRAMES, length).expect("it renders");
+        assert_eq!(twenty_four_bit.len() as u64, timeline.end_frame() + GOLDEN_SAMPLE_RATE_HZ as u64);
+        assert_eq!(twenty_four_bit.last().copied(), Some(I24(0)), "the last frame of a 24-bit fade is exactly zero");
+
+        let thirty_two_bit = render_song::<FixedPath, Linear, FixedOut<i32, 1>>(GoldenFormat::Mod, &bytes, GOLDEN_SAMPLE_RATE_HZ, GOLDEN_HOST_BLOCK_FRAMES, length).expect("it renders");
+        assert_eq!(thirty_two_bit.len() as u64, timeline.end_frame() + GOLDEN_SAMPLE_RATE_HZ as u64);
+        assert_eq!(thirty_two_bit.last().copied(), Some(0), "the last frame of a 32-bit fade is exactly zero");
     }
 
     /// Task D2's acceptance case. `NICETUNE.S3M`'s order list simply runs out, so the song
