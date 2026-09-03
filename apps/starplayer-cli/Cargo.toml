@@ -7,12 +7,19 @@ rust-version.workspace = true
 [dependencies]
 starplayer = { workspace = true, features = ["std"] }
 # `trace` is optional on `starplayer-offline` so that goldens never compile the per-tick
-# recorder in (see that crate's manifest). The CLI is not the golden job, so it takes the
-# simplest option and always builds with it — see the D5 task file's research resolution.
-starplayer-offline = { workspace = true, features = ["trace"] }
+# recorder in, and it is optional here for the same reason one level up: resolver 2
+# unifies features across a workspace build, so a CLI that always asked for it would put
+# the allocating recorder inside `render()` for every crate's tests — the host crate's
+# allocation tests catch exactly that. `cargo build -p starplayer-cli --features trace`
+# enables the `trace` command; without it the command explains how to get it.
+starplayer-offline = { workspace = true }
 starplayer-archive = { workspace = true }
 clap = { workspace = true }
 # `render` prints the SHA-256 of its PCM payload (task D5 deliverable 2), in the same
 # little-endian encoding `starplayer-offline` hashes goldens with. The integration tests
 # reuse it too, so there is no separate `[dev-dependencies]` entry.
 sha2 = { workspace = true }
+
+[features]
+default = []
+trace = ["starplayer-offline/trace"]

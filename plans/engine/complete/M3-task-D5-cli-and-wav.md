@@ -250,3 +250,11 @@ ZIP central-directory index), which also counts directories and unrecognised ent
 so is not what a user counting "the second module in the zip" means. `info`, `render` and
 `trace` all resolve `--entry` through the same `archive::resolve_entry`, so the numbering
 agrees across every subcommand.
+
+## Post-landing note (2026-09-03)
+
+Research point 2 chose to enable `trace` unconditionally; that leaked the allocating
+per-tick recorder into every workspace test build through feature unification, which the
+cpal host's callback-allocation tests (D4) caught the moment both landed. The CLI now has
+an optional `trace` feature (`cargo build -p starplayer-cli --features trace`); without it
+the `trace` command explains how to get it. The host-tests job's trace guard is the gate.
