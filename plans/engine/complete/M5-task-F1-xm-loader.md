@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M5 ([master plan](M5-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03 |
 | Depends on | M4-lite landed (E1–E3) |
 | Blocks | F2 (XM instrument runtime), F3 (effects), F4 (wiring) |
 | Parallel with | D3, D6, G1 |
