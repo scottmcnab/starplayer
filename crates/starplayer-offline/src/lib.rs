@@ -333,6 +333,8 @@ where
     let settings = EngineSettings {
         sample_rate_hz,
         channel_count,
+        // D3 replaces this with the processor's `recommended_voice_capacity`, once the
+        // facade enum gives this call site a processor to ask.
         voice_capacity: channel_count.max(1),
         ..EngineSettings::default()
     };
@@ -524,6 +526,8 @@ where
     let settings = EngineSettings {
         sample_rate_hz: GOLDEN_SAMPLE_RATE_HZ,
         channel_count,
+        // D3 replaces this with the processor's `recommended_voice_capacity`, once the
+        // facade enum gives this call site a processor to ask.
         voice_capacity: channel_count.max(1),
         ..EngineSettings::default()
     };
@@ -595,6 +599,8 @@ fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, Tra
     let engine_settings = EngineSettings {
         sample_rate_hz: TRACE_SAMPLE_RATE_HZ,
         channel_count,
+        // D3 replaces this with the processor's `recommended_voice_capacity`, once the
+        // facade enum gives this call site a processor to ask.
         voice_capacity: channel_count.max(1),
         ..EngineSettings::default()
     };
@@ -726,6 +732,7 @@ mod tests {
         let settings = EngineSettings {
             sample_rate_hz: 44_100,
             channel_count: module.header().channel_count as usize,
+            // D3: the processor's `recommended_voice_capacity` once the facade enum lands.
             voice_capacity: module.header().channel_count.max(1) as usize,
             ..EngineSettings::default()
         };

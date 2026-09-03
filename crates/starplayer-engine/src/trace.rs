@@ -6,15 +6,18 @@
 //! offline run can be serialized and diffed. They are not the configuration used for the
 //! real-time allocation check.
 //!
-//! # Text format, version 1
+//! # Text format, version 2
 //!
-//! The first line is `starplayer-trace v=1`. Each tick then has one header followed by
-//! exactly one indented line for every logical module channel, in ascending channel order:
+//! The first line is `starplayer-trace v=2`. Each tick then has one header, followed by
+//! exactly one indented ` ch=` line for every logical module channel in ascending channel
+//! order, followed by one indented ` vc=` line for every **active voice no channel owns**,
+//! in pool slot order:
 //!
 //! ```text
-//! starplayer-trace v=1
+//! starplayer-trace v=2
 //! t=00042 frm=000000037044 ord=03 pat=07 row=12 tk=00 spd=06 bpm=125 gv=64
-//!  ch=00 act=1 note=C-5 ins=01 smp=01 vol=64 per=001712 pan=048 pos=0000001234.91a2b3c4 cut=255 res=000 fl=VP
+//!  ch=00 act=1 note=C-5 ins=01 smp=0001 vol=64 per=001712 pan=048 pos=0000001234.91a2b3c4 cut=255 res=000 fl=VP
+//!  vc=017 root=03 note=C-5 ins=01 smp=0001 vol=32 per=001712 pan=128 pos=0000001234.91a2b3c4 cut=255 res=000 fl=-
 //! ```
 //!
 //! `note` uses tracker notation with C-0 as semitone zero; `---` means no note. Instrument
@@ -23,6 +26,25 @@
 //! and position is the exact Q32.32 sample cursor (decimal whole part, hexadecimal
 //! fraction). Dirty flags are `V` volume, `S` sample, `P` pitch, `N` pan, `T` tempo and
 //! `X` stop, always in that order; `-` means none.
+//!
+//! ## What version 2 added, and why
+//!
+//! IT's New Note Actions **detach** a channel's sounding voice into the background, where
+//! it keeps running its own envelopes and fadeout with no channel owning it. Such a voice
+//! has no ` ch=` row to appear on, and before v2 it was simply invisible to the trace — so
+//! the diff harness could not see an NNA at all. A ` vc=` line therefore names the voice's
+//! **pool slot** rather than a channel, and carries `root`, the channel that triggered it
+//! (the voice's `tag.channel`, still set after detachment for Duplicate Check). Its
+//! remaining fields and encodings are the ` ch=` line's, minus `act`: a voice that is
+//! listed is active by definition.
+//!
+//! A tick with no background voices emits no ` vc=` lines at all, so a MOD, S3M or MTM
+//! trace — none of which ever detaches a voice — differs from its v1 text only in the
+//! version header and in `smp` now being four digits, widened with
+//! [`VoiceTag::sample`](starplayer_mixer::VoiceTag) itself.
+//!
+//! A parameter write is attributed to the ` ch=` row when its voice **is** that channel's
+//! foreground, and to the voice's own ` vc=` row otherwise.
 //!
 //! libxmp's `test-dev/gen_mixer_data` writes
 //! `time row frame channel period note instrument volume pan position cutoff resonance`.
@@ -41,7 +63,7 @@ use crate::channel::ChannelTable;
 use crate::sequencer::{SongPosition, TraceChannelState};
 
 /// The current on-disk/text contract version.
-pub const TRACE_FORMAT_VERSION: u16 = 1;
+pub const TRACE_FORMAT_VERSION: u16 = 2;
 
 /// A complete trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +119,9 @@ pub struct TraceTick {
     pub global_volume: u8,
     /// Logical module channels, in channel-number order.
     pub channels: Vec<TraceChannel>,
+    /// Active voices that are no channel's foreground, in pool slot order. Empty for every
+    /// format that never detaches a voice, which is every format before IT.
+    pub voices: Vec<TraceVoice>,
 }
 
 impl TraceTick {
@@ -116,6 +141,9 @@ impl TraceTick {
         )?;
         for channel in &self.channels {
             channel.write_text(destination)?;
+        }
+        for voice in &self.voices {
+            voice.write_text(destination)?;
         }
         Ok(())
     }
@@ -180,7 +208,84 @@ impl TraceChannel {
         write_note(destination, self.note)?;
         write!(
             destination,
-            " ins={:02} smp={:02} vol={:02} per={:06} pan={:03} pos={:010}.{:08x} cut={:03} res={:03} fl=",
+            " ins={:02} smp={:04} vol={:02} per={:06} pan={:03} pos={:010}.{:08x} cut={:03} res={:03} fl=",
+            self.instrument,
+            self.sample,
+            self.volume,
+            self.period,
+            self.pan,
+            self.position >> 32,
+            self.position as u32,
+            self.cutoff,
+            self.resonance,
+        )?;
+        write_flags(destination, self.flags)?;
+        destination.write_char('\n')
+    }
+}
+
+/// One active voice that **no channel owns** at a tick boundary — trace format v2.
+///
+/// The trace's view of an IT background voice: detached by a New Note Action, still
+/// sounding under its own envelopes, and reachable through no channel row. Every field
+/// but `voice` and `root` carries the same quantity, on the same scale, as the
+/// [`TraceChannel`] field of the same name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceVoice {
+    /// The voice's pool slot index — the `vc=` key, and what makes the row stable across
+    /// ticks while the voice lives.
+    pub voice: u16,
+    /// The channel that triggered the voice: its `tag.channel`, kept after detachment so
+    /// IT's Duplicate Check can still find it. No channel owns the voice any more.
+    pub root: u16,
+    /// Linear note with C-0 as zero. `None` is rendered as `---`.
+    pub note: Option<u8>,
+    /// One-based instrument number; zero means none.
+    pub instrument: u16,
+    /// One-based sample number; zero means none.
+    pub sample: u16,
+    /// Format-native voice volume, normalized to 0..64.
+    pub volume: u16,
+    /// Format-native period.
+    pub period: u32,
+    /// Pan normalized to 0..255.
+    pub pan: u16,
+    /// Exact Q32.32 sample position.
+    pub position: u64,
+    /// Filter cutoff normalized to 0..255.
+    pub cutoff: u16,
+    /// Filter resonance normalized to 0..255.
+    pub resonance: u16,
+    /// Parameter writes which landed on this voice this tick.
+    pub flags: DirtyBits,
+}
+
+impl Default for TraceVoice {
+    fn default() -> TraceVoice {
+        TraceVoice {
+            voice: 0,
+            root: 0,
+            note: None,
+            instrument: 0,
+            sample: 0,
+            volume: 0,
+            period: 0,
+            pan: 128,
+            position: 0,
+            cutoff: 255,
+            resonance: 0,
+            flags: DirtyBits::empty(),
+        }
+    }
+}
+
+impl TraceVoice {
+    fn write_text(&self, destination: &mut impl Write) -> fmt::Result {
+        write!(destination, " vc={:03} root={:02} note=", self.voice, self.root)?;
+        write_note(destination, self.note)?;
+        write!(
+            destination,
+            " ins={:02} smp={:04} vol={:02} per={:06} pan={:03} pos={:010}.{:08x} cut={:03} res={:03} fl=",
             self.instrument,
             self.sample,
             self.volume,
@@ -243,6 +348,14 @@ struct WorkingTick {
     tick_in_row: u16,
     global_volume: u8,
     channels: Vec<WorkingChannel>,
+    /// Native state a format reported for a voice no channel owns, keyed by the exact
+    /// [`VoiceId`] it named. Kept as a flat list rather than a slot-indexed array because
+    /// the recorder does not know the pool's capacity, and because in every format before
+    /// IT the list stays empty.
+    voice_reports: Vec<(VoiceId, TraceChannelState)>,
+    /// Parameter writes which landed on a voice that was nobody's foreground at the moment
+    /// of the write.
+    voice_writes: Vec<(VoiceId, DirtyBits)>,
 }
 
 /// Engine-owned trace hook. One working tick is assembled during processor dispatch and
@@ -264,7 +377,16 @@ impl TraceRecorder {
     pub(crate) fn begin_tick(&mut self, frame: Frame, position: SongPosition, tick_in_row: u16, channel_count: u8) {
         let tick = self.trace.ticks.len() as u64;
         let channels = (0..channel_count).map(|channel| WorkingChannel::new(channel as u16)).collect();
-        self.working = Some(WorkingTick { tick, frame, position, tick_in_row, global_volume: self.global_volume, channels });
+        self.working = Some(WorkingTick {
+            tick,
+            frame,
+            position,
+            tick_in_row,
+            global_volume: self.global_volume,
+            channels,
+            voice_reports: Vec::new(),
+            voice_writes: Vec::new(),
+        });
     }
 
     pub(crate) fn report_global_volume(&mut self, volume: u8) {
@@ -286,14 +408,46 @@ impl TraceRecorder {
         entry.reported = true;
     }
 
-    pub(crate) fn record_param_write(&mut self, voices: &VoicePool, voice: VoiceId, param: VoiceParam) {
-        let Some(flag) = dirty_bit_for(param) else { return };
-        self.record_voice_flags(voices, voice, flag);
+    /// Native state for a voice no channel owns. The last report of a tick wins, the way
+    /// a repeated [`TraceRecorder::report_channel`] does.
+    pub(crate) fn report_voice(&mut self, voice: VoiceId, state: TraceChannelState) {
+        let Some(working) = self.working.as_mut() else { return };
+        match working.voice_reports.iter_mut().find(|(reported, _)| *reported == voice) {
+            Some((_, existing)) => *existing = state,
+            None => working.voice_reports.push((voice, state)),
+        }
     }
 
-    pub(crate) fn record_voice_flags(&mut self, voices: &VoicePool, voice: VoiceId, flags: DirtyBits) {
-        let Some(channel) = voices.get(voice).map(|state| state.tag.channel) else { return };
-        self.record_channel_flags(ChannelId(channel as u16), flags);
+    pub(crate) fn record_param_write(&mut self, voices: &VoicePool, channels: &ChannelTable, voice: VoiceId, param: VoiceParam) {
+        let Some(flag) = dirty_bit_for(param) else { return };
+        self.record_voice_flags(voices, channels, voice, flag);
+    }
+
+    /// Attribute a write to the row that is going to show it.
+    ///
+    /// A voice which **is** some channel's foreground reports on that channel's ` ch=`
+    /// row, exactly as it did in v1. A voice which is nobody's — one an IT New Note Action
+    /// detached — reports on its own ` vc=` row, because no ` ch=` row describes it any
+    /// more. Asking the channel table rather than trusting the voice's `tag.channel` is
+    /// what keeps the two decisions in step: `finish_tick` emits a ` vc=` row for exactly
+    /// the voices this predicate sends there, so a write can never land on a row that is
+    /// not written out.
+    pub(crate) fn record_voice_flags(&mut self, voices: &VoicePool, channels: &ChannelTable, voice: VoiceId, flags: DirtyBits) {
+        if voices.get(voice).is_none() {
+            return;
+        }
+        match owning_channel(channels, voice) {
+            Some(channel) => self.record_channel_flags(channel, flags),
+            None => self.record_voice_writes(voice, flags),
+        }
+    }
+
+    fn record_voice_writes(&mut self, voice: VoiceId, flags: DirtyBits) {
+        let Some(working) = self.working.as_mut() else { return };
+        match working.voice_writes.iter_mut().find(|(written, _)| *written == voice) {
+            Some((_, existing)) => existing.insert(flags),
+            None => working.voice_writes.push((voice, flags)),
+        }
     }
 
     pub(crate) fn record_channel_flags(&mut self, channel: ChannelId, flags: DirtyBits) {
@@ -316,7 +470,7 @@ impl TraceRecorder {
                     // this fallback runs.
                     entry.state.note = Some(voice.tag.note);
                     entry.state.instrument = voice.tag.instrument as u16;
-                    entry.state.sample = voice.tag.sample as u16;
+                    entry.state.sample = voice.tag.sample;
                     entry.state.volume = unit_to_scale(voice.params.volume.to_bits(), 64);
                     entry.state.pan = bipolar_pan_to_u8(voice.params.pan.to_bits());
                 }
@@ -329,6 +483,45 @@ impl TraceRecorder {
             // it in here reported a change on every tick after the one that made it.
             entry.state.flags = entry.writes;
         }
+
+        // The v2 half: every active voice that no channel owns, in pool slot order.
+        // `VoicePool::iter` already walks active slots in that order, so the rows come out
+        // deterministic without the recorder sorting anything.
+        let mut background = Vec::new();
+        for (id, voice) in voices.iter() {
+            if owning_channel(channels, id).is_some() {
+                continue;
+            }
+            let mut row = TraceVoice {
+                voice: id.index(),
+                root: voice.tag.channel as u16,
+                position: voice.position(),
+                cutoff: unit_to_scale(voice.params.filter.cutoff.to_bits(), 255),
+                resonance: unit_to_scale(voice.params.filter.resonance.to_bits(), 255),
+                flags: working.voice_writes.iter().find(|(written, _)| *written == id).map(|(_, flags)| *flags).unwrap_or_default(),
+                ..TraceVoice::default()
+            };
+            match working.voice_reports.iter().find(|(reported, _)| *reported == id) {
+                Some((_, state)) => {
+                    row.note = state.note;
+                    row.instrument = state.instrument;
+                    row.sample = state.sample;
+                    row.volume = state.volume.min(64);
+                    row.period = state.period;
+                    row.pan = state.pan.min(255);
+                }
+                None => {
+                    // The same tag-and-params fallback an unreported channel gets.
+                    row.note = Some(voice.tag.note);
+                    row.instrument = voice.tag.instrument as u16;
+                    row.sample = voice.tag.sample;
+                    row.volume = unit_to_scale(voice.params.volume.to_bits(), 64);
+                    row.pan = bipolar_pan_to_u8(voice.params.pan.to_bits());
+                }
+            }
+            background.push(row);
+        }
+
         let channels = working.channels.into_iter().map(|entry| entry.state).collect();
         self.trace.ticks.push(TraceTick {
             tick: working.tick,
@@ -339,6 +532,7 @@ impl TraceRecorder {
             bpm,
             global_volume: working.global_volume,
             channels,
+            voices: background,
         });
     }
 
@@ -348,6 +542,17 @@ impl TraceRecorder {
         self.trace.ticks.clear();
         self.working = None;
     }
+}
+
+/// The channel whose **foreground** `voice` is, if any.
+///
+/// Not `voices.get(voice).tag.channel`: a tag says which channel *triggered* the voice and
+/// survives detachment on purpose, so it answers a different question. The whole table is
+/// scanned rather than only the tagged lane so that a voice allocated straight on the pool
+/// — a scripted test source, a future MIDI sample player sharing the pool — is classified
+/// by what the channel table actually says rather than by a tag nobody set.
+fn owning_channel(channels: &ChannelTable, voice: VoiceId) -> Option<ChannelId> {
+    channels.iter().find(|(_, channel)| channel.foreground == Some(voice)).map(|(id, _)| id)
 }
 
 /// The dirty bit a parameter write reports, if the v1 trace contract has one for it.
@@ -379,6 +584,7 @@ mod tests {
     use starplayer_core::{FilterParams, VoiceParams};
     use starplayer_mixer::{SampleRegion, VoiceTag};
 
+
     /// One tick with a single live voice on channel zero.
     fn recorded_tick(writes: &[VoiceParam], preset_dirty: DirtyBits) -> TraceChannel {
         let mut voices = VoicePool::new(1);
@@ -392,7 +598,7 @@ mod tests {
         recorder.begin_tick(Frame::ZERO, SongPosition::default(), 0, 1);
         for write in writes {
             if let Some(state) = voices.get_mut(voice) { write.apply(&mut state.params); }
-            recorder.record_param_write(&voices, voice, *write);
+            recorder.record_param_write(&voices, &channels, voice, *write);
         }
         recorder.finish_tick(6, 125, &channels, &voices);
         recorder.take().ticks.remove(0).channels.remove(0)
@@ -420,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_text_is_stable_and_line_oriented() {
+    fn version_two_text_is_stable_and_line_oriented() {
         let trace = Trace {
             version: TRACE_FORMAT_VERSION,
             ticks: alloc::vec![TraceTick {
@@ -445,15 +651,92 @@ mod tests {
                     resonance: 0,
                     flags: DirtyBits::VOLUME | DirtyBits::PITCH,
                 }],
+                voices: alloc::vec![TraceVoice {
+                    voice: 17,
+                    root: 3,
+                    note: Some(60),
+                    instrument: 1,
+                    sample: 1,
+                    volume: 32,
+                    period: 1712,
+                    pan: 128,
+                    position: (1234u64 << 32) | 0x91a2_b3c4,
+                    cutoff: 255,
+                    resonance: 0,
+                    flags: DirtyBits::empty(),
+                }],
             }],
         };
         assert_eq!(
             trace.to_text(),
             concat!(
-                "starplayer-trace v=1\n",
+                "starplayer-trace v=2\n",
                 "t=00042 frm=000000037044 ord=03 pat=07 row=12 tk=00 spd=06 bpm=125 gv=64\n",
-                " ch=00 act=1 note=C-5 ins=01 smp=01 vol=64 per=001712 pan=048 pos=0000001234.91a2b3c4 cut=255 res=000 fl=VP\n",
+                " ch=00 act=1 note=C-5 ins=01 smp=0001 vol=64 per=001712 pan=048 pos=0000001234.91a2b3c4 cut=255 res=000 fl=VP\n",
+                " vc=017 root=03 note=C-5 ins=01 smp=0001 vol=32 per=001712 pan=128 pos=0000001234.91a2b3c4 cut=255 res=000 fl=-\n",
             )
         );
+    }
+
+    #[test]
+    fn a_tick_with_no_background_voice_emits_no_voice_line() {
+        let mut voices = VoicePool::new(2);
+        let mut channels = ChannelTable::new(1);
+        channels
+            .trigger(ChannelId(0), &mut voices, VoiceTag::default(), SampleRegion::one_shot(0, 8), VoiceParams::SILENT, 0)
+            .expect("a fresh pool has a slot");
+
+        let mut recorder = TraceRecorder::default();
+        recorder.begin_tick(Frame::ZERO, SongPosition::default(), 0, 1);
+        recorder.finish_tick(6, 125, &channels, &voices);
+        let tick = recorder.take().ticks.remove(0);
+        assert!(tick.voices.is_empty(), "a foreground voice is described by its channel row, not a voice row");
+        assert!(tick.channels[0].active);
+    }
+
+    #[test]
+    fn a_detached_voice_gets_its_own_row_and_keeps_the_channel_that_triggered_it() {
+        let mut voices = VoicePool::new(2);
+        let mut channels = ChannelTable::new(2);
+        let tag = VoiceTag { channel: 0, instrument: 2, sample: 300, note: 48 };
+        let voice = channels
+            .trigger(ChannelId(1), &mut voices, tag, SampleRegion::one_shot(0, 8), VoiceParams::SILENT, 0)
+            .expect("a fresh pool has a slot");
+        assert_eq!(channels.detach_foreground(ChannelId(1)), Some(voice));
+
+        let mut recorder = TraceRecorder::default();
+        recorder.begin_tick(Frame::ZERO, SongPosition::default(), 0, 2);
+        // A write to a voice nobody owns lands on the voice's own row, not on channel 1's.
+        recorder.record_param_write(&voices, &channels, voice, VoiceParam::Volume(starplayer_core::U0F16::MAX));
+        recorder.finish_tick(6, 125, &channels, &voices);
+
+        let tick = recorder.take().ticks.remove(0);
+        assert_eq!(tick.voices.len(), 1, "the detached voice is listed once");
+        assert_eq!(tick.voices[0].voice, voice.index());
+        assert_eq!(tick.voices[0].root, 1, "`root` is the channel that triggered it, which `trigger` wrote into the tag");
+        assert_eq!(tick.voices[0].sample, 300, "a sample number past 255 survives the widened tag");
+        assert_eq!(tick.voices[0].instrument, 2);
+        assert_eq!(tick.voices[0].flags, DirtyBits::VOLUME);
+        assert!(!tick.channels[1].active, "the channel it left owns nothing");
+        assert_eq!(tick.channels[1].flags, DirtyBits::empty(), "and the write did not land on its row");
+    }
+
+    #[test]
+    fn a_reported_background_voice_overrides_the_tag_fallback() {
+        let mut voices = VoicePool::new(1);
+        let mut channels = ChannelTable::new(1);
+        let voice = channels
+            .trigger(ChannelId(0), &mut voices, VoiceTag::default(), SampleRegion::one_shot(0, 8), VoiceParams::SILENT, 0)
+            .expect("a fresh pool has a slot");
+        channels.detach_foreground(ChannelId(0));
+
+        let mut recorder = TraceRecorder::default();
+        recorder.begin_tick(Frame::ZERO, SongPosition::default(), 0, 1);
+        recorder.report_voice(voice, TraceChannelState { note: Some(72), instrument: 5, sample: 9, volume: 33, period: 856, pan: 200 });
+        recorder.finish_tick(6, 125, &channels, &voices);
+
+        let row = recorder.take().ticks.remove(0).voices.remove(0);
+        assert_eq!((row.note, row.instrument, row.sample), (Some(72), 5, 9));
+        assert_eq!((row.volume, row.period, row.pan), (33, 856, 200));
     }
 }

@@ -14,9 +14,14 @@ use crate::sample::SampleRegion;
 /// What a voice is playing, for the benefit of code that has to *find* voices rather than
 /// drive them (architecture §5.1).
 ///
-/// Four bytes, present from the start so IT's Duplicate Check has somewhere to look in
-/// M6. Every other format early-outs the whole matching loop, so the cost to MOD, S3M and
-/// MTM is these four bytes and one branch.
+/// Five bytes — six once padded — present from the start so IT's Duplicate Check has
+/// somewhere to look in M6. Every other format early-outs the whole matching loop, so the
+/// cost to MOD, S3M and MTM is these bytes and one branch.
+///
+/// `sample` is sixteen bits because IT's Duplicate Check compares sample *numbers* and an
+/// IT module may carry up to 99 samples per instrument across a bank far wider than a
+/// byte: a clamped number would make two different samples compare equal and cut the
+/// wrong voice.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VoiceTag {
     /// Which channel triggered the voice. Still set for an IT background voice, which is
@@ -25,7 +30,7 @@ pub struct VoiceTag {
     /// One-based tracker instrument number; zero means none.
     pub instrument: u8,
     /// One-based tracker sample number; zero means none.
-    pub sample: u8,
+    pub sample: u16,
     /// Which note.
     pub note: u8,
 }
@@ -374,6 +379,31 @@ impl VoicePool {
         })
     }
 
+    /// Every sounding voice, in slot order, mutably — the same ids [`VoicePool::iter`]
+    /// hands out.
+    ///
+    /// # What this is for
+    ///
+    /// A format that keeps **per-voice articulation state of its own** — XM's and IT's
+    /// envelope positions, fadeout level, key-off flag and auto-vibrato phase — holds it
+    /// in a parallel array indexed by [`VoiceId::index`] and validated against the id's
+    /// generation, and walks this iterator **once per tick** from inside its own
+    /// `TrackerProcessor::tick` to advance every entry. That reaches background voices
+    /// too: a voice detached by an IT New Note Action is owned by no channel, so a walk
+    /// over the channel table would miss it.
+    ///
+    /// Slot order and active slots only, so the walk is deterministic and a format's own
+    /// state advances in a fixed order. No allocation.
+    ///
+    /// A slot the format never allocated — a future MIDI sample player sharing this pool,
+    /// or a scripted test source — shows up here too. Its id will not match the one the
+    /// format stored for that slot, so the format skips it rather than adopting it.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (VoiceId, &mut Voice)> {
+        self.slots.iter_mut().enumerate().filter(|(_, slot)| slot.active).map(|(index, slot)| {
+            (VoiceId::new(index as u16, slot.generation), &mut slot.voice)
+        })
+    }
+
     /// Render every sounding voice into `destination`, releasing the ones that end.
     ///
     /// Voices are accumulated in **slot order**, which is what makes the float path's
@@ -468,6 +498,35 @@ mod tests {
         let second = pool.allocate(VoiceTag::default(), SampleRegion::default(), VoiceParams::SILENT, 0).expect("slot 1");
         assert_eq!((first.index(), second.index()), (0, 1));
         assert_eq!(pool.voices_active(), 2);
+    }
+
+    #[test]
+    fn iter_mut_visits_exactly_the_active_slots_in_order_with_the_ids_iter_hands_out() {
+        let mut pool = VoicePool::new(4);
+        let first = pool.allocate(VoiceTag::default(), SampleRegion::default(), VoiceParams::SILENT, 0).expect("slot 0");
+        let second = pool.allocate(VoiceTag::default(), SampleRegion::default(), VoiceParams::SILENT, 0).expect("slot 1");
+        let third = pool.allocate(VoiceTag::default(), SampleRegion::default(), VoiceParams::SILENT, 0).expect("slot 2");
+        assert!(pool.release(second), "leave a hole in the middle");
+
+        let visited: Vec<VoiceId> = pool.iter().map(|(id, _)| id).collect();
+        let visited_mutably: Vec<VoiceId> = pool.iter_mut().map(|(id, _)| id).collect();
+        assert_eq!(visited_mutably, alloc::vec![first, third], "active slots only, in slot order");
+        assert_eq!(visited_mutably, visited, "the same ids the shared walk hands out");
+    }
+
+    #[test]
+    fn iter_mut_writes_land_on_the_voices_it_names() {
+        let mut pool = VoicePool::new(2);
+        let first = pool.allocate(VoiceTag::default(), SampleRegion::default(), VoiceParams::SILENT, 0).expect("slot 0");
+        let second = pool.allocate(VoiceTag::default(), SampleRegion::default(), VoiceParams::SILENT, 0).expect("slot 1");
+
+        // What a format's per-tick articulation walk does: write straight to `params`,
+        // keyed by the slot index into its own parallel array.
+        for (id, voice) in pool.iter_mut() {
+            voice.params.volume = U0F16::from_bits(1_000 * (id.index() + 1));
+        }
+        assert_eq!(pool.get(first).map(|voice| voice.params.volume), Some(U0F16::from_bits(1_000)));
+        assert_eq!(pool.get(second).map(|voice| voice.params.volume), Some(U0F16::from_bits(2_000)));
     }
 
     #[test]

@@ -32,7 +32,7 @@
 use std::fmt;
 
 use starplayer::core::{DirtyBits, Frame};
-use starplayer::engine::{TRACE_FORMAT_VERSION, SongPosition, Trace, TraceChannel, TraceTick};
+use starplayer::engine::{TRACE_FORMAT_VERSION, SongPosition, Trace, TraceChannel, TraceTick, TraceVoice};
 
 pub mod conformance;
 
@@ -81,8 +81,11 @@ pub fn parse_trace(text: &str) -> Result<Trace, TraceParseError> {
         } else if line.starts_with(" ch=") {
             let Some(tick) = current.as_mut() else { return Err(TraceParseError::new(line_number, "channel appears before its tick header")) };
             tick.channels.push(parse_channel(line, line_number)?);
+        } else if line.starts_with(" vc=") {
+            let Some(tick) = current.as_mut() else { return Err(TraceParseError::new(line_number, "voice appears before its tick header")) };
+            tick.voices.push(parse_voice(line, line_number)?);
         } else if !line.is_empty() {
-            return Err(TraceParseError::new(line_number, "expected a tick or indented channel line"));
+            return Err(TraceParseError::new(line_number, "expected a tick, an indented channel line or an indented voice line"));
         }
     }
     if let Some(tick) = current {
@@ -107,6 +110,7 @@ fn parse_tick(line: &str, line_number: usize) -> Result<TraceTick, TraceParseErr
         bpm: parse_field(&fields, 7, line_number)?,
         global_volume: parse_field(&fields, 8, line_number)?,
         channels: Vec::new(),
+        voices: Vec::new(),
     })
 }
 
@@ -124,6 +128,30 @@ fn parse_channel(line: &str, line_number: usize) -> Result<TraceChannel, TracePa
             "1" => true,
             value => return Err(TraceParseError::new(line_number, format!("invalid activity `{value}`"))),
         },
+        note: parse_note(fields[2].1, line_number)?,
+        instrument: parse_field(&fields, 3, line_number)?,
+        sample: parse_field(&fields, 4, line_number)?,
+        volume: parse_field(&fields, 5, line_number)?,
+        period: parse_field(&fields, 6, line_number)?,
+        pan: parse_field(&fields, 7, line_number)?,
+        position: parse_position(fields[8].1, line_number)?,
+        cutoff: parse_field(&fields, 9, line_number)?,
+        resonance: parse_field(&fields, 10, line_number)?,
+        flags: parse_flags(fields[11].1, line_number)?,
+    })
+}
+
+/// One ` vc=` line: a v2 row for an active voice that no channel owns.
+fn parse_voice(line: &str, line_number: usize) -> Result<TraceVoice, TraceParseError> {
+    let fields = parse_fields(line, line_number)?;
+    expect_keys(
+        &fields,
+        &["vc", "root", "note", "ins", "smp", "vol", "per", "pan", "pos", "cut", "res", "fl"],
+        line_number,
+    )?;
+    Ok(TraceVoice {
+        voice: parse_field(&fields, 0, line_number)?,
+        root: parse_field(&fields, 1, line_number)?,
         note: parse_note(fields[2].1, line_number)?,
         instrument: parse_field(&fields, 3, line_number)?,
         sample: parse_field(&fields, 4, line_number)?,
@@ -267,11 +295,18 @@ pub enum TraceField {
     Cutoff,
     Resonance,
     Flags,
+    /// Every ` vc=` row of a tick, compared as one unit.
+    ///
+    /// Deliberately not one field per attribute: until IT (G5) gives the differ a corpus
+    /// of real background voices to reason about, "the set of voices no channel owns
+    /// differs" is the actionable statement, and splitting it into eleven fields would
+    /// invent a per-attribute waiver vocabulary nothing can yet justify.
+    Voices,
 }
 
 impl TraceField {
     /// Every named field, in the order the differ compares them.
-    pub const ALL: [TraceField; 24] = [
+    pub const ALL: [TraceField; 25] = [
         TraceField::Version,
         TraceField::TickCount,
         TraceField::Tick,
@@ -296,6 +331,7 @@ impl TraceField {
         TraceField::Cutoff,
         TraceField::Resonance,
         TraceField::Flags,
+        TraceField::Voices,
     ];
 
     /// The stable spelling used by [`fmt::Display`] and by conformance field waivers.
@@ -325,6 +361,7 @@ impl TraceField {
             TraceField::Cutoff => "cutoff",
             TraceField::Resonance => "resonance",
             TraceField::Flags => "flags",
+            TraceField::Voices => "voices",
         }
     }
 
@@ -438,6 +475,22 @@ pub fn diff_traces(expected: &Trace, actual: &Trace, tolerances: &TraceTolerance
                 }
             }
         }
+        // Voice rows are compared after the channel rows, so a divergence in a channel
+        // — which every format has — is still the first thing the report names.
+        if expected_tick.voices != actual_tick.voices {
+            tick_diverged = true;
+            if first_divergence.is_none() {
+                first_divergence = Some(divergence(
+                    Some(tick_index),
+                    Some(expected_tick.tick),
+                    None,
+                    TraceField::Voices,
+                    describe_voices(&expected_tick.voices),
+                    describe_voices(&actual_tick.voices),
+                    "exact",
+                ));
+            }
+        }
         if expected_tick.channels.len() != actual_tick.channels.len() {
             tick_diverged = true;
             divergent_channels += expected_tick.channels.len().abs_diff(actual_tick.channels.len());
@@ -541,6 +594,33 @@ fn compare_channel(expected: &TraceChannel, actual: &TraceChannel, tolerance: &T
     None
 }
 
+/// The ` vc=` rows of one tick, rendered for a divergence report.
+///
+/// Divergent voice rows are counted in `divergent_ticks` but **not** in
+/// `divergent_channels`: that counter means "per-tick channel records that differ" and
+/// nothing else.
+fn describe_voices(voices: &[TraceVoice]) -> String {
+    if voices.is_empty() {
+        return String::from("no background voices");
+    }
+    voices.iter().map(|voice| format!(
+        "vc={:03} root={:02} note={:?} ins={} smp={} vol={} per={} pan={} pos={:010}.{:08x} cut={} res={} fl={:02x}",
+        voice.voice,
+        voice.root,
+        voice.note,
+        voice.instrument,
+        voice.sample,
+        voice.volume,
+        voice.period,
+        voice.pan,
+        voice.position >> 32,
+        voice.position as u32,
+        voice.cutoff,
+        voice.resonance,
+        voice.flags.bits(),
+    )).collect::<Vec<_>>().join("; ")
+}
+
 fn divergence(
     tick_index: Option<usize>,
     tick: Option<u64>,
@@ -607,8 +687,122 @@ mod tests {
                     resonance: 0,
                     flags: DirtyBits::PITCH,
                 }],
+                voices: Vec::new(),
             }).collect(),
         }
+    }
+
+    /// A [`TrackerProcessor`] that does what an IT New Note Action does: on row 1 it
+    /// unbinds the voice channel 0 is sounding without stopping it, and then writes to the
+    /// voice it no longer owns.
+    ///
+    /// [`TrackerProcessor`]: starplayer::engine::TrackerProcessor
+    struct DetachingProcessor {
+        region: starplayer::mixer::SampleRegion,
+        detached: Option<starplayer::core::VoiceId>,
+    }
+
+    impl starplayer::engine::TrackerProcessor for DetachingProcessor {
+        fn reset(&mut self) { self.detached = None; }
+
+        fn row(
+            &mut self,
+            context: &mut starplayer::engine::TickContext<'_>,
+            row: starplayer::engine::RowRef<'_>,
+        ) -> starplayer::engine::TickOutcome {
+            use starplayer::core::{ChannelId, Step, U0F16, VoiceParams};
+            use starplayer::mixer::VoiceTag;
+
+            if row.row == 0 {
+                let params = VoiceParams { step: Step::ONE, volume: U0F16::MAX, ..VoiceParams::SILENT };
+                let tag = VoiceTag { channel: 0, instrument: 2, sample: 300, note: 60 };
+                context.trigger_channel(ChannelId(0), tag, self.region, params, 0);
+            }
+            if row.row == 1 {
+                // Detach *before* anything else touches the channel: `trigger_channel`
+                // releases whatever foreground it finds.
+                self.detached = context.detach_channel(ChannelId(0));
+            }
+            context.outcome()
+        }
+
+        fn tick(&mut self, context: &mut starplayer::engine::TickContext<'_>) -> starplayer::engine::TickOutcome {
+            use starplayer::core::{U0F16, VoiceParam};
+
+            if let Some(voice) = self.detached {
+                // The per-tick articulation a format runs on a background voice.
+                context.write_voice_param(voice, VoiceParam::Volume(U0F16::from_bits(32_768)));
+            }
+            context.outcome()
+        }
+    }
+
+    /// Render a short song whose second row detaches its only voice, and return its trace.
+    fn detached_voice_trace() -> Trace {
+        use starplayer::core::ExactFixedPoint;
+        use starplayer::dsp::Linear;
+        use starplayer::engine::demo::DemoPatternData;
+        use starplayer::engine::{Engine, PatternSequencer, RENDER_QUANTUM, SequencerSettings};
+        use starplayer::mixer::{FixedPath, LoopSpan, StereoI16, append_guarded_sample};
+
+        let mut blob = Vec::new();
+        let pcm: Vec<i16> = (0..64).map(|index| 100 + index as i16).collect();
+        let region = append_guarded_sample(&mut blob, &pcm, LoopSpan::new(0, 64));
+
+        let mut engine: Engine<FixedPath, Linear, StereoI16> = Engine::new(4);
+        engine.set_pcm(blob);
+        let processor = DetachingProcessor { region, detached: None };
+        let settings = SequencerSettings { sample_rate_hz: 44_100, initial_speed: 2, ..SequencerSettings::default() };
+        let sequencer = PatternSequencer::new(ExactFixedPoint, DemoPatternData::new(1, 4, 1), processor, settings);
+        engine.set_source(Box::new(sequencer));
+
+        let mut output = vec![0i16; RENDER_QUANTUM * 2 * 64];
+        engine.render(&mut output);
+        engine.take_trace()
+    }
+
+    #[test]
+    fn a_detached_voice_is_traced_on_its_own_row_and_the_text_round_trips() {
+        let trace = detached_voice_trace();
+        let text = trace.to_text();
+        assert!(text.starts_with("starplayer-trace v=2\n"), "the contract is version 2: {text}");
+
+        let detached_ticks: Vec<&TraceTick> = trace.ticks.iter().filter(|tick| !tick.voices.is_empty()).collect();
+        assert!(!detached_ticks.is_empty(), "row 1 detaches the voice, so some tick has a background voice: {text}");
+        let first = detached_ticks[0];
+        assert_eq!(first.voices.len(), 1);
+        assert_eq!(first.voices[0].root, 0, "`root` is still the channel that triggered it");
+        assert_eq!(first.voices[0].sample, 300, "a sample number past 255 survives the widened tag");
+        assert!(!first.channels[0].active, "the channel it left owns nothing");
+
+        // The per-tick write lands on the voice's own row, never on the channel's.
+        let written = trace.ticks.iter().find(|tick| tick.voices.first().is_some_and(|voice| !voice.flags.is_empty()));
+        let written = written.expect("a write to the detached voice was recorded somewhere");
+        assert_eq!(written.voices[0].flags, DirtyBits::VOLUME);
+        assert_eq!(written.channels[0].flags, DirtyBits::empty(), "and not on the channel that used to own it");
+
+        assert!(text.contains(" vc="), "the text carries a voice line: {text}");
+        assert_eq!(parse_trace(&text).expect("version two parses"), trace, "` vc=` lines round-trip");
+    }
+
+    #[test]
+    fn voice_rows_are_compared_as_one_field_after_the_channel_rows() {
+        let expected = example_trace();
+        let mut actual = expected.clone();
+        actual.ticks[1].voices.push(TraceVoice { voice: 3, root: 1, note: Some(48), ..TraceVoice::default() });
+
+        let difference = diff_traces(&expected, &actual, &TraceTolerances::default());
+        let first = difference.first_divergence.as_ref().expect("a background voice appeared");
+        assert_eq!((first.tick, first.channel, first.field), (Some(1), None, TraceField::Voices));
+        assert_eq!(first.expected, "no background voices");
+        assert!(first.actual.contains("vc=003 root=01"), "the report names the row: {}", first.actual);
+        assert_eq!(difference.divergent_ticks, 1);
+        assert_eq!(difference.divergent_channels, 0, "a voice row is not a channel record");
+
+        // A channel divergence on the same tick still wins: channels are compared first.
+        actual.ticks[1].channels[0].volume = 33;
+        let difference = diff_traces(&expected, &actual, &TraceTolerances::default());
+        assert_eq!(difference.first_divergence.map(|first| first.field), Some(TraceField::Volume));
     }
 
     #[test]

@@ -196,3 +196,125 @@ Report the exact commands run and their results. **Do not commit** — the revie
 Envelopes, NNA, DCT, stealing, the filter, any change to `mix_run` or `MixPath`. A
 ramp-preserving `VoicePool::replace` for stealing (deferred until the IT corpus shows the
 click matters). The `Instrument` trait. The facade enum and the offline capacity sites (D3).
+
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question.
+
+### 0. One deviation from the spec — `recommended_voice_capacity` takes the channel count
+
+**Deviated, deliberately.** The task specifies
+`TrackerProcessor::recommended_voice_capacity(&self) -> usize` "with a default returning
+the processor's channel count (S3M, MOD and MTM keep the default)". Those two clauses
+cannot both hold: `TrackerProcessor` has no channel-count accessor — the channel count
+lives in each format's `PatternData`, not in its processor — so a **default body** with
+that signature has no way to name it, and S3M, MOD and MTM would each have had to write an
+override, which the task explicitly says they do not.
+
+The signature implemented is therefore
+
+```rust
+fn recommended_voice_capacity(&self, channel_count: usize) -> usize { channel_count }
+```
+
+which satisfies both clauses as written: the default *is* the channel count, and the three
+existing formats keep it with no code at all. Every caller already has the number — the
+sequencer's `PatternData::channel_count()` in `scan_timeline`, the module header in D3's
+facade dispatch — and a format with a parallel per-voice array ignores the argument and
+answers from its own constant, which is the case the API exists for.
+
+### 1. Does a bigger channel table or pool change output? — **no; ~23 KiB more memory**
+
+`VoicePool::new` and `ChannelTable::new` each allocate once and never grow, and every
+consumer walks **active slots only**: `accumulate_masked` skips `!slot.active`, `iter` and
+`iter_mut` filter on it, the trace's background scan walks `VoicePool::iter`, and the
+telemetry view reads the channel table by index. There is no per-capacity arithmetic
+anywhere on the render path — no summation over empty slots, no normalisation by pool
+size — so a wider engine mixes exactly the same voices in exactly the same slot order.
+
+Confirmed four ways, all after the change:
+
+* `a_wider_voice_pool_and_channel_table_render_byte_identical_output` in
+  `crates/starplayer-engine/tests/block_size_determinism.rs` renders the determinism
+  scenario at `voice_capacity: 64, channel_count: 32` and at `MAX_VOICE_CAPACITY: 256,
+  ChannelTable::MAX_CHANNELS: 64` and compares **bit patterns**, not floats. Identical.
+* The whole block-size sweep (1, 3, 64, 128, 4096, 8191) still passes on both paths.
+* `cargo xtask goldens --check`: all seven hashes `ok`.
+* The wasm worklet host now builds at 256/64. `node apps/starplayer-web/test/worklet-harness.mjs`
+  reports the same rendered peak, `0.731`, as the same harness run against the unmodified
+  tree, and `ring-harness.mjs` passes.
+
+**Memory cost.** `size_of::<VoiceSlot>()` is 120 bytes, so 256 slots is 30,720 bytes
+against 7,680 for 64 — **+23,040 bytes**, one allocation, made once when the worklet is
+created. `size_of::<Channel>()` is 8 bytes, so 64 lanes is 512 bytes against 256 —
++256 bytes. Under 24 KiB in total for a browser worklet that already holds a quarter of a
+megabyte of wasm; on an embedded target a host simply sizes its own engine smaller, which
+`recommended_voice_capacity` documents as legal.
+
+### 2. Which tests pin the trace text? — **three sites, all in-tree; no stored fixtures**
+
+`grep` over the whole repository for `starplayer-trace v=` and for literal ` ch=` rows
+finds no committed trace file at all: the traces are produced and compared in-process, so
+there is nothing to regenerate on disk. The three places that pinned v1 text were
+
+* `crates/starplayer-engine/src/trace.rs` module docs (the format contract itself) — rewritten
+  for v2, with the ` vc=` line documented alongside the ` ch=` line;
+* `trace::tests::version_one_text_is_stable_and_line_oriented` — now
+  `version_two_text_is_stable_and_line_oriented`, asserting the exact v2 text including a
+  ` vc=` row;
+* `starplayer-testkit`'s `parse_trace`, which rejects any version but `TRACE_FORMAT_VERSION`
+  and therefore needed the new ` vc=` arm rather than a version bump alone.
+
+Two more places compare trace text without pinning a literal, and both still pass
+unchanged: `starplayer-offline`'s `a_trace_is_repeatable_and_host_block_size_independent`
+and `native_mod_trace_is_repeatable_and_host_block_size_independent` compare a trace
+against itself at six host block sizes.
+
+`cargo xtask ci --job trace-zero-cost` passes. It still proves the hook vanishes without
+the feature: the `shipped` pass finds zero references to the trace symbols in the emitted
+assembly and the `with-trace` pass finds 16, and the new `report_trace_voice` and
+`detach_channel` are built the same way — `report_trace_voice` is `#[cfg]`-gated inside an
+`#[inline]` method whose non-trace arm is `let _ = (voice, state);`, and `detach_channel`
+records nothing at all, so it has no trace code to eliminate.
+
+`cargo xtask trace <module>` was run against `REFLEX.S3M` and emits `starplayer-trace v=2`,
+four-digit `smp`, and no ` vc=` lines — S3M never detaches a voice.
+
+### 3. `VoiceTag` layout — **`Voice` is unchanged at 112 bytes**
+
+Measured before and after the widening on the same toolchain and target:
+
+| | `size_of::<VoiceTag>()` | `align_of::<VoiceTag>()` | `size_of::<Voice>()` | `align_of::<Voice>()` |
+|---|---|---|---|---|
+| before | 4 | 1 | 112 | 8 |
+| after | 6 | 2 | 112 | 8 |
+
+The tag grew two bytes and `Voice` did not grow at all: the two bytes came out of padding
+`Voice` already carried (`VoiceParams`, `SampleRegion`, a `u64` position, two `GainRamp`s,
+three `bool`s and an `Option<SampleRegion>` leave it 8-aligned either way). No cache-line
+boundary was crossed — 112 bytes still spans two 64-byte lines exactly as before, and a
+pool's slots stay 120 bytes apart because `VoiceSlot`'s own padding absorbed nothing new.
+
+### 4. Where a background voice's write is attributed — **the channel table, not the tag**
+
+Not asked, but decided while implementing, and load-bearing. `record_voice_flags` used to
+resolve a write to a channel row through `voices.get(voice).tag.channel`. A tag survives
+detachment on purpose — Duplicate Check needs it — so after v2 that lookup would have sent
+a background voice's write to the row of a channel that no longer owns it, and
+`finish_tick` would have emitted a ` vc=` row for the same voice with empty flags: the
+write would have appeared on the wrong row *and* been missing from the right one.
+
+Both decisions now go through one predicate, `owning_channel(channels, voice)`, which asks
+the channel table which lane (if any) has this exact `VoiceId` as its foreground. Writes go
+to a ` ch=` row exactly when `finish_tick` will *not* emit a ` vc=` row, so a write can
+never land on a row that is not written out. The whole table is scanned rather than only
+the tagged lane, so a voice allocated straight on the pool — a scripted test source, a
+future MIDI sample player sharing the pool — is classified by what the channel table says
+rather than by a tag nobody set.
+
+Resolution happens **at the moment of the write**, not at `finish_tick`. A channel that
+retriggers within a tick releases its first voice before allocating the second; by
+`finish_tick` the first voice is gone, and deferring the decision would have silently
+dropped its writes. This is also what keeps v1's behaviour byte-identical for MOD, S3M and
+MTM.

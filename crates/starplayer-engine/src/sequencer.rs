@@ -355,6 +355,27 @@ impl<'engine> TickContext<'engine> {
         let _ = (channel, state);
     }
 
+    /// Report format-native state for a **background** voice — one no channel owns — which
+    /// the trace emits on its own ` vc=` line (trace format v2).
+    ///
+    /// The mirror of [`TickContext::report_trace_channel`], for the voices an IT New Note
+    /// Action detached: they have no channel row to report against, but they are still
+    /// running envelopes and a fadeout that a trace has to be able to show. A voice that
+    /// is some channel's foreground reports through `report_trace_channel` instead, and a
+    /// background voice nobody reports falls back to its tag and [`VoiceParams`] exactly
+    /// as an unreported channel does.
+    ///
+    /// A no-op without `trace`, so format crates do not grow feature-dependent call sites.
+    #[inline]
+    pub fn report_trace_voice(&mut self, voice: VoiceId, state: TraceChannelState) {
+        #[cfg(feature = "trace")]
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.report_voice(voice, state);
+        }
+        #[cfg(not(feature = "trace"))]
+        let _ = (voice, state);
+    }
+
     /// Start or retrigger a channel and trace the initial parameter writes.
     #[inline]
     pub fn trigger_channel(
@@ -368,7 +389,7 @@ impl<'engine> TickContext<'engine> {
         let voice = self.channels.trigger(channel, self.voices, tag, region, params, offset_frames)?;
         #[cfg(feature = "trace")]
         if let Some(trace) = self.trace.as_deref_mut() {
-            trace.record_voice_flags(self.voices, voice, params.dirty);
+            trace.record_voice_flags(self.voices, self.channels, voice, params.dirty);
         }
         Some(voice)
     }
@@ -392,9 +413,24 @@ impl<'engine> TickContext<'engine> {
         // itself; without it the C1 dump shows the sample changing with no cause.
         #[cfg(feature = "trace")]
         if let Some(trace) = self.trace.as_deref_mut() {
-            trace.record_voice_flags(self.voices, voice, DirtyBits::SAMPLE);
+            trace.record_voice_flags(self.voices, self.channels, voice, DirtyBits::SAMPLE);
         }
         true
+    }
+
+    /// Unbind `channel`'s foreground voice without stopping it — see
+    /// [`ChannelTable::detach_foreground`]. Returns the detached voice, if there was one.
+    ///
+    /// **Detach before [`TickContext::trigger_channel`]**, never after: `trigger` releases
+    /// whatever foreground it finds, so the other order cuts the voice the New Note Action
+    /// meant to keep sounding.
+    ///
+    /// This records **nothing** in the trace: no parameter changed and no voice started or
+    /// stopped. What the tick trace shows instead is the voice moving from its channel's
+    /// ` ch=` row to a ` vc=` row of its own, which is the detachment itself.
+    #[inline]
+    pub fn detach_channel(&mut self, channel: ChannelId) -> Option<VoiceId> {
+        self.channels.detach_foreground(channel)
     }
 
     /// Stop and unbind a channel, preserving the stop write in the tick trace even though
@@ -415,7 +451,7 @@ impl<'engine> TickContext<'engine> {
     pub fn write_voice_param(&mut self, voice: VoiceId, param: VoiceParam) {
         #[cfg(feature = "trace")]
         if let Some(trace) = self.trace.as_deref_mut() {
-            trace.record_param_write(self.voices, voice, param);
+            trace.record_param_write(self.voices, self.channels, voice, param);
         }
         if let Some(state) = self.voices.get_mut(voice) {
             param.apply(&mut state.params);
@@ -427,7 +463,7 @@ impl<'engine> TickContext<'engine> {
     pub fn mark_voice_dirty(&mut self, voice: VoiceId, flags: DirtyBits) {
         #[cfg(feature = "trace")]
         if let Some(trace) = self.trace.as_deref_mut() {
-            trace.record_voice_flags(self.voices, voice, flags);
+            trace.record_voice_flags(self.voices, self.channels, voice, flags);
         }
         if let Some(state) = self.voices.get_mut(voice) {
             state.params.dirty.insert(flags);
@@ -489,6 +525,30 @@ pub trait TrackerProcessor {
         let _ = row;
         self.tick(context)
     }
+
+    /// How many voices this processor would like the pool to hold, given the module's
+    /// `channel_count`.
+    ///
+    /// The default is `channel_count`: MOD, S3M and MTM sound exactly one voice per
+    /// pattern channel and never create a background voice, so a pool that wide can never
+    /// be full. XM and IT override it, because a channel there can hold several sounding
+    /// voices at once, and because they keep a **parallel per-voice array** — envelope
+    /// positions, fadeout, key-off, auto-vibrato phase, indexed by
+    /// [`VoiceId::index`](starplayer_core::VoiceId::index) — whose length must be sized
+    /// from the same constant as this answer, so the two can never disagree.
+    ///
+    /// # It is a recommendation, not a contract
+    ///
+    /// A host may hand the sequencer a pool of any size, and both directions are legal:
+    ///
+    /// * **Larger** — a persistent host builds one engine at
+    ///   [`MAX_VOICE_CAPACITY`](crate::MAX_VOICE_CAPACITY) and plays every module through
+    ///   it. A format with a parallel array must therefore reach its voices through
+    ///   [`VoicePool::get_mut`] and simply **skip any id past the end of its array**; it
+    ///   may never index that array unchecked.
+    /// * **Smaller** — an embedded host may not have the memory. Fewer voices sound;
+    ///   [`VoicePool::allocate`] returning `None` is already a normal outcome.
+    fn recommended_voice_capacity(&self, channel_count: usize) -> usize { channel_count }
 }
 
 // ── the sequencer ───────────────────────────────────────────────────────────────────
@@ -1311,6 +1371,29 @@ mod tests {
         /// Run `count` ticks and report the frame each landed on.
         fn ticks(&mut self, sequencer: &mut TestSequencer, count: usize) -> Vec<Frame> {
             (0..count).filter_map(|_| self.tick(sequencer)).collect()
+        }
+    }
+
+    #[test]
+    fn detaching_a_channel_through_the_tick_context_hands_back_the_voice_it_unbound() {
+        let mut voices = VoicePool::new(2);
+        let mut channels = ChannelTable::new(2);
+        let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+
+        let params = VoiceParams { step: Step::ONE, volume: U0F16::MAX, ..VoiceParams::SILENT };
+        let voice = context.trigger_channel(ChannelId(1), VoiceTag::default(), SampleRegion::one_shot(0, 32), params, 0).expect("a fresh pool has room");
+
+        assert_eq!(context.detach_channel(ChannelId(1)), Some(voice));
+        assert_eq!(context.detach_channel(ChannelId(1)), None, "there is nothing left to unbind");
+        assert!(context.voices.get(voice).is_some(), "the voice keeps sounding: detaching is not stopping");
+        assert!(!context.channels.is_sounding(ChannelId(1), context.voices));
+    }
+
+    #[test]
+    fn the_default_recommended_voice_capacity_is_the_channel_count() {
+        let processor = DemoProcessor::new(SampleRegion::default(), Step::ONE);
+        for channel_count in [1usize, 4, 8, 32, 64] {
+            assert_eq!(processor.recommended_voice_capacity(channel_count), channel_count, "the default answers with what it was given");
         }
     }
 

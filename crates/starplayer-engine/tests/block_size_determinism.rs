@@ -23,8 +23,8 @@ use starplayer_engine::demo::{
     DemoPatternData, DemoProcessor,
 };
 use starplayer_engine::{
-    ControlDriver, Engine, EngineContext, EventSource, MAX_ZERO_ADVANCE, PatternSequencer, RENDER_QUANTUM,
-    ScriptedAction, ScriptedSource, SequencerSettings,
+    ChannelTable, ControlDriver, Engine, EngineContext, EngineSettings, EventSource, MAX_VOICE_CAPACITY,
+    MAX_ZERO_ADVANCE, PatternSequencer, RENDER_QUANTUM, ScriptedAction, ScriptedSource, SequencerSettings,
 };
 use starplayer_mixer::{
     FixedPath, FloatPath, LoopSpan, MixPath, MonoI16, OutputFormat, SampleRegion, StereoF32, StereoI16, VoiceTag,
@@ -194,6 +194,39 @@ fn nearest_interpolation_is_byte_identical_at_every_host_block_size() {
 #[test]
 fn mono_output_is_byte_identical_at_every_host_block_size() {
     assert_block_size_independent::<FixedPath, Linear, MonoI16>("fixed / linear / mono i16");
+}
+
+/// The same scenario as [`render_at_block_size`], on an engine sized by `settings` rather
+/// than by [`Engine::new`].
+fn render_with_settings(settings: EngineSettings) -> Vec<i16> {
+    let (blob, region) = looping_blob();
+    let mut engine: Engine<FixedPath, Linear, StereoI16> = Engine::with_settings(settings);
+    engine.set_pcm(blob);
+
+    let tag = VoiceTag { channel: 0, instrument: 1, sample: 1, note: 60 };
+    let voice = engine.voices_mut().allocate(tag, region, voice_params(), 0).expect("a fresh pool has room");
+    engine.set_source(Box::new(ScriptedSource::new(vec![ScriptedAction::new(Frame(EVENT_FRAME), voice, VoiceParam::Volume(VOLUME_AFTER))])));
+
+    let mut output = vec![0i16; TOTAL_FRAMES * StereoI16::CHANNELS];
+    for block in output.chunks_mut(RENDER_QUANTUM * StereoI16::CHANNELS) {
+        engine.render(block);
+    }
+    output
+}
+
+/// M4-lite E3 research point 1: a persistent host sizes its engine at the maxima
+/// (`MAX_VOICE_CAPACITY` voices, `ChannelTable::MAX_CHANNELS` lanes) because it builds the
+/// engine before it has seen a module. Both are allocated once and the mixer walks only
+/// *active* slots, so the wider engine must render byte-identical output — the extra
+/// capacity is memory and nothing else.
+#[test]
+fn a_wider_voice_pool_and_channel_table_render_byte_identical_output() {
+    let narrow = render_with_settings(EngineSettings { voice_capacity: 64, channel_count: 32, ..EngineSettings::default() });
+    let wide = render_with_settings(EngineSettings { voice_capacity: MAX_VOICE_CAPACITY, channel_count: ChannelTable::MAX_CHANNELS, ..EngineSettings::default() });
+
+    assert!(narrow.iter().any(|sample| *sample != 0), "the scenario has to actually make sound");
+    assert_eq!(first_difference(&wide, &narrow), None, "256 voices / 64 channels changed a sample against 64 / 32");
+    assert_eq!(byte_image(&wide), byte_image(&narrow), "the wider engine is not byte-identical");
 }
 
 // ── events land on exact frames, not on buffer boundaries ───────────────────────────

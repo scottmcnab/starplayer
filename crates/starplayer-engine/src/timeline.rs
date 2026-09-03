@@ -427,7 +427,13 @@ where
     let sample_rate_hz = sequencer.sample_rate_hz();
     let channel_count = (sequencer.data().channel_count() as usize).max(1);
     let order_count = sequencer.data().order_count() as usize;
-    let mut voices = VoicePool::new(channel_count);
+    // The processor, not the channel count, says how wide the pool has to be: a format
+    // whose channel can sound several voices at once — XM, IT — would otherwise scan
+    // through a pool it keeps filling, and measure a song shape the player never plays.
+    // MOD, S3M and MTM keep the default, which is the channel count, so their scans are
+    // unchanged.
+    let voice_capacity = sequencer.processor().recommended_voice_capacity(channel_count).max(1);
+    let mut voices = VoicePool::new(voice_capacity);
     let mut channels = ChannelTable::new(channel_count);
     let mut control = ControlClock::new(sample_rate_hz, Frame::ZERO);
 

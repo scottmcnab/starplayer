@@ -202,6 +202,18 @@ The real reason to want an event stream was diffability. Take it directly:
 
 Zero cost in release, a full serialisable per-tick trace in test builds.
 
+**Trace format v2 (M4-lite task E3)** adds a second kind of row. After a tick's one ` ch=`
+line per module channel come zero or more ` vc=` lines, one for every active voice that is
+**no channel's foreground**, in pool slot order. IT's New Note Actions detach a channel's
+sounding voice into the background, where it runs its own envelopes and fadeout owned by
+nobody; before v2 such a voice appeared on no row at all and the diff harness could not
+see an NNA happen. A ` vc=` row is keyed by the voice's pool slot and carries `root`, the
+channel that triggered it; its other fields are the ` ch=` row's minus `act`, since a
+listed voice is active by definition. A parameter write is attributed to the ` ch=` row
+when its voice is that channel's foreground and to the voice's own row otherwise. Formats
+that never detach a voice — MOD, S3M, MTM — emit no ` vc=` lines, so their traces differ
+from v1 only in the version header and the widened `smp` field.
+
 ### 2.3 The musical layer is MIDI-*convertible*, not MIDI-*shaped*
 
 Seven-bit velocity cannot round-trip S3M volume (0–64), IT global volume (0–128),
@@ -494,8 +506,7 @@ libopenmpt, not guessed.
 
 ### 5.3 The instrument surface
 
-Sketched, not committed — extracted at M4 once XM gives it a second real implementation
-(§10):
+Sketched, not committed — the shape it will take when it is extracted:
 
 ```rust
 pub trait Instrument {
@@ -505,6 +516,37 @@ pub trait Instrument {
     fn render(&self, voice: &mut Voice, out: &mut MixBuffer);
 }
 ```
+
+**Owner decision, 2026-09-03** (`plans/engine/M3-M6-concurrency-plan.md`, delivered by
+M4-lite task E3): the extraction moves to **M4-full**, and XM and IT are implemented
+without it.
+
+The reason is design goal 8. XM and IT are being built concurrently, so neither is
+finished when the other starts, and a trait committed now would be extracted from one
+implementation and a guess — which is the mistake the goal exists to prevent. The second
+*genuinely different* implementation is the MIDI sample player of M4-full: a non-tracker
+instrument, driven by a synthesised control tick rather than a tracker tick, which is what
+will actually show whether the surface above is the right one.
+
+Until then the division is:
+
+- **Shared, in the engine and the mixer** — the voice pool and its generational handles,
+  the channel table and the foreground binding, `ChannelTable::detach_foreground` (the
+  NNA primitive), `VoicePool::iter_mut` (the per-tick walk), and the trace.
+- **Format-owned, in each format crate** — all per-voice articulation: envelope
+  positions, fadeout level, key-off flag, auto-vibrato phase. Each format keeps it in a
+  **parallel array indexed by `VoiceId::index()` and validated by the id's generation**,
+  and advances it from inside its own `TrackerProcessor::tick()` by walking
+  `VoicePool::iter_mut()`. A slot the format did not allocate shows an id that does not
+  match the one it stored, so it is skipped rather than adopted.
+
+`TrackerProcessor::recommended_voice_capacity(channel_count)` is how the pool and that
+parallel array are sized from one number. Its default is the channel count — MOD, S3M and
+MTM sound one voice per channel and never detach — and a format with a parallel array
+sizes both the array and its answer from one constant. A pool **larger** than the answer
+is legal, and is what a persistent host builds (`MAX_VOICE_CAPACITY`, IT's virtual-channel
+limit of 256): the format must reach its voices through `get_mut` and skip ids past the
+end of its array. A pool **smaller** is legal too — fewer voices sound.
 
 ### 5.4 The control clock
 
@@ -519,6 +561,15 @@ clock is itself an `EventSource`:
 
 One uniform rule — "envelopes advance on control ticks" — exactly right for trackers,
 perfectly adequate for synth instruments.
+
+**Where this stands after M4-lite (task E3).** With a tracker sequencer driving, the
+tracker tick *is* the control tick — `PatternSequencer::dispatch` calls
+`ControlClock::tick_from_tracker` on every tick — and **nothing in the engine consumes it
+yet**. XM's and IT's envelopes advance from inside their own `TrackerProcessor::tick()`,
+which is that same tick, so the rule holds as written; what has not been built is an
+engine-side consumer of a *synthesised* control tick, because the first thing that needs
+one is the MIDI sample player of M4-full. The clock is driven and observable now so that
+the consumer can be added without moving the tick.
 
 ---
 
@@ -919,6 +970,12 @@ Build S3M concretely with structs; extract `Instrument` when XM lands. The *conc
 this document are designed up front; the Rust trait boundaries follow the
 implementations. The two exceptions, which have multiple users from day one, are
 `TempoModel` (§1.3) and `EventSource` (§3, pattern sequencer + external queue).
+
+The rule bit on its own author at M4. XM and IT are built **concurrently**, so "extract
+`Instrument` when XM lands" would have meant extracting it from one implementation and a
+guess about the other. The owner's decision of 2026-09-03 is therefore to keep per-voice
+articulation format-owned through M5 and M6 and to extract the trait at M4-full, against
+XM, IT *and* the MIDI sample player — see §5.3.
 
 ---
 

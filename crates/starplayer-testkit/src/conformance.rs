@@ -139,7 +139,14 @@ impl ConformanceExclusion {
 
 /// Structural fields describe the shape of a comparison rather than one observable value,
 /// so waiving them would silently drop whole ticks or channels from the enforcement.
-const UNWAIVABLE_FIELDS: [TraceField; 3] = [TraceField::Version, TraceField::TickCount, TraceField::ChannelCount];
+const UNWAIVABLE_FIELDS: [TraceField; 4] = [
+    TraceField::Version,
+    TraceField::TickCount,
+    TraceField::ChannelCount,
+    // The libxmp dump has no voice column at all and the projection below leaves both
+    // sides' `vc=` rows empty, so a `voices` waiver could only ever waive nothing.
+    TraceField::Voices,
+];
 
 /// Scope accounting for the pinned snapshot.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -788,7 +795,7 @@ fn waive_field(field: TraceField, expected: &mut TraceTick, actual: &TraceTick) 
         TraceField::GlobalVolume => expected.global_volume = actual.global_volume,
         // `parse_waiver` rejects the structural fields, so nothing else is reachable
         // here; channel fields fall through to the per-record loop below.
-        TraceField::Version | TraceField::TickCount | TraceField::ChannelCount => {}
+        TraceField::Version | TraceField::TickCount | TraceField::ChannelCount | TraceField::Voices => {}
         channel_field => {
             for (expected_channel, actual_channel) in expected.channels.iter_mut().zip(&actual.channels) {
                 waive_channel_field(channel_field, expected_channel, actual_channel);
@@ -931,6 +938,11 @@ fn header_projection(actual: &TraceTick) -> TraceTick {
         bpm: actual.bpm,
         global_volume: actual.global_volume,
         channels: Vec::new(),
+        // The libxmp adapter reads `channels` only. Both projections therefore start with
+        // no ` vc=` rows and never gain any, so a format that grows background voices
+        // cannot make an existing conformance case start failing on a column the oracle
+        // does not have.
+        voices: Vec::new(),
     }
 }
 
@@ -970,6 +982,7 @@ mod tests {
                 bpm: 125,
                 global_volume: 64,
                 channels: vec![channel],
+                voices: Vec::new(),
             }],
         }
     }
@@ -1179,6 +1192,7 @@ mod tests {
                     resonance: 0,
                     flags: DirtyBits::PITCH,
                 }],
+                voices: Vec::new(),
             }],
         };
         assert!(diff_libxmp_dump(ConformanceFormat::S3m, &dump, &trace, &SampleGeometry::default(), &[]).is_identical());
@@ -1221,6 +1235,7 @@ mod tests {
                     resonance: 0,
                     flags: DirtyBits::empty(),
                 }],
+                voices: Vec::new(),
             }],
         };
         let identical = diff_libxmp_dump(ConformanceFormat::Mod, &dump, &trace, &SampleGeometry::default(), &[]);
@@ -1261,6 +1276,7 @@ mod tests {
                     resonance: 0,
                     flags: DirtyBits::empty(),
                 }],
+                voices: Vec::new(),
             }],
         };
         let identical = diff_libxmp_dump(ConformanceFormat::Mtm, &dump, &trace, &SampleGeometry::default(), &[]);
@@ -1295,6 +1311,7 @@ mod tests {
                     resonance: 0,
                     flags: DirtyBits::empty(),
                 }],
+                voices: Vec::new(),
             }],
         };
         assert!(diff_libxmp_dump(ConformanceFormat::S3m, &fully_open, &trace, &SampleGeometry::default(), &[]).is_identical());
