@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M4-lite ([master plan](M4-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03 |
 | Depends on | M2 complete |
 | Blocks | F1, F2 (XM loader and runtime), G1, G3 (IT loader and runtime); M11's `InstrumentBank` |
 | Parallel with | E2, D6, D7 |

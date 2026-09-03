@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M4-lite ([master plan](M4-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03 |
 | Depends on | M2 complete |
 | Blocks | F2 (XM runtime), G3 (IT runtime) |
 | Parallel with | E1, D6, D7 |

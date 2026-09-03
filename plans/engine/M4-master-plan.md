@@ -37,8 +37,8 @@ implementation exists (§10.1).
 
 | M4-lite task | Deliverable |
 |---|---|
-| [E1](M4-task-E1-instrument-and-sample-model.md) | The XM+IT instrument and sample model in `starplayer-model`, designed against both specs at once; sample sustain loops; ping-pong guard frames; the shared xorshift32 |
-| [E2](M4-task-E2-linear-frequency-and-format-dialects.md) | The `2^(n/768)` linear-frequency table; XM/IT `FormatDialect` variants |
+| [E1](complete/M4-task-E1-instrument-and-sample-model.md) | The XM+IT instrument and sample model in `starplayer-model`, designed against both specs at once; sample sustain loops; ping-pong guard frames; the shared xorshift32 |
+| [E2](complete/M4-task-E2-linear-frequency-and-format-dialects.md) | The `2^(n/768)` linear-frequency table; XM/IT `FormatDialect` variants |
 | [E3](M4-task-E3-voice-lifecycle-and-trace-v2.md) | `VoicePool::iter_mut`, `ChannelTable::detach_foreground`, `VoiceTag.sample: u16`, single-sourced voice capacity, trace format v2 with per-voice lines |
 
 Deliverables 1–8 below are M4-full, except that deliverable 1's "extract `Instrument`" now
