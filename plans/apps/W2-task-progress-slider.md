@@ -4,7 +4,7 @@
 |---|---|
 | Milestone | Web player maintenance (follows W1) |
 | Status | Not started |
-| Depends on | M3-D1 (song timeline, `OPCODE_SEEK_FRAME`, `OPCODE_AT_END`, telemetry words 19–21) |
+| Depends on | [M3-D1](../engine/complete/M3-task-D1-song-timeline-and-loop-detection.md) (song timeline, `OPCODE_SEEK_FRAME`, `OPCODE_AT_END`, telemetry words 19–21) |
 | Blocks | — |
 | Recommended model | Claude Sonnet |
 | Verified by | agent (headless harness + `cargo test -p starplayer-web`), then owner in a browser |

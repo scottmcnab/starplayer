@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M3 (native surfaces / offline) — pulled forward for the web player's progress slider |
-| Status | Not started |
+| Status | Landed 2026-09-03; owner listening check via W2 outstanding |
 | Depends on | M2 complete (MOD/S3M/MTM processors, quirks, fixed-point mixer) |
 | Blocks | W2 (web progress slider), M3 `render` command length defaults |
 | Recommended model | Claude Opus (touches the sequencer and the RT path) |
