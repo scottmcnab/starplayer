@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     fn geometry(spans: &[Option<SampleSpan>]) -> SampleGeometry {
-        SampleGeometry { spans: core::iter::once(None).chain(spans.iter().copied()).collect() }
+        SampleGeometry { spans: core::iter::once(None).chain(spans.iter().copied()).collect(), linear_periods: false }
     }
 
     fn one_tick_trace(channel: TraceChannel) -> Trace {
