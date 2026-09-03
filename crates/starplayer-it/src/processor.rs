@@ -52,7 +52,7 @@ use starplayer_engine::{
     EndOfSongPolicy, OrderEntry, PatternData, PatternFlowState, PatternSequencer, RowRef, SequencerSettings,
     TickContext, TickOutcome, TrackerProcessor,
 };
-#[cfg(any(feature = "trace", test))]
+#[cfg(feature = "trace")]
 use starplayer_engine::TraceChannelState;
 use starplayer_mixer::{LoopSpan, SampleRegion, VoiceTag};
 use starplayer_model::{
