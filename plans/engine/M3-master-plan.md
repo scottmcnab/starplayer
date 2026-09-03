@@ -40,6 +40,14 @@ not fit.
    (`cut` stops dead on the loop point with no fade). A song that *ends* of its own accord
    — a stop marker, or an order list that simply runs out — gets no fade whatever is asked
    for, because there is nothing to fade away from (task D2).
+
+   `info`, `render` and `trace` landed with task D5, along with the WAV writer
+   (`starplayer_offline::wav`). `render` also gained a `--golden` switch beyond the
+   original argument surface: the general length knobs cannot always reproduce a
+   committed golden bit-for-bit (a song shorter than the ten-second golden window is a
+   counterexample — `MOVEMENT.S3M`), so `--golden` calls the golden-generation functions
+   directly instead; see task D5's research resolution. `play` is still a stub naming
+   task D4, which this task depends on.
 4. **`starplayer-offline`** — deterministic rendering to WAV at any rate and depth, with
    the higher-quality interpolators when M7 lands. `song_timeline` and `render_song`
    landed early with task D1, because the web player's progress slider needed the scan.

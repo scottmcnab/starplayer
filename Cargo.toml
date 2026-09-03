@@ -35,6 +35,10 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # offline crate; no digest code or dependency enters the real-time graph.
 sha2 = { version = "0.10", default-features = false }
 
+# The CLI's argument surface (task D5). `std`-only like every app crate; no core crate
+# ever depends on it, so its default features are not a `no_std` purity concern here.
+clap = { version = "4.6", features = ["derive"] }
+
 # The real-time plumbing's three dependencies, all `no_std` and none enabling `std` at
 # the feature set selected here. See `crates/starplayer-rt/src/lib.rs` for why each one
 # is needed rather than hand-written.

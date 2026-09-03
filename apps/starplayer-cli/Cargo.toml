@@ -6,3 +6,13 @@ rust-version.workspace = true
 
 [dependencies]
 starplayer = { workspace = true, features = ["std"] }
+# `trace` is optional on `starplayer-offline` so that goldens never compile the per-tick
+# recorder in (see that crate's manifest). The CLI is not the golden job, so it takes the
+# simplest option and always builds with it — see the D5 task file's research resolution.
+starplayer-offline = { workspace = true, features = ["trace"] }
+starplayer-archive = { workspace = true }
+clap = { workspace = true }
+# `render` prints the SHA-256 of its PCM payload (task D5 deliverable 2), in the same
+# little-endian encoding `starplayer-offline` hashes goldens with. The integration tests
+# reuse it too, so there is no separate `[dev-dependencies]` entry.
+sha2 = { workspace = true }
