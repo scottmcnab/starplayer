@@ -7,6 +7,7 @@ const PROCESSOR_NAME = 'starplayer-player';
 const MIXER_STORAGE_KEY = 'starplayer.output-and-mixer.v1';
 const DEFAULT_MIXER_MODE = 0x0000_0202;
 const SONG_FADE_SECONDS = 5;
+const TIME_DISPLAY_STORAGE_KEY = 'starplayer.time-display.v1';
 const PATTERN_WINDOW_ROWS = 13;
 const PATTERN_CELL_BYTES = 5;
 
@@ -81,6 +82,7 @@ const state = {
     panningReloadInProgress: false,
     panningReloadRequested: false,
     scrubbing: false,
+    showRemaining: readShowRemaining(),
     pendingSeekFrame: null,
     pendingSeekSequence: 0,
 };
@@ -183,6 +185,43 @@ function formatTime(frames, rate) {
     return hours > 0
         ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
         : `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+/// The elapsed readout, or — after a click on either time readout, as in VLC — the time
+/// still to play as `-m:ss`. Remaining needs a known length; without one it falls back to
+/// elapsed rather than showing a dash with nothing behind it.
+function formatElapsed(frame, lengthFrames, rate) {
+    if (state.showRemaining && lengthFrames !== null) {
+        return `-${formatTime(Math.max(0, lengthFrames - frame), rate)}`;
+    }
+    return formatTime(frame, rate);
+}
+
+function readShowRemaining() {
+    try {
+        return localStorage.getItem(TIME_DISPLAY_STORAGE_KEY) === 'remaining';
+    } catch {
+        return false;
+    }
+}
+
+function toggleTimeDisplay() {
+    state.showRemaining = !state.showRemaining;
+    try {
+        localStorage.setItem(TIME_DISPLAY_STORAGE_KEY, state.showRemaining ? 'remaining' : 'elapsed');
+    } catch {
+        // Private browsing or storage disabled: the choice still holds for this page load.
+    }
+    if (state.scrubbing) {
+        setText(elements.elapsed, formatElapsed(Number(elements.progress.value), progressLengthFrames(), state.workletSampleRate));
+    } else if (state.latest) {
+        updateProgress(state.latest);
+    }
+}
+
+/// The slider's length as the page last set it, or `null` while the song's length is unknown.
+function progressLengthFrames() {
+    return elements.progress.disabled ? null : Number(elements.progress.max);
 }
 
 function updateOutputPanel() {
@@ -1094,13 +1133,13 @@ function updateProgress(snapshot) {
         state.pendingSeekFrame = null;
         if (state.scrubbing) return;
         elements.progress.value = '0';
-        setText(elements.elapsed, '0:00');
+        setText(elements.elapsed, formatElapsed(0, lengthFrames, rate));
         return;
     }
     if (state.pendingSeekFrame !== null && snapshot.sequence <= state.pendingSeekSequence) {
         if (state.scrubbing) return;
         elements.progress.value = String(state.pendingSeekFrame);
-        setText(elements.elapsed, formatTime(state.pendingSeekFrame, rate));
+        setText(elements.elapsed, formatElapsed(state.pendingSeekFrame, lengthFrames, rate));
         return;
     }
     state.pendingSeekFrame = null;
@@ -1108,7 +1147,7 @@ function updateProgress(snapshot) {
     let frame = Math.max(0, snapshot.songFrame);
     if (lengthFrames !== null) frame = Math.min(frame, lengthFrames);
     elements.progress.value = String(frame);
-    setText(elements.elapsed, formatTime(frame, rate));
+    setText(elements.elapsed, formatElapsed(frame, lengthFrames, rate));
 }
 
 function updateSnapshot(snapshot) {
@@ -1250,7 +1289,7 @@ elements.seekOrder.addEventListener('change', () => queueCommand(Ring.OPCODE_SEE
 // 64 entries and is drained once per render quantum — only the released `change` does.
 elements.progress.addEventListener('input', () => {
     state.scrubbing = true;
-    setText(elements.elapsed, formatTime(Number(elements.progress.value), state.workletSampleRate));
+    setText(elements.elapsed, formatElapsed(Number(elements.progress.value), progressLengthFrames(), state.workletSampleRate));
 });
 elements.progress.addEventListener('change', () => {
     const frame = Number(elements.progress.value);
@@ -1260,6 +1299,8 @@ elements.progress.addEventListener('change', () => {
     state.scrubbing = false;
 });
 elements.repeat.addEventListener('change', queueRepeatCommand);
+elements.elapsed.addEventListener('click', toggleTimeDisplay);
+elements.duration.addEventListener('click', toggleTimeDisplay);
 elements.volume.addEventListener('input', () => {
     const percent = Number(elements.volume.value);
     elements.volumeValue.value = `${percent}%`;
