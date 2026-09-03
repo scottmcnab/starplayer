@@ -7,24 +7,26 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use starplayer::engine::Trace;
-use starplayer::model::Module;
-use starplayer_offline::{TraceOptions, trace_mod, trace_mtm, trace_s3m};
+use starplayer::model::{Module, ModuleFormat};
+use starplayer_offline::{TraceOptions, trace_module};
 use starplayer_testkit::conformance::{
     ConformanceCase, ConformanceExclusion, ConformanceFormat, ExclusionKind, SampleGeometry, audit_pinned_corpus,
     check_tick_budget, diff_libxmp_dump, oracle_tick_budget, parse_case_manifest, parse_exclusions, parse_libxmp_dump,
 };
 
-type LoadModule = fn(&[u8]) -> Result<Module, String>;
-type CaptureTrace = fn(&[u8], usize) -> Result<Trace, String>;
-
-/// One format's native loader and trace capture. A capability registry, not format
-/// lowering: a format with no entry here is a visible gate, never an exclusion or a
-/// fabricated pass. Deliberately a function table rather than a trait committed before
-/// the second implementation exists.
+/// The facade's native processor for one conformance format. A capability registry, not
+/// format lowering: a format with no entry here is a visible gate, never an exclusion or a
+/// fabricated pass, and an entry exists only when `starplayer::supports` says this build
+/// can actually play that format.
+///
+/// Load and capture are the facade's own [`starplayer::load`] and
+/// [`starplayer_offline::trace_module`], so the harness measures the same dispatch every
+/// host uses. What the registry still carries is the [`ModuleFormat`] the case *claims*:
+/// autodetection must agree with the manifest, or the case is comparing a module against
+/// another format's oracle.
 #[derive(Copy, Clone)]
 struct FormatIntegration {
-    load: LoadModule,
-    capture: CaptureTrace,
+    expected: ModuleFormat,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -101,11 +103,11 @@ fn run() -> Result<bool, String> {
         inventory.openmpt_modules, inventory.openmpt_oracle_modules, inventory.openmpt_documented_only,
     );
 
-    let integrations: BTreeMap<ConformanceFormat, FormatIntegration> = [
-        (ConformanceFormat::Mod, FormatIntegration { load: load_mod, capture: capture_mod }),
-        (ConformanceFormat::Mtm, FormatIntegration { load: load_mtm, capture: capture_mtm }),
-        (ConformanceFormat::S3m, FormatIntegration { load: load_s3m, capture: capture_s3m }),
-    ].into_iter().collect();
+    let integrations: BTreeMap<ConformanceFormat, FormatIntegration> = ConformanceFormat::ALL.into_iter()
+        .map(|format| (format, module_format(format)))
+        .filter(|&(_, expected)| starplayer::supports(expected))
+        .map(|(format, expected)| (format, FormatIntegration { expected }))
+        .collect();
 
     let mut totals = Counts::default();
     let mut by_format = BTreeMap::new();
@@ -292,15 +294,13 @@ fn compare_case(corpus: &Path, case: &ConformanceCase, integration: FormatIntegr
         Err(message) => return CaseOutcome::HarnessError(message),
     };
 
-    // A loader rejection is the case's own result — the C5 tracker-dialect rows report
-    // bad magic here — so it stays a divergence rather than a harness error.
-    let module = match (integration.load)(&bytes) {
+    let module = match load_module(integration.expected, &bytes) {
         Ok(module) => module,
         Err(message) => return CaseOutcome::Divergence(message),
     };
     let geometry = SampleGeometry::from_module(case.format, &module);
     let budget = oracle_tick_budget(&oracle);
-    let trace = match (integration.capture)(&bytes, budget) {
+    let trace = match capture_trace(&bytes, budget) {
         Ok(trace) => trace,
         Err(message) => return CaseOutcome::Divergence(message),
     };
@@ -312,22 +312,29 @@ fn compare_case(corpus: &Path, case: &ConformanceCase, integration: FormatIntegr
     if difference.is_identical() { CaseOutcome::Match } else { CaseOutcome::Divergence(difference.to_string()) }
 }
 
-fn load_s3m(module: &[u8]) -> Result<Module, String> { starplayer::s3m::load(module).map_err(|error| error.to_string()) }
-
-fn load_mod(module: &[u8]) -> Result<Module, String> { starplayer::mod_file::load(module).map_err(|error| error.to_string()) }
-
-fn load_mtm(module: &[u8]) -> Result<Module, String> { starplayer::mtm::load(module).map_err(|error| error.to_string()) }
-
-fn capture_s3m(module: &[u8], ticks: usize) -> Result<Trace, String> {
-    trace_s3m(module, TraceOptions { ticks: Some(ticks), ..TraceOptions::default() }).map_err(|error| error.to_string())
+/// Which loaded-module format a conformance format's cases must decode to.
+const fn module_format(format: ConformanceFormat) -> ModuleFormat {
+    match format {
+        ConformanceFormat::Mod => ModuleFormat::Mod,
+        ConformanceFormat::S3m => ModuleFormat::S3m,
+        ConformanceFormat::Mtm => ModuleFormat::Mtm,
+    }
 }
 
-fn capture_mod(module: &[u8], ticks: usize) -> Result<Trace, String> {
-    trace_mod(module, TraceOptions { ticks: Some(ticks), ..TraceOptions::default() }).map_err(|error| error.to_string())
+/// Load through the facade's autodetection, and insist the result is the format the
+/// manifest named.
+///
+/// A loader rejection has always been the case's own result — the C5 tracker-dialect rows
+/// report bad magic here — and so is a module that probes as something else: comparing it
+/// against another format's oracle would be meaningless.
+fn load_module(expected: ModuleFormat, bytes: &[u8]) -> Result<Module, String> {
+    let module = starplayer::load(bytes).map_err(|error| error.to_string())?;
+    let actual = module.header().format;
+    if actual == expected { Ok(module) } else { Err(format!("autodetected {actual:?}, but the case is a {expected:?} case")) }
 }
 
-fn capture_mtm(module: &[u8], ticks: usize) -> Result<Trace, String> {
-    trace_mtm(module, TraceOptions { ticks: Some(ticks), ..TraceOptions::default() }).map_err(|error| error.to_string())
+fn capture_trace(bytes: &[u8], ticks: usize) -> Result<Trace, String> {
+    trace_module(bytes, TraceOptions { ticks: Some(ticks), ..TraceOptions::default() }).map_err(|error| error.to_string())
 }
 
 fn indent(message: &str) -> String {

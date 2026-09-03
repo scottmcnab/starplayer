@@ -72,13 +72,22 @@
 //! loader. [`scan_song`] is where it lives, and it is how a host gets a module's quirks:
 //!
 //! ```no_run
-//! # let module: starplayer::rt::Arc<starplayer::model::Module> = unimplemented!();
+//! # let bytes: &[u8] = &[];
 //! use starplayer::core::quirks::QuirkSelection;
 //! use starplayer::engine::ScanLimits;
+//! use starplayer::{NativeSequencer, rt::Arc};
+//! let module = Arc::new(starplayer::load(bytes).expect("a supported format"));
 //! let scanned = starplayer::scan_song(&module, 44_100, ScanLimits::for_rate(44_100)).expect("a supported format");
-//! let mut sequencer = starplayer::mod_file::sequencer_with_quirks(module, 44_100, QuirkSelection::Override(scanned.quirks));
+//! let mut sequencer = NativeSequencer::new(Arc::clone(&module), 44_100, QuirkSelection::Override(scanned.quirks))
+//!     .expect("this build has that format's processor");
 //! sequencer.set_timeline(scanned.timeline);
 //! ```
+//!
+//! [`load`] → `Arc::new` → [`scan_song`] → [`NativeSequencer::new`] → `set_timeline` is
+//! the whole host recipe, and [`NativeSequencer`] is the only place in the repository that
+//! turns a runtime [`ModuleFormat`](model::ModuleFormat) into a typed sequencer: the web
+//! player, the offline renderer and the trace path all go through it, so a format is wired
+//! up once rather than once per host.
 //!
 //! A host must build its playback sequencer from `scanned.quirks` rather than from
 //! `QuirkSelection::FromDialect`. The timeline was measured under those quirks: install it
@@ -112,6 +121,24 @@ pub use starplayer_mixer as mixer;
 pub use starplayer_model as model;
 /// Real-time ownership primitives, including the portable [`Arc`](starplayer_rt::Arc).
 pub use starplayer_rt as rt;
+
+mod sequencer;
+
+pub use sequencer::NativeSequencer;
+#[cfg(feature = "mod")]
+pub use sequencer::ModSequencer;
+#[cfg(feature = "mtm")]
+pub use sequencer::MtmSequencer;
+#[cfg(feature = "s3m")]
+pub use sequencer::S3mSequencer;
+
+/// The widest voice pool the engine will build, and what a **persistent** host takes.
+///
+/// A host that builds one engine before it has seen a module — the browser worklet, a
+/// plugin — cannot ask a processor how wide its pool should be, so it takes the maximum
+/// once and plays every module through it. A host that builds an engine per module asks
+/// [`recommended_voice_capacity`] instead.
+pub use starplayer_engine::MAX_VOICE_CAPACITY;
 /// Coherent UI snapshots.
 #[cfg(feature = "telemetry")]
 pub use starplayer_telemetry as telemetry;
@@ -173,27 +200,91 @@ pub fn scan_song(
 ) -> Result<ScannedSong, starplayer_core::Error> {
     let _ = (module, sample_rate_hz, limits);
     match module.header().format {
-        #[cfg(feature = "s3m")]
-        starplayer_model::ModuleFormat::S3m => {
-            let quirks = module.header().dialect.quirks();
-            let mut sequencer = starplayer_s3m::sequencer_with_quirks(starplayer_rt::Arc::clone(module), sample_rate_hz, quirks_override(quirks));
-            Ok(ScannedSong { timeline: starplayer_engine::scan_timeline(&mut sequencer, limits), quirks })
-        }
-        #[cfg(feature = "mtm")]
-        starplayer_model::ModuleFormat::Mtm => {
-            let quirks = module.header().dialect.quirks();
-            let mut sequencer = starplayer_mtm::sequencer_with_quirks(starplayer_rt::Arc::clone(module), sample_rate_hz, quirks_override(quirks));
-            Ok(ScannedSong { timeline: starplayer_engine::scan_timeline(&mut sequencer, limits), quirks })
-        }
         #[cfg(feature = "mod")]
-        starplayer_model::ModuleFormat::Mod => Ok(scan_mod(module, sample_rate_hz, limits)),
-        _ => Err(starplayer_core::Error::Invalid("no native processor for this module format")),
+        starplayer_model::ModuleFormat::Mod => scan_mod(module, sample_rate_hz, limits),
+        _ => {
+            let quirks = module.header().dialect.quirks();
+            scan_with(module, sample_rate_hz, limits, quirks)
+        }
     }
 }
 
-#[cfg(any(feature = "s3m", feature = "mtm", feature = "mod"))]
-fn quirks_override(quirks: starplayer_core::quirks::QuirkSet) -> starplayer_core::quirks::QuirkSelection {
-    starplayer_core::quirks::QuirkSelection::Override(quirks)
+/// One scan of `module` under an explicit resolved [`QuirkSet`](core::quirks::QuirkSet),
+/// through a throwaway [`NativeSequencer`].
+///
+/// Every scan in this crate goes through here, so the sequencer a scan measures and the
+/// sequencer a host plays are built by the same code from the same quirks.
+///
+/// With every format feature off there is nothing to scan: `NativeSequencer` is
+/// uninhabited, the `?` above the match never returns, and the whole body is dead. The
+/// `allow` says so, and exists only in that build.
+#[cfg_attr(not(any(feature = "s3m", feature = "mod", feature = "mtm")), allow(unreachable_code, unused_mut, unused_variables))]
+fn scan_with(
+    module: &starplayer_rt::Arc<starplayer_model::Module>,
+    sample_rate_hz: u32,
+    limits: starplayer_engine::ScanLimits,
+    quirks: starplayer_core::quirks::QuirkSet,
+) -> Result<ScannedSong, starplayer_core::Error> {
+    let selection = starplayer_core::quirks::QuirkSelection::Override(quirks);
+    let mut sequencer = NativeSequencer::new(starplayer_rt::Arc::clone(module), sample_rate_hz, selection)?;
+    // `match sequencer` on the value rather than on a reference: with every format feature
+    // off the enum is uninhabited, and an empty match is only accepted on a place
+    // expression of an uninhabited type.
+    let timeline = match sequencer {
+        #[cfg(feature = "s3m")]
+        NativeSequencer::S3m(ref mut sequencer) => starplayer_engine::scan_timeline(sequencer, limits),
+        #[cfg(feature = "mod")]
+        NativeSequencer::Mod(ref mut sequencer) => starplayer_engine::scan_timeline(sequencer, limits),
+        #[cfg(feature = "mtm")]
+        NativeSequencer::Mtm(ref mut sequencer) => starplayer_engine::scan_timeline(sequencer, limits),
+    };
+    Ok(ScannedSong { timeline, quirks })
+}
+
+/// Whether this build has a native processor for `format` — whether
+/// [`NativeSequencer::new`] can succeed for a module of that format.
+///
+/// The facade's format features are chosen by the embedder, so "is this format playable
+/// here?" is a build-time question with a runtime answer. A test harness uses it to *gate*
+/// a format rather than silently skip it.
+///
+/// Not `matches!`, whatever clippy says of the default build: each arm answers with its
+/// own feature, and they only all read `true` when every format is compiled in.
+#[allow(clippy::match_like_matches_macro)]
+pub const fn supports(format: starplayer_model::ModuleFormat) -> bool {
+    match format {
+        starplayer_model::ModuleFormat::S3m => cfg!(feature = "s3m"),
+        starplayer_model::ModuleFormat::Mod => cfg!(feature = "mod"),
+        starplayer_model::ModuleFormat::Mtm => cfg!(feature = "mtm"),
+        _ => false,
+    }
+}
+
+/// How many voices a host should give the engine it builds for **this module**.
+///
+/// The format's own answer — the same number
+/// [`NativeSequencer::recommended_voice_capacity`] reports — reached from the module
+/// header alone, so a host can size an engine before it has a sequencer to ask. A format
+/// this build cannot play answers with the channel count, which is what every engine sized
+/// itself to before this existed.
+///
+/// It can be zero, for a module whose header claims no channels at all; a caller that
+/// hands the number straight to [`EngineSettings`](engine::EngineSettings) should
+/// `.max(1)`, exactly as [`scan_timeline`](engine::scan_timeline) does.
+///
+/// A **persistent** host — one engine, many modules — wants [`MAX_VOICE_CAPACITY`]
+/// instead, because it has no module to ask about when it builds its engine.
+pub fn recommended_voice_capacity(module: &starplayer_model::Module) -> usize {
+    let channel_count = module.header().channel_count as usize;
+    match module.header().format {
+        #[cfg(feature = "s3m")]
+        starplayer_model::ModuleFormat::S3m => starplayer_s3m::recommended_voice_capacity(channel_count),
+        #[cfg(feature = "mod")]
+        starplayer_model::ModuleFormat::Mod => starplayer_mod::recommended_voice_capacity(channel_count),
+        #[cfg(feature = "mtm")]
+        starplayer_model::ModuleFormat::Mtm => starplayer_mtm::recommended_voice_capacity(channel_count),
+        _ => channel_count,
+    }
 }
 
 /// The MOD arm of [`scan_song`]: libxmp's loader verdict, then its length comparison.
@@ -202,7 +293,7 @@ fn scan_mod(
     module: &starplayer_rt::Arc<starplayer_model::Module>,
     sample_rate_hz: u32,
     limits: starplayer_engine::ScanLimits,
-) -> ScannedSong {
+) -> Result<ScannedSong, starplayer_core::Error> {
     use starplayer_core::quirks::{ModTiming, QuirkSet};
     use starplayer_engine::EndReason;
     use starplayer_mod::TimingVerdict;
@@ -215,18 +306,18 @@ fn scan_mod(
         TimingVerdict::Cia => scan_mod_with(module, sample_rate_hz, limits, cia),
         TimingVerdict::VBlank => scan_mod_with(module, sample_rate_hz, limits, vblank),
         TimingVerdict::CompareLengths => {
-            let first = scan_mod_with(module, sample_rate_hz, limits, cia);
+            let first = scan_mod_with(module, sample_rate_hz, limits, cia)?;
             // A scan that ran out its budget is past the threshold by definition: it never
             // reached the end of one pass.
             let over_budget = matches!(first.timeline.end(), EndReason::Budget);
             let threshold_frames = VBLANK_COMPARISON_THRESHOLD_SECONDS * sample_rate_hz as u64;
-            if !over_budget && first.timeline.end_frame() < threshold_frames { return first; }
+            if !over_budget && first.timeline.end_frame() < threshold_frames { return Ok(first); }
             // The rescan gets its own fresh `ScanLimits`, so a module that is over budget
             // both ways is not compared on two truncated lengths — it keeps CIA.
-            let second = scan_mod_with(module, sample_rate_hz, limits, vblank);
+            let second = scan_mod_with(module, sample_rate_hz, limits, vblank)?;
             let both_over_budget = over_budget && matches!(second.timeline.end(), EndReason::Budget);
             let shorter = !both_over_budget && second.timeline.end_frame() < first.timeline.end_frame();
-            if shorter { second } else { first }
+            Ok(if shorter { second } else { first })
         }
     }
 }
@@ -237,9 +328,8 @@ fn scan_mod_with(
     sample_rate_hz: u32,
     limits: starplayer_engine::ScanLimits,
     quirks: starplayer_core::quirks::QuirkSet,
-) -> ScannedSong {
-    let mut sequencer = starplayer_mod::sequencer_with_quirks(starplayer_rt::Arc::clone(module), sample_rate_hz, quirks_override(quirks));
-    ScannedSong { timeline: starplayer_engine::scan_timeline(&mut sequencer, limits), quirks }
+) -> Result<ScannedSong, starplayer_core::Error> {
+    scan_with(module, sample_rate_hz, limits, quirks)
 }
 
 /// Identify a module using the probes for the format capabilities compiled into this

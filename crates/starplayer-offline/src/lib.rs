@@ -16,9 +16,9 @@ use starplayer::core::{AtEnd, Error, Interpolator};
 use starplayer::dsp::{Interpolate, Linear, Nearest};
 use starplayer::engine::{EndReason, Engine, EngineSettings, EngineWarnings, EventSource, ScanLimits, SongTimeline};
 use starplayer::mixer::{FixedPath, FloatPath, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
-use starplayer::model::Module;
+use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::Arc;
-use starplayer::{ScannedSong, scan_song};
+use starplayer::{NativeSequencer, ScannedSong, recommended_voice_capacity, scan_song};
 
 // The per-tick trace is a diagnostic build only. Everything it needs sits behind the
 // `trace` feature, so an ordinary `cargo test --workspace` — and every golden render —
@@ -26,11 +26,9 @@ use starplayer::{ScannedSong, scan_song};
 #[cfg(feature = "trace")]
 use starplayer::core::Frame;
 #[cfg(feature = "trace")]
-use starplayer::engine::{EndOfSongPolicy, PatternSequencer, SequencerSettings, Trace};
-#[cfg(any(feature = "trace", test))]
+use starplayer::engine::{EndOfSongPolicy, SequencerSettings, Trace};
+#[cfg(test)]
 use starplayer::core::ExactFixedPoint;
-#[cfg(feature = "trace")]
-use starplayer::model::ModuleFormat;
 #[cfg(any(feature = "trace", test))]
 use starplayer::mixer::StereoI16;
 use sha2::{Digest, Sha256};
@@ -115,6 +113,20 @@ impl GoldenFormat {
             GoldenFormat::Mod => "mod",
             GoldenFormat::S3m => "s3m",
             GoldenFormat::Mtm => "mtm",
+        }
+    }
+
+    /// The loaded-module format this fixture format must decode to.
+    ///
+    /// The golden contract's promise is that a fixture cannot be rendered through the
+    /// wrong processor. Since the facade autodetects, that promise is now this check:
+    /// [`load_golden`] loads through [`starplayer::load`] and refuses a module whose header
+    /// format is not this one.
+    pub const fn module_format(self) -> ModuleFormat {
+        match self {
+            GoldenFormat::Mod => ModuleFormat::Mod,
+            GoldenFormat::S3m => ModuleFormat::S3m,
+            GoldenFormat::Mtm => ModuleFormat::Mtm,
         }
     }
 }
@@ -329,19 +341,16 @@ where
     let scanned = scanned_song(&module, sample_rate_hz)?;
     let (total_frames, fade_frames) = length.frames_for(&scanned.timeline);
 
-    let channel_count = module.header().channel_count as usize;
     let settings = EngineSettings {
         sample_rate_hz,
-        channel_count,
-        // D3 replaces this with the processor's `recommended_voice_capacity`, once the
-        // facade enum gives this call site a processor to ask.
-        voice_capacity: channel_count.max(1),
+        channel_count: module.header().channel_count as usize,
+        voice_capacity: recommended_voice_capacity(&module).max(1),
         ..EngineSettings::default()
     };
     let mut engine: Engine<Path, Interp, Out, Arc<Module>> = Engine::with_settings(settings);
     let mut control = engine.take_control().ok_or(RenderError::CommandQueue)?;
     control.load_module(Arc::clone(&module)).map_err(|_| RenderError::CommandQueue)?;
-    engine.set_source(playback_source(format, module, sample_rate_hz, scanned));
+    engine.set_source(playback_source(module, sample_rate_hz, scanned)?);
     engine.set_limiter(Limiter::Clamp);
 
     let output_samples = total_frames.saturating_mul(Out::CHANNELS);
@@ -386,31 +395,14 @@ where
     }
 }
 
-/// A playback sequencer for `format` with the scan's timeline installed, the scan's own
-/// quirks resolved into it, and the loop point set to wrap rather than stop.
-fn playback_source(format: GoldenFormat, module: Arc<Module>, sample_rate_hz: u32, scanned: ScannedSong) -> Box<dyn EventSource> {
+/// A playback sequencer for the module's own format with the scan's timeline installed,
+/// the scan's own quirks resolved into it, and the loop point set to wrap rather than stop.
+fn playback_source(module: Arc<Module>, sample_rate_hz: u32, scanned: ScannedSong) -> Result<Box<dyn EventSource>, RenderError> {
     let ScannedSong { timeline, quirks } = scanned;
-    let quirks = QuirkSelection::Override(quirks);
-    match format {
-        GoldenFormat::Mod => {
-            let mut sequencer = starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks);
-            sequencer.set_timeline(timeline);
-            sequencer.set_at_end(AtEnd::Continue);
-            Box::new(sequencer)
-        }
-        GoldenFormat::S3m => {
-            let mut sequencer = starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks);
-            sequencer.set_timeline(timeline);
-            sequencer.set_at_end(AtEnd::Continue);
-            Box::new(sequencer)
-        }
-        GoldenFormat::Mtm => {
-            let mut sequencer = starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks);
-            sequencer.set_timeline(timeline);
-            sequencer.set_at_end(AtEnd::Continue);
-            Box::new(sequencer)
-        }
-    }
+    let mut sequencer = NativeSequencer::new(module, sample_rate_hz, QuirkSelection::Override(quirks)).map_err(RenderError::Load)?;
+    sequencer.set_timeline(timeline);
+    sequencer.set_at_end(AtEnd::Continue);
+    Ok(Box::new(sequencer))
 }
 
 /// The S3M-only spelling C6 shipped, kept so existing callers and tests read unchanged.
@@ -522,20 +514,17 @@ where
     Out: OutputFormat<Accumulator = Path::Accumulator>,
 {
     let module = Arc::new(load_golden(format, bytes)?);
-    let channel_count = module.header().channel_count as usize;
     let settings = EngineSettings {
         sample_rate_hz: GOLDEN_SAMPLE_RATE_HZ,
-        channel_count,
-        // D3 replaces this with the processor's `recommended_voice_capacity`, once the
-        // facade enum gives this call site a processor to ask.
-        voice_capacity: channel_count.max(1),
+        channel_count: module.header().channel_count as usize,
+        voice_capacity: recommended_voice_capacity(&module).max(1),
         ..EngineSettings::default()
     };
     let mut engine: Engine<Path, Interp, Out, Arc<Module>> = Engine::with_settings(settings);
     let mut control = engine.take_control().ok_or(RenderError::CommandQueue)?;
     control.load_module(Arc::clone(&module)).map_err(|_| RenderError::CommandQueue)?;
     let quirks = scanned_song(&module, GOLDEN_SAMPLE_RATE_HZ)?.quirks;
-    engine.set_source(golden_source(format, module, quirks));
+    engine.set_source(golden_source(module, quirks)?);
     engine.set_limiter(Limiter::Clamp);
 
     let output_samples = frames.saturating_mul(Out::CHANNELS);
@@ -548,24 +537,23 @@ where
     if warnings.any() { Err(RenderError::EngineWarnings(warnings)) } else { Ok(output) }
 }
 
+/// Load a fixture through the facade's autodetection, then check it is the format the
+/// caller named.
+///
+/// The check is what keeps [`GoldenFormat`]'s promise now that the loader is shared: a
+/// fixture filed under `goldens/mtm/` that probes as a MOD is a corpus mistake, and it
+/// reports one rather than quietly hashing the wrong processor's output.
 fn load_golden(format: GoldenFormat, bytes: &[u8]) -> Result<Module, Error> {
-    match format {
-        GoldenFormat::Mod => starplayer::mod_file::load(bytes),
-        GoldenFormat::S3m => starplayer::s3m::load(bytes),
-        GoldenFormat::Mtm => starplayer::mtm::load(bytes),
-    }
+    let module = starplayer::load(bytes)?;
+    if module.header().format == format.module_format() { Ok(module) } else { Err(Error::BadMagic) }
 }
 
 /// The canonical golden render's source. It takes the scan's quirks like every other
 /// render path here: the fixed-length hash is a regression contract, and a MOD whose
 /// timing the scan resolves differently must be hashed the way it would be played.
-fn golden_source(format: GoldenFormat, module: Arc<Module>, quirks: QuirkSet) -> Box<dyn EventSource> {
-    let quirks = QuirkSelection::Override(quirks);
-    match format {
-        GoldenFormat::Mod => Box::new(starplayer::mod_file::sequencer_with_quirks(module, GOLDEN_SAMPLE_RATE_HZ, quirks)),
-        GoldenFormat::S3m => Box::new(starplayer::s3m::sequencer_with_quirks(module, GOLDEN_SAMPLE_RATE_HZ, quirks)),
-        GoldenFormat::Mtm => Box::new(starplayer::mtm::sequencer_with_quirks(module, GOLDEN_SAMPLE_RATE_HZ, quirks)),
-    }
+fn golden_source(module: Arc<Module>, quirks: QuirkSet) -> Result<Box<dyn EventSource>, RenderError> {
+    let sequencer = NativeSequencer::new(module, GOLDEN_SAMPLE_RATE_HZ, QuirkSelection::Override(quirks)).map_err(RenderError::Load)?;
+    Ok(Box::new(sequencer))
 }
 
 /// Autodetect a supported module and capture its stable per-tick trace with that format's
@@ -595,19 +583,18 @@ pub fn trace_mtm(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceErro
 
 #[cfg(feature = "trace")]
 fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, TraceError> {
-    let channel_count = module.header().channel_count as usize;
     let engine_settings = EngineSettings {
         sample_rate_hz: TRACE_SAMPLE_RATE_HZ,
-        channel_count,
-        // D3 replaces this with the processor's `recommended_voice_capacity`, once the
-        // facade enum gives this call site a processor to ask.
-        voice_capacity: channel_count.max(1),
+        channel_count: module.header().channel_count as usize,
+        voice_capacity: recommended_voice_capacity(&module).max(1),
         ..EngineSettings::default()
     };
     let mut engine: TraceEngine = Engine::with_settings(engine_settings);
     let mut control = engine.take_control().expect("a fresh offline engine owns its control handle");
     control.load_module(Arc::clone(&module)).map_err(|_| TraceError::Load(Error::Invalid("module command queue is full")))?;
 
+    // The one thing a trace needs that a playback sequencer does not: the order list
+    // running out is the end of the capture, not a loop back to the top.
     let sequencer_settings = SequencerSettings {
         sample_rate_hz: TRACE_SAMPLE_RATE_HZ,
         first_tick_frame: Frame::ZERO,
@@ -616,28 +603,9 @@ fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, Tra
         restart_order: 0,
         end_of_song: EndOfSongPolicy::Stop,
     };
-    let source: Box<dyn EventSource> = match module.header().format {
-        ModuleFormat::S3m => Box::new(PatternSequencer::new(
-            ExactFixedPoint,
-            starplayer::s3m::S3mPatternData(Arc::clone(&module)),
-            starplayer::s3m::S3mProcessor::new(module, TRACE_SAMPLE_RATE_HZ),
-            sequencer_settings,
-        )),
-        ModuleFormat::Mod => Box::new(PatternSequencer::new(
-            ExactFixedPoint,
-            starplayer::mod_file::ModPatternData(Arc::clone(&module)),
-            starplayer::mod_file::ModProcessor::new(module, TRACE_SAMPLE_RATE_HZ),
-            sequencer_settings,
-        )),
-        ModuleFormat::Mtm => Box::new(PatternSequencer::new(
-            ExactFixedPoint,
-            starplayer::mtm::MtmPatternData(Arc::clone(&module)),
-            starplayer::mtm::MtmProcessor::new(module, TRACE_SAMPLE_RATE_HZ),
-            sequencer_settings,
-        )),
-        _ => return Err(TraceError::Load(Error::Invalid("format has no offline native processor"))),
-    };
-    engine.set_source(source);
+    let sequencer = NativeSequencer::with_settings(module, QuirkSelection::FromDialect, sequencer_settings)
+        .map_err(|_| TraceError::Load(Error::Invalid("format has no offline native processor")))?;
+    engine.set_source(Box::new(sequencer));
 
     let requested_ticks = options.ticks.unwrap_or(MAX_CAPTURE_TICKS);
     if requested_ticks == 0 {
@@ -732,8 +700,7 @@ mod tests {
         let settings = EngineSettings {
             sample_rate_hz: 44_100,
             channel_count: module.header().channel_count as usize,
-            // D3: the processor's `recommended_voice_capacity` once the facade enum lands.
-            voice_capacity: module.header().channel_count.max(1) as usize,
+            voice_capacity: recommended_voice_capacity(&module).max(1),
             ..EngineSettings::default()
         };
         let mut engine: Engine<FixedPath, Linear, StereoI16, Arc<Module>> = Engine::with_settings(settings);
@@ -847,6 +814,20 @@ mod tests {
             at_end: AtEnd::FadeOut,
             fade_frames: sample_rate_hz as u64,
             max_frames: sample_rate_hz as u64 * 5,
+        }
+    }
+
+    /// The convenience that sizes an engine from a module header must agree with the
+    /// processor that will actually play it — that is the whole point of it, and the two
+    /// live in different crates, so nothing but a test keeps them together.
+    #[test]
+    fn the_facade_voice_capacity_convenience_agrees_with_the_processor_that_plays_the_module() {
+        for (format, name, bytes) in song_corpus() {
+            let module = Arc::new(load_golden(format, &bytes).expect("the fixture loads"));
+            let quirks = QuirkSelection::Override(scanned_song(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans").quirks);
+            let sequencer = NativeSequencer::new(Arc::clone(&module), GOLDEN_SAMPLE_RATE_HZ, quirks).expect("the fixture has a processor");
+            assert_eq!(recommended_voice_capacity(&module), sequencer.recommended_voice_capacity(), "{format} {name}");
+            assert_eq!(sequencer.format(), format.module_format(), "{format} {name}");
         }
     }
 

@@ -34,20 +34,17 @@ use std::vec::Vec;
 
 use command::{CommandRing, WireCommand};
 use starplayer::core::quirks::QuirkSelection;
-use starplayer::core::{AtEnd, ChannelId, Command, Frame, Interpolator, TempoModelId, U0F16};
+use starplayer::core::{AtEnd, ChannelId, Command, Frame, Interpolator, U0F16};
 use starplayer::dsp::{GainRamp, Interpolate, Linear, Nearest};
 use starplayer::engine::{
-    ChannelTable, Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MAX_VOICE_CAPACITY, MixPathKind,
-    MixerMode, OutputDepth, PatternSequencer, RENDER_QUANTUM, ScanLimits, SongTimeline,
+    ChannelTable, Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode,
+    OutputDepth, RENDER_QUANTUM, ScanLimits,
 };
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
-use starplayer::mod_file::{ModPatternData, ModProcessor};
-use starplayer::mtm::{MtmPatternData, MtmProcessor};
 use starplayer::rt::Arc;
-use starplayer::s3m::{S3mPatternData, S3mProcessor};
 use starplayer::telemetry::{SongEnd, Snapshot, TelemetryReader};
-use starplayer::ScannedSong;
+use starplayer::{MAX_VOICE_CAPACITY, NativeSequencer, ScannedSong};
 
 pub use command::COMMAND_RING_CAPACITY;
 
@@ -93,12 +90,6 @@ const TELEMETRY_CHANNEL_WORDS: usize = 8;
 const TELEMETRY_CHANNELS: usize = 64;
 const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
 
-// `TempoModelId` rather than a zero-sized model: the module's resolved `QuirkSet` chooses
-// the tempo model along with everything else, so the host cannot pin one here. It
-// dispatches through a `match` at tick rate, around 50 Hz.
-type S3mSequencer = PatternSequencer<TempoModelId, S3mProcessor, S3mPatternData>;
-type ModSequencer = PatternSequencer<TempoModelId, ModProcessor, ModPatternData>;
-type MtmSequencer = PatternSequencer<TempoModelId, MtmProcessor, MtmPatternData>;
 /// Everything module activation hands back: the source the engine plays, the two cells the
 /// host writes transport requests into, and the scan the source is playing against.
 struct BuiltSource {
@@ -203,86 +194,6 @@ struct SeekRequest {
     frame: Frame,
 }
 
-enum NativeSequencer {
-    S3m(S3mSequencer),
-    Mod(ModSequencer),
-    Mtm(MtmSequencer),
-}
-
-impl NativeSequencer {
-    fn next_event_frame(&self) -> Option<Frame> {
-        match self {
-            NativeSequencer::S3m(sequencer) => sequencer.next_event_frame(),
-            NativeSequencer::Mod(sequencer) => sequencer.next_event_frame(),
-            NativeSequencer::Mtm(sequencer) => sequencer.next_event_frame(),
-        }
-    }
-
-    fn advance_to(&mut self, frame: Frame) {
-        match self {
-            NativeSequencer::S3m(sequencer) => sequencer.advance_to(frame),
-            NativeSequencer::Mod(sequencer) => sequencer.advance_to(frame),
-            NativeSequencer::Mtm(sequencer) => sequencer.advance_to(frame),
-        }
-    }
-
-    fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
-        match self {
-            NativeSequencer::S3m(sequencer) => sequencer.dispatch(frame, context),
-            NativeSequencer::Mod(sequencer) => sequencer.dispatch(frame, context),
-            NativeSequencer::Mtm(sequencer) => sequencer.dispatch(frame, context),
-        }
-    }
-
-    fn seek_row(&mut self, row: u16) {
-        match self {
-            NativeSequencer::S3m(sequencer) => sequencer.seek_row(row),
-            NativeSequencer::Mod(sequencer) => sequencer.seek_row(row),
-            NativeSequencer::Mtm(sequencer) => sequencer.seek_row(row),
-        }
-    }
-
-    fn restart_clock_at(&mut self, frame: Frame) {
-        match self {
-            NativeSequencer::S3m(sequencer) => sequencer.restart_clock_at(frame),
-            NativeSequencer::Mod(sequencer) => sequencer.restart_clock_at(frame),
-            NativeSequencer::Mtm(sequencer) => sequencer.restart_clock_at(frame),
-        }
-    }
-
-    fn seek_order_at(&mut self, order: u16, now: Frame) {
-        match self {
-            NativeSequencer::S3m(sequencer) => { let _ = sequencer.seek_order_at(order, now); }
-            NativeSequencer::Mod(sequencer) => { let _ = sequencer.seek_order_at(order, now); }
-            NativeSequencer::Mtm(sequencer) => { let _ = sequencer.seek_order_at(order, now); }
-        }
-    }
-
-    fn seek_frame(&mut self, song_frame: u64, now: Frame) {
-        match self {
-            NativeSequencer::S3m(sequencer) => { let _ = sequencer.seek_frame(song_frame, now); }
-            NativeSequencer::Mod(sequencer) => { let _ = sequencer.seek_frame(song_frame, now); }
-            NativeSequencer::Mtm(sequencer) => { let _ = sequencer.seek_frame(song_frame, now); }
-        }
-    }
-
-    fn set_timeline(&mut self, timeline: SongTimeline) {
-        match self {
-            NativeSequencer::S3m(sequencer) => sequencer.set_timeline(timeline),
-            NativeSequencer::Mod(sequencer) => sequencer.set_timeline(timeline),
-            NativeSequencer::Mtm(sequencer) => sequencer.set_timeline(timeline),
-        }
-    }
-
-    fn set_at_end(&mut self, at_end: AtEnd) {
-        match self {
-            NativeSequencer::S3m(sequencer) => sequencer.set_at_end(at_end),
-            NativeSequencer::Mod(sequencer) => sequencer.set_at_end(at_end),
-            NativeSequencer::Mtm(sequencer) => sequencer.set_at_end(at_end),
-        }
-    }
-}
-
 /// A format-native tracker source with a host-owned seek mailbox.
 ///
 /// `Engine` intentionally stores `dyn EventSource`, so its generic command handler cannot
@@ -322,10 +233,13 @@ impl EventSource for SeekableModuleSource {
         let request = self.request.get();
         if !matches!(request.kind, SeekKind::None) && frame >= request.frame {
             self.request.set(SeekRequest::default());
+            // An order the module does not have, or a frame past the end of the scan, is
+            // a page-side mistake and not something the audio realm can report: the
+            // sequencer stays where it was, which is the only answer that keeps playing.
             match request.kind {
-                SeekKind::Order(order) => self.sequencer.seek_order_at(order, frame),
+                SeekKind::Order(order) => { let _ = self.sequencer.seek_order_at(order, frame); }
                 SeekKind::Row(row) => self.sequencer.seek_row(row),
-                SeekKind::Frame(song_frame) => self.sequencer.seek_frame(song_frame, frame),
+                SeekKind::Frame(song_frame) => { let _ = self.sequencer.seek_frame(song_frame, frame); }
                 SeekKind::None => {}
             }
             self.sequencer.restart_clock_at(frame);
@@ -395,19 +309,15 @@ fn source_for(
     // the timeline was measured under. The web player still exposes no override of its
     // own: this override comes from the scan, not from the UI.
     let quirks = QuirkSelection::Override(scanned.quirks);
-    let mut sequencer = match module.header().format {
-        ModuleFormat::S3m => NativeSequencer::S3m(starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks)),
-        ModuleFormat::Mod => NativeSequencer::Mod(starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks)),
-        ModuleFormat::Mtm => NativeSequencer::Mtm(starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks)),
-        _ => return Err(String::from("the module format has no web-audio processor")),
-    };
+    let mut sequencer = NativeSequencer::new(module, sample_rate_hz, quirks)
+        .map_err(|_| String::from("the module format has no web-audio processor"))?;
     sequencer.set_timeline(scanned.timeline.clone());
     sequencer.set_at_end(at_end);
     match start {
-        SeekKind::Frame(song_frame) => sequencer.seek_frame(song_frame, frame),
-        SeekKind::Order(order) => sequencer.seek_order_at(order, frame),
+        SeekKind::Frame(song_frame) => { let _ = sequencer.seek_frame(song_frame, frame); }
+        SeekKind::Order(order) => { let _ = sequencer.seek_order_at(order, frame); }
         SeekKind::Row(row) => sequencer.seek_row(row),
-        SeekKind::None => sequencer.seek_order_at(0, frame),
+        SeekKind::None => { let _ = sequencer.seek_order_at(0, frame); }
     }
     sequencer.restart_clock_at(frame);
     let request = Rc::new(Cell::new(SeekRequest::default()));
