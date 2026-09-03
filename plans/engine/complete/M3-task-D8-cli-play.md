@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M3 ([master plan](M3-master-plan.md)); see [the concurrency plan](M3-M6-concurrency-plan.md) |
-| Status | Ready |
+| Status | Landed 2026-09-03; owner listening check outstanding |
 | Depends on | D4 (cpal host) and D5 (CLI) — both landed |
 | Blocks | M3 exit criterion "`starplayer play foo.s3m` works on Linux" |
 | Parallel with | F2, G2, G3 |
