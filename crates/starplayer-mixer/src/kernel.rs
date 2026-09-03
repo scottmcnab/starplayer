@@ -192,6 +192,26 @@ fn take_queued_region<'pcm>(voice: &mut Voice, pcm: &'pcm [i16], sample: &mut Sa
     Some(Some(frames_to_bits(region.loop_span().map(LoopSpan::start).unwrap_or(0))))
 }
 
+/// The frame a voice sitting at `position` would read, folded through `sample`'s loop
+/// exactly as the render kernel folds it. `None` once a one-shot has run past its end.
+///
+/// # Why this is here rather than in the caller
+///
+/// The scope taps (M3-D6, architecture §9(b)) read one PCM frame per tap bucket at a
+/// position the voice has not reached yet, which may be past a loop end. There is exactly
+/// one right answer to "where does that land", and it is [`normalise_position`] — the
+/// same fold the run loop uses, including a ping-pong loop's turn. Exposing it is how the
+/// tap avoids writing a second loop rule that would drift out of step with this one.
+///
+/// `reverse` is the voice's current direction; a ping-pong loop's fold may turn it round,
+/// and the tap deliberately does not care where it ends up, because it does not advance
+/// the voice. Nothing here mutates anything: this is a pure read.
+pub fn folded_frame(sample: SampleData<'_>, position: i128, reverse: bool) -> Option<i16> {
+    let mut reverse = reverse;
+    let normalised = normalise_position(position, &mut reverse, sample)?;
+    sample.frames().get((normalised >> 32) as usize).copied()
+}
+
 /// Bring a position back inside the sample, and say which way a ping-pong loop is now
 /// travelling. `None` means a one-shot has run out and the voice is over.
 fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>) -> Option<u64> {

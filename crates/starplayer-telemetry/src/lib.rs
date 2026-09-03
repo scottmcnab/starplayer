@@ -17,12 +17,15 @@
 //! * **(a) coherent scalar state** — [`Snapshot`]: about 2.5 KB of transport and
 //!   per-channel scalars, published whole so a UI never pairs a row number from one tick
 //!   with a note from the next;
-//! * **(b) lossy audio taps** — scope waveforms and per-channel peak rings, where tearing
-//!   is invisible and a `Relaxed` write index is the right answer. **That is M3.**
+//! * **(b) lossy audio taps** — scope waveforms, where tearing is invisible and a
+//!   `Relaxed` write index is the right answer. That landed in M3-D6 as
+//!   [`starplayer_rt::tap`] and `starplayer_engine::scope`, and it does **not** live here:
+//!   it is not a snapshot, and nothing about it wants coherence.
 //!
-//! [`ChannelState::vu_level`] is the deliberate exception: VU peaks belong in (b), but
-//! they are cheap scalars and a UI wants them in M1, so they ride in (a) until the scope
-//! rings arrive.
+//! [`ChannelState::vu_level`] **stays here**, in (a). M1-B6 said it would move to (b) at
+//! M3; D6 decided against it. It is one scalar per channel, the snapshot already carries
+//! it for free, and every consumer reads it here — moving it would rewrite the 22-word
+//! wire header and every reader in exchange for nothing (architecture §9).
 //!
 //! # Who depends on whom
 //!

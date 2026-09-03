@@ -213,6 +213,90 @@
         return decodeSnapshot(sourceWords, { memoryBytes, quantumFrames, droppedCommands, quantaRendered });
     }
 
+    // ── scope taps: architecture §9(b), the lossy half of telemetry ─────────────────
+    //
+    // Deliberately *not* the coherent snapshot's protocol. A scope is a picture of a
+    // waveform: if the worklet republishes while the page is drawing, the trace has a
+    // seam a few milliseconds wide that nobody can see. So this block is its own
+    // SharedArrayBuffer, the page reads the values straight out of it with no copy, and
+    // the sequence word exists only so a reader can tell "nothing published yet" from
+    // "silence". The engine already downsampled: 4 output frames per bucket, so a whole
+    // render quantum is 32 buckets rather than 128 frames.
+    const SCOPE_CHANNELS = 64;
+    const SCOPE_WINDOW_BUCKETS = 256;
+    const SCOPE_HEADER_WORDS = 8;
+    const SCOPE_SEQUENCE_INDEX = 0;
+    const SCOPE_GENERATION_INDEX = 1;
+    const SCOPE_CHANNEL_COUNT_INDEX = 2;
+    const SCOPE_BUCKET_FRAMES_INDEX = 3;
+    const SCOPE_WINDOW_INDEX = 4;
+    const SCOPE_INDEX_WORDS = SCOPE_HEADER_WORDS + SCOPE_CHANNELS;
+    const SCOPE_VALUES_BYTE_OFFSET = SCOPE_INDEX_WORDS * 4;
+    const SCOPE_BYTES = SCOPE_VALUES_BYTE_OFFSET + SCOPE_CHANNELS * SCOPE_WINDOW_BUCKETS * 2;
+
+    function viewScope(buffer) {
+        return {
+            buffer,
+            words: new Int32Array(buffer, 0, SCOPE_INDEX_WORDS),
+            values: new Int16Array(buffer, SCOPE_VALUES_BYTE_OFFSET, SCOPE_CHANNELS * SCOPE_WINDOW_BUCKETS),
+        };
+    }
+
+    function createScope() {
+        return viewScope(new SharedArrayBuffer(SCOPE_BYTES));
+    }
+
+    /** Worklet side. One copy per *refresh*, not per quantum: the wasm block only moves
+     *  every few quanta, and the generation word says when. */
+    function publishScope(scope, sourceValues, sourceIndices, channelCount, bucketFrames, generation) {
+        const words = scope.words;
+        const channels = Math.max(0, Math.min(SCOPE_CHANNELS, channelCount));
+        const previous = Atomics.load(words, SCOPE_SEQUENCE_INDEX);
+        const writing = (previous & 1) === 0 ? previous + 1 : previous + 2;
+        Atomics.store(words, SCOPE_SEQUENCE_INDEX, writing);
+        words[SCOPE_GENERATION_INDEX] = generation;
+        words[SCOPE_CHANNEL_COUNT_INDEX] = channels;
+        words[SCOPE_BUCKET_FRAMES_INDEX] = bucketFrames;
+        words[SCOPE_WINDOW_INDEX] = SCOPE_WINDOW_BUCKETS;
+        if (channels > 0) {
+            scope.values.set(sourceValues.subarray(0, channels * SCOPE_WINDOW_BUCKETS));
+            words.set(sourceIndices.subarray(0, channels), SCOPE_HEADER_WORDS);
+        }
+        Atomics.store(words, SCOPE_SEQUENCE_INDEX, writing + 1);
+    }
+
+    /** Page side. Returns a *view*, not a copy — tearing is the design (see above). */
+    function readScope(scope) {
+        const words = scope.words;
+        if (Atomics.load(words, SCOPE_SEQUENCE_INDEX) === 0) {
+            return null;
+        }
+        return {
+            generation: words[SCOPE_GENERATION_INDEX],
+            channelCount: words[SCOPE_CHANNEL_COUNT_INDEX],
+            bucketFrames: words[SCOPE_BUCKET_FRAMES_INDEX],
+            windowBuckets: words[SCOPE_WINDOW_INDEX] || SCOPE_WINDOW_BUCKETS,
+            values: scope.values,
+            indices: words.subarray(SCOPE_HEADER_WORDS, SCOPE_INDEX_WORDS),
+        };
+    }
+
+    /** Worklet fallback side: one copy of the active channels, riding the same batched
+     *  telemetry message the snapshot already goes in. 32 channels is 16 KB — an eighth
+     *  of what a whole-ring transfer would cost, and the message is posted once every
+     *  TELEMETRY_FALLBACK_QUANTA quanta rather than every one. */
+    function decodeWorkletScope(sourceValues, sourceIndices, channelCount, bucketFrames, generation) {
+        const channels = Math.max(0, Math.min(SCOPE_CHANNELS, channelCount));
+        return {
+            generation,
+            channelCount: channels,
+            bucketFrames,
+            windowBuckets: SCOPE_WINDOW_BUCKETS,
+            values: sourceValues.slice(0, channels * SCOPE_WINDOW_BUCKETS),
+            indices: sourceIndices.slice(0, channels),
+        };
+    }
+
     scope.StarPlayerRing = {
         COMMAND_CAPACITY,
         COMMAND_RING_BYTES,
@@ -235,6 +319,9 @@
         SNAPSHOT_WORDS,
         TELEMETRY_BYTES,
         TELEMETRY_FALLBACK_QUANTA,
+        SCOPE_BYTES,
+        SCOPE_CHANNELS,
+        SCOPE_WINDOW_BUCKETS,
         viewCommandRing,
         createCommandRing,
         pushCommand,
@@ -247,5 +334,10 @@
         publishTelemetry,
         readTelemetry,
         decodeWasmTelemetry,
+        viewScope,
+        createScope,
+        publishScope,
+        readScope,
+        decodeWorkletScope,
     };
 })(globalThis);

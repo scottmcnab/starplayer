@@ -58,6 +58,13 @@
 //! needs `UnsafeCell` for the same reason the ring does, and the one obvious dependency
 //! (`triple_buffer`) is `std`-only, so it is a bounded channel of whole snapshots
 //! instead — see that module for the full argument.
+//!
+//! # The scope taps
+//!
+//! [`tap`] is the other half — architecture §9(b). Where a snapshot must never tear, a
+//! scope tap may: it is a picture of a waveform, so both sides are `Relaxed` and the
+//! audio thread never waits for anyone. One fixed ring per channel, downsampled in the
+//! audio thread to [`TAP_BUCKETS_PER_QUANTUM`] values per render quantum.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -67,10 +74,12 @@ extern crate alloc;
 pub mod garbage;
 pub mod snapshot;
 pub mod spsc;
+pub mod tap;
 
 pub use garbage::{GarbageChannel, GarbageCollector, garbage_channel};
 pub use snapshot::{DEFAULT_SNAPSHOT_DEPTH, SnapshotPublisher, SnapshotReader, snapshot_channel};
 pub use spsc::{Consumer, Producer, channel};
+pub use tap::{TAP_BUCKETS_PER_QUANTUM, TAP_BUCKET_FRAMES, TAP_RING_BUCKETS, TapReader, TapRing, TapWriter};
 
 /// The workspace's one `Arc`.
 ///

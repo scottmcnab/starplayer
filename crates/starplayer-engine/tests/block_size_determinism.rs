@@ -480,3 +480,134 @@ fn the_synthetic_module_actually_plays() {
     assert_eq!(engine.frame(), Frame(whole_quanta as u64));
     assert_eq!(engine.control_clock().driver(), ControlDriver::Tracker, "the sequencer is the control clock");
 }
+
+// ── the scope taps (M3-D6) ──────────────────────────────────────────────────────────
+
+/// Telemetry (b)'s per-channel oscilloscope taps are part of the same invariant.
+///
+/// The tap samples voice state at the start of every render segment, and a segment
+/// boundary is exactly where a host block size could leak in. A bucket's first frame sits
+/// inside precisely one segment, so its value must be a pure function of the quantum —
+/// identical whether the host asked for one frame at a time or 8191. This asserts that at
+/// every block size in [`BLOCK_SIZES`], **and** against independently computed expected
+/// values, so a tap that was consistently wrong could not pass by being consistent.
+#[cfg(feature = "telemetry")]
+mod scope_taps {
+    use super::*;
+    use starplayer_rt::{TAP_BUCKETS_PER_QUANTUM, TAP_BUCKET_FRAMES, TAP_RING_BUCKETS, TapReader};
+
+    /// The channel the one voice is tagged with. Not zero, so a tap that ignored the tag
+    /// and wrote to channel 0 would be caught.
+    const SCOPE_CHANNEL: u8 = 2;
+
+    /// Frames of the ramp, and its loop length. A power of two so the wrap lands on a
+    /// bucket boundary and the expected values stay readable.
+    const RAMP_FRAMES: usize = 512;
+
+    /// Exactly the ring's worth of output: 1024 buckets × 4 frames = 32 whole quanta, so
+    /// the run fills the ring exactly once and nothing has scrolled out of it.
+    const SCOPE_FRAMES: usize = TAP_RING_BUCKETS * TAP_BUCKET_FRAMES;
+
+    /// Half scale, so the expected value of a frame is exactly half of it and the test
+    /// does not restate the tap's own rounding.
+    const SCOPE_VOLUME: U0F16 = U0F16::from_bits(32_768);
+
+    /// A looping ramp whose frame `index` holds `index * 64`, so a bucket value names the
+    /// frame it was read at and a mistimed tap is visible rather than plausible.
+    fn ramp_blob() -> (Vec<i16>, SampleRegion) {
+        let pcm: Vec<i16> = (0..RAMP_FRAMES).map(|index| (index as i16) * 64).collect();
+        let mut blob = Vec::new();
+        let region = append_guarded_sample(&mut blob, &pcm, LoopSpan::new(0, RAMP_FRAMES as u32));
+        (blob, region)
+    }
+
+    /// One voice on [`SCOPE_CHANNEL`] at [`Step::ONE`], so the playback position is the
+    /// output frame and the expected bucket values can be written down.
+    fn render_scope_at_block_size(block_frames: usize) -> Vec<i16> {
+        let (blob, region) = ramp_blob();
+        let mut engine: Engine<FloatPath, Linear, StereoF32> = Engine::new(VOICE_CAPACITY);
+        engine.set_pcm(blob);
+        let readers: Box<[TapReader]> = engine.scope_readers().expect("a new engine owns its scope readers");
+
+        let tag = VoiceTag { channel: SCOPE_CHANNEL, instrument: 1, sample: 1, note: 60 };
+        let params = VoiceParams { step: Step::ONE, volume: SCOPE_VOLUME, pan: I1F15::ZERO, ..VoiceParams::SILENT };
+        engine.voices_mut().allocate(tag, region, params, 0).expect("a fresh pool has room");
+        engine.set_source(Box::new(ScriptedSource::new(Vec::new())));
+
+        let mut output = vec![0.0f32; SCOPE_FRAMES * <StereoF32 as OutputFormat>::CHANNELS];
+        let mut written = 0;
+        while written < output.len() {
+            let end = (written + block_frames * <StereoF32 as OutputFormat>::CHANNELS).min(output.len());
+            let Some(block) = output.get_mut(written..end) else { break };
+            engine.render(block);
+            written = end;
+        }
+
+        let mut window = vec![0i16; TAP_RING_BUCKETS];
+        let reader = readers.get(SCOPE_CHANNEL as usize).expect("the channel table is wider than the tapped channel");
+        let seen = reader.latest(&mut window);
+        assert_eq!(seen as usize, TAP_RING_BUCKETS, "32 quanta published 32 buckets each, at block size {block_frames}");
+        window
+    }
+
+    /// Bucket `index` reads the frame `TAP_BUCKET_FRAMES * index` of a loop `RAMP_FRAMES`
+    /// long, at half volume. Written out here rather than derived from the engine, so the
+    /// test is an independent statement of the sampling rule.
+    fn expected_window() -> Vec<i16> {
+        (0..TAP_RING_BUCKETS)
+            .map(|bucket| {
+                let frame = (bucket * TAP_BUCKET_FRAMES) % RAMP_FRAMES;
+                ((frame as i32 * 64 * 32_768) >> 16) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_scope_buckets_are_the_expected_values_at_every_host_block_size() {
+        let expected = expected_window();
+        assert_eq!(expected.len(), TAP_RING_BUCKETS);
+        assert!(expected.iter().any(|value| *value != 0), "the fixture actually produces a signal");
+
+        for block_frames in BLOCK_SIZES {
+            let window = render_scope_at_block_size(block_frames);
+            assert_eq!(window, expected, "block size {block_frames} changed the scope taps");
+        }
+    }
+
+    #[test]
+    fn a_quantums_worth_of_buckets_is_thirty_two() {
+        let window = render_scope_at_block_size(128);
+        let quanta = window.len() / TAP_BUCKETS_PER_QUANTUM;
+        assert_eq!(quanta, SCOPE_FRAMES / (TAP_BUCKETS_PER_QUANTUM * TAP_BUCKET_FRAMES), "32 buckets per 128-frame quantum");
+    }
+
+    #[test]
+    fn an_untouched_channel_stays_silent_while_a_tapped_one_does_not() {
+        let (blob, region) = ramp_blob();
+        let mut engine: Engine<FloatPath, Linear, StereoF32> = Engine::new(VOICE_CAPACITY);
+        engine.set_pcm(blob);
+        let readers: Box<[TapReader]> = engine.scope_readers().expect("a new engine owns its scope readers");
+
+        let tag = VoiceTag { channel: SCOPE_CHANNEL, instrument: 1, sample: 1, note: 60 };
+        let params = VoiceParams { step: Step::ONE, volume: SCOPE_VOLUME, pan: I1F15::ZERO, ..VoiceParams::SILENT };
+        engine.voices_mut().allocate(tag, region, params, 0).expect("a fresh pool has room");
+        engine.set_source(Box::new(ScriptedSource::new(Vec::new())));
+
+        let mut output = vec![0.0f32; RENDER_QUANTUM * <StereoF32 as OutputFormat>::CHANNELS];
+        engine.render(&mut output);
+
+        let mut tapped = vec![0i16; TAP_BUCKETS_PER_QUANTUM];
+        let mut untouched = vec![-1i16; TAP_BUCKETS_PER_QUANTUM];
+        readers.get(SCOPE_CHANNEL as usize).expect("a ring").latest(&mut tapped);
+        readers.first().expect("a ring").latest(&mut untouched);
+        assert!(tapped.iter().any(|value| *value != 0), "the tapped channel carries the voice");
+        assert_eq!(untouched, vec![0i16; TAP_BUCKETS_PER_QUANTUM], "a channel with no voice reads as silence");
+    }
+
+    #[test]
+    fn the_readers_are_handed_out_exactly_once() {
+        let mut engine: Engine<FloatPath, Linear, StereoF32> = Engine::new(VOICE_CAPACITY);
+        assert!(engine.scope_readers().is_some(), "a new engine owns them");
+        assert!(engine.scope_readers().is_none(), "and hands them out once, like the telemetry reader");
+    }
+}

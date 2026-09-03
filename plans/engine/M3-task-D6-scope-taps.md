@@ -168,3 +168,112 @@ Report the exact commands run and their results. **Do not commit** — the revie
 
 Per-channel buses, any change to `accumulate_masked` or `mix_run`, the TUI, moving the VU
 level, and the M6 filter.
+
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question.
+
+### 1. Bucket size and ring length — **4 frames, 1024 buckets, confirmed affordable**
+
+Kept as specified. `TAP_BUCKET_FRAMES = 4` makes a 128-frame `RENDER_QUANTUM` exactly 32
+buckets, which is §9's "32 values per quantum, not 4096"; `TAP_RING_BUCKETS = 1024` is
+4096 output frames — 92.9 ms at 44.1 kHz, 85.3 ms at 48 kHz — and a power of two, so the
+bucket counter wraps by mask.
+
+The 64-channel cost is what the question guessed: 64 × 1024 × 2 = 131 072 bytes of `i16`
+storage, plus 64 `AtomicU32` write indices and the two `Arc` headers per ring — under
+132 KiB in total, allocated once in `Engine::with_settings`. `HEAP_RESERVE_BYTES` is
+16 MiB and the worklet's measured stable footprint after loading REFLEX is ~18 MB of wasm
+memory, so this is 0.7 % of the reservation and 0.8 % of the live heap. The wasm host's
+own flat publish block (64 × 256 `i16` = 32 KiB, plus 64 index words) brings the total to
+164 KiB. The Node worklet harness asserts `memoryBytes` is unchanged across ten seconds of
+render, and it still passes — the reservation absorbed all of it, and `process()` grows
+nothing.
+
+### 2. A voice whose channel is past `channel_count` — **skipped, as specified**
+
+`ScopeTaps::sample_segment` does `self.writers.get(voice.tag.channel as usize)` and
+`continue`s on `None`. The rings are sized once at construction and there is nowhere else
+to put such a voice; folding it onto another channel's ring would draw one channel's
+signal on another's scope, which is worse than not drawing it. The mixer still plays the
+voice — the tap has no effect on audio whatsoever.
+`a_voice_on_a_channel_past_the_ring_count_is_skipped_rather_than_folded_onto_another`
+pins it. In practice this cannot happen in the hosts we ship: both the wasm host and the
+offline renderer size the channel table to `ChannelTable::MAX_CHANNELS` (64), which is the
+widest `tag.channel` any format produces.
+
+### 3. Fallback transport size — **16 KiB per message for a 32-channel module, and the
+copy is not on the audio thread's critical path any more than the snapshot's already is**
+
+256 buckets × 2 bytes = 512 bytes per channel, and the worklet trims the copy to the
+*active* channels: 2 KiB for a four-channel MOD, 16 KiB for a 32-channel S3M, 32 KiB in
+the 64-channel worst case. It rides the batched telemetry message the snapshot already
+goes in — one `postMessage` every `TELEMETRY_FALLBACK_QUANTA` (8) quanta, ~47 Hz — rather
+than a second post, so "no `postMessage` per interaction" still holds on the fallback path.
+
+Two honest qualifications, since the question asked for a comparison and a claim:
+
+- **Against the snapshot batch.** The snapshot message is a decoded JavaScript object with
+  a 22-field header plus one object of nine fields per channel; for 32 channels that is
+  ~300 property slots and a 288-element array, which is the same order of allocation and
+  structured-clone work as a 16 KiB `Int16Array`. The scope roughly doubles the fallback
+  message, it does not dominate it.
+- **"The audio thread allocates nothing."** That is true on the **shared-memory** path,
+  which is the one that matters and the one architecture Q1 chose for exactly this reason:
+  `Ring.publishScope` writes into a block it already owns. On the `postMessage` fallback
+  the copy is `sourceValues.slice(...)` inside `process()` — an allocation in the audio
+  realm. That is not new and not something this task introduced: the fallback already
+  builds a whole decoded snapshot object there every eighth quantum, and Q1's resolution
+  already records that the fallback trades RT purity for working audio without COOP/COEP.
+  The scope is built in the same branch, once per posted message rather than once per
+  refresh, so the fallback's allocation *rate* is unchanged. The page-side read on the SAB
+  path is a view, not a copy: `Ring.readScope` hands back an `Int16Array` over the shared
+  block and the canvas draws straight out of it.
+
+### 4. Headless harness — **fails identically; unchanged by this work**
+
+`node apps/starplayer-web/test/headless.mjs` fails before and after with the same
+assertion and no console errors:
+
+```
+Error: timed out waiting for the slider to grow by the fade with Repeat off
+  page says: Playing Reflex; the retired module Arc returned off the audio callback. |
+  console: quiet
+```
+
+The run reaches that point having passed everything before it, which now includes the page
+rendering nine channel-table columns instead of eight and creating a `<canvas>` per row:
+`console: quiet` means no exception was raised by the scope drawing, the channel-mute
+assertions (`#channel-body button`) still resolve, and the pan-column assertions that index
+`row.children[4]` still read the pan column — the scope column was deliberately inserted
+*after* the VU column, at index 6, so no existing positional selector moved. Not fixed
+here, as instructed.
+
+### 5. Where the VU level lives — **it stays in the snapshot (deliverable 3's decision, recorded)**
+
+M1-B6 said the VU level would move from (a) to (b) at M3. It does not. `vu_level` is one
+`U0F16` per channel; the snapshot is a fixed 64-channel `Copy` value that carries it at no
+marginal cost, it is already word 6 of the eight-word per-channel wire block that the web
+player, the Node harnesses and the conformance tooling all read, and it is a *scalar with
+peak-hold and decay* — a quantity that wants exactly the coherence (a) provides and gains
+nothing from a lossy ring. Moving it would rewrite the 22-word header contract and every
+reader of it to buy nothing. Recorded in architecture §9 and in
+`crates/starplayer-telemetry/src/lib.rs`.
+
+### 6. Two decisions the task file left open, taken here
+
+- **`normalise_position` is exposed rather than re-derived.** The task said to reuse the
+  kernel's fold and not to write a second loop rule, but the fold is private and
+  `accumulate_voice` cannot be called for a read (it mixes, advances and can release the
+  voice). So `crates/starplayer-mixer/src/kernel.rs` gains one new public function,
+  `folded_frame(sample, position, reverse) -> Option<i16>`, which is `normalise_position`
+  plus a bounds-checked frame read and nothing else. `mix_run`, `MixPath` and
+  `VoicePool::accumulate_masked` are untouched, so G2 still finds `kernel.rs` unchanged
+  where it needs to change it.
+- **The scope gets its own `SharedArrayBuffer`, not a widened telemetry block.** Appending
+  the scope to the existing telemetry SAB would have put a 32 KiB copy inside the snapshot
+  seqlock's critical section, at the snapshot's per-quantum rate, and changed
+  `TELEMETRY_BYTES` — which the ring harness and the page both pin. A separate buffer keeps
+  the snapshot protocol byte-for-byte as B7 left it, lets the scope publish at its own
+  (slower) cadence driven by a generation counter, and keeps the D3 merge clean.

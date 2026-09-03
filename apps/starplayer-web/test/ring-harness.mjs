@@ -75,4 +75,50 @@ assert.equal(Ring.readTelemetry(telemetry), null);
 Atomics.add(telemetry.words, 0, 1);
 assert.equal(Ring.readTelemetry(telemetry).sequence, 42);
 
-console.log('ring harness: typed commands and coherent telemetry passed');
+// ── the scope taps (architecture 9(b)) ──────────────────────────────────────────────
+
+const scope = Ring.createScope();
+assert.equal(Ring.readScope(scope), null, 'nothing published yet reads as absent, not as silence');
+
+const scopeValues = new Int16Array(Ring.SCOPE_CHANNELS * Ring.SCOPE_WINDOW_BUCKETS);
+const scopeIndices = new Int32Array(Ring.SCOPE_CHANNELS);
+for (let channel = 0; channel < 4; channel += 1) {
+    scopeIndices[channel] = 1024 + channel;
+    for (let bucket = 0; bucket < Ring.SCOPE_WINDOW_BUCKETS; bucket += 1) {
+        scopeValues[channel * Ring.SCOPE_WINDOW_BUCKETS + bucket] = (channel + 1) * 100 + bucket;
+    }
+}
+// A fifth channel's worth of data that the publish must not carry: the worklet only
+// publishes the channels the module actually uses.
+scopeValues[4 * Ring.SCOPE_WINDOW_BUCKETS] = -31_000;
+
+Ring.publishScope(scope, scopeValues, scopeIndices, 4, 4, 7);
+const window = Ring.readScope(scope);
+assert.equal(window.generation, 7);
+assert.equal(window.channelCount, 4);
+assert.equal(window.bucketFrames, 4);
+assert.equal(window.windowBuckets, Ring.SCOPE_WINDOW_BUCKETS);
+assert.equal(window.values[0], 100, 'channel 1, oldest bucket');
+assert.equal(window.values[Ring.SCOPE_WINDOW_BUCKETS - 1], 100 + Ring.SCOPE_WINDOW_BUCKETS - 1, 'channel 1, newest bucket');
+assert.equal(window.values[2 * Ring.SCOPE_WINDOW_BUCKETS], 300, 'channel 3 starts one window on');
+assert.equal(window.values[4 * Ring.SCOPE_WINDOW_BUCKETS], 0, 'a channel the module does not use is never published');
+assert.deepEqual([...window.indices.slice(0, 4)], [1024, 1025, 1026, 1027]);
+
+// Tearing is the design: a reader that races a republish still gets a window, never null
+// and never a throw. That is what makes the scope path free on the audio side.
+Atomics.add(scope.words, 0, 1);
+const torn = Ring.readScope(scope);
+assert.notEqual(torn, null, 'a window read mid-publish is served rather than refused');
+Atomics.add(scope.words, 0, 1);
+
+Ring.publishScope(scope, scopeValues, scopeIndices, 0, 4, 8);
+assert.equal(Ring.readScope(scope).channelCount, 0, 'a module with no channels publishes an empty window');
+
+const fallback = Ring.decodeWorkletScope(scopeValues, scopeIndices, 4, 4, 9);
+assert.equal(fallback.generation, 9);
+assert.equal(fallback.values.length, 4 * Ring.SCOPE_WINDOW_BUCKETS, 'the fallback copies only the active channels');
+assert.equal(fallback.indices.length, 4);
+assert.equal(fallback.values[0], 100);
+assert.notEqual(fallback.values.buffer, scopeValues.buffer, 'and it is a copy, so the message owns it');
+
+console.log('ring harness: typed commands, coherent telemetry and lossy scope taps passed');

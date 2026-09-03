@@ -10,6 +10,10 @@ const SONG_FADE_SECONDS = 5;
 const TIME_DISPLAY_STORAGE_KEY = 'starplayer.time-display.v1';
 const PATTERN_WINDOW_ROWS = 13;
 const PATTERN_CELL_BYTES = 5;
+// One pixel column per tap bucket, so the trace is drawn rather than resampled. 132
+// buckets is 528 output frames, about 11 ms at 48 kHz — a little over four render quanta.
+const SCOPE_CANVAS_WIDTH = 132;
+const SCOPE_CANVAS_HEIGHT = 26;
 
 // The English effect names are the engine's own table, read once from the page-side wasm
 // instance rather than transcribed here. `EffectDisplay.name` is a `&'static str` that
@@ -30,7 +34,8 @@ const elements = {
     progress: byId('progress'), elapsed: byId('elapsed'), duration: byId('duration'), repeat: byId('repeat'),
     voices: byId('voices'), masterPeak: byId('master-peak'), channelBody: byId('channel-body'), patternTable: byId('pattern-table'),
     instrumentCount: byId('instrument-count'), instrumentList: byId('instrument-list'), commandTransport: byId('command-transport'),
-    telemetryTransport: byId('telemetry-transport'), quantum: byId('quantum'), memory: byId('memory'),
+    telemetryTransport: byId('telemetry-transport'), scopeTransport: byId('scope-transport'),
+    quantum: byId('quantum'), memory: byId('memory'),
     dropped: byId('dropped'), retired: byId('retired'), health: byId('health'), forceFallback: byId('force-fallback'),
     archivePicker: byId('archive-picker'), archivePickerName: byId('archive-picker-name'), archiveEntries: byId('archive-entries'),
     archiveLoad: byId('archive-load'), archiveCancel: byId('archive-cancel'),
@@ -52,7 +57,14 @@ const state = {
     startPromise: null,
     commandRing: null,
     telemetry: null,
+    scope: null,
     latest: null,
+    /// The newest scope window on the `postMessage` fallback, where it rides the batched
+    /// telemetry message rather than shared memory.
+    latestScope: null,
+    /// The refresh already drawn, so an animation frame that beat the worklet redraws
+    /// nothing.
+    drawnScopeGeneration: -1,
     fallbackCommands: [],
     pendingLoads: new Map(),
     nextRequestId: 1,
@@ -251,6 +263,9 @@ function installGraph(graph) {
     state.node = graph.node;
     state.commandRing = graph.commandRing;
     state.telemetry = graph.telemetry;
+    state.scope = graph.scope;
+    state.latestScope = null;
+    state.drawnScopeGeneration = -1;
     state.workletSampleRate = graph.node.starplayerSampleRate ?? graph.context.sampleRate;
     state.outputChannelCount = graph.channels;
     if (graph.node.starplayerRenderQuantum) elements.quantum.textContent = `${graph.node.starplayerRenderQuantum} frames`;
@@ -264,19 +279,21 @@ async function prepareNode(context, channels, mixerMode, addModule) {
     const shared = sharedMemoryAvailable() && !elements.forceFallback.checked;
     const commandRing = shared ? Ring.createCommandRing() : null;
     const telemetry = shared ? Ring.createTelemetry() : null;
+    const scope = shared ? Ring.createScope() : null;
     const processorOptions = {
         channelCount: channels,
         mixerMode,
         wasmModule: state.wasmModule,
         commandRing: commandRing ? commandRing.buffer : null,
         telemetry: telemetry ? telemetry.buffer : null,
+        scope: scope ? scope.buffer : null,
     };
     const node = createNode(context, processorOptions, state.wasmBytes, channels);
     node.port.onmessage = (event) => onWorkletMessage(event.data, node);
     node.onprocessorerror = () => {
         if (node === state.node) showError('The AudioWorklet processor stopped unexpectedly. Reload the page to restart it.');
     };
-    return { context, node, commandRing, telemetry, channels };
+    return { context, node, commandRing, telemetry, scope, channels };
 }
 
 async function startAudio() {
@@ -317,6 +334,9 @@ async function startAudio() {
 
         elements.commandTransport.textContent = state.commandRing ? 'SharedArrayBuffer SPSC ring' : 'postMessage, batched once per frame';
         elements.telemetryTransport.textContent = state.telemetry ? 'SharedArrayBuffer seqlock' : `postMessage every ${Ring.TELEMETRY_FALLBACK_QUANTA} quanta`;
+        elements.scopeTransport.textContent = state.scope
+            ? 'SharedArrayBuffer window, read in place'
+            : `${Ring.SCOPE_WINDOW_BUCKETS} buckets per channel on the telemetry message`;
         elements.transportChip.textContent = 'audio ready';
         elements.transportChip.classList.add('live');
         elements.startAudio.textContent = 'Audio ready';
@@ -601,7 +621,10 @@ function onWorkletMessage(message, node) {
         if (node !== state.node) return;
         elements.quantum.textContent = `${message.frames} frames${message.matchesEngine ? '' : ' (unexpected)'}`;
     } else if (message.type === 'telemetry') {
-        if (node === state.node) state.latest = message;
+        if (node === state.node) {
+            state.latest = message;
+            if (message.scope) state.latestScope = message.scope;
+        }
     } else if (message.type === 'moduleLoaded' || message.type === 'moduleError') {
         const pending = state.pendingLoads.get(message.requestId);
         if (pending) {
@@ -1006,10 +1029,12 @@ function ensureChannelRows(count) {
         const volume = document.createElement('td');
         const pan = document.createElement('td');
         const vuCell = document.createElement('td');
+        const scopeCell = document.createElement('td');
         const effect = document.createElement('td');
         const action = document.createElement('td');
         const vuTrack = document.createElement('span');
         const vuFill = document.createElement('span');
+        const scopeCanvas = document.createElement('canvas');
         const mute = document.createElement('button');
         channel.textContent = String(index + 1).padStart(2, '0');
         instrument.className = 'instrument';
@@ -1018,15 +1043,77 @@ function ensureChannelRows(count) {
         vuFill.className = 'vu-fill';
         vuTrack.append(vuFill);
         vuCell.append(vuTrack);
+        scopeCell.className = 'scope-column';
+        scopeCanvas.className = 'scope-canvas';
+        scopeCanvas.width = SCOPE_CANVAS_WIDTH;
+        scopeCanvas.height = SCOPE_CANVAS_HEIGHT;
+        scopeCanvas.setAttribute('aria-label', `Channel ${index + 1} oscilloscope`);
+        scopeCell.append(scopeCanvas);
         mute.textContent = 'Mute';
         mute.addEventListener('click', () => {
             const muted = mute.dataset.muted !== 'true';
             queueCommand(Ring.OPCODE_MUTE_CHANNEL, index, muted ? 1 : 0);
         });
         action.append(mute);
-        row.append(channel, instrument, note, volume, pan, vuCell, effect, action);
+        row.append(channel, instrument, note, volume, pan, vuCell, scopeCell, effect, action);
         elements.channelBody.append(row);
-        state.channelRows.push({ row, instrument, note, volume, pan, vuFill, effect, mute });
+        state.channelRows.push({ row, instrument, note, volume, pan, vuFill, effect, mute, scope: scopeCanvas.getContext('2d') });
+    }
+    state.drawnScopeGeneration = -1;
+}
+
+/// The newest scope window, from whichever transport is live.
+///
+/// On the shared-memory path this is a *view* into the worklet's block, not a copy: the
+/// taps are architecture 9(b)'s lossy half, so a window torn by a republish mid-draw is
+/// a seam of a few milliseconds that nobody can see, and paying to remove it would cost
+/// the audio thread real work.
+function currentScope() {
+    if (state.scope !== null) return Ring.readScope(state.scope);
+    return state.latestScope;
+}
+
+/// Draw one trace per channel from the tap window.
+///
+/// The values are voice state sampled per render segment, scaled by the voice's volume —
+/// not the mix, which has no per-channel bus to read (see `crates/starplayer-engine/src/scope.rs`).
+/// So a muted channel still draws its own signal, which is the point of having one scope
+/// per channel rather than one per bus.
+function drawScopes() {
+    const scope = currentScope();
+    if (!scope || state.channelRows.length === 0) return;
+    if (scope.generation === state.drawnScopeGeneration) return;
+    state.drawnScopeGeneration = scope.generation;
+
+    const middle = SCOPE_CANVAS_HEIGHT / 2;
+    const amplitude = middle - 1;
+    const columns = Math.min(SCOPE_CANVAS_WIDTH, scope.windowBuckets);
+    // The newest `columns` buckets: the window is wider than the canvas so that a page
+    // drawing slower than the worklet publishes still has an unbroken trace to show.
+    const oldest = scope.windowBuckets - columns;
+
+    for (let index = 0; index < state.channelRows.length; index += 1) {
+        const context = state.channelRows[index].scope;
+        if (!context) continue;
+        context.clearRect(0, 0, SCOPE_CANVAS_WIDTH, SCOPE_CANVAS_HEIGHT);
+        context.strokeStyle = '#243040';
+        context.lineWidth = 1;
+        context.beginPath();
+        context.moveTo(0, middle + 0.5);
+        context.lineTo(SCOPE_CANVAS_WIDTH, middle + 0.5);
+        context.stroke();
+        if (index >= scope.channelCount) continue;
+
+        const base = index * scope.windowBuckets;
+        context.strokeStyle = state.latest?.channels?.[index]?.muted ? '#5b6a7d' : '#6fd3c5';
+        context.beginPath();
+        for (let column = 0; column < columns; column += 1) {
+            const value = scope.values[base + oldest + column] / 32768;
+            const y = middle - value * amplitude;
+            if (column === 0) context.moveTo(0.5, y);
+            else context.lineTo(column + 0.5, y);
+        }
+        context.stroke();
     }
 }
 
@@ -1189,6 +1276,7 @@ function refresh() {
     flushFallbackCommands();
     const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
     updateSnapshot(snapshot);
+    drawScopes();
 }
 
 function setText(element, text) {
@@ -1332,6 +1420,7 @@ if (!sharedMemoryAvailable()) {
     elements.forceFallback.checked = true;
     elements.commandTransport.textContent = 'postMessage fallback (COOP/COEP unavailable)';
     elements.telemetryTransport.textContent = 'postMessage fallback (COOP/COEP unavailable)';
+    elements.scopeTransport.textContent = 'postMessage fallback (COOP/COEP unavailable)';
 }
 restorePreferences();
 state.activeModeWire = mixerModeFromControls();

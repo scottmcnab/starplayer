@@ -55,15 +55,21 @@ assert.equal(new globalThis.TextDecoder('utf-8').decode(nodeTextDecoder === unde
 const Ring = globalThis.StarPlayerRing;
 const commandRing = Ring.createCommandRing();
 const telemetry = Ring.createTelemetry();
+const scope = Ring.createScope();
 const processor = new Processor({ processorOptions: {
     channelCount: 2,
     mixerMode: 0x0000_0202,
     wasmModule: new WebAssembly.Module(wasmBytes),
     commandRing: commandRing.buffer,
     telemetry: telemetry.buffer,
+    scope: scope.buffer,
 } });
 const port = lastPort;
-assert.ok(port.messages.some((message) => message.type === 'ready'));
+const ready = port.messages.find((message) => message.type === 'ready');
+assert.ok(ready);
+assert.equal(ready.scopeTransport, 'SharedArrayBuffer');
+assert.equal(ready.scopeBucketFrames, 4, 'the engine downsamples four output frames into one tap bucket');
+assert.equal(ready.scopeWindowBuckets, Ring.SCOPE_WINDOW_BUCKETS);
 
 port.dispatch({ type: 'loadModule', requestId: 1, bytes: firstFixture });
 const loaded = port.messages.find((message) => message.type === 'moduleLoaded' && message.requestId === 1);
@@ -96,6 +102,22 @@ let snapshot = Ring.readTelemetry(telemetry);
 assert.ok(snapshot.sequence > 0);
 assert.ok(snapshot.channelCount > 0);
 assert.equal(snapshot.memoryBytes, stableMemory, 'process did not grow wasm memory');
+
+// The scope taps: real voice state, sampled through the engine's rings, published into
+// shared memory. `crates/starplayer-engine/src/scope.rs` is what fills them, and the
+// goldens prove the same render is byte-identical with the taps on.
+const scopeWindow = Ring.readScope(scope);
+assert.ok(scopeWindow, 'the worklet published a scope window');
+assert.ok(scopeWindow.generation > 0);
+assert.equal(scopeWindow.bucketFrames, 4);
+assert.equal(scopeWindow.channelCount, snapshot.channelCount, 'one trace per sounding channel');
+const scopePeak = scopeWindow.values.slice(0, scopeWindow.channelCount * scopeWindow.windowBuckets)
+    .reduce((peak, value) => Math.max(peak, Math.abs(value)), 0);
+assert.ok(scopePeak > 100, `the taps carry the module's signal (peak ${scopePeak})`);
+assert.ok(
+    scopeWindow.values.slice(scopeWindow.channelCount * scopeWindow.windowBuckets).every((value) => value === 0),
+    'channels the module does not use stay silent',
+);
 
 Ring.pushCommand(commandRing, Ring.OPCODE_SEEK_ORDER, 1, 0);
 quantum();
@@ -168,5 +190,31 @@ assert.equal(Ring.readTelemetry(telemetry).moduleGeneration, 4, 'the live proces
 assert.equal(port.messages.some((message) => message.type === 'fault'), false, 'the live processor saw no candidate memory growth');
 assert.equal(secondPort.messages.some((message) => message.type === 'fault'), false, 'the candidate stayed stable too');
 
+// The `postMessage` fallback carries the same window on the telemetry message rather
+// than a second post, and never touches shared memory (architecture Q1 resolution).
+const fallbackProcessor = new Processor({ processorOptions: {
+    channelCount: 2,
+    mixerMode: 0x0000_0202,
+    wasmModule: new WebAssembly.Module(wasmBytes),
+    commandRing: null,
+    telemetry: null,
+    scope: null,
+} });
+const fallbackPort = lastPort;
+assert.equal(fallbackPort.messages.find((message) => message.type === 'ready').scopeTransport, 'postMessage');
+fallbackPort.dispatch({ type: 'loadModule', requestId: 7, bytes: firstFixture.slice() });
+assert.ok(fallbackPort.messages.some((message) => message.type === 'moduleLoaded' && message.requestId === 7));
+for (let index = 0; index < 200; index += 1) {
+    fallbackProcessor.process([], [[new Float32Array(128), new Float32Array(128)]]);
+}
+const posted = fallbackPort.messages.findLast((message) => message.type === 'telemetry');
+assert.ok(posted, 'the fallback path posted a telemetry batch');
+assert.ok(posted.scope, 'and the scope window rode along on it');
+assert.equal(posted.scope.bucketFrames, 4);
+assert.equal(posted.scope.channelCount, posted.channelCount);
+assert.equal(posted.scope.values.length, posted.scope.channelCount * posted.scope.windowBuckets, 'active channels only');
+const fallbackPeak = posted.scope.values.reduce((peak, value) => Math.max(peak, Math.abs(value)), 0);
+assert.ok(fallbackPeak > 100, `the fallback taps carry the signal too (peak ${fallbackPeak})`);
+
 globalThis.TextDecoder = nodeTextDecoder;
-console.log(`worklet harness: 10 s of real S3M render (peak ${loudest.toFixed(3)}), independent overlapping processors, MOD panning, transport, seek, memory, garbage and bad-file rejection passed`);
+console.log(`worklet harness: 10 s of real S3M render (peak ${loudest.toFixed(3)}), independent overlapping processors, MOD panning, transport, seek, memory, garbage, scope taps on both transports and bad-file rejection passed`);

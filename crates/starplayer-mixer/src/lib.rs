@@ -44,7 +44,7 @@ pub mod sample;
 pub mod voice;
 
 pub use gain::{GAIN_UNITY, RAMP_FRAMES, pan_gains_q15, voice_gain_units};
-pub use kernel::{VoiceStatus, accumulate_voice};
+pub use kernel::{VoiceStatus, accumulate_voice, folded_frame};
 pub use master::{Limiter, MasterSettings};
 pub use output::{Dither, FixedOut, FloatOut, HostSample, I24, MonoF32, MonoI16, OutputFormat, StereoF32, StereoI16};
 pub use path::{FixedFrame, FixedPath, FloatFrame, FloatPath, MixPath, Stereo};
