@@ -9,6 +9,14 @@
 | Recommended model | Claude Sonnet |
 | Verified by | agent (headless harness + `cargo test -p starplayer-web`), then owner in a browser |
 
+## Amended by D2 (2026-09-03)
+
+The Repeat-off behaviour described below applies only to a song that genuinely **loops**.
+Task `plans/engine/M3-task-D2-natural-end-versus-loop.md` made an order list that simply
+runs out an *end* rather than a loop point: with Repeat off such a song stops on its end
+frame with no fade, and `fadesAtEnd` (which already keys on `SONG_FLAG_LOOPS`) leaves its
+displayed length at one pass. No page logic changed.
+
 ## Context for a fresh agent
 
 `apps/starplayer-web` is a framework-free page (`www/index.html`, `www/style.css`,

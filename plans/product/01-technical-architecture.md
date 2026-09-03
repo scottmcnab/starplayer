@@ -388,9 +388,16 @@ the first tick of every row, before the tick runs:
 * the sequencer records **how** it reached the row (`RowArrival`: `Start`, `Sequential`,
   `NextOrder`, `Jump`, `PatternLoop`, `Wrapped`);
 * `PatternLoop` sets `inside_loop`, every arrival but `Sequential` clears it;
-* every row is **marked**, but the "have I been here before?" question is only **asked**
-  when not inside a pattern loop. That is what lets an `E6x` body repeat four times
-  without ending the song while a `Bxx` back to an earlier order ends it immediately;
+* a `Wrapped` arrival — the order list ran out — is answered **before the map is consulted
+  at all**: it is `Visit::Wrapped`, and the timeline's `EndReason::Ended`, whatever row the
+  restart order names and whether or not it has been played. Running out of order list is
+  not something the music asked for, so it is the *end* of the song rather than a loop
+  (task D2). This covers a `Cxx`/`Dxx` break on the last order, a `Bxx` to an order at or
+  past the end of the list, and an S3M `0xFF` terminator;
+* every other row is **marked**, but the "have I been here before?" question is only
+  **asked** when not inside a pattern loop. That is what lets an `E6x` body repeat four
+  times without ending the song while a `Bxx` back to an earlier order ends it immediately
+  — with `EndReason::Looped`, which is the only end the host fades over;
 * a pattern-loop arrival budget catches the constructions that loop for ever inside one
   pattern, including a stuck ProTracker counter.
 
@@ -402,6 +409,12 @@ the song has been heard through once — the media player's repeat button — an
 answered by the loop detector, not by the order list. `AtEnd` is inert until a host
 installs a timeline, so a sequencer without one behaves exactly as it did before any of
 this existed.
+
+`FadeOut` is the one place the two ends differ. At a real loop point the sequencer plays
+straight on into the second pass so the host can fade the transport over it; at an
+order-list end there is no second pass to fade into, so it stops on the end frame exactly
+as `Stop` does and the host stops the transport through its ordinary click-free glide
+(task D2).
 
 The **song clock** is one signed offset, `song_origin`, and `song_frame(now) = now −
 song_origin`. Wrapping under `Continue` rebases the origin onto the loop point rather than
@@ -836,8 +849,8 @@ channel count, voices, order, pattern, row, tick, speed, BPM, global volume, war
 engine frame, pending garbage, module generation, playing, master peak, retired modules,
 **active mixer mode**, song frame, song length in frames, song flags) then eight words per
 channel for all 64. The last three arrived with the song timeline (§4.1): the song flags
-are bit 0 length known, bit 1 ends by looping, bit 2 loop point reached, bit 3 transport
-fading. The mode word is what the
+are bit 0 length known, bit 1 ends by looping (clear for a song whose order list merely
+runs out), bit 2 end reached, bit 3 transport fading. The mode word is what the
 host actually built rather than what was requested, so the page can show the difference. The seqlock is the page's; the worklet copies the
 whole block between an odd and an even sequence store. What does **not** cross is
 `EffectDisplay::name` — a `&'static str` has no meaning in another address space, let alone

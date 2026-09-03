@@ -458,6 +458,9 @@ struct Host {
     telemetry_words: Box<[i32]>,
     transport_gain: GainRamp,
     pending_engine_stop: bool,
+    /// Whether the queued engine stop is the end of the song rather than the Stop button,
+    /// and so must rewind to frame zero once it lands.
+    pending_end_rewind: bool,
     commands_rejected: u32,
     quanta_rendered: u64,
     module_generation: u32,
@@ -501,6 +504,7 @@ impl Host {
             telemetry_words: vec![0; TELEMETRY_WORDS].into_boxed_slice(),
             transport_gain: GainRamp::steady(TRANSPORT_GAIN_UNITY),
             pending_engine_stop: false,
+            pending_end_rewind: false,
             commands_rejected: 0,
             quanta_rendered: 0,
             module_generation: 0,
@@ -537,6 +541,7 @@ impl Host {
         self.at_end = built.at_end;
         self.song_scan = Some(built.scanned);
         self.fading = false;
+        self.pending_end_rewind = false;
         self.current_module = Some(module);
         self.module_generation = self.module_generation.wrapping_add(1).max(1);
         Ok(self.module_generation)
@@ -603,6 +608,7 @@ impl Host {
         self.dither = dither_for(mode);
         self.transport_gain = GainRamp::steady(if was_playing { TRANSPORT_GAIN_UNITY } else { 0 });
         self.pending_engine_stop = false;
+        self.pending_end_rewind = false;
         Ok(mode.to_wire())
     }
 
@@ -648,17 +654,16 @@ impl Host {
             }
             match command {
                 // Fade first; the typed engine stop is queued when the ramp reaches zero.
-                Command::Stop => {
-                    self.transport_gain.glide_to(0, TRANSPORT_RAMP_FRAMES);
-                    self.pending_engine_stop = true;
-                }
+                Command::Stop => self.begin_transport_stop(),
                 Command::Play => {
                     self.pending_engine_stop = false;
-                    // Play during a fade-out means "again", not "louder": the song is
-                    // ending, so it goes back to the top, which also clears the sticky
-                    // `end_reached` the fade was armed from.
-                    if self.fading {
+                    // Play during a fade-out, or after the song ran out of order list,
+                    // means "again", not "louder": the song is over, so it goes back to the
+                    // top, which also clears the sticky `end_reached` the fade or the stop
+                    // was armed from.
+                    if self.fading || self.pending_end_rewind {
                         self.fading = false;
+                        self.pending_end_rewind = false;
                         self.request_seek(SeekKind::Frame(0));
                     }
                     self.transport_gain.glide_to(TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES);
@@ -678,6 +683,16 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// Ramp the transport down over the usual 64 frames and queue the typed engine stop for
+    /// when the ramp lands.
+    ///
+    /// The Stop button's whole body, shared with the end of a song so the two stop
+    /// identically — click-free, and through one code path rather than two.
+    fn begin_transport_stop(&mut self) {
+        self.transport_gain.glide_to(0, TRANSPORT_RAMP_FRAMES);
+        self.pending_engine_stop = true;
     }
 
     fn request_seek(&mut self, kind: SeekKind) {
@@ -724,20 +739,40 @@ impl Host {
         let frames = frames.min(MAX_FRAMES_PER_CALL);
         self.engine.render_native(frames, &mut self.float_interleaved, &mut self.fixed_interleaved);
 
-        // The song has been heard through once and the page asked for a fade. The ramp
-        // therefore starts up to one host block (at most 1024 frames, ~21 ms at 48 kHz)
-        // after the loop point itself; for a fade measured in seconds that is inaudible,
-        // and it keeps the arming decision out of the per-frame loop.
+        // The song has been heard through once. What that means depends on *how* it ends
+        // (task D2), and only the two cases below do anything at all:
         //
-        // Only while the transport is actually running: once the fade has landed and the
-        // engine has stopped, no tick publishes again until the next Play consumes the
-        // rewind, so the snapshot keeps saying `end_reached` and would otherwise re-arm a
-        // fade over silence — and leave `fading` stuck for the next real loop point.
+        // * it **loops** — something in the module jumps back — and the page asked for a
+        //   fade, so the second pass plays under a fading transport. The ramp starts up to
+        //   one host block (at most 1024 frames, ~21 ms at 48 kHz) after the loop point;
+        //   for a fade measured in seconds that is inaudible, and it keeps the arming
+        //   decision out of the per-frame loop.
+        // * it **ends** — the order list ran out, or a stop marker fired — and the page
+        //   asked for anything but Repeat. There is no second pass to fade into and the
+        //   sequencer has already stopped itself on the end frame, so the transport stops
+        //   the way the Stop button stops it and rewinds for the next Play. (Before D2 this
+        //   case armed the fade too, and an `F00` ended in ten seconds of silence.)
+        //
+        // Only while the transport is actually running: once the fade or the stop has
+        // landed and the engine has stopped, no tick publishes again until the next Play
+        // consumes the rewind, so the snapshot keeps saying `end_reached` and would
+        // otherwise re-arm over silence — and leave `fading` stuck for the next real loop
+        // point.
         let snapshot = *self.telemetry.read();
         let transport_running = self.engine.is_playing() && !self.pending_engine_stop;
-        if transport_running && snapshot.transport.end_reached && self.at_end.get() == AtEnd::FadeOut && !self.fading {
-            self.fading = true;
-            self.fade_elapsed = 0;
+        if transport_running && snapshot.transport.end_reached && !self.fading {
+            let loops = snapshot.transport.song_end == SongEnd::Loops;
+            match self.at_end.get() {
+                AtEnd::FadeOut if loops => {
+                    self.fading = true;
+                    self.fade_elapsed = 0;
+                }
+                AtEnd::FadeOut | AtEnd::Stop if !loops => {
+                    self.begin_transport_stop();
+                    self.pending_end_rewind = true;
+                }
+                _ => {}
+            }
         }
 
         let mut peak = 0.0f32;
@@ -788,6 +823,12 @@ impl Host {
         if self.pending_engine_stop && !self.transport_gain.is_ramping() {
             if self.control.send(Command::Stop).is_ok() {
                 self.pending_engine_stop = false;
+                // A song that stopped because it *ended* is over, not paused: rewind it so
+                // the next Play starts from the top. A Stop the user asked for keeps its
+                // place, which is why this rides its own flag.
+                if core::mem::take(&mut self.pending_end_rewind) {
+                    self.request_seek(SeekKind::Frame(0));
+                }
             } else {
                 self.commands_rejected = self.commands_rejected.saturating_add(1);
             }
@@ -1008,6 +1049,16 @@ mod tests {
         bytes[1084..1088].copy_from_slice(&starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0, param: 0 }.to_bytes());
         let sample_offset = 1084 + 64 * 4 * 4;
         for (index, byte) in bytes[sample_offset..].iter_mut().enumerate() { *byte = if index & 1 == 0 { 0x7F } else { 0x80 }; }
+        bytes
+    }
+
+    /// [`minimal_mod`] with a `B00` on its very last row, so the song genuinely loops
+    /// rather than merely running out of order list — which task D2 reads as an end.
+    fn looping_mod() -> Vec<u8> {
+        let mut bytes = minimal_mod();
+        let last_cell = 1084 + 63 * 4 * 4;
+        let jump = starplayer::mod_file::ModCell { period: 0, instrument: 0, effect: 0xB, param: 0x00 };
+        bytes[last_cell..last_cell + 4].copy_from_slice(&jump.to_bytes());
         bytes
     }
 
@@ -1243,12 +1294,20 @@ mod tests {
         let scanned = Rc::clone(host.song_scan.as_ref().expect("activation scans the module"));
         let timeline = &scanned.timeline;
         assert!(timeline.end_frame() > 48_000, "REFLEX is longer than a second");
-        assert!(matches!(timeline.end(), starplayer::engine::EndReason::Looped { .. }), "REFLEX loops");
+        // REFLEX's order list runs out; nothing in it jumps backwards (task D2).
+        assert_eq!(timeline.end(), starplayer::engine::EndReason::Ended, "REFLEX ends");
 
         host.process(RENDER_QUANTUM);
         assert_eq!(host.telemetry_words[20] as u64, timeline.end_frame(), "the song length rides in word 20");
-        assert_eq!(host.telemetry_words[21] & 0b11, 0b11, "length known, and the song ends by looping");
+        assert_eq!(host.telemetry_words[21] & 0b11, 0b01, "length known, and the song does not end by looping");
         assert_eq!(host.telemetry_words[21] & 0b1000, 0, "nothing is fading");
+
+        // …and a module that really loops says so, which is the bit the page's "add the
+        // fade to the displayed length" decision keys on.
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(&looping_mod()).is_ok());
+        host.process(RENDER_QUANTUM);
+        assert_eq!(host.telemetry_words[21] & 0b11, 0b11, "length known, and the song ends by looping");
     }
 
     #[test]
@@ -1297,7 +1356,7 @@ mod tests {
 
     #[test]
     fn a_song_that_reaches_its_loop_point_under_fade_out_ramps_down_and_rewinds() {
-        let module = minimal_mod();
+        let module = looping_mod();
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
         let end_frame = host.song_scan.as_ref().expect("the module was scanned").timeline.end_frame();
@@ -1321,9 +1380,58 @@ mod tests {
         assert_eq!(host.seek_request.as_ref().map(|request| request.get().kind), Some(SeekKind::Frame(0)), "a faded-out song rewinds for the next Play");
     }
 
+    /// Task D2, the owner's case: with Repeat off, a song whose order list simply runs out
+    /// stops at its end frame instead of playing on under a five-second fade.
+    #[test]
+    fn a_song_that_runs_out_of_order_list_stops_at_its_end_instead_of_fading() {
+        let module = minimal_mod();
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(&module).is_ok());
+        let end_frame = host.song_scan.as_ref().expect("the module was scanned").timeline.end_frame();
+        assert_eq!(host.song_scan.as_ref().expect("scanned").timeline.end(), starplayer::engine::EndReason::Ended);
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 48_000 * 5 }));
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+
+        let mut fade_seen = false;
+        let mut stopped_at = None;
+        for quantum in 0..(end_frame as usize / RENDER_QUANTUM + 200) {
+            host.process(RENDER_QUANTUM);
+            fade_seen |= host.telemetry_words[21] & 0b1000 != 0;
+            if !host.engine.is_playing() {
+                stopped_at = Some(quantum);
+                break;
+            }
+        }
+        assert!(!fade_seen, "a song that ends has nothing to fade into");
+        assert!(!host.fading);
+        let stopped_at = stopped_at.expect("the transport stopped");
+        let stopped_frame = stopped_at as u64 * RENDER_QUANTUM as u64;
+        assert!(stopped_frame >= end_frame, "it did not stop before the end of the song");
+        // The 64-frame transport glide plus the quantum the arming decision is taken in.
+        assert!(stopped_frame < end_frame + 4 * RENDER_QUANTUM as u64, "and it stopped there, not five seconds later: {stopped_frame} vs {end_frame}");
+        assert_eq!(host.seek_request.as_ref().map(|request| request.get().kind), Some(SeekKind::Frame(0)), "a song that ended rewinds for the next Play");
+
+        // A stopped engine whose snapshot still says `end_reached` must not stop again.
+        let rejected = host.dropped_commands();
+        for _ in 0..20 { host.process(RENDER_QUANTUM); }
+        assert!(!host.pending_engine_stop);
+        assert!(!host.pending_end_rewind);
+        assert_eq!(host.dropped_commands(), rejected, "nothing re-armed over the silence");
+
+        // Play after an end-stop is "again", not "resume": the pending rewind is consumed,
+        // the transport gain glides back to unity and the sticky end flag clears.
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+        for _ in 0..8 { host.process(RENDER_QUANTUM); }
+        assert!(host.engine.is_playing(), "the song plays again");
+        assert_eq!(host.transport_gain.target(), TRANSPORT_GAIN_UNITY, "at unity, not at the faded-out level");
+        assert_eq!(host.seek_request.as_ref().map(|request| request.get().kind), Some(SeekKind::None), "the rewind was consumed");
+        assert_eq!(host.telemetry_words[21] & 0b100, 0, "and the sticky end flag went with it");
+        assert!((host.telemetry_words[19] as u64) < end_frame / 4, "it restarted from the top, not from the end");
+    }
+
     #[test]
     fn a_faded_out_song_fades_again_on_its_next_pass() {
-        let module = minimal_mod();
+        let module = looping_mod();
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
         let end_frame = host.song_scan.as_ref().expect("the module was scanned").timeline.end_frame();
@@ -1372,7 +1480,7 @@ mod tests {
 
     #[test]
     fn the_song_fade_attenuates_the_output_all_the_way_to_silence() {
-        let module = minimal_mod();
+        let module = looping_mod();
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
         let end_frame = host.song_scan.as_ref().expect("the module was scanned").timeline.end_frame();

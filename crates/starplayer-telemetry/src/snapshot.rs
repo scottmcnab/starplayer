@@ -47,8 +47,9 @@ pub struct TransportState {
     pub song_length_frames: u64,
     /// What the scan found at the end of the song.
     pub song_end: SongEnd,
-    /// Whether the song has passed its detected loop point. A one-tick pulse when the host
-    /// asked to keep playing, sticky when it asked to fade.
+    /// Whether the song has been heard through once — its detected loop point, or the end
+    /// of its order list. A one-tick pulse when the host asked to keep playing, sticky
+    /// otherwise.
     pub end_reached: bool,
 }
 
@@ -58,7 +59,8 @@ pub enum SongEnd {
     /// Nothing has been scanned, so the length and the end are both unknown.
     #[default]
     Unknown,
-    /// The song reaches a row it has already played and repeats from there.
+    /// The song jumps back into music it has already played — a `Bxx`/`Cxx`/`Dxx` — and
+    /// repeats from there for ever.
     Loops,
     /// The song ends: the order list runs out, or a stop marker fires.
     Stops,

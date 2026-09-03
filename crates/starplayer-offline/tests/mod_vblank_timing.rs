@@ -196,7 +196,10 @@ fn a_cia_scan_that_runs_out_of_budget_is_rescanned_and_a_hopeless_one_keeps_cia(
     // A leash the CIA reading cannot finish inside but the VBlank reading can.
     let between = ScanLimits { max_frames: 200 * SAMPLE_RATE_HZ as u64, max_ticks: 1_000_000 };
     let scanned = starplayer::scan_song(&module, SAMPLE_RATE_HZ, between).expect("the fixture scans");
-    assert!(matches!(scanned.timeline.end(), starplayer::engine::EndReason::Looped { .. }), "the VBlank pass finished inside the leash");
+    // The fixture's order list runs out rather than jumping back, so a pass that finishes
+    // inside the leash *ends* rather than looping (task D2). What matters here is only
+    // that it is not a `Budget` end.
+    assert_eq!(scanned.timeline.end(), starplayer::engine::EndReason::Ended, "the VBlank pass finished inside the leash");
     assert_eq!(scanned.quirks.mod_timing, ModTiming::VBlank);
     assert_eq!(scanned.timeline.end_frame(), vblank_frames, "and it is the same pass a full budget produces");
 

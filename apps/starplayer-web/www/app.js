@@ -648,6 +648,8 @@ function queueCommand(opcode, argument = 0, extra = 0) {
     }
 }
 
+/// How long the host fades a *looping* song out for with Repeat off. A song that ends of
+/// its own accord is stopped on its end frame instead, and never sees this.
 function repeatFadeFrames() {
     return Math.round(SONG_FADE_SECONDS * (state.workletSampleRate || 44100));
 }
@@ -1120,8 +1122,11 @@ function updatePattern(snapshot) {
 function updateProgress(snapshot) {
     const rate = state.workletSampleRate;
     const lengthKnown = (snapshot.songFlags & Ring.SONG_FLAG_LENGTH_KNOWN) !== 0;
-    // With Repeat off a looping song plays on past its loop point under the fade, so the
-    // slider covers the fade too: it always represents one complete playback.
+    // With Repeat off a song that *loops* — something in it jumps back into music already
+    // played — plays on past its loop point under the fade, so the slider covers the fade
+    // too and always represents one complete playback. A song that merely runs out of
+    // order list does not loop and does not fade: the host stops it on its end frame, so
+    // its displayed length is exactly one pass (task D2).
     const fadesAtEnd = !elements.repeat.checked && (snapshot.songFlags & Ring.SONG_FLAG_LOOPS) !== 0;
     const lengthFrames = lengthKnown ? Math.max(0, snapshot.songLengthFrames) + (fadesAtEnd ? repeatFadeFrames() : 0) : null;
     elements.progress.max = String(lengthFrames ?? 0);

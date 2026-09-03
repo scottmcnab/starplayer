@@ -504,6 +504,11 @@ pub trait TrackerProcessor {
 pub enum EndOfSongPolicy {
     /// Go back to the restart order and keep playing, raising
     /// [`PatternSequencer::song_looped`].
+    ///
+    /// A *policy*, not a musical statement: once a host has installed a
+    /// [`SongTimeline`] the loop detector reads the wrap as the **end of the song**
+    /// ([`EndReason::Ended`](crate::EndReason)) and [`AtEnd`] decides whether the restart
+    /// order is heard at all.
     #[default]
     Loop,
     /// Stop. The sequencer reports no further events and the voices ring out.
@@ -691,6 +696,12 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// The original fires its loop callback only when the new position is order 0
     /// (`PM_SetLoopCode`, `SB_IRQ_Handler`); this is the same signal, sticky so a host
     /// polling at UI rate cannot miss it.
+    ///
+    /// It says the **order list** came round, which is not the same as the song looping:
+    /// with a timeline installed that wrap is where the song ends, and under
+    /// [`AtEnd::FadeOut`] or [`AtEnd::Stop`] the restart row is never played. A host that
+    /// wants "has the song repeated?" wants [`PatternSequencer::end_reached`] and the
+    /// timeline's [`EndReason`](crate::EndReason) instead.
     pub const fn song_looped(&self) -> bool { self.song_looped }
 
     /// Read and clear [`PatternSequencer::song_looped`].
@@ -740,10 +751,12 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// One pass of the song in frames, when a timeline says how long that is.
     pub fn song_length_frames(&self) -> Option<u64> { self.timeline.as_ref().map(SongTimeline::end_frame) }
 
-    /// Whether the song has passed its detected loop point.
+    /// Whether the song has been heard through once — its detected loop point, or the end
+    /// of its order list.
     ///
-    /// Cleared at the next row under [`AtEnd::Continue`]; sticky until a seek under
-    /// [`AtEnd::FadeOut`], which is what lets a host arm a multi-second fade from it.
+    /// Cleared at the next row under [`AtEnd::Continue`]; sticky until a seek otherwise,
+    /// which is what lets a host arm a multi-second fade from it at a loop point, and stop
+    /// the transport from it at an end.
     pub const fn end_reached(&self) -> bool { self.end_reached }
 
     /// How the current row was reached.
@@ -968,8 +981,9 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// Once per row, not once per pattern-delay repeat: `is_first_tick_of_row` is true only
     /// at absolute tick 0, so an `SEx` repeat is the same row and is not re-counted.
     ///
-    /// Returns whether the tick may run — `false` only when the song has been heard through
-    /// once and [`AtEnd::Stop`] says to stop dead on that row.
+    /// Returns whether the tick may run — `false` when the song has been heard through once
+    /// and the host asked for it to stop there: [`AtEnd::Stop`] at any end, and
+    /// [`AtEnd::FadeOut`] at an order-list end, which has nothing to fade into.
     ///
     /// Nothing here allocates: the detector's bitset was sized when the sequencer was
     /// built, and the timeline is only read.
@@ -991,26 +1005,36 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         if matches!(self.at_end, AtEnd::Continue) {
             self.end_reached = false;
         }
-        if !matches!(visit, Visit::Looped | Visit::Budget) {
+        if !matches!(visit, Visit::Looped | Visit::Wrapped | Visit::Budget) {
             return true;
         }
         self.end_reached = true;
 
-        match self.at_end {
-            AtEnd::Continue => {
+        match (visit, self.at_end) {
+            (_, AtEnd::Continue) => {
                 self.wrap_at_loop_point(frame);
                 true
             }
-            AtEnd::Stop => false,
-            // Play straight on: the elapsed clock runs past the total and the host, which
-            // is the only thing that can fade, decides when to stop. Deliberately no
-            // rebase — a fade wants to hear the second pass, not restart the counter.
-            AtEnd::FadeOut => true,
+            (_, AtEnd::Stop) => false,
+            // The order list ran out: the song is over, and there is no second pass to fade
+            // into (task D2). It stops here exactly as `AtEnd::Stop` does, and the host —
+            // which is the only thing that can ramp the transport — takes it from there.
+            (Visit::Wrapped, AtEnd::FadeOut) => false,
+            // A real loop point. Play straight on: the elapsed clock runs past the total
+            // and the host decides when to stop. Deliberately no rebase — a fade wants to
+            // hear the second pass, not restart the counter.
+            (_, AtEnd::FadeOut) => true,
         }
     }
 
-    /// The song has come round again and the host wants it to keep playing: rebase the
-    /// elapsed clock onto the loop point and re-arm the detector against the same point.
+    /// The song has come round again — at a real loop point or at the end of its order list
+    /// — and the host wants it to keep playing: rebase the elapsed clock onto the row now
+    /// starting and re-arm the detector against it.
+    ///
+    /// A row the scan never reached (a `Bxx` skipped the restart order on the first pass,
+    /// so the wrap lands on an unmarked row) has no elapsed position of its own: the clock
+    /// restarts from zero and the detector forgets everything, which is the only honest
+    /// answer available.
     fn wrap_at_loop_point(&mut self, frame: Frame) {
         let position = self.position;
         let Some(timeline) = self.timeline.take() else {
@@ -1034,8 +1058,12 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         self.timeline = Some(timeline);
     }
 
-    /// The order list ran out under [`EndOfSongPolicy::Stop`], or a stop marker fired: a
-    /// **natural** end, not the detected loop point.
+    /// The order list ran out under [`EndOfSongPolicy::Stop`], or a stop marker fired.
+    ///
+    /// The same end as the one `begin_row` reaches through [`Visit::Wrapped`] — after task
+    /// D2 the two differ only in which [`EndOfSongPolicy`] the sequencer was built with —
+    /// so they answer [`AtEnd`] the same way: `Continue` restarts, `FadeOut` and `Stop`
+    /// stop.
     ///
     /// Returns whether the song was restarted instead of stopping.
     fn end_naturally(&mut self) -> bool {
@@ -1177,7 +1205,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             self.timeline.as_ref().map_or(0, SongTimeline::end_frame),
             match self.timeline.as_ref().map(SongTimeline::end) {
                 None => starplayer_telemetry::SongEnd::Unknown,
-                Some(crate::timeline::EndReason::Stopped) => starplayer_telemetry::SongEnd::Stops,
+                Some(crate::timeline::EndReason::Ended | crate::timeline::EndReason::Stopped) => starplayer_telemetry::SongEnd::Stops,
                 Some(crate::timeline::EndReason::Looped { .. } | crate::timeline::EndReason::Budget) => starplayer_telemetry::SongEnd::Loops,
             },
             self.end_reached,

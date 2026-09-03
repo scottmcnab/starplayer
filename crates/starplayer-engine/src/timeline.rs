@@ -81,6 +81,11 @@ pub enum RowArrival {
     PatternLoop,
     /// The order list ran out and [`EndOfSongPolicy::Loop`](crate::EndOfSongPolicy)
     /// restarted it.
+    ///
+    /// **This is the end of the song, not a loop point.** Running off the end of the order
+    /// list is not something the music asks for — it is what is left when the music stops
+    /// asking for anything — so it ends the pass whatever row the restart order names and
+    /// whether or not that row has been played (task D2).
     Wrapped,
 }
 
@@ -93,7 +98,13 @@ pub enum Visit {
     /// after the detector has already fired.
     Repeat,
     /// A row already played, reached by moving through the song: **the loop point**.
+    ///
+    /// Only a `Bxx` / `Cxx` / `Dxx` jump, a pattern loop, or the ordinary advance after one
+    /// of those can produce this. The order list running out is [`Visit::Wrapped`] instead.
     Looped,
+    /// The order list ran out: **the end of the song**, reported before the map is
+    /// consulted at all, because a wrap ends the pass whatever row it lands on.
+    Wrapped,
     /// The detector gave up: too many pattern-loop arrivals in a row.
     Budget,
 }
@@ -118,13 +129,28 @@ pub struct RowMark {
 /// Why the scan stopped.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EndReason {
-    /// The song reached a row it had already played: it repeats from `target` for ever.
+    /// The song reached, **through its own flow**, a row it had already played: it repeats
+    /// from `target` for ever.
+    ///
+    /// A `Bxx` / `Cxx` / `Dxx` jump, a pattern loop, or the ordinary advance after one of
+    /// those. The order list simply running out is [`EndReason::Ended`], not this.
     Looped {
         /// The row the song goes back to — the start of the repeating section.
         target: SongPosition,
     },
-    /// The song ended: the order list ran out under
+    /// The order list ran out: the song is over (task D2).
+    ///
+    /// Whatever the restart order names, and whether or not that row has been played. This
+    /// covers a `Cxx` / `Dxx` break on the last order, a `Bxx` to an order at or past the
+    /// end of the list, and an S3M order list reaching its `0xFF` terminator under
+    /// [`EndOfSongPolicy::Loop`](crate::EndOfSongPolicy). There is no repeating section:
+    /// a host that wants the song again restarts it from the top.
+    Ended,
+    /// The song stopped playing of its own accord: the order list ran out under
     /// [`EndOfSongPolicy::Stop`](crate::EndOfSongPolicy), or a stop marker fired.
+    ///
+    /// The same kind of end as [`EndReason::Ended`]; they differ only in which end-of-song
+    /// policy the sequencer was built with.
     Stopped,
     /// The scan hit one of its [`ScanLimits`], or the pattern-loop budget. The length is a
     /// lower bound rather than the answer.
@@ -156,7 +182,10 @@ impl SongTimeline {
     /// Every row the song reaches, in the order it reaches them — ascending by frame.
     pub fn marks(&self) -> &[RowMark] { &self.marks }
 
-    /// The length of one pass, in frames: the frame the first repeated row would start on.
+    /// The length of one pass, in frames: the frame the song stops being new on — the
+    /// first repeated row for a [`EndReason::Looped`] song, the restart row for an
+    /// [`EndReason::Ended`] one, and the tick after the last for an
+    /// [`EndReason::Stopped`] one.
     pub const fn end_frame(&self) -> u64 { self.end_frame }
 
     /// How the song ends.
@@ -205,7 +234,7 @@ impl SongTimeline {
             // The scan never found the loop point, so the best available answer is "as
             // long as we watched for".
             EndReason::Budget => Some(self.end_frame),
-            EndReason::Stopped => None,
+            EndReason::Ended | EndReason::Stopped => None,
         }
     }
 
@@ -281,6 +310,14 @@ impl LoopDetector {
         let already_played = self.mark(position);
         if !self.armed {
             return Visit::Repeat;
+        }
+        // The order list ran out. That ends the pass whatever row the restart lands on, so
+        // it is answered before the map is consulted (task D2). It is also answered before
+        // the budget, which cannot fire here anyway: a `Wrapped` arrival has just cleared
+        // `loop_arrivals`.
+        if matches!(arrival, RowArrival::Wrapped) {
+            self.armed = false;
+            return Visit::Wrapped;
         }
         if self.loop_arrivals > MAX_PATTERN_LOOP_ARRIVALS {
             self.armed = false;
@@ -450,6 +487,13 @@ where
                 end_frame = visit.mark.frame;
                 break;
             }
+            // The order list ran out. The pass is as long as it would have been had the
+            // wrap been a loop point: the frame the restart row's first tick lands on.
+            Visit::Wrapped => {
+                end = EndReason::Ended;
+                end_frame = visit.mark.frame;
+                break;
+            }
             Visit::Budget => {
                 end = EndReason::Budget;
                 end_frame = visit.mark.frame;
@@ -566,6 +610,38 @@ mod tests {
         assert_eq!(built.song_frame(last), timeline.end_frame(), "elapsed reaches the total and stops there");
     }
 
+    /// Task D2, the owner's case: Repeat off on a song whose order list runs out stops it
+    /// on the end frame instead of playing into a second pass under a fade.
+    #[test]
+    fn at_end_fade_out_stops_a_song_that_runs_out_of_order_list() {
+        let (mut built, timeline) = playback(DemoPatternData::new(2, 2, 1), AtEnd::FadeOut);
+        assert_eq!(timeline.end(), EndReason::Ended);
+        let mut harness = Harness::new();
+
+        let last = harness.play_to_the_end(&mut built).expect("the song plays");
+        assert_eq!(last.0, timeline.end_frame(), "it stops on the scanned end frame, not one pass later");
+        assert!(built.is_stopped(), "there is no second pass to fade into");
+        assert!(built.end_reached());
+    }
+
+    /// …and Repeat off on a song that really loops still plays on, so the host can fade it.
+    #[test]
+    fn at_end_fade_out_plays_on_past_a_real_loop_point() {
+        let mut data = DemoPatternData::new(2, 2, 1);
+        data.set(1, 1, 0, DemoCell::command(DEMO_ORDER_JUMP, 0));
+        let (mut built, timeline) = playback(data, AtEnd::FadeOut);
+        assert!(matches!(timeline.end(), EndReason::Looped { .. }), "the B00 makes this a loop");
+        let mut harness = Harness::new();
+
+        let mut last = Frame::ZERO;
+        while last.0 < timeline.end_frame() {
+            last = harness.tick(&mut built).expect("a fading song keeps playing");
+        }
+        assert!(built.end_reached(), "the loop point is reported");
+        assert!(!built.is_stopped(), "and the song plays into the second pass for the host to fade");
+        assert_eq!(harness.tick(&mut built).map(|frame| frame.0), Some(timeline.end_frame() + FRAMES_PER_TICK));
+    }
+
     #[test]
     fn at_end_continue_rebases_the_song_clock_onto_the_loop_point() {
         let mut data = DemoPatternData::new(3, 2, 1);
@@ -596,6 +672,84 @@ mod tests {
         assert_eq!(last.0, timeline.end_frame() + loop_length);
         assert!(built.end_reached(), "the second pass ends on the same row as the first");
         assert_eq!(built.song_frame(last), target_frame);
+    }
+
+    /// D2 research point 1: a restart order that points into the middle of the song. Under
+    /// `Continue` the second pass starts there with the elapsed clock rebased onto that
+    /// order's scanned frame, and the *third* pass ends the same way — the wrap must be
+    /// `Visit::Wrapped` again, not a spurious `Looped` off the re-marked map.
+    ///
+    /// The scan and the playback sequencer are given different restart orders on purpose:
+    /// [`PatternSequencer::new`] starts a song at its restart order, so a song that starts
+    /// at the top and restarts at order 2 cannot be spelled any other way until a MOD's
+    /// Noisetracker restart byte is read (out of scope in D1).
+    #[test]
+    fn a_restart_order_in_the_middle_of_the_song_wraps_onto_its_own_frame_every_pass() {
+        let data = DemoPatternData::new(4, 2, 1);
+        let timeline = scan(data.clone());
+        assert_eq!(timeline.end(), EndReason::Ended);
+        let row_length = 6 * FRAMES_PER_TICK;
+        assert_eq!(timeline.end_frame(), 8 * row_length);
+
+        let settings = SequencerSettings { restart_order: 2, ..SequencerSettings::default() };
+        let mut built = sequencer(data, settings);
+        built.set_timeline(timeline.clone());
+        built.set_at_end(AtEnd::Continue);
+        assert!(built.seek_order_at(0, Frame::ZERO), "the song itself starts at the top");
+
+        let restart_frame = timeline.frame_at(2, 0).expect("the scan reached order 2");
+        assert_eq!(restart_frame, 4 * row_length);
+
+        let mut harness = Harness::new();
+        let mut last = Frame::ZERO;
+        // Three ends: the order list runs out at 8 rows, then every 4 rows after it.
+        for (pass, wrap_at) in [8 * row_length, 12 * row_length, 16 * row_length].into_iter().enumerate() {
+            while last.0 < wrap_at {
+                last = harness.tick(&mut built).expect("a song set to continue never stops");
+            }
+            assert_eq!(last.0, wrap_at, "pass {pass} ends where the order list runs out");
+            assert!(built.end_reached(), "pass {pass} reported its end");
+            assert_eq!(built.position(), SongPosition { order: 2, pattern: 2, row: 0 }, "pass {pass} restarted at the restart order");
+            assert_eq!(built.song_frame(last), restart_frame, "pass {pass} rebased elapsed onto order 2's scanned frame");
+        }
+    }
+
+    /// D2 research point 2: a wrap onto a row the scan never reached. It is still the end
+    /// of the song, and `wrap_at_loop_point`'s `None` arm — restart the elapsed clock at
+    /// zero and forget every mark — is what a row with no scanned position deserves.
+    #[test]
+    fn a_wrap_onto_an_unplayed_row_still_ends_the_song_and_restarts_its_clock() {
+        let mut data = DemoPatternData::new(4, 2, 1);
+        // Order 0 jumps straight to order 2, so order 1 is never played and never scanned.
+        data.set(0, 0, 0, DemoCell::command(DEMO_ORDER_JUMP, 2));
+        let timeline = scan(data.clone());
+        assert_eq!(timeline.end(), EndReason::Ended);
+        assert_eq!(timeline.frame_at(1, 0), None, "the scan never reaches order 1");
+
+        let settings = SequencerSettings { restart_order: 1, ..SequencerSettings::default() };
+        let mut built = sequencer(data, settings);
+        built.set_timeline(timeline.clone());
+        built.set_at_end(AtEnd::Continue);
+        assert!(built.seek_order_at(0, Frame::ZERO), "the song itself starts at the top");
+
+        let row_length = 6 * FRAMES_PER_TICK;
+        let mut harness = Harness::new();
+        let mut last = Frame::ZERO;
+        while last.0 < 5 * row_length {
+            last = harness.tick(&mut built).expect("a song set to continue never stops");
+        }
+        assert_eq!(last.0, timeline.end_frame(), "one row of order 0, then orders 2 and 3");
+        assert!(built.end_reached());
+        assert!(!built.is_stopped());
+        assert_eq!(built.position(), SongPosition { order: 1, pattern: 1, row: 0 }, "the wrap lands on the unplayed restart order");
+        assert_eq!(built.song_frame(last), 0, "a row with no scanned position starts the elapsed clock afresh");
+
+        // The detector was reset rather than re-marked, so the next wrap fires too.
+        while last.0 < 5 * row_length + 6 * row_length {
+            last = harness.tick(&mut built).expect("still playing");
+        }
+        assert!(built.end_reached(), "orders 1, 2 and 3, then the order list runs out again");
+        assert_eq!(built.song_frame(last), 0);
     }
 
     #[test]
@@ -696,16 +850,70 @@ mod tests {
         assert_eq!(timeline.end_frame(), (18 + 6) * FRAMES_PER_TICK);
     }
 
+    /// Task D2: a song whose order list simply runs out *ends* there. Nothing in it asked
+    /// to be heard again, so it is not a loop however the end-of-song policy restarts it.
     #[test]
-    fn a_straight_order_list_loops_back_to_the_top() {
+    fn a_straight_order_list_ends_when_it_runs_out() {
         let timeline = scan(DemoPatternData::new(3, 4, 1));
-        assert_eq!(timeline.end(), EndReason::Looped { target: SongPosition { order: 0, pattern: 0, row: 0 } });
+        assert_eq!(timeline.end(), EndReason::Ended);
         assert_eq!(timeline.end_frame(), 3 * 4 * 6 * FRAMES_PER_TICK, "three patterns of four rows at speed 6");
         assert_eq!(timeline.marks().len(), 12);
-        assert_eq!(timeline.loop_length_frames(), Some(timeline.end_frame()), "the whole song is the loop");
+        assert_eq!(timeline.loop_length_frames(), None, "a song that ends has no repeating section");
         assert_eq!(timeline.frame_at(1, 0), Some(4 * 6 * FRAMES_PER_TICK));
         assert_eq!(timeline.order_mark(2).map(|mark| mark.frame), Some(8 * 6 * FRAMES_PER_TICK));
         assert_eq!(timeline.sample_rate_hz(), 44_100);
+    }
+
+    /// …and the same order list with a `B00` on its last row *does* loop, at exactly the
+    /// same frame: the difference between the two ends is the module asking for it.
+    #[test]
+    fn a_position_jump_on_the_last_row_loops_where_a_run_out_would_have_ended() {
+        let run_out = scan(DemoPatternData::new(3, 4, 1));
+        let mut data = DemoPatternData::new(3, 4, 1);
+        data.set(2, 3, 0, DemoCell::command(DEMO_ORDER_JUMP, 0));
+        let timeline = scan(data);
+
+        assert_eq!(timeline.end(), EndReason::Looped { target: SongPosition { order: 0, pattern: 0, row: 0 } });
+        assert_eq!(timeline.end_frame(), run_out.end_frame(), "the same frame, read two ways");
+        assert_eq!(timeline.loop_length_frames(), Some(timeline.end_frame()), "the whole song is the loop");
+    }
+
+    /// A `Cxx`/`Dxx` break on the last order has nowhere to break to: the order list runs
+    /// out and the song ends.
+    #[test]
+    fn a_pattern_break_on_the_last_order_ends_the_song() {
+        let mut data = DemoPatternData::new(2, 4, 1);
+        data.set(1, 1, 0, DemoCell::command(DEMO_BREAK_ROW, 2));
+        let timeline = scan(data);
+
+        assert_eq!(timeline.end(), EndReason::Ended);
+        assert_eq!(timeline.end_frame(), 6 * 6 * FRAMES_PER_TICK, "four rows of order 0, two of order 1");
+        assert_eq!(timeline.loop_length_frames(), None);
+    }
+
+    /// A `Bxx` past the end of the order list is a restart, not a jump — ProTracker's
+    /// `mt_PosJump` clamps one the same way — so it ends the song rather than looping it.
+    #[test]
+    fn a_position_jump_past_the_end_of_the_order_list_ends_the_song() {
+        let mut data = DemoPatternData::new(2, 4, 1);
+        data.set(0, 1, 0, DemoCell::command(DEMO_ORDER_JUMP, 9));
+        let timeline = scan(data);
+
+        assert_eq!(timeline.end(), EndReason::Ended);
+        assert_eq!(timeline.end_frame(), 2 * 6 * FRAMES_PER_TICK, "two rows, then the jump runs off the list");
+        assert_eq!(timeline.marks().len(), 2);
+    }
+
+    /// An S3M order list reaching its `0xFF` terminator under the wrapping policy every
+    /// format builder uses: the same end.
+    #[test]
+    fn an_end_marker_ends_the_song_even_under_the_wrapping_policy() {
+        let data = DemoPatternData::new(2, 4, 1).with_orders(vec![OrderEntry::Pattern(0), OrderEntry::End, OrderEntry::Pattern(1)]);
+        let timeline = scan(data);
+
+        assert_eq!(timeline.end(), EndReason::Ended);
+        assert_eq!(timeline.end_frame(), 4 * 6 * FRAMES_PER_TICK, "the one reachable pattern, once");
+        assert_eq!(timeline.loop_length_frames(), None);
     }
 
     #[test]
@@ -766,7 +974,7 @@ mod tests {
         // Leaving the loop and moving on is checked normally again.
         assert_eq!(detector.visit(SongPosition { order: 1, pattern: 1, row: 0 }, RowArrival::NextOrder), Visit::New);
         assert!(!detector.is_inside_loop());
-        assert_eq!(detector.visit(at(0), RowArrival::Wrapped), Visit::Looped, "wrapping onto a played row is the loop point");
+        assert_eq!(detector.visit(at(0), RowArrival::Wrapped), Visit::Wrapped, "the order list running out is the end of the song");
         assert!(!detector.is_armed());
         assert_eq!(detector.visit(at(1), RowArrival::Sequential), Visit::Repeat, "and it only fires once");
     }
@@ -788,6 +996,24 @@ mod tests {
             assert!(visits < MAX_PATTERN_LOOP_ARRIVALS + 8, "the budget must bite");
         }
         assert_eq!(visits, MAX_PATTERN_LOOP_ARRIVALS + 1);
+        assert!(!detector.is_armed());
+    }
+
+    /// D2 research point 3: a wrap can never be reported as a budget end. A `Wrapped`
+    /// arrival clears the pattern-loop counter on its way in, so the two conditions cannot
+    /// both hold on the same visit however close the budget was to biting.
+    #[test]
+    fn a_wrap_on_the_brink_of_the_pattern_loop_budget_is_still_a_wrap() {
+        let data = DemoPatternData::new(2, 4, 1);
+        let mut detector = LoopDetector::new(&data);
+        let at = |row| SongPosition { order: 0, pattern: 0, row };
+
+        assert_eq!(detector.visit(at(0), RowArrival::Start), Visit::New);
+        for arrival in 0..MAX_PATTERN_LOOP_ARRIVALS {
+            assert_ne!(detector.visit(at(1), RowArrival::PatternLoop), Visit::Budget, "arrival {arrival} is still inside the budget");
+        }
+        assert!(detector.is_armed(), "the budget has not bitten yet");
+        assert_eq!(detector.visit(at(0), RowArrival::Wrapped), Visit::Wrapped, "and the wrap answers first");
         assert!(!detector.is_armed());
     }
 

@@ -9,6 +9,20 @@
 | Recommended model | Claude Opus (touches the sequencer and the RT path) |
 | Verified by | agent (`cargo test --workspace`, `cargo xtask ci`), then owner listening check via W2 |
 
+## Superseded in part by D2 (2026-09-03)
+
+One decision below has been reversed. D1 said to "keep the `EndOfSongPolicy::Loop` wrap
+exactly as it is — the detector's `Wrapped` visit is what turns it into the loop point",
+so a song whose order list simply ran out was reported as `EndReason::Looped` and, with
+Repeat off, played five seconds of a second pass under a fade. The owner tested
+`NICETUNE.S3M` and decided otherwise: **running out of order list is the end of the song,
+not a loop.** Task `M3-task-D2-natural-end-versus-loop.md` adds `Visit::Wrapped` and
+`EndReason::Ended`, stops such a song on its end frame under `AtEnd::FadeOut` as well as
+`AtEnd::Stop`, and maps it to `SongEnd::Stops` so the page adds no fade to the displayed
+length. `end_frame` itself is unchanged — it is still the frame of the restart row's first
+tick — so every length D1 measured is the length D2 measures. Everything else in this file
+still stands; only `EndReason::Looped` now means a `Bxx`/`Cxx`/`Dxx` loop.
+
 ## Context for a fresh agent
 
 StarPlayer is a `no_std + alloc` Rust tracked-music engine. Read `AGENTS.md` first — the

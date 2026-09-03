@@ -240,13 +240,16 @@ pub fn scanned_song_with_limits(module: &Arc<Module>, sample_rate_hz: u32, limit
 /// A module does not say how long it is, so a file render has to be told. The default is
 /// what a media player's "export" button wants: play the song once, then fade out over ten
 /// seconds into the start of the second pass. A song that *ends* — its order list runs out
-/// or a stop marker fires — gets no fade, because there is nothing to fade away from.
+/// ([`EndReason::Ended`]) or a stop marker fires ([`EndReason::Stopped`]) — gets no fade,
+/// because there is nothing to fade away from; only an explicit `Bxx`/`Cxx`/`Dxx` loop
+/// does.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RenderLength {
     /// Extra passes through the repeating section after the first. Zero plays it once.
     pub repeat_count: u32,
-    /// What happens at the loop point. [`AtEnd::Stop`] cuts dead there with no fade;
-    /// anything else fades, because a file has to end somewhere.
+    /// What happens at a **loop point**. [`AtEnd::Stop`] cuts dead there with no fade;
+    /// anything else fades, because a file has to end somewhere. A song that ends rather
+    /// than loops is cut whatever this says — there is nothing to fade away from.
     pub at_end: AtEnd,
     /// Frames the fade lasts. Ignored when there is no fade.
     pub fade_frames: u64,
@@ -271,12 +274,14 @@ impl RenderLength {
         let loop_length = match timeline.end() {
             // A song that ends has nothing to repeat, so a repeat plays it again from the
             // top; a budget end never found the loop point, so the cap stands in for it.
-            EndReason::Stopped | EndReason::Budget => timeline.end_frame(),
+            EndReason::Ended | EndReason::Stopped | EndReason::Budget => timeline.end_frame(),
             EndReason::Looped { .. } => timeline.loop_length_frames().unwrap_or(timeline.end_frame()),
         };
         let body = timeline.end_frame().saturating_add(loop_length.saturating_mul(self.repeat_count as u64));
         let fade = match (self.at_end, timeline.end()) {
-            (AtEnd::Stop, _) | (_, EndReason::Stopped) => 0,
+            // An order list that ran out and a stop marker are the same kind of end: the
+            // song is over on its own terms, so there is nothing to fade away from.
+            (AtEnd::Stop, _) | (_, EndReason::Ended | EndReason::Stopped) => 0,
             _ => self.fade_frames,
         };
         let total = body.saturating_add(fade).min(self.max_frames);
@@ -939,9 +944,49 @@ mod tests {
         }
     }
 
+    /// The synthetic MOD's order list simply runs out, which task D2 reads as the end of
+    /// the song rather than a loop. This is the same fixture with a `B00` on its very last
+    /// row, so it genuinely repeats — and at exactly the same frame, which is what makes
+    /// the two renders below comparable.
+    fn looping_synthetic_mod() -> Vec<u8> {
+        const HEADER_BYTES: usize = 1084;
+        const CELL_BYTES: usize = 4;
+        const CHANNELS: usize = 4;
+        const ROWS: usize = 64;
+        let mut bytes = fixtures::synthetic_mod();
+        let last_cell = HEADER_BYTES + ((ROWS + ROWS - 1) * CHANNELS) * CELL_BYTES;
+        let jump = starplayer::mod_file::ModCell { period: 0, instrument: 0, effect: 0xB, param: 0x00 };
+        bytes[last_cell..last_cell + CELL_BYTES].copy_from_slice(&jump.to_bytes());
+        bytes
+    }
+
+    /// Task D2: a song whose order list merely runs out is rendered once, with no fade —
+    /// there is nothing to fade away from.
+    #[test]
+    fn a_song_that_runs_out_of_order_list_renders_one_pass_with_no_fade() {
+        let bytes = fixtures::synthetic_mod();
+        let module = Arc::new(starplayer::mod_file::load(&bytes).expect("the fixture loads"));
+        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+        assert_eq!(timeline.end(), EndReason::Ended, "the fixture's order list runs out");
+        assert_eq!(timeline.loop_length_frames(), None);
+
+        let length = RenderLength { repeat_count: 0, at_end: AtEnd::FadeOut, fade_frames: GOLDEN_SAMPLE_RATE_HZ as u64, max_frames: GOLDEN_SAMPLE_RATE_HZ as u64 * 60 };
+        assert_eq!(length.frames_for(&timeline), (timeline.end_frame() as usize, 0), "one pass, and not one frame of fade");
+        let rendered = render_song_fixed_mono(GoldenFormat::Mod, &bytes, GOLDEN_SAMPLE_RATE_HZ, GOLDEN_HOST_BLOCK_FRAMES, length).expect("it renders");
+        assert_eq!(rendered.len() as u64, timeline.end_frame());
+        assert!(rendered.iter().rev().take(64).any(|sample| *sample != 0), "it is cut at full level rather than faded");
+
+        // The `B00` twin is the same song with an explicit loop, and it ends at the same
+        // frame — the only difference is that the module asked to be heard again.
+        let looping = Arc::new(starplayer::mod_file::load(&looping_synthetic_mod()).expect("the twin loads"));
+        let looping_timeline = song_timeline(&looping, GOLDEN_SAMPLE_RATE_HZ).expect("the twin scans");
+        assert!(matches!(looping_timeline.end(), EndReason::Looped { .. }), "the twin loops");
+        assert_eq!(looping_timeline.end_frame(), timeline.end_frame(), "at the same frame");
+    }
+
     #[test]
     fn a_faded_render_ends_in_silence_and_a_cut_one_ends_on_the_loop_point() {
-        let bytes = fixtures::synthetic_mod();
+        let bytes = looping_synthetic_mod();
         let module = Arc::new(starplayer::mod_file::load(&bytes).expect("the fixture loads"));
         let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
         assert!(matches!(timeline.end(), EndReason::Looped { .. }), "the fixture loops");
@@ -963,12 +1008,36 @@ mod tests {
         assert_eq!(repeated.get(..cut.len()).expect("the repeat contains the first pass"), cut.as_slice(), "a repeat appends rather than changing the first pass");
     }
 
+    /// Task D2's acceptance case. `NICETUNE.S3M`'s order list simply runs out, so the song
+    /// *ends* rather than looping — and it ends on exactly the frame D1 called its loop
+    /// point, so nothing about its measured length moved. The number is the one the build
+    /// before D2 reported.
+    #[test]
+    fn nicetune_ends_when_its_order_list_runs_out_at_the_length_it_always_had() {
+        const NICETUNE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/NICETUNE.S3M");
+        let module = Arc::new(starplayer::s3m::load(NICETUNE).expect("NICETUNE loads"));
+        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("NICETUNE scans");
+
+        assert_eq!(timeline.end(), EndReason::Ended, "nothing in NICETUNE jumps backwards");
+        assert_eq!(timeline.end_frame(), 1_128_960, "the same frame count D1 measured");
+        assert!((timeline.duration_seconds() - 25.6).abs() < 0.001, "0:25, not 0:30");
+        assert_eq!(timeline.loop_length_frames(), None);
+    }
+
     #[test]
     fn a_render_length_is_clamped_to_its_ceiling() {
-        let module = Arc::new(starplayer::s3m::load(REFLEX).expect("REFLEX loads"));
-        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("REFLEX scans");
+        let bytes = looping_synthetic_mod();
+        let module = Arc::new(starplayer::mod_file::load(&bytes).expect("the fixture loads"));
+        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
         let length = RenderLength { repeat_count: 1_000_000, at_end: AtEnd::FadeOut, fade_frames: 1_000, max_frames: 10_000 };
         assert_eq!(length.frames_for(&timeline), (10_000, 1_000), "the ceiling wins over the repeat count");
+
+        // REFLEX's order list runs out, so however many repeats are asked for there is no
+        // fade to append to them.
+        let reflex = Arc::new(starplayer::s3m::load(REFLEX).expect("REFLEX loads"));
+        let reflex_timeline = song_timeline(&reflex, GOLDEN_SAMPLE_RATE_HZ).expect("REFLEX scans");
+        assert_eq!(reflex_timeline.end(), EndReason::Ended);
+        assert_eq!(length.frames_for(&reflex_timeline), (10_000, 0), "a song that ends is cut, not faded");
     }
 
     /// Research point: no format processor may keep a shadow copy of speed or tempo that

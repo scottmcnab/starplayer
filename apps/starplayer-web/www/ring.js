@@ -96,6 +96,9 @@
 
     // Bits of the song_flags word (index 21).
     const SONG_FLAG_LENGTH_KNOWN = 1;
+    // Set only when the song comes round through its own flow — a Bxx/Cxx/Dxx jump back
+    // into music already played. An order list that simply runs out is an *end*, and
+    // leaves this clear (task D2).
     const SONG_FLAG_LOOPS = 2;
     const SONG_FLAG_END_REACHED = 4;
     const SONG_FLAG_FADING = 8;
