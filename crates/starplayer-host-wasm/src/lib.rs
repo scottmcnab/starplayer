@@ -37,8 +37,8 @@ use starplayer::core::quirks::QuirkSelection;
 use starplayer::core::{AtEnd, ChannelId, Command, Frame, Interpolator, TempoModelId, U0F16};
 use starplayer::dsp::{GainRamp, Interpolate, Linear, Nearest};
 use starplayer::engine::{
-    Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode, OutputDepth,
-    PatternSequencer, RENDER_QUANTUM, ScanLimits, SongTimeline,
+    ChannelTable, Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MAX_VOICE_CAPACITY, MixPathKind,
+    MixerMode, OutputDepth, PatternSequencer, RENDER_QUANTUM, ScanLimits, SongTimeline,
 };
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
@@ -476,10 +476,15 @@ impl Host {
     }
 
     fn with_mode(sample_rate_hz: u32, active_mode: MixerMode) -> Result<Host, String> {
+        // The worklet builds its engine before it has seen a module and plays every module
+        // through it, so it cannot ask a processor for its recommended capacity: it takes
+        // the maxima. Both are allocated once, and the mixer and the telemetry view walk
+        // only what is *active*, so a wider pool and a longer channel table change no
+        // rendered sample — only how much memory the worklet holds.
         let settings = EngineSettings {
             sample_rate_hz,
-            voice_capacity: 64,
-            channel_count: 32,
+            voice_capacity: MAX_VOICE_CAPACITY,
+            channel_count: ChannelTable::MAX_CHANNELS,
             ..EngineSettings::default()
         };
         let (engine, control, telemetry) = WebEngine::build(active_mode, settings)?;
@@ -553,10 +558,11 @@ impl Host {
         if mode == self.active_mode {
             return Ok(mode.to_wire());
         }
+        // The rebuilt engine is the same persistent engine, so it takes the same maxima.
         let settings = EngineSettings {
             sample_rate_hz: self.sample_rate_hz,
-            voice_capacity: 64,
-            channel_count: 32,
+            voice_capacity: MAX_VOICE_CAPACITY,
+            channel_count: ChannelTable::MAX_CHANNELS,
             ..EngineSettings::default()
         };
         let snapshot = *self.telemetry.read();

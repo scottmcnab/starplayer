@@ -685,7 +685,11 @@ impl S3mProcessor {
             {
                 let region = sample_region(sample);
                 let params = self.voice_params(channel_index, dirty);
-                let sample_number = sample_id.0.saturating_add(1).min(u8::MAX as u16) as u8;
+                // `VoiceTag::sample` is sixteen bits, so the one-based sample number no
+                // longer has to be clamped into a byte: S3M's own limit is 99 samples,
+                // and IT's Duplicate Check must never see two different samples compare
+                // equal because a clamp folded them together.
+                let sample_number = sample_id.0.saturating_add(1);
                 let tag = VoiceTag { channel: channel_index as u8, instrument: instrument_number, sample: sample_number, note: linear_note(self.channels[channel_index].current_note) };
                 context.trigger_channel(channel_id, tag, region, params, self.channels[channel_index].sample_offset);
             }

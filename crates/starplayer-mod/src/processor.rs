@@ -804,7 +804,7 @@ impl ModProcessor {
             let tag = VoiceTag {
                 channel: channel_index as u8,
                 instrument: state.sample_number,
-                sample: state.sample_number,
+                sample: state.sample_number as u16,
                 note: if state.current_note == NO_NOTE { 0 } else { state.current_note },
             };
             let offset_frames = state.sample_offset;

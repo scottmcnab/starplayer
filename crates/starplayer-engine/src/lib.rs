@@ -72,7 +72,7 @@ pub mod timeline;
 #[cfg(feature = "trace")]
 pub mod trace;
 
-pub use channel::{Channel, ChannelTable};
+pub use channel::{Channel, ChannelTable, MAX_VOICE_CAPACITY};
 pub use flow::PatternFlowState;
 pub use command::{
     DEFAULT_COMMAND_CAPACITY, DEFAULT_GARBAGE_CAPACITY, EngineHandle, MAX_COMMANDS_PER_QUANTUM, PcmSource,
@@ -94,7 +94,7 @@ pub use timeline::{
     SongTimeline, Visit, scan_timeline,
 };
 #[cfg(feature = "trace")]
-pub use trace::{TRACE_FORMAT_VERSION, Trace, TraceChannel, TraceTick};
+pub use trace::{TRACE_FORMAT_VERSION, Trace, TraceChannel, TraceTick, TraceVoice};
 
 use starplayer_mixer::{FixedPath, FloatPath, StereoF32, StereoI16};
 

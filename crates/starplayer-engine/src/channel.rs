@@ -45,9 +45,23 @@ pub struct ChannelTable {
     channels: Box<[Channel]>,
 }
 
+/// The widest voice pool any in-scope format asks for: IT's virtual-channel limit.
+///
+/// The companion to [`ChannelTable::MAX_CHANNELS`], and the number a **persistent host**
+/// uses — one that builds its engine before it has seen a module, and so cannot ask the
+/// module's processor for [`TrackerProcessor::recommended_voice_capacity`]. A pool is
+/// allocated once and the mixer walks active slots only, so sizing it at the maximum costs
+/// memory and nothing else: no rendered sample changes.
+///
+/// A module-specific host — the offline renderer, a scan — sizes its pool from the
+/// processor instead, and gets a pool exactly as wide as that format can fill.
+pub const MAX_VOICE_CAPACITY: usize = 256;
+
 impl ChannelTable {
     /// The widest tracker channel count in any format this engine targets. IT allows 64
-    /// pattern channels; S3M allows 32.
+    /// pattern channels; S3M allows 32. The voice-side companion is
+    /// [`MAX_VOICE_CAPACITY`]: IT's 64 channels can each hold several sounding voices at
+    /// once, which is why the two numbers are not the same.
     pub const MAX_CHANNELS: usize = 64;
 
     /// A table of `count` silent, unmuted channels, clamped to
@@ -124,6 +138,26 @@ impl ChannelTable {
         let voice = voices.allocate(tag, region, params, offset_frames)?;
         lane.foreground = Some(voice);
         Some(voice)
+    }
+
+    /// Unbind `channel`'s foreground voice **without touching it**: it keeps sounding, it
+    /// keeps its tag — `tag.channel` included, so Duplicate Check can still find it — and
+    /// it now belongs to nobody. Returns the voice that was detached, if there was one.
+    ///
+    /// IT's New Note Actions `Continue`, `NoteOff` and `NoteFade` all start here: the note
+    /// already sounding becomes a *background* voice which runs on under its own envelopes
+    /// and fadeout until it dies, while the channel goes on to trigger the new note.
+    ///
+    /// # Ordering
+    ///
+    /// **Detach first, then [`ChannelTable::trigger`].** `trigger` releases whatever
+    /// foreground it finds before allocating the replacement, so triggering first would
+    /// cut the very voice the NNA meant to keep. The detached voice is now owned by
+    /// nobody, so whoever detached it is responsible for ending it — a fadeout that
+    /// reaches zero, an explicit [`VoicePool::release`], or the voice running off the end
+    /// of a one-shot sample.
+    pub fn detach_foreground(&mut self, channel: ChannelId) -> Option<VoiceId> {
+        self.channels.get_mut(channel.0 as usize)?.foreground.take()
     }
 
     /// Ask `channel`'s voice to stop and unbind it.
@@ -221,6 +255,52 @@ mod tests {
         assert!(channels.trigger(ChannelId(1), &mut voices, VoiceTag::default(), region, sounding(), 0).is_some());
         assert_eq!(voices.voices_active(), 1, "the muted channel's voice exists so unmuting can resume it mid-note");
         assert!(channels.is_sounding(ChannelId(1), &voices));
+    }
+
+    #[test]
+    fn detaching_leaves_the_voice_sounding_and_unowned_but_still_tagged_with_its_channel() {
+        let (blob, region) = looping_blob();
+        let mut channels = ChannelTable::new(2);
+        let mut voices = VoicePool::new(4);
+        let tag = VoiceTag { channel: 0, instrument: 3, sample: 300, note: 60 };
+        let voice = channels.trigger(ChannelId(1), &mut voices, tag, region, sounding(), 0).expect("slot 0");
+
+        assert_eq!(channels.detach_foreground(ChannelId(1)), Some(voice));
+        assert_eq!(channels.foreground(ChannelId(1)), None, "the channel owns nothing now");
+        assert!(!channels.is_sounding(ChannelId(1), &voices), "and reports itself silent, which is what a fresh trigger needs");
+
+        let detached = voices.get(voice).expect("the voice is untouched");
+        assert!(!detached.wants_stop(), "detaching is not stopping: the NNA meant to keep it sounding");
+        assert_eq!(detached.tag.channel, 1, "`tag.channel` survives, so Duplicate Check can still find it");
+        assert_eq!(detached.tag.sample, 300, "a sample number past a byte survives the widened tag");
+        assert_eq!(voices.voices_active(), 1);
+
+        let mut destination = [starplayer_mixer::FixedFrame::default(); 8];
+        voices.accumulate::<starplayer_mixer::FixedPath, starplayer_dsp::Linear>(&blob, &mut destination);
+        assert_eq!(voices.voices_active(), 1, "an accumulation pass does not reclaim it — nothing asked it to stop");
+
+        assert_eq!(channels.detach_foreground(ChannelId(1)), None, "detaching an unowned channel is a no-op");
+        assert_eq!(channels.detach_foreground(ChannelId(9)), None, "and so is detaching a channel that does not exist");
+    }
+
+    #[test]
+    fn a_trigger_after_a_detach_keeps_both_voices_but_a_trigger_before_it_does_not() {
+        let (_blob, region) = looping_blob();
+        let mut channels = ChannelTable::new(1);
+        let mut voices = VoicePool::new(4);
+
+        let background = channels.trigger(ChannelId(0), &mut voices, VoiceTag::default(), region, sounding(), 0).expect("slot 0");
+        channels.detach_foreground(ChannelId(0));
+        let foreground = channels.trigger(ChannelId(0), &mut voices, VoiceTag::default(), region, sounding(), 0).expect("slot 1");
+        assert_eq!(voices.voices_active(), 2, "detach then trigger is the New Note Action order: both voices sound");
+        assert!(voices.get(background).is_some());
+        assert_eq!(channels.foreground(ChannelId(0)), Some(foreground));
+
+        // The other order is what the ordering rule warns about: `trigger` releases the
+        // foreground it finds, so the voice the NNA meant to keep is already gone.
+        let replaced = channels.trigger(ChannelId(0), &mut voices, VoiceTag::default(), region, sounding(), 0).expect("slot 1 again");
+        assert!(voices.get(foreground).is_none(), "trigger released it before allocating the replacement");
+        assert_eq!(channels.detach_foreground(ChannelId(0)), Some(replaced), "leaving nothing but the new voice to detach");
     }
 
     #[test]
