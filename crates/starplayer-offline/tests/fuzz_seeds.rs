@@ -11,15 +11,19 @@
 //! * `fuzz/regressions/<format>/` — inputs a fuzzer once crashed on. `Ok` or `Err` are both
 //!   fine; not panicking is the whole assertion.
 //!
-//! Every input is additionally offered to the two loaders it does not belong to, because
+//! Every input is additionally offered to the three loaders it does not belong to, because
 //! a host that probes formats in the wrong order must not be able to crash a loader with
 //! another format's bytes.
+//!
+//! XM goes through `starplayer_xm` directly rather than through the facade: task F4 adds
+//! the `starplayer::xm` arms, and this file is meant to be checking the loader from the
+//! commit that introduces it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The three native loaders, by the directory name their inputs live under.
-const FORMATS: [&str; 3] = ["mod", "s3m", "mtm"];
+/// The native loaders, by the directory name their inputs live under.
+const FORMATS: [&str; 4] = ["mod", "s3m", "mtm", "xm"];
 
 fn fuzz_directory(kind: &str, format: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz").join(kind).join(format)
@@ -42,9 +46,11 @@ fn every_loader_survives(bytes: &[u8]) {
     let _ = starplayer::mod_file::probe(bytes);
     let _ = starplayer::s3m::probe(bytes);
     let _ = starplayer::mtm::probe(bytes);
+    let _ = starplayer_xm::probe(bytes);
     let _ = starplayer::mod_file::load(bytes);
     let _ = starplayer::s3m::load(bytes);
     let _ = starplayer::mtm::load(bytes);
+    let _ = starplayer_xm::load(bytes);
 }
 
 fn load_for(format: &str, bytes: &[u8]) -> Result<starplayer::model::Module, starplayer::core::Error> {
@@ -52,6 +58,7 @@ fn load_for(format: &str, bytes: &[u8]) -> Result<starplayer::model::Module, sta
         "mod" => starplayer::mod_file::load(bytes),
         "s3m" => starplayer::s3m::load(bytes),
         "mtm" => starplayer::mtm::load(bytes),
+        "xm" => starplayer_xm::load(bytes),
         other => panic!("unknown fuzz corpus format `{other}`"),
     }
 }
@@ -71,7 +78,7 @@ fn every_committed_seed_is_a_module_its_own_loader_accepts() {
             checked += 1;
         }
     }
-    assert!(checked >= 20, "the seed corpus shrank to {checked} inputs");
+    assert!(checked >= 26, "the seed corpus shrank to {checked} inputs");
 }
 
 #[test]

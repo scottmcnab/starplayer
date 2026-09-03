@@ -34,6 +34,13 @@ impl LoopMode {
 }
 
 /// Shape of XM/IT auto-vibrato's LFO.
+///
+/// The two formats number these differently and neither numbering is reproduced here:
+/// IT's `VibratoType` is `0` sine, `1` ramp down, `2` square, `3` random, while XM's
+/// `vibType` is `0` sine, `1` square, `2` ramp down, `3` ramp up. Each loader maps its own
+/// numbering onto this enum, which is why [`RampUp`](AutoVibratoWaveform::RampUp) — an XM
+/// shape IT has no code for — sits at the end rather than beside
+/// [`RampDown`](AutoVibratoWaveform::RampDown).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AutoVibratoWaveform {
     #[default]
@@ -41,6 +48,8 @@ pub enum AutoVibratoWaveform {
     RampDown,
     Square,
     Random,
+    /// A rising sawtooth: XM's `vibType` 3 (M5-F1). IT has no equivalent.
+    RampUp,
 }
 
 /// Auto-vibrato, in the source format's own units — like [`InstrumentDef::fadeout`](crate::InstrumentDef::fadeout).

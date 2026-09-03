@@ -238,6 +238,7 @@ dependencies = [
  "starplayer-model",
  "starplayer-mtm",
  "starplayer-s3m",
+ "starplayer-xm",
 ]
 
 [[package]]
@@ -295,6 +296,16 @@ dependencies = [
  "starplayer-core",
  "starplayer-engine",
  "starplayer-mixer",
+ "starplayer-model",
+ "starplayer-rt",
+]
+
+[[package]]
+name = "starplayer-xm"
+version = "0.1.0"
+dependencies = [
+ "starplayer-core",
+ "starplayer-engine",
  "starplayer-model",
  "starplayer-rt",
 ]

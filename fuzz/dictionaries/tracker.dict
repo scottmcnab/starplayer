@@ -37,6 +37,42 @@ s3m_cwtv_st321="\x21\x13"
 # ── MTM ─────────────────────────────────────────────────────────────────────────────
 mtm_magic="MTM\x10"
 
+# ── XM ──────────────────────────────────────────────────────────────────────────────
+xm_magic="Extended Module: "
+# The DOS end-of-file byte at offset 37, which `probe` requires alongside the signature.
+xm_eof="\x1a"
+# Format versions. 0x0104 is the current layout; the two older ones move the patterns.
+xm_version_104="\x04\x01"
+xm_version_103="\x03\x01"
+xm_version_102="\x02\x01"
+# `header_size` == 276: the fields plus a full 256-byte order table, which FastTracker 2
+# always writes and which the FastTracker 2 dialect detection requires.
+xm_header_size_276="\x14\x01\x00\x00"
+# Tracker names the dialect classifier compares against, byte for byte.
+xm_tracker_ft2="FastTracker v2.00   "
+xm_tracker_ft2_clone="Fasttracker II clone"
+xm_tracker_modplug="FastTracker v 2.00  "
+xm_tracker_openmpt="OpenMPT "
+xm_tracker_milky="MilkyTracker"
+# The instrument header sizes real trackers write: FastTracker 2's 263 and its 33 for an
+# empty instrument, and ModPlug Tracker 1.0 alpha's 245.
+xm_instrument_size_263="\x07\x01\x00\x00"
+xm_instrument_size_33="\x21\x00\x00\x00"
+xm_instrument_size_245="\xf5\x00\x00\x00"
+# The sample header size FastTracker 2 writes, 40.
+xm_sample_header_size="\x28\x00\x00\x00"
+# ModPlug's ADPCM marker, in the sample header's `reserved` byte.
+xm_adpcm_marker="\xad"
+# The chunks OpenMPT appends after the last sample, all of which are skipped.
+xm_chunk_text="text"
+xm_chunk_midi="MIDI"
+xm_chunk_pnam="PNAM"
+xm_chunk_cnam="CNAM"
+xm_chunk_xtpm="XTPM"
+# A packed-pattern mask byte with every field present, and the key-off note.
+xm_pattern_mask_all="\x9f"
+xm_note_key_off="\x61"
+
 # ── order-list markers shared by the formats ────────────────────────────────────────
 order_end="\xff"
 order_skip="\xfe"
