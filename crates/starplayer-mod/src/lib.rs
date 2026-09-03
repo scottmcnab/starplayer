@@ -15,11 +15,13 @@ pub mod loader;
 pub mod pattern;
 pub mod processor;
 pub mod tables;
+pub mod timing;
 
 pub use loader::{LoadOptions, StereoSeparation, load, load_from, load_from_with_options, load_with_options, probe, probe_reader};
 pub use pattern::{CELL_BYTES, ROWS, ModCell, PatternView};
 pub use processor::{EffectCell, EffectNote, EffectSemantics, ModChannel, ModPatternData, ModProcessor, sequencer_for, sequencer_with_quirks};
 pub use tables::{AMIGA_CHANNEL_MAP, FINETUNE_REFERENCE_RATES, PROTRACKER_PERIODS};
+pub use timing::{ModTimingEvidence, TimingVerdict, timing_evidence, timing_verdict, timing_verdict_for};
 
 pub use starplayer_core::Error;
 pub use starplayer_model::Module;

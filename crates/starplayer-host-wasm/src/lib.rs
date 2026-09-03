@@ -38,7 +38,7 @@ use starplayer::core::{AtEnd, ChannelId, Command, Frame, Interpolator, TempoMode
 use starplayer::dsp::{GainRamp, Interpolate, Linear, Nearest};
 use starplayer::engine::{
     Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode, OutputDepth,
-    PatternSequencer, RENDER_QUANTUM, ScanLimits, SongTimeline, scan_timeline,
+    PatternSequencer, RENDER_QUANTUM, ScanLimits, SongTimeline,
 };
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
@@ -47,6 +47,7 @@ use starplayer::mtm::{MtmPatternData, MtmProcessor};
 use starplayer::rt::Arc;
 use starplayer::s3m::{S3mPatternData, S3mProcessor};
 use starplayer::telemetry::{SongEnd, Snapshot, TelemetryReader};
+use starplayer::ScannedSong;
 
 pub use command::COMMAND_RING_CAPACITY;
 
@@ -104,7 +105,7 @@ struct BuiltSource {
     source: Box<dyn EventSource>,
     seek_request: Rc<Cell<SeekRequest>>,
     at_end: Rc<Cell<AtEnd>>,
-    timeline: Rc<SongTimeline>,
+    scanned: Rc<ScannedSong>,
 }
 
 const DITHER_SEED: u32 = 0x5354_4152;
@@ -369,16 +370,9 @@ fn quantize_fixed_sample(value: i32, depth: OutputDepth, dither: &mut Dither) ->
 ///
 /// Runs in the worklet's message task, never in `process()` — like module decoding, which
 /// is the other thing here that allocates and takes milliseconds.
-fn scan_for(module: &Arc<Module>, sample_rate_hz: u32) -> Result<SongTimeline, String> {
-    let quirks = QuirkSelection::FromDialect;
-    let limits = ScanLimits::for_rate(sample_rate_hz);
-    let module = Arc::clone(module);
-    Ok(match module.header().format {
-        ModuleFormat::S3m => scan_timeline(&mut starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
-        ModuleFormat::Mod => scan_timeline(&mut starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
-        ModuleFormat::Mtm => scan_timeline(&mut starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
-        _ => return Err(String::from("the module format has no web-audio processor")),
-    })
+fn scan_for(module: &Arc<Module>, sample_rate_hz: u32) -> Result<ScannedSong, String> {
+    starplayer::scan_song(module, sample_rate_hz, ScanLimits::for_rate(sample_rate_hz))
+        .map_err(|_| String::from("the module format has no web-audio processor"))
 }
 
 /// Build the playback source, scanning the song first unless the caller already has the
@@ -390,21 +384,24 @@ fn source_for(
     start: SeekKind,
     frame: Frame,
     at_end: AtEnd,
-    cached_timeline: Option<Rc<SongTimeline>>,
+    cached_scan: Option<Rc<ScannedSong>>,
 ) -> Result<BuiltSource, String> {
-    let timeline = match cached_timeline {
-        Some(timeline) => timeline,
+    let scanned = match cached_scan {
+        Some(scanned) => scanned,
         None => Rc::new(scan_for(&module, sample_rate_hz)?),
     };
-    // The file's own dialect decides the quirks; the web player exposes no override yet.
-    let quirks = QuirkSelection::FromDialect;
+    // The scan decides the quirks — for a MOD it is the scan, not the header, that settles
+    // CIA against VBlank — and the playback sequencer must be built from exactly the set
+    // the timeline was measured under. The web player still exposes no override of its
+    // own: this override comes from the scan, not from the UI.
+    let quirks = QuirkSelection::Override(scanned.quirks);
     let mut sequencer = match module.header().format {
         ModuleFormat::S3m => NativeSequencer::S3m(starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks)),
         ModuleFormat::Mod => NativeSequencer::Mod(starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks)),
         ModuleFormat::Mtm => NativeSequencer::Mtm(starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks)),
         _ => return Err(String::from("the module format has no web-audio processor")),
     };
-    sequencer.set_timeline((*timeline).clone());
+    sequencer.set_timeline(scanned.timeline.clone());
     sequencer.set_at_end(at_end);
     match start {
         SeekKind::Frame(song_frame) => sequencer.seek_frame(song_frame, frame),
@@ -421,7 +418,7 @@ fn source_for(
         at_end: Rc::clone(&at_end_cell),
         applied_at_end: at_end,
     };
-    Ok(BuiltSource { source: Box::new(source), seek_request: request, at_end: at_end_cell, timeline })
+    Ok(BuiltSource { source: Box::new(source), seek_request: request, at_end: at_end_cell, scanned })
 }
 
 struct Host {
@@ -448,8 +445,11 @@ struct Host {
     /// silence, which is what shipped first.
     fade_elapsed: u32,
     current_module: Option<Arc<Module>>,
-    /// The scan for `current_module` at this rate, kept so a mixer-mode rebuild reuses it.
-    song_timeline: Option<Rc<SongTimeline>>,
+    /// The scan for `current_module` at this rate — timeline *and* the quirks it was
+    /// measured under — kept so a mixer-mode rebuild reuses it. The quirks have to ride
+    /// along: rebuilding a MOD's sequencer from the header dialect alone would lose the
+    /// scan's CIA-versus-VBlank verdict and play the song at a different speed.
+    song_scan: Option<Rc<ScannedSong>>,
     active_mode: MixerMode,
     float_interleaved: Vec<f32>,
     fixed_interleaved: Vec<i16>,
@@ -492,7 +492,7 @@ impl Host {
             fading: false,
             fade_elapsed: 0,
             current_module: None,
-            song_timeline: None,
+            song_scan: None,
             active_mode,
             float_interleaved: vec![0.0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
             fixed_interleaved: vec![0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
@@ -535,7 +535,7 @@ impl Host {
         self.engine.set_source(built.source);
         self.seek_request = Some(built.seek_request);
         self.at_end = built.at_end;
-        self.song_timeline = Some(built.timeline);
+        self.song_scan = Some(built.scanned);
         self.fading = false;
         self.current_module = Some(module);
         self.module_generation = self.module_generation.wrapping_add(1).max(1);
@@ -557,7 +557,7 @@ impl Host {
         let snapshot = *self.telemetry.read();
         // The sounding *song frame*, not just the order: a rebuild in the middle of a bar
         // should come back where the ear left it, and the timeline can say where that is.
-        let sounding = match self.song_timeline.as_ref() {
+        let sounding = match self.song_scan.as_ref() {
             Some(_) => SeekKind::Frame(snapshot.transport.song_frame),
             None => SeekKind::Order(snapshot.transport.order),
         };
@@ -574,13 +574,13 @@ impl Host {
                 sounding,
                 engine.source_frame(),
                 self.at_end.get(),
-                self.song_timeline.clone(),
+                self.song_scan.clone(),
             )?;
             control.load_module(Arc::clone(module)).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
             engine.set_source(built.source);
             seek_request = Some(built.seek_request);
             at_end_cell = built.at_end;
-            self.song_timeline = Some(built.timeline);
+            self.song_scan = Some(built.scanned);
         }
         control.send(Command::SetMasterVolume(master_volume)).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
         for (channel_index, channel) in snapshot.channels.iter().enumerate() {
@@ -1240,7 +1240,8 @@ mod tests {
     fn a_loaded_module_is_scanned_and_its_length_reaches_the_telemetry() {
         let mut host = Host::new(48_000);
         assert!(host.load_module(FIXTURE).is_ok());
-        let timeline = Rc::clone(host.song_timeline.as_ref().expect("activation scans the module"));
+        let scanned = Rc::clone(host.song_scan.as_ref().expect("activation scans the module"));
+        let timeline = &scanned.timeline;
         assert!(timeline.end_frame() > 48_000, "REFLEX is longer than a second");
         assert!(matches!(timeline.end(), starplayer::engine::EndReason::Looped { .. }), "REFLEX loops");
 
@@ -1256,7 +1257,8 @@ mod tests {
         assert!(host.load_module(FIXTURE).is_ok());
         for _ in 0..10 { host.process(RENDER_QUANTUM); }
 
-        let timeline = Rc::clone(host.song_timeline.as_ref().expect("the module was scanned"));
+        let scanned = Rc::clone(host.song_scan.as_ref().expect("the module was scanned"));
+        let timeline = &scanned.timeline;
         let target = timeline.end_frame() / 2;
         let expected = *timeline.mark_at_frame(target).expect("a frame inside the song resolves");
         assert!(host.enqueue(WireCommand { opcode: OPCODE_SEEK_FRAME, argument: target as u32, extra: 0 }));
@@ -1298,7 +1300,7 @@ mod tests {
         let module = minimal_mod();
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
-        let end_frame = host.song_timeline.as_ref().expect("the module was scanned").end_frame();
+        let end_frame = host.song_scan.as_ref().expect("the module was scanned").timeline.end_frame();
         assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
         assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
 
@@ -1324,7 +1326,7 @@ mod tests {
         let module = minimal_mod();
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
-        let end_frame = host.song_timeline.as_ref().expect("the module was scanned").end_frame();
+        let end_frame = host.song_scan.as_ref().expect("the module was scanned").timeline.end_frame();
         assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
         let budget = end_frame as usize / RENDER_QUANTUM + 200;
 
@@ -1373,7 +1375,7 @@ mod tests {
         let module = minimal_mod();
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
-        let end_frame = host.song_timeline.as_ref().expect("the module was scanned").end_frame();
+        let end_frame = host.song_scan.as_ref().expect("the module was scanned").timeline.end_frame();
         let fade_frames: u32 = 48_000;
         assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: fade_frames }));
         assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
