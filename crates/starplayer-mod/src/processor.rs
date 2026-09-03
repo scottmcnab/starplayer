@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use starplayer_core::fixed::{bipolar_from_ratio, unit_from_ratio};
 use starplayer_core::quirks::{BreakParameter, ModTiming, PaulaClock, QuirkSelection, QuirkSet};
-use starplayer_core::{ChannelId, DirtyBits, Frame, I1F15, InstrumentId, Note, Step, TempoModel, TempoModelId, U0F16, VoiceParams};
+use starplayer_core::{ChannelId, DirtyBits, Frame, I1F15, InstrumentId, Note, Step, TempoModel, TempoModelId, U0F16, VoiceParams, Xorshift32};
 use starplayer_engine::{EndOfSongPolicy, OrderEntry, PatternData, PatternFlowState, PatternSequencer, RowRef, SequencerSettings, TickContext, TickOutcome, TrackerProcessor};
 #[cfg(feature = "trace")]
 use starplayer_engine::TraceChannelState;
@@ -201,7 +201,7 @@ pub struct ModProcessor {
     amiga_limits: bool,
     last_pattern: Option<u16>,
     row_pattern_break: bool,
-    waveform_random_state: u32,
+    waveform_random_state: Xorshift32,
     pending_tempo: Option<(u16, usize)>,
     semantics: EffectSemantics,
     /// The replay behaviour this module was loaded with. Resolved once, at construction,
@@ -249,7 +249,7 @@ impl ModProcessor {
             row_pattern_break: false,
             // Unlike libxmp's wall-clock seed, a fixed seed preserves StarPlayer's
             // byte-identical replay invariant while still implementing waveform 3.
-            waveform_random_state: WAVEFORM_RANDOM_SEED,
+            waveform_random_state: Xorshift32::new(WAVEFORM_RANDOM_SEED),
             pending_tempo: None,
             semantics,
             quirks,
@@ -731,12 +731,7 @@ impl ModProcessor {
 
     fn waveform_value(&mut self, selector: u8, phase: u8) -> i16 {
         if selector & 3 == 3 {
-            let mut random = self.waveform_random_state;
-            if random == 0 { random = 1; }
-            random ^= random << 13;
-            random ^= random >> 17;
-            random ^= random << 5;
-            self.waveform_random_state = random;
+            let random = self.waveform_random_state.next_u32();
             return ((random >> 23) as i16 & 511) - 256;
         }
         waveform_value(selector, phase)
@@ -911,7 +906,7 @@ impl TrackerProcessor for ModProcessor {
         self.last_pattern = None;
         self.row_pattern_break = false;
         self.flow.reset();
-        self.waveform_random_state = WAVEFORM_RANDOM_SEED;
+        self.waveform_random_state = Xorshift32::new(WAVEFORM_RANDOM_SEED);
         self.pending_tempo = None;
     }
 

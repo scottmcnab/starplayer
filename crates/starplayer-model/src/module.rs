@@ -155,14 +155,18 @@ impl Module {
     ///
     /// The list is the fuzz-resistance contract:
     ///
-    /// 1. the header names at least one channel, and its pan table is either empty or
-    ///    exactly `channel_count` long;
+    /// 1. the header names at least one channel, and its pan table and its
+    ///    `default_channel_volume` table are each either empty or exactly
+    ///    `channel_count` long;
     /// 2. every sample's frames *and* its guard frames fit inside `pcm`;
-    /// 3. a looping sample has `loop_start < loop_end <= length_frames`, and a forward
-    ///    loop's `length_frames` equals its `loop_end` — the guard-frame layout;
+    /// 3. a looping sample has `loop_start < loop_end <= length_frames`; with no sustain
+    ///    loop, a forward or ping-pong sample's `length_frames` equals its `loop_end` — the
+    ///    guard-frame layout; a sustain loop has `start < end <= length_frames`, a looping
+    ///    mode, and `length_frames >= max(loop_end, sustain_end)`;
     /// 4. every pattern's `blob_offset + length_bytes` fits inside `blob`, and it has at
     ///    least one row and one channel;
-    /// 5. every instrument's sample reference names a sample that exists;
+    /// 5. every instrument's sample reference names a sample that exists, and every
+    ///    non-zero entry of its `note_sample_map` names a sample that exists;
     /// 6. every order names a pattern that exists, or is [`ORDER_MARKER`] /
     ///    [`ORDER_END`].
     pub(crate) fn validate(&self) -> Result<(), Error> {
@@ -172,6 +176,10 @@ impl Module {
         let pan_length = self.header.default_pan.len();
         if pan_length != 0 && pan_length != self.header.channel_count as usize {
             return Err(Error::Invalid("default_pan must be empty or one entry per channel"));
+        }
+        let channel_volume_length = self.header.default_channel_volume.len();
+        if channel_volume_length != 0 && channel_volume_length != self.header.channel_count as usize {
+            return Err(Error::Invalid("default_channel_volume must be empty or one entry per channel"));
         }
 
         for sample in self.samples.iter() {
@@ -185,6 +193,11 @@ impl Module {
                 && (sample as usize) >= self.samples.len()
             {
                 return Err(Error::OutOfRange);
+            }
+            for &mapped_sample in instrument.note_sample_map.iter() {
+                if mapped_sample != 0 && (mapped_sample - 1) as usize >= self.samples.len() {
+                    return Err(Error::OutOfRange);
+                }
             }
         }
         for order in self.orders.iter() {
@@ -212,8 +225,28 @@ fn validate_sample(sample: &SampleIndex, pcm_length: usize) -> Result<(), Error>
             return Err(Error::Invalid("loop_end is past the end of the sample"));
         }
     }
-    if sample.loop_mode() == LoopMode::Forward && sample.loop_end() != sample.length_frames() {
-        return Err(Error::Invalid("a forward loop stores exactly loop_end frames, so the guard frames can hold the loop"));
+    match sample.sustain_loop() {
+        Some(sustain) => {
+            if !sustain.mode.is_looping() {
+                return Err(Error::Invalid("a sustain loop needs a looping mode"));
+            }
+            if sustain.start >= sustain.end {
+                return Err(Error::Invalid("a sustain loop needs start < end"));
+            }
+            if sustain.end > sample.length_frames() {
+                return Err(Error::Invalid("a sustain loop's end is past the end of the sample"));
+            }
+            if sample.length_frames() < sample.loop_end().max(sustain.end) {
+                return Err(Error::Invalid("a sample with a sustain loop must store at least max(loop_end, sustain_end) frames"));
+            }
+        }
+        // With no sustain loop, a forward or ping-pong loop stores exactly `loop_end`
+        // frames: the tail after it is never audible, and the guard frames hold the
+        // wrapped or reflected continuation instead.
+        None if matches!(sample.loop_mode(), LoopMode::Forward | LoopMode::PingPong) && sample.loop_end() != sample.length_frames() => {
+            return Err(Error::Invalid("a forward or ping-pong loop with no sustain loop stores exactly loop_end frames, so the guard frames can hold the loop"));
+        }
+        None => {}
     }
     if sample.length_frames() == 0 && sample.loop_mode().is_looping() {
         return Err(Error::Invalid("an empty sample cannot loop"));

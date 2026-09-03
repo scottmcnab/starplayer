@@ -44,21 +44,34 @@ impl ModuleBuilder {
     /// Exactly what `starplayer_mixer::sample::SampleData::resolve` expects, which is why
     /// this is the only supported way to build the blob:
     ///
-    /// * **[`LoopMode::Forward`]** — frames `0 .. loop_end` are stored and the tail after
-    ///   the loop end is discarded, because a forward loop never plays it. The
-    ///   [`GUARD_FRAMES`] that follow repeat the loop from `loop_start`, wrapping as many
-    ///   times as a loop shorter than the guard needs.
-    /// * **[`LoopMode::None`] and [`LoopMode::PingPong`]** — the whole sample is stored
-    ///   and the guard frames are silence, so a kernel interpolating over the final frame
-    ///   decays to zero rather than clicking. A ping-pong loop reads *backwards* out of
-    ///   its loop end, so it needs a reflected lookahead rather than a wrapped one; that
-    ///   arrives with the bidirectional kernel in M6.
+    /// * **[`LoopMode::Forward`], no sustain loop** — frames `0 .. loop_end` are stored
+    ///   and the tail after the loop end is discarded, because a forward loop never plays
+    ///   it. The [`GUARD_FRAMES`] that follow repeat the loop from `loop_start`, wrapping
+    ///   as many times as a loop shorter than the guard needs.
+    /// * **[`LoopMode::PingPong`], no sustain loop** — frames `0 .. loop_end` are stored,
+    ///   same as a forward loop, and the guard frames hold the **reflected** continuation
+    ///   — `pcm[loop_end - 2], pcm[loop_end - 3], …` — computed with the same arithmetic
+    ///   `starplayer_mixer::sample::LoopSpan::ping_pong_frame` uses to read them back, so
+    ///   the two agree frame for frame.
+    /// * **[`LoopMode::None`], no sustain loop** — the whole sample is stored and the
+    ///   guard frames are silence, so a kernel interpolating over the final frame decays
+    ///   to zero rather than clicking.
+    /// * **any sample with a sustain loop**, regardless of `loop_mode` — the whole sample
+    ///   is stored, because the normal loop and the sustain loop may each lie anywhere
+    ///   inside it, and the guard frames are silence. Playback swaps the voice's sample
+    ///   region between the sustain-loop region and the normal region on key-off; neither
+    ///   region's loop end need sit at the stored length any more, so the guard cannot be
+    ///   a loop continuation. One frame of `Linear` interpolation therefore reads real PCM
+    ///   past a loop end here instead of the wrapped or reflected copy — accepted for now,
+    ///   left for M7's kernels to reconsider.
     ///
     /// # Errors
     ///
-    /// * [`Error::Invalid`] — a looping sample with `loop_start >= loop_end`, or a zero
-    ///   `reference_rate_hz` (which would make the resample step meaningless).
-    /// * [`Error::OutOfRange`] — `loop_end` past the end of `pcm`.
+    /// * [`Error::Invalid`] — a looping sample with `loop_start >= loop_end`; a sustain
+    ///   loop with `start >= end` or a non-looping [`LoopMode`]; a zero `reference_rate_hz`
+    ///   (which would make the resample step meaningless).
+    /// * [`Error::OutOfRange`] — `loop_end`, or a sustain loop's `end`, past the end of
+    ///   `pcm`.
     /// * [`Error::TooLarge`] — more samples, or more frames, than `u16` ids and `u32`
     ///   offsets can address.
     pub fn add_sample(&mut self, pcm: &[i16], specification: SampleSpec) -> Result<SampleId, Error> {
@@ -79,10 +92,31 @@ impl ModuleBuilder {
             }
         }
 
-        // A forward loop keeps only `0 .. loop_end`; everything else keeps the lot.
-        let stored_frames = match specification.loop_mode {
-            LoopMode::Forward => specification.loop_end,
-            LoopMode::None | LoopMode::PingPong => source_frames,
+        let has_sustain_loop = if let Some(sustain) = specification.sustain_loop {
+            if !sustain.mode.is_looping() {
+                return Err(Error::Invalid("a sustain loop needs a looping mode"));
+            }
+            if sustain.start >= sustain.end {
+                return Err(Error::Invalid("a sustain loop needs start < end"));
+            }
+            if sustain.end > source_frames {
+                return Err(Error::OutOfRange);
+            }
+            true
+        } else {
+            false
+        };
+
+        // A forward or ping-pong loop with no sustain loop keeps only `0 .. loop_end`; a
+        // sustain loop needs the whole sample, because neither loop's end has to sit at
+        // the stored length any more; a one-shot keeps the lot too.
+        let stored_frames = if has_sustain_loop {
+            source_frames
+        } else {
+            match specification.loop_mode {
+                LoopMode::Forward | LoopMode::PingPong => specification.loop_end,
+                LoopMode::None => source_frames,
+            }
         };
 
         let pcm_offset = u32::try_from(self.pcm.len()).map_err(|_| Error::TooLarge("module PCM larger than 4 GFrames"))?;
@@ -92,15 +126,22 @@ impl ModuleBuilder {
 
         let body = pcm.get(..stored_frames as usize).ok_or(Error::OutOfRange)?;
         self.pcm.extend_from_slice(body);
-        match specification.loop_mode {
-            LoopMode::Forward => {
+        match (has_sustain_loop, specification.loop_mode) {
+            (true, _) => self.pcm.extend(core::iter::repeat_n(0, GUARD_FRAMES)),
+            (false, LoopMode::Forward) => {
                 let loop_length = specification.loop_end - specification.loop_start;
                 for guard_index in 0..GUARD_FRAMES {
                     let wrapped = specification.loop_start as usize + guard_index % loop_length as usize;
                     self.pcm.push(pcm.get(wrapped).copied().unwrap_or(0));
                 }
             }
-            LoopMode::None | LoopMode::PingPong => self.pcm.extend(core::iter::repeat_n(0, GUARD_FRAMES)),
+            (false, LoopMode::PingPong) => {
+                for guard_index in 0..GUARD_FRAMES as u32 {
+                    let source = ping_pong_reflect(specification.loop_start, specification.loop_end, specification.loop_end + guard_index);
+                    self.pcm.push(pcm.get(source as usize).copied().unwrap_or(0));
+                }
+            }
+            (false, LoopMode::None) => self.pcm.extend(core::iter::repeat_n(0, GUARD_FRAMES)),
         }
 
         self.samples.push(SampleIndex::new(pcm_offset, stored_frames, specification));
@@ -160,13 +201,16 @@ impl ModuleBuilder {
     /// # Errors
     ///
     /// * [`Error::Invalid`] — no header was set; the header names zero channels; its pan
-    ///   table is neither empty nor one entry per channel; a looping sample has
-    ///   `loop_start >= loop_end` or a `loop_end` past its stored length; a forward loop's
-    ///   stored length is not its `loop_end`; a pattern has no rows or no channels.
+    ///   table, or its `default_channel_volume` table, is neither empty nor one entry per
+    ///   channel; a looping sample has `loop_start >= loop_end` or a `loop_end` past its
+    ///   stored length; a forward or ping-pong loop with no sustain loop stores anything
+    ///   other than `max(loop_end, sustain_end)` frames; a pattern has no rows or no
+    ///   channels.
     /// * [`Error::OutOfRange`] — a sample's frames or guard frames fall outside `pcm`; a
     ///   pattern's bytes fall outside `blob`; an instrument names a sample that does not
-    ///   exist; an order names a pattern that does not exist and is neither
-    ///   [`ORDER_MARKER`](crate::ORDER_MARKER) nor [`ORDER_END`](crate::ORDER_END).
+    ///   exist, or has a `note_sample_map` entry that does; an order names a pattern that
+    ///   does not exist and is neither [`ORDER_MARKER`](crate::ORDER_MARKER) nor
+    ///   [`ORDER_END`](crate::ORDER_END).
     pub fn build(self) -> Result<Module, Error> {
         let header = self.header.ok_or(Error::Invalid("no module header was set"))?;
         let module = Module::from_parts(
@@ -196,12 +240,29 @@ impl ModuleBuilder {
     pub(crate) fn replace_patterns_for_test(&mut self, patterns: Vec<PatternIndex>) { self.patterns = patterns; }
 }
 
+/// The source frame a ping-pong loop over `start .. end` reads at `position` — which may
+/// be at or past `end`, as the guard frames in [`ModuleBuilder::add_sample`] ask for —
+/// reflecting exactly the way `starplayer_mixer::sample::LoopSpan::ping_pong_frame` does.
+/// Reproduced here, rather than called there, because `starplayer-model` does not depend
+/// on `starplayer-mixer`; `tests::a_ping_pong_guard_matches_the_mixers_own_arithmetic`
+/// below is the proof the two agree.
+const fn ping_pong_reflect(start: u32, end: u32, position: u32) -> u32 {
+    let length = end - start;
+    if length <= 1 {
+        return start;
+    }
+    let period = 2 * (length - 1);
+    let phase = (position - start) % period;
+    if phase < length { start + phase } else { start + (period - phase) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::header::{ModuleFormat, ModuleHeader};
     use crate::module::{ORDER_END, ORDER_MARKER, OrderEntry};
     use crate::pattern::PatternId;
+    use crate::sample::SustainLoop;
     use alloc::vec;
     use starplayer_core::U0F16;
 
@@ -293,15 +354,117 @@ mod tests {
     }
 
     #[test]
-    fn a_ping_pong_sample_keeps_its_whole_body_and_a_silent_guard_until_m6() {
+    fn a_ping_pong_sample_with_no_sustain_loop_stores_loop_end_frames_and_a_reflected_guard() {
         let mut builder = ModuleBuilder::new();
         let specification = SampleSpec { loop_mode: LoopMode::PingPong, loop_start: 1, loop_end: 3, ..SampleSpec::one_shot("bounce") };
         let id = builder.add_sample(&[1, 2, 3, 4], specification).expect("a valid ping-pong sample");
         builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
         let module = builder.build().expect("a valid module");
 
-        assert_eq!(module.sample(id).map(SampleIndex::length_frames), Some(4), "a backwards pass reads past loop_end");
-        assert_eq!(module.pcm(), &[1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(module.sample(id).map(SampleIndex::length_frames), Some(3), "same rule as a forward loop: the tail after loop_end is never audible");
+        // start=1, end=3: the reflection turns on frames 1 and 2, so the guard mirrors
+        // pcm[1], pcm[2] forever — the same pattern
+        // `a_ping_pong_guard_matches_the_mixers_own_arithmetic` derives independently.
+        assert_eq!(module.pcm(), &[1, 2, 3, /* guard: */ 2, 3, 2, 3, 2, 3, 2, 3]);
+    }
+
+    #[test]
+    fn a_ping_pong_guard_matches_the_mixers_own_arithmetic() {
+        // The same fixture built two ways: once through `ModuleBuilder::add_sample`, and
+        // once through the mixer's own `append_guarded_sample`, which is the contract the
+        // builder has to honour. Task E1 research point 4.
+        let pcm: [i16; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+        let mut builder = ModuleBuilder::new();
+        let specification = SampleSpec { loop_mode: LoopMode::PingPong, loop_start: 4, loop_end: 8, ..SampleSpec::one_shot("bounce") };
+        builder.add_sample(&pcm, specification).expect("a valid ping-pong sample");
+        builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
+        let module = builder.build().expect("a valid module");
+
+        let mut mixer_blob = alloc::vec::Vec::new();
+        let mixer_span = starplayer_mixer::LoopSpan::ping_pong(4, 8).expect("a valid span");
+        starplayer_mixer::sample::append_guarded_sample(&mut mixer_blob, &pcm, Some(mixer_span));
+
+        assert_eq!(module.pcm(), mixer_blob.as_slice(), "the model's guard and the mixer's own guard must agree frame for frame");
+    }
+
+    #[test]
+    fn a_sustain_loop_past_the_normal_loop_stores_the_whole_sample_and_validates() {
+        let mut builder = ModuleBuilder::new();
+        let specification = SampleSpec {
+            loop_mode: LoopMode::Forward,
+            loop_start: 0,
+            loop_end: 4,
+            sustain_loop: Some(SustainLoop { mode: LoopMode::Forward, start: 4, end: 8 }),
+            ..SampleSpec::one_shot("sustained")
+        };
+        let id = builder.add_sample(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], specification).expect("a valid sustain-looping sample");
+        builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
+        let module = builder.build().expect("a sustain loop past the normal loop still validates");
+
+        let sample = module.sample(id).expect("the sample exists");
+        assert_eq!(sample.length_frames(), 10, "the sustain loop's end sits past loop_end, so the whole sample is stored");
+        assert_eq!(sample.sustain_loop(), Some(SustainLoop { mode: LoopMode::Forward, start: 4, end: 8 }));
+        assert_eq!(module.pcm(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, /* guard: */ 0, 0, 0, 0, 0, 0, 0, 0], "a sustain loop's guard is silence");
+    }
+
+    #[test]
+    fn add_sample_rejects_a_sustain_loop_with_start_at_or_after_end() {
+        let mut builder = ModuleBuilder::new();
+        let specification = SampleSpec { sustain_loop: Some(SustainLoop { mode: LoopMode::Forward, start: 4, end: 4 }), ..SampleSpec::one_shot("bad") };
+        assert_eq!(builder.add_sample(&[0, 1, 2, 3, 4], specification), Err(Error::Invalid("a sustain loop needs start < end")));
+    }
+
+    #[test]
+    fn add_sample_rejects_a_sustain_loop_with_a_non_looping_mode() {
+        let mut builder = ModuleBuilder::new();
+        let specification = SampleSpec { sustain_loop: Some(SustainLoop { mode: LoopMode::None, start: 0, end: 4 }), ..SampleSpec::one_shot("bad") };
+        assert_eq!(builder.add_sample(&[0, 1, 2, 3, 4], specification), Err(Error::Invalid("a sustain loop needs a looping mode")));
+    }
+
+    #[test]
+    fn add_sample_rejects_a_sustain_loop_past_the_end_of_the_sample() {
+        let mut builder = ModuleBuilder::new();
+        let specification = SampleSpec { sustain_loop: Some(SustainLoop { mode: LoopMode::Forward, start: 0, end: 99 }), ..SampleSpec::one_shot("bad") };
+        assert_eq!(builder.add_sample(&[0, 1, 2, 3, 4], specification), Err(Error::OutOfRange));
+    }
+
+    #[test]
+    fn build_rejects_a_dangling_note_sample_map_entry() {
+        let mut builder = populated_builder();
+        let mut instrument = InstrumentDef::from_sample("ghost", SampleId(0), U0F16::MAX);
+        instrument.note_sample_map[0] = 99;
+        builder.add_instrument(instrument).expect("added");
+        assert_eq!(builder.build().map(|_| ()), Err(Error::OutOfRange), "sample 98 (one-based 99) does not exist");
+    }
+
+    #[test]
+    fn build_accepts_a_zero_note_sample_map_entry_as_no_sample() {
+        let mut builder = populated_builder();
+        let instrument = InstrumentDef::from_sample("no-op", SampleId(0), U0F16::MAX);
+        assert_eq!(instrument.note_sample_map[0], 0, "the default map is all zero");
+        builder.add_instrument(instrument).expect("added");
+        assert!(builder.build().is_ok(), "an all-zero note_sample_map names no sample anywhere");
+    }
+
+    #[test]
+    fn build_rejects_a_default_channel_volume_table_of_the_wrong_length() {
+        let mut builder = populated_builder();
+        let mut header = ModuleHeader::new(ModuleFormat::S3m, 4);
+        header.default_channel_volume = vec![U0F16::MAX; 2].into_boxed_slice();
+        builder.set_header(header);
+        assert_eq!(builder.build().map(|_| ()), Err(Error::Invalid("default_channel_volume must be empty or one entry per channel")));
+    }
+
+    #[test]
+    fn build_accepts_an_empty_or_fully_populated_default_channel_volume_table() {
+        let mut builder = populated_builder();
+        let mut header = ModuleHeader::new(ModuleFormat::S3m, 4);
+        header.default_channel_volume = vec![U0F16::MAX; 4].into_boxed_slice();
+        builder.set_header(header);
+        let module = builder.build().expect("a full-length table is valid");
+        assert_eq!(module.header().channel_volume(0), Some(U0F16::MAX));
+        assert_eq!(module.header().channel_volume(4), None, "past the end of the channels");
     }
 
     #[test]

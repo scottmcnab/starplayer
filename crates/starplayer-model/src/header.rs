@@ -88,6 +88,18 @@ pub struct ModuleHeader {
     /// Format-owned header bits. The format crate that produced the module is the only
     /// thing that may interpret this; the engine passes it through untouched.
     pub format_extra: u32,
+    /// Default volume per channel (IT's `ChnVol`).
+    ///
+    /// Either empty — meaning unity everywhere — or exactly `channel_count` long, the
+    /// same rule as [`default_pan`](ModuleHeader::default_pan). The builder rejects any
+    /// other length.
+    pub default_channel_volume: Box<[U0F16]>,
+    /// Format-owned bytes the engine never interprets and never even looks at the length
+    /// of: IT's MIDI macro configuration, channel surround/disabled flags, and whatever
+    /// else a format's processor needs that does not fit in
+    /// [`format_extra`](ModuleHeader::format_extra)'s 32 bits. Only the format crate that
+    /// produced the module may interpret this.
+    pub format_data: Box<[u8]>,
 }
 
 impl ModuleHeader {
@@ -106,6 +118,8 @@ impl ModuleHeader {
             flags: ModuleFlags::default(),
             dialect: FormatDialect::Unknown,
             format_extra: 0,
+            default_channel_volume: Box::default(),
+            format_data: Box::default(),
         }
     }
 
@@ -126,6 +140,20 @@ impl ModuleHeader {
         match self.default_pan.is_empty() {
             true => Some(I1F15::ZERO),
             false => self.default_pan.get(channel as usize).copied(),
+        }
+    }
+
+    /// Default volume for one channel, `None` past the end of the song's channels.
+    ///
+    /// An empty [`default_channel_volume`](ModuleHeader::default_channel_volume) means
+    /// every channel is at unity, so this answers [`U0F16::MAX`] for any channel in range.
+    pub fn channel_volume(&self, channel: u8) -> Option<U0F16> {
+        if channel >= self.channel_count {
+            return None;
+        }
+        match self.default_channel_volume.is_empty() {
+            true => Some(U0F16::MAX),
+            false => self.default_channel_volume.get(channel as usize).copied(),
         }
     }
 }

@@ -71,6 +71,16 @@
 //! **`GUARD_FRAMES` lives in `starplayer-core`** for the same reason: this crate *writes*
 //! the guard frames and `starplayer-mixer` *reads* them, and there is no dependency edge
 //! between the two. `starplayer-mixer` re-exports it.
+//!
+//! # Sample sustain loops
+//!
+//! IT's [`SustainLoop`](sample::SustainLoop) is a second loop, played instead of the
+//! sample's ordinary loop until the note is released. Whenever a sample declares one,
+//! [`ModuleBuilder::add_sample`] stores the sample's **whole** body rather than truncating
+//! it at a loop end — the ordinary loop and the sustain loop may each lie anywhere inside
+//! it — and fills the guard with silence rather than a wrapped or reflected continuation,
+//! because neither loop's end has to sit at the stored length any more. This is task E1;
+//! nothing plays a sustain loop yet, and no format loader produces one before G1 (IT).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -98,7 +108,10 @@ pub use pattern::{
     EffectCell, EffectNames, NoteCell, PatternCell, PatternId, PatternIndex, s3m_command_code,
 };
 pub use reader::ModuleReader;
-pub use sample::{DEFAULT_REFERENCE_RATE_HZ, LoopMode, SampleIndex, SampleSpec};
+pub use sample::{
+    AutoVibrato, AutoVibratoWaveform, DEFAULT_REFERENCE_RATE_HZ, LoopMode, SampleIndex,
+    SampleSpec, SustainLoop,
+};
 pub use text::{cp437_char, decode_cp437};
 
 // Re-exported so a format crate can name every type it needs from this one crate.

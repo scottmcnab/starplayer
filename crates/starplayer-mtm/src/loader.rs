@@ -131,6 +131,7 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
             default_volume: unit_from_ratio(volume as u32, 64),
             // MultiTracker uses the same signed-nibble C2SPD table as MOD, not S3M's S2x table.
             reference_rate_hz: FINETUNE_REFERENCE_RATES[finetune as usize],
+            ..SampleSpec::default()
         };
         let sample = builder.add_sample(&pcm, specification)?;
         builder.add_instrument(InstrumentDef::from_sample(&name, sample, U0F16::MAX))?;
@@ -165,6 +166,8 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
         // hexadecimal, `F00` is a no-op and there is no queued sample swap.
         dialect: starplayer_core::quirks::FormatDialect::MultiTracker,
         format_extra,
+        default_channel_volume: Vec::new().into_boxed_slice(),
+        format_data: Vec::new().into_boxed_slice(),
     });
     builder.build()
 }
