@@ -34,16 +34,19 @@ use std::vec::Vec;
 
 use command::{CommandRing, WireCommand};
 use starplayer::core::quirks::QuirkSelection;
-use starplayer::core::{ChannelId, Command, Frame, Interpolator, TempoModelId, U0F16};
+use starplayer::core::{AtEnd, ChannelId, Command, Frame, Interpolator, TempoModelId, U0F16};
 use starplayer::dsp::{GainRamp, Interpolate, Linear, Nearest};
-use starplayer::engine::{Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode, OutputDepth, PatternSequencer, RENDER_QUANTUM};
+use starplayer::engine::{
+    Engine, EngineContext, EngineHandle, EngineSettings, EventSource, MixPathKind, MixerMode, OutputDepth,
+    PatternSequencer, RENDER_QUANTUM, ScanLimits, SongTimeline, scan_timeline,
+};
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, HostSample, I24, MixPath, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::mod_file::{ModPatternData, ModProcessor};
 use starplayer::mtm::{MtmPatternData, MtmProcessor};
 use starplayer::rt::Arc;
 use starplayer::s3m::{S3mPatternData, S3mProcessor};
-use starplayer::telemetry::{Snapshot, TelemetryReader};
+use starplayer::telemetry::{SongEnd, Snapshot, TelemetryReader};
 
 pub use command::COMMAND_RING_CAPACITY;
 
@@ -69,9 +72,22 @@ const OPCODE_SEEK_ROW: u8 = 4;
 const OPCODE_MASTER_VOLUME: u8 = 5;
 const OPCODE_MUTE_CHANNEL: u8 = 6;
 const OPCODE_SET_MIXER_MODE: u8 = 7;
+/// Seek to an elapsed position in the song. `argument` is a song frame.
+const OPCODE_SEEK_FRAME: u8 = 8;
+/// What to do at the detected loop point: `argument` 0 fade out, 1 continue, 2 stop;
+/// `extra` is the fade length in frames.
+const OPCODE_AT_END: u8 = 9;
+
+/// Wire spelling of [`AtEnd`], chosen so the page's default repeat-off value is zero.
+const AT_END_FADE_OUT: u32 = 0;
+const AT_END_CONTINUE: u32 = 1;
+const AT_END_STOP: u32 = 2;
+
+/// Fade length used when the page asks for one without naming a length.
+const DEFAULT_FADE_FRAMES: u32 = 10 * 48_000;
 
 /// Layout exported to the worklet, then copied coherently to the SAB telemetry block.
-const TELEMETRY_HEADER_WORDS: usize = 19;
+const TELEMETRY_HEADER_WORDS: usize = 22;
 const TELEMETRY_CHANNEL_WORDS: usize = 8;
 const TELEMETRY_CHANNELS: usize = 64;
 const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
@@ -82,7 +98,14 @@ const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TEL
 type S3mSequencer = PatternSequencer<TempoModelId, S3mProcessor, S3mPatternData>;
 type ModSequencer = PatternSequencer<TempoModelId, ModProcessor, ModPatternData>;
 type MtmSequencer = PatternSequencer<TempoModelId, MtmProcessor, MtmPatternData>;
-type BuiltSource = (Box<dyn EventSource>, Rc<Cell<SeekRequest>>);
+/// Everything module activation hands back: the source the engine plays, the two cells the
+/// host writes transport requests into, and the scan the source is playing against.
+struct BuiltSource {
+    source: Box<dyn EventSource>,
+    seek_request: Rc<Cell<SeekRequest>>,
+    at_end: Rc<Cell<AtEnd>>,
+    timeline: Rc<SongTimeline>,
+}
 
 const DITHER_SEED: u32 = 0x5354_4152;
 
@@ -169,6 +192,8 @@ enum SeekKind {
     None,
     Order(u16),
     Row(u16),
+    /// An elapsed position in the song, in frames from the start of the current pass.
+    Frame(u64),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -208,14 +233,6 @@ impl NativeSequencer {
         }
     }
 
-    fn seek_order(&mut self, order: u16) {
-        match self {
-            NativeSequencer::S3m(sequencer) => { let _ = sequencer.seek_order(order); }
-            NativeSequencer::Mod(sequencer) => { let _ = sequencer.seek_order(order); }
-            NativeSequencer::Mtm(sequencer) => { let _ = sequencer.seek_order(order); }
-        }
-    }
-
     fn seek_row(&mut self, row: u16) {
         match self {
             NativeSequencer::S3m(sequencer) => sequencer.seek_row(row),
@@ -231,6 +248,38 @@ impl NativeSequencer {
             NativeSequencer::Mtm(sequencer) => sequencer.restart_clock_at(frame),
         }
     }
+
+    fn seek_order_at(&mut self, order: u16, now: Frame) {
+        match self {
+            NativeSequencer::S3m(sequencer) => { let _ = sequencer.seek_order_at(order, now); }
+            NativeSequencer::Mod(sequencer) => { let _ = sequencer.seek_order_at(order, now); }
+            NativeSequencer::Mtm(sequencer) => { let _ = sequencer.seek_order_at(order, now); }
+        }
+    }
+
+    fn seek_frame(&mut self, song_frame: u64, now: Frame) {
+        match self {
+            NativeSequencer::S3m(sequencer) => { let _ = sequencer.seek_frame(song_frame, now); }
+            NativeSequencer::Mod(sequencer) => { let _ = sequencer.seek_frame(song_frame, now); }
+            NativeSequencer::Mtm(sequencer) => { let _ = sequencer.seek_frame(song_frame, now); }
+        }
+    }
+
+    fn set_timeline(&mut self, timeline: SongTimeline) {
+        match self {
+            NativeSequencer::S3m(sequencer) => sequencer.set_timeline(timeline),
+            NativeSequencer::Mod(sequencer) => sequencer.set_timeline(timeline),
+            NativeSequencer::Mtm(sequencer) => sequencer.set_timeline(timeline),
+        }
+    }
+
+    fn set_at_end(&mut self, at_end: AtEnd) {
+        match self {
+            NativeSequencer::S3m(sequencer) => sequencer.set_at_end(at_end),
+            NativeSequencer::Mod(sequencer) => sequencer.set_at_end(at_end),
+            NativeSequencer::Mtm(sequencer) => sequencer.set_at_end(at_end),
+        }
+    }
 }
 
 /// A format-native tracker source with a host-owned seek mailbox.
@@ -243,6 +292,10 @@ impl NativeSequencer {
 struct SeekableModuleSource {
     sequencer: NativeSequencer,
     request: Rc<Cell<SeekRequest>>,
+    /// The host's repeat setting, read at each event boundary rather than written straight
+    /// into the sequencer: the page can change it while `process()` is between quanta.
+    at_end: Rc<Cell<AtEnd>>,
+    applied_at_end: AtEnd,
 }
 
 impl EventSource for SeekableModuleSource {
@@ -260,12 +313,18 @@ impl EventSource for SeekableModuleSource {
     fn advance_to(&mut self, frame: Frame) { self.sequencer.advance_to(frame); }
 
     fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        let at_end = self.at_end.get();
+        if at_end != self.applied_at_end {
+            self.sequencer.set_at_end(at_end);
+            self.applied_at_end = at_end;
+        }
         let request = self.request.get();
         if !matches!(request.kind, SeekKind::None) && frame >= request.frame {
             self.request.set(SeekRequest::default());
             match request.kind {
-                SeekKind::Order(order) => self.sequencer.seek_order(order),
+                SeekKind::Order(order) => self.sequencer.seek_order_at(order, frame),
                 SeekKind::Row(row) => self.sequencer.seek_row(row),
+                SeekKind::Frame(song_frame) => self.sequencer.seek_frame(song_frame, frame),
                 SeekKind::None => {}
             }
             self.sequencer.restart_clock_at(frame);
@@ -306,7 +365,37 @@ fn quantize_fixed_sample(value: i32, depth: OutputDepth, dither: &mut Dither) ->
     }
 }
 
-fn source_for(module: Arc<Module>, sample_rate_hz: u32, order: u16, frame: Frame) -> Result<BuiltSource, String> {
+/// Scan a module on a throwaway sequencer, so the playback one never has to be rewound.
+///
+/// Runs in the worklet's message task, never in `process()` — like module decoding, which
+/// is the other thing here that allocates and takes milliseconds.
+fn scan_for(module: &Arc<Module>, sample_rate_hz: u32) -> Result<SongTimeline, String> {
+    let quirks = QuirkSelection::FromDialect;
+    let limits = ScanLimits::for_rate(sample_rate_hz);
+    let module = Arc::clone(module);
+    Ok(match module.header().format {
+        ModuleFormat::S3m => scan_timeline(&mut starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
+        ModuleFormat::Mod => scan_timeline(&mut starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
+        ModuleFormat::Mtm => scan_timeline(&mut starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
+        _ => return Err(String::from("the module format has no web-audio processor")),
+    })
+}
+
+/// Build the playback source, scanning the song first unless the caller already has the
+/// scan — a mixer-mode rebuild does, because the timeline depends on the rate and the
+/// module's dialect and on nothing the mixer mode chooses.
+fn source_for(
+    module: Arc<Module>,
+    sample_rate_hz: u32,
+    start: SeekKind,
+    frame: Frame,
+    at_end: AtEnd,
+    cached_timeline: Option<Rc<SongTimeline>>,
+) -> Result<BuiltSource, String> {
+    let timeline = match cached_timeline {
+        Some(timeline) => timeline,
+        None => Rc::new(scan_for(&module, sample_rate_hz)?),
+    };
     // The file's own dialect decides the quirks; the web player exposes no override yet.
     let quirks = QuirkSelection::FromDialect;
     let mut sequencer = match module.header().format {
@@ -315,11 +404,24 @@ fn source_for(module: Arc<Module>, sample_rate_hz: u32, order: u16, frame: Frame
         ModuleFormat::Mtm => NativeSequencer::Mtm(starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks)),
         _ => return Err(String::from("the module format has no web-audio processor")),
     };
-    sequencer.seek_order(order);
+    sequencer.set_timeline((*timeline).clone());
+    sequencer.set_at_end(at_end);
+    match start {
+        SeekKind::Frame(song_frame) => sequencer.seek_frame(song_frame, frame),
+        SeekKind::Order(order) => sequencer.seek_order_at(order, frame),
+        SeekKind::Row(row) => sequencer.seek_row(row),
+        SeekKind::None => sequencer.seek_order_at(0, frame),
+    }
     sequencer.restart_clock_at(frame);
     let request = Rc::new(Cell::new(SeekRequest::default()));
-    let source = SeekableModuleSource { sequencer, request: Rc::clone(&request) };
-    Ok((Box::new(source), request))
+    let at_end_cell = Rc::new(Cell::new(at_end));
+    let source = SeekableModuleSource {
+        sequencer,
+        request: Rc::clone(&request),
+        at_end: Rc::clone(&at_end_cell),
+        applied_at_end: at_end,
+    };
+    Ok(BuiltSource { source: Box::new(source), seek_request: request, at_end: at_end_cell, timeline })
 }
 
 struct Host {
@@ -332,7 +434,16 @@ struct Host {
     telemetry: TelemetryReader,
     commands: CommandRing,
     seek_request: Option<Rc<Cell<SeekRequest>>>,
+    /// The repeat setting, shared with the live source so a change lands at the next event
+    /// boundary rather than inside a render.
+    at_end: Rc<Cell<AtEnd>>,
+    /// How long the transport fade lasts when the song reaches its loop point.
+    fade_frames: u32,
+    /// Whether that fade is running, so it is armed once rather than every quantum.
+    fading: bool,
     current_module: Option<Arc<Module>>,
+    /// The scan for `current_module` at this rate, kept so a mixer-mode rebuild reuses it.
+    song_timeline: Option<Rc<SongTimeline>>,
     active_mode: MixerMode,
     float_interleaved: Vec<f32>,
     fixed_interleaved: Vec<i16>,
@@ -370,7 +481,11 @@ impl Host {
             telemetry,
             commands: CommandRing::new(),
             seek_request: None,
+            at_end: Rc::new(Cell::new(AtEnd::Continue)),
+            fade_frames: DEFAULT_FADE_FRAMES,
+            fading: false,
             current_module: None,
+            song_timeline: None,
             active_mode,
             float_interleaved: vec![0.0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
             fixed_interleaved: vec![0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
@@ -407,11 +522,14 @@ impl Host {
         // tick of the new module is due thousands of frames in the past, and the engine
         // burns ticks trying to catch up until it gives up and raises
         // `zero_advance_forced`. Start the clock where the engine actually is.
-        let (source, request) = source_for(Arc::clone(&module), self.sample_rate_hz, 0, self.engine.source_frame())?;
+        let built = source_for(Arc::clone(&module), self.sample_rate_hz, SeekKind::None, self.engine.source_frame(), self.at_end.get(), None)?;
 
         self.control.load_module(Arc::clone(&module)).map_err(|_| String::from("the engine command ring is full"))?;
-        self.engine.set_source(source);
-        self.seek_request = Some(request);
+        self.engine.set_source(built.source);
+        self.seek_request = Some(built.seek_request);
+        self.at_end = built.at_end;
+        self.song_timeline = Some(built.timeline);
+        self.fading = false;
         self.current_module = Some(module);
         self.module_generation = self.module_generation.wrapping_add(1).max(1);
         Ok(self.module_generation)
@@ -430,17 +548,32 @@ impl Host {
             ..EngineSettings::default()
         };
         let snapshot = *self.telemetry.read();
-        let sounding_order = snapshot.transport.order;
+        // The sounding *song frame*, not just the order: a rebuild in the middle of a bar
+        // should come back where the ear left it, and the timeline can say where that is.
+        let sounding = match self.song_timeline.as_ref() {
+            Some(_) => SeekKind::Frame(snapshot.transport.song_frame),
+            None => SeekKind::Order(snapshot.transport.order),
+        };
         let was_playing = self.engine.is_playing() && !self.pending_engine_stop;
         let master_volume = self.engine.master_volume();
         let (mut engine, mut control, telemetry) = WebEngine::build(mode, settings)?;
         let mut seek_request = None;
 
+        let mut at_end_cell = Rc::clone(&self.at_end);
         if let Some(module) = self.current_module.as_ref() {
-            let (source, request) = source_for(Arc::clone(module), self.sample_rate_hz, sounding_order, engine.source_frame())?;
+            let built = source_for(
+                Arc::clone(module),
+                self.sample_rate_hz,
+                sounding,
+                engine.source_frame(),
+                self.at_end.get(),
+                self.song_timeline.clone(),
+            )?;
             control.load_module(Arc::clone(module)).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
-            engine.set_source(source);
-            seek_request = Some(request);
+            engine.set_source(built.source);
+            seek_request = Some(built.seek_request);
+            at_end_cell = built.at_end;
+            self.song_timeline = Some(built.timeline);
         }
         control.send(Command::SetMasterVolume(master_volume)).map_err(|_| String::from("the rebuilt engine command ring is full"))?;
         for (channel_index, channel) in snapshot.channels.iter().enumerate() {
@@ -457,6 +590,8 @@ impl Host {
         self.control = control;
         self.telemetry = telemetry;
         self.seek_request = seek_request;
+        self.at_end = at_end_cell;
+        self.fading = false;
         self.active_mode = mode;
         self.dither = dither_for(mode);
         self.transport_gain = GainRamp::steady(if was_playing { TRANSPORT_GAIN_UNITY } else { 0 });
@@ -472,6 +607,13 @@ impl Host {
             OPCODE_STOP => Some(Command::Stop),
             OPCODE_SEEK_ORDER => Some(Command::SeekOrder(command.argument as u16)),
             OPCODE_SEEK_ROW => Some(Command::SeekRow(command.argument as u16)),
+            OPCODE_SEEK_FRAME => Some(Command::SeekFrame(command.argument as u64)),
+            OPCODE_AT_END => match command.argument {
+                AT_END_FADE_OUT => Some(Command::SetAtEnd(AtEnd::FadeOut)),
+                AT_END_CONTINUE => Some(Command::SetAtEnd(AtEnd::Continue)),
+                AT_END_STOP => Some(Command::SetAtEnd(AtEnd::Stop)),
+                _ => None,
+            },
             OPCODE_MASTER_VOLUME => Some(Command::SetMasterVolume(U0F16::from_bits(command.argument as u16))),
             OPCODE_MUTE_CHANNEL => Some(Command::MuteChannel {
                 channel: ChannelId(command.argument as u16),
@@ -491,6 +633,12 @@ impl Host {
                 self.commands_rejected = self.commands_rejected.saturating_add(1);
                 continue;
             };
+            // `Command` has no room for the fade length, so the wire record's `extra` is
+            // read here rather than being folded into the typed command.
+            if let Command::SetAtEnd(at_end) = command {
+                self.set_at_end(at_end, wire.extra);
+                continue;
+            }
             match command {
                 // Fade first; the typed engine stop is queued when the ramp reaches zero.
                 Command::Stop => {
@@ -499,6 +647,13 @@ impl Host {
                 }
                 Command::Play => {
                     self.pending_engine_stop = false;
+                    // Play during a fade-out means "again", not "louder": the song is
+                    // ending, so it goes back to the top, which also clears the sticky
+                    // `end_reached` the fade was armed from.
+                    if self.fading {
+                        self.fading = false;
+                        self.request_seek(SeekKind::Frame(0));
+                    }
                     self.transport_gain.glide_to(TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES);
                     if self.control.send(Command::Play).is_err() {
                         self.commands_rejected = self.commands_rejected.saturating_add(1);
@@ -508,6 +663,7 @@ impl Host {
                 // typed variants through the wrapper's fixed mailbox.
                 Command::SeekOrder(order) => self.request_seek(SeekKind::Order(order)),
                 Command::SeekRow(row) => self.request_seek(SeekKind::Row(row)),
+                Command::SeekFrame(song_frame) => self.request_seek(SeekKind::Frame(song_frame)),
                 other => {
                     if self.control.send(other).is_err() {
                         self.commands_rejected = self.commands_rejected.saturating_add(1);
@@ -525,10 +681,44 @@ impl Host {
         }
     }
 
+    /// Set the repeat behaviour, and its fade length when one was named.
+    ///
+    /// Choosing `Continue` while the transport is already fading takes the fade back: the
+    /// gain glides home and the queued stop is cancelled, so the repeat button is a toggle
+    /// rather than a one-way door.
+    fn set_at_end(&mut self, at_end: AtEnd, fade_frames: u32) {
+        if fade_frames > 0 {
+            self.fade_frames = fade_frames;
+        }
+        self.at_end.set(at_end);
+        if at_end != AtEnd::FadeOut && self.fading {
+            self.transport_gain.glide_to(TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES);
+            self.pending_engine_stop = false;
+            self.fading = false;
+        }
+    }
+
     fn process(&mut self, frames: usize) -> f32 {
         self.drain_commands();
         let frames = frames.min(MAX_FRAMES_PER_CALL);
         self.engine.render_native(frames, &mut self.float_interleaved, &mut self.fixed_interleaved);
+
+        // The song has been heard through once and the page asked for a fade. The ramp
+        // therefore starts up to one host block (at most 1024 frames, ~21 ms at 48 kHz)
+        // after the loop point itself; for a fade measured in seconds that is inaudible,
+        // and it keeps the arming decision out of the per-frame loop.
+        //
+        // Only while the transport is actually running: once the fade has landed and the
+        // engine has stopped, no tick publishes again until the next Play consumes the
+        // rewind, so the snapshot keeps saying `end_reached` and would otherwise re-arm a
+        // fade over silence — and leave `fading` stuck for the next real loop point.
+        let snapshot = *self.telemetry.read();
+        let transport_running = self.engine.is_playing() && !self.pending_engine_stop;
+        if transport_running && snapshot.transport.end_reached && self.at_end.get() == AtEnd::FadeOut && !self.fading {
+            self.transport_gain.glide_to(0, self.fade_frames);
+            self.pending_engine_stop = true;
+            self.fading = true;
+        }
 
         let mut peak = 0.0f32;
         for frame in 0..frames {
@@ -561,6 +751,12 @@ impl Host {
         if self.pending_engine_stop && !self.transport_gain.is_ramping() {
             if self.control.send(Command::Stop).is_ok() {
                 self.pending_engine_stop = false;
+                // A song that faded out is over, not paused: rewind it so the next Play
+                // starts from the top rather than from the silence at the end.
+                if self.fading {
+                    self.fading = false;
+                    self.request_seek(SeekKind::Frame(0));
+                }
             } else {
                 self.commands_rejected = self.commands_rejected.saturating_add(1);
             }
@@ -571,12 +767,15 @@ impl Host {
         // bare 2.7 ms quantum peak flickers, and a quantum that lands between transients
         // reads as silence.
         self.last_peak = peak.max(self.last_peak * MASTER_PEAK_DECAY_PER_QUANTUM);
-        let snapshot = *self.telemetry.read();
         self.pack_telemetry(snapshot);
         peak
     }
 
     fn pack_telemetry(&mut self, snapshot: Snapshot) {
+        let song_flags = ((snapshot.transport.song_end != SongEnd::Unknown) as i32)
+            | (((snapshot.transport.song_end == SongEnd::Loops) as i32) << 1)
+            | ((snapshot.transport.end_reached as i32) << 2)
+            | ((self.fading as i32) << 3);
         let warnings = (snapshot.warnings.zero_advance_forced as i32)
             | ((snapshot.warnings.event_limit_reached as i32) << 1)
             | ((snapshot.warnings.retired_module_dropped as i32) << 2)
@@ -603,6 +802,9 @@ impl Host {
             (self.last_peak.clamp(0.0, 1.0) * 65_535.0) as i32,
             self.retired_modules_collected as i32,
             self.active_mode.to_wire() as i32,
+            snapshot.transport.song_frame.min(i32::MAX as u64) as i32,
+            snapshot.transport.song_length_frames.min(i32::MAX as u64) as i32,
+            song_flags,
         ];
         if let Some(destination) = self.telemetry_words.get_mut(..TELEMETRY_HEADER_WORDS) {
             destination.copy_from_slice(&header);
@@ -853,6 +1055,7 @@ mod tests {
         for _ in 0..10 { host.process(RENDER_QUANTUM); }
 
         assert_eq!(host.telemetry.read().transport.order, 1, "the rebuilt sequencer seeks to the sounding order");
+        assert!(host.telemetry.read().transport.song_frame > 0, "and to the song frame that was sounding, not to the top");
         assert_eq!(host.module_generation, generation, "a mode switch is not a module reload");
         assert_eq!(host.retired_modules_collected, retired, "the same Arc is not retired through the audio channel");
         assert_eq!(host.collect_garbage(), 0, "no module was retired by the switch");
@@ -1000,6 +1203,138 @@ mod tests {
         assert!(host.load_module(FIXTURE).is_ok());
         for _ in 0..100 { host.process(RENDER_QUANTUM); }
         assert!(!host.engine.warnings().zero_advance_forced, "and so does the one loaded over the top of it");
+    }
+
+    #[test]
+    fn a_loaded_module_is_scanned_and_its_length_reaches_the_telemetry() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        let timeline = Rc::clone(host.song_timeline.as_ref().expect("activation scans the module"));
+        assert!(timeline.end_frame() > 48_000, "REFLEX is longer than a second");
+        assert!(matches!(timeline.end(), starplayer::engine::EndReason::Looped { .. }), "REFLEX loops");
+
+        host.process(RENDER_QUANTUM);
+        assert_eq!(host.telemetry_words[20] as u64, timeline.end_frame(), "the song length rides in word 20");
+        assert_eq!(host.telemetry_words[21] & 0b11, 0b11, "length known, and the song ends by looping");
+        assert_eq!(host.telemetry_words[21] & 0b1000, 0, "nothing is fading");
+    }
+
+    #[test]
+    fn a_frame_seek_moves_the_song_clock_through_the_mailbox() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        for _ in 0..10 { host.process(RENDER_QUANTUM); }
+
+        let timeline = Rc::clone(host.song_timeline.as_ref().expect("the module was scanned"));
+        let target = timeline.end_frame() / 2;
+        let expected = *timeline.mark_at_frame(target).expect("a frame inside the song resolves");
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_SEEK_FRAME, argument: target as u32, extra: 0 }));
+        for _ in 0..10 { host.process(RENDER_QUANTUM); }
+
+        let snapshot = *host.telemetry.read();
+        assert_eq!(snapshot.transport.order, expected.order, "the seek landed on the scanned order");
+        assert!(snapshot.transport.song_frame >= expected.frame, "elapsed picks up where the scan says that row is");
+        assert!(snapshot.transport.song_frame < expected.frame + 48_000, "and not somewhere else entirely");
+        assert!(!host.engine.warnings().unsupported_command, "a frame seek is routed, not flagged");
+        assert_eq!(host.telemetry_words[19] as u64, snapshot.transport.song_frame, "the elapsed frame rides in word 19");
+    }
+
+    #[test]
+    fn the_at_end_opcode_carries_the_mode_and_its_fade_length() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        assert_eq!(host.at_end.get(), AtEnd::Continue, "repeat is on by default");
+
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
+        host.process(RENDER_QUANTUM);
+        assert_eq!(host.at_end.get(), AtEnd::FadeOut);
+        assert_eq!(host.fade_frames, 4_096);
+
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_STOP, extra: 0 }));
+        host.process(RENDER_QUANTUM);
+        assert_eq!(host.at_end.get(), AtEnd::Stop);
+        assert_eq!(host.fade_frames, 4_096, "an unnamed fade length leaves the previous one alone");
+
+        let rejected = host.dropped_commands();
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: 99, extra: 0 }));
+        host.process(RENDER_QUANTUM);
+        assert_eq!(host.at_end.get(), AtEnd::Stop, "an unknown mode is rejected rather than guessed");
+        assert_eq!(host.dropped_commands(), rejected + 1);
+    }
+
+    #[test]
+    fn a_song_that_reaches_its_loop_point_under_fade_out_ramps_down_and_rewinds() {
+        let module = minimal_mod();
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(&module).is_ok());
+        let end_frame = host.song_timeline.as_ref().expect("the module was scanned").end_frame();
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+
+        let mut fade_seen = false;
+        let mut stopped_at = None;
+        for quantum in 0..(end_frame as usize / RENDER_QUANTUM + 200) {
+            host.process(RENDER_QUANTUM);
+            fade_seen |= host.telemetry_words[21] & 0b1000 != 0;
+            if !host.engine.is_playing() {
+                stopped_at = Some(quantum);
+                break;
+            }
+        }
+        assert!(fade_seen, "the fade was armed and reported");
+        let stopped_at = stopped_at.expect("the transport stopped once the fade finished");
+        assert!(stopped_at as u64 * RENDER_QUANTUM as u64 >= end_frame, "it did not stop before the loop point");
+        assert!(!host.fading, "the fade is finished, not stuck");
+        assert_eq!(host.seek_request.as_ref().map(|request| request.get().kind), Some(SeekKind::Frame(0)), "a faded-out song rewinds for the next Play");
+    }
+
+    #[test]
+    fn a_faded_out_song_fades_again_on_its_next_pass() {
+        let module = minimal_mod();
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(&module).is_ok());
+        let end_frame = host.song_timeline.as_ref().expect("the module was scanned").end_frame();
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
+        let budget = end_frame as usize / RENDER_QUANTUM + 200;
+
+        let play_through = |host: &mut Host| {
+            assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+            let mut fade_seen = false;
+            for _ in 0..budget {
+                host.process(RENDER_QUANTUM);
+                fade_seen |= host.telemetry_words[21] & 0b1000 != 0;
+                if !host.engine.is_playing() { break; }
+            }
+            assert!(!host.engine.is_playing(), "the fade landed and the transport stopped");
+            fade_seen
+        };
+
+        assert!(play_through(&mut host), "the first pass fades");
+        // Stopped, with the snapshot still saying the end was reached: nothing may re-arm.
+        for _ in 0..20 { host.process(RENDER_QUANTUM); }
+        assert!(!host.fading, "a stopped transport does not fade over silence");
+        assert!(!host.pending_engine_stop);
+        assert_eq!(host.telemetry_words[21] & 0b1000, 0, "and does not report a fade");
+
+        assert!(play_through(&mut host), "the second pass fades again from the top");
+        assert!(!host.fading);
+    }
+
+    #[test]
+    fn choosing_continue_while_a_fade_runs_takes_the_fade_back() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        host.at_end.set(AtEnd::FadeOut);
+        host.transport_gain.glide_to(0, 48_000);
+        host.pending_engine_stop = true;
+        host.fading = true;
+
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_CONTINUE, extra: 0 }));
+        host.process(RENDER_QUANTUM);
+        assert_eq!(host.at_end.get(), AtEnd::Continue);
+        assert!(!host.fading);
+        assert!(!host.pending_engine_stop, "the queued stop is cancelled");
+        assert_eq!(host.transport_gain.target(), TRANSPORT_GAIN_UNITY, "and the gain heads back to unity");
     }
 
     #[test]

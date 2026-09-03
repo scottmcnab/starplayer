@@ -11,11 +11,12 @@
 
 use std::fmt;
 
-use starplayer::core::{Error, ExactFixedPoint, Interpolator};
+use starplayer::core::quirks::QuirkSelection;
+use starplayer::core::{AtEnd, Error, ExactFixedPoint, Interpolator};
 use starplayer::dsp::{Interpolate, Linear, Nearest};
-use starplayer::engine::{Engine, EngineSettings, EngineWarnings, EventSource};
+use starplayer::engine::{EndReason, Engine, EngineSettings, EngineWarnings, EventSource, ScanLimits, SongTimeline, scan_timeline};
 use starplayer::mixer::{FixedPath, FloatPath, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
-use starplayer::model::Module;
+use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::Arc;
 
 // The per-tick trace is a diagnostic build only. Everything it needs sits behind the
@@ -27,9 +28,6 @@ use starplayer::core::Frame;
 use starplayer::engine::{EndOfSongPolicy, PatternSequencer, SequencerSettings, Trace};
 #[cfg(any(feature = "trace", test))]
 use starplayer::mixer::StereoI16;
-#[cfg(feature = "trace")]
-use starplayer::model::ModuleFormat;
-
 use sha2::{Digest, Sha256};
 
 pub mod fixtures;
@@ -202,6 +200,198 @@ pub fn canonical_sha256(format: GoldenFormat, bytes: &[u8], host_block_frames: u
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&digest);
     Ok(hash)
+}
+
+/// Scan a loaded module and report the shape of its song: every row it plays, when, how
+/// long one pass is, and whether it loops or ends.
+///
+/// Built through the same `sequencer_with_quirks(module, rate, QuirkSelection::FromDialect)`
+/// the browser host uses, so an offline length and a browser progress slider cannot
+/// disagree. The scan runs a **throwaway** sequencer; callers build a second one to play.
+pub fn song_timeline(module: &Arc<Module>, sample_rate_hz: u32) -> Result<SongTimeline, RenderError> {
+    song_timeline_with_limits(module, sample_rate_hz, ScanLimits::for_rate(sample_rate_hz))
+}
+
+/// [`song_timeline`] with explicit limits, for a test that wants a short leash.
+pub fn song_timeline_with_limits(module: &Arc<Module>, sample_rate_hz: u32, limits: ScanLimits) -> Result<SongTimeline, RenderError> {
+    let quirks = QuirkSelection::FromDialect;
+    let module = Arc::clone(module);
+    Ok(match module.header().format {
+        ModuleFormat::S3m => scan_timeline(&mut starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
+        ModuleFormat::Mod => scan_timeline(&mut starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
+        ModuleFormat::Mtm => scan_timeline(&mut starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks), limits),
+        _ => return Err(RenderError::Load(Error::Invalid("format has no offline native processor"))),
+    })
+}
+
+/// How much of a song an offline render should produce.
+///
+/// A module does not say how long it is, so a file render has to be told. The default is
+/// what a media player's "export" button wants: play the song once, then fade out over ten
+/// seconds into the start of the second pass. A song that *ends* — its order list runs out
+/// or a stop marker fires — gets no fade, because there is nothing to fade away from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RenderLength {
+    /// Extra passes through the repeating section after the first. Zero plays it once.
+    pub repeat_count: u32,
+    /// What happens at the loop point. [`AtEnd::Stop`] cuts dead there with no fade;
+    /// anything else fades, because a file has to end somewhere.
+    pub at_end: AtEnd,
+    /// Frames the fade lasts. Ignored when there is no fade.
+    pub fade_frames: u64,
+    /// A hard ceiling, so a pathological module cannot ask for an unbounded file.
+    pub max_frames: u64,
+}
+
+impl RenderLength {
+    /// Once through, then a ten-second fade, capped at an hour.
+    pub const fn default_for(sample_rate_hz: u32) -> RenderLength {
+        RenderLength {
+            repeat_count: 0,
+            at_end: AtEnd::FadeOut,
+            fade_frames: sample_rate_hz as u64 * 10,
+            max_frames: sample_rate_hz as u64 * 3_600,
+        }
+    }
+
+    /// How many frames this length asks for, and how many of them are fade, given a scanned
+    /// timeline.
+    pub fn frames_for(&self, timeline: &SongTimeline) -> (usize, usize) {
+        let loop_length = match timeline.end() {
+            // A song that ends has nothing to repeat, so a repeat plays it again from the
+            // top; a budget end never found the loop point, so the cap stands in for it.
+            EndReason::Stopped | EndReason::Budget => timeline.end_frame(),
+            EndReason::Looped { .. } => timeline.loop_length_frames().unwrap_or(timeline.end_frame()),
+        };
+        let body = timeline.end_frame().saturating_add(loop_length.saturating_mul(self.repeat_count as u64));
+        let fade = match (self.at_end, timeline.end()) {
+            (AtEnd::Stop, _) | (_, EndReason::Stopped) => 0,
+            _ => self.fade_frames,
+        };
+        let total = body.saturating_add(fade).min(self.max_frames);
+        // A fade cannot be longer than the render it is applied to.
+        (total as usize, fade.min(total) as usize)
+    }
+}
+
+/// One output sample, scalable by a Q16.16 gain. The fade is the only place this crate
+/// touches sample values, and it does it without a single transcendental call.
+pub trait FadeSample: Copy + Default {
+    /// This sample at `gain_q16 / 65_536` of its value.
+    fn scaled_q16(self, gain_q16: u32) -> Self;
+}
+
+impl FadeSample for i16 {
+    fn scaled_q16(self, gain_q16: u32) -> i16 { ((self as i64 * gain_q16 as i64) >> 16) as i16 }
+}
+
+impl FadeSample for f32 {
+    fn scaled_q16(self, gain_q16: u32) -> f32 { self * (gain_q16 as f32 / 65_536.0) }
+}
+
+/// Render a whole song rather than a fixed segment: scan it, play it for as long as
+/// [`RenderLength`] asks, and fade the tail.
+///
+/// The scan and the playback are two separate sequencers over the same `Arc<Module>`, so
+/// nothing depends on `TrackerProcessor::reset` restoring every last bit of a processor's
+/// state. The playback sequencer runs with [`AtEnd::Continue`] whatever the caller asked
+/// for: the length decides where the render stops, and the fade decides how it ends.
+pub fn render_song<Path, Interp, Out>(
+    format: GoldenFormat,
+    bytes: &[u8],
+    sample_rate_hz: u32,
+    host_block_frames: usize,
+    length: RenderLength,
+) -> Result<Vec<Out::Sample>, RenderError>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: FadeSample,
+{
+    let module = Arc::new(load_golden(format, bytes)?);
+    let timeline = song_timeline(&module, sample_rate_hz)?;
+    let (total_frames, fade_frames) = length.frames_for(&timeline);
+
+    let channel_count = module.header().channel_count as usize;
+    let settings = EngineSettings {
+        sample_rate_hz,
+        channel_count,
+        voice_capacity: channel_count.max(1),
+        ..EngineSettings::default()
+    };
+    let mut engine: Engine<Path, Interp, Out, Arc<Module>> = Engine::with_settings(settings);
+    let mut control = engine.take_control().ok_or(RenderError::CommandQueue)?;
+    control.load_module(Arc::clone(&module)).map_err(|_| RenderError::CommandQueue)?;
+    engine.set_source(playback_source(format, module, sample_rate_hz, timeline));
+    engine.set_limiter(Limiter::Clamp);
+
+    let output_samples = total_frames.saturating_mul(Out::CHANNELS);
+    let block_samples = host_block_frames.max(1).saturating_mul(Out::CHANNELS).max(Out::CHANNELS);
+    let mut output = vec![Out::Sample::default(); output_samples];
+    for block in output.chunks_mut(block_samples) {
+        engine.render(block);
+    }
+    let warnings = engine.warnings();
+    if warnings.any() {
+        return Err(RenderError::EngineWarnings(warnings));
+    }
+
+    apply_fade::<Out>(&mut output, total_frames, fade_frames);
+    Ok(output)
+}
+
+/// The `i16` mono spelling, mirroring [`render_fixed_mono`].
+pub fn render_song_fixed_mono(format: GoldenFormat, bytes: &[u8], sample_rate_hz: u32, host_block_frames: usize, length: RenderLength) -> Result<Vec<i16>, RenderError> {
+    render_song::<FixedPath, Linear, MonoI16>(format, bytes, sample_rate_hz, host_block_frames, length)
+}
+
+/// A linear fade over the last `fade_frames` frames, in Q16.16 with no floating-point
+/// curve and no transcendental call. The last frame is exactly zero.
+fn apply_fade<Out>(output: &mut [Out::Sample], total_frames: usize, fade_frames: usize)
+where
+    Out: OutputFormat,
+    Out::Sample: FadeSample,
+{
+    if fade_frames == 0 || total_frames == 0 {
+        return;
+    }
+    let first_faded = total_frames.saturating_sub(fade_frames);
+    for frame in first_faded..total_frames {
+        let remaining = (total_frames - 1 - frame) as u64;
+        let gain_q16 = (remaining * 65_536 / fade_frames as u64) as u32;
+        let start = frame.saturating_mul(Out::CHANNELS);
+        let Some(samples) = output.get_mut(start..start + Out::CHANNELS) else { continue };
+        for sample in samples {
+            *sample = sample.scaled_q16(gain_q16);
+        }
+    }
+}
+
+/// A playback sequencer for `format` with `timeline` installed and the loop point set to
+/// wrap rather than stop.
+fn playback_source(format: GoldenFormat, module: Arc<Module>, sample_rate_hz: u32, timeline: SongTimeline) -> Box<dyn EventSource> {
+    let quirks = QuirkSelection::FromDialect;
+    match format {
+        GoldenFormat::Mod => {
+            let mut sequencer = starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks);
+            sequencer.set_timeline(timeline);
+            sequencer.set_at_end(AtEnd::Continue);
+            Box::new(sequencer)
+        }
+        GoldenFormat::S3m => {
+            let mut sequencer = starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks);
+            sequencer.set_timeline(timeline);
+            sequencer.set_at_end(AtEnd::Continue);
+            Box::new(sequencer)
+        }
+        GoldenFormat::Mtm => {
+            let mut sequencer = starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks);
+            sequencer.set_timeline(timeline);
+            sequencer.set_at_end(AtEnd::Continue);
+            Box::new(sequencer)
+        }
+    }
 }
 
 /// The S3M-only spelling C6 shipped, kept so existing callers and tests read unchanged.
@@ -618,6 +808,229 @@ mod tests {
                 assert_eq!(canonical_sha256(format, bytes, host_block_frames).expect("the fixture hashes"), reference_hash, "{format} {name}: host block size {host_block_frames} changed the canonical hash");
             }
         }
+    }
+
+    /// A short render, so the six block sizes stay quick: five seconds of song with a
+    /// one-second tail.
+    fn short_length(sample_rate_hz: u32) -> RenderLength {
+        RenderLength {
+            repeat_count: 0,
+            at_end: AtEnd::FadeOut,
+            fade_frames: sample_rate_hz as u64,
+            max_frames: sample_rate_hz as u64 * 5,
+        }
+    }
+
+    fn song_corpus() -> Vec<(GoldenFormat, &'static str, Vec<u8>)> {
+        vec![
+            (GoldenFormat::Mod, "synthetic", fixtures::synthetic_mod()),
+            (GoldenFormat::S3m, "REFLEX.S3M", REFLEX.to_vec()),
+            (GoldenFormat::Mtm, "synthetic", fixtures::synthetic_mtm()),
+        ]
+    }
+
+    /// Play a real sequencer to a stop with no mixing, and report the frame of the last
+    /// tick it dispatched. This is the live dispatch path — the same `begin_row` the engine
+    /// runs — so agreeing with the scan is a real claim about playback, not about a copy of
+    /// it.
+    /// A frame far enough into the engine's monotonic timeline that seeking back to the
+    /// start of a song still leaves a positive origin.
+    const SEEK_TEST_ORIGIN: u64 = 1 << 40;
+
+    fn last_live_tick_frame(format: GoldenFormat, module: &Arc<Module>, sample_rate_hz: u32, timeline: &SongTimeline, seek_to: Option<u64>) -> Option<u64> {
+        use starplayer::core::Frame;
+        use starplayer::engine::{ChannelTable, ControlClock, EngineContext, PatternData};
+        use starplayer::mixer::VoicePool;
+
+        macro_rules! drive {
+            ($sequencer:expr) => {{
+                let mut sequencer = $sequencer;
+                sequencer.set_timeline(timeline.clone());
+                sequencer.set_at_end(AtEnd::Stop);
+                if let Some(song_frame) = seek_to {
+                    // Well clear of the song's own length, so the rebased origin is a
+                    // subtraction rather than a saturation and `song_frame` stays
+                    // comparable with the timeline's frames.
+                    let now = Frame(SEEK_TEST_ORIGIN);
+                    sequencer.seek_frame(song_frame, now)?;
+                    sequencer.restart_clock_at(now);
+                }
+                let channel_count = (sequencer.data().channel_count() as usize).max(1);
+                let mut voices = VoicePool::new(channel_count);
+                let mut channels = ChannelTable::new(channel_count);
+                let mut control = ControlClock::new(sample_rate_hz, Frame::ZERO);
+                let mut last = None;
+                for _ in 0..2_000_000u32 {
+                    let Some(frame) = sequencer.next_event_frame() else { break };
+                    let mut context = EngineContext::new(frame, &mut voices, &mut channels, &mut control);
+                    sequencer.dispatch(frame, &mut context);
+                    last = Some(sequencer.song_frame(frame));
+                }
+                last
+            }};
+        }
+
+        let quirks = starplayer::core::quirks::QuirkSelection::FromDialect;
+        let module = Arc::clone(module);
+        match format {
+            GoldenFormat::Mod => drive!(starplayer::mod_file::sequencer_with_quirks(module, sample_rate_hz, quirks)),
+            GoldenFormat::S3m => drive!(starplayer::s3m::sequencer_with_quirks(module, sample_rate_hz, quirks)),
+            GoldenFormat::Mtm => drive!(starplayer::mtm::sequencer_with_quirks(module, sample_rate_hz, quirks)),
+        }
+    }
+
+    #[test]
+    fn a_scanned_timeline_describes_a_song_the_live_sequencer_plays_the_same_way() {
+        for (format, name, bytes) in song_corpus() {
+            let module = Arc::new(load_golden(format, &bytes).expect("the fixture loads"));
+            let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+            assert!(timeline.end_frame() > 0, "{format} {name}: a playable module is longer than nothing");
+            assert!(!timeline.marks().is_empty(), "{format} {name}: the scan recorded rows");
+
+            let live = last_live_tick_frame(format, &module, GOLDEN_SAMPLE_RATE_HZ, &timeline, None);
+            assert_eq!(live, Some(timeline.end_frame()), "{format} {name}: the live detector fired somewhere else");
+
+            // …and again from halfway in, which is what a progress-slider drag does.
+            let halfway = timeline.end_frame() / 2;
+            let seeked = last_live_tick_frame(format, &module, GOLDEN_SAMPLE_RATE_HZ, &timeline, Some(halfway));
+            assert_eq!(seeked, Some(timeline.end_frame()), "{format} {name}: the loop point moved after a seek");
+        }
+    }
+
+    #[test]
+    fn scanning_the_same_module_twice_gives_the_same_timeline() {
+        let module = Arc::new(starplayer::s3m::load(REFLEX).expect("REFLEX loads"));
+        let first = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("REFLEX scans");
+        let second = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("REFLEX scans twice");
+        assert_eq!(first, second, "the scan is deterministic");
+    }
+
+    #[test]
+    fn a_scanned_song_is_rendered_identically_at_every_host_block_size() {
+        for (format, name, bytes) in song_corpus() {
+            let length = short_length(GOLDEN_SAMPLE_RATE_HZ);
+            let reference = render_song_fixed_mono(format, &bytes, GOLDEN_SAMPLE_RATE_HZ, GOLDEN_HOST_BLOCK_FRAMES, length).expect("the fixture renders");
+            assert!(reference.iter().any(|sample| *sample != 0), "{format} {name}: the render is not silent");
+            for host_block_frames in [1, 3, 64, 128, 4096, 8191] {
+                let rendered = render_song_fixed_mono(format, &bytes, GOLDEN_SAMPLE_RATE_HZ, host_block_frames, length).expect("the fixture renders");
+                assert_eq!(rendered, reference, "{format} {name}: host block size {host_block_frames} changed the song render");
+            }
+        }
+    }
+
+    #[test]
+    fn a_faded_render_ends_in_silence_and_a_cut_one_ends_on_the_loop_point() {
+        let bytes = fixtures::synthetic_mod();
+        let module = Arc::new(starplayer::mod_file::load(&bytes).expect("the fixture loads"));
+        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+        assert!(matches!(timeline.end(), EndReason::Looped { .. }), "the fixture loops");
+
+        let faded_length = RenderLength { repeat_count: 0, at_end: AtEnd::FadeOut, fade_frames: GOLDEN_SAMPLE_RATE_HZ as u64, max_frames: GOLDEN_SAMPLE_RATE_HZ as u64 * 60 };
+        let faded = render_song_fixed_mono(GoldenFormat::Mod, &bytes, GOLDEN_SAMPLE_RATE_HZ, GOLDEN_HOST_BLOCK_FRAMES, faded_length).expect("it renders");
+        assert_eq!(faded.len() as u64, timeline.end_frame() + GOLDEN_SAMPLE_RATE_HZ as u64);
+        assert_eq!(faded.last().copied(), Some(0), "the last frame of a fade is exactly zero");
+        assert!(faded.iter().rev().take(64).all(|sample| sample.abs() < 512), "the fade really is a fade");
+
+        let cut_length = RenderLength { repeat_count: 0, at_end: AtEnd::Stop, ..faded_length };
+        let cut = render_song_fixed_mono(GoldenFormat::Mod, &bytes, GOLDEN_SAMPLE_RATE_HZ, GOLDEN_HOST_BLOCK_FRAMES, cut_length).expect("it renders");
+        assert_eq!(cut.len() as u64, timeline.end_frame(), "a cut render is exactly one pass");
+
+        let repeated_length = RenderLength { repeat_count: 1, ..cut_length };
+        let repeated = render_song_fixed_mono(GoldenFormat::Mod, &bytes, GOLDEN_SAMPLE_RATE_HZ, GOLDEN_HOST_BLOCK_FRAMES, repeated_length).expect("it renders");
+        let loop_length = timeline.loop_length_frames().expect("a looping song has a loop length");
+        assert_eq!(repeated.len() as u64, timeline.end_frame() + loop_length);
+        assert_eq!(repeated.get(..cut.len()).expect("the repeat contains the first pass"), cut.as_slice(), "a repeat appends rather than changing the first pass");
+    }
+
+    #[test]
+    fn a_render_length_is_clamped_to_its_ceiling() {
+        let module = Arc::new(starplayer::s3m::load(REFLEX).expect("REFLEX loads"));
+        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("REFLEX scans");
+        let length = RenderLength { repeat_count: 1_000_000, at_end: AtEnd::FadeOut, fade_frames: 1_000, max_frames: 10_000 };
+        assert_eq!(length.frames_for(&timeline), (10_000, 1_000), "the ceiling wins over the repeat count");
+    }
+
+    /// Research point: no format processor may keep a shadow copy of speed or tempo that
+    /// survives `TrackerProcessor::reset` and overrides the mark on the first tick after a
+    /// seek. MOD's deferred CIA `pending_tempo` is the suspect; it is cleared in `reset`.
+    #[test]
+    fn a_seek_restores_the_scanned_timing_rather_than_the_processors() {
+        use starplayer::core::Frame;
+        use starplayer::core::quirks::QuirkSelection;
+        use starplayer::engine::{ChannelTable, ControlClock, EngineContext, PatternData};
+        use starplayer::mixer::VoicePool;
+
+        for (format, name, bytes) in song_corpus() {
+            let module = Arc::new(load_golden(format, &bytes).expect("the fixture loads"));
+            let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("the fixture scans");
+
+            macro_rules! check {
+                ($sequencer:expr) => {{
+                    let mut sequencer = $sequencer;
+                    sequencer.set_timeline(timeline.clone());
+                    let channel_count = (sequencer.data().channel_count() as usize).max(1);
+                    let mut voices = VoicePool::new(channel_count);
+                    let mut channels = ChannelTable::new(channel_count);
+                    let mut control = ControlClock::new(GOLDEN_SAMPLE_RATE_HZ, Frame::ZERO);
+
+                    for mark in timeline.marks().iter().step_by(17) {
+                        let now = Frame(SEEK_TEST_ORIGIN);
+                        let seeked = sequencer.seek_frame(mark.frame, now).expect("a scanned frame resolves");
+                        assert_eq!(&seeked, mark, "{format} {name}: seeking to a mark's frame lands on that mark");
+                        sequencer.restart_clock_at(now);
+                        assert_eq!(sequencer.song_frame(now), mark.frame, "{format} {name}: elapsed is continuous across the seek");
+                        assert_eq!(sequencer.row_clock().speed, mark.speed, "{format} {name}: speed at {}", mark.frame);
+                        assert_eq!(sequencer.tempo_bpm(), mark.tempo_bpm, "{format} {name}: tempo at {}", mark.frame);
+
+                        // What a seek restores is the speed and the tempo and nothing
+                        // else: the processor's global volume (`Vxx`), effect memories and
+                        // sample positions come back as `TrackerProcessor::reset` left
+                        // them, not as they were when the song last played this row.
+                        // Matching OpenMPT's `eAdjust` state replay is separate work.
+                        //
+                        // Run the row's first tick: whatever the processor kept across
+                        // `reset` must not have replaced the sequencer's values.
+                        let frame = sequencer.next_event_frame().expect("a seeked sequencer is ready");
+                        let mut context = EngineContext::new(frame, &mut voices, &mut channels, &mut control);
+                        sequencer.dispatch(frame, &mut context);
+                        let visit = sequencer.last_row_visit().expect("the first tick after a seek starts a row");
+                        assert_eq!(visit.mark.speed, mark.speed, "{format} {name}: the first tick after a seek ran at the scanned speed");
+                        assert_eq!(visit.mark.tempo_bpm, mark.tempo_bpm, "{format} {name}: and the scanned tempo");
+                    }
+                }};
+            }
+
+            let quirks = QuirkSelection::FromDialect;
+            let handle = Arc::clone(&module);
+            match format {
+                GoldenFormat::Mod => check!(starplayer::mod_file::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
+                GoldenFormat::S3m => check!(starplayer::s3m::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
+                GoldenFormat::Mtm => check!(starplayer::mtm::sequencer_with_quirks(handle, GOLDEN_SAMPLE_RATE_HZ, quirks)),
+            }
+        }
+    }
+
+    /// Research point: how expensive is a scan? Reported rather than asserted tightly —
+    /// the browser runs it in the worklet's message task, like module decoding, so what
+    /// matters is that it is milliseconds and not seconds.
+    #[test]
+    fn scanning_reflex_costs_milliseconds() {
+        use std::time::Instant;
+
+        let module = Arc::new(starplayer::s3m::load(REFLEX).expect("REFLEX loads"));
+        let started = Instant::now();
+        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("REFLEX scans");
+        let elapsed = started.elapsed();
+
+        let ticks: u64 = timeline.end_frame() / 882;
+        let ticks_per_second = ticks as f64 / elapsed.as_secs_f64().max(1.0e-9);
+        println!(
+            "REFLEX.S3M: {:.1} s of song, ~{ticks} ticks, scanned in {:.1} ms ({:.0} ticks/s)",
+            timeline.duration_seconds(),
+            elapsed.as_secs_f64() * 1_000.0,
+            ticks_per_second
+        );
+        assert!(elapsed.as_secs() < 5, "a scan that takes seconds does not belong in a message task");
     }
 
     #[test]

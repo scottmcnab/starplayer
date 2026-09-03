@@ -45,7 +45,7 @@ pub mod tempo;
 pub use clock::FrameClock;
 pub use error::Error;
 pub use event::{
-    ChannelId, Command, DirtyBits, Event, FilterParams, InstrumentId, Interpolator, SampleId,
+    AtEnd, ChannelId, Command, DirtyBits, Event, FilterParams, InstrumentId, Interpolator, SampleId,
     Target, TimedEvent, TriggerFlags, TriggerSpec, VoiceId, VoiceParam, VoiceParams,
 };
 pub use fixed::{I1F15, Q32_32, Step, U0F16};

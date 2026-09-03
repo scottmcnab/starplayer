@@ -39,6 +39,29 @@ pub struct TransportState {
     pub tempo_bpm: u16,
     /// The module's global volume (`Vxx`), **not** the host's master volume.
     pub global_volume: U0F16,
+    /// Frames into the current pass through the song — the elapsed position a media
+    /// player's progress slider is drawn from. Zero when no song timeline is installed.
+    pub song_frame: u64,
+    /// Frames in one pass, from the scanned song timeline. Zero when there is none, which
+    /// is how a UI tells "no total to show" from "at the start".
+    pub song_length_frames: u64,
+    /// What the scan found at the end of the song.
+    pub song_end: SongEnd,
+    /// Whether the song has passed its detected loop point. A one-tick pulse when the host
+    /// asked to keep playing, sticky when it asked to fade.
+    pub end_reached: bool,
+}
+
+/// What a scanned song does when it gets to the end of itself.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SongEnd {
+    /// Nothing has been scanned, so the length and the end are both unknown.
+    #[default]
+    Unknown,
+    /// The song reaches a row it has already played and repeats from there.
+    Loops,
+    /// The song ends: the order list runs out, or a stop marker fires.
+    Stops,
 }
 
 impl TransportState {
@@ -52,6 +75,10 @@ impl TransportState {
         speed: 0,
         tempo_bpm: 0,
         global_volume: U0F16::MAX,
+        song_frame: 0,
+        song_length_frames: 0,
+        song_end: SongEnd::Unknown,
+        end_reached: false,
     };
 }
 
@@ -255,6 +282,9 @@ mod tests {
         assert_eq!(snapshot.channels.len(), MAX_CHANNELS);
         assert_eq!(snapshot.active_channels(), &[] as &[ChannelState], "no module, no channels to draw");
         assert_eq!(snapshot.transport.global_volume, U0F16::MAX, "a module starts at full global volume");
+        assert_eq!(snapshot.transport.song_end, SongEnd::Unknown, "nothing has been scanned");
+        assert_eq!((snapshot.transport.song_frame, snapshot.transport.song_length_frames), (0, 0));
+        assert!(!snapshot.transport.end_reached);
         assert!(!snapshot.warnings.any());
         assert!(snapshot.channels.iter().all(|channel| *channel == ChannelState::SILENT));
     }

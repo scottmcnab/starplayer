@@ -21,6 +21,13 @@
     const OPCODE_MASTER_VOLUME = 5;
     const OPCODE_MUTE_CHANNEL = 6;
     const OPCODE_SET_MIXER_MODE = 7;
+    const OPCODE_SEEK_FRAME = 8;
+    const OPCODE_AT_END = 9;
+
+    // Arguments for OPCODE_AT_END; `extra` carries the fade length in frames.
+    const AT_END_FADE_OUT = 0;
+    const AT_END_CONTINUE = 1;
+    const AT_END_STOP = 2;
 
     function viewCommandRing(buffer) {
         return { buffer, words: new Int32Array(buffer) };
@@ -85,7 +92,13 @@
     }
 
     // Rust's packed Snapshot layout. The SAB adds a seqlock and diagnostics ahead of it.
-    const SNAPSHOT_HEADER_WORDS = 19;
+    const SNAPSHOT_HEADER_WORDS = 22;
+
+    // Bits of the song_flags word (index 21).
+    const SONG_FLAG_LENGTH_KNOWN = 1;
+    const SONG_FLAG_LOOPS = 2;
+    const SONG_FLAG_END_REACHED = 4;
+    const SONG_FLAG_FADING = 8;
     const SNAPSHOT_CHANNEL_WORDS = 8;
     const SNAPSHOT_CHANNELS = 64;
     const SNAPSHOT_WORDS = SNAPSHOT_HEADER_WORDS + SNAPSHOT_CHANNELS * SNAPSHOT_CHANNEL_WORDS;
@@ -158,6 +171,9 @@
             masterPeak: source[16],
             retiredCollected: source[17],
             mixerModeWire: source[18] >>> 0,
+            songFrame: source[19],
+            songLengthFrames: source[20],
+            songFlags: source[21],
             channels,
             memoryBytes: diagnostics.memoryBytes,
             quantumFrames: diagnostics.quantumFrames,
@@ -204,6 +220,15 @@
         OPCODE_MASTER_VOLUME,
         OPCODE_MUTE_CHANNEL,
         OPCODE_SET_MIXER_MODE,
+        OPCODE_SEEK_FRAME,
+        OPCODE_AT_END,
+        AT_END_FADE_OUT,
+        AT_END_CONTINUE,
+        AT_END_STOP,
+        SONG_FLAG_LENGTH_KNOWN,
+        SONG_FLAG_LOOPS,
+        SONG_FLAG_END_REACHED,
+        SONG_FLAG_FADING,
         SNAPSHOT_WORDS,
         TELEMETRY_BYTES,
         TELEMETRY_FALLBACK_QUANTA,

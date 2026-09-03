@@ -27,8 +27,16 @@ not fit.
    info. Argument surface deliberately echoes the original's where it still makes sense
    (`plans/reference/original-star-ui.md` §7): a mixing rate, a buffer size, a device
    selection.
+
+   `render` has no natural length, so it inherits `RenderLength::default_for(rate)` from
+   task D1 — play the song once, then fade over ten seconds into the second pass, capped at
+   an hour — and exposes the three knobs that change it: `--repeat N` (extra passes through
+   the repeating section), `--fade S` (fade length in seconds) and `--at-end cut|fade`
+   (`cut` stops dead on the loop point with no fade). A song that *ends* of its own accord
+   gets no fade whatever is asked for, because there is nothing to fade away from.
 4. **`starplayer-offline`** — deterministic rendering to WAV at any rate and depth, with
-   the higher-quality interpolators when M7 lands.
+   the higher-quality interpolators when M7 lands. `song_timeline` and `render_song`
+   landed early with task D1, because the web player's progress slider needed the scan.
 5. **The telemetry split** (architecture §9): the coherent scalar snapshot from M1-B6
    gains its second half — per-channel lossy audio taps for oscilloscopes and VU peaks.
    Per-channel fixed rings, `Relaxed` write index, downsampled in the audio thread
