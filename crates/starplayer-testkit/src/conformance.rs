@@ -668,6 +668,7 @@ pub fn diff_libxmp_dump(
         volume: volume_tolerance(format),
         pan: pan_tolerance(format),
         position: POSITION_TOLERANCE,
+        cutoff: cutoff_tolerance(format),
         ..TraceTolerances::default()
     };
     diff_traces(&expected, &actual, &tolerances)
@@ -692,17 +693,19 @@ const fn period_tolerance(format: ConformanceFormat) -> u32 {
 
 /// How far apart the two implementations' idea of the same channel volume may be.
 ///
-/// Exact for MOD, S3M and MTM, which have no envelope. **One** for XM, and the unit is the
+/// Exact for MOD, S3M and MTM, which have no envelope. **One** for XM and IT, and the unit is the
 /// envelope's: FastTracker 2 interpolates its volume envelope in Q8 and accumulates a Q8
 /// per-tick delta (`ft2_replayer.c` `updateVolPanAutoVib`, `volEnvDelta = (yDiff << 8) /
 /// xDiff`), where libxmp recomputes `y1 + (y2 - y1) * (x - x1) / (x2 - x1)` in whole
 /// envelope units with a division that truncates towards zero (`src/player.c:118`). On a
 /// falling envelope libxmp is therefore up to one whole unit high — accuracy policy D44.
-/// Every other term of the volume is integer and identical on both sides.
+/// Every other XM term is integer and identical on both sides. IT's corresponding one-unit
+/// allowance covers the final six-bit projection after OpenMPT/IT and libxmp group the
+/// envelope, fadeout, sample and instrument products differently (accuracy policy D80).
 const fn volume_tolerance(format: ConformanceFormat) -> u16 {
     match format {
-        ConformanceFormat::Mod | ConformanceFormat::S3m | ConformanceFormat::Mtm | ConformanceFormat::It => 0,
-        ConformanceFormat::Xm => 1,
+        ConformanceFormat::Mod | ConformanceFormat::S3m | ConformanceFormat::Mtm => 0,
+        ConformanceFormat::Xm | ConformanceFormat::It => 1,
     }
 }
 
@@ -715,11 +718,30 @@ const fn volume_tolerance(format: ConformanceFormat) -> u16 {
 /// envelope unit of disagreement is `(256 * 1024) >> 16 == 4` pan units at the widest, so
 /// four is the derived bound rather than a chosen one. A channel with **no** panning
 /// envelope is compared exactly on both sides, which is what the `PanMemory` and
-/// `PanSlideMem` fixtures test — accuracy policy D44.
+/// `PanSlideMem` fixtures test — accuracy policy D44. IT reaches the same bound through the
+/// same mechanism, `pan += envelope · (256 - pan) / 32` over a Q16.16 envelope value —
+/// accuracy policy D86.
 const fn pan_tolerance(format: ConformanceFormat) -> u16 {
     match format {
-        ConformanceFormat::Mod | ConformanceFormat::S3m | ConformanceFormat::Mtm | ConformanceFormat::It => 0,
-        ConformanceFormat::Xm => 4,
+        ConformanceFormat::Mod | ConformanceFormat::S3m | ConformanceFormat::Mtm => 0,
+        ConformanceFormat::Xm | ConformanceFormat::It => 4,
+    }
+}
+
+/// How far apart the two implementations' idea of the same filter cutoff may be, on
+/// libxmp's **doubled** `0..=254` cutoff axis where one step is half an IT unit.
+///
+/// Exact for every format without a filter. **Two** for IT, and both halves of it are one
+/// deviation: libxmp holds `xc->filter.envelope` at its previous value whenever the filter
+/// envelope reads `0xfe` or more (`src/player.c:1318`, initialised to `0x100` by
+/// `src/read_event.c:134`), where Impulse Tracker and OpenMPT feed the envelope straight
+/// into `cutoff · (envModifier + 256) / 256` (OpenMPT `Snd_flt.cpp` `SetupChannelFilter`).
+/// The envelope axis is `0..=256` and the cutoff is at most 254, so holding two envelope
+/// units moves the cutoff by at most `254 · 2 / 256 < 2`. Accuracy policy D85.
+const fn cutoff_tolerance(format: ConformanceFormat) -> u16 {
+    match format {
+        ConformanceFormat::Mod | ConformanceFormat::S3m | ConformanceFormat::Mtm | ConformanceFormat::Xm => 0,
+        ConformanceFormat::It => 2,
     }
 }
 
@@ -845,6 +867,7 @@ fn project_libxmp_dump(
         expected_tick.tick_in_row = upstream_tick.frame;
         let mut actual_tick_projection = header_projection(actual_tick);
         actual_tick_projection.frame = actual_end_frames[actual_index];
+        actual_tick_projection.tick_in_row = project_tick_in_row(format, actual_tick.tick_in_row, actual_tick.speed);
 
         let upstream_by_channel: BTreeMap<u16, &LibxmpChannel> = upstream_tick.channels.iter().map(|channel| (channel.channel, channel)).collect();
         // The oracle's channel column covers libxmp's *virtual* channels, so for IT it
@@ -885,12 +908,16 @@ fn project_libxmp_dump(
                     expected_channel.position = actual_channel.position;
                 }
                 if let Some(cutoff) = upstream_channel.cutoff {
-                    // libxmp leaves a voice whose filter was never engaged at zero, which
-                    // is C1's fully-open 255; and its own comparator accepts any two
-                    // values at or above 254 as the same fully-open cutoff
-                    // (`test-dev/compare_mixer_data.c:84-87`). Operative values are exact.
+                    // libxmp's own comparator accepts any two values at or above 254 as
+                    // the same fully-open cutoff (`test-dev/compare_mixer_data.c:84-87`),
+                    // and its dump column is a *mixer* voice field that is only ever
+                    // written when the filter engages (`src/player.c:1330-1341` calls
+                    // `libxmp_virt_seteffect(DSP_EFFECT_CUTOFF)` only inside that branch),
+                    // so a zero there is either "never engaged" — C1's fully-open 255 —
+                    // or a genuine cutoff of zero. Accept both readings and let every
+                    // other value be exact (accuracy policy D84).
                     expected_channel.cutoff = match cutoff {
-                        0 => 255,
+                        0 if actual_channel.cutoff >= 254 => actual_channel.cutoff,
                         254.. if actual_channel.cutoff >= 254 => actual_channel.cutoff,
                         cutoff => cutoff,
                     };
@@ -921,6 +948,16 @@ fn project_libxmp_dump(
     }
 
     (Trace { version: TRACE_FORMAT_VERSION, ticks: expected_ticks }, Trace { version: actual.version, ticks: actual_ticks })
+}
+
+/// IT's row-delay repeats restart the player-visible tick counter, while the engine's
+/// `RowClock` deliberately exposes the absolute tick budget so processors can distinguish
+/// repeated first ticks. Project only this diagnostic representation (accuracy policy D81).
+const fn project_tick_in_row(format: ConformanceFormat, tick_in_row: u16, speed: u8) -> u16 {
+    match format {
+        ConformanceFormat::It => tick_in_row % (if speed == 0 { 1 } else { speed }) as u16,
+        _ => tick_in_row,
+    }
 }
 
 /// libxmp's virtual-channel number for every background voice of every tick, in trace
@@ -1230,6 +1267,21 @@ mod tests {
     use starplayer::engine::SongPosition;
 
     use super::*;
+
+    #[test]
+    fn it_volume_projection_allows_only_the_documented_final_quantisation_bit() {
+        assert_eq!(volume_tolerance(ConformanceFormat::It), 1);
+        assert_eq!(volume_tolerance(ConformanceFormat::Mod), 0);
+        assert_eq!(volume_tolerance(ConformanceFormat::S3m), 0);
+        assert_eq!(volume_tolerance(ConformanceFormat::Mtm), 0);
+    }
+
+    #[test]
+    fn it_row_delay_projects_the_absolute_clock_onto_its_repeating_tick_counter() {
+        assert_eq!(project_tick_in_row(ConformanceFormat::It, 6, 6), 0);
+        assert_eq!(project_tick_in_row(ConformanceFormat::It, 8, 6), 2);
+        assert_eq!(project_tick_in_row(ConformanceFormat::Xm, 6, 6), 6);
+    }
 
     fn cases() -> Vec<ConformanceCase> {
         parse_case_manifest("case-one\tlibxmp\ts3m\tdata/a.s3m\tdata/a.data\tparameter memory\n").expect("valid manifest")

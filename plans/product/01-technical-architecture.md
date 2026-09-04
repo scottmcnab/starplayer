@@ -554,6 +554,16 @@ the fadeout into the score explicitly (`v = volume * fadeout_volume` for a fadin
 `volume << 16` otherwise) rather than relying on a cached mixing volume, and it uses a
 fixed 25 % threshold instead of the stealing note's own score.
 
+**Retirement, settled in M6-G6.** The complement of stealing is when a voice *leaves* the
+pool, and Impulse Tracker's rule is asymmetric: libxmp reclaims a zero-volume voice only
+when its channel index is past the module's own tracks (`libxmp_virt_setvol`,
+`src/virtual.c:325`), and OpenMPT's `NoteCut` under `kITSCxStopsSample` zeroes the
+increment and the fadeout but leaves the note, the instrument and the sample on the
+channel. `ItProcessor` therefore frees a silent **background** voice outright and keeps a
+foreground one that `SCx` silenced, so the channel keeps reporting its note until another
+note replaces it. It does not yet keep a foreground voice whose *fadeout* reached zero;
+that is `G6-IT-005`, and it needs a reclaim rule to come with it.
+
 `ItProcessor::choose_victim` implements OpenMPT's rule with Schism's explicit fadeout term
 folded in, because StarPlayer recomputes a voice's volume from its articulation each tick
 rather than caching a 14-bit mixing volume. It is **a concrete policy in `starplayer-it`,

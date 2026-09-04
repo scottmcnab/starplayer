@@ -61,17 +61,46 @@ not something to guess. It is architecture open question **Q3**.
 * Deliverable 8 grew: the harness's own completeness audit means wiring `it` brings in
   **121** cases, not the 59 `openmpt/it` fixtures the task file named — the 62 `data/*.it`
   `compare_mixer_data` pairs come with them. 39 pass (13 with every field enforced, 26
-  waiving `position` under accuracy-policy D67) and 82 are recorded as `G3-IT-001` …
+  waiving `position` under accuracy-policy D67) and 82 were recorded as `G3-IT-001` …
   `G3-IT-008` in `conformance/known-failures.md` for **G6**, grouped by the first field
-  that diverges so each group is one piece of work.
+  that diverges so each group is one piece of work. G6 has since settled them and
+  renumbered the remainder `G6-IT-001` … `G6-IT-007`.
 * Two new `QuirkSet` fields, each named by a corpus case: `it_pattern_loop`
   (`ItLoopDialect`, four `Cwt/v`-gated `SBx` profiles — accuracy policy D65) and the IT
   dialects' `tempo_model`.
+
+## G6 — the conformance repair pass
+
+* **55 of 121 IT cases pass** (14 with every field enforced, 41 waiving `position` under
+  accuracy-policy D67), up from G3's 39. The 66 that remain are regrouped as
+  `G6-IT-001` … `G6-IT-007` in `conformance/known-failures.md`, one group per first
+  diverging field, and `--strict` names exactly those plus `C2-S3M-009` and F5's four XM
+  records. MOD 16/27, S3M 16/17, MTM 1/3 and XM 87/93 are unchanged.
+* Seven new accuracy-policy entries, **D80**–**D86**: the volume chain's one-step
+  projection tolerance, the row-delay tick counter, ModPlug Tracker 1.16's IT pattern-loop
+  profile, the ping-pong cycle with `S9E`/`S9F`, libxmp's ambiguous zero cutoff, the
+  two-step cutoff tolerance and the four-unit pan tolerance.
+* One new `QuirkSet` value named by a corpus case: `ItLoopDialect::ModPlug116`, selected
+  by `FormatDialect::ModPlugIt` (D82, `data/pattern_loop_mpt.it`) — the same flow profile
+  C5 already carries for S3M, so one detected tracker now has one profile in both formats.
+* The IT golden hash moved. `goldens/it/synthetic__i16_mono_44100_linear.sha256` is a
+  render of the synthetic IT fixture, and the fixture carries a `Zxx` filter macro and an
+  `SCx`; both of G6's largest repairs — the filter staying engaged when a fully open
+  cutoff arrives without a note trigger, and `SCx` silencing a voice without taking it off
+  the channel — change what that render contains. Regenerated with `cargo xtask goldens`.
+* `TempoModelId::ItModern` was left alone, as the task file required. **Four** cases
+  depend on it: the `G6-IT-006` group is entirely `frame`-column divergence, and
+  `libxmp-it-storlek-22`'s 7100-against-3445 at tick zero is the tick length itself.
 
 ## Exit criteria
 
 The IT conformance corpus passes with exclusions justified; dense real-world `.it` files
 sound right, including their voice-stealing behaviour.
+
+G6 leaves 66 cases recorded rather than passing, so the corpus half of this criterion is
+met only in the sense M2 met it: every remaining case is executed on every run, grouped,
+and carries the evidence that would settle it. The owner's listening check on the three
+dense `data/m/*.it` modules is the other half.
 
 ## Out of scope
 

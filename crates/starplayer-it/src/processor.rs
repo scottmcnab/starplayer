@@ -117,6 +117,7 @@ const COMMAND_GLOBAL_VOLUME_SLIDE: u8 = 23;
 const COMMAND_PAN: u8 = 24;
 const COMMAND_PANBRELLO: u8 = 25;
 const COMMAND_MIDI_MACRO: u8 = 26;
+const COMMAND_SMOOTH_MIDI_MACRO: u8 = 27;
 
 /// ITTECH.TXT's `FineSineData`, 256 entries peaking at ±64 — the table `Hxy`, `Rxy`,
 /// `Yxy` and per-sample auto-vibrato all read.
@@ -269,6 +270,11 @@ pub struct ItVoiceState {
     pub note_fade: bool,
     /// The voice still has a sample to play. OpenMPT's `nLength != 0`.
     pub playing: bool,
+    /// `SCx` silenced this voice. Impulse Tracker zeroes the increment and the fadeout but
+    /// leaves the note on the channel, where a `^^` note cut takes the channel away
+    /// altogether (OpenMPT `Snd_fx.cpp` `NoteCut` under `kITSCxStopsSample`, against
+    /// libxmp's `libxmp_virt_resetchannel` for `XMP_KEY_CUT`).
+    pub cut_by_scx: bool,
     pub auto_vibrato_position: u16,
     pub auto_vibrato_depth: u32,
     /// The per-note random volume offset, applied to the instrument volume.
@@ -319,6 +325,7 @@ impl Default for ItVoiceState {
             key_off_previous: false,
             note_fade: false,
             playing: false,
+            cut_by_scx: false,
             auto_vibrato_position: 0,
             auto_vibrato_depth: 0,
             volume_swing: 0,
@@ -431,6 +438,18 @@ pub struct ItChannel {
     pub filter_active: bool,
     /// Which of the sixteen parametered macros `Zxx` below `0x80` runs (`SFx`).
     pub active_macro: u8,
+    /// The last MIDI macro parameter and a smooth macro's fixed-point interpolation.
+    pub macro_value: i32,
+    pub macro_target: i32,
+    pub macro_slide: i32,
+    /// The **previous** tick's computed volume and pan, which the `u` and `y` macro
+    /// letters read. A macro runs at the top of the tick, before the tick's own volume
+    /// and pan are computed, and the value it sees belongs to the channel rather than to
+    /// the voice — it survives a note change and an idle row (libxmp
+    /// `xc->macro.finalvol` / `xc->macro.notepan`, `src/player.c:1113,1374`; OpenMPT
+    /// `chn.nCalcVolume` / `chn.nRealPan`, `MIDIMacroParser.cpp` letters `u` and `y`).
+    pub macro_real_volume: i32,
+    pub macro_real_pan: i16,
     /// `nNewNote` / `nLastNote`: the note a lone instrument number would play.
     /// `kITInitialNoteMemory` starts it at `C-0`, not "no note".
     pub last_note: u8,
@@ -517,6 +536,11 @@ impl ItChannel {
             resonance: 0,
             filter_active: false,
             active_macro: 0,
+            macro_value: 0,
+            macro_target: 0,
+            macro_slide: 0,
+            macro_real_volume: 0,
+            macro_real_pan: 128,
             last_note: 0,
             last_instrument: 0,
             pending_instrument: 0,
@@ -718,10 +742,18 @@ fn sample_region(sample: &SampleIndex, sustain: bool) -> SampleRegion {
 
 /// One envelope's interpolated value at `position`, already multiplied by `scale`.
 ///
-/// OpenMPT interpolates in 16.16 and rounds once on the way out
-/// (`InstrumentEnvelope::GetValueFromPosition`); scaling inside the interpolation is the
-/// same arithmetic without the intermediate precision loss.
-fn envelope_value(envelope: &Envelope, position: u16, scale: i32) -> i32 {
+/// OpenMPT interpolates in Q16.16 over the file's own `0..=64` node domain and rounds once
+/// after scaling the output — `InstrumentEnvelope::GetValueFromPosition(position, rangeOut,
+/// rangeIn = 64)` in `ModInstrument.cpp`, which its three callers ask for a `0..=256`
+/// volume, a `0..=64` pan and a `0..=512` pitch/filter value from.
+///
+/// IT's volume envelope is stored in the model as the file's own `0..=64`, so its
+/// `centre_offset` is zero. The pan and pitch/filter envelopes are stored as `-32..=32`,
+/// so theirs is 32: the interpolation runs in the file's unsigned domain and the offset
+/// comes back off the scaled result. That is not only bookkeeping — it keeps every
+/// intermediate division non-negative, so a falling segment truncates the way OpenMPT's
+/// does rather than toward zero.
+fn envelope_value(envelope: &Envelope, position: u16, scale: i32, centre_offset: i32) -> i32 {
     let points = &envelope.points;
     let Some(&last) = points.last() else { return 0 };
     let mut index = points.len() - 1;
@@ -741,9 +773,11 @@ fn envelope_value(envelope: &Envelope, position: u16, scale: i32) -> i32 {
     if span <= 0 {
         return point.value as i32 * scale;
     }
-    let base = previous.value as i32 * scale;
-    let delta = (point.value as i32 - previous.value as i32) * scale;
-    base + (position as i32 - previous.tick as i32) * delta / span
+    let output_range = 64 * scale;
+    let mut value_q16 = (previous.value as i32 + centre_offset) * 65_536 / 64;
+    let destination_q16 = (point.value as i32 + centre_offset) * 65_536 / 64;
+    value_q16 += (position as i32 - previous.tick as i32) * (destination_q16 - value_q16) / span;
+    (value_q16 * output_range + 32_768) / 65_536 - centre_offset * scale
 }
 
 /// The envelope tick a loop or sustain span sends the position back to, and the tick it
@@ -927,10 +961,17 @@ impl ItProcessor {
         // unless the instrument actually changed or the sample already stopped, in which
         // case it synthesises the channel's remembered note and retriggers
         // (`kITInstrWithoutNote`, `it_instrument_memory_default.it`, `StoppedInstrSwap.it`).
-        if note == NOTE_NONE && instrument != INSTRUMENT_NONE && self.instrument_mode {
+        if note == NOTE_NONE && instrument != INSTRUMENT_NONE {
             let playing = self.foreground_playing(channel_index);
-            let current = self.foreground_instrument(channel_index);
-            if current != instrument as u16 || !playing {
+            // Sample mode compares the *sample* the number addresses, exactly as OpenMPT's
+            // `kITInstrWithoutNote` branch does (`Snd_fx.cpp`: instrument mode compares
+            // `chn.pModInstrument`, sample mode `chn.pModSample`), so a lone sample number
+            // after `SCx` retriggers there too.
+            let changed = match self.instrument_mode {
+                true => self.foreground_instrument(channel_index) != instrument as u16,
+                false => self.foreground_sample(channel_index) != instrument as u16,
+            };
+            if changed || !playing {
                 note = self.channels[channel_index].last_note;
             }
         }
@@ -939,8 +980,8 @@ impl ItProcessor {
             self.channels[channel_index].last_note = note;
             if !tone_portamento {
                 self.check_new_note_action(context, channel_index, instrument, note);
+                self.restore_channel_pan(channel_index);
             }
-            self.restore_channel_pan(channel_index);
         }
 
         // A note with no instrument column still adopts an instrument number latched
@@ -998,6 +1039,14 @@ impl ItProcessor {
             return;
         }
         self.channels[channel_index].note_volume = self.sample_volume(sample);
+        // A lone instrument number leaves the playing voice's identity and sample data
+        // alone, but immediately adopts the addressed sample/instrument volume product.
+        // `it_channel_filter.it` varies instrument global volume this way while the
+        // trace correctly continues to identify the original voice as instrument 1.
+        let instrument_volume = self.instrument_volume(instrument as u16, sample);
+        if let Some(state) = self.foreground_state_mut(channel_index) {
+            state.instrument_volume = instrument_volume;
+        }
         if !self.instrument_mode {
             return;
         }
@@ -1033,7 +1082,7 @@ impl ItProcessor {
                 return;
             }
             NOTE_CUT => {
-                self.cut_foreground(channel_index);
+                self.cut_foreground(channel_index, false);
                 return;
             }
             NOTE_FADE => {
@@ -1071,12 +1120,6 @@ impl ItProcessor {
             let current_sample = self.foreground_sample(channel_index);
             if !self.compatible_gxx && current_sample != sample {
                 self.start_note(context, channel_index, instrument_number, sample, note, mapped_note, frequency, reference_rate_hz, true);
-            } else if self.compatible_gxx {
-                // `NewFrequency = OldFrequency * NewC5 / OldC5` when the sample changes
-                // under Compatible Gxx.
-                if let Some(state) = self.foreground_state_mut(channel_index) {
-                    state.note = mapped_note;
-                }
             }
             self.channels[channel_index].last_note = note;
             return;
@@ -1114,6 +1157,7 @@ impl ItProcessor {
         keep_position: bool,
     ) {
         let Some(sample_index) = self.sample_index(sample) else { return };
+        let carried_envelopes = self.carried_envelopes(channel_index, instrument);
         let region = sample_region(sample_index, sample_index.sustain_loop().is_some());
         let sample_default_pan = sample_index.default_pan();
         let channel_id = ChannelId(channel_index as u16);
@@ -1195,6 +1239,11 @@ impl ItProcessor {
             new_note_action: carry.map(|(_, action)| action).unwrap_or(NewNoteAction::Cut),
             ..ItVoiceState::default()
         };
+        if let Some((volume, panning, pitch)) = carried_envelopes {
+            entry.volume_envelope = volume;
+            entry.panning_envelope = panning;
+            entry.pitch_envelope = pitch;
+        }
         // `kITNNAReset`: the New Note Action is reset by a note, not by an instrument
         // number, so an `S73`..`S76` override survives a lone instrument (`s7xinsnum.it`).
         self.channels[channel_index].new_note_action = carry.map(|(_, action)| action).unwrap_or(NewNoteAction::Cut);
@@ -1212,6 +1261,32 @@ impl ItProcessor {
         self.channels[channel_index].sample_offset = 0;
         self.roll_swing(voice, instrument);
         self.apply_envelope_flags(voice, instrument);
+    }
+
+    /// Envelope Carry copies the preceding voice's counters into a newly allocated
+    /// voice. Depending on its NNA, that voice is either still the channel foreground or
+    /// was just detached and recorded as `m_lastMovedChannel`.
+    fn carried_envelopes(&self, channel_index: usize, instrument: u16) -> Option<(ItEnvelopeState, ItEnvelopeState, ItEnvelopeState)> {
+        let definition = self.instrument_def(instrument)?;
+        let source_voice = self.channels[channel_index].voice.or(self.last_moved_voice)?;
+        let source = self.voices.get(source_voice.index() as usize).filter(|state| state.owns(source_voice))?;
+        let mut volume = ItEnvelopeState::default();
+        let mut panning = ItEnvelopeState::default();
+        let mut pitch = ItEnvelopeState::default();
+        let mut any = false;
+        if definition.volume_envelope.as_ref().is_some_and(|envelope| envelope.carry) {
+            volume = source.volume_envelope;
+            any = true;
+        }
+        if definition.panning_envelope.as_ref().is_some_and(|envelope| envelope.carry) {
+            panning = source.panning_envelope;
+            any = true;
+        }
+        if definition.pitch_envelope.as_ref().is_some_and(|envelope| envelope.carry) {
+            pitch = source.pitch_envelope;
+            any = true;
+        }
+        any.then_some((volume, panning, pitch))
     }
 
     /// Allocate a voice, stealing a background one if the pool is full.
@@ -1453,7 +1528,7 @@ impl ItProcessor {
 
     /// `^^^` and `SCx`: IT really stops the sample rather than muting it
     /// (`kITSCxStopsSample`, `scx.it`).
-    fn cut_foreground(&mut self, channel_index: usize) {
+    fn cut_foreground(&mut self, channel_index: usize, by_scx: bool) {
         // `kITNoteCutWithPorta`: picking the note back up with a lone instrument number
         // also forgets the portamento's pitch.
         self.channels[channel_index].portamento_target_hz = 0;
@@ -1461,13 +1536,14 @@ impl ItProcessor {
             state.fadeout = 0;
             state.note_fade = true;
             state.playing = false;
+            state.cut_by_scx = by_scx;
         }
     }
 }
 
 /// A model pan position as IT's 0..=256 channel pan.
 fn bipolar_to_pan(pan: I1F15) -> i16 {
-    ((pan.to_bits() as i32 + 32_768) * MAX_PAN / 65_536).clamp(0, MAX_PAN) as i16
+    (((pan.to_bits() as i32 + 32_768) * MAX_PAN + 32_768) / 65_536).clamp(0, MAX_PAN) as i16
 }
 
 /// IT's 0..=256 pan as the bipolar position a voice takes.
@@ -1591,14 +1667,24 @@ impl ItProcessor {
                 self.set_pan(channel_index, ((parameter as i32 + 2) >> 2).min(64) as i16 * 4);
             }
             COMMAND_PANBRELLO => self.init_panbrello(channel_index, parameter),
-            COMMAND_MIDI_MACRO => self.midi_macro(channel_index, parameter),
+            COMMAND_MIDI_MACRO => {
+                self.channels[channel_index].macro_value = (parameter as i32) << 16;
+                self.channels[channel_index].macro_target = (parameter as i32) << 16;
+                self.channels[channel_index].macro_slide = 0;
+                self.midi_macro(context, channel_index, parameter);
+            }
+            COMMAND_SMOOTH_MIDI_MACRO => {
+                let channel = &mut self.channels[channel_index];
+                channel.macro_target = (parameter as i32) << 16;
+                channel.macro_slide = (channel.macro_target - channel.macro_value) / self.song_speed.max(1) as i32;
+            }
             _ => {}
         }
         self.volume_column_effect(channel_index, true);
     }
 
     /// Per-tick effects, for every tick of the row past the channel's own first.
-    fn tick_effect(&mut self, channel_index: usize, tick_in_repeat: u16, outcome: &mut TickOutcome) {
+    fn tick_effect(&mut self, context: &TickContext<'_>, channel_index: usize, tick_in_repeat: u16, outcome: &mut TickOutcome) {
         let cell = self.channels[channel_index].row;
         let parameter = cell.info;
         match cell.command {
@@ -1624,6 +1710,7 @@ impl ItProcessor {
             COMMAND_TEMPO => outcome.tempo_bpm = self.tempo_slide(channel_index, outcome.tempo_bpm),
             COMMAND_GLOBAL_VOLUME_SLIDE => self.global_volume_slide(channel_index, parameter, false),
             COMMAND_PANBRELLO => self.run_panbrello(channel_index),
+            COMMAND_SMOOTH_MIDI_MACRO => self.smooth_midi_macro(context, channel_index),
             _ => {}
         }
         self.volume_column_effect(channel_index, false);
@@ -1767,9 +1854,10 @@ impl ItProcessor {
 
     /// One IT pitch slide, in 1/64ths of a semitone.
     ///
-    /// Linear slides multiply the frequency by `2^(amount/768)`, reading the coarse table
-    /// at `|amount|/4` and the fine table at `|amount| & 3`. Amiga slides use IT's own
-    /// reciprocal form, which is still a frequency operation — IT never holds a period.
+    /// Linear slides multiply the frequency through IT's two lookup-table domains: fine
+    /// amounts below 16 index the fine table directly, while larger amounts index the
+    /// coarse table at `|amount| / 4` and discard the low two bits. Amiga slides use IT's
+    /// own reciprocal form, which is still a frequency operation — IT never holds a period.
     fn slide_frequency(&mut self, channel_index: usize, amount: i32) {
         let frequency = self.channels[channel_index].frequency_hz;
         let updated = self.slide_value(frequency, amount);
@@ -1792,25 +1880,24 @@ impl ItProcessor {
             return (frequency as i64 * AMIGA_NUMERATOR / denominator).clamp(1, u32::MAX as i64) as u32;
         }
         let magnitude = amount.unsigned_abs().min(255 * 4 + 3);
-        let coarse = (magnitude / 4).min(255) as u8;
-        let fine = (magnitude % 4) as u8;
-        let mut value = frequency;
-        if amount > 0 {
-            value = apply_slide_ratio(value, linear_slide_up_q16(coarse));
-            if fine != 0 {
-                value = apply_slide_ratio(value, fine_linear_slide_up_q16(fine));
-            }
-            if value == frequency {
-                value = value.saturating_add(1);
+        let ratio = if magnitude < 16 {
+            match amount > 0 {
+                true => fine_linear_slide_up_q16(magnitude as u8),
+                false => fine_linear_slide_down_q16(magnitude as u8),
             }
         } else {
-            value = apply_slide_ratio(value, linear_slide_down_q16(coarse));
-            if fine != 0 {
-                value = apply_slide_ratio(value, fine_linear_slide_down_q16(fine));
+            let coarse = (magnitude / 4).min(255) as u8;
+            match amount > 0 {
+                true => linear_slide_up_q16(coarse),
+                false => linear_slide_down_q16(coarse),
             }
-            if value == frequency {
-                value = value.saturating_sub(1);
-            }
+        };
+        let mut value = apply_slide_ratio(frequency, ratio);
+        if value == frequency {
+            value = match amount > 0 {
+                true => value.saturating_add(1),
+                false => value.saturating_sub(1),
+            };
         }
         value.max(1)
     }
@@ -2193,14 +2280,34 @@ impl ItProcessor {
     /// Only IT's two internal macros exist in a sample-only engine: `F0 F0 00 z` sets the
     /// filter cutoff and `F0 F0 01 z` the resonance. Everything else is parsed so message
     /// boundaries stay right and then reported rather than emitted.
-    fn midi_macro(&mut self, channel_index: usize, parameter: u8) {
+    fn midi_macro(&mut self, context: &TickContext<'_>, channel_index: usize, parameter: u8) {
         let data = ItFormatData::from_header(self.module.header());
         let macro_bytes = match parameter >= 0x80 {
             true => data.and_then(|data| data.fixed_macro((parameter & 0x7F) as usize)),
             false => data.and_then(|data| data.parametered_macro(self.channels[channel_index].active_macro as usize)),
         };
+        let channel = &self.channels[channel_index];
+        let voice = channel.voice.and_then(|voice| self.voices.get(voice.index() as usize).filter(|state| state.owns(voice)));
+        let substitutions = MacroSubstitutions {
+            parameter,
+            note: channel.last_note & 0x7F,
+            channel: channel_index.min(127) as u8,
+            offset: channel.offset_memory,
+            reverse: channel.voice.and_then(|voice| context.voices.get(voice)).is_some_and(|voice| voice.is_reversed()) as u8,
+            // `v`: `muldiv((volume + swing) · global, channel · instrument, 1 << 20) / 2`,
+            // read live from the channel's own columns rather than from the voice.
+            note_velocity: {
+                let instrument_volume = voice.map(|state| state.instrument_volume).unwrap_or(MAX_CHANNEL_VOLUME);
+                let volume_swing = voice.map(|state| state.volume_swing as i64).unwrap_or(0);
+                let product = (channel.note_volume.max(0) as i64 + volume_swing) * (self.global_volume as i64 * 2) * channel.channel_volume as i64 * instrument_volume as i64;
+                ((product >> 20) / 2).clamp(1, 127) as u8
+            },
+            computed_velocity: (channel.macro_real_volume >> 7).clamp(1, 127) as u8,
+            note_pan: ((channel.pan as i32 + channel.panbrello_offset).clamp(0, 256) / 2).min(127) as u8,
+            computed_pan: (channel.macro_real_pan.clamp(0, 255) / 2) as u8,
+        };
         let (cutoff, resonance) = match macro_bytes {
-            Some(bytes) => parse_filter_macro(bytes, parameter),
+            Some(bytes) => parse_filter_macro(bytes, substitutions),
             // The default configuration: `Z00`..`Z7F` is `F0F000z`, and `Z80`..`Z8F` is
             // `F0F001` with the parameter in steps of eight.
             None => match parameter {
@@ -2221,6 +2328,21 @@ impl ItProcessor {
                 state.resonance = resonance.min(0x7F);
             }
         }
+    }
+
+    fn smooth_midi_macro(&mut self, context: &TickContext<'_>, channel_index: usize) {
+        let parameter = {
+            let channel = &mut self.channels[channel_index];
+            channel.macro_value += channel.macro_slide;
+            if (channel.macro_slide > 0 && channel.macro_value > channel.macro_target)
+                || (channel.macro_slide < 0 && channel.macro_value < channel.macro_target)
+            {
+                channel.macro_value = channel.macro_target;
+                channel.macro_slide = 0;
+            }
+            (channel.macro_value >> 16).clamp(0, 255) as u8
+        };
+        self.midi_macro(context, channel_index, parameter);
     }
 
     /// The whole `Sxy` family. One memory covers the entire byte, so `S00` recalls the
@@ -2274,6 +2396,21 @@ impl ItProcessor {
                     self.channels[channel_index].surround = true;
                     if let Some(state) = self.foreground_state_mut(channel_index) {
                         state.surround = true;
+                    }
+                }
+                // OpenMPT's `kITReverseSample`: S9E resumes forward playback; S9F
+                // reverses it and, on a fresh note or a non-looping sample at position
+                // zero, starts at the final fractional position of the sample.
+                0xE | 0xF => {
+                    let reverse = argument == 0xF;
+                    let triggered = self.channels[channel_index].triggered;
+                    if let Some(voice) = self.channels[channel_index].voice
+                        && let Some(slot) = context.voices.get_mut(voice)
+                    {
+                        if reverse && slot.position() == 0 && (triggered || slot.region().loop_span().is_none()) {
+                            slot.set_position(((slot.region().length_frames() as u64) << 32).saturating_sub(1));
+                        }
+                        slot.set_reversed(reverse);
                     }
                 }
                 _ => {}
@@ -2354,67 +2491,92 @@ impl ItProcessor {
     }
 }
 
-/// The cutoff and resonance an IT MIDI macro sets, if it is one of the two internal ones.
-///
-/// The macro is a string of nibbles with letter substitutions; only `z` — the `Zxx`
-/// parameter — is meaningful for a sample-only engine, and only the `F0 F0 00 xx` and
-/// `F0 F0 01 xx` messages do anything.
-fn parse_filter_macro(bytes: &[u8], parameter: u8) -> (Option<u8>, Option<u8>) {
-    let mut message = [0u8; 4];
-    let mut length = 0usize;
-    let mut nibble: Option<u8> = None;
-    let push = |value: u8, message: &mut [u8; 4], length: &mut usize| {
-        if *length < message.len() {
-            message[*length] = value;
+#[derive(Copy, Clone)]
+struct MacroSubstitutions {
+    parameter: u8,
+    note: u8,
+    channel: u8,
+    offset: u8,
+    reverse: u8,
+    note_velocity: u8,
+    computed_velocity: u8,
+    note_pan: u8,
+    computed_pan: u8,
+}
+
+struct MacroNibbleStream<'a> {
+    bytes: &'a [u8],
+    index: usize,
+    buffered: Option<u8>,
+    substitutions: MacroSubstitutions,
+}
+
+impl MacroNibbleStream<'_> {
+    fn next_nibble(&mut self) -> Option<u8> {
+        if let Some(nibble) = self.buffered.take() {
+            return Some(nibble);
         }
-        *length += 1;
-    };
-    for &byte in bytes {
-        let digit = match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            0 => break,
-            b'z' => {
-                if let Some(high) = nibble.take() {
-                    push(high << 4, &mut message, &mut length);
-                }
-                push(parameter, &mut message, &mut length);
-                continue;
-            }
-            b' ' => {
-                if let Some(high) = nibble.take() {
-                    push(high << 4, &mut message, &mut length);
-                }
-                continue;
-            }
-            // Any other letter is a value this engine cannot supply; treat it as zero so
-            // the message boundaries stay right.
-            _ => {
-                if let Some(high) = nibble.take() {
-                    push(high << 4, &mut message, &mut length);
-                }
-                push(0, &mut message, &mut length);
-                continue;
-            }
-        };
-        let Some(digit) = digit else { continue };
-        match nibble.take() {
-            Some(high) => push(high << 4 | digit, &mut message, &mut length),
-            None => nibble = Some(digit),
+        while let Some(&byte) = self.bytes.get(self.index) {
+            self.index += 1;
+            let value = match byte {
+                b'0'..=b'9' => return Some(byte - b'0'),
+                b'A'..=b'F' => return Some(byte - b'A' + 10),
+                b'z' => self.substitutions.parameter,
+                b'n' => self.substitutions.note,
+                b'h' => self.substitutions.channel,
+                b'o' => self.substitutions.offset,
+                b'm' => self.substitutions.reverse,
+                b'v' => self.substitutions.note_velocity,
+                b'u' => self.substitutions.computed_velocity,
+                b'x' => self.substitutions.note_pan,
+                b'y' => self.substitutions.computed_pan,
+                b'a' | b'b' | b'p' | b's' | b'c' => 0,
+                0 => return None,
+                _ => continue,
+            };
+            self.buffered = Some(value & 0x0F);
+            return Some(value >> 4);
+        }
+        None
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let high = self.next_nibble()?;
+        let low = self.next_nibble()?;
+        Some(high << 4 | low)
+    }
+}
+
+/// Parse every internal message in one macro. Real-time stop/status bytes reset the
+/// filter, and the last internal cutoff or resonance write wins.
+fn parse_filter_macro(bytes: &[u8], substitutions: MacroSubstitutions) -> (Option<u8>, Option<u8>) {
+    let mut stream = MacroNibbleStream { bytes, index: 0, buffered: None, substitutions };
+    let mut cutoff = None;
+    let mut resonance = None;
+    while let Some(first) = stream.next_byte() {
+        if matches!(first, 0xFA | 0xFC | 0xFF) {
+            cutoff = Some(0x7F);
+            resonance = Some(0);
+            continue;
+        }
+        if first != 0xF0 {
+            continue;
+        }
+        let Some(second) = stream.next_byte() else { break };
+        if !matches!(second, 0xF0 | 0xF1) {
+            continue;
+        }
+        let (Some(command), Some(value)) = (stream.next_byte(), stream.next_byte()) else { break };
+        if command >= 0x80 || value >= 0x80 {
+            continue;
+        }
+        match command {
+            0 => cutoff = Some(value),
+            1 => resonance = Some(value),
+            _ => {}
         }
     }
-    if let Some(high) = nibble {
-        push(high << 4, &mut message, &mut length);
-    }
-    if length >= 4 && message[0] == 0xF0 && message[1] == 0xF0 && message[3] < 0x80 {
-        return match message[2] {
-            0x00 => (Some(message[3]), None),
-            0x01 => (None, Some(message[3])),
-            _ => (None, None),
-        };
-    }
-    (None, None)
+    (cutoff, resonance)
 }
 
 // ── the tick ─────────────────────────────────────────────────────────────────────────
@@ -2450,7 +2612,7 @@ impl ItProcessor {
                 if channel_first_tick {
                     self.static_effect(context, channel_index, outcome, song_first_tick);
                 } else {
-                    self.tick_effect(channel_index, tick_in_repeat, outcome);
+                    self.tick_effect(context, channel_index, tick_in_repeat, outcome);
                 }
             }
             self.apply_tremolo_and_tremor(channel_index);
@@ -2486,7 +2648,7 @@ impl ItProcessor {
         }
         if tick_in_repeat as u32 == self.channels[channel_index].note_cut as u32 {
             self.channels[channel_index].note_cut = 0;
-            self.cut_foreground(channel_index);
+            self.cut_foreground(channel_index, true);
         }
     }
 
@@ -2527,6 +2689,12 @@ impl ItProcessor {
                 self.voices[index].release();
                 continue;
             }
+            // `chn.triggerNote`: the note that started this voice landed on this very
+            // tick, which is the only moment IT is allowed to *disengage* a filter.
+            let trigger_note = {
+                let state = &self.voices[index];
+                state.foreground && self.channels.get(state.root_channel as usize).is_some_and(|channel| channel.triggered)
+            };
             let state = &mut self.voices[index];
             let definition = match instrument_mode {
                 true => module.instrument(InstrumentId(state.instrument.wrapping_sub(1))),
@@ -2546,7 +2714,7 @@ impl ItProcessor {
                     fade |= advance_envelope(&mut state.volume_envelope, envelope, key_off_previous);
                     let position = state.volume_envelope.position.saturating_sub(1);
                     if state.volume_envelope.position != 0 {
-                        state.volume_envelope.value = envelope_value(envelope, position, 4).clamp(0, MAX_NOTE_VOLUME);
+                        state.volume_envelope.value = envelope_value(envelope, position, 4, 0).clamp(0, MAX_NOTE_VOLUME);
                         volume = volume * state.volume_envelope.value / 256;
                     }
                     if fade {
@@ -2561,7 +2729,7 @@ impl ItProcessor {
                     advance_envelope(&mut state.panning_envelope, envelope, key_off_previous);
                     if state.panning_envelope.position != 0 {
                         let position = state.panning_envelope.position.saturating_sub(1);
-                        let value = envelope_value(envelope, position, 1).clamp(-32, 32);
+                        let value = envelope_value(envelope, position, 1, 32).clamp(-32, 32);
                         state.panning_envelope.value = value;
                         // The envelope's reach is proportional to the distance to the
                         // nearer edge, so a hard-panned voice barely moves outward.
@@ -2572,7 +2740,7 @@ impl ItProcessor {
                     advance_envelope(&mut state.pitch_envelope, envelope, key_off_previous);
                     if state.pitch_envelope.position != 0 {
                         let position = state.pitch_envelope.position.saturating_sub(1);
-                        let value = envelope_value(envelope, position, 8).clamp(-256, 256);
+                        let value = envelope_value(envelope, position, 8, 32).clamp(-256, 256);
                         state.pitch_envelope.value = value;
                         if state.pitch_envelope_is_filter {
                             filter_modifier = value;
@@ -2620,31 +2788,54 @@ impl ItProcessor {
             }
             state.real_pan = pan.clamp(0, MAX_PAN) as i16;
 
-            // The filter. IT only ever *disengages* it on a note trigger.
+            // The filter. `SetupChannelFilter` filters whenever the cutoff is not fully
+            // open or the resonance is set; otherwise it returns `-1` and *leaves the
+            // coefficients alone*, and only a note trigger on the same tick clears
+            // `CHN_FILTER` and so silences the filter (OpenMPT `Snd_flt.cpp`
+            // `SetupChannelFilter`, the `kITFilterBehaviour` branch; libxmp spells the
+            // same rule as `cutoff < 0xfe || resonance > 0 || xc->filter.can_disable`,
+            // `src/player.c:1330`). Test cases `filter-reset.it`, `filter-reset-carry.it`,
+            // `filter-nna.it`.
             let computed_cutoff = (state.cutoff as i32 * (filter_modifier + 256) / 256).clamp(0, 255) as u8;
             let filter = if state.resonance == 0 && computed_cutoff >= 254 {
-                state.filter_active = false;
-                Some(FilterParams::BYPASS)
+                match state.filter_active && !trigger_note {
+                    // Still filtering with the coefficients it already has.
+                    true => None,
+                    false => {
+                        state.filter_active = false;
+                        Some(FilterParams::BYPASS)
+                    }
+                }
             } else {
                 state.filter_active = true;
                 Some(FilterParams::from_it_scaled(computed_cutoff, state.resonance))
             };
 
-            let step = Step::from_ratio(frequency as u64, sample_rate_hz.max(1) as u64);
+            // `SCx` zeroes the increment outright (OpenMPT `Snd_fx.cpp` `NoteCut` under
+            // `kITSCxStopsSample`); the note itself stays on the channel.
+            let step = match state.playing {
+                true => Step::from_ratio(frequency as u64, sample_rate_hz.max(1) as u64),
+                false => Step::ZERO,
+            };
             let volume_unit = unit_from_ratio(real_volume as u32, 1 << 14);
             let pan_unit = pan_to_bipolar_position(state.real_pan);
             let written = state.written;
             let has_written = state.has_written;
-            state.written = VoiceParams { step, volume: volume_unit, pan: pan_unit, filter: filter.unwrap_or(FilterParams::BYPASS), dirty: DirtyBits::empty() };
+            let held_filter = match has_written {
+                true => written.filter,
+                false => FilterParams::BYPASS,
+            };
+            state.written = VoiceParams { step, volume: volume_unit, pan: pan_unit, filter: filter.unwrap_or(held_filter), dirty: DirtyBits::empty() };
             state.has_written = true;
-            let ended = state.note_fade && state.fadeout == 0 && real_volume == 0;
-            let stop = ended || !state.playing;
-
-            if stop {
-                // The voice is already silent — the fadeout reached zero, or `SCx` zeroed
-                // the increment — so the pool slot is released outright rather than
-                // flagged, which is what keeps the active voice set the same shape as
-                // libxmp's.
+            // A silent voice — the fadeout reached zero, or `SCx` zeroed the increment.
+            // Impulse Tracker frees the pool slot only for a *background* voice: libxmp
+            // reclaims a zero-volume voice only when its channel index is past the
+            // module's own tracks (`libxmp_virt_setvol`, `src/virtual.c:325`), and
+            // OpenMPT's `NoteCut` leaves the note, the instrument and the sample on the
+            // channel with `nFadeOutVol` at zero. A foreground channel therefore keeps
+            // reporting its silent note until another note replaces it.
+            let silent = state.note_fade && state.fadeout == 0 && real_volume == 0;
+            if silent && !(state.foreground && state.cut_by_scx) {
                 if state.foreground {
                     if let Some(slot) = context.voices.get_mut(voice) {
                         slot.stop();
@@ -2658,6 +2849,19 @@ impl ItProcessor {
                 }
                 self.voices[index].release();
                 continue;
+            }
+            // The channel's macro inputs, for the *next* tick's `u` and `y` letters. Only
+            // a voice that survives the tick writes them, exactly as libxmp only reaches
+            // `process_volume` for a channel whose voice is still active
+            // (`src/player.c:1633` returns early otherwise), so a cut or faded-out note
+            // leaves the last sounding values in place.
+            if self.voices[index].foreground {
+                let (real_volume, real_pan) = (self.voices[index].real_volume, self.voices[index].real_pan);
+                let root = self.voices[index].root_channel as usize;
+                if let Some(channel) = self.channels.get_mut(root) {
+                    channel.macro_real_volume = real_volume;
+                    channel.macro_real_pan = real_pan;
+                }
             }
             if !has_written || written.step != step {
                 context.write_voice_param(voice, VoiceParam::Step(step));
@@ -2765,20 +2969,19 @@ fn advance_auto_vibrato(state: &mut ItVoiceState, sample: Option<&SampleIndex>, 
         return frequency;
     }
     let magnitude = delta.unsigned_abs().min(255 * 4 + 3);
-    let coarse = (magnitude / 4).min(255) as u8;
-    let fine = (magnitude % 4) as u8;
-    let mut value = frequency;
-    if delta > 0 {
-        value = apply_slide_ratio(value, linear_slide_up_q16(coarse));
-        if fine != 0 {
-            value = apply_slide_ratio(value, fine_linear_slide_up_q16(fine));
+    let ratio = if magnitude < 16 {
+        match delta > 0 {
+            true => fine_linear_slide_up_q16(magnitude as u8),
+            false => fine_linear_slide_down_q16(magnitude as u8),
         }
     } else {
-        value = apply_slide_ratio(value, linear_slide_down_q16(coarse));
-        if fine != 0 {
-            value = apply_slide_ratio(value, fine_linear_slide_down_q16(fine));
+        let coarse = (magnitude / 4).min(255) as u8;
+        match delta > 0 {
+            true => linear_slide_up_q16(coarse),
+            false => linear_slide_down_q16(coarse),
         }
-    }
+    };
+    let value = apply_slide_ratio(frequency, ratio);
     value.max(1)
 }
 
@@ -3025,9 +3228,9 @@ mod tests {
         let mut state = ItEnvelopeState { position: 0, enabled: true, value: 0 };
         assert!(!advance_envelope(&mut state, &envelope, false));
         assert_eq!(state.position, 1, "the stored position is one-based");
-        assert_eq!(envelope_value(&envelope, state.position - 1, 1), 64, "the first tick evaluates node zero");
+        assert_eq!(envelope_value(&envelope, state.position - 1, 1, 32), 64, "the first tick evaluates node zero");
         advance_envelope(&mut state, &envelope, false);
-        assert_eq!(envelope_value(&envelope, state.position - 1, 1), 48, "the second tick is one envelope tick in");
+        assert_eq!(envelope_value(&envelope, state.position - 1, 1, 32), 48, "the second tick is one envelope tick in");
 
         // `S77` pauses the counter rather than stopping the envelope.
         state.enabled = false;
@@ -3091,11 +3294,24 @@ mod tests {
     /// resonance in sixteen steps of eight.
     #[test]
     fn the_default_midi_macros_set_the_cutoff_and_the_resonance() {
-        assert_eq!(parse_filter_macro(b"F0F000z", 0x40), (Some(0x40), None));
-        assert_eq!(parse_filter_macro(b"F0F001z", 0x20), (None, Some(0x20)));
-        assert_eq!(parse_filter_macro(b"F0F00120", 0x7F), (None, Some(0x20)), "a fixed macro spells its own value");
-        assert_eq!(parse_filter_macro(b"F0F002z", 0x10), (None, None), "the filter-mode macro is a ModPlug extension");
-        assert_eq!(parse_filter_macro(b"9c n v", 0x10), (None, None), "a real MIDI message reaches no filter");
+        let values = |parameter| MacroSubstitutions {
+            parameter,
+            note: 60,
+            channel: 1,
+            offset: 2,
+            reverse: 0,
+            note_velocity: 127,
+            computed_velocity: 64,
+            note_pan: 32,
+            computed_pan: 96,
+        };
+        assert_eq!(parse_filter_macro(b"F0F000z", values(0x40)), (Some(0x40), None));
+        assert_eq!(parse_filter_macro(b"F0F001z", values(0x20)), (None, Some(0x20)));
+        assert_eq!(parse_filter_macro(b"F0F00120", values(0x7F)), (None, Some(0x20)), "a fixed macro spells its own value");
+        assert_eq!(parse_filter_macro(b"F0F002z", values(0x10)), (None, None), "the filter-mode macro is a ModPlug extension");
+        assert_eq!(parse_filter_macro(b"9c n v", values(0x10)), (None, None), "a real MIDI message reaches no filter");
+        assert_eq!(parse_filter_macro(b"F0F000v F0F001u", values(0x10)), (Some(127), Some(64)), "one macro may contain multiple internal messages");
+        assert_eq!(parse_filter_macro(b"FA", values(0x10)), (Some(127), Some(0)), "MIDI start resets both filter parameters");
     }
 
     /// `VIRTUAL_CHANNELS` is both the recommended pool size and the length of the parallel
