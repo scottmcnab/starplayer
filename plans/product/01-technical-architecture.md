@@ -1224,9 +1224,28 @@ to S3M *before* the player saw them, and that is why its MOD playback was inaccu
 `starplayer-host` is the one crate a *host* may depend on besides the facade, and it is
 still a host: it holds what is true of every backend — what a device is, what a stream is,
 and the `Player` that turns a file into sound through one — so that adding a backend is
-"implement `AudioBackend`" rather than "reimplement the transport" (task D4). The wasm host
-shares its seek mailbox, repeat slot and output-depth post-stage today; putting it fully
-behind `AudioBackend` is a deferred follow-up.
+"implement `AudioBackend`" rather than "reimplement the transport" (task D4). **Both**
+hosts are behind it: `starplayer-host-cpal` and `starplayer-host-wasm`'s `WorkletBackend`
+implement the same `AudioBackend`, and both drive the same `Player` (task D9). `ManualBackend`
+is the third, and lives in `starplayer-host` itself so the invariants are testable with no
+device.
+
+One trait covers a *pulling* backend and a *pushed* one because `AudioBackend::open` never
+promised to start a thread — it takes ownership of a callback and promises to call it, and
+which clock does the calling is the backend's own business. cpal's clock is a thread it
+owns; the worklet's is the browser calling `process()` with 128 frames; `ManualBackend`'s is
+the caller. What the worklet does need is exactly what `negotiate` is for: an `AudioContext`
+is constructed at a sample rate and cannot be renegotiated, so it answers with the context's
+rate whatever was asked for, and the engine and every module scan are built from that answer
+(§4.1). A second push-shaped trait was considered and rejected in D9: it would have bought
+one thing — a host would not have to keep the backend alive alongside its `Player` — and
+cost two lifecycles per host and a duplicated `negotiate`.
+
+What stays in each backend crate is what is genuinely platform. cpal keeps device
+enumeration and its `i16` conversion; the wasm host keeps the wire command decoding, the
+`SharedArrayBuffer` and `postMessage` transports, the scope-window copy, the planar output
+buffer and the heap pre-reservation. Neither keeps a transport, an engine-arm enum, a seek
+mailbox or an output-depth post-stage.
 
 Dependency edges are strictly one-directional. Apps depend only on the facade.
 Extracting `starplayer` for crates.io later is a manifest change, not a refactor.

@@ -39,7 +39,9 @@ use std::vec::Vec;
 use starplayer::core::{AtEnd, ChannelId, Command, Frame, U0F16};
 use starplayer::engine::{EngineHandle, EngineWarnings, EventSource, MixerMode, RENDER_QUANTUM};
 use starplayer::model::Module;
-use starplayer::rt::{Arc as RtArc, Consumer, Producer, SnapshotPublisher, SnapshotReader, channel, snapshot_channel};
+use starplayer::rt::{
+    Arc as RtArc, Consumer, Producer, SnapshotPublisher, SnapshotReader, TapReader, channel, snapshot_channel,
+};
 use starplayer::telemetry::{Snapshot, SongEnd, TelemetryReader};
 use starplayer::{ScannedSong, recommended_voice_capacity};
 
@@ -99,6 +101,8 @@ struct PlayerTaps {
     source_frame: AtomicU64,
     output_frame: AtomicU64,
     playing: AtomicBool,
+    /// Whether the song fade is running, which a UI shows and a wire header carries.
+    fading: AtomicBool,
     /// `f32::to_bits` of the last block's peak.
     peak_bits: AtomicU32,
     blocks_rendered: AtomicU64,
@@ -117,6 +121,14 @@ struct RenderState {
     transport: Transport,
     taps: Arc<PlayerTaps>,
     last_snapshot: Snapshot,
+    /// A typed [`Command::Stop`] the engine has been sent and has not acted on yet.
+    ///
+    /// The engine applies its command ring inside its own render, so for one whole quantum
+    /// after a stop is sent `engine.is_playing()` still says yes. Without this latch
+    /// [`RenderState::arm_end_of_song`] fires a second time over a song that has already
+    /// finished — re-arming the very fade that just landed, which leaves the transport
+    /// reporting a fade over silence.
+    awaiting_engine_stop: bool,
     /// Frames handed to the backend so far. The clock the control-plane cadence is aligned
     /// to; `HostEngine::frame` cannot serve, because it counts frames *rendered* and so
     /// jumps a whole quantum at a time however few of them the host has taken.
@@ -193,6 +205,7 @@ impl RenderState {
                 if self.transport.take_restart() {
                     self.request_seek(SeekKind::Frame(0));
                 }
+                self.awaiting_engine_stop = false;
                 self.transport.begin_play();
                 let _ = self.send(Command::Play);
             }
@@ -226,7 +239,7 @@ impl RenderState {
     /// saying `end_reached` and would otherwise re-arm over silence.
     fn arm_end_of_song(&mut self) {
         self.last_snapshot = *self.telemetry.read();
-        let running = self.engine.is_playing() && !self.transport.stop_is_pending();
+        let running = self.engine.is_playing() && !self.transport.stop_is_pending() && !self.awaiting_engine_stop;
         if !running || !self.last_snapshot.transport.end_reached || self.transport.is_fading() {
             return;
         }
@@ -243,11 +256,15 @@ impl RenderState {
     /// rewinds for the next Play; a Stop the caller asked for keeps its place.
     fn settle_transport(&mut self) {
         if self.transport.fade_has_landed() && self.send(Command::Stop) {
+            self.awaiting_engine_stop = true;
             self.transport.take_fade();
             self.request_seek(SeekKind::Frame(0));
         }
-        if self.transport.stop_has_landed() && self.send(Command::Stop) && self.transport.take_stop() {
-            self.request_seek(SeekKind::Frame(0));
+        if self.transport.stop_has_landed() && self.send(Command::Stop) {
+            self.awaiting_engine_stop = true;
+            if self.transport.take_stop() {
+                self.request_seek(SeekKind::Frame(0));
+            }
         }
     }
 
@@ -295,11 +312,17 @@ impl RenderState {
         self.taps.source_frame.store(self.engine.source_frame().0, Ordering::Relaxed);
         self.taps.output_frame.store(self.engine.frame().0, Ordering::Relaxed);
         self.taps.playing.store(self.engine.is_playing() && !self.transport.stop_is_pending(), Ordering::Relaxed);
+        self.taps.fading.store(self.transport.is_fading(), Ordering::Relaxed);
         self.taps.peak_bits.store(peak.to_bits(), Ordering::Relaxed);
         self.taps.blocks_rendered.fetch_add(1, Ordering::Relaxed);
+        // The **freshest** snapshot, not the one this callback's first quantum armed its
+        // end-of-song decision from: the decision has to be taken on a fixed cadence so that
+        // it lands on the same frame at every block size, but the reading a caller gets
+        // should be as new as the engine can make it.
+        //
         // A snapshot the caller is too slow to collect is dropped rather than queued, which
         // is the same bargain the engine's own telemetry channel strikes.
-        let _ = self.forwarded.publish(self.last_snapshot);
+        let _ = self.forwarded.publish(*self.telemetry.read());
     }
 }
 
@@ -310,6 +333,9 @@ struct ControlSide {
     telemetry: SnapshotReader<Snapshot>,
     taps: Arc<PlayerTaps>,
     handles: SourceHandles,
+    /// Taken from the engine here, because [`Player::open`] is the last moment a `&mut` to
+    /// it exists on this thread.
+    scopes: Option<Box<[TapReader]>>,
 }
 
 /// Build both sides of one engine at `spec`'s rate, in `mode`.
@@ -321,7 +347,8 @@ fn build_sides(mode: MixerMode, spec: AudioSpec) -> Result<(RenderState, Control
         let reason = std::format!("the engine renders {} channels, the device wants {}", mode.channels, spec.channels);
         return Err(HostError::UnsupportedSpec { requested: spec, reason });
     }
-    let (engine, mut control, telemetry) = HostEngine::build(mode, spec.sample_rate_hz)?;
+    let (mut engine, mut control, telemetry) = HostEngine::build(mode, spec.sample_rate_hz)?;
+    let scopes = engine.scope_readers();
     // Freeze the musical clock until the first Play. Without this a stream that is started
     // as soon as it is open plays the song silently while the caller is still deciding.
     control.send(Command::Stop).map_err(|_| HostError::ControlQueueFull)?;
@@ -345,11 +372,34 @@ fn build_sides(mode: MixerMode, spec: AudioSpec) -> Result<(RenderState, Control
         transport: Transport::stopped(),
         taps: Arc::clone(&taps),
         last_snapshot: Snapshot::default(),
+        awaiting_engine_stop: false,
         frames_emitted: 0,
     };
-    let control_side =
-        ControlSide { commands: command_producer, retired: retired_consumer, telemetry: snapshot_reader, taps, handles };
+    let control_side = ControlSide {
+        commands: command_producer,
+        retired: retired_consumer,
+        telemetry: snapshot_reader,
+        taps,
+        handles,
+        scopes,
+    };
     Ok((render, control_side))
+}
+
+/// What a rebuild needs beyond the device it opens on.
+///
+/// A struct rather than four more parameters because the two callers differ in exactly these
+/// four things and in nothing else, and a reader of either wants them named.
+struct Rebuild {
+    /// The mixer mode to instantiate the engine in.
+    mode: MixerMode,
+    /// Where the module should pick up in the rebuilt sequencer.
+    start: SeekKind,
+    /// A scan to reuse rather than measure again — only when nothing the timeline depends
+    /// on has changed, which means the output rate and the module's dialect.
+    cached_scan: Option<Arc<ScannedSong>>,
+    /// Whether the transport should be running when the rebuild is done.
+    resume: bool,
 }
 
 /// The backend-neutral player: one engine, one stream, one module at a time.
@@ -368,6 +418,7 @@ pub struct Player {
     module: Option<RtArc<Module>>,
     scan: Option<Arc<ScannedSong>>,
     collected: usize,
+    scopes: Option<Box<[TapReader]>>,
 }
 
 impl Player {
@@ -408,6 +459,7 @@ impl Player {
             module: None,
             scan: None,
             collected: 0,
+            scopes: control.scopes,
         })
     }
 
@@ -421,22 +473,68 @@ impl Player {
     /// Master volume and the repeat setting are restored; per-channel mutes are not, because
     /// the caller owns those and can reapply them without this having to shadow them.
     pub fn reopen(&mut self, backend: &mut dyn AudioBackend, device: Option<&str>, requested: AudioSpec) -> Result<(), HostError> {
+        let plan = Rebuild { mode: self.mode, start: SeekKind::None, cached_scan: None, resume: false };
+        self.rebuild(backend, device, requested, plan)
+    }
+
+    /// Rebuild the engine in another [`MixerMode`], on the same device, from the position
+    /// that is sounding now.
+    ///
+    /// The mixer mode is a set of **type parameters** (architecture §7.1), so changing it is
+    /// a re-instantiation and not a field write — which means a new engine, a new voice pool
+    /// and a new source. What survives is everything the ear would notice losing: the module
+    /// (the same `Arc`, never a reload, so nothing is retired), the scan (a timeline is a
+    /// function of the rate and the module's dialect and of nothing the mixer chooses, so it
+    /// is *reused* rather than measured again), the song frame that was sounding, the master
+    /// volume, the repeat setting and whether the transport was running.
+    ///
+    /// Per-channel mutes are the caller's, exactly as they are across [`Player::reopen`]: a
+    /// caller that shadows them reapplies them, and one that does not is not silently
+    /// overruled.
+    pub fn set_mixer_mode(&mut self, backend: &mut dyn AudioBackend, device: Option<&str>, mode: MixerMode) -> Result<(), HostError> {
+        if mode == self.mode {
+            return Ok(());
+        }
+        let playing = self.is_playing();
+        let snapshot = *self.telemetry.read();
+        // The sounding *song frame*, not just the order: a rebuild in the middle of a bar
+        // should come back where the ear left it, and the scan can say where that is.
+        let start = match self.scan {
+            Some(_) => SeekKind::Frame(snapshot.transport.song_frame),
+            None => SeekKind::Order(snapshot.transport.order),
+        };
+        let plan = Rebuild { mode, start, cached_scan: self.scan.clone(), resume: playing };
+        self.rebuild(backend, device, self.spec, plan)
+    }
+
+    /// Open a second player on the same backend and become it.
+    ///
+    /// One code path for both rebuilds, because both are the same sentence: everything the
+    /// caller has told this player is said again to a new one, the module is reinstalled at
+    /// `start`, and the old stream — with the engine and the module handles inside its
+    /// callback — dies here, on this thread.
+    fn rebuild(&mut self, backend: &mut dyn AudioBackend, device: Option<&str>, requested: AudioSpec, plan: Rebuild) -> Result<(), HostError> {
         let module = self.module.clone();
         let at_end = self.at_end;
         let fade_frames = self.fade_frames;
         let master_volume = self.master_volume;
-        let mut reopened = Player::open(backend, device, requested, self.mode)?;
-        reopened.set_master_volume(master_volume)?;
+        let collected = self.collected;
+        let mut rebuilt = Player::open(backend, device, requested, plan.mode)?;
+        // Carried, not restarted: the count is what a caller reports as "modules dropped on
+        // this thread since start-up", and a rebuild is not a fresh start-up.
+        rebuilt.collected = collected;
+        rebuilt.set_master_volume(master_volume)?;
         if fade_frames > 0 {
-            reopened.set_fade_frames(fade_frames)?;
+            rebuilt.set_fade_frames(fade_frames)?;
         }
-        reopened.set_at_end(at_end)?;
+        rebuilt.set_at_end(at_end)?;
         if let Some(module) = module {
-            reopened.install(module, SeekKind::None, None)?;
+            rebuilt.install(module, plan.start, plan.cached_scan)?;
         }
-        // The old stream — and the engine and module handles inside its callback — dies
-        // here, on this thread.
-        *self = reopened;
+        if plan.resume {
+            rebuilt.play()?;
+        }
+        *self = rebuilt;
         Ok(())
     }
 
@@ -516,6 +614,9 @@ impl Player {
         Ok(())
     }
 
+    /// What the caller last chose to happen when the song has been heard through once.
+    pub fn at_end(&self) -> AtEnd { self.at_end }
+
     /// Choose what happens when the song has been heard through once.
     pub fn set_at_end(&mut self, at_end: AtEnd) -> Result<(), HostError> {
         self.at_end = at_end;
@@ -575,6 +676,10 @@ impl Player {
     /// Whether the transport is running: the musical clock is going and no stop is queued.
     pub fn is_playing(&self) -> bool { self.taps.playing.load(Ordering::Relaxed) }
 
+    /// Whether the song fade is running — the transport is playing a pass it will fade out
+    /// of, rather than merely being quiet.
+    pub fn is_fading(&self) -> bool { self.taps.fading.load(Ordering::Relaxed) }
+
     /// The last block's peak, `0.0..=1.0`. A lossy tap: a stale reading costs a meter
     /// nothing.
     pub fn peak(&self) -> f32 { f32::from_bits(self.taps.peak_bits.load(Ordering::Relaxed)) }
@@ -597,6 +702,17 @@ impl Player {
         }
         self.collected
     }
+
+    /// One [`TapReader`] per channel, claimed once (architecture §9(b)).
+    ///
+    /// The scope taps are the lossy half of telemetry: they sample voice state, never the
+    /// mix, and a reader that races the audio thread sees a torn window, which on a scope is
+    /// invisible. A host that draws no scope never calls this and pays nothing for the rings,
+    /// which the engine allocates either way.
+    ///
+    /// The readers belong to *this* engine, so a [`Player::reopen`] or a
+    /// [`Player::set_mixer_mode`] retires them: take them again from the rebuilt player.
+    pub fn take_scope_readers(&mut self) -> Option<Box<[TapReader]>> { self.scopes.take() }
 
     /// Stop the stream and let the callback — and the engine inside it — go.
     pub fn close(self) { drop(self) }
@@ -622,6 +738,10 @@ pub const CONTROL_CADENCE_FRAMES: usize = RENDER_QUANTUM;
 impl Player {
     /// How many retirements are waiting for [`Player::collect_garbage`].
     pub fn pending_garbage(&self) -> usize { self.retired.len() }
+
+    /// The seek the audio side has not consumed yet, for a test that wants to see a rewind
+    /// queued rather than infer it from where the song restarts.
+    pub fn pending_seek(&self) -> SeekRequest { self.handles.seek.peek() }
 
     /// Every device the backend can see. A convenience so a caller need not import the
     /// backend trait to print a list.

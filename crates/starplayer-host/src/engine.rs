@@ -23,7 +23,7 @@ use starplayer::engine::{
 };
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, MixPath, OutputFormat};
 use starplayer::model::Module;
-use starplayer::rt::Arc;
+use starplayer::rt::{Arc, TapReader};
 use starplayer::telemetry::TelemetryReader;
 use starplayer::{MAX_VOICE_CAPACITY, core::Frame};
 
@@ -92,6 +92,12 @@ macro_rules! define_arms {
                 match self {
                     $(EngineArm::$variant(engine) => render_arm!($buffer, engine, frames, float, fixed, $channels),)+
                 }
+            }
+
+            /// The per-channel scope tap readers, claimed once per engine
+            /// (architecture §9(b)). `None` if they have already been taken.
+            fn scope_readers(&mut self) -> Option<Box<[TapReader]>> {
+                match self { $(EngineArm::$variant(engine) => engine.scope_readers(),)+ }
             }
 
             fn frame(&self) -> Frame { match self { $(EngineArm::$variant(engine) => engine.frame(),)+ } }
@@ -168,6 +174,14 @@ impl HostEngine {
     pub fn replace_source(&mut self, source: Box<dyn EventSource>) -> Option<Box<dyn EventSource>> {
         self.arm.replace_source(source)
     }
+
+    /// One [`TapReader`] per channel, in channel order, claimed once (architecture §9(b)).
+    ///
+    /// The readers have to be taken **before** the engine goes into the backend's callback,
+    /// because that is the last moment a `&mut` to it exists on this thread. They are
+    /// `Send + Sync` and lossy by design, so reading them from the control thread while the
+    /// audio thread writes is exactly what §9(b) specifies.
+    pub fn scope_readers(&mut self) -> Option<Box<[TapReader]>> { self.arm.scope_readers() }
 
     /// The output clock.
     pub fn frame(&self) -> Frame { self.arm.frame() }

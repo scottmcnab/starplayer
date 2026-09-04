@@ -627,12 +627,20 @@ async function run(executable, mode) {
         assert.equal(afterSliderSeek.order, settledSliderSeek.order, 'the order the page shows settles at the frame the slider was seeked to');
         report.sliderSeek = `${beforeSliderSeek.order} → ${settledSliderSeek.order} at frame ${sliderSeekTarget}/${beforeSliderSeek.progressMax}`;
 
-        // ── Repeat off fades out at the loop point and stops, resetting to 0:00 ─────
+        // ── Repeat off stops at the end of a song that ends, resetting to 0:00 ──────
+        // REFLEX's order list runs out; nothing in it jumps back into music already
+        // played, so task D2 reads it as an *end* rather than a loop. With Repeat off the
+        // host stops it on its end frame instead of playing a second pass under a fade,
+        // and the slider therefore still covers exactly one pass — the fade is added to
+        // the displayed length only for a song that really loops (`app.js`,
+        // `updateProgress`). This assertion used to demand the five-second growth, which
+        // was right before D2 and has been stale since.
         await page.evaluate("const repeat = document.getElementById('repeat'); repeat.checked = false; repeat.dispatchEvent(new Event('change')); return true;");
         const rate = rateDigits(settledSliderSeek.workletRate);
-        await page.waitFor('the slider to grow by the fade with Repeat off', `Number(document.getElementById('progress').max) > ${settledSliderSeek.progressMax}`);
+        await delay(500);
         const repeatOff = await page.evaluate(READ_STATE);
-        assert.equal(repeatOff.progressMax, settledSliderSeek.progressMax + 5 * rate, 'with Repeat off the slider covers the five-second fade as well');
+        assert.equal(repeatOff.progressMax, settledSliderSeek.progressMax, 'a song that ends keeps a one-pass slider with Repeat off');
+        assert.equal(repeatOff.duration, settledSliderSeek.duration, 'and the displayed length with it');
         const nearEndFrame = Math.max(0, settledSliderSeek.progressMax - rate);
         await page.evaluate(`
             const progress = document.getElementById('progress');
@@ -640,12 +648,12 @@ async function run(executable, mode) {
             progress.dispatchEvent(new Event('change'));
             return true;
         `);
-        await page.waitFor('the transport to stop after the fade-out', "document.getElementById('transport-chip').textContent === 'stopped'", 30_000);
+        await page.waitFor('the transport to stop at the end of the song', "document.getElementById('transport-chip').textContent === 'stopped'", 30_000);
         const afterFadeStop = await page.evaluate(READ_STATE);
-        assert.equal(afterFadeStop.chip, 'stopped', 'Repeat off fades out and stops at the loop point instead of wrapping');
-        assert.equal(afterFadeStop.elapsed, '0:00', 'elapsed reads 0:00 once the fade-out stop lands');
-        assert.equal(afterFadeStop.progressValue, 0, 'the slider rewinds to 0 once the fade-out stop lands');
-        report.fadeStop = `stopped at ${afterFadeStop.elapsed}`;
+        assert.equal(afterFadeStop.chip, 'stopped', 'Repeat off stops at the end of the song instead of wrapping');
+        assert.equal(afterFadeStop.elapsed, '0:00', 'elapsed reads 0:00 once the end-of-song stop lands');
+        assert.equal(afterFadeStop.progressValue, 0, 'the slider rewinds to 0 once the end-of-song stop lands');
+        report.endStop = `stopped at ${afterFadeStop.elapsed}`;
 
         // Leave Repeat checked and the transport playing again, as the rest of this run
         // (and the next mode's run of the same page) expects.

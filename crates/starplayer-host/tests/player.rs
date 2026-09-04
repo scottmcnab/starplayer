@@ -11,7 +11,7 @@ use std::sync::Arc;
 use starplayer::core::{AtEnd, ChannelId, Interpolator, U0F16};
 use starplayer::engine::{EndReason, MixPathKind, MixerMode, OutputDepth, RENDER_QUANTUM};
 use starplayer::rt::Arc as RtArc;
-use starplayer_host::{AudioSpec, ManualBackend, ManualDriver, Player, TRANSPORT_RAMP_FRAMES};
+use starplayer_host::{AudioSpec, ManualBackend, ManualDriver, Player, SeekKind, TRANSPORT_RAMP_FRAMES};
 
 const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/NICETUNE.S3M");
 const REFLEX: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
@@ -268,6 +268,125 @@ fn reopening_at_another_rate_rebuilds_the_engine_and_rescans_the_module() {
     let mut output = vec![0.0f32; spec.samples_for(RENDER_QUANTUM * 64)];
     driver.render(&mut output);
     assert!(output.iter().any(|sample| *sample != 0.0), "the rebuilt engine plays");
+}
+
+// ── the mixer-mode rebuild, and the scope readers that go with it ───────────────────
+
+#[test]
+fn switching_the_mixer_mode_keeps_the_module_the_scan_and_the_transport() {
+    let spec = AudioSpec::stereo(48_000);
+    let (mut backend, mut player, driver) = open(spec, MixerMode::DEFAULT);
+    player.load(FIXTURE).expect("the fixture loads");
+    player.play().expect("play");
+    let mut output = vec![0.0f32; spec.samples_for(RENDER_QUANTUM * 200)];
+    driver.render(&mut output);
+
+    let module = RtArc::clone(player.module().expect("the player keeps its module"));
+    let scan = Arc::clone(player.scan().expect("the player keeps the scan"));
+    let sounding = player.song_frame();
+    assert!(sounding > 0 && player.is_playing());
+
+    let fixed = MixerMode { path: MixPathKind::Fixed, depth: OutputDepth::I16, ..MixerMode::DEFAULT };
+    player.set_mixer_mode(&mut backend, None, fixed).expect("the fixed arm exists");
+    assert_eq!(player.mixer_mode(), fixed);
+    assert!(RtArc::ptr_eq(player.module().expect("module retained"), &module), "a mode switch is not a reload");
+    assert!(Arc::ptr_eq(player.scan().expect("scan retained"), &scan), "and the timeline is reused, not measured again");
+    assert_eq!(player.collect_garbage(), 0, "nothing went down the garbage channel");
+
+    let driver = backend.driver().expect("the rebuilt stream has a driver");
+    driver.render(&mut output);
+    assert!(output.iter().any(|sample| *sample != 0.0), "the rebuilt engine plays");
+    assert!(player.is_playing(), "a mode switch is not a stop");
+    assert!(player.song_frame() >= sounding, "and it came back where the ear left it: {} vs {sounding}", player.song_frame());
+}
+
+#[test]
+fn the_scope_readers_come_out_once_and_follow_a_rebuilt_engine() {
+    let spec = AudioSpec::stereo(48_000);
+    let (mut backend, mut player, driver) = open(spec, MixerMode::DEFAULT);
+    let scopes = player.take_scope_readers().expect("a new engine owns its scope readers");
+    assert!(!scopes.is_empty());
+    assert!(player.take_scope_readers().is_none(), "they come out once");
+
+    player.load(FIXTURE).expect("the fixture loads");
+    player.play().expect("play");
+    let mut output = vec![0.0f32; spec.samples_for(RENDER_QUANTUM * 200)];
+    driver.render(&mut output);
+
+    let mut window = vec![0i16; 256];
+    let filled = scopes[0].latest(&mut window);
+    assert!(filled > 0, "the audio thread wrote into the ring the control thread is reading");
+    assert!(window.iter().any(|value| *value != 0), "and the tap carries the module's signal");
+
+    let fixed = MixerMode { path: MixPathKind::Fixed, depth: OutputDepth::I16, ..MixerMode::DEFAULT };
+    player.set_mixer_mode(&mut backend, None, fixed).expect("the fixed arm exists");
+    assert!(player.take_scope_readers().is_some(), "a rebuilt engine owns a fresh set");
+}
+
+// ── the end of the song ─────────────────────────────────────────────────────────────
+
+/// A four-channel MOD one pattern long whose last row is a `B00`, so the song comes round
+/// through its own flow rather than merely running out of order list — which is the only
+/// case [`AtEnd::FadeOut`] fades (task D2).
+fn looping_mod() -> Vec<u8> {
+    const SAMPLE_FRAMES: usize = 256;
+    let mut bytes = vec![0u8; 1084 + 64 * 4 * 4 + SAMPLE_FRAMES];
+    bytes[..10].copy_from_slice(b"looping   ");
+    bytes[42..44].copy_from_slice(&((SAMPLE_FRAMES / 2) as u16).to_be_bytes());
+    bytes[45] = 64;
+    bytes[950] = 1;
+    bytes[1080..1084].copy_from_slice(b"M.K.");
+    let first = starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0, param: 0 };
+    bytes[1084..1088].copy_from_slice(&first.to_bytes());
+    let last_cell = 1084 + 63 * 4 * 4;
+    let jump = starplayer::mod_file::ModCell { period: 0, instrument: 0, effect: 0xB, param: 0x00 };
+    bytes[last_cell..last_cell + 4].copy_from_slice(&jump.to_bytes());
+    let sample_offset = 1084 + 64 * 4 * 4;
+    for (index, byte) in bytes[sample_offset..].iter_mut().enumerate() { *byte = if index & 1 == 0 { 0x7F } else { 0x80 }; }
+    bytes
+}
+
+/// The fade must land **once**. The engine applies its command ring inside its own render,
+/// so for one quantum after the fade's `Command::Stop` is sent the engine still reports
+/// itself playing — and without the latch in `RenderState` the end-of-song arming fires
+/// again on that quantum and re-arms the fade over a song that has already stopped.
+#[test]
+fn a_fade_that_has_landed_does_not_re_arm_itself_over_the_silence() {
+    let spec = AudioSpec::stereo(48_000);
+    let (_backend, mut player, driver) = open(spec, MixerMode::DEFAULT);
+    player.load(&looping_mod()).expect("the looping fixture loads");
+    player.set_fade_frames(4_096).expect("a short fade");
+    player.set_at_end(AtEnd::FadeOut).expect("fade at the loop point");
+    player.play().expect("play");
+
+    let length = player.song_length().expect("a scanned song has a length") as usize;
+    let mut block = vec![0.0f32; spec.samples_for(RENDER_QUANTUM)];
+    let mut faded = false;
+    for _ in 0..(length / RENDER_QUANTUM + 400) {
+        driver.render(&mut block);
+        faded |= player.is_fading();
+        if !player.is_playing() { break; }
+    }
+    assert!(faded, "the song reached its loop point and the fade was armed");
+    assert!(!player.is_playing(), "and the fade landed in the stop it queues");
+    assert!(!player.is_fading(), "the fade is finished, not stuck");
+
+    // Keep rendering over the silence: the snapshot still says the end was reached, and
+    // nothing may act on it a second time.
+    for _ in 0..40 { driver.render(&mut block); }
+    assert!(!player.is_fading(), "a stopped transport does not fade over silence");
+    assert!(block.iter().all(|sample| *sample == 0.0), "and it really is silence");
+    assert_eq!(player.pending_seek().kind, SeekKind::Frame(0), "a faded-out song rewinds for the next Play");
+
+    // Play is "again", not "louder": the rewind is consumed and the song sounds from the top.
+    player.play().expect("play again");
+    let mut heard = false;
+    for _ in 0..40 {
+        driver.render(&mut block);
+        heard |= block.iter().any(|sample| *sample != 0.0);
+    }
+    assert!(heard, "the transport came back to unity rather than staying faded out");
+    assert_eq!(player.pending_seek().kind, SeekKind::None, "the rewind was consumed");
 }
 
 // ── the engine arms ─────────────────────────────────────────────────────────────────
