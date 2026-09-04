@@ -17,8 +17,8 @@
 use starplayer_core::{FilterParams, I1F15, Step, U0F16, VoiceParams};
 use starplayer_dsp::Linear;
 use starplayer_mixer::{
-    FixedFrame, FixedPath, FloatFrame, FloatPath, LoopSpan, MixPath, SampleRegion, Voice, VoicePool, VoiceTag,
-    accumulate_voice, append_guarded_sample,
+    BusSegment, FixedFrame, FixedPath, FloatFrame, FloatPath, LoopSpan, MixPath, SampleRegion, Voice, VoicePool,
+    VoiceTag, accumulate_voice, append_guarded_sample,
 };
 
 const SAMPLE_RATE_HZ: u32 = 44_100;
@@ -248,9 +248,9 @@ fn a_muted_voices_filter_keeps_its_delay_line_moving() {
     muted_first.get_mut(identifier).expect("live voice").settle_gains();
     let mut discard = vec![FixedFrame::default(); 1_024];
     let mut hidden = vec![FixedFrame::default(); 1_024];
-    muted_first.accumulate_masked::<FixedPath, Linear>(&blob, &mut hidden, &mut discard, SAMPLE_RATE_HZ, |_| true);
+    muted_first.accumulate_masked::<FixedPath, Linear>(&blob, &mut BusSegment::none(), &mut hidden, &mut discard, SAMPLE_RATE_HZ, |_| true);
     let mut heard = vec![FixedFrame::default(); 1_024];
-    muted_first.accumulate_masked::<FixedPath, Linear>(&blob, &mut heard, &mut discard, SAMPLE_RATE_HZ, |_| false);
+    muted_first.accumulate_masked::<FixedPath, Linear>(&blob, &mut BusSegment::none(), &mut heard, &mut discard, SAMPLE_RATE_HZ, |_| false);
 
     let mut always_audible = VoicePool::new(1);
     let identifier = always_audible.allocate(VoiceTag::default(), region, params, 0).expect("a free slot");

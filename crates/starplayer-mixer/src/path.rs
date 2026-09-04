@@ -65,27 +65,20 @@
 
 use starplayer_core::{I1F15, U0F16};
 use starplayer_dsp::{
-    FilterCoefficients, Interpolate, resonant_low_pass_f32, resonant_low_pass_fixed, resonate_f32, resonate_fixed,
-    round_shift_nearest,
+    DspSample, FilterCoefficients, Interpolate, resonant_low_pass_f32, resonant_low_pass_fixed, resonate_f32,
+    resonate_fixed, round_shift_nearest,
 };
+
+/// A left/right pair of whatever the path uses for gain or for accumulated signal.
+///
+/// **Defined in `starplayer-dsp` since M7-H1** and re-exported here, so that an effect —
+/// which cannot depend on the mixer — can name the type a bus is made of. Both
+/// `starplayer_mixer::Stereo` and `starplayer_mixer::path::Stereo` still resolve to it.
+pub use starplayer_dsp::Stereo;
 
 use crate::gain::{GAIN_FRACTION_BITS, GAIN_UNITY, voice_gain_units};
 use crate::master::{MasterSettings, process_fixed, process_float};
 use crate::voice::{PathFilter, VoiceFilter};
-
-/// A left/right pair of whatever the path uses for gain or for accumulated signal.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct Stereo<T> {
-    /// Left channel.
-    pub left: T,
-    /// Right channel.
-    pub right: T,
-}
-
-impl<T> Stereo<T> {
-    /// A left/right pair.
-    pub const fn new(left: T, right: T) -> Stereo<T> { Stereo { left, right } }
-}
 
 /// One accumulated output frame on the float path.
 pub type FloatFrame = Stereo<f32>;
@@ -108,7 +101,11 @@ pub trait MixPath {
     /// `f32` on the float path and `i32` on the fixed path, both on the raw `i16` scale
     /// the interpolators produce — normalisation stays folded into the gain, where it
     /// costs nothing.
-    type Mono: Copy;
+    ///
+    /// It is [`DspSample`] from M7-H1: it is also the type an [`Insert`](starplayer_dsp::Insert)
+    /// on this path's buses is written over, which is what makes
+    /// `Box<dyn Insert<Path::Mono>>` nameable from the engine.
+    type Mono: DspSample;
 
     /// Convert a gain from the shared ramping space (`0 ..= GAIN_UNITY`) into this path's
     /// multiplier.
@@ -152,6 +149,22 @@ pub trait MixPath {
     ) {
         Self::accumulate(destination, Self::interpolate::<Interp>(frames, index, fraction_bits), gains);
     }
+
+    /// Add one accumulated frame into another: float `+=`, fixed `saturating_add`.
+    ///
+    /// The channel buses are summed into the pre-master mix with this rather than by
+    /// reaching into `left` and `right`, so the saturation rule stays in one place — the
+    /// same place the voice accumulation's does.
+    fn add_frame(destination: &mut Self::Accumulator, source: Self::Accumulator);
+
+    /// One bus, as the DSP graph sees it.
+    ///
+    /// `Accumulator` *is* `Stereo<Mono>` on both paths, but the trait cannot say so
+    /// without an equality bound that every caller of [`MixPath`] would then have to
+    /// carry. Each implementation hands the slice straight back, so this compiles to
+    /// nothing and gives the engine the one name it needs to call
+    /// [`Insert::process`](starplayer_dsp::Insert::process).
+    fn as_frames(bus: &mut [Self::Accumulator]) -> &mut [Stereo<Self::Mono>];
 
     /// Master volume and limiting, over a whole `RENDER_QUANTUM` (architecture §1.4 — the
     /// master bus never sees a ragged segment).
@@ -198,6 +211,13 @@ impl MixPath for FloatPath {
 
     fn path_filter(filter: &mut VoiceFilter) -> &mut PathFilter<f32> { &mut filter.float }
 
+    fn add_frame(destination: &mut FloatFrame, source: FloatFrame) {
+        destination.left += source.left;
+        destination.right += source.right;
+    }
+
+    fn as_frames(bus: &mut [FloatFrame]) -> &mut [Stereo<f32>] { bus }
+
     fn master(quantum: &mut [FloatFrame], settings: MasterSettings) {
         for frame in quantum.iter_mut() {
             *frame = process_float(*frame, settings);
@@ -240,6 +260,13 @@ impl MixPath for FixedPath {
     }
 
     fn path_filter(filter: &mut VoiceFilter) -> &mut PathFilter<i32> { &mut filter.fixed }
+
+    fn add_frame(destination: &mut FixedFrame, source: FixedFrame) {
+        destination.left = destination.left.saturating_add(source.left);
+        destination.right = destination.right.saturating_add(source.right);
+    }
+
+    fn as_frames(bus: &mut [FixedFrame]) -> &mut [Stereo<i32>] { bus }
 
     fn master(quantum: &mut [FixedFrame], settings: MasterSettings) {
         for frame in quantum.iter_mut() {
@@ -326,6 +353,55 @@ mod tests {
         assert_eq!(round_shift_nearest(-3, 1), -2);
         assert_eq!(round_shift_nearest(1, 1), 1);
         assert_eq!(round_shift_nearest(-1, 1), -1);
+    }
+
+    #[test]
+    fn adding_a_bus_into_the_mix_saturates_on_the_fixed_path_and_sums_on_the_float_one() {
+        let mut fixed = Stereo::new(20_000, -20_000);
+        FixedPath::add_frame(&mut fixed, Stereo::new(5_000, -5_000));
+        assert_eq!(fixed, Stereo::new(25_000, -25_000));
+        FixedPath::add_frame(&mut fixed, Stereo::new(i32::MAX, i32::MIN));
+        assert_eq!(fixed, Stereo::new(i32::MAX, i32::MIN), "the pre-master sum saturates rather than wrapping");
+
+        let mut float = Stereo::new(0.25f32, -0.25);
+        FloatPath::add_frame(&mut float, Stereo::new(0.5, -0.5));
+        assert_eq!(float, Stereo::new(0.75, -0.75));
+    }
+
+    /// Summing the same values bus by bus and voice by voice is the same arithmetic on the
+    /// fixed path unless an intermediate sum saturates — which is M7 master-plan
+    /// decision 1, and the reason the goldens hold with the buses always on.
+    #[test]
+    fn channel_major_and_slot_order_summation_agree_on_the_fixed_path() {
+        let values = [7_000i32, -3_500, 21_000, -12_345, 900, 32_767];
+
+        let mut slot_order = Stereo::new(0i32, 0);
+        for value in values {
+            FixedPath::add_frame(&mut slot_order, Stereo::new(value, -value));
+        }
+
+        let mut channel_major = Stereo::new(0i32, 0);
+        for pair in values.chunks(2) {
+            let mut bus = Stereo::new(0i32, 0);
+            for value in pair {
+                FixedPath::add_frame(&mut bus, Stereo::new(*value, -*value));
+            }
+            FixedPath::add_frame(&mut channel_major, bus);
+        }
+
+        assert_eq!(channel_major, slot_order);
+    }
+
+    #[test]
+    fn a_bus_is_already_a_block_of_stereo_frames() {
+        let mut fixed = [Stereo::new(1i32, 2); 4];
+        let frames: &mut [Stereo<i32>] = FixedPath::as_frames(&mut fixed);
+        frames.first_mut().expect("a frame").left = 9;
+        assert_eq!(fixed.first().expect("a frame").left, 9, "as_frames hands the same storage back");
+
+        let mut float = [Stereo::new(1.0f32, 2.0); 4];
+        let frames: &mut [Stereo<f32>] = FloatPath::as_frames(&mut float);
+        assert_eq!(frames.len(), 4);
     }
 
     #[test]
