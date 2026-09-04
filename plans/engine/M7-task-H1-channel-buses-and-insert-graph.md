@@ -235,3 +235,179 @@ cargo xtask ci --job fma-check
 
 Any real effect (H3, H4); host or CLI surfaces (H7); SIMD (H6); reading the buses from the
 scope taps; a general node graph; changing the master limiter.
+
+## Research resolution
+
+### 1. Does slot-order → channel-major summation move any fixed golden?
+
+**No. Nothing moved.**
+
+`cargo xtask goldens --check` passes with all nine hashes unchanged, before and after the
+buses were switched on:
+
+```
+mod/synthetic   c5adc0cc55f95e9147a24530e9c4d0803f9c9930a59ad8107ac386ff7c3eb82a
+mtm/synthetic   2ca02ee1d5ec67fb6b603ba28950cccc0a6044d44ce9f4836b3e83a5345dcabb
+xm/synthetic    20beedc6f28ef53716dd63563789d70325ec50cf2350da907e236dd22fd48039
+it/synthetic    d32490e9248c4edc2ea01945f4bb9a84f6aab38c8bb36ec5031c20a853b69c74
+s3m/armani      59977a266576827a8fd5614b75688ee3391ebe640c0a97d43f15b4a5fde8687f
+s3m/movement    cc1974494ca57ac555348007dbffd8c292823171e38a46c8fcf82e46b3b9ca5e
+s3m/nicetune    89f26304021c7466a37798a5efd02bbd5e233fa1aab545161355992cbd127bc1
+s3m/petri       eaa4842ed00bfc48bcc35948dcfe635ec0d7f472cb59eae05cd3632d1f73412b
+s3m/reflex      bab4413c73d6d4da3681e088af0e761ec50ce7e2ec6fbd9885d28681f4a5e625
+```
+
+The dense-IT check the task asks for was run through a throwaway
+`crates/starplayer-offline/examples/dense_it_hash.rs` (deleted afterwards, not committed)
+that renders `starplayer_offline::canonical_sha256(GoldenFormat::It, …, 128)` — the exact
+fixed-path, mono `i16`, 44.1 kHz, 10-second golden contract — over the three
+`target/conformance/corpora/libxmp-…/test-dev/data/m/*.it` modules. Identical before and
+after:
+
+```
+941351df7dbeb40149f080e8a1fbd88eef6b17ad876aa7301fdfe078c5095e0a  4th_Symmetriad.it
+c7623119c81e86720e6d4c4d5d604e486fdba36c46e842fb071327822225943a  Fight2.it
+c15eb6c840eecdc295a053d99bd80af511789c606bc8f7613b7b33ad621b427f  another life.it
+```
+
+Why it holds, restated so it can be relied on rather than re-measured: within one bus the
+voices are still walked in slot order, and across buses `i32` saturating addition is
+ordinary two's-complement addition — which is associative and commutative — unless an
+intermediate sum reaches ±2³¹. The accumulator is on the raw `i16` scale, so that is
+65,536× full scale; a module would need tens of thousands of simultaneous voices at full
+volume to reach it. The float path's last bits may move, and nothing pins them.
+
+### 2. Where does the MIDI lane's channel land?
+
+`MIDI_CHANNEL_BASE = 48` and `MIDI_CHANNEL_COUNT = 16`, so the MIDI lanes are 48–63 and
+need a 64-lane engine to have buses of their own. Every path that plays MIDI already sizes
+itself that way, and none of them was changed:
+
+* `crates/starplayer-offline/src/lib.rs` `render_smf_song` passes
+  `channel_count: ChannelTable::MAX_CHANNELS` with the comment already explaining why (the
+  MIDI lanes sit above a module's own). `tests/smf_block_size_determinism.rs` goes through
+  that entry point, so its MIDI voices each land on their own bus, lanes 48–63.
+* `crates/starplayer-offline/tests/jam_determinism.rs` also uses
+  `ChannelTable::MAX_CHANNELS`.
+* `crates/starplayer-host/src/engine.rs` `HostEngine::build` — which is what
+  `Player::load_smf` renders through — takes `MAX_VOICE_CAPACITY` and
+  `ChannelTable::MAX_CHANNELS` because a persistent host builds its engine before it has
+  seen a module.
+
+So no MIDI voice is in the spill lane on any shipping path, and each of the sixteen MIDI
+lanes can carry its own insert chain from this task onwards. The spill lane exists for the
+*narrow* engine case — an offline tracker render sized to a four-channel MOD, given a voice
+tagged for a lane it does not have — and it is a sum into the mix, not a discard:
+`a_voice_beyond_the_bus_count_is_still_heard` in `tests/insert_graph.rs` pins that. What a
+spilled voice loses is the chance to have an insert on it, nothing else.
+
+### 3. `Insert<Sample>` vs `Insert<Frame>`
+
+The trait is written over the **mono** sample type and processes `&mut [Stereo<Sample>]`
+blocks, as the task specifies. Object safety and `Send` are both proved by compilation
+rather than by argument: `crates/starplayer-dsp/src/effects/mod.rs` returns
+`Box<dyn Insert<Sample>>` from `build_insert`, `crates/starplayer-engine/src/insert.rs`
+stores `[Option<Box<dyn Insert<Sample>>>; 4]`, and
+`effects::gain::tests::a_boxed_insert_is_send` asserts `Box<dyn Insert<f32>>: Send` through
+a `fn assert_send<T: Send>` bound. `Send` comes from the supertrait, so every trait object
+has it without each effect restating it.
+
+Writing the trait over the frame type instead would have made `Insert<Stereo<f32>>` the
+name a host says, and would have put the stereo-ness into the type parameter rather than
+into the signature — which H3's mid/side EQ and H4's stereo reverb both need to see. The
+mono parameter also makes `MixPath::Mono` the single seam: it is already the type the voice
+filter is written in.
+
+The one thing it needed was a way to get from `Path::Accumulator` to `Stereo<Path::Mono>`.
+They are the same type on both paths, but the trait cannot say so without an equality bound
+(`MixPath<Accumulator = Stereo<Self::Mono>>`) that every caller of `MixPath` — the engine,
+both hosts, the offline crate, every test — would then have to carry in its own where
+clause. `MixPath::as_frames` hands the slice straight back instead: one line per
+implementation, no bound, and it compiles to nothing.
+
+### 4. The muted scratch
+
+Kept exactly as it was. `muted_scratch` is one `RENDER_QUANTUM` buffer that muted voices
+render into so their position, loops, ramps and filter state advance as if they were
+audible; it is never read and it is not a bus. `accumulate_masked` still checks `is_muted`
+**before** it looks for a bus, so a muted voice never reaches one — which is what keeps
+`resonant_filter.rs`'s `a_muted_voices_filter_keeps_its_delay_line_moving` true and what
+makes unmuting resume mid-note without a click.
+
+## Done differently from the task file, and why
+
+1. **`accumulate_masked` takes a `BusSegment` view, not a `buses: &mut [Path::Accumulator]`
+   laid out as `bus_count × segment_len`.** The two sentences in deliverable 5 pull in
+   different directions: the engine's buses are `channel_count × RENDER_QUANTUM` and a
+   segment "accumulat[es] into bus windows at `offset..end`", which is a strided view, not a
+   `bus_count × segment_len` contiguous block. Making the literal signature work would have
+   meant a `channel_count × span` scratch per segment plus a copy back into the quantum-wide
+   buses — real work per segment, for nothing. `BusSegment<'_, Accumulator>`
+   (`crates/starplayer-mixer/src/voice.rs`) carries the slice, the stride, the offset and
+   the frame count and hands out one window at a time; `BusSegment::none()` is the "no buses"
+   view that `VoicePool::accumulate` and the mixer's own tests use. It allocates nothing,
+   which a `&mut [&mut [_]]` built per segment would not have managed.
+
+2. **The spill lane has its own `RENDER_QUANTUM` buffer.** Deliverable 5 renames
+   `destination` to `spill` and then says the buses are summed into the mix first and "then
+   the spill lane is added". Those cannot both be the same buffer, so `Engine` has
+   `accumulator` (the pre-master mix), `buses` and `spill`. The extra buffer is 128 frames.
+
+3. **`build` is exported as `build_insert`.** A bare `build` in `starplayer_dsp`'s root
+   re-export is too generic a name for a crate whose root is `use`d wholesale;
+   `effects::build` is still there under its own module path.
+
+4. **`db_to_gain_q15` lives in `effects/gain.rs` for now**, as deliverable 3 permits, with
+   a 73-entry `i32` table of whole decibels from −60 to +12 and linear interpolation of the
+   centi-decibel remainder. Two conventions were fixed here and should survive the H2 merge
+   because the rest of this task depends on them:
+   * **Q15 unity is 32768, not 32767.** A power of two makes `DspSample::scale_q15` at unity
+     the *identity* on both paths, which is what lets an insert sitting at its default leave
+     a bus bit-identical — the property that makes "buses always on with a chain installed"
+     safe to reason about.
+   * **`GAIN_MIN_CENTI_DB` (−6000) is −∞, not −60 dB.** The bottom of the fader is silence,
+     so a host has somewhere to put the slider and the routing tests have a value that
+     really mutes a bus.
+
+5. **The block-size determinism scenario stops on its phase boundaries.** An insert command
+   has no scheduled frame the way a `ScriptedAction` has — it takes effect when the audio
+   thread next drains the ring — so pushing it "after N host calls" makes the *input*
+   differ between block sizes and the test fails for the wrong reason (it did, first time:
+   at block size 3 the `SetParam` landed at frame 5248 instead of 5120). The render loop
+   therefore clamps to each phase boundary, which is a whole number of quanta and hence a
+   point where the output ring is empty and the engine has rendered exactly that many
+   frames whatever the host asked in. The block size still varies everywhere else, and the
+   256-frame smoothing ramp the `SetParam` starts runs across two quanta of ordinary
+   block-split rendering after it. The invariant is not weakened: it is still "the same
+   control timeline produces byte-identical output at every block size".
+
+6. **`EngineWarnings::retired_insert_dropped` is not published through telemetry.**
+   `starplayer_telemetry::Warnings` is a separate type in a separate crate with its own
+   `any()` and a bit-packing in the wasm host; widening it is host-surface work and belongs
+   with the rest of H7. `crates/starplayer-host/src/player.rs` now fills the field from
+   `EngineWarnings::default()` with a comment saying so. The flag is set, is in
+   `EngineWarnings::any()`, and is asserted on directly in
+   `tests/insert_graph.rs::a_full_garbage_channel_raises_a_warning_rather_than_leaking`.
+
+7. **`GAIN_Q15_TABLE` is indexed directly rather than through `get`.** `<[T]>::get` is not
+   a `const fn`, and `db_to_gain_q15` is a `const fn` so an effect can be built at a value
+   in a `const` context. Both indices are proved in range by the clamps immediately above
+   them, and a `const _: () = assert!(…)` pins the 0 dB entry to `Q15_UNITY`. Every other
+   index in the task's code goes through `get`/`get_mut`, and `clippy::indexing_slicing`
+   stays denied in `starplayer-mixer` and `starplayer-engine`.
+
+## Verification results (2026-09-05)
+
+All nine commands pass on branch `h1`:
+
+```
+cargo test --workspace                     ok (76 test binaries, 0 failures)
+cargo test -p starplayer-engine --features telemetry   ok
+cargo xtask goldens --check                ok (9/9 byte-identical)
+cargo xtask ci --job host-tests            ok
+cargo xtask ci --job rt-safety             ok
+cargo xtask ci --job clippy                ok
+cargo xtask ci --job no-std-purity         ok
+cargo xtask ci --job wasm-build            ok
+cargo xtask ci --job fma-check             ok
+```
