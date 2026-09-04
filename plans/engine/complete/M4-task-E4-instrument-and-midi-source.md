@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M4-full ([master plan](M4-master-plan.md), "M4-full — the task graph") |
-| Status | **Landed** 2026-09-04 — implemented and verified; awaiting review and commit |
+| Status | Landed 2026-09-04 |
 | Depends on | Everything landed by 2026-09-04 (E1–E3, D3–D9, F1–F6, G1–G6) |
 | Blocks | E5, E6, E7 |
 | Recommended model | Claude Opus (commits the trait; touches the engine's source and channel machinery) |
