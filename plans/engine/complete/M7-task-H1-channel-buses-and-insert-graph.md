@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M7 ([master plan](M7-master-plan.md), "The task graph" section) |
-| Status | Ready |
+| Status | Landed 2026-09-05 |
 | Depends on | — (M6 landed) |
 | Blocks | H3, H4, H6, H7 |
 | Parallel with | H2 (dsp primitives), H5 (interpolators) |
