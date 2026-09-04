@@ -52,7 +52,7 @@ crates/     starplayer-{core,rt,dsp,mixer,model,engine}   no_std + alloc
             starplayer-{mod,s3m,mtm,xm,it}                one crate per format: loader + effects
             starplayer-{midi,telemetry}                   no_std + alloc
             starplayer                                    facade / public crate
-            starplayer-{host-cpal,host-wasm,offline,testkit}   std
+            starplayer-{host-cpal,host-wasm,midi-native,offline,testkit}   std
 apps/       starplayer-{web,cli,tui}
 xtask/      build orchestration, wasm packaging, golden regeneration
 fuzz/       cargo-fuzz loader targets and their seed corpus — its own workspace, nightly only

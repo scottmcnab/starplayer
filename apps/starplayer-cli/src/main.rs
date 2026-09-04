@@ -33,16 +33,21 @@
 //!     Print a per-tick diagnostic trace of the sequencer's state to stdout.
 //!
 //! starplayer play <file> [--entry N] [--device NAME] [--rate HZ] [--buffer FRAMES]
-//!                         [--repeat] [--list-devices]
+//!                         [--repeat] [--list-devices] [--midi PORT] [--list-midi-ports]
 //!     Play a module on an audio output device through starplayer-host-cpal. Prints
 //!     the title and the negotiated stream spec once, then order/pattern/row/speed/
 //!     BPM/voices/peak on one updating line once a second. Stops at the song's natural
 //!     end or a detected loop's fade unless --repeat keeps it looping; Ctrl-C stops the
 //!     transport click-free and exits 0. --list-devices prints every output device on
-//!     every backend this build can reach, instead of playing anything. `--instruments`
-//!     is accepted for a `.mid` but playback through a device is not wired up yet
-//!     (task E5; needs `starplayer-host::Player` support E6/E7 land) — render it
-//!     instead.
+//!     every backend this build can reach, instead of playing anything.
+//!
+//!     --midi PORT plays the module's *instruments* from a MIDI input port instead of
+//!     playing the module: the keyboard sounds the module's samples and its pattern data
+//!     stays silent, because hearing both at once is task E7's jam mode. PORT is an
+//!     index, an exact port name, or any case-insensitive part of one, and
+//!     --list-midi-ports prints what this machine has.
+//!
+//!     --instruments MODULE names the module whose instruments play a `.mid` (task E5).
 //! ```
 //!
 //! A ZIP archive is accepted anywhere a module file is. With more than one recognised

@@ -57,6 +57,17 @@ cpal = { version = "0.18.2", default-features = false, features = ["pulseaudio"]
 # polling loop checks — never a call into the player from the handler's own thread.
 ctrlc = { version = "3.5.2" }
 
+# Native MIDI *input* for `starplayer-midi-native` (task E6). A `std` crate reachable only
+# from that host crate, so like cpal it cannot threaten design goal 4. On Linux it binds
+# the ALSA **sequencer** (`libasound`'s `snd_seq_*`), which is the same `alsa-lib` cpal's
+# PCM host needs and therefore the same header story: `sudo apt install libasound2-dev`,
+# or a `PKG_CONFIG_PATH` naming an `alsa-lib` prefix. `winmm`/CoreMIDI need nothing extra.
+# midir's own default feature set is empty — the ALSA, CoreMIDI and WinMM backends and
+# their virtual ports are unconditional — so `default-features = false` only says out loud
+# that the optional `jack` feature stays off: it binds `libjack`, a system dependency, for
+# a server this project does not require.
+midir = { version = "0.11", default-features = false }
+
 # The real-time plumbing's three dependencies, all `no_std` and none enabling `std` at
 # the feature set selected here. See `crates/starplayer-rt/src/lib.rs` for why each one
 # is needed rather than hand-written.
@@ -88,6 +99,7 @@ starplayer-mtm = { path = "crates/starplayer-mtm" }
 starplayer-xm = { path = "crates/starplayer-xm" }
 starplayer-it = { path = "crates/starplayer-it" }
 starplayer-midi = { path = "crates/starplayer-midi" }
+starplayer-midi-native = { path = "crates/starplayer-midi-native" }
 starplayer-telemetry = { path = "crates/starplayer-telemetry" }
 starplayer-host = { path = "crates/starplayer-host" }
 starplayer-host-cpal = { path = "crates/starplayer-host-cpal" }

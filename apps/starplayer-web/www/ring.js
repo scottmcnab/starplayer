@@ -23,11 +23,26 @@
     const OPCODE_SET_MIXER_MODE = 7;
     const OPCODE_SEEK_FRAME = 8;
     const OPCODE_AT_END = 9;
+    // One live MIDI channel-voice message (task E6): Web MIDI, or the page's own
+    // tracker-style keyboard. `argument` packs the three bytes a browser already hands
+    // over framed — status in bits 0-7, data1 in 8-15, data2 in 16-23 — and `extra` is
+    // unused. It rides this ring rather than a second one because it is an ordinary
+    // command: bounded, drained between render quanta, and turned into one push onto the
+    // engine's live-input queue. Installing that queue is a `midiInput` port message
+    // instead, because building the instrument rack allocates.
+    const OPCODE_MIDI_EVENT = 10;
 
     // Arguments for OPCODE_AT_END; `extra` carries the fade length in frames.
     const AT_END_FADE_OUT = 0;
     const AT_END_CONTINUE = 1;
     const AT_END_STOP = 2;
+
+    /** Pack a channel-voice message into one wire `argument`. Bytes are masked to seven
+     *  bits below the status byte, so a malformed message cannot smear into the next
+     *  field. */
+    function packMidiMessage(status, data1, data2) {
+        return ((status & 0xFF) | ((data1 & 0x7F) << 8) | ((data2 & 0x7F) << 16)) >>> 0;
+    }
 
     function viewCommandRing(buffer) {
         return { buffer, words: new Int32Array(buffer) };
@@ -309,6 +324,7 @@
         OPCODE_SET_MIXER_MODE,
         OPCODE_SEEK_FRAME,
         OPCODE_AT_END,
+        OPCODE_MIDI_EVENT,
         AT_END_FADE_OUT,
         AT_END_CONTINUE,
         AT_END_STOP,
@@ -324,6 +340,7 @@
         SCOPE_WINDOW_BUCKETS,
         viewCommandRing,
         createCommandRing,
+        packMidiMessage,
         pushCommand,
         drainCommands,
         drainFallbackCommands,

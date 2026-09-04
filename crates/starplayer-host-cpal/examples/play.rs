@@ -73,6 +73,9 @@ struct Options {
     sample_rate_hz: u32,
     buffer_frames: Option<u32>,
     list_devices: bool,
+    // ── live MIDI input (task E6) ───────────────────────────────────────────────────
+    midi: Option<String>,
+    list_midi_ports: bool,
 }
 
 impl Default for Options {
@@ -83,17 +86,23 @@ impl Default for Options {
             sample_rate_hz: 48_000,
             buffer_frames: Some(DEFAULT_BUFFER_FRAMES),
             list_devices: false,
+            midi: None,
+            list_midi_ports: false,
         }
     }
 }
 
 const USAGE: &str = "\
-usage: play [--list-devices] [--device NAME] [--rate HZ] [--buffer FRAMES] <module>
+usage: play [--list-devices] [--device NAME] [--rate HZ] [--buffer FRAMES]
+            [--midi PORT] [--list-midi-ports] <module>
 
-  --list-devices   print every output device on every backend and exit
-  --device NAME    an exact device name, or any case-insensitive part of one
-  --rate HZ        the sample rate to ask the device for (default 48000)
-  --buffer FRAMES  the block size to ask the device for (default 1024; 0 for the device's own)
+  --list-devices     print every output device on every backend and exit
+  --device NAME      an exact device name, or any case-insensitive part of one
+  --rate HZ          the sample rate to ask the device for (default 48000)
+  --buffer FRAMES    the block size to ask the device for (default 1024; 0 for the device's own)
+  --midi PORT        play the module's instruments from a MIDI input port instead of
+                     playing the module: an index, a name, or part of one
+  --list-midi-ports  print every MIDI input port this build can see and exit
 ";
 
 fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
@@ -103,6 +112,8 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
         let mut value = |name: &str| arguments.next().ok_or_else(|| std::format!("{name} needs a value"));
         match argument.as_str() {
             "--list-devices" => options.list_devices = true,
+            "--list-midi-ports" => options.list_midi_ports = true,
+            "--midi" => options.midi = Some(value("--midi")?),
             "--device" => options.device = Some(value("--device")?),
             "--rate" => {
                 let raw = value("--rate")?;
@@ -126,6 +137,10 @@ fn run() -> Result<ExitCode, String> {
 
     if options.list_devices {
         print_devices(&all_devices());
+        return Ok(ExitCode::SUCCESS);
+    }
+    if options.list_midi_ports {
+        print_midi_ports();
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -160,6 +175,26 @@ fn run() -> Result<ExitCode, String> {
     // FadeOut covers both endings: a song that runs out of order list stops where it ends,
     // and a song that jumps back to a loop point plays one pass and fades.
     player.set_at_end(AtEnd::FadeOut).map_err(describe)?;
+
+    // ── live MIDI input (task E6) ───────────────────────────────────────────────────
+    //
+    // The module's *instruments* on a live-input source, with its pattern data silent.
+    // Hearing both at once is task E7's jam mode. Bound to a name because dropping the
+    // connection closes the port.
+    let _midi_connection = match options.midi.as_deref() {
+        None => None,
+        Some(selector) => {
+            player.midi_only().map_err(describe)?;
+            let sender = player.take_event_sender().ok_or("live input installed no sender")?;
+            let connection = starplayer_midi_native::open_input(Some(selector), sender)
+                .map_err(|error| std::format!("{error}; `--list-midi-ports` shows what this machine has"))?;
+            println!("midi    {} - the module's instruments only; its pattern data is not playing", connection.port_name());
+            println!("lead    {} frames ({:.1} ms) ahead of the audio clock", player.event_lead(), player.event_lead_millis());
+            Some(connection)
+        }
+    };
+    // ── end of the live MIDI input block ────────────────────────────────────────────
+
     player.play().map_err(describe)?;
 
     let outcome = follow(&mut player, spec.sample_rate_hz);
@@ -224,6 +259,19 @@ fn follow(player: &mut Player, sample_rate_hz: u32) -> Outcome {
         }
         player.collect_garbage();
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// `--list-midi-ports`. A machine with no MIDI stack prints why rather than failing.
+fn print_midi_ports() {
+    match starplayer_midi_native::input_ports() {
+        Err(error) => println!("{error}"),
+        Ok(ports) if ports.is_empty() => println!("no MIDI input port is available"),
+        Ok(ports) => {
+            for port in ports {
+                println!("{:>2}  {}", port.index, port.name);
+            }
+        }
     }
 }
 

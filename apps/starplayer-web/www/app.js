@@ -49,6 +49,10 @@ const elements = {
     outputChannels: byId('output-channels'), applyChannels: byId('apply-channels'), mixerPath: byId('mixer-path'),
     mixerInterpolator: byId('mixer-interpolator'), mixerDepth: byId('mixer-depth'), mixerDither: byId('mixer-dither'),
     applyMixer: byId('apply-mixer'), modHeadphonePanning: byId('mod-headphone-panning'),
+    // Live input (task E6).
+    liveInputStatus: byId('live-input-status'), keyboardEnable: byId('keyboard-enable'), eventLead: byId('event-lead'),
+    midiInput: byId('midi-input'), enableMidi: byId('enable-midi'), midiNote: byId('midi-note'),
+    keyboardOctave: byId('keyboard-octave'), keyboardInstrument: byId('keyboard-instrument'), midiEvents: byId('midi-events'),
 };
 
 const state = {
@@ -97,6 +101,26 @@ const state = {
     showRemaining: readShowRemaining(),
     pendingSeekFrame: null,
     pendingSeekSequence: 0,
+    // ── live input (task E6) ────────────────────────────────────────────────────────
+    /// Whether the worklet is playing a live-input source rather than the module.
+    liveInputActive: false,
+    /// A `midiInput` message already sent and not yet answered, so a fast double-click
+    /// does not interleave two installs on the port's FIFO.
+    liveInputPending: false,
+    /// The lead the worklet reported, in frames and milliseconds.
+    eventLeadFrames: 0,
+    eventLeadMillis: 0,
+    /// `navigator.requestMIDIAccess`'s answer, once it has been asked for.
+    midiAccess: null,
+    /// The port the selector currently has open, so it can be closed when another is
+    /// chosen.
+    midiPort: null,
+    /// The keyboard's own octave and program, and which physical keys are down — so a
+    /// note-off goes to the note the key started, even after the octave has moved.
+    keyboardOctave: 4,
+    keyboardInstrument: 0,
+    keysDown: new Map(),
+    eventsSent: 0,
 };
 
 const loaderReady = initLoader().then(loadEffectNames);
@@ -260,6 +284,10 @@ function updateOutputPanel() {
 }
 
 function installGraph(graph) {
+    // A rebuilt graph is a new Rust host with no live-input source. `activateLoadedModule`
+    // asks for it back once the module has been reinstalled on it.
+    state.liveInputActive = false;
+    state.liveInputPending = false;
     state.node = graph.node;
     state.commandRing = graph.commandRing;
     state.telemetry = graph.telemetry;
@@ -436,6 +464,13 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
     state.loadCount += 1;
     renderMetadata();
     setControlsEnabled(true);
+    // Activating a module installs its own sequencer, which is what retires any live-input
+    // source with it. The page's toggles are unchanged, so ask for it back.
+    state.liveInputActive = false;
+    state.liveInputPending = false;
+    state.keyboardInstrument = 0;
+    releaseHeldKeys(false);
+    syncLiveInput();
     queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(Number(elements.volume.value) * 65535 / 100), 0);
     queueRepeatCommand();
     queueCommand(Ring.OPCODE_PLAY, 0, 0);
@@ -650,7 +685,250 @@ function onWorkletMessage(message, node) {
         showMessage(`Mixer active: ${describeMixerMode(state.activeModeWire)}.`);
     } else if (message.type === 'mixerModeError') {
         if (node === state.node) showError(`Could not switch mixer mode: ${message.reason}`);
+    } else if (message.type === 'midiInputApplied') {
+        if (node !== state.node) return;
+        state.liveInputPending = false;
+        state.liveInputActive = message.active === true;
+        state.eventLeadFrames = message.leadFrames;
+        state.eventLeadMillis = message.leadMillis;
+        state.activationMemoryBytes = message.memoryBytes;
+        showMessage(state.liveInputActive
+            ? 'Live input: the keyboard and any MIDI port play this module’s instruments. Its pattern data is silent.'
+            : 'Live input off; the module is playing again.');
+        updateLiveInputPanel();
+    } else if (message.type === 'midiInputError') {
+        if (node !== state.node) return;
+        state.liveInputPending = false;
+        elements.keyboardEnable.checked = false;
+        showError(`Could not switch live input: ${message.reason}`);
+        updateLiveInputPanel();
     }
+}
+
+// ── live input: Web MIDI and the tracker-style keyboard (task E6) ───────────────────
+//
+// The engine half is `starplayer_engine::instrument`: an `InstrumentRack` bound to the
+// module's instruments, fed by an SPSC queue. The page's half is only ever three things —
+// install the source, pack three bytes, and say how far ahead of the audio clock they
+// land.
+//
+// # Why the keyboard map is this one
+//
+// The original StarPlayer has no note-entry keyboard at all: it is a player, and every key
+// in `plans/reference/original-star-ui.md` is transport, menu or CD control. So the map
+// echoed here is the one every tracker since Ultimate Soundtracker has used and the one a
+// tracker musician's fingers already know — FastTracker 2's and Impulse Tracker's: the
+// `Z`-`M` row is an octave of white keys with its sharps on `S D  G H J`, and the `Q`-`P`
+// row is the octave above with its sharps on `2 3  5 6 7`. Both rows run five notes past
+// their octave, exactly as a tracker's do, so a two-handed player has thirty-one keys
+// rather than twenty-four. The TUI (plan A1) reuses this table.
+//
+// Named by `KeyboardEvent.code` rather than `.key`, so an AZERTY or Dvorak keyboard plays
+// the same *physical* keys a tracker player reaches for.
+const KEYBOARD_SEMITONES = new Map([
+    // Lower octave: the `Z` row, sharps on the `S` row above it.
+    ['KeyZ', 0], ['KeyS', 1], ['KeyX', 2], ['KeyD', 3], ['KeyC', 4], ['KeyV', 5], ['KeyG', 6],
+    ['KeyB', 7], ['KeyH', 8], ['KeyN', 9], ['KeyJ', 10], ['KeyM', 11],
+    ['Comma', 12], ['KeyL', 13], ['Period', 14], ['Semicolon', 15], ['Slash', 16],
+    // Upper octave: the `Q` row, sharps on the number row above it.
+    ['KeyQ', 12], ['Digit2', 13], ['KeyW', 14], ['Digit3', 15], ['KeyE', 16], ['KeyR', 17], ['Digit5', 18],
+    ['KeyT', 19], ['Digit6', 20], ['KeyY', 21], ['Digit7', 22], ['KeyU', 23],
+    ['KeyI', 24], ['Digit9', 25], ['KeyO', 26], ['Digit0', 27], ['KeyP', 28],
+]);
+
+/// The MIDI channel the computer keyboard plays on. Channel 0 is `ChannelId(48)` in the
+/// engine (`MIDI_CHANNEL_BASE`), well clear of any module's own lanes.
+const KEYBOARD_MIDI_CHANNEL = 0;
+/// Fixed, as the deliverable specifies: a computer keyboard has no velocity to read.
+const KEYBOARD_VELOCITY = 100;
+const KEYBOARD_MIN_OCTAVE = 0;
+const KEYBOARD_MAX_OCTAVE = 8;
+
+/// One channel-voice message onto the command ring. On shared memory it reaches the
+/// worklet at its next render quantum; on the `postMessage` fallback it waits for the
+/// animation frame the rest of the commands are batched into, which is the added latency
+/// `updateLiveInputPanel` reports.
+function queueMidiMessage(status, data1, data2) {
+    queueCommand(Ring.OPCODE_MIDI_EVENT, Ring.packMidiMessage(status, data1, data2), 0);
+    state.eventsSent += 1;
+}
+
+/// Turn the live-input source on or off in the worklet. It allocates an instrument rack,
+/// so it is a port message rather than a ring command.
+function requestLiveInput(enabled) {
+    if (state.node === null || state.liveInputPending || enabled === state.liveInputActive) return;
+    if (enabled && state.metadata === null) {
+        showError('Load a module first: live input plays that module’s instruments.');
+        elements.keyboardEnable.checked = false;
+        return;
+    }
+    state.liveInputPending = true;
+    // Anything already queued has to cross *first*, or a note the page has already sent
+    // arrives at a queue this message is about to install or retire. The port is FIFO, so
+    // ordering it is enough: on the fallback transport flush the animation-frame batch,
+    // and on the shared ring ask the worklet to drain it in a message task — the same
+    // `flushCommands` a mixer-mode change already uses for the same reason.
+    flushFallbackCommands();
+    if (state.commandRing !== null) state.node.port.postMessage({ type: 'flushCommands' });
+    state.node.port.postMessage({ type: 'midiInput', enabled });
+}
+
+/// Live input is wanted while the keyboard is armed or a MIDI port is open.
+function syncLiveInput() {
+    requestLiveInput(elements.keyboardEnable.checked || state.midiPort !== null);
+}
+
+function updateLiveInputPanel() {
+    const active = state.liveInputActive;
+    elements.liveInputStatus.textContent = active ? 'playing the module’s instruments' : 'off';
+    const lead = state.eventLeadFrames > 0
+        ? `lead ${state.eventLeadFrames} frames (${state.eventLeadMillis.toFixed(1)} ms)`
+        : 'lead —';
+    // The fallback transport batches commands into one animation frame, so a note waits
+    // for the next one on top of the engine's own lead. Architecture §9.1's Q1 resolution
+    // asks for that extra latency to be *reported* rather than hidden.
+    setText(elements.eventLead, state.commandRing === null && state.node !== null ? `${lead} + one frame batched` : lead);
+    setText(elements.keyboardOctave, String(state.keyboardOctave));
+    setText(elements.keyboardInstrument, String(state.keyboardInstrument + 1));
+    // Only what the page sent: an event the engine's queue refused is already counted in
+    // the Engine panel's "Dropped", because a refused live event is a command that could
+    // not be delivered like any other.
+    setText(elements.midiEvents, `${state.eventsSent} sent`);
+    elements.keyboardEnable.disabled = state.node === null || state.metadata === null;
+    elements.midiInput.disabled = state.midiAccess === null || state.metadata === null;
+}
+
+/// Ask the browser for MIDI access, once, on a click. Sysex is not requested: nothing here
+/// decodes it, and asking would turn a silent permission into a prompt.
+async function enableWebMidi() {
+    if (typeof navigator.requestMIDIAccess !== 'function') {
+        elements.midiNote.textContent = 'This browser has no Web MIDI. The computer keyboard still works.';
+        return;
+    }
+    try {
+        state.midiAccess = await navigator.requestMIDIAccess({ sysex: false });
+    } catch (error) {
+        elements.midiNote.textContent = `Web MIDI was refused: ${error.message || error}`;
+        return;
+    }
+    state.midiAccess.onstatechange = fillMidiInputs;
+    fillMidiInputs();
+    elements.enableMidi.disabled = true;
+    elements.midiNote.textContent = 'Web MIDI is on. Choose an input.';
+}
+
+function fillMidiInputs() {
+    if (state.midiAccess === null) return;
+    const chosen = elements.midiInput.value;
+    // Built as elements rather than as markup: a port name is whatever the device's
+    // firmware says it is, and it has no business being parsed as HTML.
+    elements.midiInput.replaceChildren(new Option('None', ''));
+    for (const input of state.midiAccess.inputs.values()) {
+        const label = `${input.name || 'MIDI input'}${input.manufacturer ? ` — ${input.manufacturer}` : ''}`;
+        elements.midiInput.append(new Option(label, input.id));
+    }
+    // A port that vanished takes the selection with it; one that is still there keeps it.
+    elements.midiInput.value = [...state.midiAccess.inputs.keys()].includes(chosen) ? chosen : '';
+    if (elements.midiInput.value !== chosen) selectMidiInput();
+    updateLiveInputPanel();
+}
+
+/// Open the selected port and forward its messages as they arrive. Web MIDI delivers
+/// *framed* messages — the browser has already resolved running status — so each one is
+/// packed straight into a wire record with no decoder on this side.
+function selectMidiInput() {
+    if (state.midiPort !== null) {
+        state.midiPort.onmidimessage = null;
+        state.midiPort = null;
+    }
+    const id = elements.midiInput.value;
+    if (id && state.midiAccess !== null) {
+        const port = state.midiAccess.inputs.get(id);
+        if (port) {
+            port.onmidimessage = (event) => {
+                const data = event.data;
+                if (!data || data.length === 0 || data[0] < 0x80 || data[0] >= 0xF0) return;
+                queueMidiMessage(data[0], data.length > 1 ? data[1] : 0, data.length > 2 ? data[2] : 0);
+            };
+            state.midiPort = port;
+        }
+    }
+    syncLiveInput();
+    updateLiveInputPanel();
+}
+
+/// Whether a key event is the page's to play, rather than something the person is typing.
+function keyboardIsListening(event) {
+    if (!elements.keyboardEnable.checked || !state.liveInputActive) return false;
+    if (event.ctrlKey || event.altKey || event.metaKey) return false;
+    const target = event.target;
+    if (target instanceof HTMLElement && target.isContentEditable) return false;
+    return !(target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement);
+}
+
+/// MIDI note for a physical key at the current octave. Octave 4 puts `Z` on note 60,
+/// which is the engine's reference note — a sample plays at its own rate there
+/// (M4 master-plan decision 4).
+function noteForKey(code) {
+    const semitone = KEYBOARD_SEMITONES.get(code);
+    if (semitone === undefined) return null;
+    const note = (state.keyboardOctave + 1) * 12 + semitone;
+    return note >= 0 && note <= 127 ? note : null;
+}
+
+function onKeyDown(event) {
+    if (!keyboardIsListening(event)) return;
+    // Held keys repeat at the platform's typematic rate. A retrigger every 30 ms is not
+    // what holding a note means, so a repeat is dropped rather than sounded.
+    if (event.repeat) return;
+
+    if (event.code === 'BracketLeft' || event.code === 'BracketRight') {
+        const step = event.code === 'BracketRight' ? 1 : -1;
+        state.keyboardOctave = Math.max(KEYBOARD_MIN_OCTAVE, Math.min(KEYBOARD_MAX_OCTAVE, state.keyboardOctave + step));
+        event.preventDefault();
+        updateLiveInputPanel();
+        return;
+    }
+    if (event.code === 'Minus' || event.code === 'Equal') {
+        const count = Math.max(1, state.metadata?.instruments?.length ?? 1);
+        const step = event.code === 'Equal' ? 1 : -1;
+        state.keyboardInstrument = Math.max(0, Math.min(count - 1, state.keyboardInstrument + step));
+        queueMidiMessage(0xC0 | KEYBOARD_MIDI_CHANNEL, state.keyboardInstrument, 0);
+        event.preventDefault();
+        updateLiveInputPanel();
+        return;
+    }
+
+    const note = noteForKey(event.code);
+    if (note === null || state.keysDown.has(event.code)) return;
+    // Remembered per key, so the note-off releases the note the key *started* even if the
+    // octave moved while it was held.
+    state.keysDown.set(event.code, note);
+    queueMidiMessage(0x90 | KEYBOARD_MIDI_CHANNEL, note, KEYBOARD_VELOCITY);
+    event.preventDefault();
+}
+
+function onKeyUp(event) {
+    const note = state.keysDown.get(event.code);
+    if (note === undefined) return;
+    state.keysDown.delete(event.code);
+    queueMidiMessage(0x80 | KEYBOARD_MIDI_CHANNEL, note, 0);
+    event.preventDefault();
+}
+
+/// A page that loses focus with keys held would leave those notes sounding for ever.
+///
+/// `send` is false when live input is about to be torn down: reinstalling the module's own
+/// sequencer releases every voice anyway, so a note-off queued here would arrive at a queue
+/// that has gone and be counted as a command that could not be delivered. Forgetting the
+/// keys is the whole job in that case.
+function releaseHeldKeys(send = true) {
+    if (send) {
+        for (const note of state.keysDown.values()) {
+            queueMidiMessage(0x80 | KEYBOARD_MIDI_CHANNEL, note, 0);
+        }
+    }
+    state.keysDown.clear();
 }
 
 function requestGarbageCollection() {
@@ -1277,6 +1555,7 @@ function refresh() {
     const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
     updateSnapshot(snapshot);
     drawScopes();
+    updateLiveInputPanel();
 }
 
 function setText(element, text) {
@@ -1400,6 +1679,23 @@ elements.volume.addEventListener('input', () => {
     queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(percent * 65535 / 100));
 });
 
+// ── live input (task E6) ────────────────────────────────────────────────────────────
+elements.keyboardEnable.addEventListener('change', () => {
+    // Unchecking with a MIDI port still open leaves live input running, so the held notes
+    // need their note-offs; unchecking with nothing else open tears the source down, which
+    // silences them by itself.
+    if (!elements.keyboardEnable.checked) releaseHeldKeys(state.midiPort !== null);
+    syncLiveInput();
+    updateLiveInputPanel();
+});
+elements.enableMidi.addEventListener('click', () => enableWebMidi().catch(showError));
+elements.midiInput.addEventListener('change', selectMidiInput);
+// On `window`, not on an element: the keyboard should play wherever the focus is, as long
+// as the focus is not somewhere text is being typed — which `keyboardIsListening` decides.
+window.addEventListener('keydown', onKeyDown);
+window.addEventListener('keyup', onKeyUp);
+window.addEventListener('blur', releaseHeldKeys);
+
 elements.applySampleRate.addEventListener('click', () => rebuildAudioContext().catch(showError));
 elements.applyChannels.addEventListener('click', () => rebuildOutputChannels().catch(showError));
 elements.applyOutputDevice.addEventListener('click', () => applyOutputDevice().catch(showError));
@@ -1425,6 +1721,7 @@ if (!sharedMemoryAvailable()) {
 restorePreferences();
 state.activeModeWire = mixerModeFromControls();
 updateOutputPanel();
+updateLiveInputPanel();
 refreshOutputDevices().catch(() => {});
 requestAnimationFrame(refresh);
 

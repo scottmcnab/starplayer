@@ -1243,6 +1243,10 @@ crates/
                         backend-neutral Player: engine + transport + seek
                         mailbox + output depth.                   → starplayer
   starplayer-host-cpal  native audio output          → starplayer, starplayer-host, cpal
+  starplayer-midi-native  native MIDI *input*: a midir port decoded onto a Player's
+                        live-input queue (M4-E6). Not part of the cpal crate: it is not
+                        an audio backend, and a host on any other one still wants a
+                        keyboard.               → starplayer, starplayer-host, midir
   starplayer-host-wasm  AudioWorklet glue  → starplayer, starplayer-host, wasm-bindgen
   starplayer-archive    zip (later: lha/rar?) container support   → model, zip
   starplayer-offline    WAV writer, deterministic render, trace dump

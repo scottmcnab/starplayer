@@ -145,6 +145,15 @@ tbody tr:last-child td { border-bottom: 0; }
 .option-note { grid-column: 1 / -1; color: var(--muted); overflow-wrap: anywhere; }
 .mixer-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .mixer-options button { grid-column: 1 / -1; }
+/* Live input (task E6): the keyboard toggle sits on the same row as the lead it costs,
+   because the latency is the thing a player wants to read while deciding to use it. */
+.live-input-options .live-toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+/* The lead sits in the grid's second column, beside the toggle, rather than spanning the
+   row the way `.option-note` does — a `#midi-note` explanation wants the width, a latency
+   reading wants to be next to the switch it belongs to. */
+.live-input-options .lead-note { align-self: center; text-align: right; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.keyboard-hint { margin: 12px 0 0; color: var(--muted); line-height: 1.5; }
+.keyboard-hint strong { color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
 @media (max-width: 820px) {
     main { width: min(100% - 20px, 720px); padding-top: 20px; }

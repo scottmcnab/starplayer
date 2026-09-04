@@ -62,8 +62,9 @@ const DEFAULT_BUFFER_FRAMES: u32 = 1_024;
 
 #[derive(clap::Args, Debug)]
 pub struct PlayArgs {
-    /// Module file, or a ZIP archive containing one. Not needed with `--list-devices`.
-    #[arg(required_unless_present = "list_devices")]
+    /// Module file, or a ZIP archive containing one. Not needed with `--list-devices`
+    /// or `--list-midi-ports`.
+    #[arg(required_unless_present_any = ["list_devices", "list_midi_ports"])]
     pub file: Option<PathBuf>,
     /// Which recognised entry of a ZIP archive to play.
     #[arg(long)]
@@ -93,11 +94,28 @@ pub struct PlayArgs {
     #[arg(long)]
     pub instruments: Option<PathBuf>,
     // ── end task E5 ──────────────────────────────────────────────────────────────────
+
+
+    // ── live MIDI input (task E6) ───────────────────────────────────────────────────
+    //
+    // Kept in one block, separate from the transport flags above, because E5 lands
+    // `--instruments` on this same command concurrently and the two must not tangle.
+    /// Play the module's instruments from a MIDI input port instead of playing the
+    /// module: an index, an exact port name, or any case-insensitive part of one.
+    #[arg(long, value_name = "PORT")]
+    pub midi: Option<String>,
+    /// Print every MIDI input port this build can see, and exit.
+    #[arg(long)]
+    pub list_midi_ports: bool,
 }
 
 pub fn run(args: PlayArgs) -> Result<(), String> {
     if args.list_devices {
         print_devices(&starplayer_host_cpal::all_devices());
+        return Ok(());
+    }
+    if args.list_midi_ports {
+        print_midi_ports();
         return Ok(());
     }
 
@@ -163,6 +181,28 @@ fn play_on(backend: &mut dyn AudioBackend, backend_name: &str, file_display: &st
         player.set_fade_frames(LOOP_FADE_SECONDS.saturating_mul(spec.sample_rate_hz)).map_err(|error| error.to_string())?;
         player.set_at_end(AtEnd::FadeOut).map_err(|error| error.to_string())?;
     }
+    // ── live MIDI input (task E6) ───────────────────────────────────────────────────
+    //
+    // `--midi` swaps the module's own sequencer for its *instruments* on a live-input
+    // source, so the keyboard plays the module and the module does not play itself.
+    // Hearing both at once is task E7's `SourceMux`; this is the honest half of it, and
+    // the printed line says so rather than leaving a silent module looking like a bug.
+    // The connection is bound to a name because dropping it closes the port.
+    let _midi_connection = match args.midi.as_deref() {
+        None => None,
+        Some(selector) => {
+            player.midi_only().map_err(|error| error.to_string())?;
+            let sender = player.take_event_sender().ok_or("live input installed no sender")?;
+            let connection = starplayer_midi_native::open_input(Some(selector), sender).map_err(|error| {
+                format!("{error}; `--list-midi-ports` shows what this machine has")
+            })?;
+            println!("midi    {} - the module's instruments only; its pattern data is not playing", connection.port_name());
+            println!("lead    {} frames ({:.1} ms) ahead of the audio clock", player.event_lead(), player.event_lead_millis());
+            Some(connection)
+        }
+    };
+    // ── end of the live MIDI input block ────────────────────────────────────────────
+
     player.play().map_err(|error| error.to_string())?;
 
     let outcome = follow(&mut player, spec.sample_rate_hz, interrupted);
@@ -224,7 +264,7 @@ fn follow(player: &mut Player, sample_rate_hz: u32, interrupted: &AtomicBool) ->
         }
 
         if Instant::now() >= next_report {
-            report(player, sample_rate_hz);
+            if player.is_midi_only() { report_live_input(player); } else { report(player, sample_rate_hz); }
             next_report = Instant::now() + Duration::from_secs(1);
         }
         player.collect_garbage();
@@ -253,6 +293,39 @@ fn report(player: &mut Player, sample_rate_hz: u32) {
         peak,
     );
     let _ = std::io::stdout().flush();
+}
+
+/// The `--midi` status line. Song position means nothing under a live-input source — the
+/// module is not playing — so this reports what the keyboard is doing instead.
+fn report_live_input(player: &mut Player) {
+    use std::io::Write;
+
+    let snapshot = *player.telemetry();
+    print!(
+        "\rmidi  events {:>7}  dropped {:>5}  lead {:>5} frames ({:>5.1} ms)  voices {:>3}  peak {:>5.3}  ",
+        player.events_sent(),
+        player.events_rejected(),
+        player.event_lead(),
+        player.event_lead_millis(),
+        snapshot.voices_active,
+        player.peak(),
+    );
+    let _ = std::io::stdout().flush();
+}
+
+/// `--list-midi-ports`. A machine with no MIDI stack at all — every container, and every
+/// WSL2 box without `/dev/snd` — prints why rather than failing: nothing was asked to play,
+/// so there is nothing to fail.
+fn print_midi_ports() {
+    match starplayer_midi_native::input_ports() {
+        Err(error) => println!("{error}"),
+        Ok(ports) if ports.is_empty() => println!("no MIDI input port is available"),
+        Ok(ports) => {
+            for port in ports {
+                println!("{:>2}  {}", port.index, port.name);
+            }
+        }
+    }
 }
 
 fn print_devices(devices: &[DeviceInfo]) {
@@ -288,7 +361,18 @@ mod tests {
     }
 
     fn default_args() -> PlayArgs {
-        PlayArgs { file: None, entry: None, device: None, rate: 48_000, buffer: DEFAULT_BUFFER_FRAMES, repeat: false, list_devices: false, instruments: None }
+        PlayArgs {
+            file: None,
+            entry: None,
+            device: None,
+            rate: 48_000,
+            buffer: DEFAULT_BUFFER_FRAMES,
+            repeat: false,
+            list_devices: false,
+            instruments: None,
+            midi: None,
+            list_midi_ports: false,
+        }
     }
 
     /// Research point 1: a machine with no device fails `play` with one clear line
@@ -324,6 +408,43 @@ mod tests {
         // research point 2 ties this command's default fade to that rule rather than to
         // a value of its own, so a song fades over the same span in every host.
         assert_eq!(LOOP_FADE_SECONDS, 5);
+    }
+
+    // ── live MIDI input (task E6) ───────────────────────────────────────────────────
+
+    /// `--list-midi-ports` has to answer on a machine with no MIDI stack at all, which is
+    /// every container and the WSL2 box this task was written on. It prints why and exits
+    /// zero, exactly as `--list-devices` does with no sound card.
+    #[test]
+    fn listing_midi_ports_answers_without_panicking_on_a_machine_with_no_midi_stack() {
+        print_midi_ports();
+    }
+
+    #[test]
+    fn a_midi_port_selector_reads_back_the_way_the_help_text_promises() {
+        assert_eq!(default_args().midi, None, "no live input unless it was asked for");
+        let args = PlayArgs { midi: Some(String::from("keystation")), ..default_args() };
+        assert_eq!(args.midi.as_deref(), Some("keystation"));
+        assert!(PlayArgs { list_midi_ports: true, ..default_args() }.list_midi_ports);
+    }
+
+    /// Both listing flags have to work with no file argument, which is a clap
+    /// `required_unless_present_any` and therefore worth pinning: adding a third listing
+    /// flag and forgetting to name it there makes `--list-midi-ports` demand a module.
+    #[test]
+    fn the_listing_flags_do_not_need_a_module() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            play: PlayArgs,
+        }
+        assert!(Wrapper::try_parse_from(["play", "--list-devices"]).is_ok());
+        assert!(Wrapper::try_parse_from(["play", "--list-midi-ports"]).is_ok());
+        assert!(Wrapper::try_parse_from(["play"]).is_err(), "playing still needs something to play");
+        let parsed = Wrapper::try_parse_from(["play", "song.s3m", "--midi", "2"]).expect("a port selector parses");
+        assert_eq!(parsed.play.midi.as_deref(), Some("2"));
     }
 
     #[test]

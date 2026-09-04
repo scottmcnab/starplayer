@@ -216,5 +216,95 @@ assert.equal(posted.scope.values.length, posted.scope.channelCount * posted.scop
 const fallbackPeak = posted.scope.values.reduce((peak, value) => Math.max(peak, Math.abs(value)), 0);
 assert.ok(fallbackPeak > 100, `the fallback taps carry the signal too (peak ${fallbackPeak})`);
 
+// ── live input: opcode 10 on both transports (task E6) ──────────────────────────────
+//
+// The whole path, with no browser: install the live-input source from a port message,
+// push a framed MIDI message as an ordinary wire record, and hear the module's own
+// instrument sound while its pattern data does not. Both transports, because the
+// `postMessage` fallback is where architecture 9.1's Q1 resolution says these events
+// still have to cross.
+
+/// One processor with the S3M loaded, for a live-input run that must not disturb the
+/// assertions above.
+function liveInputProcessor(shared) {
+    const ring = shared ? Ring.createCommandRing() : null;
+    const telemetryBlock = shared ? Ring.createTelemetry() : null;
+    const built = new Processor({ processorOptions: {
+        channelCount: 2,
+        mixerMode: 0x0000_0202,
+        wasmModule: new WebAssembly.Module(wasmBytes),
+        commandRing: ring ? ring.buffer : null,
+        telemetry: telemetryBlock ? telemetryBlock.buffer : null,
+        scope: null,
+    } });
+    const builtPort = lastPort;
+    builtPort.dispatch({ type: 'loadModule', requestId: 100, bytes: firstFixture.slice() });
+    assert.ok(builtPort.messages.some((message) => message.type === 'moduleLoaded' && message.requestId === 100));
+    return { processor: built, port: builtPort, ring };
+}
+
+/// Render `count` quanta and report the loudest sample in them.
+function renderPeak(target, count) {
+    let highest = 0;
+    for (let index = 0; index < count; index += 1) {
+        const left = new Float32Array(128);
+        const right = new Float32Array(128);
+        assert.equal(target.process([], [[left, right]]), true);
+        for (const sample of left) highest = Math.max(highest, Math.abs(sample));
+        for (const sample of right) highest = Math.max(highest, Math.abs(sample));
+    }
+    return highest;
+}
+
+function sendMidi(live, status, data1, data2) {
+    const argument = Ring.packMidiMessage(status, data1, data2);
+    if (live.ring !== null) {
+        assert.equal(Ring.pushCommand(live.ring, Ring.OPCODE_MIDI_EVENT, argument, 0), true);
+    } else {
+        live.port.dispatch({ type: 'commandBatch', commands: [Ring.OPCODE_MIDI_EVENT, argument, 0] });
+    }
+}
+
+for (const shared of [true, false]) {
+    const transport = shared ? 'SharedArrayBuffer' : 'postMessage';
+    const live = liveInputProcessor(shared);
+    // Let the module play first, so "silent" below means the live-input source silenced it
+    // rather than the fixture never having started.
+    assert.ok(renderPeak(live.processor, 400) > 0.01, `${transport}: the module plays before live input`);
+
+    const memoryBeforeInstall = live.processor.memory.buffer.byteLength;
+    live.port.dispatch({ type: 'midiInput', enabled: true });
+    const applied = live.port.messages.findLast((message) => message.type === 'midiInputApplied');
+    assert.ok(applied, `${transport}: the worklet answered the install`);
+    assert.equal(applied.active, true);
+    assert.equal(applied.leadFrames, 256, 'two render quanta, as master-plan decision 6 chose');
+    assert.ok(Math.abs(applied.leadMillis - 256 * 1000 / globalThis.sampleRate) < 0.001, `${applied.leadMillis} ms`);
+    const stableAfterInstall = applied.memoryBytes;
+    assert.ok(stableAfterInstall >= memoryBeforeInstall, 'the rack is allocated in the message task, never in process()');
+
+    assert.equal(renderPeak(live.processor, 16), 0, `${transport}: the module's own pattern data went silent`);
+
+    sendMidi(live, 0xC0, 0, 0);          // program change: MIDI channel 0 takes instrument 0
+    sendMidi(live, 0x90, 60, 100);       // note on, middle C at the engine's reference note
+    const sounded = renderPeak(live.processor, 60);
+    assert.ok(sounded > 0.001, `${transport}: the note sounded from the silent module's instruments (peak ${sounded})`);
+
+    sendMidi(live, 0x80, 60, 0);         // note off
+    sendMidi(live, 0xB0, 120, 0);        // all sound off
+    renderPeak(live.processor, 8);
+    assert.equal(renderPeak(live.processor, 16), 0, `${transport}: and stopped when the page said so`);
+
+    // Design goal 5 on the shared-memory path: nothing in `process()` may allocate, and a
+    // growing `WebAssembly.Memory` is how that would show. The processor itself posts a
+    // `fault` the moment it sees one.
+    assert.equal(live.processor.memory.buffer.byteLength, stableAfterInstall, `${transport}: process() did not grow wasm memory`);
+    assert.equal(live.port.messages.some((message) => message.type === 'fault'), false, `${transport}: no growth fault`);
+
+    live.port.dispatch({ type: 'midiInput', enabled: false });
+    const removed = live.port.messages.findLast((message) => message.type === 'midiInputApplied');
+    assert.equal(removed.active, false, `${transport}: live input goes off again`);
+    assert.ok(renderPeak(live.processor, 400) > 0.01, `${transport}: and the module plays again`);
+}
+
 globalThis.TextDecoder = nodeTextDecoder;
-console.log(`worklet harness: 10 s of real S3M render (peak ${loudest.toFixed(3)}), independent overlapping processors, MOD panning, transport, seek, memory, garbage, scope taps on both transports and bad-file rejection passed`);
+console.log(`worklet harness: 10 s of real S3M render (peak ${loudest.toFixed(3)}), independent overlapping processors, MOD panning, transport, seek, memory, garbage, scope taps on both transports, live MIDI input on both transports and bad-file rejection passed`);

@@ -216,6 +216,32 @@
                 <button id="apply-mixer" class="primary" type="button">Apply mixer</button>
             </div>
         </article>
+        <!-- Task E6. Live input plays the module's *instruments*: the keyboard and a MIDI
+             port sound its samples while its pattern data stays silent. Hearing both at
+             once is task E7's jam mode. -->
+        <article class="panel diagnostics live-input-panel" aria-labelledby="live-input-heading">
+            <div class="panel-heading"><h2 id="live-input-heading">Live input</h2><span id="live-input-status">off</span></div>
+            <div class="option-grid live-input-options">
+                <label class="live-toggle"><input id="keyboard-enable" type="checkbox" disabled> Keyboard</label>
+                <span id="event-lead" class="lead-note">lead —</span>
+                <label>MIDI input
+                    <select id="midi-input" disabled><option value="">None</option></select>
+                </label>
+                <button id="enable-midi" type="button">Enable Web MIDI</button>
+                <p id="midi-note" class="option-note"></p>
+            </div>
+            <p class="keyboard-hint" id="keyboard-hint">
+                <strong>Z</strong>–<strong>M</strong> is the lower octave and <strong>Q</strong>–<strong>P</strong> the
+                upper one, with the sharps on the row above each.
+                <strong>[</strong> / <strong>]</strong> shifts the octave, <strong>-</strong> / <strong>=</strong>
+                steps the instrument. Typing in a field never plays a note.
+            </p>
+            <dl>
+                <div><dt>Octave</dt><dd id="keyboard-octave">4</dd></div>
+                <div><dt>Instrument</dt><dd id="keyboard-instrument">1</dd></div>
+                <div><dt title="Events the engine's queue refused are counted in the Engine panel's Dropped.">Events</dt><dd id="midi-events">0 sent</dd></div>
+            </dl>
+        </article>
     </section>
 </main>
 
