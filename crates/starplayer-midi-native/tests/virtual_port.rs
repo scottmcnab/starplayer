@@ -37,7 +37,7 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// virtual port is a different `midir` entry point.
 fn on_message(message: &[u8], state: &mut (MidiDecoder, EventSender, Arc<AtomicUsize>)) {
     for byte in message {
-        if let Some((channel, event)) = state.0.feed(*byte) {
+        if let Some((channel, event)) = state.0.decode(*byte) {
             let _ = state.1.send_event(channel, event);
             state.2.fetch_add(1, Ordering::SeqCst);
         }
