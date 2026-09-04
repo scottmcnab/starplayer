@@ -450,7 +450,7 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
     use starplayer_core::{Step, U0F16, VoiceParams};
-    use starplayer_dsp::{Linear, Nearest};
+    use starplayer_dsp::{Cubic, Linear, Nearest, Sinc};
 
     use crate::gain::RAMP_FRAMES;
     use crate::path::{FixedFrame, FixedPath};
@@ -634,6 +634,110 @@ mod tests {
                 assert_eq!(render(chunk), whole, "{span:?} at chunk length {chunk}");
             }
         }
+    }
+
+    /// The wide kernels' half of the guard-frame contract, and the reason a forward
+    /// loop's wrap is deferred by `LEADING_FRAMES`.
+    ///
+    /// The fixture's run-in looks nothing like the frames before `loop_end`, so a kernel
+    /// that took its leading taps from the frames before `loop_start` — which is what a
+    /// silent pre-roll alone would give it — would differ audibly here. Rendering the
+    /// same loop **unrolled into a one-shot** is the reference: the deferred wrap has to
+    /// produce that byte for byte, not merely something without a step in it.
+    #[test]
+    fn a_wide_kernel_renders_a_loop_exactly_as_the_unrolled_loop_renders() {
+        let body: Vec<i16> = (0..32).map(|index: i32| ((index * 977) % 4_001 - 2_000) as i16).collect();
+        let (looping_blob, looping_region) = blob_with(&body, LoopSpan::new(8, 32));
+
+        let mut unrolled = body.clone();
+        for _ in 0..6 {
+            unrolled.extend_from_slice(body.get(8..32).expect("the loop body"));
+        }
+        let (unrolled_blob, unrolled_region) = blob_with(&unrolled, None);
+
+        fn render<Interp: Interpolate>(blob: &[i16], region: SampleRegion) -> [FixedFrame; 60] {
+            let mut voice = voice_for(region, Step::from_ratio(7, 3));
+            let mut output = [FixedFrame::default(); 60];
+            accumulate_voice::<FixedPath, Interp>(&mut voice, blob, &mut output, 44_100);
+            output
+        }
+
+        assert_eq!(render::<Cubic>(&looping_blob, looping_region), render::<Cubic>(&unrolled_blob, unrolled_region), "cubic");
+        assert_eq!(render::<Sinc>(&looping_blob, looping_region), render::<Sinc>(&unrolled_blob, unrolled_region), "sinc");
+        assert_eq!(render::<Linear>(&looping_blob, looping_region), render::<Linear>(&unrolled_blob, unrolled_region), "linear, which needs no deferral to agree");
+        assert_ne!(render::<Sinc>(&looping_blob, looping_region), render::<Linear>(&looping_blob, looping_region), "the kernels are not all rendering the same thing");
+    }
+
+    /// Task B5's verification, for the kernels that read behind themselves: no
+    /// discontinuity at the wrap beyond the kernel's own ripple.
+    #[test]
+    fn a_wide_kernel_has_no_step_at_the_wrap() {
+        // A triangle that joins to itself, as in `a_forward_loop_has_no_step_at_the_wrap`.
+        let pcm: Vec<i16> = (0..64).map(|index: i32| ((if index < 32 { index } else { 64 - index }) * 900) as i16).collect();
+        let (blob, region) = blob_with(&pcm, LoopSpan::new(0, 64));
+
+        fn largest_step<Interp: Interpolate>(blob: &[i16], region: SampleRegion) -> i32 {
+            let mut voice = voice_for(region, Step::from_ratio(7, 3));
+            let mut output = [FixedFrame::default(); 512];
+            accumulate_voice::<FixedPath, Interp>(&mut voice, blob, &mut output, 44_100);
+            output.windows(2)
+                .filter_map(|pair| match pair {
+                    [first, second] => Some((second.left - first.left).abs()),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+        }
+
+        // The waveform's own slope is 900 per source frame at 7/3 frames per output frame,
+        // so a continuous render steps by about 2100; the kernels' overshoot at the two
+        // corners of the triangle is the only thing above that.
+        assert!(largest_step::<Cubic>(&blob, region) <= 2_600, "cubic stepped by {}", largest_step::<Cubic>(&blob, region));
+        assert!(largest_step::<Sinc>(&blob, region) <= 2_600, "sinc stepped by {}", largest_step::<Sinc>(&blob, region));
+    }
+
+    #[test]
+    fn splitting_a_wide_kernels_run_anywhere_produces_the_same_frames() {
+        let pcm: Vec<i16> = (0..12).map(|index| 500 + 37 * index as i16).collect();
+
+        fn render<Interp: Interpolate>(blob: &[i16], region: SampleRegion, chunk: usize) -> [FixedFrame; 40] {
+            let mut voice = voice_for(region, Step::from_ratio(7, 3));
+            let mut output = [FixedFrame::default(); 40];
+            let mut written = 0;
+            while written < output.len() {
+                let end = (written + chunk).min(output.len());
+                if let Some(window) = output.get_mut(written..end) {
+                    accumulate_voice::<FixedPath, Interp>(&mut voice, blob, window, 44_100);
+                }
+                written = end;
+            }
+            output
+        }
+
+        for span in [LoopSpan::new(3, 12), LoopSpan::ping_pong(3, 12), None] {
+            let (blob, region) = blob_with(&pcm, span);
+            let whole_cubic = render::<Cubic>(&blob, region, 40);
+            let whole_sinc = render::<Sinc>(&blob, region, 40);
+            for chunk in [1usize, 3, 7, 11, 25] {
+                assert_eq!(render::<Cubic>(&blob, region, chunk), whole_cubic, "cubic, {span:?} at chunk length {chunk}");
+                assert_eq!(render::<Sinc>(&blob, region, chunk), whole_sinc, "sinc, {span:?} at chunk length {chunk}");
+            }
+        }
+    }
+
+    /// The pre-roll's own job: a note starts from nothing, so the frames a wide kernel
+    /// reads before frame 0 are silence rather than whatever the previous sample left in
+    /// the blob.
+    #[test]
+    fn a_wide_kernel_starts_a_note_from_silence_rather_than_from_the_sample_before_it() {
+        let mut blob = Vec::new();
+        append_guarded_sample(&mut blob, &[i16::MAX; 16], None);
+        let region = append_guarded_sample(&mut blob, &[0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000], None);
+
+        let mut voice = voice_for(region, Step::from_ratio(1, 4));
+        let mut output = [FixedFrame::default(); 4];
+        accumulate_voice::<FixedPath, Sinc>(&mut voice, &blob, &mut output, 44_100);
+        assert!(output.iter().all(|frame| frame.left.abs() < 2_000), "the loud sample before this one leaked into its attack: {output:?}");
     }
 
     #[test]
