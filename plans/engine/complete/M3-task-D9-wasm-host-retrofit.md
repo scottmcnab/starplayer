@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M3 ([master plan](M3-master-plan.md)); the follow-up the owner deferred from D4 on 2026-09-03 |
-| Status | Ready — not yet dispatched; lower priority than the M5/M6 format work |
+| Status | Landed 2026-09-04; owner browser check outstanding |
 | Depends on | D4, D6, D8 landed |
 | Blocks | Nothing hard; A1 (TUI) benefits from one host lifecycle |
 | Parallel with | F2, G3 and their repair tasks |

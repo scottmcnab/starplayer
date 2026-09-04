@@ -21,7 +21,7 @@ G2, G3, G6 (IT: 55 of 121 pass, 66 regrouped as `G6-IT-*` with the evidence that
 settle them). Whole corpus: 175 of 261 pass, 0 fail, 15 accepted deviations.
 Outstanding, filed and queued for GPT-5.6-sol one at a time: [F6](M5-task-F6-order-list-wrap.md)
 (the trace path's order-list wrap, which unblocks two XM cases) and
-[D9](M3-task-D9-wasm-host-retrofit.md) (the wasm host behind `AudioBackend`). Then the
+[D9](complete/M3-task-D9-wasm-host-retrofit.md) (the wasm host behind `AudioBackend`). Then the
 owner's acceptance of M3, M5 and M6, and the owner's call on `TempoModel::ItModern`
 (accuracy policy §2).
 
