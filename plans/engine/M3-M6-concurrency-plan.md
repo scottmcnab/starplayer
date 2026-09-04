@@ -19,7 +19,7 @@ complete); D3, D4, D5, D6, D7, D8 (M3 complete pending the owner's listening and
 checks; D9, the wasm retrofit, is filed but not dispatched); F1 and F2 (XM: 72 of 93
 conformance cases pass, 20 recorded as `F2-XM-*`); G1, G2 and G3 (IT: 39 of 121 pass, 82
 recorded as `G3-IT-*`). Outstanding: [F5](complete/M5-task-F5-xm-conformance-repairs.md) and
-[G6](M6-task-G6-it-conformance-repairs.md), run one worker at a time by the owner's
+[G6](complete/M6-task-G6-it-conformance-repairs.md), run one worker at a time by the owner's
 instruction after the overnight session limits; then the owner's acceptance of M3, M5 and M6.
 
 ## Task letters
