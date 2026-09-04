@@ -916,6 +916,11 @@ impl Player {
             retired_module_dropped: snapshot.warnings.retired_module_dropped,
             unsupported_command: snapshot.warnings.unsupported_command,
             late_events: snapshot.warnings.late_events,
+            // `retired_insert_dropped` (M7-H1) has no telemetry field yet: the snapshot's
+            // `Warnings` is `starplayer-telemetry`'s and widening it is H7's, with the
+            // rest of the host's insert surface. Reported through
+            // `HostEngine::warnings()` on the audio side in the meantime.
+            ..EngineWarnings::default()
         }
     }
 

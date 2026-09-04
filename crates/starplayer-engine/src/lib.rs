@@ -63,8 +63,15 @@
 //!   [`TapRing`](starplayer_rt::TapRing) per channel, 32 buckets per quantum, claimed
 //!   through [`Engine::scope_readers`]. It does **not** read the mix; see that module.
 //!
-//! Not here yet: effect interpretation (B4), instruments (M4), the DSP graph, and
-//! background voices (M6).
+//! # What M7 adds (task H1)
+//!
+//! * [`insert`] — the insert control plane: [`InsertChain`] (four ordered slots per bus
+//!   plus a bypass bit), [`InsertCommand`] and the [`InsertHandle`] a host installs
+//!   effects through, and the garbage channel a retired effect leaves by. The engine
+//!   itself grows per-channel buses, always on, summed channel-major into the pre-master
+//!   mix; see [`Engine::render`] and `crate::engine::Engine::process_channel_inserts`.
+//!
+//! Not here yet: SIMD kernels (H6) and the real effects (H3, H4).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -78,6 +85,7 @@ pub mod control;
 pub mod demo;
 pub mod engine;
 pub mod flow;
+pub mod insert;
 pub mod instrument;
 pub mod mixer_mode;
 pub mod ring;
@@ -100,6 +108,10 @@ pub use control::{ControlClock, ControlDriver, DEFAULT_CONTROL_INTERVAL_MICROS};
 pub use engine::{
     DEFAULT_SAMPLE_RATE_HZ, Engine, EngineSettings, EngineWarnings, MAX_EVENTS_PER_BLOCK, MAX_ZERO_ADVANCE,
     RENDER_QUANTUM,
+};
+pub use insert::{
+    DEFAULT_INSERT_COMMAND_CAPACITY, DEFAULT_INSERT_GARBAGE_CAPACITY, InsertChain, InsertCommand, InsertHandle,
+    InsertTarget, MAX_INSERTS_PER_CHAIN,
 };
 pub use instrument::{
     DEFAULT_BEND_RANGE_CENTS, EventFeed, EventOutcome, ExternalEventProducer, ExternalEventQueue, Instrument,
