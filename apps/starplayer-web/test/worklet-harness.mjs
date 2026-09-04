@@ -220,7 +220,7 @@ assert.ok(fallbackPeak > 100, `the fallback taps carry the signal too (peak ${fa
 //
 // The whole path, with no browser: install the live-input source from a port message,
 // push a framed MIDI message as an ordinary wire record, and hear the module's own
-// instrument sound while its pattern data does not. Both transports, because the
+// instrument sound beside its pattern data. Both transports, because the
 // `postMessage` fallback is where architecture 9.1's Q1 resolution says these events
 // still have to cross.
 
@@ -268,8 +268,7 @@ function sendMidi(live, status, data1, data2) {
 for (const shared of [true, false]) {
     const transport = shared ? 'SharedArrayBuffer' : 'postMessage';
     const live = liveInputProcessor(shared);
-    // Let the module play first, so "silent" below means the live-input source silenced it
-    // rather than the fixture never having started.
+    // Let the module play first, then verify installing live input leaves it playing.
     assert.ok(renderPeak(live.processor, 400) > 0.01, `${transport}: the module plays before live input`);
 
     const memoryBeforeInstall = live.processor.memory.buffer.byteLength;
@@ -282,17 +281,22 @@ for (const shared of [true, false]) {
     const stableAfterInstall = applied.memoryBytes;
     assert.ok(stableAfterInstall >= memoryBeforeInstall, 'the rack is allocated in the message task, never in process()');
 
-    assert.equal(renderPeak(live.processor, 16), 0, `${transport}: the module's own pattern data went silent`);
+    // Toggling jam mode rebuilds the module's sequencer at the sounding song position,
+    // exactly as a seek does: the song keeps its place, but the voices that were ringing
+    // are gone and the module is audible again from its next *note*, which in this
+    // fixture is several rows away. The window covers that rather than pretending the
+    // toggle is gapless.
+    assert.ok(renderPeak(live.processor, 400) > 0.001, `${transport}: the module keeps playing in jam mode`);
 
     sendMidi(live, 0xC0, 0, 0);          // program change: MIDI channel 0 takes instrument 0
     sendMidi(live, 0x90, 60, 100);       // note on, middle C at the engine's reference note
     const sounded = renderPeak(live.processor, 60);
-    assert.ok(sounded > 0.001, `${transport}: the note sounded from the silent module's instruments (peak ${sounded})`);
+    assert.ok(sounded > 0.001, `${transport}: the live note sounded beside the module (peak ${sounded})`);
 
     sendMidi(live, 0x80, 60, 0);         // note off
     sendMidi(live, 0xB0, 120, 0);        // all sound off
     renderPeak(live.processor, 8);
-    assert.equal(renderPeak(live.processor, 16), 0, `${transport}: and stopped when the page said so`);
+    assert.ok(renderPeak(live.processor, 16) > 0.001, `${transport}: all-sound-off leaves the module playing`);
 
     // Design goal 5 on the shared-memory path: nothing in `process()` may allocate, and a
     // growing `WebAssembly.Memory` is how that would show. The processor itself posts a
@@ -303,7 +307,7 @@ for (const shared of [true, false]) {
     live.port.dispatch({ type: 'midiInput', enabled: false });
     const removed = live.port.messages.findLast((message) => message.type === 'midiInputApplied');
     assert.equal(removed.active, false, `${transport}: live input goes off again`);
-    assert.ok(renderPeak(live.processor, 400) > 0.01, `${transport}: and the module plays again`);
+    assert.ok(renderPeak(live.processor, 400) > 0.01, `${transport}: disabling jam does not interrupt the module`);
 }
 
 globalThis.TextDecoder = nodeTextDecoder;

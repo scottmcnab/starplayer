@@ -340,7 +340,7 @@ fit comes for free without contaminating the tracker path.
 | `MidiSource<Feed>` | **landed M4-E4.** Plays any `EventFeed` through an `InstrumentRack`, and carries its own control tick (§5.4). The only `EventSource` on the musical side — a feed is not a source |
 | `ExternalEventQueue` | **landed M4-E4.** An `EventFeed`, not an `EventSource`: the SPSC ring of `TimedEvent`s that live MIDI, the keyboard and a plugin host push into, with a one-event lookahead refreshed per render segment |
 | `SmfSequencer` | M4-E5. The other `EventFeed`: a cursor over a MIDI file's sorted event list |
-| `SourceMux` | merges several sources with the §3.1.3 tie-break — "play a module and jam over it". Landed at **M1-B3** rather than M4: it is a hundred lines, and the tie-break rule is only testable once two real sources can collide |
+| `SourceMux` | merges several sources with the §3.1.3 tie-break — "play a module and jam over it". Landed at **M1-B3**; its two-real-source collision acceptance case landed at **M4-E7** |
 
 The split between `EventSource` and `EventFeed` is worth stating: a **source** is asked
 when it next has something to do, is advanced, and dispatches into the engine; a **feed**
@@ -649,10 +649,12 @@ Until then the division is:
 `TrackerProcessor::recommended_voice_capacity(channel_count)` is how the pool and that
 parallel array are sized from one number. Its default is the channel count — MOD, S3M and
 MTM sound one voice per channel and never detach — and a format with a parallel array
-sizes both the array and its answer from one constant. A pool **larger** than the answer
-is legal, and is what a persistent host builds (`MAX_VOICE_CAPACITY`, IT's virtual-channel
-limit of 256): the format must reach its voices through `get_mut` and skip ids past the
-end of its array. A pool **smaller** is legal too — fewer voices sound.
+sizes its answer from the format's limit. A pool **larger** than the answer is legal, and
+is what a persistent host builds: `MAX_VOICE_CAPACITY` is 272 after M4-E7, IT's 256
+virtual channels plus sixteen reserved for MIDI jam voices. IT's ID-indexed articulation
+array covers all 272 global slots while its allocator still caps IT-owned voices at 256,
+so MIDI occupying a low slot cannot push an IT voice beyond its state and IT cannot
+consume the reserve. A pool **smaller** is legal too — fewer voices sound.
 
 ### 5.4 The control clock
 

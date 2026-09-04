@@ -237,7 +237,8 @@ impl NativeSequencer {
     /// The processor's own answer, given the module's channel count — see
     /// [`TrackerProcessor::recommended_voice_capacity`]. A per-module host sizes its pool
     /// from this; a persistent host that plays every module through one engine takes
-    /// [`MAX_VOICE_CAPACITY`](crate::MAX_VOICE_CAPACITY) instead, and
+    /// [`MAX_VOICE_CAPACITY`](crate::MAX_VOICE_CAPACITY) instead (IT's 256 voices plus
+    /// sixteen live-MIDI jam slots), and
     /// [`crate::recommended_voice_capacity`] answers the same question without building a
     /// sequencer at all.
     pub fn recommended_voice_capacity(&self) -> usize {

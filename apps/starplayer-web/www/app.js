@@ -102,7 +102,7 @@ const state = {
     pendingSeekFrame: null,
     pendingSeekSequence: 0,
     // ── live input (task E6) ────────────────────────────────────────────────────────
-    /// Whether the worklet is playing a live-input source rather than the module.
+    /// Whether the worklet is jamming live input over the module.
     liveInputActive: false,
     /// A `midiInput` message already sent and not yet answered, so a fast double-click
     /// does not interleave two installs on the port's FIFO.
@@ -693,8 +693,8 @@ function onWorkletMessage(message, node) {
         state.eventLeadMillis = message.leadMillis;
         state.activationMemoryBytes = message.memoryBytes;
         showMessage(state.liveInputActive
-            ? 'Live input: the keyboard and any MIDI port play this module’s instruments. Its pattern data is silent.'
-            : 'Live input off; the module is playing again.');
+            ? 'Jam mode: the keyboard and any MIDI port play this module’s instruments over its pattern data.'
+            : 'Jam mode off; the module keeps playing.');
         updateLiveInputPanel();
     } else if (message.type === 'midiInputError') {
         if (node !== state.node) return;
@@ -780,7 +780,7 @@ function syncLiveInput() {
 
 function updateLiveInputPanel() {
     const active = state.liveInputActive;
-    elements.liveInputStatus.textContent = active ? 'playing the module’s instruments' : 'off';
+    elements.liveInputStatus.textContent = active ? 'jamming over the module' : 'off';
     const lead = state.eventLeadFrames > 0
         ? `lead ${state.eventLeadFrames} frames (${state.eventLeadMillis.toFixed(1)} ms)`
         : 'lead —';

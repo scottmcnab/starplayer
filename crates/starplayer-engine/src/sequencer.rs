@@ -532,10 +532,11 @@ pub trait TrackerProcessor {
     /// The default is `channel_count`: MOD, S3M and MTM sound exactly one voice per
     /// pattern channel and never create a background voice, so a pool that wide can never
     /// be full. XM and IT override it, because a channel there can hold several sounding
-    /// voices at once, and because they keep a **parallel per-voice array** — envelope
+    /// voices at once. A format may also keep a **parallel per-voice array** — envelope
     /// positions, fadeout, key-off, auto-vibrato phase, indexed by
-    /// [`VoiceId::index`](starplayer_core::VoiceId::index) — whose length must be sized
-    /// from the same constant as this answer, so the two can never disagree.
+    /// [`VoiceId::index`](starplayer_core::VoiceId::index). Its storage must cover every
+    /// pool size the host supports; its recommendation may remain the format's smaller
+    /// owned-voice limit, as IT's does when a persistent host reserves jam slots.
     ///
     /// # It is a recommendation, not a contract
     ///
@@ -544,8 +545,7 @@ pub trait TrackerProcessor {
     /// * **Larger** — a persistent host builds one engine at
     ///   [`MAX_VOICE_CAPACITY`](crate::MAX_VOICE_CAPACITY) and plays every module through
     ///   it. A format with a parallel array must therefore reach its voices through
-    ///   [`VoicePool::get_mut`] and simply **skip any id past the end of its array**; it
-    ///   may never index that array unchecked.
+    ///   [`VoicePool::get_mut`] and may never index that array unchecked.
     /// * **Smaller** — an embedded host may not have the memory. Fewer voices sound;
     ///   [`VoicePool::allocate`] returning `None` is already a normal outcome.
     fn recommended_voice_capacity(&self, channel_count: usize) -> usize { channel_count }
@@ -1289,9 +1289,20 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             self.end_reached,
         );
         crate::telemetry::capture_channels(telemetry, context.channels, context.voices);
-        // The table has however many lanes the host sized it with; the UI wants the
-        // *song's* channels, which only the pattern data knows.
-        telemetry.set_channel_count(self.data.channel_count().min(context.channels.len().min(u8::MAX as usize) as u8));
+        // The table has however many lanes the host sized it with; normally the UI wants
+        // the song's own channel count. While a MIDI lane is sounding beside it, keep the
+        // full MIDI range visible so the same snapshot shows both halves of a jam.
+        let module_channels = self.data.channel_count().min(context.channels.len().min(u8::MAX as usize) as u8);
+        let midi_sounding = context
+            .channels
+            .iter()
+            .skip(crate::instrument::MIDI_CHANNEL_BASE as usize)
+            .any(|(_, channel)| channel.foreground.is_some_and(|voice| context.voices.get(voice).is_some()));
+        telemetry.set_channel_count(if midi_sounding {
+            context.channels.len().min(u8::MAX as usize) as u8
+        } else {
+            module_channels
+        });
         telemetry.publish();
     }
 }

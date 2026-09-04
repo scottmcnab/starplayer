@@ -67,9 +67,10 @@ pub const MAX_OUTPUT_CHANNELS: usize = 2;
 /// It is returned to the allocator immediately and then reused by module activation.
 ///
 /// Sized for the *host*, not for a module: the engine is built at
-/// [`MAX_VOICE_CAPACITY`](starplayer::MAX_VOICE_CAPACITY) voices and 64 channels whatever is
-/// loaded, and 16 MiB covers that several times over. Task D9 measured it again after the
-/// [`Player`] retrofit — see that task's research resolution.
+/// [`MAX_VOICE_CAPACITY`](starplayer::MAX_VOICE_CAPACITY) voices (including sixteen jam
+/// slots) and 64 channels whatever is loaded, and 16 MiB covers that several times over.
+/// Task D9 measured it again after the [`Player`] retrofit — see that task's research
+/// resolution.
 const HEAP_RESERVE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Fraction of the held master peak that survives one quantum: about a 200 ms fall from
@@ -283,17 +284,16 @@ impl Host {
 
     /// Turn live input on or off, from a worklet message task.
     ///
-    /// On: the module's instruments are bound to sixteen MIDI channels and the module's
-    /// own pattern data stops playing (task E6; hearing both at once is E7). Off: the
-    /// module's sequencer goes back, from the top. Both allocate — a rack, a queue, a
-    /// sequencer — which is exactly why this is not an opcode.
+    /// On: the module's instruments are bound to sixteen MIDI channels beside the
+    /// module's own sequencer in a `SourceMux`. Off: the MIDI source is removed without
+    /// changing the song position. Both allocate — a rack, a queue, a sequencer — which
+    /// is exactly why this is not an opcode.
     fn set_midi_input(&mut self, enabled: bool) -> Result<bool, String> {
-        if enabled == self.player.is_midi_only() {
+        if enabled == self.player.is_jamming() {
             return Ok(enabled);
         }
-        let result = if enabled { self.player.midi_only() } else { self.player.restore_module_source() };
-        result.map_err(|error| error.to_string())?;
-        Ok(self.player.is_midi_only())
+        self.player.jam(enabled).map_err(|error| error.to_string())?;
+        Ok(self.player.is_jamming())
     }
 
     fn enqueue(&mut self, command: WireCommand) -> bool { self.commands.push(command) }
@@ -1073,28 +1073,42 @@ mod tests {
     }
 
     #[test]
-    fn a_midi_event_opcode_sounds_a_note_from_a_silent_modules_instruments() {
+    fn a_midi_event_opcode_sounds_beside_the_module_and_both_reach_telemetry() {
         let mut host = Host::new(48_000);
         assert!(host.load_module(FIXTURE).is_ok());
-        assert!(!host.player.is_midi_only());
+        assert!(!host.player.is_jamming());
 
         assert_eq!(host.set_midi_input(true), Ok(true), "the rack installs from a worklet message task");
-        assert!(host.player.is_midi_only());
-        assert_eq!(render_peak(&mut host, 8), 0.0, "the module's own pattern data stopped");
+        assert!(host.player.is_jamming());
+        assert!(render_peak(&mut host, 8) > 0.001, "the module keeps playing in jam mode");
 
         assert!(host.enqueue(midi_wire(0xC0, 0, 0)), "program change: MIDI channel 0 takes instrument 0");
         assert!(host.enqueue(midi_wire(0x90, 60, 100)), "note on");
-        assert!(render_peak(&mut host, 40) > 0.001, "the note sounded through the wire opcode");
+        let mut together_peak = 0.0f32;
+        let mut simultaneous = None;
+        for _ in 0..16 {
+            together_peak = together_peak.max(render_peak(&mut host, 1));
+            let snapshot = *host.player.telemetry();
+            if snapshot.channels[48].active && snapshot.channels[..48].iter().any(|channel| channel.active) {
+                simultaneous = Some(snapshot);
+                break;
+            }
+        }
+        assert!(together_peak > 0.001, "the note sounded through the wire opcode");
+        let snapshot = simultaneous.expect("one coherent snapshot shows tracker and MIDI voices together");
+        assert_eq!(snapshot.channel_count, 64, "module and MIDI lanes are visible together");
+        assert!(snapshot.channels[..48].iter().any(|channel| channel.active), "a tracker lane is sounding");
+        assert!(snapshot.channels[48].active, "the live MIDI lane is sounding beside it");
         assert_eq!(host.player.events_sent(), 2);
         assert_eq!(host.player.events_rejected(), 0);
 
         assert!(host.enqueue(midi_wire(0xB0, 120, 0)), "controller 120 is all-sound-off");
         let _ = render_peak(&mut host, 4);
-        assert_eq!(render_peak(&mut host, 8), 0.0, "and stopped when the page said so");
+        assert!(render_peak(&mut host, 8) > 0.001, "all-sound-off leaves the module playing");
 
         assert_eq!(host.set_midi_input(false), Ok(false), "and the module comes back");
-        assert!(!host.player.is_midi_only());
-        assert!(render_peak(&mut host, 200) > 0.001, "playing its own pattern data again");
+        assert!(!host.player.is_jamming());
+        assert!(render_peak(&mut host, 200) > 0.001, "and disabling jam does not interrupt the module");
     }
 
     /// An `argument` that spells no channel voice message is refused, exactly as an unknown
@@ -1144,7 +1158,7 @@ mod tests {
         host.process(RENDER_QUANTUM);
 
         assert!(host.set_mixer_mode(mode(MixPathKind::Fixed, Interpolator::Linear, OutputDepth::I16, false, 2)).is_ok());
-        assert!(host.player.is_midi_only(), "the rebuilt engine came back on live input");
+        assert!(host.player.is_jamming(), "the rebuilt engine came back in jam mode");
 
         assert!(host.enqueue(midi_wire(0xC0, 0, 0)));
         assert!(host.enqueue(midi_wire(0x90, 60, 100)));

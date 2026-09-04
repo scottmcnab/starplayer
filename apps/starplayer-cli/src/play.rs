@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use starplayer::core::AtEnd;
+use starplayer::core::{AtEnd, Frame};
 use starplayer::engine::MixerMode;
 use starplayer_host::{AudioBackend, AudioSpec, DeviceInfo, Player, format_seconds};
 use starplayer_host_cpal::CpalBackend;
@@ -85,12 +85,8 @@ pub struct PlayArgs {
     #[arg(long)]
     pub list_devices: bool,
     // ── task E5 ──────────────────────────────────────────────────────────────────────
-    /// The module whose instruments play a `.mid` file (task E5 deliverable 4).
-    /// Required when `file` is a Standard MIDI File; ignored, with no effect, for a
-    /// tracker module. `play` does not yet play a `.mid` through a device — that needs
-    /// `starplayer-host::Player` support E6/E7 land — so today this flag only lets a
-    /// `.mid` fail with a message naming `render` instead of the generic "not a module
-    /// format this build plays".
+    /// The module whose instruments play a `.mid` file. Required when `file` is a
+    /// Standard MIDI File; ignored, with no effect, for a tracker module.
     #[arg(long)]
     pub instruments: Option<PathBuf>,
     // ── end task E5 ──────────────────────────────────────────────────────────────────
@@ -100,8 +96,8 @@ pub struct PlayArgs {
     //
     // Kept in one block, separate from the transport flags above, because E5 lands
     // `--instruments` on this same command concurrently and the two must not tangle.
-    /// Play the module's instruments from a MIDI input port instead of playing the
-    /// module: an index, an exact port name, or any case-insensitive part of one.
+    /// Jam the module's instruments from a MIDI input port over the playing module: an
+    /// index, an exact port name, or any case-insensitive part of one.
     #[arg(long, value_name = "PORT")]
     pub midi: Option<String>,
     /// Print every MIDI input port this build can see, and exit.
@@ -124,17 +120,12 @@ pub fn run(args: PlayArgs) -> Result<(), String> {
     };
     let bytes = archive::load_module_bytes(&file, args.entry)?;
 
-    // ── task E5: `play` cannot drive a `.mid` yet; fail clearly rather than through
-    // `Player::load`'s generic "not a module format this build plays". ──────────────
-    if starplayer::probe_smf(&bytes) {
-        return match &args.instruments {
-            None => Err(format!("{}: a Standard MIDI File needs --instruments <module> naming the module whose instruments play it", file.display())),
-            Some(_) => Err(format!(
-                "{}: `play` cannot drive a .mid through a device yet; render it instead: `starplayer render {} --instruments <module> -o out.wav`",
-                file.display(),
-                file.display()
-            )),
-        };
+    let is_smf = starplayer::probe_smf(&bytes);
+    if is_smf && args.instruments.is_none() {
+        return Err(format!("{}: a Standard MIDI File needs --instruments <module> naming the module whose instruments play it", file.display()));
+    }
+    if is_smf && args.midi.is_some() {
+        return Err(String::from("--midi cannot be combined with Standard MIDI File playback; it is live input for a tracker module"));
     }
     // ── end task E5 ────────────────────────────────────────────────────────────────
 
@@ -155,6 +146,9 @@ pub fn run(args: PlayArgs) -> Result<(), String> {
 /// below drive a device that finds nothing, without a sound card or a process-wide signal
 /// handler.
 fn play_on(backend: &mut dyn AudioBackend, backend_name: &str, file_display: &str, bytes: &[u8], args: &PlayArgs, interrupted: &AtomicBool) -> Result<(), String> {
+    if starplayer::probe_smf(bytes) && args.midi.is_some() {
+        return Err(String::from("--midi cannot be combined with Standard MIDI File playback; it is live input for a tracker module"));
+    }
     let requested = AudioSpec {
         sample_rate_hz: args.rate,
         channels: MixerMode::DEFAULT.channels as u16,
@@ -168,10 +162,19 @@ fn play_on(backend: &mut dyn AudioBackend, backend_name: &str, file_display: &st
     println!("backend {backend_name} - device {}", args.device.as_deref().unwrap_or("(default)"));
     println!("stream  {spec}");
 
-    player.load(bytes).map_err(|error| error.to_string())?;
+    let smf_length = if starplayer::probe_smf(bytes) {
+        let path = args.instruments.as_ref().ok_or("a Standard MIDI File needs --instruments <module>")?;
+        let instrument_bytes = std::fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        let instruments = starplayer::rt::Arc::new(starplayer::load(&instrument_bytes).map_err(|error| error.to_string())?);
+        Some(player.load_smf(bytes, instruments).map_err(|error| error.to_string())?)
+    } else {
+        player.load(bytes).map_err(|error| error.to_string())?;
+        None
+    };
     let title = player.module().map(|module| String::from(module.header().title.as_ref())).unwrap_or_default();
-    let song_length = player.song_length().unwrap_or(0);
-    println!("module  {file_display}: {title:?}, {song_length} frames ({})", format_seconds(song_length, spec.sample_rate_hz));
+    let song_length = smf_length.or_else(|| player.song_length()).unwrap_or(0);
+    let kind = if smf_length.is_some() { "smf" } else { "module" };
+    println!("{kind:<7} {file_display}: {title:?}, {song_length} frames ({})", format_seconds(song_length, spec.sample_rate_hz));
 
     if args.repeat {
         player.set_at_end(AtEnd::Continue).map_err(|error| error.to_string())?;
@@ -183,20 +186,18 @@ fn play_on(backend: &mut dyn AudioBackend, backend_name: &str, file_display: &st
     }
     // ── live MIDI input (task E6) ───────────────────────────────────────────────────
     //
-    // `--midi` swaps the module's own sequencer for its *instruments* on a live-input
-    // source, so the keyboard plays the module and the module does not play itself.
-    // Hearing both at once is task E7's `SourceMux`; this is the honest half of it, and
-    // the printed line says so rather than leaving a silent module looking like a bug.
+    // `--midi` puts the module sequencer in slot 0 and its live-input instruments in slot
+    // 1 of one deterministic `SourceMux`.
     // The connection is bound to a name because dropping it closes the port.
     let _midi_connection = match args.midi.as_deref() {
         None => None,
         Some(selector) => {
-            player.midi_only().map_err(|error| error.to_string())?;
+            player.jam(true).map_err(|error| error.to_string())?;
             let sender = player.take_event_sender().ok_or("live input installed no sender")?;
             let connection = starplayer_midi_native::open_input(Some(selector), sender).map_err(|error| {
                 format!("{error}; `--list-midi-ports` shows what this machine has")
             })?;
-            println!("midi    {} - the module's instruments only; its pattern data is not playing", connection.port_name());
+            println!("midi    {} - jamming the module's instruments over its pattern data", connection.port_name());
             println!("lead    {} frames ({:.1} ms) ahead of the audio clock", player.event_lead(), player.event_lead_millis());
             Some(connection)
         }
@@ -205,7 +206,11 @@ fn play_on(backend: &mut dyn AudioBackend, backend_name: &str, file_display: &st
 
     player.play().map_err(|error| error.to_string())?;
 
-    let outcome = follow(&mut player, spec.sample_rate_hz, interrupted);
+    let smf_span = smf_length.map(|length| {
+        let start = player.source_frame();
+        (start, start.saturating_add(length))
+    });
+    let outcome = follow(&mut player, spec.sample_rate_hz, interrupted, smf_span);
     player.stop().map_err(|error| error.to_string())?;
     std::thread::sleep(RING_OUT);
     player.collect_garbage();
@@ -236,7 +241,7 @@ enum Outcome {
 }
 
 /// Poll telemetry until the song is over, updating one status line a second.
-fn follow(player: &mut Player, sample_rate_hz: u32, interrupted: &AtomicBool) -> Outcome {
+fn follow(player: &mut Player, sample_rate_hz: u32, interrupted: &AtomicBool, smf_span: Option<(Frame, Frame)>) -> Outcome {
     let started = Instant::now();
     let mut next_report = Instant::now();
     // The transport is queued, not immediate: `is_playing` is false for the first block
@@ -262,14 +267,42 @@ fn follow(player: &mut Player, sample_rate_hz: u32, interrupted: &AtomicBool) ->
         } else if has_started {
             return if stopping { Outcome::Interrupted } else { Outcome::Ended };
         }
+        if smf_span.is_some_and(|(_, end)| player.source_frame() >= end) {
+            return Outcome::Ended;
+        }
 
         if Instant::now() >= next_report {
-            if player.is_midi_only() { report_live_input(player); } else { report(player, sample_rate_hz); }
+            if let Some((start, end)) = smf_span {
+                report_smf(player, sample_rate_hz, start, end);
+            } else if player.is_midi_only() {
+                report_live_input(player);
+            } else {
+                report(player, sample_rate_hz);
+            }
             next_report = Instant::now() + Duration::from_secs(1);
         }
         player.collect_garbage();
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// One updating status line for a file-driven MIDI source. Tracker telemetry has no song
+/// row for this source, so elapsed time comes directly from the same monotonic clock that
+/// dispatches its events.
+fn report_smf(player: &mut Player, sample_rate_hz: u32, start: Frame, end: Frame) {
+    use std::io::Write;
+
+    let elapsed = start.frames_until(player.source_frame()).min(start.frames_until(end));
+    let duration = start.frames_until(end);
+    let voices_active = player.telemetry().voices_active;
+    print!(
+        "\r{:>8} / {:<8}  voices {:>3}  peak {:>5.3}  ",
+        format_seconds(elapsed, sample_rate_hz),
+        format_seconds(duration, sample_rate_hz),
+        voices_active,
+        player.peak(),
+    );
+    let _ = std::io::stdout().flush();
 }
 
 /// One updating status line: `\r` and no trailing newline, so each second's report
@@ -470,19 +503,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Task E5: `play` does not yet drive a `.mid` through a device (that needs
-    /// `starplayer-host::Player` support E6/E7 land) — with `--instruments` given, the
-    /// error points at `render` instead of failing silently or panicking.
+    /// Task E7: `--instruments` is accepted on the device playback path; the host-level
+    /// ManualBackend test proves the source itself without needing a sound card here.
     #[test]
-    fn a_mid_file_with_instruments_points_at_render_instead_of_playing() {
-        let path = std::env::temp_dir().join("starplayer-e5-play-test-2.mid");
-        std::fs::write(&path, minimal_smf_bytes()).expect("can write a scratch file");
-
-        let error = run(PlayArgs { file: Some(path.clone()), instruments: Some(PathBuf::from("module.it")), ..default_args() })
-            .expect_err("play cannot drive a .mid through a device yet");
-        assert!(error.contains("render"), "the error must point at `render` instead: {error:?}");
-
-        let _ = std::fs::remove_file(&path);
+    fn a_mid_file_accepts_an_instrument_module_argument() {
+        let args = PlayArgs { instruments: Some(PathBuf::from("module.it")), ..default_args() };
+        assert_eq!(args.instruments.as_deref(), Some(std::path::Path::new("module.it")));
     }
 
     /// The smallest legal Standard MIDI File: an empty format-0 track.

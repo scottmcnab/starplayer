@@ -56,9 +56,10 @@
 //!
 //! # Live input (task E6)
 //!
-//! A host does not only push audio out; it takes notes in. [`Player::midi_only`] binds the
-//! loaded module's instruments to sixteen MIDI channels and installs the engine's
-//! `MidiSource` in place of the module's own sequencer, and [`Player::send_event`] stamps
+//! A host does not only push audio out; it takes notes in. [`Player::jam`] binds the loaded
+//! module's instruments to sixteen MIDI channels and installs the engine's `MidiSource`
+//! beside its sequencer in a `SourceMux`; [`Player::midi_only`] remains available for an
+//! instrument-only host. [`Player::send_event`] stamps
 //! an event `source_frame + lead` and pushes it at that source's queue. [`EventSender`] is
 //! the sending half, made `Send` so a `midir` callback thread can own it
 //! (`starplayer-midi-native`), and [`EventClock`] carries the lead policy, the clock and

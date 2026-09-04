@@ -138,10 +138,9 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             }
             this.applyPendingMixerMode();
         } else if (message.type === 'midiInput') {
-            // Task E6. Installing the live-input source builds an instrument rack and a
-            // queue, both of which allocate, so it happens here — in a message task —
-            // exactly as a mixer-mode rebuild does. The events themselves are opcode 10 on
-            // the ordinary command ring.
+            // Installing jam mode builds an instrument rack, queue and two-source mux, so
+            // it happens here — in a message task — exactly as a mixer-mode rebuild does.
+            // The events themselves are opcode 10 on the ordinary command ring.
             try {
                 const active = this.wasm.set_midi_input(message.enabled === true);
                 // The rack is allocated out of the pre-reserved heap; rebind here, outside
