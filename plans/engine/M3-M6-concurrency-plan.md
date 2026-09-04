@@ -21,7 +21,8 @@ G2, G3, G6 (IT: 55 of 121 pass, 66 regrouped as `G6-IT-*` with the evidence that
 settle them). Whole corpus: 175 of 261 pass, 0 fail, 15 accepted deviations.
 D9 (the wasm host behind `AudioBackend`) landed the same day, so both hosts share one
 lifecycle and the headless web harness passes again. F6 (the trace path's order-list wrap) landed too, taking XM to 88 of 93 and the corpus to
-176 of 261 with 0 failures. M4-full is planned as E4–E7 (see the M4 master plan) and parked with the owner. Then the
+176 of 261 with 0 failures. M4-full landed the same day as E4–E7 (see the M4 master plan): the `Instrument` trait, the
+MIDI codec and SMF playback, live MIDI and keyboard input on both hosts, and jam mode. Then the
 owner's acceptance of M3, M5 and M6, and the owner's call on `TempoModel::ItModern`
 (accuracy policy §2).
 

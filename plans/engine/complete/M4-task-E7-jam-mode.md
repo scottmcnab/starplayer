@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M4-full ([master plan](M4-master-plan.md)) |
-| Status | Implemented 2026-09-04 — review and owner hardware jam check pending |
+| Status | Landed 2026-09-04; owner jam check outstanding |
 | Depends on | E4, E5, E6 |
 | Blocks | M4 exit; M9 (the plugin edge reuses `ExternalEventQueue`) |
 | Recommended model | Claude Sonnet (assembly of landed parts plus the acceptance test) |
