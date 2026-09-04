@@ -786,6 +786,61 @@ loop, never a semantic change. A scalar-equivalence test gates it.
 Per-channel insert chains and a master bus, both operating on whole `RENDER_QUANTUM`
 blocks (§1.4). Effects: reverb, chorus, delay, compressor, EQ.
 
+#### The graph as it landed (M7-H1)
+
+**The buses are always on.** `VoicePool::accumulate_masked` sums each voice into the bus of
+its `tag.channel` rather than into one shared accumulator, through a `BusSegment` view over
+one channel-major allocation the engine makes in `Engine::with_settings`; a voice whose
+lane has no bus goes to a **spill lane**. There is deliberately no "no inserts, take the
+old path" branch, because two summation orders would be two things to keep in step and only
+one of them would be under test.
+
+**The nine fixed goldens did not move for it**, which is the claim the design rests on.
+Voices are still walked in slot order *within* a bus, and on the fixed path `i32` addition
+is associative unless an intermediate sum saturates — which needs 65,536× full scale and no
+real module reaches it. H1 proved it two ways: `cargo xtask goldens --check` byte-identical,
+and the pinned corpus's three dense `data/m/*.it` modules — the mixes most likely to
+saturate an intermediate sum — rendered on the fixed path to identical SHA-256 digests
+before and after. The float path's last bits may move, which no golden pins.
+
+**The order per quantum** is: clear the buses and the spill lane; accumulate voices in
+event-split segments into the bus windows; run each channel's chain over its whole bus; sum
+the buses into the pre-master mix **channel-major**; add the spill lane; run the master
+chain; then master volume and the limiter. Every DSP call takes a whole quantum, and
+`RENDER_QUANTUM == starplayer_dsp::DSP_BLOCK_FRAMES` is a compile-time assertion in the
+engine.
+
+**The topology is fixed**: `MAX_INSERTS_PER_CHAIN = 4` ordered slots per bus and four more
+on the master, ahead of the master volume and the limiter. Slot order is processing order.
+This is not a node graph. **Bypass is a bit the engine reads**, so bypassing is one branch
+rather than something every effect implements identically, and a bypassed effect still
+receives its parameters and is still reset.
+
+**`Insert` lives in `starplayer-dsp`**, generic over a `DspSample` arithmetic trait
+implemented for `f32` and `i32`, so every effect exists on both mixing paths from the day it
+lands and the fixed one stays cross-target bit-identical. Parameters are integers in fixed
+units (`ParamUnit`: centi-dB, frames, cents, percent, milliseconds, ratio×100, switch) so
+the fixed path never sees a float. `Stereo<T>` moved down from `starplayer-mixer` to
+`starplayer-dsp` for the same reason and is re-exported from where it was. Q15 unity is
+32768 rather than 32767, so `scale_q15` at unity is the identity on both paths and an
+insert sitting at its default leaves a bus bit-identical.
+
+**An effect is built off the audio thread and installed by command.** Building one
+allocates its delay lines, so it arrives boxed over an engine-side SPSC ring drained at the
+top of a quantum right after the command ring and bounded by `MAX_COMMANDS_PER_QUANTUM`, and
+it leaves over a garbage channel exactly as a retired `Arc<Module>` does. An `Err` from
+`retire` sets `EngineWarnings::retired_insert_dropped` and drops in place, mirroring
+`retired_module_dropped`. `Command::LoadModule` resets every insert, so a delay line cannot
+carry one song into the next; `InsertCommand::ResetAll` is the host's seek.
+
+**Every audible parameter is smoothed inside the effect**, with the mixer's
+frames-since-change discipline (`starplayer_dsp::SmoothedParam`, `SMOOTH_FRAMES = 256` —
+two quanta, where a voice's gain ramp is 64). A parameter is a function of frames elapsed
+since the change and lands exactly on its target, so it cannot depend on where a host block
+boundary fell. `tests/block_size_determinism.rs` carries a scenario with a channel chain, a
+master chain, a mid-song `SetParam` and a later `Remove`, byte-identical at every block size
+on both paths.
+
 #### IT's resonant filter is a *voice*-level filter, not an insert (M6-G2, landed)
 
 It sits inside the render kernel, between the resampler and the pan gains — which is where

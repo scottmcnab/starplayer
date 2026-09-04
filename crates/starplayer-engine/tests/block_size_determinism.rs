@@ -16,15 +16,17 @@
 //! Samples are compared as **bit patterns**, never with `==` on floats: `==` would accept
 //! `0.0 == -0.0` and reject two identical NaNs, and byte identity is the actual claim.
 
-use starplayer_core::{ExactFixedPoint, FilterParams, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
-use starplayer_dsp::{Interpolate, Linear, Nearest};
+use starplayer_core::{ChannelId, ExactFixedPoint, FilterParams, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
+use starplayer_dsp::effects::{GAIN_MIN_CENTI_DB, GAIN_PARAM};
+use starplayer_dsp::{InsertKind, Interpolate, Linear, Nearest, build_insert};
 use starplayer_engine::demo::{
     DEMO_BREAK_ROW, DEMO_NOTE_CUT, DEMO_ORDER_JUMP, DEMO_PATTERN_DELAY, DEMO_SET_SPEED, DEMO_SET_TEMPO, DemoCell,
     DemoPatternData, DemoProcessor,
 };
 use starplayer_engine::{
-    ChannelTable, ControlDriver, Engine, EngineContext, EngineSettings, EventSource, MAX_VOICE_CAPACITY,
-    MAX_ZERO_ADVANCE, PatternSequencer, RENDER_QUANTUM, ScriptedAction, ScriptedSource, SequencerSettings,
+    ChannelTable, ControlDriver, Engine, EngineContext, EngineSettings, EventSource, InsertCommand, InsertHandle,
+    InsertTarget, MAX_VOICE_CAPACITY, MAX_ZERO_ADVANCE, PatternSequencer, RENDER_QUANTUM, ScriptedAction,
+    ScriptedSource, SequencerSettings,
 };
 use starplayer_mixer::{
     FixedPath, FloatPath, LoopSpan, MixPath, MonoI16, OutputFormat, SampleRegion, StereoF32, StereoI16, VoiceTag,
@@ -269,6 +271,241 @@ fn a_filtered_voice_is_byte_identical_at_every_host_block_size() {
     assert_filtered_block_size_independent::<FloatPath, Linear, StereoF32>("float / linear / stereo f32, filtered");
     assert_filtered_block_size_independent::<FixedPath, Linear, StereoI16>("fixed / linear / stereo i16, filtered");
     assert_filtered_block_size_independent::<FixedPath, Nearest, MonoI16>("fixed / nearest / mono i16, filtered");
+}
+
+// ── the same invariant, with the insert graph live (M7-H1) ──────────────────────────
+//
+// The insert control ring is drained at the **top of a quantum**, exactly like the command
+// ring, so a command pushed from the host lands on a quantum boundary rather than on a
+// host block boundary.
+//
+// An insert command has no scheduled frame the way a `ScriptedAction` has — it takes
+// effect when the audio thread next drains the ring — so the *input* to these runs is only
+// the same at every block size if the host pushes at the same point in the stream. The
+// render loop below therefore stops exactly on each phase boundary and pushes there,
+// varying the block size everywhere else. Each boundary is a whole number of quanta, so at
+// one the output ring is empty and the engine has rendered exactly that many frames
+// whatever size the host asked in. That is not a weakening of the invariant: what is being
+// asserted is still that the same control timeline produces byte-identical output at every
+// block size, and the smoothing ramp the `SetParam` starts runs for two whole quanta after
+// the boundary, across block boundaries wherever they fall.
+
+/// Frames of host output before the `SetParam` is queued: 40 whole quanta.
+const INSERT_SET_PARAM_FRAMES: usize = 40 * RENDER_QUANTUM;
+
+/// Frames of host output before the `Remove` is queued: 100 whole quanta, so the
+/// smoothing ramp the `SetParam` started has long since landed and the removal is a step
+/// rather than a change to a moving value.
+const INSERT_REMOVE_FRAMES: usize = 100 * RENDER_QUANTUM;
+
+const _: () = assert!(INSERT_SET_PARAM_FRAMES < INSERT_REMOVE_FRAMES && INSERT_REMOVE_FRAMES < TOTAL_FRAMES);
+
+/// The channel the inserted chain sits on. The second voice is on channel 0 and has no
+/// chain, so it proves the graph touches one bus and not the other.
+const INSERT_CHANNEL: u16 = 1;
+
+/// What the `SetParam` moves the channel gain to: 6 dB down, far enough to be visible in
+/// one sample on the fixed path.
+const INSERT_SET_PARAM_CENTI_DB: i32 = -600;
+
+/// A gentle trim on the master, so the master chain is live for the whole render and a
+/// mistake in the order "channel chains, sum, spill, master chain, master bus" shows.
+const INSERT_MASTER_CENTI_DB: i32 = -150;
+
+/// Two looping voices — one on channel 0, one on [`INSERT_CHANNEL`] — with a gain insert
+/// on the second channel's bus and another on the master.
+fn render_with_inserts_at_block_size<Path, Interp, Out>(block_frames: usize) -> Vec<Out::Sample>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let (blob, region) = looping_blob();
+    let mut engine: Engine<Path, Interp, Out> = Engine::new(VOICE_CAPACITY);
+    engine.set_pcm(blob);
+    let mut inserts = engine.take_insert_control().expect("a fresh engine owns its insert handle");
+
+    for channel in [0u8, INSERT_CHANNEL as u8] {
+        let tag = VoiceTag { channel, instrument: 1, sample: 1, note: 60 };
+        engine.voices_mut().allocate(tag, region, voice_params(), 0).expect("a fresh pool has room");
+    }
+    engine.set_source(Box::new(ScriptedSource::new(Vec::new())));
+
+    // Both effects are built here, on the "control thread", and cross to the engine boxed.
+    let channel_target = InsertTarget::Channel(ChannelId(INSERT_CHANNEL));
+    inserts.install(channel_target, 0, build_insert::<Path::Mono>(InsertKind::Gain, 44_100)).map_err(|_| "full").expect("the ring has room");
+    let mut master = build_insert::<Path::Mono>(InsertKind::Gain, 44_100);
+    master.set_param(GAIN_PARAM, INSERT_MASTER_CENTI_DB);
+    inserts.install(InsertTarget::Master, 0, master).map_err(|_| "full").expect("the ring has room");
+
+    let mut output = vec![Out::Sample::default(); TOTAL_FRAMES * Out::CHANNELS];
+    let set_param = InsertCommand::SetParam { target: channel_target, slot: 0, param: GAIN_PARAM, value: INSERT_SET_PARAM_CENTI_DB };
+    let remove = InsertCommand::Remove { target: channel_target, slot: 0 };
+    let phases = [(INSERT_SET_PARAM_FRAMES, Some(set_param)), (INSERT_REMOVE_FRAMES, Some(remove)), (TOTAL_FRAMES, None)];
+    render_phases::<Path, Interp, Out>(&mut engine, &mut inserts, &mut output, block_frames, phases);
+
+    // Retired on the audio thread, dropped here — the point of the garbage channel.
+    assert_eq!(inserts.collect_all_garbage(), 1, "the removed insert came back to the control thread");
+    assert!(!engine.warnings().any(), "the insert graph raised no warnings: {:?}", engine.warnings());
+    output
+}
+
+/// Render `output` in `block_frames`-sized host calls, stopping exactly at each phase's
+/// frame count and sending that phase's insert command there.
+fn render_phases<Path, Interp, Out>(
+    engine: &mut Engine<Path, Interp, Out>,
+    inserts: &mut InsertHandle<Path::Mono>,
+    output: &mut [Out::Sample],
+    block_frames: usize,
+    phases: [(usize, Option<InsertCommand<Path::Mono>>); 3],
+) where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let mut written = 0usize;
+    for (boundary_frames, command) in phases {
+        let boundary = (boundary_frames * Out::CHANNELS).min(output.len());
+        while written < boundary {
+            let end = (written + block_frames * Out::CHANNELS).min(boundary);
+            let Some(block) = output.get_mut(written..end) else { return };
+            engine.render(block);
+            written = end;
+        }
+        if let Some(command) = command {
+            inserts.send(command).map_err(|_| "full").expect("the ring has room");
+        }
+    }
+}
+
+fn assert_inserted_block_size_independent<Path, Interp, Out>(what: &str)
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: BitPattern + Default,
+{
+    let reference = render_with_inserts_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM);
+    let plain = render_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM, false);
+    assert!(first_difference(&reference, &plain).is_some(), "{what}: the inserts have to actually change the sound");
+
+    for block_frames in BLOCK_SIZES {
+        let output = render_with_inserts_at_block_size::<Path, Interp, Out>(block_frames);
+        let difference = first_difference(&output, &reference);
+        assert_eq!(difference, None, "{what}: block size {block_frames} changed the output at sample {difference:?}");
+        assert_eq!(byte_image(&output), byte_image(&reference), "{what}: block size {block_frames} is not byte-identical");
+    }
+}
+
+/// A channel chain, a master chain, a parameter change part way through and a removal
+/// later, at every host block size on both mixing paths.
+///
+/// The three things this would catch: an insert handed a ragged segment instead of a whole
+/// quantum, a smoothing ramp advanced per host block rather than per frame, and a command
+/// drained anywhere but the top of a quantum.
+#[test]
+fn an_insert_graph_is_byte_identical_at_every_host_block_size() {
+    assert_inserted_block_size_independent::<FloatPath, Linear, StereoF32>("inserted float / linear / stereo f32");
+    assert_inserted_block_size_independent::<FixedPath, Linear, StereoI16>("inserted fixed / linear / stereo i16");
+    assert_inserted_block_size_independent::<FixedPath, Nearest, MonoI16>("inserted fixed / nearest / mono i16");
+}
+
+/// The parameter change lands on the first quantum after the phase boundary, at every
+/// block size — the insert graph's version of
+/// [`the_parameter_change_lands_on_exactly_its_scheduled_frame_at_every_block_size`].
+#[test]
+fn an_insert_parameter_change_lands_on_the_same_quantum_at_every_block_size() {
+    let reference = render_with_inserts_at_block_size::<FixedPath, Linear, StereoI16>(RENDER_QUANTUM);
+    let never_changed = render_with_inserts_without_the_parameter_change::<FixedPath, Linear, StereoI16>(RENDER_QUANTUM);
+    let first = first_difference(&reference, &never_changed).map(|sample| sample / 2).expect("the change is audible");
+    assert_eq!(first, INSERT_SET_PARAM_FRAMES, "the change landed at frame {first}, not on the quantum boundary it was queued at");
+
+    for block_frames in BLOCK_SIZES {
+        let output = render_with_inserts_at_block_size::<FixedPath, Linear, StereoI16>(block_frames);
+        let baseline = render_with_inserts_without_the_parameter_change::<FixedPath, Linear, StereoI16>(block_frames);
+        let seen = first_difference(&output, &baseline).map(|sample| sample / 2);
+        assert_eq!(seen, Some(INSERT_SET_PARAM_FRAMES), "block size {block_frames} moved the parameter change");
+    }
+}
+
+/// [`render_with_inserts_at_block_size`] with the `SetParam` never sent, so the two runs
+/// differ at exactly the frame the change lands on.
+fn render_with_inserts_without_the_parameter_change<Path, Interp, Out>(block_frames: usize) -> Vec<Out::Sample>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let (blob, region) = looping_blob();
+    let mut engine: Engine<Path, Interp, Out> = Engine::new(VOICE_CAPACITY);
+    engine.set_pcm(blob);
+    let mut inserts = engine.take_insert_control().expect("a fresh engine owns its insert handle");
+
+    for channel in [0u8, INSERT_CHANNEL as u8] {
+        let tag = VoiceTag { channel, instrument: 1, sample: 1, note: 60 };
+        engine.voices_mut().allocate(tag, region, voice_params(), 0).expect("a fresh pool has room");
+    }
+    engine.set_source(Box::new(ScriptedSource::new(Vec::new())));
+
+    let channel_target = InsertTarget::Channel(ChannelId(INSERT_CHANNEL));
+    inserts.install(channel_target, 0, build_insert::<Path::Mono>(InsertKind::Gain, 44_100)).map_err(|_| "full").expect("the ring has room");
+    let mut master = build_insert::<Path::Mono>(InsertKind::Gain, 44_100);
+    master.set_param(GAIN_PARAM, INSERT_MASTER_CENTI_DB);
+    inserts.install(InsertTarget::Master, 0, master).map_err(|_| "full").expect("the ring has room");
+
+    let mut output = vec![Out::Sample::default(); TOTAL_FRAMES * Out::CHANNELS];
+    let remove = InsertCommand::Remove { target: channel_target, slot: 0 };
+    let phases = [(INSERT_SET_PARAM_FRAMES, None), (INSERT_REMOVE_FRAMES, Some(remove)), (TOTAL_FRAMES, None)];
+    render_phases::<Path, Interp, Out>(&mut engine, &mut inserts, &mut output, block_frames, phases);
+    inserts.collect_all_garbage();
+    output
+}
+
+/// A gain insert at the bottom of its fader silences its own bus and leaves every other
+/// one alone. On both paths, because an effect body is generic over
+/// [`DspSample`](starplayer_dsp::DspSample) and this is what proves both instantiations
+/// route the same way.
+fn assert_a_silenced_channel_leaves_the_others_alone<Path, Interp, Out>(what: &str)
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: BitPattern + Default + PartialEq,
+{
+    let render = |silence_channel_zero: bool| {
+        let (blob, region) = looping_blob();
+        let mut engine: Engine<Path, Interp, Out> = Engine::new(VOICE_CAPACITY);
+        engine.set_pcm(blob);
+        let mut inserts = engine.take_insert_control().expect("a fresh engine owns its insert handle");
+        for channel in [0u8, 1] {
+            let tag = VoiceTag { channel, instrument: 1, sample: 1, note: 60 };
+            engine.voices_mut().allocate(tag, region, voice_params(), 0).expect("a fresh pool has room");
+        }
+        engine.set_source(Box::new(ScriptedSource::new(Vec::new())));
+        if silence_channel_zero {
+            // Built at the bottom of the fader rather than ramped down to it, so the
+            // muting is in force from the very first frame.
+            let mut insert = build_insert::<Path::Mono>(InsertKind::Gain, 44_100);
+            insert.set_param(GAIN_PARAM, GAIN_MIN_CENTI_DB);
+            insert.reset();
+            inserts.install(InsertTarget::Channel(ChannelId(0)), 0, insert).map_err(|_| "full").expect("the ring has room");
+        }
+        let mut output = vec![Out::Sample::default(); RENDER_QUANTUM * 8 * Out::CHANNELS];
+        engine.render(&mut output);
+        output
+    };
+
+    let both = render(false);
+    let one_silenced = render(true);
+    assert!(both.iter().any(|sample| *sample != Out::Sample::default()), "{what}: the scenario has to make sound");
+    assert!(one_silenced.iter().any(|sample| *sample != Out::Sample::default()), "{what}: channel 1 is still audible");
+    assert!(first_difference(&both, &one_silenced).is_some(), "{what}: silencing channel 0 changed nothing");
+}
+
+#[test]
+fn a_gain_insert_at_the_bottom_of_its_fader_silences_one_bus_only() {
+    assert_a_silenced_channel_leaves_the_others_alone::<FloatPath, Linear, StereoF32>("float / linear / stereo f32");
+    assert_a_silenced_channel_leaves_the_others_alone::<FixedPath, Linear, StereoI16>("fixed / linear / stereo i16");
 }
 
 /// The same scenario as [`render_at_block_size`], on an engine sized by `settings` rather

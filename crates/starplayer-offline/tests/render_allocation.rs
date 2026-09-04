@@ -44,9 +44,10 @@ use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use starplayer::core::ExactFixedPoint;
-use starplayer::dsp::Linear;
-use starplayer::engine::{Engine, EngineSettings, EventSource};
+use starplayer::core::{ChannelId, ExactFixedPoint};
+use starplayer::dsp::effects::GAIN_PARAM;
+use starplayer::dsp::{InsertKind, Linear, build_insert};
+use starplayer::engine::{Engine, EngineSettings, EventSource, InsertCommand, InsertTarget};
 use starplayer::mixer::{FixedPath, StereoI16};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::Arc;
@@ -403,6 +404,59 @@ fn swapping_a_module_inside_render_allocates_nothing() {
     assert_eq!(control.pending_garbage(), 1, "the retired module went down the garbage channel");
     assert!(!engine.warnings().retired_module_dropped, "and did not have to be dropped inline");
     assert_eq!(control.collect_all_garbage(), 1, "the control thread is where it dies");
+}
+
+/// M7-H1: the insert graph is inside `render()` too.
+///
+/// A gain insert on **every** channel bus and one on the master, with a stream of
+/// `SetParam`s arriving while the render runs — which is the shape a host's automation
+/// takes. Nothing here may allocate: the effects were built on this thread before the hook
+/// was armed, the parameter changes are `i32`s on a preallocated ring, and the smoothing
+/// they start is arithmetic on state the effect already owns.
+#[test]
+fn rendering_with_an_insert_on_every_channel_allocates_nothing() {
+    let module = Arc::new(starplayer::mod_file::load(&starplayer_offline::fixtures::synthetic_mod()).expect("the synthesised MOD loads"));
+    let channel_count = (module.header().channel_count as usize).max(1);
+    let settings = EngineSettings {
+        sample_rate_hz: SAMPLE_RATE_HZ,
+        channel_count,
+        voice_capacity: starplayer::recommended_voice_capacity(&module).max(1),
+        // Wide enough to install every chain before the first render, so the installs are
+        // not what the drain limit is spent on.
+        insert_command_capacity: 128,
+        ..EngineSettings::default()
+    };
+    let mut engine: CorpusEngine = Engine::with_settings(settings);
+    let mut control = engine.take_control().expect("a fresh engine owns its control handle");
+    let mut inserts = engine.take_insert_control().expect("a fresh engine owns its insert handle");
+    control.load_module(Arc::clone(&module)).map_err(|_| "full").expect("the ring has room");
+    engine.set_source(source_for(ModuleFormat::Mod, Arc::clone(&module)).expect("a MOD sequencer"));
+
+    // Every `Box::new` happens here, on the control thread, before the hook is armed.
+    for channel in 0..channel_count {
+        let insert = build_insert::<i32>(InsertKind::Gain, SAMPLE_RATE_HZ);
+        inserts.install(InsertTarget::Channel(ChannelId(channel as u16)), 0, insert).map_err(|_| "full").expect("the ring has room");
+    }
+    inserts.install(InsertTarget::Master, 0, build_insert::<i32>(InsertKind::Gain, SAMPLE_RATE_HZ)).map_err(|_| "full").expect("the ring has room");
+
+    let mut block = vec![0i16; 128 * 2];
+    let blocks = FRAMES_PER_MODULE.div_ceil(128);
+    let (_, report) = while_watching_for_allocations(|| {
+        for index in 0..blocks {
+            // A slider being dragged: one parameter change per host callback, walking the
+            // channels so every chain is touched.
+            let target = InsertTarget::Channel(ChannelId((index % channel_count) as u16));
+            let value = -100 - (index % 40) as i32 * 100;
+            let _ = inserts.send(InsertCommand::SetParam { target, slot: 0, param: GAIN_PARAM, value });
+            engine.render(&mut block);
+        }
+    });
+
+    assert!(report.is_clean(), "render() with the insert graph live allocated: {report:?}");
+    assert!(!engine.warnings().any(), "the insert graph raised an engine warning: {:?}", engine.warnings());
+    assert_eq!(inserts.pending_garbage(), 0, "nothing was retired, so nothing is waiting");
+    control.collect_all_garbage();
+    inserts.collect_all_garbage();
 }
 
 /// The hook has to be able to fail, or its silence means nothing. This is C7's deliberate
