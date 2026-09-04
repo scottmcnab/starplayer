@@ -304,3 +304,50 @@ fn the_snapshot_reports_the_songs_channel_count_not_the_tables_lane_count() {
     assert_eq!(snapshot.channel_count, 3, "the song has three channels, whatever the table's capacity");
     assert_eq!(snapshot.active_channels().len(), 3);
 }
+
+// ── the musical half's lanes (M4-E4) ────────────────────────────────────────────────
+
+/// A `MidiSource` publishes the sixteen MIDI lanes, and the snapshot's channel count is
+/// **raised** to cover them rather than set — a tracker sharing the mux publishes its
+/// song's own channel count into the same working snapshot, and neither may hide the
+/// other's lanes.
+#[test]
+fn a_midi_source_publishes_the_note_and_instrument_on_channels_48_upwards() {
+    use starplayer_core::{Event, TimedEvent};
+    use starplayer_engine::{InstrumentRack, MIDI_CHANNEL_BASE, MidiSource, external_event_channel, midi_channel};
+    use starplayer_model::{InstrumentDef, LoopMode, ModuleBuilder, ModuleFormat, ModuleHeader, SampleSpec};
+    use starplayer_rt::Arc;
+
+    let mut builder = ModuleBuilder::new();
+    builder.set_header(ModuleHeader::new(ModuleFormat::Mod, 4));
+    let waveform: Vec<i16> = (0..64).map(|index: i16| 2_500 + index * 350).collect();
+    let specification = SampleSpec { loop_mode: LoopMode::Forward, loop_start: 0, loop_end: 64, ..SampleSpec::one_shot("voice") };
+    let sample = builder.add_sample(&waveform, specification).expect("the sample is well formed");
+    builder.add_instrument(InstrumentDef::from_sample("lead", sample, U0F16::MAX)).expect("room for an instrument");
+    let module = Arc::new(builder.build().expect("the fixture validates"));
+
+    let (publisher, mut reader) = telemetry_channel();
+    let mut harness = Harness::new(ChannelTable::MAX_CHANNELS, publisher);
+
+    let (mut producer, queue) = external_event_channel(8);
+    let rack = InstrumentRack::for_module(&module, SAMPLE_RATE_HZ);
+    let mut source = MidiSource::new(queue, rack, SAMPLE_RATE_HZ);
+
+    let note_on = Event::NoteOn { note: Note::new(64), velocity: U0F16::MAX };
+    producer.send(TimedEvent::on_channel(Frame(0), midi_channel(2), note_on)).expect("room in the ring");
+    source.advance_to(Frame(0));
+
+    let mut context = EngineContext::new(Frame(0), &mut harness.voices, &mut harness.channels, &mut harness.control);
+    context.set_telemetry(&mut harness.publisher);
+    source.dispatch(Frame(0), &mut context);
+
+    let snapshot: &Snapshot = reader.read();
+    let lane = (MIDI_CHANNEL_BASE + 2) as usize;
+    let published = snapshot.channel(lane).expect("lane 50 is inside the 64 the snapshot carries");
+    assert_eq!(published.note, Some(Note::new(64)), "the MIDI note reaches the snapshot");
+    assert_eq!(published.instrument, 1, "and so does the one-based instrument number");
+    assert!(published.active, "the lane is sounding");
+    assert!(snapshot.channel_count as usize > lane, "the count covers the MIDI lanes");
+    assert_eq!(snapshot.voices_active, 1);
+    assert!(harness.channels.foreground(ChannelId(lane as u16)).is_some());
+}

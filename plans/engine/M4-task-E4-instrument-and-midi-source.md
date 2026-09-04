@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M4-full ([master plan](M4-master-plan.md), "M4-full — the task graph") |
-| Status | Ready — not yet dispatched |
+| Status | **Landed** 2026-09-04 — implemented and verified; awaiting review and commit |
 | Depends on | Everything landed by 2026-09-04 (E1–E3, D3–D9, F1–F6, G1–G6) |
 | Blocks | E5, E6, E7 |
 | Recommended model | Claude Opus (commits the trait; touches the engine's source and channel machinery) |
@@ -176,3 +176,130 @@ cargo xtask ci --job host-tests
 
 MIDI bytes and SMF (E5), any host input (E6), the mux acceptance (E7), envelopes/NNA
 for MIDI instruments (M11), non-sample instruments (M10).
+
+## Research resolution
+
+Recorded at implementation time; each answer is the decision, not a summary of the
+question.
+
+### 0. Deviations from the task file — **four, all small, all deliberate**
+
+1. **`InstrumentRack::for_module` and `instrument_for` take a sample rate.** The task
+   writes `InstrumentRack::for_module(&Arc<Module>)` and
+   `instrument_for(module, index) -> Box<dyn Instrument>`. Neither can work: an instrument
+   turns a note into a `Step`, which is *frames per output frame*, so it needs the output
+   rate, and `EngineContext` does not carry one (the tracker processors each store it at
+   construction for the same reason). Both take `sample_rate_hz` as a third argument, which
+   is also what a module swap already has to hand.
+2. **The determinism test builds its two modules with `ModuleBuilder`** rather than loading
+   `starplayer_offline::fixtures::synthetic_mod()` and `synthetic_it()`. Those fixtures are
+   *file bytes*, so using them from `crates/starplayer-engine/tests/` would need
+   dev-dependencies on `starplayer-mod` and `starplayer-it`, which depend on the engine —
+   a dev-dependency cycle, for fixtures whose value here is their instrument tables rather
+   than their bytes. The test builds a MOD-format module (one sample per instrument) and an
+   IT-format one (note-sample and note-transpose maps, per-sample tuning, a ping-pong loop)
+   directly. The real fixtures are covered where they belong, in
+   `crates/starplayer-offline/tests/render_allocation.rs`, whose new MIDI arm plays the
+   synthetic IT's instruments through a live `ExternalEventQueue`.
+3. **`EventFeed` gained a third method, `refresh`.** See research point 3's answer below:
+   `EventSource::next_event_frame` takes `&self`, so a feed that has to *look* for its next
+   event — which is exactly what an SPSC ring is — cannot fill its lookahead there. The
+   method has a default no-op body, so E5's `SmfSequencer` implements two methods, as the
+   task specifies.
+4. **The rack's late-event counting lives in `MidiSource`, not in `ExternalEventQueue`.**
+   The task puts the `late_events` counter on the queue. It is the *source* that knows the
+   frame an event was dispatched at, and putting it there means every feed — E5's SMF
+   sequencer included — gets late-event accounting for free instead of each implementing
+   it. `MidiSource::late_events()` reports the count and
+   `EngineContext::report_late_event` raises the engine's flag.
+
+### 1. One integer pitch path for `SampleInstrument` — **the linear-frequency table, for all five formats**
+
+The ST3 period table cannot meet the task's own two conditions. `period_from_note`
+truncates (`PERIOD_TABLE[n] · 8363 · 16 >> octave` **divided by** the reference rate) and
+`step_from_period` truncates again (`14317056 / period`), so MIDI 60 on a sample whose
+reference rate is 8363 Hz comes back as 8362 or 8364 Hz depending on the sample, and the
+error moves with the rate. The linear table is exact at the reference note by construction:
+`LINEAR_FREQUENCY_TABLE[0]` is `1 << 24` and the rounding shift undoes it, so
+`scale_frequency(rate, 0) == rate` for **every** rate. That is what makes master-plan
+decision 4 — "MIDI note 60 plays a sample at its reference rate" — and "a bend of zero
+cents changes nothing" true rather than nearly true, and it is the table pitch bend has to
+use anyway; the alternative was two tables disagreeing by a few cents at the ends of the
+keyboard.
+
+So `SampleInstrument` and `MappedInstrument` share one formula:
+`frequency = scale_frequency(sample.reference_rate_hz(), units)` where `units` is
+1/64ths of a semitone from note 60, plus the sample's own `relative_note`/`finetune` where
+the format has them. **This is not an accuracy deviation**: no tracker pattern reaches this
+code. The five format processors keep their own period arithmetic, which is what the
+goldens and the conformance corpus pin, and both are byte-identical before and after this
+task.
+
+Rather than write a fourth copy of the arithmetic, IT's own `scale_frequency` — which was
+already exactly this function — **moved to `starplayer_core::tables::scale_frequency`**,
+with `LINEAR_UNITS_PER_SEMITONE` beside it. `starplayer-it` now calls it; its body is
+unchanged, so the IT conformance results are unchanged. (The other candidate for lifting,
+`sample_region`, is a *projection* of `SampleIndex` into the mixer's vocabulary rather than
+arithmetic, and IT's version chooses the sustain loop, which is key-off semantics. The
+engine has its own `instrument::sample_region` for the non-sustain case and the format
+crates keep theirs.)
+
+### 2. Bend resolution — **1.5625 cents, and it is FT2's and IT's own**
+
+`cents_to_units(cents) = round(cents × 64 / 100)`, and one unit is 1/768 of an octave =
+1/64 of a semitone = **1.5625 cents**. The default ±200-cent range therefore resolves to
+**256 steps**, not MIDI's 16,384: a wheel moved by one fourteen-bit LSB usually changes
+nothing, and two adjacent bend words can produce the same step. That is deliberate — it is
+the pitch resolution FastTracker 2 and Impulse Tracker themselves have, and using it keeps
+the MIDI path on the same table as the tracker path and therefore bit-identical across x86,
+ARM and WASM (design goal 5). A finer bend would mean a second, wider table used by nothing
+else.
+
+The rack scales the wheel by its range first — `bend.to_bits() × range_cents / 32767` — so
+the quantisation happens once, in the instrument, against the note.
+
+### 3. Does `Engine` need to know about a synthesised control tick? — **no engine change; one addition to `EngineContext`**
+
+Confirmed by construction. `Engine::render_quantum` already asks every source for its next
+frame and splits the segment there, and `MidiSource::next_event_frame` reports
+`min(feed, own control clock)`, so a control tick lands on an exact frame with no engine
+support at all. `ControlClock` needed nothing either: `MidiSource` owns a second instance
+of it — `with_interval_micros` at the engine's rate — and the engine's own clock keeps
+running unread beside it. That redundancy is the point: a tracker sharing the mux calls
+`tick_from_tracker`, which switches the *engine's* clock to `ControlDriver::Tracker` and
+stops it synthesising, and a MIDI instrument must not fall silent because somebody else's
+module started playing. The cost is one `u64` increment per millisecond.
+
+Two things were added rather than changed, neither on the tracker path:
+
+* **`EngineContext::report_late_event`**, backed by an `Option<&'engine mut EngineWarnings>`
+  field the engine attaches the way it already attaches the telemetry publisher.
+  `EngineContext::new` keeps its four-argument signature, so the format crates' tests and
+  the offline scanner are untouched. `EngineWarnings::late_events` and its telemetry mirror
+  `WarningFlags::late_events` follow, plus bit 4 of the wasm snapshot's warning word.
+* **`EventFeed::refresh`**, for the reason in deviation 3 above. `ExternalEventQueue`
+  refills its one-event lookahead there; the engine calls `advance_to` at the end of
+  **every render segment**, so an event in the ring at a segment boundary is visible before
+  the next segment is planned and dispatches on its exact frame. The host's two-quantum
+  stamping lead (master-plan decision 6) is what keeps that true for an event pushed while
+  a segment is being rendered.
+
+### 4. Sustain and held notes per channel — **sixteen, steal the oldest, and the stolen note is forgotten rather than stopped**
+
+`MAX_HELD_NOTES = 16` per channel, in a fixed array with a parallel "note-off arrived while
+the pedal was down" flag. Sixteen is past what ten fingers and a sustain pedal produce, and
+a fixed array is what keeps the rack allocation-free.
+
+The steal rule falls out of the channel being **monophonic**: a channel drives one
+foreground voice, so it sounds its *newest* note and the held list exists for bookkeeping —
+whose note-off matters, and what the pedal is holding. A seventeenth note therefore drops
+the **oldest** entry, and dropping it is audibly free, because that note has not been
+sounding since the note after it arrived. The only observable consequence is that the
+stolen note's own `NoteOff` finds nothing to release, which is the correct outcome: the
+voice it would have released is already gone.
+
+Sustain: `CC64 ≥ half scale` sets the pedal. A `NoteOff` while it is down marks the held
+note `releasing` and stops nothing; raising the pedal walks the held notes newest-first,
+removes every marked one and releases whichever of them is the sounding note. `AllNotesOff`
+and `AllSoundOff` both clear the list and lift the pedal — a pedal left down through a
+panic would swallow the next note-off.

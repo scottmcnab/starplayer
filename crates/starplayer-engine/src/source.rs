@@ -34,6 +34,7 @@ use starplayer_mixer::VoicePool;
 
 use crate::channel::ChannelTable;
 use crate::control::ControlClock;
+use crate::engine::EngineWarnings;
 
 /// What [`EventSource::dispatch`] is given access to.
 ///
@@ -64,6 +65,12 @@ pub struct EngineContext<'engine> {
     /// (architecture §9). `None` means nobody is watching and every report is a no-op.
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<&'engine mut starplayer_telemetry::TelemetryPublisher>,
+    /// The engine's sticky warning flags, when the engine built this context.
+    ///
+    /// Reached through [`EngineContext::report_late_event`] rather than written directly,
+    /// and absent for a context a test or a format crate built by hand — which is exactly
+    /// why it is an `Option` rather than a parameter of [`EngineContext::new`].
+    warnings: Option<&'engine mut EngineWarnings>,
     /// Per-tick diagnostic recorder. Absent, including as a field, when tracing is off.
     #[cfg(feature = "trace")]
     pub(crate) trace: Option<&'engine mut crate::trace::TraceRecorder>,
@@ -84,6 +91,7 @@ impl<'engine> EngineContext<'engine> {
             control,
             #[cfg(feature = "telemetry")]
             telemetry: None,
+            warnings: None,
             #[cfg(feature = "trace")]
             trace: None,
         }
@@ -100,6 +108,23 @@ impl<'engine> EngineContext<'engine> {
     #[cfg(feature = "trace")]
     pub(crate) fn set_trace(&mut self, trace: &'engine mut crate::trace::TraceRecorder) {
         self.trace = Some(trace);
+    }
+
+    /// Attach the engine's sticky warning flags, so a source can raise one.
+    pub(crate) fn set_warnings(&mut self, warnings: &'engine mut EngineWarnings) {
+        self.warnings = Some(warnings);
+    }
+
+    /// Report that an event arrived at a frame already past and was dispatched at the
+    /// current one — [`EngineWarnings::late_events`].
+    ///
+    /// A no-op for a context built without the engine's flags, which is what makes the
+    /// call site in [`MidiSource`](crate::instrument::MidiSource) unconditional.
+    #[inline]
+    pub fn report_late_event(&mut self) {
+        if let Some(warnings) = self.warnings.as_deref_mut() {
+            warnings.late_events = true;
+        }
     }
 
     /// Apply one absolute parameter write and feed the trace hook in diagnostic builds.
@@ -127,6 +152,7 @@ impl<'engine> EngineContext<'engine> {
             control: self.control,
             #[cfg(feature = "telemetry")]
             telemetry: self.telemetry.as_deref_mut(),
+            warnings: self.warnings.as_deref_mut(),
             #[cfg(feature = "trace")]
             trace: self.trace.as_deref_mut(),
         }

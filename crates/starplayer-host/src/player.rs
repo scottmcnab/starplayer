@@ -658,6 +658,7 @@ impl Player {
             event_limit_reached: snapshot.warnings.event_limit_reached,
             retired_module_dropped: snapshot.warnings.retired_module_dropped,
             unsupported_command: snapshot.warnings.unsupported_command,
+            late_events: snapshot.warnings.late_events,
         }
     }
 

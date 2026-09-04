@@ -41,8 +41,8 @@ use starplayer_core::fixed::{bipolar_from_ratio, unit_from_ratio};
 use starplayer_core::quirks::{QuirkSelection, QuirkSet};
 use starplayer_core::random::Xorshift32;
 use starplayer_core::tables::{
-    LINEAR_FREQUENCY_TABLE, LINEAR_FREQUENCY_TABLE_LEN, fine_linear_slide_down_q16, fine_linear_slide_up_q16,
-    linear_slide_down_q16, linear_slide_up_q16,
+    LINEAR_FREQUENCY_TABLE_LEN, fine_linear_slide_down_q16, fine_linear_slide_up_q16, linear_slide_down_q16,
+    linear_slide_up_q16, scale_frequency,
 };
 use starplayer_core::{
     ChannelId, DirtyBits, FilterParams, Frame, I1F15, InstrumentId, Note, SampleId, Step, TempoModel, TempoModelId,
@@ -164,24 +164,6 @@ fn oscillator_sample(waveform: u8, position: u8, random: &mut Xorshift32) -> i32
         2 => if position < 128 { 64 } else { 0 },
         _ => (random.next_u32() & 127) as i32 - 64,
     }
-}
-
-/// `base · 2^(units / 768)`, rounded — the only pitch arithmetic IT needs.
-///
-/// One unit is 1/64 of a semitone, IT's own linear-slide resolution.
-fn scale_frequency(base: u32, units: i32) -> u32 {
-    if base == 0 {
-        return 0;
-    }
-    let octave = units.div_euclid(LINEAR_FREQUENCY_TABLE_LEN as i32);
-    let index = units.rem_euclid(LINEAR_FREQUENCY_TABLE_LEN as i32) as usize;
-    let value = base as u64 * LINEAR_FREQUENCY_TABLE[index] as u64;
-    let value = if octave >= 0 {
-        value.saturating_mul(1u64 << (octave.min(40) as u32))
-    } else {
-        value >> ((-octave).min(63) as u32)
-    };
-    ((value + (1 << 23)) >> 24).min(u32::MAX as u64) as u32
 }
 
 /// The frequency at which `note` sounds for a sample whose reference rate is `c5speed`.
