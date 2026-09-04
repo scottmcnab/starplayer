@@ -13,8 +13,10 @@ assert.equal(Ring.pushCommand(commands, Ring.OPCODE_MASTER_VOLUME, 32768, 0), tr
 assert.equal(Ring.pushCommand(commands, Ring.OPCODE_SET_MIXER_MODE, 0x0000_0261, 0), true);
 assert.equal(Ring.pushCommand(commands, Ring.OPCODE_SEEK_FRAME, 441000, 0), true);
 assert.equal(Ring.pushCommand(commands, Ring.OPCODE_AT_END, Ring.AT_END_FADE_OUT, 480000), true);
+// Task E6: one live MIDI channel-voice message, three bytes in one argument.
+assert.equal(Ring.pushCommand(commands, Ring.OPCODE_MIDI_EVENT, Ring.packMidiMessage(0x90, 60, 100), 0), true);
 const received = [];
-assert.equal(Ring.drainCommands(commands, (...record) => received.push(record)), 6);
+assert.equal(Ring.drainCommands(commands, (...record) => received.push(record)), 7);
 assert.deepEqual(received, [
     [Ring.OPCODE_PLAY, 0, 0],
     [Ring.OPCODE_SEEK_ORDER, 17, 0],
@@ -22,7 +24,16 @@ assert.deepEqual(received, [
     [Ring.OPCODE_SET_MIXER_MODE, 0x0000_0261, 0],
     [Ring.OPCODE_SEEK_FRAME, 441000, 0],
     [Ring.OPCODE_AT_END, Ring.AT_END_FADE_OUT, 480000],
+    [Ring.OPCODE_MIDI_EVENT, 0x64_3C_90, 0],
 ]);
+
+// The packing the Rust host unpacks in `apply`: status in bits 0-7, data1 in 8-15,
+// data2 in 16-23, and nothing above them.
+assert.equal(Ring.packMidiMessage(0x90, 60, 100), 0x64_3C_90);
+assert.equal(Ring.packMidiMessage(0x80, 0, 0), 0x80, 'a note-off with no data is just its status byte');
+assert.equal(Ring.packMidiMessage(0xE7, 0x7F, 0x7F), 0x7F_7F_E7, 'a full-scale pitch bend fits');
+assert.equal(Ring.packMidiMessage(0x90, 0xFF, 0xFF), 0x7F_7F_90, 'data bytes are masked to seven bits');
+assert.ok(Ring.packMidiMessage(0xFF, 0x7F, 0x7F) > 0, 'the packed value is unsigned');
 
 const sourceWords = new Int32Array(Ring.SNAPSHOT_WORDS);
 sourceWords[0] = 42;

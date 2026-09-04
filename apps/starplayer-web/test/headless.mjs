@@ -80,6 +80,16 @@ async function freePort() {
     });
 }
 
+/// One physical key, pressed and released through the DevTools protocol — a real
+/// `KeyboardEvent` with a real `code`, which is what the page's map is keyed on.
+async function pressKey(page, code, key, virtualKeyCode) {
+    const base = { code, key, windowsVirtualKeyCode: virtualKeyCode, nativeVirtualKeyCode: virtualKeyCode };
+    await page.send('Input.dispatchKeyEvent', { type: 'keyDown', ...base });
+    await delay(30);
+    await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+    await delay(30);
+}
+
 function delay(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -328,6 +338,11 @@ const READ_STATE = `
         archivePickerVisible: !document.getElementById('archive-picker').hidden,
         engineMode: text('engine-mode'),
         outputEngineMode: text('output-engine-mode'),
+        liveInputStatus: text('live-input-status'),
+        eventLead: text('event-lead'),
+        keyboardOctave: text('keyboard-octave'),
+        keyboardInstrument: text('keyboard-instrument'),
+        midiEvents: text('midi-events'),
         outputStatus: text('output-status'),
         sampleRateStatus: text('sample-rate-status'),
         contextState: text('context-state'),
@@ -660,6 +675,58 @@ async function run(executable, mode) {
         await page.evaluate("const repeat = document.getElementById('repeat'); repeat.checked = true; repeat.dispatchEvent(new Event('change')); return true;");
         await page.evaluate("document.getElementById('play').click(); return true;");
         await page.waitFor('playback to resume after the fade-out test', "document.getElementById('transport-chip').textContent === 'playing'");
+
+        // ── live input: the tracker-style keyboard (task E6) ────────────────────────
+        //
+        // A real key event through the DevTools protocol, so the focus rules, the
+        // `KeyboardEvent.code` map and the ring opcode are all exercised the way a person
+        // exercises them. The module goes silent under a live-input source, so a moving
+        // peak meter here can only be the note.
+        await page.evaluate("const keyboard = document.getElementById('keyboard-enable'); keyboard.checked = true; keyboard.dispatchEvent(new Event('change')); return true;");
+        await page.waitFor('live input to install', "document.getElementById('live-input-status').textContent !== 'off'");
+        const armed = await page.evaluate(READ_STATE);
+        assert.match(armed.eventLead, /^lead 256 frames \(\d+\.\d ms\)/, `the lead is reported: ${armed.eventLead}`);
+        if (!isolate || mode === 'fallback') {
+            assert.match(armed.eventLead, /batched/, 'the fallback transport reports its extra animation-frame latency');
+        }
+        await delay(400);
+        assert.equal((await page.evaluate(READ_STATE)).masterPeak, 0, 'the module itself is silent under a live-input source');
+
+        // Typing in a field is typing, never playing.
+        await page.evaluate("document.getElementById('url').focus(); return true;");
+        await pressKey(page, 'KeyZ', 'z', 90);
+        await delay(200);
+        assert.equal((await page.evaluate(READ_STATE)).midiEvents, '0 sent', 'a key pressed inside a text field plays nothing');
+        await page.evaluate("document.getElementById('url').blur(); return true;");
+
+        // `]` up an octave, `=` to the next instrument, then a held Z.
+        await pressKey(page, 'BracketRight', ']', 221);
+        await pressKey(page, 'Equal', '=', 187);
+        const stepped = await page.evaluate(READ_STATE);
+        assert.equal(stepped.keyboardOctave, '5', 'the octave stepped up');
+        assert.equal(stepped.keyboardInstrument, '2', 'and the instrument stepped on');
+        await pressKey(page, 'BracketLeft', '[', 219);
+
+        await page.send('Input.dispatchKeyEvent', { type: 'keyDown', code: 'KeyZ', key: 'z', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90 });
+        let notePeak = 0;
+        for (let attempt = 0; attempt < 40 && notePeak === 0; attempt += 1) {
+            await delay(50);
+            notePeak = (await page.evaluate(READ_STATE)).masterPeak;
+        }
+        await page.send('Input.dispatchKeyEvent', { type: 'keyUp', code: 'KeyZ', key: 'z', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90 });
+        assert.ok(notePeak > 0, 'the keyboard sounded a note from the silent module\u2019s instruments');
+        const played = await page.evaluate(READ_STATE);
+        assert.match(played.midiEvents, /^[1-9]\d* sent$/, `events reached the ring: ${played.midiEvents}`);
+        report.liveInput = `${played.liveInputStatus}; ${played.eventLead}; ${played.midiEvents}; peak ${notePeak}`;
+
+        // The note-off the key-up queued is still crossing to the worklet. Tearing the
+        // live-input source down under it would leave a stale record to refuse — see the
+        // toggle's own handling of held keys in `app.js` — so let the ring drain first.
+        await delay(250);
+        await page.evaluate("const keyboard = document.getElementById('keyboard-enable'); keyboard.checked = false; keyboard.dispatchEvent(new Event('change')); return true;");
+        await page.waitFor('live input to go off', "document.getElementById('live-input-status').textContent === 'off'");
+        await page.waitFor('the module to play again', "parseFloat(document.getElementById('master-peak').style.width) > 0", 30_000);
+        assert.equal((await page.evaluate(READ_STATE)).errorShown, false, 'turning live input on and off is not an error');
 
         // ── a single-module ZIP loads straight through the file picker ──────────────
         await loadFile(page, singleModuleZip, 'reflex.zip');

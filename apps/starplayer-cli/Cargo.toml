@@ -17,6 +17,8 @@ starplayer-archive = { workspace = true }
 # `play` (task D8): the backend-neutral controller and the cpal driver behind it.
 starplayer-host = { workspace = true }
 starplayer-host-cpal = { workspace = true }
+# `play --midi` (task E6): a `midir` input port feeding the player's live-input queue.
+starplayer-midi-native = { workspace = true }
 clap = { workspace = true }
 # `render` prints the SHA-256 of its PCM payload (task D5 deliverable 2), in the same
 # little-endian encoding `starplayer-offline` hashes goldens with. The integration tests

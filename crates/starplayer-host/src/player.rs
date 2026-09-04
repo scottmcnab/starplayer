@@ -20,6 +20,7 @@
 //! | seeks | control → audio | [`SeekMailbox`], latest wins |
 //! | retired modules and retired sources | audio → control | an SPSC ring; **dropped here**, never there |
 //! | telemetry, position, peak | audio → control | a snapshot channel and a handful of atomics |
+//! | live MIDI and keyboard events | control (or any thread) → audio | an [`ExternalEventQueue`](starplayer::engine::ExternalEventQueue) of absolutely-stamped events; see `src/events.rs` |
 //!
 //! # Why the module travels over the ring rather than through `EngineHandle`
 //!
@@ -36,8 +37,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::vec::Vec;
 
-use starplayer::core::{AtEnd, ChannelId, Command, Frame, U0F16};
-use starplayer::engine::{EngineHandle, EngineWarnings, EventSource, MixerMode, RENDER_QUANTUM};
+use starplayer::core::{AtEnd, ChannelId, Command, Event, Frame, U0F16};
+use starplayer::engine::{
+    EngineHandle, EngineWarnings, EventSource, InstrumentRack, MidiSource, MixerMode, RENDER_QUANTUM,
+    external_event_channel,
+};
 use starplayer::model::Module;
 use starplayer::rt::{
     Arc as RtArc, Consumer, Producer, SnapshotPublisher, SnapshotReader, TapReader, channel, snapshot_channel,
@@ -47,6 +51,7 @@ use starplayer::{ScannedSong, recommended_voice_capacity};
 
 use crate::backend::{AudioBackend, AudioSpec, HostError, Stream, StreamHealth};
 use crate::engine::HostEngine;
+use crate::events::{EVENT_QUEUE_CAPACITY, EventClock, EventSender};
 use crate::source::{SeekKind, SeekRequest, SourceHandles, build_source};
 use crate::transport::Transport;
 
@@ -133,6 +138,10 @@ struct RenderState {
     /// to; `HostEngine::frame` cannot serve, because it counts frames *rendered* and so
     /// jumps a whole quantum at a time however few of them the host has taken.
     frames_emitted: u64,
+    /// The musical clock and the block size a live-input sender stamps against
+    /// ([`EventClock`]). Two relaxed stores per callback, and the block size is the
+    /// only way a host can know how far ahead a live event has to be stamped.
+    event_clock: Arc<EventClock>,
 }
 
 impl RenderState {
@@ -167,6 +176,10 @@ impl RenderState {
     /// callback, carrying the newest state, is exactly right at any block size.
     fn render(&mut self, output: &mut [f32]) {
         let channels = self.engine.channels().max(1);
+        // What the device actually asks for, which is not always what it was asked for: a
+        // backend given no preference answers with its own block, and the live-input lead
+        // has to cover whatever that turns out to be.
+        self.event_clock.observe_block((output.len() / channels) as u32);
         let mut peak = 0.0f32;
         let mut written = 0usize;
         while written < output.len() {
@@ -310,6 +323,10 @@ impl RenderState {
 
     fn publish(&mut self, peak: f32) {
         self.taps.source_frame.store(self.engine.source_frame().0, Ordering::Relaxed);
+        // The *musical* clock, not the output one: a live event is dispatched against the
+        // frame an `EventSource` reports in, which stops with the transport. See
+        // `crate::events`.
+        self.event_clock.publish(self.engine.source_frame());
         self.taps.output_frame.store(self.engine.frame().0, Ordering::Relaxed);
         self.taps.playing.store(self.engine.is_playing() && !self.transport.stop_is_pending(), Ordering::Relaxed);
         self.taps.fading.store(self.transport.is_fading(), Ordering::Relaxed);
@@ -336,6 +353,7 @@ struct ControlSide {
     /// Taken from the engine here, because [`Player::open`] is the last moment a `&mut` to
     /// it exists on this thread.
     scopes: Option<Box<[TapReader]>>,
+    event_clock: Arc<EventClock>,
 }
 
 /// Build both sides of one engine at `spec`'s rate, in `mode`.
@@ -357,6 +375,7 @@ fn build_sides(mode: MixerMode, spec: AudioSpec) -> Result<(RenderState, Control
     let (retired_producer, retired_consumer) = channel(RETIRED_CAPACITY);
     let (forwarded, snapshot_reader) = snapshot_channel(TELEMETRY_DEPTH, Snapshot::default());
     let taps = Arc::new(PlayerTaps::default());
+    let event_clock = EventClock::new(spec.sample_rate_hz);
     // Made once, for the life of the stream, and shared. A pair made per module would leave
     // the audio thread holding the last handle to the outgoing one on every load.
     let handles = SourceHandles::new(AtEnd::Continue);
@@ -374,6 +393,7 @@ fn build_sides(mode: MixerMode, spec: AudioSpec) -> Result<(RenderState, Control
         last_snapshot: Snapshot::default(),
         awaiting_engine_stop: false,
         frames_emitted: 0,
+        event_clock: Arc::clone(&event_clock),
     };
     let control_side = ControlSide {
         commands: command_producer,
@@ -382,6 +402,7 @@ fn build_sides(mode: MixerMode, spec: AudioSpec) -> Result<(RenderState, Control
         taps,
         handles,
         scopes,
+        event_clock,
     };
     Ok((render, control_side))
 }
@@ -419,6 +440,16 @@ pub struct Player {
     scan: Option<Arc<ScannedSong>>,
     collected: usize,
     scopes: Option<Box<[TapReader]>>,
+    /// The clock, the lead and the counters live input is stamped and reported against.
+    /// Made once per stream, shared with the render callback and with every
+    /// [`EventSender`] handed out.
+    event_clock: Arc<EventClock>,
+    /// The sending half of the live-input queue, once [`Player::midi_only`] has installed
+    /// one and until [`Player::take_event_sender`] moves it to another thread.
+    events: Option<EventSender>,
+    /// Whether the source the engine is playing is a live-input one. Not the same question
+    /// as `events.is_some()`, which goes false the moment a caller takes the sender.
+    live_input: bool,
 }
 
 impl Player {
@@ -460,6 +491,9 @@ impl Player {
             scan: None,
             collected: 0,
             scopes: control.scopes,
+            event_clock: control.event_clock,
+            events: None,
+            live_input: false,
         })
     }
 
@@ -519,6 +553,8 @@ impl Player {
         let fade_frames = self.fade_frames;
         let master_volume = self.master_volume;
         let collected = self.collected;
+        let requested_lead = self.event_clock.requested_lead_frames();
+        let live_input = self.live_input;
         let mut rebuilt = Player::open(backend, device, requested, plan.mode)?;
         // Carried, not restarted: the count is what a caller reports as "modules dropped on
         // this thread since start-up", and a rebuild is not a fresh start-up.
@@ -528,8 +564,16 @@ impl Player {
             rebuilt.set_fade_frames(fade_frames)?;
         }
         rebuilt.set_at_end(at_end)?;
+        rebuilt.set_event_lead(requested_lead);
         if let Some(module) = module {
             rebuilt.install(module, plan.start, plan.cached_scan)?;
+        }
+        // A rebuilt engine gets a **new** live-input queue, because the old one's consumer
+        // went into the retired engine. An [`EventSender`] a caller had already taken is
+        // therefore dead after a rebuild and has to be taken again — which is the same
+        // contract [`Player::take_scope_readers`] already has.
+        if live_input {
+            rebuilt.midi_only()?;
         }
         if plan.resume {
             rebuilt.play()?;
@@ -574,6 +618,8 @@ impl Player {
         self.commands.push(command).map_err(|_| HostError::ControlQueueFull)?;
         self.scan = Some(built.scanned);
         self.module = Some(module);
+        self.live_input = false;
+        self.events = None;
         Ok(())
     }
 
@@ -641,6 +687,98 @@ impl Player {
     pub fn mute(&mut self, channel: ChannelId, muted: bool) -> Result<(), HostError> {
         self.queue(HostCommand::Engine(Command::MuteChannel { channel, muted }))
     }
+
+    // ── live input ──────────────────────────────────────────────────────────────────
+    //
+    // Task E6. The engine half is `starplayer_engine::instrument`: an `InstrumentRack`
+    // bound to the loaded module's instruments, fed by an `ExternalEventQueue` through a
+    // `MidiSource`. What a host adds is the *stamp* — see `crate::events` for which clock
+    // it is taken from and why the lead has a floor.
+
+    /// Play the loaded module's **instruments** from live input, with the module itself
+    /// silent.
+    ///
+    /// The queue is made here rather than at [`Player::open`] because the rack it feeds
+    /// needs the module: sixteen MIDI channels, each bound to one of the module's
+    /// instruments. Everything expensive happens on this thread — the rack, the queue's
+    /// ring and the boxed source — and only a `Box` and an `Arc` cross to the audio side.
+    ///
+    /// The module stops playing. Merging the two, so a keyboard can be jammed over a
+    /// playing module, is task E7's `SourceMux`; until then this is the honest half of it,
+    /// and it is what the CLI's `--midi` and the web player's keyboard toggle install.
+    /// [`Player::restore_module_source`] puts the module back.
+    ///
+    /// The transport has to be **running** for anything to sound: the musical clock is
+    /// what a source is dispatched against, and it stops with the transport.
+    pub fn midi_only(&mut self) -> Result<(), HostError> {
+        let module = self.module.clone().ok_or(HostError::NoModule)?;
+        let rack = InstrumentRack::for_module(&module, self.spec.sample_rate_hz);
+        let (producer, queue) = external_event_channel(EVENT_QUEUE_CAPACITY);
+        let mut source = MidiSource::new(queue, rack, self.spec.sample_rate_hz);
+        // The engine's musical clock has been running since the stream opened; a source
+        // whose control tick starts at zero would otherwise spend its first dispatch
+        // resynchronising.
+        source.start_control_at(Frame(self.taps.source_frame.load(Ordering::Relaxed)));
+        // The same module handle, sent again on purpose: `Command::LoadModule` releases
+        // every voice and forgets every binding, which is exactly what silencing the
+        // tracker lanes as the source is swapped means. Nothing is decoded or scanned.
+        self.commands
+            .push(HostCommand::Load { module, source: Box::new(source) })
+            .map_err(|_| HostError::ControlQueueFull)?;
+        self.events = Some(EventSender::new(producer, Arc::clone(&self.event_clock)));
+        self.live_input = true;
+        Ok(())
+    }
+
+    /// Put the module's own sequencer back, ending live input.
+    ///
+    /// The scan is reused — nothing the timeline depends on changed — so this costs a
+    /// sequencer, not a rescan, and the song restarts from the top of the order list.
+    pub fn restore_module_source(&mut self) -> Result<(), HostError> {
+        let module = self.module.clone().ok_or(HostError::NoModule)?;
+        let cached_scan = self.scan.clone();
+        self.install(module, SeekKind::None, cached_scan)
+    }
+
+    /// Whether the engine is playing a live-input source.
+    pub const fn is_midi_only(&self) -> bool { self.live_input }
+
+    /// Queue one live event on MIDI channel `channel` (0–15), stamped
+    /// `source_frame + lead`.
+    ///
+    /// Allocation-free and non-blocking, so the browser host calls it from inside the
+    /// worklet's command drain. A full queue is counted and reported
+    /// ([`HostError::EventQueueFull`]), never waited on.
+    pub fn send_event(&mut self, channel: u8, event: Event) -> Result<(), HostError> {
+        let sender = self.events.as_mut().ok_or(HostError::NoEventQueue)?;
+        sender.send_event(channel, event)
+    }
+
+    /// Take the sending half away, so another thread can own it.
+    ///
+    /// The queue underneath is single-producer, so there is exactly one of these and
+    /// [`Player::send_event`] stops working once it has gone. A native host moves it into
+    /// its `midir` callback; the browser host never calls this.
+    pub fn take_event_sender(&mut self) -> Option<EventSender> { self.events.take() }
+
+    /// The clock, the lead and the live-input counters, shareable with whoever is sending.
+    pub fn event_clock(&self) -> &Arc<EventClock> { &self.event_clock }
+
+    /// Ask for a stamping lead in frames. The effective lead never drops below what the
+    /// device's own block size requires — see [`EventClock::lead_frames`].
+    pub fn set_event_lead(&mut self, frames: u32) { self.event_clock.set_requested_lead_frames(frames); }
+
+    /// The lead actually applied to the next live event, in frames.
+    pub fn event_lead(&self) -> u32 { self.event_clock.lead_frames() }
+
+    /// The same lead in milliseconds, which is what a UI shows next to a keyboard toggle.
+    pub fn event_lead_millis(&self) -> f32 { self.event_clock.lead_millis() }
+
+    /// Live events a full queue refused.
+    pub fn events_rejected(&self) -> u64 { self.event_clock.rejected() }
+
+    /// Live events accepted onto the queue.
+    pub fn events_sent(&self) -> u64 { self.event_clock.sent() }
 
     fn queue(&mut self, command: HostCommand) -> Result<(), HostError> {
         self.commands.push(command).map_err(|_| HostError::ControlQueueFull)

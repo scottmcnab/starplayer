@@ -92,6 +92,12 @@ pub enum HostError {
     ControlQueueFull,
     /// A `Player` call that needs a module arrived before one was loaded.
     NoModule,
+    /// A live event arrived before a live-input source was installed, or after the
+    /// sender was taken away by [`Player::take_event_sender`](crate::Player::take_event_sender).
+    NoEventQueue,
+    /// The live-input queue is full: the caller is sending faster than the audio thread
+    /// consumes. Counted rather than waited on — see [`crate::EventClock`].
+    EventQueueFull,
 }
 
 impl fmt::Display for HostError {
@@ -105,6 +111,8 @@ impl fmt::Display for HostError {
             HostError::Module(error) => write!(formatter, "could not play the module: {error}"),
             HostError::ControlQueueFull => formatter.write_str("the host control queue is full"),
             HostError::NoModule => formatter.write_str("no module is loaded"),
+            HostError::NoEventQueue => formatter.write_str("no live-input queue is installed"),
+            HostError::EventQueueFull => formatter.write_str("the live-input queue is full"),
         }
     }
 }

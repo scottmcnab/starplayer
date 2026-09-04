@@ -8,3 +8,10 @@ rust-version.workspace = true
 starplayer = { workspace = true, features = ["std"] }
 starplayer-host = { workspace = true }
 cpal = { workspace = true }
+
+# `examples/play.rs`'s `--midi` (task E6). A dev-dependency because MIDI *input* is not
+# this crate's business — see `starplayer-midi-native`'s own preamble for why it is a
+# separate crate — and because that crate depends on `starplayer-host`, not on this one,
+# so there is no cycle.
+[dev-dependencies]
+starplayer-midi-native = { workspace = true }

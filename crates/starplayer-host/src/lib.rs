@@ -54,6 +54,17 @@
 //! enum, a seek mailbox or a depth post-stage: those were the two copies D4 predicted D9
 //! would delete, and it did.
 //!
+//! # Live input (task E6)
+//!
+//! A host does not only push audio out; it takes notes in. [`Player::midi_only`] binds the
+//! loaded module's instruments to sixteen MIDI channels and installs the engine's
+//! `MidiSource` in place of the module's own sequencer, and [`Player::send_event`] stamps
+//! an event `source_frame + lead` and pushes it at that source's queue. [`EventSender`] is
+//! the sending half, made `Send` so a `midir` callback thread can own it
+//! (`starplayer-midi-native`), and [`EventClock`] carries the lead policy, the clock and
+//! the counters both sides share. `src/events.rs` explains which of the engine's two clocks
+//! the stamp is taken from and why the lead has a floor.
+//!
 //! # Real-time rules, and where they apply
 //!
 //! Everything reachable from a [`RenderCallback`] obeys design goal 5: no allocation, no
@@ -67,8 +78,11 @@
 mod backend;
 mod depth;
 mod engine;
+mod events;
 mod format;
 mod manual;
+// E5 supersedes this: `starplayer_midi::MidiDecoder` replaces it and the module goes.
+mod midi_decode;
 mod player;
 mod source;
 mod transport;
@@ -76,8 +90,11 @@ mod transport;
 pub use backend::{AudioBackend, AudioSpec, DeviceInfo, HostError, RenderCallback, Stream, StreamControl, StreamHealth};
 pub use depth::{DITHER_SEED, dither_for, quantize_fixed_sample, quantize_float_sample};
 pub use engine::{HostEngine, MAX_FRAMES_PER_RENDER, SUPPORTED_DEPTHS, supported_modes};
+pub use events::{DEFAULT_EVENT_LEAD_FRAMES, EVENT_QUEUE_CAPACITY, EventClock, EventSender};
 pub use format::format_seconds;
 pub use manual::{MANUAL_DEVICE_NAME, MANUAL_RATES, ManualBackend, ManualDriver};
+// E5 supersedes this re-export together with the module behind it.
+pub use midi_decode::{MidiDecoder, message_to_event};
 pub use player::{CONTROL_CADENCE_FRAMES, HOST_COMMAND_CAPACITY, Player, RETIRED_CAPACITY, TELEMETRY_DEPTH};
 pub use source::{
     AtEndSlot, BuiltSource, SeekKind, SeekMailbox, SeekRequest, SeekableModuleSource, SourceHandles, build_source,

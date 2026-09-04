@@ -54,7 +54,7 @@ use starplayer::engine::{MixerMode, RENDER_QUANTUM};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::{Arc, TAP_BUCKET_FRAMES, TapReader};
 use starplayer::telemetry::{Snapshot, SongEnd};
-use starplayer_host::{AudioSpec, HostError, Player};
+use starplayer_host::{AudioSpec, HostError, Player, message_to_event};
 
 pub use command::COMMAND_RING_CAPACITY;
 
@@ -89,6 +89,16 @@ const OPCODE_SEEK_FRAME: u8 = 8;
 /// What to do at the detected loop point: `argument` 0 fade out, 1 continue, 2 stop;
 /// `extra` is the fade length in frames.
 const OPCODE_AT_END: u8 = 9;
+/// One live MIDI channel-voice message — Web MIDI, or the page's tracker keyboard (task
+/// E6). `argument` packs the three bytes a browser already hands over framed: status in
+/// bits 0–7, `data1` in 8–15, `data2` in 16–23. `extra` is unused.
+///
+/// It rides the ordinary command ring rather than a second one because it *is* an ordinary
+/// command: bounded, decoded between render quanta, and turned into one allocation-free
+/// push onto the player's live-input queue. What it is not is the *install* — building the
+/// instrument rack allocates, so that is [`exports::set_midi_input`], called from a worklet
+/// message task exactly as `set_mixer_mode` is.
+const OPCODE_MIDI_EVENT: u8 = 10;
 
 /// Wire spelling of [`AtEnd`], chosen so the page's default repeat-off value is zero.
 const AT_END_FADE_OUT: u32 = 0;
@@ -271,6 +281,21 @@ impl Host {
         Ok(mode.to_wire())
     }
 
+    /// Turn live input on or off, from a worklet message task.
+    ///
+    /// On: the module's instruments are bound to sixteen MIDI channels and the module's
+    /// own pattern data stops playing (task E6; hearing both at once is E7). Off: the
+    /// module's sequencer goes back, from the top. Both allocate — a rack, a queue, a
+    /// sequencer — which is exactly why this is not an opcode.
+    fn set_midi_input(&mut self, enabled: bool) -> Result<bool, String> {
+        if enabled == self.player.is_midi_only() {
+            return Ok(enabled);
+        }
+        let result = if enabled { self.player.midi_only() } else { self.player.restore_module_source() };
+        result.map_err(|error| error.to_string())?;
+        Ok(self.player.is_midi_only())
+    }
+
     fn enqueue(&mut self, command: WireCommand) -> bool { self.commands.push(command) }
 
     /// Turn each staged wire record into one call on the player.
@@ -303,6 +328,17 @@ impl Host {
                 Some(at_end) => self.set_at_end(at_end, wire.extra),
                 None => return false,
             },
+            // A framed browser MIDI message. An `argument` that spells no channel voice
+            // message is refused rather than guessed at, exactly as `AT_END` is.
+            OPCODE_MIDI_EVENT => {
+                let status = wire.argument as u8;
+                let data1 = (wire.argument >> 8) as u8;
+                let data2 = (wire.argument >> 16) as u8;
+                match message_to_event(status, data1, data2) {
+                    Some((channel, event)) => self.player.send_event(channel, event),
+                    None => return false,
+                }
+            }
             // Handled synchronously by the worklet message handler, because rebuilding a
             // typed engine allocates; it must never reach the render path.
             OPCODE_SET_MIXER_MODE => return false,
@@ -582,6 +618,33 @@ mod exports {
     /// Channels the last refresh filled.
     #[wasm_bindgen]
     pub fn scope_channels() -> u32 { with_host(0, |host| host.scope_channels) }
+
+    /// Install or remove the live-input source, outside `process()`.
+    ///
+    /// Returns whether live input is on afterwards. It allocates the instrument rack and
+    /// the event queue, so — like [`set_mixer_mode`] — it is only ever reached from a
+    /// worklet message task.
+    #[wasm_bindgen]
+    pub fn set_midi_input(enabled: bool) -> Result<bool, JsValue> {
+        HOST.with(|cell| {
+            let mut slot = cell.try_borrow_mut().map_err(|_| JsValue::from_str("the worklet host is busy"))?;
+            let host = slot.as_mut().ok_or_else(|| JsValue::from_str("the worklet host is not initialized"))?;
+            host.set_midi_input(enabled).map_err(|message| JsValue::from_str(&message))
+        })
+    }
+
+    /// How far ahead of the audio clock a live event is stamped, in frames — the latency
+    /// the page reports next to its keyboard toggle.
+    ///
+    /// Live events a full queue refused are **not** exported separately: a refused live
+    /// event fails `Host::apply` like any other undeliverable record, so it is already in
+    /// [`dropped_commands`].
+    #[wasm_bindgen]
+    pub fn event_lead_frames() -> u32 { with_host(0, |host| host.player.event_lead()) }
+
+    /// The same lead in milliseconds, computed against the context's own rate.
+    #[wasm_bindgen]
+    pub fn event_lead_millis() -> f32 { with_host(0.0, |host| host.player.event_lead_millis()) }
 
     #[wasm_bindgen]
     pub fn render_quantum() -> u32 { RENDER_QUANTUM as u32 }
@@ -981,6 +1044,111 @@ mod tests {
         host.process(RENDER_QUANTUM);
         assert_eq!(host.dropped_commands(), rejected + 2);
         assert_eq!(host.player.mixer_mode(), MixerMode::DEFAULT, "and no engine was rebuilt");
+    }
+
+    // ── live input (task E6) ────────────────────────────────────────────────────────
+
+    /// Pack a channel voice message the way `ring.js` does.
+    fn midi_wire(status: u8, data1: u8, data2: u8) -> WireCommand {
+        WireCommand {
+            opcode: OPCODE_MIDI_EVENT,
+            argument: status as u32 | ((data1 as u32) << 8) | ((data2 as u32) << 16),
+            extra: 0,
+        }
+    }
+
+    /// The loudest sample in `quanta` quanta of the planar block.
+    fn render_peak(host: &mut Host, quanta: usize) -> f32 {
+        let mut peak = 0.0f32;
+        for _ in 0..quanta {
+            host.process(RENDER_QUANTUM);
+            for channel in 0..host.player.mixer_mode().channels as usize {
+                let first = channel * MAX_FRAMES_PER_CALL;
+                for sample in &host.planar[first..first + RENDER_QUANTUM] {
+                    peak = peak.max(sample.abs());
+                }
+            }
+        }
+        peak
+    }
+
+    #[test]
+    fn a_midi_event_opcode_sounds_a_note_from_a_silent_modules_instruments() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        assert!(!host.player.is_midi_only());
+
+        assert_eq!(host.set_midi_input(true), Ok(true), "the rack installs from a worklet message task");
+        assert!(host.player.is_midi_only());
+        assert_eq!(render_peak(&mut host, 8), 0.0, "the module's own pattern data stopped");
+
+        assert!(host.enqueue(midi_wire(0xC0, 0, 0)), "program change: MIDI channel 0 takes instrument 0");
+        assert!(host.enqueue(midi_wire(0x90, 60, 100)), "note on");
+        assert!(render_peak(&mut host, 40) > 0.001, "the note sounded through the wire opcode");
+        assert_eq!(host.player.events_sent(), 2);
+        assert_eq!(host.player.events_rejected(), 0);
+
+        assert!(host.enqueue(midi_wire(0xB0, 120, 0)), "controller 120 is all-sound-off");
+        let _ = render_peak(&mut host, 4);
+        assert_eq!(render_peak(&mut host, 8), 0.0, "and stopped when the page said so");
+
+        assert_eq!(host.set_midi_input(false), Ok(false), "and the module comes back");
+        assert!(!host.player.is_midi_only());
+        assert!(render_peak(&mut host, 200) > 0.001, "playing its own pattern data again");
+    }
+
+    /// An `argument` that spells no channel voice message is refused, exactly as an unknown
+    /// `AT_END` mode is — and a live event with no queue installed is refused too, rather
+    /// than installing one on the render path.
+    #[test]
+    fn a_midi_event_the_host_cannot_use_is_counted_rather_than_guessed_at() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+
+        let rejected = host.dropped_commands();
+        assert!(host.enqueue(midi_wire(0x90, 60, 100)));
+        host.process(RENDER_QUANTUM);
+        assert_eq!(host.dropped_commands(), rejected + 1, "no live-input queue is installed yet");
+
+        assert_eq!(host.set_midi_input(true), Ok(true));
+        // 0xF0 is a system message, which `message_to_event` has no channel voice meaning
+        // for; the page should never send one.
+        assert!(host.enqueue(midi_wire(0xF0, 0x7E, 0x00)));
+        host.process(RENDER_QUANTUM);
+        assert_eq!(host.dropped_commands(), rejected + 2);
+        assert_eq!(host.player.events_sent(), 0, "and nothing reached the queue");
+    }
+
+    /// The lead the page shows next to its keyboard toggle. A worklet is always called
+    /// with a whole render quantum, so the floor never rises above the two quanta
+    /// master-plan decision 6 chose.
+    #[test]
+    fn the_reported_lead_is_two_quanta_on_a_worklets_block_size() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        for _ in 0..8 {
+            host.process(RENDER_QUANTUM);
+        }
+        assert_eq!(host.player.event_lead(), 2 * RENDER_QUANTUM as u32);
+        assert!((host.player.event_lead_millis() - 256.0 * 1_000.0 / 48_000.0).abs() < 1e-3);
+    }
+
+    /// Live input has to survive a mixer-mode rebuild, because the page's Mixer panel and
+    /// its keyboard are independent controls and a rebuild is the one thing that throws
+    /// away the engine the queue was talking to.
+    #[test]
+    fn live_input_survives_a_mixer_mode_rebuild() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        assert_eq!(host.set_midi_input(true), Ok(true));
+        host.process(RENDER_QUANTUM);
+
+        assert!(host.set_mixer_mode(mode(MixPathKind::Fixed, Interpolator::Linear, OutputDepth::I16, false, 2)).is_ok());
+        assert!(host.player.is_midi_only(), "the rebuilt engine came back on live input");
+
+        assert!(host.enqueue(midi_wire(0xC0, 0, 0)));
+        assert!(host.enqueue(midi_wire(0x90, 60, 100)));
+        assert!(render_peak(&mut host, 60) > 0.001, "and the new queue reaches the new engine");
     }
 
     #[test]
