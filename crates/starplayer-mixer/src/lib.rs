@@ -22,12 +22,14 @@
 //! * [`master`] — master volume and the table-driven soft limiter.
 //! * [`output`] — accumulator frames to host samples, at every depth, with dither.
 //!
-//! # What is still to come
+//! # Per-channel buses (M7-H1)
 //!
-//! **Per-*channel* buses are not here yet.** Every voice accumulates into one stereo bus,
-//! which is then handed to the master section. Per-channel insert chains land with the DSP
-//! graph in M7, and nothing in this crate's shape has to change for them — the kernel
-//! already writes into a caller-supplied window, so a bus is a window like any other.
+//! [`VoicePool::accumulate_masked`] sums each voice into the bus of its `tag.channel`
+//! rather than into one shared accumulator, through a [`BusSegment`] view over the
+//! engine's channel-major bus array. A voice whose channel has no bus goes to the spill
+//! lane, which the engine sums in after every bus. The buses are **always on**: there is
+//! no "no inserts, old path" branch to keep in sync, and M7 master-plan decision 1 records
+//! why the fixed goldens do not move for it.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -49,4 +51,4 @@ pub use master::{Limiter, MasterSettings};
 pub use output::{Dither, FixedOut, FloatOut, HostSample, I24, MonoF32, MonoI16, OutputFormat, StereoF32, StereoI16};
 pub use path::{FixedFrame, FixedPath, FloatFrame, FloatPath, MixPath, Stereo};
 pub use sample::{GUARD_FRAMES, LoopMode, LoopSpan, SampleData, SampleRegion, append_guarded_sample};
-pub use voice::{PathFilter, Voice, VoiceFilter, VoicePool, VoiceTag};
+pub use voice::{BusSegment, PathFilter, Voice, VoiceFilter, VoicePool, VoiceTag};

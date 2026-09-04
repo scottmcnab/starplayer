@@ -11,6 +11,59 @@ use crate::kernel::{VoiceStatus, accumulate_voice};
 use crate::path::{MixPath, Stereo};
 use crate::sample::SampleRegion;
 
+/// The per-channel bus windows one render segment accumulates into (M7-H1).
+///
+/// # Why a view rather than a slice of slices
+///
+/// The engine owns one `RENDER_QUANTUM`-long bus per control lane, channel-major in a
+/// single allocation made in `Engine::with_settings`. A render segment covers
+/// `offset .. offset + frames` of *every* one of those buses, and those windows are not
+/// contiguous with each other — so a `&mut [&mut [Accumulator]]` would have to be built
+/// per segment, which is an allocation inside `render()`. This carries the stride and the
+/// window instead and hands out one bus at a time.
+///
+/// [`BusSegment::none`] is the "no buses at all" view: every voice then spills, which is
+/// what [`VoicePool::accumulate`] and the mixer's own tests want.
+#[derive(Debug)]
+pub struct BusSegment<'buses, Accumulator> {
+    buses: &'buses mut [Accumulator],
+    stride: usize,
+    offset: usize,
+    frames: usize,
+}
+
+impl<'buses, Accumulator> BusSegment<'buses, Accumulator> {
+    /// A view over `buses`, laid out as `count x stride` frames, covering
+    /// `offset .. offset + frames` of each.
+    pub const fn new(buses: &'buses mut [Accumulator], stride: usize, offset: usize, frames: usize) -> BusSegment<'buses, Accumulator> {
+        BusSegment { buses, stride, offset, frames }
+    }
+
+    /// A view with no buses in it. Every voice accumulates into the spill lane.
+    pub const fn none() -> BusSegment<'buses, Accumulator> { BusSegment { buses: &mut [], stride: 0, offset: 0, frames: 0 } }
+
+    /// How many buses there are.
+    pub const fn count(&self) -> usize {
+        match self.buses.len().checked_div(self.stride) {
+            Some(count) => count,
+            None => 0,
+        }
+    }
+
+    /// Frames in this segment.
+    pub const fn frames(&self) -> usize { self.frames }
+
+    /// Bus `index`'s window for this segment, or `None` if there is no such bus.
+    pub fn window(&mut self, index: usize) -> Option<&mut [Accumulator]> {
+        if index >= self.count() {
+            return None;
+        }
+        let start = index.checked_mul(self.stride)?.checked_add(self.offset)?;
+        let end = start.checked_add(self.frames)?;
+        self.buses.get_mut(start..end)
+    }
+}
+
 /// What a voice is playing, for the benefit of code that has to *find* voices rather than
 /// drive them (architecture §5.1).
 ///
@@ -544,19 +597,30 @@ impl VoicePool {
     /// but the filter's cutoff is a real frequency, so its coefficients cannot be derived
     /// without it.
     pub fn accumulate<Path: MixPath, Interp: Interpolate>(&mut self, pcm: &[i16], destination: &mut [Path::Accumulator], sample_rate_hz: u32) {
-        self.accumulate_masked::<Path, Interp>(pcm, destination, &mut [], sample_rate_hz, |_| false);
+        self.accumulate_masked::<Path, Interp>(pcm, &mut BusSegment::none(), destination, &mut [], sample_rate_hz, |_| false);
     }
 
-    /// [`VoicePool::accumulate`], with the voices whose `tag.channel` satisfies `is_muted`
-    /// rendered into `discard` instead of `destination`.
+    /// [`VoicePool::accumulate`], into **per-channel buses**, with the voices whose
+    /// `tag.channel` satisfies `is_muted` rendered into `discard` instead.
+    ///
+    /// A voice goes into the bus of its `tag.channel` if `buses` has one, and into `spill`
+    /// if it does not — a MIDI lane above a narrow engine's channel count, or a pool used
+    /// without buses at all. The spill lane is summed into the mix after every bus, so a
+    /// voice there is still heard; what it does not have is an insert chain of its own.
+    ///
+    /// Voices are still walked in **slot order**, which is what makes the float path's
+    /// summation within one bus independent of the host's block size. Whether two voices
+    /// on *different* channels are summed in slot order or channel-major is a different
+    /// question, and M7 master-plan decision 1 is the answer: on the fixed path `i32`
+    /// addition is associative unless an intermediate sum saturates, which no real module
+    /// reaches, so the goldens do not move.
     ///
     /// This is how a host mutes a channel. The muted voice keeps running exactly as it
     /// would have — position, loop, ramps, and every parameter write its channel makes —
     /// so unmuting resumes mid-note, and the output at every other channel is
-    /// bit-identical to an unmuted render. `discard` must be at least as long as
-    /// `destination`; if it is shorter, muted voices are skipped for this call and their
-    /// state does not advance, which is the lesser evil next to a panic on the audio
-    /// thread.
+    /// bit-identical to an unmuted render. `discard` must be at least as long as `spill`;
+    /// if it is shorter, muted voices are skipped for this call and their state does not
+    /// advance, which is the lesser evil next to a panic on the audio thread.
     ///
     /// A muted voice's **filter runs too**, for exactly the reason its position and ramps
     /// do: the filter is a two-pole recursion whose output depends on the two frames
@@ -566,14 +630,15 @@ impl VoicePool {
     pub fn accumulate_masked<Path: MixPath, Interp: Interpolate>(
         &mut self,
         pcm: &[i16],
-        destination: &mut [Path::Accumulator],
+        buses: &mut BusSegment<'_, Path::Accumulator>,
+        spill: &mut [Path::Accumulator],
         discard: &mut [Path::Accumulator],
         sample_rate_hz: u32,
         is_muted: impl Fn(u8) -> bool,
     ) {
         let mut free_head = self.free_head;
         let mut active_count = self.active_count;
-        let mut discard = discard.get_mut(..destination.len());
+        let mut discard = discard.get_mut(..spill.len());
 
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if !slot.active {
@@ -585,7 +650,10 @@ impl VoicePool {
                     None => VoiceStatus::Sounding,
                 }
             } else {
-                accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, destination, sample_rate_hz)
+                match buses.window(slot.voice.tag.channel as usize) {
+                    Some(bus) => accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, bus, sample_rate_hz),
+                    None => accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, spill, sample_rate_hz),
+                }
             };
             if status == VoiceStatus::Finished {
                 slot.active = false;
@@ -803,5 +871,90 @@ mod tests {
         for chunk_length in [1usize, 3, 7, 11, 25] {
             assert_eq!(render(chunk_length), whole, "chunk length {chunk_length} changed the output");
         }
+    }
+    /// The bus routing rule, stated on the pool itself: a voice's `tag.channel` chooses
+    /// its bus, and a channel with no bus spills.
+    #[test]
+    fn a_voice_accumulates_into_the_bus_of_its_channel() {
+        const BUS_COUNT: usize = 3;
+        const FRAMES: usize = 8;
+        let (blob, region) = one_shot_blob(32);
+
+        let mut pool = VoicePool::new(2);
+        let first = VoiceTag { channel: 1, ..VoiceTag::default() };
+        let second = VoiceTag { channel: 2, ..VoiceTag::default() };
+        pool.allocate(first, region, sounding_params(), 0).expect("slot 0");
+        pool.allocate(second, region, sounding_params(), 0).expect("slot 1");
+
+        let mut buses = vec![FixedFrame::default(); BUS_COUNT * FRAMES];
+        let mut spill = vec![FixedFrame::default(); FRAMES];
+        let mut view = BusSegment::new(&mut buses, FRAMES, 0, FRAMES);
+        assert_eq!(view.count(), BUS_COUNT);
+        pool.accumulate_masked::<FixedPath, Linear>(&blob, &mut view, &mut spill, &mut [], 44_100, |_| false);
+
+        assert!(buses.get(..FRAMES).expect("bus 0").iter().all(|frame| *frame == FixedFrame::default()), "no voice is on channel 0");
+        assert!(buses.get(FRAMES..FRAMES * 2).expect("bus 1").iter().any(|frame| *frame != FixedFrame::default()), "channel 1 sounded");
+        assert!(buses.get(FRAMES * 2..).expect("bus 2").iter().any(|frame| *frame != FixedFrame::default()), "channel 2 sounded");
+        assert!(spill.iter().all(|frame| *frame == FixedFrame::default()), "both channels had a bus, so nothing spilled");
+    }
+
+    #[test]
+    fn a_voice_beyond_the_bus_count_spills_rather_than_going_silent() {
+        const BUS_COUNT: usize = 2;
+        const FRAMES: usize = 8;
+        let (blob, region) = one_shot_blob(32);
+
+        let mut pool = VoicePool::new(1);
+        let tag = VoiceTag { channel: 48, ..VoiceTag::default() };
+        pool.allocate(tag, region, sounding_params(), 0).expect("slot 0");
+
+        let mut buses = vec![FixedFrame::default(); BUS_COUNT * FRAMES];
+        let mut spill = vec![FixedFrame::default(); FRAMES];
+        let mut view = BusSegment::new(&mut buses, FRAMES, 0, FRAMES);
+        pool.accumulate_masked::<FixedPath, Linear>(&blob, &mut view, &mut spill, &mut [], 44_100, |_| false);
+
+        assert!(buses.iter().all(|frame| *frame == FixedFrame::default()), "lane 48 has no bus here");
+        assert!(spill.iter().any(|frame| *frame != FixedFrame::default()), "and is still heard, through the spill lane");
+    }
+
+    /// A segment view addresses `offset .. offset + frames` of each bus, so rendering a
+    /// quantum in two segments fills one bus contiguously.
+    #[test]
+    fn a_segment_view_addresses_a_window_of_each_bus() {
+        const BUS_COUNT: usize = 2;
+        const QUANTUM: usize = 16;
+        let (blob, region) = one_shot_blob(64);
+
+        let render = |splits: &[usize]| {
+            let mut pool = VoicePool::new(1);
+            pool.allocate(VoiceTag { channel: 1, ..VoiceTag::default() }, region, sounding_params(), 0).expect("slot 0");
+            let mut buses = vec![FixedFrame::default(); BUS_COUNT * QUANTUM];
+            let mut spill = [FixedFrame::default(); QUANTUM];
+            let mut offset = 0;
+            for span in splits {
+                let mut view = BusSegment::new(&mut buses, QUANTUM, offset, *span);
+                let end = offset + span;
+                let window = spill.get_mut(offset..end).expect("inside the quantum");
+                pool.accumulate_masked::<FixedPath, Linear>(&blob, &mut view, window, &mut [], 44_100, |_| false);
+                offset = end;
+            }
+            buses
+        };
+
+        assert_eq!(render(&[5, 3, 8]), render(&[16]), "splitting the quantum changed the bus");
+    }
+
+    #[test]
+    fn an_empty_view_sends_everything_to_the_spill_lane() {
+        let (blob, region) = one_shot_blob(32);
+        let mut pool = VoicePool::new(1);
+        pool.allocate(VoiceTag::default(), region, sounding_params(), 0).expect("slot 0");
+
+        let mut spill = vec![FixedFrame::default(); 8];
+        let mut view: BusSegment<'_, FixedFrame> = BusSegment::none();
+        assert_eq!(view.count(), 0);
+        assert!(view.window(0).is_none(), "a view with no buses hands none out");
+        pool.accumulate_masked::<FixedPath, Linear>(&blob, &mut view, &mut spill, &mut [], 44_100, |_| false);
+        assert!(spill.iter().any(|frame| *frame != FixedFrame::default()));
     }
 }

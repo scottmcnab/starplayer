@@ -6,14 +6,20 @@
 //!
 //! # The tap does not read the mix
 //!
-//! There are **no per-channel buses**. [`VoicePool::accumulate_masked`] sums every voice
-//! into one accumulator in slot order, and that summation order is exactly what makes the
-//! float path's output independent of the host's block size and what the golden hashes
-//! fingerprint. Accumulating per channel to get a scope signal would change it, and the
-//! goldens would move — for a picture.
+//! There **are** per-channel buses since M7-H1: [`VoicePool::accumulate_masked`] sums each
+//! voice into the bus of its `tag.channel`, and the engine holds one whole
+//! `RENDER_QUANTUM` of every one of them. Reading a bus would give a scope the real mixed
+//! signal, complete with pan, ramps, the voice filter and this channel's insert chain.
 //!
-//! So the tap samples **voice state** instead, at the start of each render segment, and
-//! never touches the accumulator at all:
+//! The tap does not do that **because it predates the buses**, not because there is
+//! nowhere to read from: it was written when accumulating per channel would have changed
+//! the summation order and moved the goldens, and it still samples **voice state** at the
+//! start of each render segment, touching no accumulator at all. Moving it onto the bus is
+//! a follow-up — M7 master-plan decision 1 says explicitly that it is not part of this
+//! milestone — and it would change what a scope draws, which is a UI decision with an
+//! owner, not a refactor.
+//!
+//! So, as it stands:
 //!
 //! * the engine's `render_quantum` already splits each 128-frame quantum into segments at
 //!   event boundaries and accumulates each segment at a quantum-relative `offset`;

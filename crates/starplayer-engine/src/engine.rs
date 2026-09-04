@@ -6,13 +6,17 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use starplayer_core::{ChannelId, Command, Frame, U0F16};
-use starplayer_dsp::Interpolate;
-use starplayer_mixer::{Limiter, MasterSettings, MixPath, OutputFormat, VoicePool};
+use starplayer_dsp::{DSP_BLOCK_FRAMES, Insert, Interpolate};
+use starplayer_mixer::{BusSegment, Limiter, MasterSettings, MixPath, OutputFormat, VoicePool};
 use starplayer_rt::{Consumer, GarbageChannel, garbage_channel};
 
 use crate::channel::ChannelTable;
 use crate::command::{DEFAULT_COMMAND_CAPACITY, DEFAULT_GARBAGE_CAPACITY, EngineHandle, MAX_COMMANDS_PER_QUANTUM, PcmSource};
 use crate::control::ControlClock;
+use crate::insert::{
+    DEFAULT_INSERT_COMMAND_CAPACITY, DEFAULT_INSERT_GARBAGE_CAPACITY, InsertChain, InsertCommand, InsertHandle,
+    InsertTarget,
+};
 use crate::ring::OutputRing;
 use crate::source::{EngineContext, EventSource, SourceMux, SourceSlot};
 
@@ -27,6 +31,10 @@ use crate::source::{EngineContext, EventSource, SourceMux, SourceSlot};
 /// Q2, to be settled at M8. Until then this is a constant and there is deliberately no
 /// knob.
 pub const RENDER_QUANTUM: usize = 128;
+
+/// The DSP graph is written against a block length of its own, and an effect is allowed to
+/// rely on `block.len()` being it. The two must be the same number.
+const _: () = assert!(RENDER_QUANTUM == DSP_BLOCK_FRAMES, "an insert is handed a whole render quantum");
 
 /// Consecutive dispatches at the same frame before the engine forces the clock forward
 /// (architecture §3.1 rule 2).
@@ -72,6 +80,13 @@ pub struct EngineWarnings {
     /// `SeekRow`, `SetInterpolator` or `SetTempoModel`. Flagged rather than ignored
     /// silently, so a host is not left wondering why nothing happened.
     pub unsupported_command: bool,
+    /// A retired insert could not be returned over the insert garbage channel and was
+    /// dropped on the audio thread, which may have called `free()` inside the callback.
+    ///
+    /// The same host bug [`EngineWarnings::retired_module_dropped`] reports, about the
+    /// other garbage channel: the control side has stopped calling
+    /// [`InsertHandle::collect_all_garbage`], or never claimed the handle at all.
+    pub retired_insert_dropped: bool,
     /// An external event arrived stamped for a frame that had already passed, and was
     /// dispatched at the current frame instead (M4-E4).
     ///
@@ -87,6 +102,7 @@ impl EngineWarnings {
         self.zero_advance_forced
             || self.event_limit_reached
             || self.retired_module_dropped
+            || self.retired_insert_dropped
             || self.unsupported_command
             || self.late_events
     }
@@ -110,6 +126,10 @@ pub struct EngineSettings {
     pub command_capacity: usize,
     /// Depth of the garbage channel.
     pub garbage_capacity: usize,
+    /// Depth of the insert command ring (M7-H1).
+    pub insert_command_capacity: usize,
+    /// Depth of the retired-insert garbage channel (M7-H1).
+    pub insert_garbage_capacity: usize,
 }
 
 impl Default for EngineSettings {
@@ -121,6 +141,8 @@ impl Default for EngineSettings {
             source_capacity: SourceMux::DEFAULT_CAPACITY,
             command_capacity: DEFAULT_COMMAND_CAPACITY,
             garbage_capacity: DEFAULT_GARBAGE_CAPACITY,
+            insert_command_capacity: DEFAULT_INSERT_COMMAND_CAPACITY,
+            insert_garbage_capacity: DEFAULT_INSERT_GARBAGE_CAPACITY,
         }
     }
 }
@@ -179,8 +201,19 @@ where
     /// The module the control plane last swapped in. Retiring one sends it down the
     /// garbage channel; it is never dropped here.
     module: Option<Module>,
-    /// One whole quantum of accumulated frames. Allocated once.
+    /// One whole quantum of the **pre-master mix**: the channel buses summed
+    /// channel-major, then the spill lane. Allocated once.
     accumulator: Box<[Path::Accumulator]>,
+    /// One `RENDER_QUANTUM`-long bus per control lane, channel-major in one allocation
+    /// (M7-H1). Always on: there is no "no inserts, old path" branch.
+    buses: Box<[Path::Accumulator]>,
+    /// How many buses [`Engine::buses`] holds — the channel table's width.
+    bus_count: usize,
+    /// Where a voice whose `tag.channel` has no bus renders. Summed into the mix after
+    /// every bus, so such a voice is still heard; what it has not got is an insert chain.
+    spill: Box<[Path::Accumulator]>,
+    /// One chain per bus, plus the master chain last. `bus_count + 1` entries.
+    chains: Box<[InsertChain<Path::Mono>]>,
     /// Where muted channels' voices render, so their state advances exactly as if they
     /// were audible. Never read.
     muted_scratch: Box<[Path::Accumulator]>,
@@ -190,6 +223,10 @@ where
     garbage: GarbageChannel<Module>,
     /// The control half, held until [`Engine::take_control`] claims it.
     control_handle: Option<EngineHandle<Module>>,
+    insert_commands: Consumer<InsertCommand<Path::Mono>>,
+    insert_garbage: GarbageChannel<Box<dyn Insert<Path::Mono>>>,
+    /// The insert control half, held until [`Engine::take_insert_control`] claims it.
+    insert_handle: Option<InsertHandle<Path::Mono>>,
     frame: Frame,
     source_frame: Frame,
     playing: bool,
@@ -240,6 +277,13 @@ where
     pub fn with_settings(settings: EngineSettings) -> Engine<Path, Interp, Out, Module> {
         let (command_producer, command_consumer) = starplayer_rt::channel(settings.command_capacity);
         let (garbage, collector) = garbage_channel(settings.garbage_capacity);
+        let (insert_producer, insert_consumer) = starplayer_rt::channel(settings.insert_command_capacity);
+        let (insert_garbage, insert_collector) = garbage_channel(settings.insert_garbage_capacity);
+        // The channel table clamps to `ChannelTable::MAX_CHANNELS`, so the bus count comes
+        // from the table rather than from the request: 64 buses is the widest the engine
+        // can be asked for, and the two must agree or a lane's voices would spill.
+        let channels = ChannelTable::new(settings.channel_count);
+        let bus_count = channels.len();
         #[cfg(feature = "telemetry")]
         let (telemetry, telemetry_reader) = starplayer_telemetry::telemetry_channel();
         // One scope ring per control lane, allocated here with everything else. A ring is
@@ -249,17 +293,24 @@ where
 
         Engine {
             voices: VoicePool::new(settings.voice_capacity),
-            channels: ChannelTable::new(settings.channel_count),
+            channels,
             control: ControlClock::new(settings.sample_rate_hz, Frame::ZERO),
             pcm: Vec::new(),
             module: None,
             accumulator: vec![Path::Accumulator::default(); RENDER_QUANTUM].into_boxed_slice(),
+            buses: vec![Path::Accumulator::default(); bus_count * RENDER_QUANTUM].into_boxed_slice(),
+            bus_count,
+            spill: vec![Path::Accumulator::default(); RENDER_QUANTUM].into_boxed_slice(),
+            chains: (0..bus_count + 1).map(|_| InsertChain::default()).collect::<Vec<_>>().into_boxed_slice(),
             muted_scratch: vec![Path::Accumulator::default(); RENDER_QUANTUM].into_boxed_slice(),
             ring: OutputRing::new(RENDER_QUANTUM * Out::CHANNELS),
             sources: SourceMux::new(settings.source_capacity),
             commands: command_consumer,
             garbage,
             control_handle: Some(EngineHandle::new(command_producer, collector)),
+            insert_commands: insert_consumer,
+            insert_garbage,
+            insert_handle: Some(InsertHandle::new(insert_producer, insert_collector)),
             frame: Frame::ZERO,
             source_frame: Frame::ZERO,
             playing: true,
@@ -330,6 +381,34 @@ where
     /// does must take it **before** the engine goes to the audio thread, because it is the
     /// only way to load a module and the only place retired modules are dropped.
     pub fn take_control(&mut self) -> Option<EngineHandle<Module>> { self.control_handle.take() }
+
+    /// Claim the insert graph's control handle, once (M7-H1).
+    ///
+    /// Held until taken, for the same reasons [`Engine::take_control`] is: a host that
+    /// wants no effects never has to think about it, and a host that does must take it
+    /// **before** the engine goes to the audio thread — it is the only way to install an
+    /// effect and the only place a retired one is dropped.
+    pub fn take_insert_control(&mut self) -> Option<InsertHandle<Path::Mono>> { self.insert_handle.take() }
+
+    /// How many channel buses the engine has. The master chain sits one past the last.
+    pub const fn bus_count(&self) -> usize { self.bus_count }
+
+    /// One bus's insert chain, or the master chain, for a caller reading the graph back.
+    pub fn chain(&self, target: InsertTarget) -> Option<&InsertChain<Path::Mono>> {
+        self.chains.get(self.chain_index(target)?)
+    }
+
+    /// Which entry of [`Engine::chains`] `target` names, or `None` for a lane the engine
+    /// does not have.
+    const fn chain_index(&self, target: InsertTarget) -> Option<usize> {
+        match target {
+            InsertTarget::Channel(ChannelId(channel)) => {
+                let index = channel as usize;
+                if index < self.bus_count { Some(index) } else { None }
+            }
+            InsertTarget::Master => Some(self.bus_count),
+        }
+    }
 
     /// Install the module's PCM blob directly, bypassing the control plane. Off the audio
     /// thread, and a fixture hook — see the field's documentation.
@@ -458,9 +537,19 @@ where
         // it once per quantum rather than once per host call is what keeps a command from
         // landing on a different frame depending on the host's buffer size.
         self.drain_commands();
+        self.drain_insert_commands();
 
         for accumulated in self.accumulator.iter_mut() {
             *accumulated = Path::Accumulator::default();
+        }
+        // The buses are always on, so they are always cleared: there is no branch here
+        // that a chain being empty could take, and therefore no second code path to keep
+        // in step with this one (M7 master-plan decision 1).
+        for bus in self.buses.iter_mut() {
+            *bus = Path::Accumulator::default();
+        }
+        for spilled in self.spill.iter_mut() {
+            *spilled = Path::Accumulator::default();
         }
 
         // The scope taps sum into this quantum's buckets, so they start at zero. Done
@@ -505,11 +594,16 @@ where
                 // `cargo xtask goldens --check` proves.
                 #[cfg(feature = "telemetry")]
                 self.scope_taps.sample_segment(&self.voices, pcm, offset, span);
-                if let Some(window) = self.accumulator.get_mut(offset..end) {
+                if let Some(spill_window) = self.spill.get_mut(offset..end) {
                     let scratch = self.muted_scratch.get_mut(offset..end).unwrap_or(&mut []);
                     let channels = &self.channels;
                     let is_muted = |channel: u8| channels.get(ChannelId(channel as u16)).is_some_and(|lane| lane.muted);
-                    self.voices.accumulate_masked::<Path, Interp>(pcm, window, scratch, self.sample_rate_hz, is_muted);
+                    // A view, not a slice of slices: the buses are one channel-major
+                    // allocation and this segment covers `offset..end` of each of them.
+                    // Building a `&mut [&mut [_]]` here would be an allocation in
+                    // `render()`.
+                    let mut buses = BusSegment::new(&mut self.buses, RENDER_QUANTUM, offset, span);
+                    self.voices.accumulate_masked::<Path, Interp>(pcm, &mut buses, spill_window, scratch, self.sample_rate_hz, is_muted);
                 }
             }
 
@@ -532,11 +626,19 @@ where
         self.channels.release_finished(&self.voices);
 
         // ── DSP, on whole quanta only ───────────────────────────────────────────────
-        // The per-channel insert hook is a no-op until the DSP graph lands (M7), but the
-        // call site exists and takes a whole quantum so that there is no ragged-segment
-        // shape for it to slip into. The master bus is real from M1-B5: master volume,
-        // then the limiter.
-        Self::process_channel_inserts(&mut self.accumulator);
+        // Every call below takes a whole `RENDER_QUANTUM`, so there is no ragged-segment
+        // shape for an effect to slip into (architecture §1.4). Channel chains first, on
+        // their own buses, then the channel-major sum into the pre-master mix, then the
+        // spill lane, then the master chain, then master volume and the limiter.
+        Self::process_channel_inserts(&mut self.buses, &mut self.chains, &mut self.accumulator);
+        for (mixed, spilled) in self.accumulator.iter_mut().zip(self.spill.iter()) {
+            Path::add_frame(mixed, *spilled);
+        }
+        if let Some(master_chain) = self.chains.get_mut(self.bus_count)
+            && !master_chain.is_empty()
+        {
+            master_chain.process(Path::as_frames(&mut self.accumulator));
+        }
         let master_settings = MasterSettings { volume: self.master_volume, limiter: self.limiter };
         Self::process_master_bus(&mut self.accumulator, master_settings);
 
@@ -552,6 +654,76 @@ where
         }
     }
 
+    /// Apply up to [`MAX_COMMANDS_PER_QUANTUM`] queued insert commands.
+    ///
+    /// Bounded for the same reason [`Engine::drain_commands`] is: an unbounded drain would
+    /// let a control thread that floods the ring stall the audio callback for as long as
+    /// it kept writing.
+    fn drain_insert_commands(&mut self) {
+        for _ in 0..MAX_COMMANDS_PER_QUANTUM {
+            let Some(command) = self.insert_commands.pop() else { break };
+            self.apply_insert_command(command);
+        }
+    }
+
+    fn apply_insert_command(&mut self, command: InsertCommand<Path::Mono>) {
+        match command {
+            InsertCommand::Install { target, slot, insert } => {
+                // The retired box comes out first and is retired after the chain borrow
+                // has ended, so nothing is dropped here even when the target does not
+                // exist — an insert addressed to a lane this engine has not got still
+                // goes back to the control thread to die.
+                let retired = match self.chain_index(target).and_then(|index| self.chains.get_mut(index)) {
+                    Some(chain) => chain.install(slot, insert),
+                    None => Some(insert),
+                };
+                if let Some(retired) = retired {
+                    self.retire_insert(retired);
+                }
+            }
+            InsertCommand::Remove { target, slot } => {
+                let retired = self.chain_index(target).and_then(|index| self.chains.get_mut(index)).and_then(|chain| chain.remove(slot));
+                if let Some(retired) = retired {
+                    self.retire_insert(retired);
+                }
+            }
+            InsertCommand::SetParam { target, slot, param, value } => {
+                if let Some(index) = self.chain_index(target)
+                    && let Some(chain) = self.chains.get_mut(index)
+                {
+                    chain.set_param(slot, param, value);
+                }
+            }
+            InsertCommand::Bypass { target, slot, bypassed } => {
+                if let Some(index) = self.chain_index(target)
+                    && let Some(chain) = self.chains.get_mut(index)
+                {
+                    chain.set_bypassed(slot, bypassed);
+                }
+            }
+            InsertCommand::ResetAll => self.reset_all_inserts(),
+        }
+    }
+
+    /// Hand a retired insert to the control thread, or drop it here and say so.
+    ///
+    /// The last resort, exactly as it is for a retired module: the control side has
+    /// stopped collecting, so there is nowhere else for this to go and the alternative —
+    /// growing a queue — is an allocation on the audio thread.
+    fn retire_insert(&mut self, insert: Box<dyn Insert<Path::Mono>>) {
+        if let Err(orphan) = self.insert_garbage.retire(insert) {
+            self.warnings.retired_insert_dropped = true;
+            drop(orphan);
+        }
+    }
+
+    /// Clear every delay line and envelope in every chain, keeping the parameters.
+    fn reset_all_inserts(&mut self) {
+        for chain in self.chains.iter_mut() {
+            chain.reset();
+        }
+    }
+
     fn apply_command(&mut self, command: Command<Module>) {
         match command {
             // The garbage-channel case, and the reason the channel exists: dropping the
@@ -563,6 +735,10 @@ where
                 // channels' mute flags are the host's and stay.
                 self.voices.release_all();
                 self.channels.forget_all();
+                // A delay line still holding the previous song would bleed it into the
+                // first bar of the next one. The effects stay installed at their
+                // parameters; only their state goes.
+                self.reset_all_inserts();
                 if let Some(retired) = self.module.replace(module)
                     && let Err(orphan) = self.garbage.retire(retired)
                 {
@@ -666,11 +842,27 @@ where
         }
     }
 
-    /// Per-channel insert chains. A no-op until the DSP graph lands; the signature is the
-    /// point.
-    fn process_channel_inserts(quantum: &mut [Path::Accumulator]) {
-        debug_assert_eq!(quantum.len(), RENDER_QUANTUM, "DSP only ever sees whole quanta");
-        let _ = quantum;
+    /// Run each channel's insert chain over its own bus, then sum the buses into the
+    /// pre-master `mix` in **channel order** (M7-H1).
+    ///
+    /// A chain with nothing installed is skipped rather than walked, but its bus is summed
+    /// in exactly the same way — the sum is not conditional on there being an effect, so
+    /// there is only ever one summation order and nothing for the goldens to notice.
+    fn process_channel_inserts(buses: &mut [Path::Accumulator], chains: &mut [InsertChain<Path::Mono>], mix: &mut [Path::Accumulator]) {
+        debug_assert_eq!(mix.len(), RENDER_QUANTUM, "DSP only ever sees whole quanta");
+        let bus_count = buses.len() / RENDER_QUANTUM;
+        for channel in 0..bus_count {
+            let start = channel * RENDER_QUANTUM;
+            let Some(bus) = buses.get_mut(start..start + RENDER_QUANTUM) else { continue };
+            if let Some(chain) = chains.get_mut(channel)
+                && !chain.is_empty()
+            {
+                chain.process(Path::as_frames(bus));
+            }
+            for (mixed, mine) in mix.iter_mut().zip(bus.iter()) {
+                Path::add_frame(mixed, *mine);
+            }
+        }
     }
 
     /// The master bus: master volume, then the limiter, on a whole quantum (M1-B5).
