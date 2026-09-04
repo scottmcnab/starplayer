@@ -1,0 +1,57 @@
+//! The effect set, and the one place a host names an effect.
+//!
+//! M7 lands them in three tasks: H1 the [`gain`] trim that the [`Insert`] trait is proved
+//! against, H3 the EQ, delay and chorus, H4 the reverb and compressor. [`InsertKind`] and
+//! [`build`] grow one arm each time, and a host never names a concrete effect type.
+
+pub mod gain;
+
+pub use gain::{GAIN_MAX_CENTI_DB, GAIN_MIN_CENTI_DB, GAIN_PARAM, GainInsert, db_to_gain_q15};
+
+use alloc::boxed::Box;
+
+use crate::insert::Insert;
+use crate::sample::DspSample;
+
+/// Every effect the engine can build.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum InsertKind {
+    /// A smoothed gain trim in centi-decibels ([`GainInsert`]).
+    #[default]
+    Gain,
+}
+
+/// Build one effect, boxed for a chain slot.
+///
+/// **Off the audio thread.** Building an effect allocates — its delay lines, from H3
+/// onwards — which is exactly why an insert arrives at the engine over a control ring
+/// rather than being constructed inside `render()`.
+///
+/// `sample_rate_hz` is the rate the effect will run at; a time-based effect sizes its
+/// delay lines from it. The gain trim has no use for it.
+pub fn build_insert<Sample: DspSample>(kind: InsertKind, sample_rate_hz: u32) -> Box<dyn Insert<Sample>> {
+    let _ = sample_rate_hz;
+    match kind {
+        InsertKind::Gain => Box::new(GainInsert::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::insert::ParamId;
+
+    #[test]
+    fn build_hands_out_an_effect_at_its_defaults() {
+        let insert: Box<dyn Insert<f32>> = build_insert(InsertKind::Gain, 44_100);
+        assert_eq!(insert.descriptor().name, "gain");
+        assert_eq!(insert.param(ParamId(0)), Some(0));
+    }
+
+    #[test]
+    fn both_sample_types_build() {
+        let float: Box<dyn Insert<f32>> = build_insert(InsertKind::Gain, 48_000);
+        let fixed: Box<dyn Insert<i32>> = build_insert(InsertKind::Gain, 48_000);
+        assert_eq!(float.descriptor().name, fixed.descriptor().name);
+    }
+}
