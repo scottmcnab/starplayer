@@ -193,6 +193,9 @@ pub struct WarningFlags {
     pub retired_module_dropped: bool,
     /// A command arrived that this milestone does not act on yet.
     pub unsupported_command: bool,
+    /// An external event was stamped for a frame that had already passed and dispatched at
+    /// the current one. The host's event lead is too short.
+    pub late_events: bool,
 }
 
 impl WarningFlags {
@@ -202,11 +205,16 @@ impl WarningFlags {
         event_limit_reached: false,
         retired_module_dropped: false,
         unsupported_command: false,
+        late_events: false,
     };
 
     /// Whether anything has been flagged.
     pub const fn any(self) -> bool {
-        self.zero_advance_forced || self.event_limit_reached || self.retired_module_dropped || self.unsupported_command
+        self.zero_advance_forced
+            || self.event_limit_reached
+            || self.retired_module_dropped
+            || self.unsupported_command
+            || self.late_events
     }
 }
 

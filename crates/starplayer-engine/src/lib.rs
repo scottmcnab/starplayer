@@ -49,6 +49,15 @@
 //!
 //! # What M3 adds (task D6)
 //!
+//! # What M4 adds (task E4)
+//!
+//! * [`instrument`] — the musical half of architecture §2.4: the [`Instrument`] trait with
+//!   its two implementations ([`SampleInstrument`] for MOD/S3M/MTM, [`MappedInstrument`]
+//!   for XM/IT), the [`InstrumentRack`] of sixteen MIDI channels, the [`EventFeed`] a feed
+//!   implements, the [`ExternalEventQueue`] live input pushes into, and [`MidiSource`] —
+//!   an [`EventSource`](source::EventSource) that plays a feed through a rack and carries
+//!   its own control tick.
+//!
 //! * [`scope`] — behind the same feature: telemetry (b), the per-channel oscilloscope
 //!   taps. Voice state sampled once per render segment into a lossy
 //!   [`TapRing`](starplayer_rt::TapRing) per channel, 32 buckets per quantum, claimed
@@ -69,6 +78,7 @@ pub mod control;
 pub mod demo;
 pub mod engine;
 pub mod flow;
+pub mod instrument;
 pub mod mixer_mode;
 pub mod ring;
 #[cfg(feature = "telemetry")]
@@ -90,6 +100,11 @@ pub use control::{ControlClock, ControlDriver, DEFAULT_CONTROL_INTERVAL_MICROS};
 pub use engine::{
     DEFAULT_SAMPLE_RATE_HZ, Engine, EngineSettings, EngineWarnings, MAX_EVENTS_PER_BLOCK, MAX_ZERO_ADVANCE,
     RENDER_QUANTUM,
+};
+pub use instrument::{
+    DEFAULT_BEND_RANGE_CENTS, EventFeed, EventOutcome, ExternalEventProducer, ExternalEventQueue, Instrument,
+    InstrumentRack, MAX_HELD_NOTES, MIDI_CHANNEL_BASE, MIDI_CHANNEL_COUNT, MappedInstrument, MidiSource, NoteParams,
+    REFERENCE_NOTE, SampleInstrument, external_event_channel, instrument_for, midi_channel, midi_channel_index,
 };
 pub use mixer_mode::{MixPathKind, MixerMode, OutputDepth};
 pub use ring::OutputRing;

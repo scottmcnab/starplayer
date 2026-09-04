@@ -337,9 +337,17 @@ fit comes for free without contaminating the tracker path.
 | Source | Role |
 |---|---|
 | `PatternSequencer` | order list → pattern → row → tick; owns tempo/speed and the format's effect processor |
-| `SmfSequencer` | a sorted MIDI-file event list |
-| `ExternalEventQueue` | live MIDI, keyboard, plugin host events |
+| `MidiSource<Feed>` | **landed M4-E4.** Plays any `EventFeed` through an `InstrumentRack`, and carries its own control tick (§5.4). The only `EventSource` on the musical side — a feed is not a source |
+| `ExternalEventQueue` | **landed M4-E4.** An `EventFeed`, not an `EventSource`: the SPSC ring of `TimedEvent`s that live MIDI, the keyboard and a plugin host push into, with a one-event lookahead refreshed per render segment |
+| `SmfSequencer` | M4-E5. The other `EventFeed`: a cursor over a MIDI file's sorted event list |
 | `SourceMux` | merges several sources with the §3.1.3 tie-break — "play a module and jam over it". Landed at **M1-B3** rather than M4: it is a hundred lines, and the tie-break rule is only testable once two real sources can collide |
+
+The split between `EventSource` and `EventFeed` is worth stating: a **source** is asked
+when it next has something to do, is advanced, and dispatches into the engine; a **feed**
+only answers "what is the next event, and may I have it". Everything a feed's events mean —
+which instrument plays them, what the channel's controllers say, when the control tick
+falls — belongs to `MidiSource`, so there is exactly one implementation of it rather than
+one per input.
 
 `starplayer::NativeSequencer` (M3-D3) is the host-side dispatch above them: one enum, one
 arm per format crate compiled in, that turns a runtime `ModuleFormat` into the typed
@@ -573,18 +581,49 @@ different heuristic.
 
 ### 5.3 The instrument surface
 
-Sketched, not committed — the shape it will take when it is extracted:
+**Committed in M4-full task E4**, with the two implementations design goal 8 asks for —
+`SampleInstrument` (MOD, S3M, MTM) and `MappedInstrument` (XM, IT), neither of them a
+tracker processor. It lives in `starplayer_engine::instrument`:
 
 ```rust
-pub trait Instrument {
-    fn note_on(&self, ch: &mut Channel, pool: &mut VoicePool, note: NoteParams);
-    fn note_off(&self, ch: &mut Channel, pool: &mut VoicePool);
-    fn control_tick(&self, ch: &mut Channel, pool: &mut VoicePool);  // envelopes, NNA, fadeout
-    fn render(&self, voice: &mut Voice, out: &mut MixBuffer);
+pub struct NoteParams { pub note: Note, pub velocity: U0F16, pub pan_override: Option<I1F15> }
+
+pub trait Instrument: Send {
+    fn note_on(&self, channel: ChannelId, params: NoteParams, context: &mut EngineContext<'_>) -> Option<VoiceId>;
+    fn note_off(&self, channel: ChannelId, context: &mut EngineContext<'_>);
+    fn control_tick(&self, channel: ChannelId, context: &mut EngineContext<'_>);
+    fn set_bend(&self, channel: ChannelId, cents: i16, context: &mut EngineContext<'_>);
 }
 ```
 
-**Owner decision, 2026-09-03** (`plans/engine/M3-M6-concurrency-plan.md`, delivered by
+Four things moved from the sketch, each for a reason worth keeping:
+
+* **`&self`, and the channel is a parameter.** An instrument is shared, immutable knowledge
+  about a module's samples; everything that varies per channel — held notes, controller
+  state, the bend — belongs to the `InstrumentRack` that owns it. That is what lets one
+  `Box<dyn Instrument>` serve all sixteen MIDI channels at once.
+* **`EngineContext` rather than `(&mut Channel, &mut VoicePool)`.** The sketch's pair is
+  half of what `note_on` needs: a voice is started through `ChannelTable::trigger`, which
+  owns the release-then-allocate ordering NNA depends on, and the context is already the
+  thing every `EventSource` is handed.
+* **`render` is gone.** No instrument renders: the mixer does, monomorphised over the path
+  and the interpolator (§7.1). A `dyn` call per sample was never on the table.
+* **`set_bend` arrived**, because pitch bend is the one musical gesture with no tracker
+  peer at all — the rack scales the wheel by its range and the instrument re-derives the
+  step from the sounding voice's own tag.
+
+`InstrumentRack` is the channel-state half: sixteen MIDI channels at
+`MIDI_CHANNEL_BASE = 48` (a module of up to 48 channels and sixteen MIDI channels coexist
+in the 64-lane table), each with its program, CC7 volume, CC10 pan, CC64 sustain, pitch
+bend and a fixed array of held notes. It consumes `Event`s and reports `Trigger`/`Param` as
+unsupported: the tracker vocabulary is a **peer** of the musical one (§2.4), never a
+lowering of it.
+
+Neither implementation runs envelopes, fadeout, NNA or auto-vibrato. Giving a MIDI-driven
+XM or IT instrument its format's own articulation is M11's deliverable, and Q4 — whether
+this surface survives a non-sample instrument — is still M10's to settle.
+
+**Owner decision, 2026-09-03** (the history this replaced) (`plans/engine/M3-M6-concurrency-plan.md`, delivered by
 M4-lite task E3): the extraction moves to **M4-full**, and XM and IT are implemented
 without it.
 
@@ -628,6 +667,18 @@ clock is itself an `EventSource`:
 
 One uniform rule — "envelopes advance on control ticks" — exactly right for trackers,
 perfectly adequate for synth instruments.
+
+**Amendment, M4-full (task E4).** A **MIDI-driven source carries its own control tick**,
+whether or not a tracker is in the mux. The rule above ties the control rate to the
+module's tempo, which is right for a format's envelopes and wrong for a keyboard jammed
+over a stopped or absent module: a MIDI channel would then tick at the mercy of somebody
+else's `Fxx`, or never. `MidiSource` therefore keeps a `ControlClock` of its own at the
+engine rate (~1 ms), reports `min(feed, control)` as its next event frame, and ticks it
+from inside its own `dispatch`. Nothing in the engine changed for it — the render loop
+already splits its segments at whatever frame a source reports — and the engine's own
+synthesised clock keeps running alongside, unread by the source, so a tracker taking that
+clock over cannot silence a MIDI instrument. Revisit when M11 gives MIDI instruments
+envelopes and the two rates have to agree about something.
 
 **Where this stands after M4-lite (task E3).** With a tracker sequencer driving, the
 tracker tick *is* the control tick — `PatternSequencer::dispatch` calls
@@ -1287,5 +1338,5 @@ Recorded rather than guessed. Each has a milestone where it must be settled.
 | Q1 | Does `SharedArrayBuffer` + COOP/COEP work well enough for scope telemetry, or is `postMessage` the practical default? | **Settled in M0-A4 — see §9** |
 | Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | M8 |
 | Q3 | Which voice-stealing heuristic does libopenmpt actually use, exactly? | **Settled in M6-G3 — see §5.2** |
-| Q4 | Does the `Instrument` trait survive contact with a non-sample instrument (FM), or does it need a second tier? | M10 |
+| Q4 | Does the `Instrument` trait survive contact with a non-sample instrument (FM), or does it need a second tier? | M10 — **still open**; M4-E4 committed the trait with two *sample* implementations (§5.3), which is what design goal 8 asked for and is not yet the question Q4 asks |
 | Q5 | CLAP first with a VST3 wrapper, or nih-plug for both? | M9 |

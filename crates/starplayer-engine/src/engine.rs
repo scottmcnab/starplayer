@@ -72,12 +72,23 @@ pub struct EngineWarnings {
     /// `SeekRow`, `SetInterpolator` or `SetTempoModel`. Flagged rather than ignored
     /// silently, so a host is not left wondering why nothing happened.
     pub unsupported_command: bool,
+    /// An external event arrived stamped for a frame that had already passed, and was
+    /// dispatched at the current frame instead (M4-E4).
+    ///
+    /// The host is stamping its events too close to the present — `Player::send_event`
+    /// stamps `output_frame + lead`, and `lead` has to cover the callback's own latency.
+    /// Nothing is dropped; the event is simply a little late.
+    pub late_events: bool,
 }
 
 impl EngineWarnings {
     /// Whether anything has been flagged.
     pub const fn any(self) -> bool {
-        self.zero_advance_forced || self.event_limit_reached || self.retired_module_dropped || self.unsupported_command
+        self.zero_advance_forced
+            || self.event_limit_reached
+            || self.retired_module_dropped
+            || self.unsupported_command
+            || self.late_events
     }
 
     /// Take the flags and reset them.
@@ -628,6 +639,7 @@ where
                 self.telemetry.set_warnings(self.warnings.into());
 
                 let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+                context.set_warnings(&mut self.warnings);
                 #[cfg(feature = "telemetry")]
                 context.set_telemetry(&mut self.telemetry);
                 #[cfg(feature = "trace")]

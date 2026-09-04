@@ -437,3 +437,62 @@ fn allocation_on_another_thread_is_not_a_violation() {
     // megabyte the other thread asked for, not about a clean report.
     assert!(report.largest < 1 << 20, "another thread's megabyte was attributed to this one: {report:?}");
 }
+
+/// Task E4's arm: the **musical** path under the same hook.
+///
+/// `MidiSource` brings two things the tracker path does not have — an `InstrumentRack`
+/// holding `Box<dyn Instrument>`s, and events arriving from another thread over an SPSC
+/// ring — and both are new opportunities to allocate inside the callback. The rack is
+/// built off the audio thread, the ring is allocated once, and the queue's one-event
+/// lookahead is a `Copy` field, so `render()` must stay clean with a live keyboard playing
+/// through it.
+#[test]
+fn rendering_a_midi_source_allocates_nothing() {
+    use starplayer::core::{Event, Frame, Note, TimedEvent, U0F16};
+    use starplayer::engine::{InstrumentRack, MidiSource, external_event_channel, midi_channel};
+
+    let module = Arc::new(starplayer::it::load(&starplayer_offline::fixtures::synthetic_it()).expect("the synthesised IT loads"));
+    let settings = EngineSettings {
+        sample_rate_hz: SAMPLE_RATE_HZ,
+        // The MIDI lanes sit above a module's, so the table has to be the full width.
+        channel_count: starplayer::engine::ChannelTable::MAX_CHANNELS,
+        voice_capacity: starplayer::recommended_voice_capacity(&module).max(16),
+        ..EngineSettings::default()
+    };
+
+    for host_block_frames in [128usize, 37, 4096] {
+        let mut engine: CorpusEngine = Engine::with_settings(settings);
+        let mut control = engine.take_control().expect("a fresh engine owns its control handle");
+        control.load_module(Arc::clone(&module)).map_err(|_| "full").expect("the ring has room");
+
+        // Everything the audio thread will touch is allocated here, before it goes over:
+        // the rack's boxed instruments, the event ring, and the source itself.
+        let rack = InstrumentRack::for_module(&module, SAMPLE_RATE_HZ);
+        let (mut producer, queue) = external_event_channel(256);
+        engine.set_source(Box::new(MidiSource::new(queue, rack, SAMPLE_RATE_HZ)));
+
+        // A chord per eighth of the render, held and released — enough note-ons, note-offs
+        // and controller writes that a per-event allocation could not hide.
+        let step_frames = (FRAMES_PER_MODULE / 16) as u64;
+        for index in 0..8u64 {
+            let channel = midi_channel((index % 4) as u8);
+            let note = Note::new(48 + (index as u8 * 5) % 36);
+            let on = Event::NoteOn { note, velocity: U0F16::MAX };
+            let off = Event::NoteOff { note, velocity: U0F16::ZERO };
+            producer.send(TimedEvent::on_channel(Frame(index * step_frames + 7), channel, on)).expect("room in the ring");
+            producer.send(TimedEvent::on_channel(Frame(index * step_frames + step_frames / 2), channel, Event::PitchBend(starplayer::core::I1F15::from_bits(9_000)))).expect("room");
+            producer.send(TimedEvent::on_channel(Frame((index + 1) * step_frames - 3), channel, off)).expect("room in the ring");
+        }
+
+        let mut block = vec![0i16; host_block_frames * 2];
+        let blocks = FRAMES_PER_MODULE.div_ceil(host_block_frames);
+        let (_, report) = while_watching_for_allocations(|| {
+            for _ in 0..blocks {
+                engine.render(&mut block);
+            }
+        });
+        assert!(report.is_clean(), "render() allocated with a MIDI source at block size {host_block_frames}: {report:?}");
+        assert!(engine.voices().voices_active() > 0 || engine.frame() > Frame(0), "the source drove the engine");
+        control.collect_all_garbage();
+    }
+}

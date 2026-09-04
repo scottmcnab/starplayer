@@ -278,6 +278,41 @@ pub const fn linear_frequency_q24(units: u32) -> u32 {
     LINEAR_FREQUENCY_TABLE[index] >> shift
 }
 
+/// 1/768ths of an octave per semitone: the resolution of [`LINEAR_FREQUENCY_TABLE`], and
+/// IT's own linear-slide unit of 1/64 of a semitone.
+pub const LINEAR_UNITS_PER_SEMITONE: i32 = LINEAR_FREQUENCY_TABLE_LEN as i32 / 12;
+
+/// `base_hz · 2^(units / 768)`, rounded to the nearest whole hertz.
+///
+/// One unit is 1/64 of a semitone. This is the whole of the linear pitch path: IT's
+/// note-to-frequency and its linear slides (`starplayer-it`), and the MIDI instrument
+/// rack's note, transpose and pitch-bend arithmetic (`starplayer_engine::instrument`),
+/// are all this function at different `units`. It lives here rather than in either crate
+/// because a second copy of it would be a second set of rounding boundaries.
+///
+/// `units == 0` returns `base_hz` **exactly** — `LINEAR_FREQUENCY_TABLE[0]` is `1 << 24`
+/// and the rounding shift undoes it — which is what makes "MIDI note 60 plays the sample
+/// at its reference rate" and "a bend of zero changes nothing" true by construction
+/// rather than to within a hertz.
+///
+/// Table only, no transcendental function and no float, so the answer is bit-identical on
+/// x86, ARM and WASM (design goal 5). A zero `base_hz` stays zero; the octave shift
+/// saturates rather than wrapping, so no `units` can panic or overflow.
+pub fn scale_frequency(base_hz: u32, units: i32) -> u32 {
+    if base_hz == 0 {
+        return 0;
+    }
+    let octave = units.div_euclid(LINEAR_FREQUENCY_TABLE_LEN as i32);
+    let index = units.rem_euclid(LINEAR_FREQUENCY_TABLE_LEN as i32) as usize;
+    let value = base_hz as u64 * LINEAR_FREQUENCY_TABLE[index] as u64;
+    let value = if octave >= 0 {
+        value.saturating_mul(1u64 << (octave.min(40) as u32))
+    } else {
+        value >> ((-octave).min(63) as u32)
+    };
+    ((value + (1 << 23)) >> 24).min(u32::MAX as u64) as u32
+}
+
 /// Entries in each IT linear-slide table below.
 const LINEAR_SLIDE_TABLE_LEN: usize = 256;
 
