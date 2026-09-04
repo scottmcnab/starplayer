@@ -12,7 +12,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 starplayer = { workspace = true, features = ["std", "telemetry"] }
-# The backend-neutral half of a host: the seek mailbox and the output-depth post-stage
-# both live there now, and both used to be copies of each other (task D4).
+# The backend-neutral half of a host. This crate implements `AudioBackend` over the
+# browser's audio graph and drives `Player` through it, so the engine arms, the transport,
+# the song fade, the seek mailbox and the output-depth post-stage all live there (task D9).
 starplayer-host = { workspace = true }
 wasm-bindgen = { workspace = true }
