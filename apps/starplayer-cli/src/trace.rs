@@ -14,7 +14,8 @@ pub struct TraceArgs {
     /// Module file, or a ZIP archive containing one.
     pub file: PathBuf,
     /// Stop after this many ticks. Runs to the module's end marker by default, capped at
-    /// `starplayer_offline::MAX_CAPTURE_TICKS`.
+    /// `starplayer_offline::MAX_CAPTURE_TICKS` — which is where an XM or IT whose order
+    /// list wraps, like any module that jumps backwards, ends up.
     #[arg(long)]
     pub ticks: Option<usize>,
     /// Which recognised entry of a ZIP archive to trace.
