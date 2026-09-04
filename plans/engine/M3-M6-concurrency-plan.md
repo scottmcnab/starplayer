@@ -19,9 +19,10 @@ complete); D3, D4, D5, D6, D7, D8 (M3 complete pending the owner's listening and
 checks); F1, F2, F5 (XM: 87 of 93 conformance cases pass, 4 sharpened known failures); G1,
 G2, G3, G6 (IT: 55 of 121 pass, 66 regrouped as `G6-IT-*` with the evidence that would
 settle them). Whole corpus: 175 of 261 pass, 0 fail, 15 accepted deviations.
-Outstanding, filed and queued for GPT-5.6-sol one at a time: [F6](M5-task-F6-order-list-wrap.md)
-(the trace path's order-list wrap, which unblocks two XM cases) and
-[D9](complete/M3-task-D9-wasm-host-retrofit.md) (the wasm host behind `AudioBackend`). Then the
+D9 (the wasm host behind `AudioBackend`) landed the same day, so both hosts share one
+lifecycle and the headless web harness passes again. Outstanding, filed and parked until
+the owner says go: [F6](M5-task-F6-order-list-wrap.md) (the trace path's order-list wrap,
+which unblocks two XM cases). Then the
 owner's acceptance of M3, M5 and M6, and the owner's call on `TempoModel::ItModern`
 (accuracy policy §2).
 
