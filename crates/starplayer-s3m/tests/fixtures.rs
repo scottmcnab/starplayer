@@ -293,7 +293,7 @@ fn assert_module_is_sound(module: &starplayer_model::Module, what: &str) {
         let id = SampleId(index as u16);
         let sample = module.sample(id).unwrap_or_else(|| panic!("{what}: sample {index} exists"));
         let pcm = module.sample_pcm(id).unwrap_or_else(|| panic!("{what}: sample {index} has frames"));
-        assert_eq!(pcm.len(), sample.stored_frames(), "{what}: sample {index} frame count");
+        assert_eq!(pcm.len(), sample.readable_frames(), "{what}: sample {index} frame count");
     }
 }
 

@@ -53,7 +53,7 @@
 use starplayer_dsp::Interpolate;
 
 use crate::path::{MixPath, Stereo};
-use crate::sample::{LoopMode, LoopSpan, SampleData};
+use crate::sample::{LoopMode, LoopSpan, PRE_ROLL_FRAMES, SampleData};
 use crate::voice::Voice;
 
 /// Whether a voice survived a render segment.
@@ -100,6 +100,12 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     };
 
     let step = voice.params.step.to_bits();
+    // How many frames before the interpolation point this kernel reads. It is zero for
+    // `Nearest` and `Linear`, which is why everything below is the code those two have
+    // always executed; for the wide kernels it defers a forward loop's wrap by that many
+    // frames, so the frames *behind* the interpolation point are always real ones the
+    // voice has just played. See `starplayer_core::PRE_ROLL_FRAMES`.
+    let leading = Interp::LEADING_FRAMES as u32;
     let mut reverse = voice.is_reversed();
     let mut remaining: &mut [Path::Accumulator] = destination;
 
@@ -107,7 +113,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     // the loop, and a previous segment may have left the voice at the very end of a
     // one-shot.
     let mut position = voice.position();
-    let mut ended = match cross_boundary(voice, pcm, &mut sample, position as i128, &mut reverse) {
+    let mut ended = match cross_boundary(voice, pcm, &mut sample, position as i128, &mut reverse, leading) {
         Some(normalised) => {
             position = normalised;
             false
@@ -120,7 +126,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
 
     while !ended && !finished_ramp && !remaining.is_empty() {
         // ── how long the next run is ────────────────────────────────────────────────
-        let limit = run_limit(sample, reverse);
+        let limit = run_limit(sample, reverse, leading);
         let ramp_frames = voice.gain_ramp_frames_remaining();
         let run = frames_before_limit(position, step, limit, reverse)
             .min(if ramp_frames == 0 { u64::MAX } else { ramp_frames as u64 })
@@ -130,7 +136,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
         remaining = rest;
 
         // ── the run itself ──────────────────────────────────────────────────────────
-        let frames = sample.frames();
+        let frames = sample.stored();
         let (gains, filter) = voice.run_state_mut();
         let path_filter = Path::path_filter(filter);
         let coefficients = path_filter.coefficients;
@@ -154,7 +160,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
         // that the position written back to the voice is always a real one.
         let travelled = run as i128 * step as i128;
         let advanced = if reverse { position as i128 - travelled } else { position as i128 + travelled };
-        match cross_boundary(voice, pcm, &mut sample, advanced, &mut reverse) {
+        match cross_boundary(voice, pcm, &mut sample, advanced, &mut reverse, leading) {
             Some(normalised) => position = normalised,
             None => {
                 position = clamp_position(advanced);
@@ -181,12 +187,13 @@ fn cross_boundary<'pcm>(
     sample: &mut SampleData<'pcm>,
     position: i128,
     reverse: &mut bool,
+    leading: u32,
 ) -> Option<u64> {
     if let Some(rebased) = take_queued_region(voice, pcm, sample, position) {
         *reverse = false;
         return rebased;
     }
-    normalise_position(position, reverse, *sample)
+    normalise_position(position, reverse, *sample, leading)
 }
 
 /// Apply a queued region if `position` has reached the boundary that releases it.
@@ -237,13 +244,18 @@ fn take_queued_region<'pcm>(voice: &mut Voice, pcm: &'pcm [i16], sample: &mut Sa
 /// the voice. Nothing here mutates anything: this is a pure read.
 pub fn folded_frame(sample: SampleData<'_>, position: i128, reverse: bool) -> Option<i16> {
     let mut reverse = reverse;
-    let normalised = normalise_position(position, &mut reverse, sample)?;
+    // No leading frames: the tap reads *one* frame rather than resampling, so it has no
+    // taps to keep behind it and wants the wrap where the sample says it is. A wide
+    // kernel's deferred wrap moves the fold by at most `LEADING_FRAMES` frames, and the
+    // guard frames it reads there are a copy of the loop, so the tap sees the same value
+    // either way.
+    let normalised = normalise_position(position, &mut reverse, sample, 0)?;
     sample.frames().get((normalised >> 32) as usize).copied()
 }
 
 /// Bring a position back inside the sample, and say which way a ping-pong loop is now
 /// travelling. `None` means a one-shot has run out and the voice is over.
-fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>) -> Option<u64> {
+fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>, leading: u32) -> Option<u64> {
     match sample.loop_span() {
         None => {
             if position >= frames_to_bits(sample.length_frames()) as i128 {
@@ -253,7 +265,7 @@ fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>
             }
         }
         Some(span) if span.mode() == LoopMode::Forward => {
-            if position >= frames_to_bits(span.end()) as i128 {
+            if position >= forward_wrap_bits(span, leading) as i128 {
                 Some(wrap_forward(position, span))
             } else {
                 Some(clamp_position(position))
@@ -278,10 +290,10 @@ fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>
 
 /// The position a run must stop at: the first position out of range going forwards, the
 /// last one still in range going backwards.
-fn run_limit(sample: SampleData<'_>, reverse: bool) -> u64 {
+fn run_limit(sample: SampleData<'_>, reverse: bool, leading: u32) -> u64 {
     match sample.loop_span() {
         None => frames_to_bits(sample.length_frames()),
-        Some(span) if span.mode() == LoopMode::Forward => frames_to_bits(span.end()),
+        Some(span) if span.mode() == LoopMode::Forward => forward_wrap_bits(span, leading),
         Some(span) => {
             if reverse {
                 frames_to_bits(span.start())
@@ -320,7 +332,10 @@ fn mix_run<Path: MixPath, Interp: Interpolate, const FILTERED: bool, const RAMPI
         } else {
             steady
         };
-        let value = Path::interpolate::<Interp>(frames, (position >> 32) as usize, position as u32);
+        // `frames` is the stored run, so frame 0 sits at index `PRE_ROLL_FRAMES` and a
+        // kernel reading `index - LEADING_FRAMES` stays inside the slice. The addition is
+        // loop-invariant and folds into the addressing mode.
+        let value = Path::interpolate::<Interp>(frames, ((position >> 32) as usize).wrapping_add(PRE_ROLL_FRAMES), position as u32);
         // Between the resampler and the pan gains, which is where IT puts it: OpenMPT's
         // `SampleLoop` runs `interpolate(); filter(); mix();` in that order.
         let value = if FILTERED { Path::filter(value, filter_state, coefficients) } else { value };
@@ -366,6 +381,24 @@ const fn frames_before_limit(position: u64, step: u64, limit: u64, reverse: bool
     } else {
         ((limit - position) as u128).div_ceil(step as u128) as u64
     }
+}
+
+/// The position at which a forward loop wraps, which is `loop_end` **plus the kernel's
+/// leading frames**.
+///
+/// Deferring the wrap is how a symmetric kernel gets the frames it needs *behind* the
+/// interpolation point without a second copy of them anywhere: the trailing guard already
+/// holds the loop's continuation, so a position `t < LEADING_FRAMES` frames past
+/// `loop_end` reads exactly the frames position `loop_start + t` would have, while the
+/// taps behind it are the real frames just before `loop_end`. The output is therefore the
+/// same sequence an unrolled loop produces, frame for frame, and the wrap lands
+/// `LEADING_FRAMES` frames further round the loop than it used to — `loop_start + t`
+/// rather than `loop_start`.
+///
+/// `Nearest` and `Linear` have no leading frames, so this is `loop_end` for them and the
+/// canonical goldens do not move.
+fn forward_wrap_bits(span: LoopSpan, leading: u32) -> u64 {
+    frames_to_bits(span.end()).saturating_add(frames_to_bits(leading))
 }
 
 /// Bring a position that has run past `loop_end` back into a forward loop.

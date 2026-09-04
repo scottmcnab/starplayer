@@ -1,7 +1,7 @@
 //! [`Module`] itself: two owned blobs, four index tables and a header, and nothing else.
 
 use alloc::boxed::Box;
-use starplayer_core::{Error, InstrumentId, SampleId};
+use starplayer_core::{Error, InstrumentId, PRE_ROLL_FRAMES, SampleId};
 
 use crate::header::ModuleHeader;
 use crate::instrument::InstrumentDef;
@@ -85,7 +85,8 @@ impl Module {
     /// these; see [`PatternIndex`].
     pub const fn blob(&self) -> &[u8] { &self.blob }
 
-    /// Every sample's frames, concatenated, each followed by its
+    /// Every sample's frames, concatenated, each preceded by its
+    /// [`PRE_ROLL_FRAMES`](starplayer_core::PRE_ROLL_FRAMES) and followed by its
     /// [`GUARD_FRAMES`](starplayer_core::GUARD_FRAMES).
     ///
     /// This is the slice the mixer resolves a `SampleRegion` against.
@@ -105,7 +106,7 @@ impl Module {
     pub fn sample_pcm(&self, id: SampleId) -> Option<&[i16]> {
         let sample = self.sample(id)?;
         let start = sample.pcm_offset() as usize;
-        let end = start.checked_add(sample.stored_frames())?;
+        let end = start.checked_add(sample.readable_frames())?;
         self.pcm.get(start..end)
     }
 
@@ -158,7 +159,8 @@ impl Module {
     /// 1. the header names at least one channel, and its pan table and its
     ///    `default_channel_volume` table are each either empty or exactly
     ///    `channel_count` long;
-    /// 2. every sample's frames *and* its guard frames fit inside `pcm`;
+    /// 2. every sample's frames, its pre-roll frames *and* its guard frames fit inside
+    ///    `pcm`;
     /// 3. a looping sample has `loop_start < loop_end <= length_frames`; with no sustain
     ///    loop, a forward or ping-pong sample's `length_frames` equals its `loop_end` — the
     ///    guard-frame layout; a sustain loop has `start < end <= length_frames`, a looping
@@ -211,7 +213,10 @@ impl Module {
 }
 
 fn validate_sample(sample: &SampleIndex, pcm_length: usize) -> Result<(), Error> {
-    let start = sample.pcm_offset() as usize;
+    // The stored run starts at the pre-roll, `PRE_ROLL_FRAMES` before frame 0, so a
+    // sample whose offset is inside the first pre-roll's worth of the blob cannot be
+    // addressed at all — the leading taps of its very first frame would fall outside it.
+    let start = (sample.pcm_offset() as usize).checked_sub(PRE_ROLL_FRAMES).ok_or(Error::OutOfRange)?;
     let end = start.checked_add(sample.stored_frames()).ok_or(Error::OutOfRange)?;
     if end > pcm_length {
         return Err(Error::OutOfRange);

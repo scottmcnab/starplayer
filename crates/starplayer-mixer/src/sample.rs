@@ -1,5 +1,5 @@
-//! Sample data as the mixer sees it: [`GUARD_FRAMES`], [`LoopSpan`], [`SampleRegion`]
-//! (offsets) and [`SampleData`] (the resolved borrow).
+//! Sample data as the mixer sees it: [`GUARD_FRAMES`], [`PRE_ROLL_FRAMES`], [`LoopSpan`],
+//! [`SampleRegion`] (offsets) and [`SampleData`] (the resolved borrow).
 //!
 //! # Offsets in the voice, a borrow in the kernel
 //!
@@ -25,10 +25,26 @@ use alloc::vec::Vec;
 /// contain.
 pub use starplayer_core::GUARD_FRAMES;
 
+/// The pre-roll count, defined in `starplayer-core` for the same reason
+/// [`GUARD_FRAMES`] is. See [`starplayer_core::PRE_ROLL_FRAMES`] for what the frames
+/// contain and why a loop's leading frames do not come from them.
+pub use starplayer_core::PRE_ROLL_FRAMES;
+
 /// Enforced at compile time rather than in a test, so that adding a kernel which needs
-/// more guard frames than the samples carry cannot build at all.
+/// more guard or pre-roll frames than the samples carry cannot build at all.
 const _: () = assert!(GUARD_FRAMES >= <starplayer_dsp::Linear as starplayer_dsp::Interpolate>::GUARD_FRAMES_REQUIRED);
-const _: () = assert!(GUARD_FRAMES >= 4, "an 8-tap windowed sinc reads index + 4 (M7)");
+const _: () = assert!(GUARD_FRAMES >= <starplayer_dsp::Cubic as starplayer_dsp::Interpolate>::GUARD_FRAMES_REQUIRED);
+const _: () = assert!(GUARD_FRAMES >= <starplayer_dsp::Sinc as starplayer_dsp::Interpolate>::GUARD_FRAMES_REQUIRED);
+const _: () = assert!(PRE_ROLL_FRAMES >= <starplayer_dsp::Cubic as starplayer_dsp::Interpolate>::LEADING_FRAMES);
+const _: () = assert!(PRE_ROLL_FRAMES >= <starplayer_dsp::Sinc as starplayer_dsp::Interpolate>::LEADING_FRAMES);
+// A forward loop's wrap is deferred by `LEADING_FRAMES` (see `kernel::forward_wrap_bits`),
+// so the furthest a run reads past `loop_end` is `LEADING_FRAMES - 1 + GUARD_FRAMES_REQUIRED`
+// and the guard has to cover it.
+const _: () = assert!(
+    <starplayer_dsp::Sinc as starplayer_dsp::Interpolate>::LEADING_FRAMES
+        + <starplayer_dsp::Sinc as starplayer_dsp::Interpolate>::GUARD_FRAMES_REQUIRED
+        <= GUARD_FRAMES
+);
 
 /// How a loop repeats.
 ///
@@ -164,16 +180,24 @@ impl SampleRegion {
     /// The forward loop, if the sample has one.
     pub const fn loop_span(self) -> Option<LoopSpan> { self.loop_span }
 
-    /// Frames this region occupies in the blob, guard frames included.
-    pub const fn stored_frames(self) -> usize { self.length_frames as usize + GUARD_FRAMES }
+    /// Frames this region occupies in the blob: its [`PRE_ROLL_FRAMES`], its addressable
+    /// frames and its [`GUARD_FRAMES`]. The run starts `PRE_ROLL_FRAMES` *before*
+    /// [`SampleRegion::pcm_offset`].
+    pub const fn stored_frames(self) -> usize { self.length_frames as usize + PRE_ROLL_FRAMES + GUARD_FRAMES }
+
+    /// Frames readable from frame 0 onwards: the addressable frames and the guard frames.
+    pub const fn readable_frames(self) -> usize { self.length_frames as usize + GUARD_FRAMES }
 }
 
 /// A [`SampleRegion`] resolved against a PCM blob.
 ///
 /// [`SampleData::frames`] includes the guard frames, so an interpolator may read up to
-/// [`GUARD_FRAMES`] past `length_frames` without a bounds failure.
+/// [`GUARD_FRAMES`] past `length_frames` without a bounds failure, and
+/// [`SampleData::stored`] adds the [`PRE_ROLL_FRAMES`] in front of frame 0, which is what
+/// a kernel with leading taps resamples through.
 #[derive(Copy, Clone, Debug)]
 pub struct SampleData<'pcm> {
+    stored: &'pcm [i16],
     frames: &'pcm [i16],
     length_frames: u32,
     loop_span: Option<LoopSpan>,
@@ -182,17 +206,30 @@ pub struct SampleData<'pcm> {
 impl<'pcm> SampleData<'pcm> {
     /// Resolve `region` against `blob`, or `None` if the region does not fit.
     ///
+    /// A region whose `pcm_offset` leaves no room for its [`PRE_ROLL_FRAMES`] does not
+    /// fit either: a kernel with leading taps would read outside its own sample. That is
+    /// the whole check — a blob built by `starplayer_model::ModuleBuilder::add_sample`
+    /// always satisfies it, and a region that does not came from a corrupt module.
+    ///
     /// A `None` here means a corrupt or mismatched module; the mixer treats it as a voice
     /// that has finished rather than as an error, because `render()` may not panic.
     pub fn resolve(blob: &'pcm [i16], region: SampleRegion) -> Option<SampleData<'pcm>> {
-        let start = region.pcm_offset() as usize;
+        let frame_zero = region.pcm_offset() as usize;
+        let start = frame_zero.checked_sub(PRE_ROLL_FRAMES)?;
         let end = start.checked_add(region.stored_frames())?;
-        let frames = blob.get(start..end)?;
-        Some(SampleData { frames, length_frames: region.length_frames(), loop_span: region.loop_span() })
+        let stored = blob.get(start..end)?;
+        let frames = blob.get(frame_zero..end)?;
+        Some(SampleData { stored, frames, length_frames: region.length_frames(), loop_span: region.loop_span() })
     }
 
-    /// The sample's frames, guard frames included. Indices are sample-relative.
+    /// The sample's frames, guard frames included. Indices are sample-relative: index 0
+    /// is frame 0.
     pub const fn frames(&self) -> &'pcm [i16] { self.frames }
+
+    /// The whole stored run, pre-roll included. Index `PRE_ROLL_FRAMES` is frame 0, so a
+    /// kernel reading `index - LEADING_FRAMES` stays inside the slice for every
+    /// addressable frame. This is what the render kernel resamples through.
+    pub const fn stored(&self) -> &'pcm [i16] { self.stored }
 
     /// Addressable frames, excluding the guard frames.
     pub const fn length_frames(&self) -> u32 { self.length_frames }
@@ -201,8 +238,8 @@ impl<'pcm> SampleData<'pcm> {
     pub const fn loop_span(&self) -> Option<LoopSpan> { self.loop_span }
 }
 
-/// Append `pcm` to a module PCM blob with its [`GUARD_FRAMES`] filled in, and return the
-/// [`SampleRegion`] that addresses it.
+/// Append `pcm` to a module PCM blob with its [`PRE_ROLL_FRAMES`] and [`GUARD_FRAMES`]
+/// filled in, and return the [`SampleRegion`] that addresses it.
 ///
 /// This is the function a loader calls once per sample in **M1-task-B1** while it builds
 /// the module's single `pcm` blob; it is here rather than in `starplayer-model` because
@@ -222,9 +259,16 @@ impl<'pcm> SampleData<'pcm> {
 /// * **One-shot** — the whole sample is stored and the guard frames are silence, so a
 ///   kernel interpolating over the final frame decays to zero instead of clicking.
 ///
+/// The [`PRE_ROLL_FRAMES`] written in front of frame 0 are silence for every mode: a note
+/// starts from nothing, and a wide kernel's leading taps at the attack should say so. The
+/// returned region's `pcm_offset` points at frame 0, not at the pre-roll.
+///
 /// A `loop_span` that does not fit inside `pcm` is ignored and the sample is stored as a
 /// one-shot; a loader that cares should validate before calling.
 pub fn append_guarded_sample(blob: &mut Vec<i16>, pcm: &[i16], loop_span: Option<LoopSpan>) -> SampleRegion {
+    for _ in 0..PRE_ROLL_FRAMES {
+        blob.push(0);
+    }
     let pcm_offset = blob.len().min(u32::MAX as usize) as u32;
     let usable_loop = loop_span.filter(|span| span.end() as usize <= pcm.len());
 
@@ -262,10 +306,10 @@ mod tests {
         let mut blob = Vec::new();
         let region = append_guarded_sample(&mut blob, &[10, 20, 30], None);
 
-        assert_eq!(region.pcm_offset(), 0);
+        assert_eq!(region.pcm_offset(), PRE_ROLL_FRAMES as u32, "the offset names frame 0, and the pre-roll sits before it");
         assert_eq!(region.length_frames(), 3);
         assert_eq!(region.loop_span(), None);
-        assert_eq!(blob, vec![10, 20, 30, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(blob, vec![/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 10, 20, 30, /* guard: */ 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -277,7 +321,7 @@ mod tests {
 
         assert_eq!(region.length_frames(), 8, "the tail after loop_end is never audible and is discarded");
         assert_eq!(region.loop_span(), Some(span));
-        assert_eq!(blob, vec![0, 1, 2, 3, 4, 5, 6, 7, /* guard: */ 4, 5, 6, 7, 4, 5, 6, 7]);
+        assert_eq!(blob, vec![/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, /* guard: */ 4, 5, 6, 7, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -285,7 +329,7 @@ mod tests {
         let mut blob = Vec::new();
         let span = LoopSpan::new(1, 3).expect("a valid loop span");
         append_guarded_sample(&mut blob, &[7, 8, 9], Some(span));
-        assert_eq!(blob, vec![7, 8, 9, /* guard: */ 8, 9, 8, 9, 8, 9, 8, 9]);
+        assert_eq!(blob, vec![/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 7, 8, 9, /* guard: */ 8, 9, 8, 9, 8, 9, 8, 9]);
     }
 
     #[test]
@@ -296,7 +340,7 @@ mod tests {
         let region = append_guarded_sample(&mut blob, &pcm, Some(span));
 
         assert_eq!(region.loop_span().map(LoopSpan::mode), Some(LoopMode::PingPong));
-        assert_eq!(blob, vec![0, 1, 2, 3, 4, 5, 6, 7, /* guard: */ 6, 5, 4, 5, 6, 7, 6, 5]);
+        assert_eq!(blob, vec![/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, /* guard: */ 6, 5, 4, 5, 6, 7, 6, 5]);
     }
 
     #[test]
@@ -304,7 +348,7 @@ mod tests {
         let mut blob = Vec::new();
         let span = LoopSpan::ping_pong(1, 3).expect("a valid loop span");
         append_guarded_sample(&mut blob, &[7, 8, 9], Some(span));
-        assert_eq!(blob, vec![7, 8, 9, /* guard: */ 8, 9, 8, 9, 8, 9, 8, 9]);
+        assert_eq!(blob, vec![/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 7, 8, 9, /* guard: */ 8, 9, 8, 9, 8, 9, 8, 9]);
     }
 
     #[test]
@@ -336,9 +380,9 @@ mod tests {
         let mut blob = Vec::new();
         let first = append_guarded_sample(&mut blob, &[1, 2], None);
         let second = append_guarded_sample(&mut blob, &[3], None);
-        assert_eq!(first.pcm_offset(), 0);
-        assert_eq!(second.pcm_offset(), 2 + GUARD_FRAMES as u32);
-        assert_eq!(blob.len(), second.pcm_offset() as usize + second.stored_frames());
+        assert_eq!(first.pcm_offset(), PRE_ROLL_FRAMES as u32);
+        assert_eq!(second.pcm_offset(), (PRE_ROLL_FRAMES + 2 + GUARD_FRAMES + PRE_ROLL_FRAMES) as u32);
+        assert_eq!(blob.len(), second.pcm_offset() as usize + second.readable_frames());
     }
 
     #[test]
@@ -346,6 +390,11 @@ mod tests {
         let blob = [0i16; 4];
         assert!(SampleData::resolve(&blob, SampleRegion::one_shot(0, 4)).is_none(), "no room for the guard frames");
         assert!(SampleData::resolve(&blob, SampleRegion::one_shot(9, 0)).is_none());
+
+        // Frame 0 within the first `PRE_ROLL_FRAMES` of the blob leaves no pre-roll.
+        let blob = [0i16; 64];
+        assert!(SampleData::resolve(&blob, SampleRegion::one_shot(PRE_ROLL_FRAMES as u32 - 1, 4)).is_none(), "no room for the pre-roll");
+        assert!(SampleData::resolve(&blob, SampleRegion::one_shot(PRE_ROLL_FRAMES as u32, 4)).is_some());
     }
 
     #[test]
@@ -358,5 +407,8 @@ mod tests {
         assert_eq!(sample.length_frames(), 3);
         assert_eq!(sample.frames().first().copied(), Some(30));
         assert_eq!(sample.frames().len(), 3 + GUARD_FRAMES);
+        assert_eq!(sample.stored().len(), PRE_ROLL_FRAMES + 3 + GUARD_FRAMES);
+        assert_eq!(sample.stored().get(PRE_ROLL_FRAMES).copied(), Some(30), "index PRE_ROLL_FRAMES of the stored run is frame 0");
+        assert!(sample.stored().get(..PRE_ROLL_FRAMES).is_some_and(|pre_roll| pre_roll.iter().all(|frame| *frame == 0)), "the pre-roll is silence");
     }
 }

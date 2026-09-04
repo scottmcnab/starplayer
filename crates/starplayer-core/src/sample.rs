@@ -28,8 +28,9 @@
 /// sample itself.
 ///
 /// The *leading* taps a symmetric kernel wants (`index - 3` for an 8-tap sinc) are a
-/// different problem with a different answer — a pre-roll before the sample start and
-/// before the loop start — and belong to M7 along with the kernels that need them.
+/// different problem with a different answer, and M7-task-H5 gave it one:
+/// [`PRE_ROLL_FRAMES`] before the sample start, plus a deferred loop wrap so that the
+/// frames a kernel wants *before* a loop start come out of the trailing guard instead.
 ///
 /// # What the guard frames contain
 ///
@@ -43,3 +44,31 @@
 ///   silence, so a kernel interpolating over the final frame decays to zero rather than
 ///   clicking.
 pub const GUARD_FRAMES: usize = 8;
+
+/// Frames written *before* every sample's first frame, so a symmetric interpolator can
+/// read `index - 1` (cubic Hermite) or `index - 3` (an 8-tap windowed sinc) at the very
+/// start of a sample without a branch and without leaving the module's PCM blob
+/// (architecture §7.1).
+///
+/// Every sample's stored run is therefore `pre-roll ‖ frames ‖ guard`, and a sample's
+/// `pcm_offset` keeps pointing at **frame 0** — the pre-roll sits at
+/// `pcm_offset - PRE_ROLL_FRAMES`, which is why every offset already written down, the
+/// scope tap and the loop folds are unchanged by its arrival.
+///
+/// # Why eight, and why it is silence
+///
+/// Eight matches [`GUARD_FRAMES`] so the two ends of a sample have one number between
+/// them, and it leaves the same room for a 16-tap kernel (which would want seven leading
+/// frames). The frames are **silence for every loop mode**: they are read at a note's
+/// attack, where a note starts from nothing, and filling them with anything else would
+/// put a pre-echo in front of every trigger.
+///
+/// # Where a loop's leading frames come from instead
+///
+/// A forward loop's wrap is *deferred* by the kernel's `LEADING_FRAMES` instead of being
+/// served from a second copy: the run is allowed to walk that far past `loop_end` into
+/// the guard — which already holds the loop's continuation — and only then wraps, so the
+/// frames before the interpolation point are always real, already-played frames. Nothing
+/// in the blob has to hold two different things at one address, and the linear kernel,
+/// whose `LEADING_FRAMES` is zero, wraps exactly where it always did.
+pub const PRE_ROLL_FRAMES: usize = 8;

@@ -175,9 +175,11 @@ impl SampleSpec {
 /// `length_frames` counts the **addressable** frames — the frames a playback position may
 /// legally land on. Immediately after them the blob holds
 /// [`GUARD_FRAMES`](starplayer_core::GUARD_FRAMES) more, which the interpolator may read
-/// but which are never a playback position. So the sample occupies
-/// `pcm_offset .. pcm_offset + length_frames + GUARD_FRAMES`, which is exactly what
-/// `starplayer_mixer::sample::SampleData::resolve` expects.
+/// but which are never a playback position, and immediately *before* them it holds
+/// [`PRE_ROLL_FRAMES`](starplayer_core::PRE_ROLL_FRAMES) of silence, which a symmetric
+/// kernel reads at the start of the sample. So the sample occupies
+/// `pcm_offset - PRE_ROLL_FRAMES .. pcm_offset + length_frames + GUARD_FRAMES`, which is
+/// exactly what `starplayer_mixer::sample::SampleData::resolve` expects.
 ///
 /// For a forward-looping sample the addressable length **is** `loop_end`: the frames
 /// after the loop end are never audible, so the builder discards them and fills the guard
@@ -257,8 +259,15 @@ impl SampleIndex {
     /// Addressable frames, excluding the guard frames.
     pub const fn length_frames(&self) -> u32 { self.length_frames }
 
-    /// Frames this sample occupies in the blob, guard frames included.
+    /// Frames this sample occupies in the blob: its pre-roll, its frames and its guard.
     pub const fn stored_frames(&self) -> usize {
+        self.length_frames as usize + starplayer_core::PRE_ROLL_FRAMES + starplayer_core::GUARD_FRAMES
+    }
+
+    /// Frames readable from frame 0 onwards: the addressable frames and the guard frames
+    /// after them, which is the slice [`Module::sample_pcm`](crate::Module::sample_pcm)
+    /// hands out.
+    pub const fn readable_frames(&self) -> usize {
         self.length_frames as usize + starplayer_core::GUARD_FRAMES
     }
 
