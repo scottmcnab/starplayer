@@ -787,9 +787,9 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_typed_engine_arms_build_and_render_a_quantum() {
+    fn all_sixteen_typed_engine_arms_build_and_render_a_quantum() {
         for path in [MixPathKind::Float, MixPathKind::Fixed] {
-            for interpolator in [Interpolator::None, Interpolator::Linear] {
+            for interpolator in [Interpolator::None, Interpolator::Linear, Interpolator::Cubic, Interpolator::Sinc] {
                 for channels in [1, 2] {
                     let mode = mode(path, interpolator, OutputDepth::F32, false, channels);
                     let mut host = Host::with_mode(48_000, mode).expect("the documented arm exists");

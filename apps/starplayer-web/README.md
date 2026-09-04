@@ -173,13 +173,13 @@ The engine's path, interpolator and output format are **type parameters**, so ch
 is a re-instantiation, not a field write — `Command::SetInterpolator` is still flagged as
 unsupported for exactly that reason. `starplayer-engine` therefore carries only
 `MixerMode`, a plain `no_std` description with a stable `u32` wire encoding, and
-`starplayer-host-wasm` owns an eight-arm enum over the engine instantiations the mode can
-select (2 paths × 2 interpolators × mono/stereo), built by a macro so each arm is one line.
+`starplayer-host-wasm` owns a sixteen-arm enum over the engine instantiations the mode can
+select (2 paths × 4 interpolators × mono/stereo), built by a macro so each arm is one line.
 
 Depth and dither are **not** engine arms. They are a post-quantisation stage in the host,
 applied to the rendered samples with the mixer's own `HostSample` conversions and `Dither`
 after the engine's output ring and before the planar copy the worklet reads. That gives
-all five depths on all eight arms without forty engine instantiations, and it keeps the
+all five depths on all sixteen arms without eighty engine instantiations, and it keeps the
 fixed path's native `i16` output bit-exact at `I16` depth — the golden path M2 will hash.
 
 A mode switch happens in the worklet's message handler, never in `process()`. It rebuilds

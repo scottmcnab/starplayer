@@ -17,7 +17,7 @@
 //! `0.0 == -0.0` and reject two identical NaNs, and byte identity is the actual claim.
 
 use starplayer_core::{ExactFixedPoint, FilterParams, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
-use starplayer_dsp::{Interpolate, Linear, Nearest};
+use starplayer_dsp::{Cubic, Interpolate, Linear, Nearest, Sinc};
 use starplayer_engine::demo::{
     DEMO_BREAK_ROW, DEMO_NOTE_CUT, DEMO_ORDER_JUMP, DEMO_PATTERN_DELAY, DEMO_SET_SPEED, DEMO_SET_TEMPO, DemoCell,
     DemoPatternData, DemoProcessor,
@@ -196,6 +196,21 @@ fn mono_output_is_byte_identical_at_every_host_block_size() {
     assert_block_size_independent::<FixedPath, Linear, MonoI16>("fixed / linear / mono i16");
 }
 
+/// The wide kernels (M7-task-H5) read behind the interpolation point and defer a forward
+/// loop's wrap by that many frames, both of which are properties of the voice rather than
+/// of the block — which is exactly what this has to prove.
+#[test]
+fn cubic_interpolation_is_byte_identical_at_every_host_block_size() {
+    assert_block_size_independent::<FloatPath, Cubic, StereoF32>("float / cubic / stereo f32");
+    assert_block_size_independent::<FixedPath, Cubic, StereoI16>("fixed / cubic / stereo i16");
+}
+
+#[test]
+fn sinc_interpolation_is_byte_identical_at_every_host_block_size() {
+    assert_block_size_independent::<FloatPath, Sinc, StereoF32>("float / sinc / stereo f32");
+    assert_block_size_independent::<FixedPath, Sinc, StereoI16>("fixed / sinc / stereo i16");
+}
+
 // ── the same invariant, with IT's per-voice resonant filter live (M6-G2) ────────────
 
 /// When the filter sweeps. Deliberately not a multiple of `RENDER_QUANTUM` and not equal
@@ -269,6 +284,8 @@ fn a_filtered_voice_is_byte_identical_at_every_host_block_size() {
     assert_filtered_block_size_independent::<FloatPath, Linear, StereoF32>("float / linear / stereo f32, filtered");
     assert_filtered_block_size_independent::<FixedPath, Linear, StereoI16>("fixed / linear / stereo i16, filtered");
     assert_filtered_block_size_independent::<FixedPath, Nearest, MonoI16>("fixed / nearest / mono i16, filtered");
+    assert_filtered_block_size_independent::<FixedPath, Cubic, StereoI16>("fixed / cubic / stereo i16, filtered");
+    assert_filtered_block_size_independent::<FixedPath, Sinc, StereoI16>("fixed / sinc / stereo i16, filtered");
 }
 
 /// The same scenario as [`render_at_block_size`], on an engine sized by `settings` rather

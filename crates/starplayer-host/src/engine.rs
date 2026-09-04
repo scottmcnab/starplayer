@@ -7,9 +7,9 @@
 //! [`MixerMode`] is a `match` performed once when the stream opens — never something
 //! `render()` branches on.
 //!
-//! Eight arms: two paths × two interpolators × mono and stereo. Depth and dither are not
-//! arms; they are the post-stage in [`crate::depth`], which is what gives every arm all
-//! five depths without forty instantiations.
+//! Sixteen arms: two paths × four interpolators × mono and stereo. Depth and dither are
+//! not arms; they are the post-stage in [`crate::depth`], which is what gives every arm
+//! all five depths without eighty instantiations.
 
 use std::boxed::Box;
 use std::string::{String, ToString};
@@ -17,7 +17,7 @@ use std::vec;
 use std::vec::Vec;
 
 use starplayer::core::{Interpolator, U0F16};
-use starplayer::dsp::{Interpolate, Linear, Nearest};
+use starplayer::dsp::{Cubic, Interpolate, Linear, Nearest, Sinc};
 use starplayer::engine::{
     ChannelTable, Engine, EngineHandle, EngineSettings, EngineWarnings, EventSource, MixPathKind, MixerMode, OutputDepth,
 };
@@ -119,6 +119,14 @@ define_arms! {
     FixedNearestStereo => (MixPathKind::Fixed, Interpolator::None, 2, FixedPath, Nearest, FixedOut<i16, 2>, fixed),
     FixedLinearMono => (MixPathKind::Fixed, Interpolator::Linear, 1, FixedPath, Linear, FixedOut<i16, 1>, fixed),
     FixedLinearStereo => (MixPathKind::Fixed, Interpolator::Linear, 2, FixedPath, Linear, FixedOut<i16, 2>, fixed),
+    FloatCubicMono => (MixPathKind::Float, Interpolator::Cubic, 1, FloatPath, Cubic, FloatOut<f32, 1>, float),
+    FloatCubicStereo => (MixPathKind::Float, Interpolator::Cubic, 2, FloatPath, Cubic, FloatOut<f32, 2>, float),
+    FixedCubicMono => (MixPathKind::Fixed, Interpolator::Cubic, 1, FixedPath, Cubic, FixedOut<i16, 1>, fixed),
+    FixedCubicStereo => (MixPathKind::Fixed, Interpolator::Cubic, 2, FixedPath, Cubic, FixedOut<i16, 2>, fixed),
+    FloatSincMono => (MixPathKind::Float, Interpolator::Sinc, 1, FloatPath, Sinc, FloatOut<f32, 1>, float),
+    FloatSincStereo => (MixPathKind::Float, Interpolator::Sinc, 2, FloatPath, Sinc, FloatOut<f32, 2>, float),
+    FixedSincMono => (MixPathKind::Fixed, Interpolator::Sinc, 1, FixedPath, Sinc, FixedOut<i16, 1>, fixed),
+    FixedSincStereo => (MixPathKind::Fixed, Interpolator::Sinc, 2, FixedPath, Sinc, FixedOut<i16, 2>, fixed),
 }
 
 /// The engine a native host renders through, plus the buffers and the dither state that
