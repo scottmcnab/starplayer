@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M4-full ([master plan](M4-master-plan.md)) |
-| Status | Implemented — awaiting review (not committed) |
+| Status | Landed 2026-09-04; owner keyboard check outstanding |
 | Depends on | E4 (`ExternalEventQueue`, `MidiSource`, `InstrumentRack`) |
 | Blocks | E7 |
 | Parallel with | E5 |
