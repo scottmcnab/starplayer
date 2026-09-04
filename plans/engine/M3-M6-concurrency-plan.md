@@ -20,9 +20,8 @@ checks); F1, F2, F5 (XM: 87 of 93 conformance cases pass, 4 sharpened known fail
 G2, G3, G6 (IT: 55 of 121 pass, 66 regrouped as `G6-IT-*` with the evidence that would
 settle them). Whole corpus: 175 of 261 pass, 0 fail, 15 accepted deviations.
 D9 (the wasm host behind `AudioBackend`) landed the same day, so both hosts share one
-lifecycle and the headless web harness passes again. Outstanding, filed and parked until
-the owner says go: [F6](M5-task-F6-order-list-wrap.md) (the trace path's order-list wrap,
-which unblocks two XM cases). Then the
+lifecycle and the headless web harness passes again. F6 (the trace path's order-list wrap) landed too, taking XM to 88 of 93 and the corpus to
+176 of 261 with 0 failures. Nothing is outstanding under `plans/engine/` but M2's deferred C8. Then the
 owner's acceptance of M3, M5 and M6, and the owner's call on `TempoModel::ItModern`
 (accuracy policy §2).
 

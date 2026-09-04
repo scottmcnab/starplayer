@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M5 ([master plan](M5-master-plan.md)) — a follow-up F5 surfaced |
-| Status | Implemented 2026-09-04 — awaiting review; the reviewer commits |
+| Status | Landed 2026-09-04 |
 | Depends on | F5 landed |
 | Blocks | The last two `F2-XM-009` cases (`openmpt-xm-patloop-break`, `openmpt-xm-patloop-weird`); possibly IT cases in G6 |
 | Recommended model | Claude Opus (touches `PatternSequencer::move_to_order`, shared by every format, and the scanned song length) |
