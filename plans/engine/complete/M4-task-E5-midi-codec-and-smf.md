@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M4-full ([master plan](M4-master-plan.md)) |
-| Status | Ready — not yet dispatched |
+| Status | Landed 2026-09-04 |
 | Depends on | E4 (`Event` consumers: `InstrumentRack`, `MidiSource`, the `EventFeed` trait) |
 | Blocks | E7 |
 | Parallel with | E6 |

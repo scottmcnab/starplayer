@@ -84,7 +84,7 @@ five format crates with their instrument and sample models (E1, F1, G1). The
 | Task | Deliverable | Depends on | Model |
 |---|---|---|---|
 | [E4](complete/M4-task-E4-instrument-and-midi-source.md) | **Landed 2026-09-04.** `Instrument` trait, `SampleInstrument`, `MappedInstrument`, `InstrumentRack`, the `EventFeed` trait, `ExternalEventQueue`, `MidiSource` (an `EventSource` over any event feed with the rack inside), the control tick, channel base, telemetry, an offline determinism test with scripted events | — | Opus |
-| [E5](M4-task-E5-midi-codec-and-smf.md) | `starplayer-midi`: the byte codec to and from `Event`, the SMF parser and tempo map, `SmfSequencer`; facade `midi`/`smf` arms; `.mid` in the CLI's `info`/`render`/`play` with `--instruments` | E4 | Sonnet |
+| [E5](complete/M4-task-E5-midi-codec-and-smf.md) | `starplayer-midi`: the byte codec to and from `Event`, the SMF parser and tempo map, `SmfSequencer`; facade `midi`/`smf` arms; `.mid` in the CLI's `info`/`render`/`play` with `--instruments` | E4 | Sonnet |
 | [E6](M4-task-E6-live-input.md) | `Player::send_event`; `midir` input on the cpal host and the CLI's `--midi`; Web MIDI and the tracker-style keyboard map in the web player through a new ring opcode | E4 | Opus |
 | [E7](M4-task-E7-jam-mode.md) | Jam mode: `Player::jam` installing a `SourceMux` of the module's sequencer and the `MidiSource`; the CLI and web player switches; the two-source block-size determinism test; docs; M4 exit | E4, E5, E6 | Sonnet |
 
