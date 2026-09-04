@@ -24,7 +24,17 @@ impl SmfSequencer {
     /// Convert `smf` to frames at `sample_rate_hz` and start a cursor at the beginning of
     /// the file.
     pub fn new(smf: &Smf, sample_rate_hz: u32) -> SmfSequencer {
-        SmfSequencer { events: smf.to_frames(sample_rate_hz), length_frames: smf.length_frames(sample_rate_hz), cursor: 0 }
+        SmfSequencer::new_at(smf, sample_rate_hz, Frame::ZERO)
+    }
+
+    /// Convert `smf` to frames and place its frame zero at `start_frame` on an already
+    /// running engine's monotonic source clock.
+    pub fn new_at(smf: &Smf, sample_rate_hz: u32, start_frame: Frame) -> SmfSequencer {
+        let mut events = smf.to_frames(sample_rate_hz);
+        for event in &mut events {
+            event.frame = start_frame.saturating_add(event.frame.get());
+        }
+        SmfSequencer { events, length_frames: smf.length_frames(sample_rate_hz), cursor: 0 }
     }
 
     /// The file's own length in output frames: the latest `end_of_track` tick across
@@ -120,6 +130,15 @@ mod tests {
 
         assert_eq!(sequencer.next_frame(), None);
         assert_eq!(sequencer.pop_due(Frame(1_000_000)), None);
+    }
+
+    #[test]
+    fn can_start_on_an_already_running_source_clock() {
+        let smf = parse_smf(&two_track_smf_bytes()).expect("the hand-assembled file parses");
+        let sequencer = SmfSequencer::new_at(&smf, 44_100, Frame(7_000));
+
+        assert_eq!(sequencer.next_frame(), Some(Frame(18_025)), "the first event is rebased by the source-clock start");
+        assert_eq!(sequencer.length_frames(), 44_100, "the reported file duration is not rebased");
     }
 
     #[test]

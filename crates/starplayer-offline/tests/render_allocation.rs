@@ -438,7 +438,7 @@ fn allocation_on_another_thread_is_not_a_violation() {
     assert!(report.largest < 1 << 20, "another thread's megabyte was attributed to this one: {report:?}");
 }
 
-/// Task E4's arm: the **musical** path under the same hook.
+/// Task E4's musical path and E7's two-source mux under the same hook.
 ///
 /// `MidiSource` brings two things the tracker path does not have — an `InstrumentRack`
 /// holding `Box<dyn Instrument>`s, and events arriving from another thread over an SPSC
@@ -447,16 +447,16 @@ fn allocation_on_another_thread_is_not_a_violation() {
 /// lookahead is a `Copy` field, so `render()` must stay clean with a live keyboard playing
 /// through it.
 #[test]
-fn rendering_a_midi_source_allocates_nothing() {
+fn rendering_a_tracker_and_midi_source_mux_allocates_nothing() {
     use starplayer::core::{Event, Frame, Note, TimedEvent, U0F16};
-    use starplayer::engine::{InstrumentRack, MidiSource, external_event_channel, midi_channel};
+    use starplayer::engine::{InstrumentRack, MidiSource, SourceMux, external_event_channel, midi_channel};
 
     let module = Arc::new(starplayer::it::load(&starplayer_offline::fixtures::synthetic_it()).expect("the synthesised IT loads"));
     let settings = EngineSettings {
         sample_rate_hz: SAMPLE_RATE_HZ,
         // The MIDI lanes sit above a module's, so the table has to be the full width.
         channel_count: starplayer::engine::ChannelTable::MAX_CHANNELS,
-        voice_capacity: starplayer::recommended_voice_capacity(&module).max(16),
+        voice_capacity: starplayer::recommended_voice_capacity(&module).saturating_add(16),
         ..EngineSettings::default()
     };
 
@@ -469,7 +469,12 @@ fn rendering_a_midi_source_allocates_nothing() {
         // the rack's boxed instruments, the event ring, and the source itself.
         let rack = InstrumentRack::for_module(&module, SAMPLE_RATE_HZ);
         let (mut producer, queue) = external_event_channel(256);
-        engine.set_source(Box::new(MidiSource::new(queue, rack, SAMPLE_RATE_HZ)));
+        let midi_source = MidiSource::new(queue, rack, SAMPLE_RATE_HZ);
+        let tracker_source = source_for(ModuleFormat::It, Arc::clone(&module)).expect("an IT sequencer");
+        let mut mux = SourceMux::new(2);
+        assert!(mux.insert(tracker_source).is_ok(), "slot 0 is free");
+        assert!(mux.insert(Box::new(midi_source)).is_ok(), "slot 1 is free");
+        engine.set_source(Box::new(mux));
 
         // A chord per eighth of the render, held and released — enough note-ons, note-offs
         // and controller writes that a per-event allocation could not hide.

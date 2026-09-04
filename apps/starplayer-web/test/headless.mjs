@@ -680,8 +680,8 @@ async function run(executable, mode) {
         //
         // A real key event through the DevTools protocol, so the focus rules, the
         // `KeyboardEvent.code` map and the ring opcode are all exercised the way a person
-        // exercises them. The module goes silent under a live-input source, so a moving
-        // peak meter here can only be the note.
+        // exercises them. Jam mode keeps the module playing while the MIDI channel appears
+        // beside it in the channel table.
         await page.evaluate("const keyboard = document.getElementById('keyboard-enable'); keyboard.checked = true; keyboard.dispatchEvent(new Event('change')); return true;");
         await page.waitFor('live input to install', "document.getElementById('live-input-status').textContent !== 'off'");
         const armed = await page.evaluate(READ_STATE);
@@ -690,7 +690,7 @@ async function run(executable, mode) {
             assert.match(armed.eventLead, /batched/, 'the fallback transport reports its extra animation-frame latency');
         }
         await delay(400);
-        assert.equal((await page.evaluate(READ_STATE)).masterPeak, 0, 'the module itself is silent under a live-input source');
+        assert.ok((await page.evaluate(READ_STATE)).masterPeak > 0, 'the module keeps playing in jam mode');
 
         // Typing in a field is typing, never playing.
         await page.evaluate("document.getElementById('url').focus(); return true;");
@@ -714,7 +714,7 @@ async function run(executable, mode) {
             notePeak = (await page.evaluate(READ_STATE)).masterPeak;
         }
         await page.send('Input.dispatchKeyEvent', { type: 'keyUp', code: 'KeyZ', key: 'z', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90 });
-        assert.ok(notePeak > 0, 'the keyboard sounded a note from the silent module\u2019s instruments');
+        assert.ok(notePeak > 0, 'the keyboard sounded a note beside the playing module');
         const played = await page.evaluate(READ_STATE);
         assert.match(played.midiEvents, /^[1-9]\d* sent$/, `events reached the ring: ${played.midiEvents}`);
         report.liveInput = `${played.liveInputStatus}; ${played.eventLead}; ${played.midiEvents}; peak ${notePeak}`;

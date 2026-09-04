@@ -45,7 +45,8 @@ pub struct ChannelTable {
     channels: Box<[Channel]>,
 }
 
-/// The widest voice pool any in-scope format asks for: IT's virtual-channel limit.
+/// The widest voice pool any in-scope source arrangement asks for: IT's virtual-channel
+/// limit, plus one foreground voice for each MIDI channel jammed over it.
 ///
 /// The companion to [`ChannelTable::MAX_CHANNELS`], and the number a **persistent host**
 /// uses — one that builds its engine before it has seen a module, and so cannot ask the
@@ -55,7 +56,7 @@ pub struct ChannelTable {
 ///
 /// A module-specific host — the offline renderer, a scan — sizes its pool from the
 /// processor instead, and gets a pool exactly as wide as that format can fill.
-pub const MAX_VOICE_CAPACITY: usize = 256;
+pub const MAX_VOICE_CAPACITY: usize = 256 + 16;
 
 impl ChannelTable {
     /// The widest tracker channel count in any format this engine targets. IT allows 64

@@ -1,5 +1,5 @@
-//! Live input (task E6) driven end to end through the [`ManualBackend`], with no device
-//! and no MIDI hardware.
+//! Live input and jam mode (tasks E6/E7) driven end to end through the
+//! [`ManualBackend`], with no device and no MIDI hardware.
 //!
 //! What this file is about is the *stamp* and the *queue*: that an event lands on
 //! `source_frame + lead`, that a lead shorter than the device's block is raised to cover
@@ -30,6 +30,20 @@ fn jamming(spec: AudioSpec) -> (ManualBackend, Player, ManualDriver) {
 }
 
 fn note_on(note: u8) -> Event { Event::NoteOn { note: Note::new(note), velocity: U0F16::MAX } }
+
+fn short_smf() -> Vec<u8> {
+    let track: &[u8] = &[0x00, 0x90, 60, 100, 0x60, 0x80, 60, 0, 0x00, 0xFF, 0x2F, 0x00];
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MThd");
+    bytes.extend_from_slice(&6u32.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&1u16.to_be_bytes());
+    bytes.extend_from_slice(&96u16.to_be_bytes());
+    bytes.extend_from_slice(b"MTrk");
+    bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(track);
+    bytes
+}
 
 fn peak(block: &[f32]) -> f32 { block.iter().fold(0.0f32, |loudest, sample| loudest.max(sample.abs())) }
 
@@ -174,4 +188,128 @@ fn a_rebuilt_engine_comes_back_jamming_with_a_new_queue() {
     player.send_event(0, note_on(60)).expect("note on");
     let sounding = driver.render_blocks(spec, RENDER_QUANTUM * 60, RENDER_QUANTUM);
     assert!(peak(&sounding) > 0.001, "and the new queue reaches the new engine (peak {})", peak(&sounding));
+}
+
+#[test]
+fn jam_mode_keeps_the_tracker_and_midi_lanes_sounding_together() {
+    let spec = AudioSpec { preferred_block_frames: Some(RENDER_QUANTUM as u32), ..AudioSpec::stereo(48_000) };
+    let (_backend, mut player, driver) = open(spec);
+    player.load(FIXTURE).expect("the fixture loads");
+    player.jam(true).expect("jam mode installs");
+    player.play().expect("play");
+    let tracker = driver.render_blocks(spec, RENDER_QUANTUM * 200, RENDER_QUANTUM);
+    assert!(peak(&tracker) > 0.001, "the tracker source is still sounding");
+
+    player.send_event(0, Event::Program(InstrumentId(0))).expect("program change");
+    player.send_event(0, note_on(60)).expect("note on");
+    let mut together_peak = 0.0f32;
+    let mut simultaneous = None;
+    for _ in 0..16 {
+        let block = driver.render_blocks(spec, RENDER_QUANTUM, RENDER_QUANTUM);
+        together_peak = together_peak.max(peak(&block));
+        let snapshot = *player.telemetry();
+        if snapshot.channels[48].active && snapshot.channels[..48].iter().any(|channel| channel.active) {
+            simultaneous = Some(snapshot);
+            break;
+        }
+    }
+    assert!(together_peak > 0.001, "the mux sounds with both sources active");
+    let snapshot = simultaneous.expect("one coherent snapshot shows tracker and MIDI voices together");
+    assert_eq!(snapshot.channel_count, 64, "the snapshot exposes module and MIDI lanes together");
+    assert!(snapshot.channels[..48].iter().any(|channel| channel.active), "a module lane is active");
+    assert!(snapshot.channels[48].active, "MIDI channel zero is active beside it");
+}
+
+#[test]
+fn seek_and_disabling_jam_preserve_the_song_position() {
+    let spec = AudioSpec { preferred_block_frames: Some(RENDER_QUANTUM as u32), ..AudioSpec::stereo(48_000) };
+    let (_backend, mut player, driver) = open(spec);
+    player.load(FIXTURE).expect("the fixture loads");
+    player.play().expect("play");
+    let mut output = vec![0.0f32; spec.samples_for(RENDER_QUANTUM * 16)];
+    driver.render(&mut output);
+    let before_jam = player.song_frame();
+    assert!(before_jam > 0, "the song advanced before jam mode: {before_jam}");
+
+    player.jam(true).expect("jam mode installs at the sounding position");
+    driver.render(&mut output);
+    let after_jam = player.song_frame();
+    assert!(after_jam >= before_jam, "enabling jam did not rewind: {before_jam} -> {after_jam}");
+
+    player.seek_frame(10_000).expect("the slot-0 seek mailbox remains reachable");
+    driver.render(&mut output);
+    let after_seek = player.song_frame();
+    assert!((10_000..20_000).contains(&after_seek), "the jammed tracker consumed the seek: {after_seek}");
+
+    player.jam(false).expect("jam mode disables at the sounding position");
+    driver.render(&mut output);
+    let after_disable = player.song_frame();
+    assert!(after_disable >= after_seek, "disabling jam did not rewind: {after_seek} -> {after_disable}");
+    assert!(!player.is_jamming());
+    assert_eq!(player.send_event(0, note_on(60)), Err(HostError::NoEventQueue));
+}
+
+#[test]
+fn a_module_swap_while_jamming_rebuilds_both_sources_and_the_queue() {
+    let spec = AudioSpec { preferred_block_frames: Some(RENDER_QUANTUM as u32), ..AudioSpec::stereo(48_000) };
+    let (_backend, mut player, driver) = open(spec);
+    player.load(FIXTURE).expect("the fixture loads");
+    player.jam(true).expect("jam mode installs");
+    let _old_sender = player.take_event_sender().expect("the first queue has a sender");
+    player.load(FIXTURE).expect("a module swap rebuilds the jam source");
+    assert!(player.is_jamming());
+    player.send_event(0, note_on(60)).expect("the replacement module has a fresh event queue");
+    player.play().expect("play");
+    assert!(peak(&driver.render_blocks(spec, RENDER_QUANTUM * 200, RENDER_QUANTUM)) > 0.001);
+}
+
+#[test]
+fn a_mixer_rebuild_keeps_jam_position_and_installs_one_fresh_queue() {
+    let spec = AudioSpec { preferred_block_frames: Some(RENDER_QUANTUM as u32), ..AudioSpec::stereo(48_000) };
+    let mut backend = ManualBackend::new();
+    let mut player = Player::open(&mut backend, None, spec, MixerMode::DEFAULT).expect("open");
+    player.load(FIXTURE).expect("load");
+    player.jam(true).expect("jam");
+    player.play().expect("play");
+    let old_driver = backend.driver().expect("driver");
+    let _ = old_driver.render_blocks(spec, 48_000, RENDER_QUANTUM);
+    let before = player.song_frame();
+    let _old_sender = player.take_event_sender().expect("old queue");
+
+    let mode = MixerMode { interpolator: starplayer::core::Interpolator::None, ..MixerMode::DEFAULT };
+    player.set_mixer_mode(&mut backend, None, mode).expect("rebuild");
+    assert!(player.is_jamming());
+    let driver = backend.driver().expect("new driver");
+    let _ = driver.render_blocks(spec, RENDER_QUANTUM * 8, RENDER_QUANTUM);
+    assert!(player.song_frame() >= before, "the requested rebuild position survived");
+    player.send_event(0, note_on(60)).expect("the rebuilt mux has one fresh queue");
+}
+
+#[test]
+fn an_smf_plays_through_a_modules_instruments_on_the_manual_host() {
+    let spec = AudioSpec { preferred_block_frames: Some(RENDER_QUANTUM as u32), ..AudioSpec::stereo(48_000) };
+    let (_backend, mut player, driver) = open(spec);
+    let instruments = starplayer::rt::Arc::new(starplayer::load(FIXTURE).expect("the instrument module loads"));
+    let length = player.load_smf(&short_smf(), instruments).expect("the SMF source installs");
+    assert_eq!(length, 24_000, "96 PPQN at the default 120 BPM is half a second");
+    player.play().expect("play");
+    let rendered = driver.render_blocks(spec, RENDER_QUANTUM * 80, RENDER_QUANTUM);
+    assert!(peak(&rendered) > 0.001, "the SMF note sounds through the module's first instrument");
+}
+
+#[test]
+fn an_smf_loaded_after_another_source_is_rebased_to_the_current_source_clock() {
+    let spec = AudioSpec { preferred_block_frames: Some(RENDER_QUANTUM as u32), ..AudioSpec::stereo(48_000) };
+    let (_backend, mut player, driver) = open(spec);
+    player.load(FIXTURE).expect("the tracker module loads");
+    player.play().expect("play");
+    let _ = driver.render_blocks(spec, RENDER_QUANTUM * 20, RENDER_QUANTUM);
+    let start = player.source_frame();
+    assert!(start > Frame::ZERO);
+
+    let instruments = starplayer::rt::Arc::new(starplayer::load(FIXTURE).expect("the instrument module loads"));
+    player.load_smf(&short_smf(), instruments).expect("the SMF source installs on the running clock");
+    let rendered = driver.render_blocks(spec, RENDER_QUANTUM * 80, RENDER_QUANTUM);
+    assert!(peak(&rendered) > 0.001, "the frame-zero MIDI note was rebased instead of being dispatched late");
+    assert!(!player.warnings().late_events, "rebasing does not report the new source's events late");
 }

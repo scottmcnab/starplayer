@@ -88,6 +88,8 @@ pub enum HostError {
     UnsupportedMixerMode(String),
     /// A module could not be loaded, scanned, or played by this build.
     Module(starplayer::core::Error),
+    /// A Standard MIDI File could not be parsed.
+    StandardMidiFile(starplayer::core::Error),
     /// The control plane could not accept a command because its ring was full.
     ControlQueueFull,
     /// A `Player` call that needs a module arrived before one was loaded.
@@ -109,6 +111,7 @@ impl fmt::Display for HostError {
             HostError::Backend(message) => write!(formatter, "the audio backend failed: {message}"),
             HostError::UnsupportedMixerMode(message) => write!(formatter, "unsupported mixer mode: {message}"),
             HostError::Module(error) => write!(formatter, "could not play the module: {error}"),
+            HostError::StandardMidiFile(error) => write!(formatter, "could not parse the Standard MIDI File: {error}"),
             HostError::ControlQueueFull => formatter.write_str("the host control queue is full"),
             HostError::NoModule => formatter.write_str("no module is loaded"),
             HostError::NoEventQueue => formatter.write_str("no live-input queue is installed"),

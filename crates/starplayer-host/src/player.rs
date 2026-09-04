@@ -39,8 +39,8 @@ use std::vec::Vec;
 
 use starplayer::core::{AtEnd, ChannelId, Command, Event, Frame, U0F16};
 use starplayer::engine::{
-    EngineHandle, EngineWarnings, EventSource, InstrumentRack, MidiSource, MixerMode, RENDER_QUANTUM,
-    external_event_channel,
+    EngineHandle, EngineWarnings, EventSource, ExternalEventProducer, InstrumentRack, MidiSource, MixerMode,
+    RENDER_QUANTUM, SourceMux, external_event_channel,
 };
 use starplayer::model::Module;
 use starplayer::rt::{
@@ -95,6 +95,15 @@ enum HostCommand {
 enum Retired {
     Module(RtArc<Module>),
     Source(Box<dyn EventSource>),
+}
+
+/// Which live-input arrangement the installed source uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LiveInputMode {
+    #[default]
+    Off,
+    MidiOnly,
+    Jam,
 }
 
 /// The lossy audio taps a caller reads without waiting for a snapshot.
@@ -444,12 +453,13 @@ pub struct Player {
     /// Made once per stream, shared with the render callback and with every
     /// [`EventSender`] handed out.
     event_clock: Arc<EventClock>,
-    /// The sending half of the live-input queue, once [`Player::midi_only`] has installed
-    /// one and until [`Player::take_event_sender`] moves it to another thread.
+    /// The sending half of the live-input queue, once [`Player::midi_only`] or
+    /// [`Player::jam`] has installed one and until [`Player::take_event_sender`] moves it
+    /// to another thread.
     events: Option<EventSender>,
-    /// Whether the source the engine is playing is a live-input one. Not the same question
+    /// Whether live input is alone or sharing a mux with the module. Not the same question
     /// as `events.is_some()`, which goes false the moment a caller takes the sender.
-    live_input: bool,
+    live_input: LiveInputMode,
 }
 
 impl Player {
@@ -493,7 +503,7 @@ impl Player {
             scopes: control.scopes,
             event_clock: control.event_clock,
             events: None,
-            live_input: false,
+            live_input: LiveInputMode::Off,
         })
     }
 
@@ -565,6 +575,13 @@ impl Player {
         }
         rebuilt.set_at_end(at_end)?;
         rebuilt.set_event_lead(requested_lead);
+        // Jam mode is part of module installation: establish it first so the rebuilt
+        // player constructs one mux at `plan.start`, rather than installing a sequencer
+        // and immediately replacing it with another one built from a not-yet-published
+        // frame-zero snapshot.
+        if live_input == LiveInputMode::Jam {
+            rebuilt.live_input = LiveInputMode::Jam;
+        }
         if let Some(module) = module {
             rebuilt.install(module, plan.start, plan.cached_scan)?;
         }
@@ -572,8 +589,10 @@ impl Player {
         // went into the retired engine. An [`EventSender`] a caller had already taken is
         // therefore dead after a rebuild and has to be taken again — which is the same
         // contract [`Player::take_scope_readers`] already has.
-        if live_input {
-            rebuilt.midi_only()?;
+        match live_input {
+            LiveInputMode::Off => {}
+            LiveInputMode::MidiOnly => rebuilt.midi_only()?,
+            LiveInputMode::Jam => {}
         }
         if plan.resume {
             rebuilt.play()?;
@@ -606,6 +625,31 @@ impl Player {
         self.install(module, SeekKind::None, None)
     }
 
+    /// Play a Standard MIDI File through `instruments` without a tracker sequencer.
+    ///
+    /// Parsing, frame conversion and rack construction all happen on this control thread.
+    /// The returned frame count is the file's end-of-track duration, including trailing
+    /// silence after its last event, so a host can end playback even though the MIDI
+    /// source's synthesised control clock intentionally runs forever.
+    pub fn load_smf(&mut self, bytes: &[u8], instruments: RtArc<Module>) -> Result<u64, HostError> {
+        let smf = starplayer::midi::smf::parse_smf(bytes).map_err(HostError::StandardMidiFile)?;
+        let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
+        let sequencer = starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame);
+        let length_frames = sequencer.length_frames();
+        let rack = InstrumentRack::for_module(&instruments, self.spec.sample_rate_hz);
+        let mut source = MidiSource::new(sequencer, rack, self.spec.sample_rate_hz);
+        source.start_control_at(frame);
+        self.commands
+            .push(HostCommand::Load { module: RtArc::clone(&instruments), source: Box::new(source) })
+            .map_err(|_| HostError::ControlQueueFull)?;
+        self.handles.seek.clear();
+        self.module = Some(instruments);
+        self.scan = None;
+        self.events = None;
+        self.live_input = LiveInputMode::Off;
+        Ok(length_frames)
+    }
+
     fn install(&mut self, module: RtArc<Module>, start: SeekKind, cached_scan: Option<Arc<ScannedSong>>) -> Result<(), HostError> {
         // A new sequencer's tick clock starts at frame zero, but the engine's musical clock
         // is monotonic and has been running since the stream opened. Starting the clock
@@ -614,13 +658,44 @@ impl Player {
         // A seek asked for against the outgoing module means nothing to the incoming one.
         self.handles.seek.clear();
         let built = build_source(RtArc::clone(&module), self.spec.sample_rate_hz, start, frame, &self.handles, cached_scan)?;
-        let command = HostCommand::Load { module: RtArc::clone(&module), source: built.source };
+        let (source, events) = if self.live_input == LiveInputMode::Jam {
+            let (source, producer) = self.build_jam_source(&module, frame, built.source)?;
+            (source, Some(EventSender::new(producer, Arc::clone(&self.event_clock))))
+        } else {
+            (built.source, None)
+        };
+        let command = HostCommand::Load { module: RtArc::clone(&module), source };
         self.commands.push(command).map_err(|_| HostError::ControlQueueFull)?;
         self.scan = Some(built.scanned);
         self.module = Some(module);
-        self.live_input = false;
-        self.events = None;
+        self.events = events;
+        if self.live_input != LiveInputMode::Jam {
+            self.live_input = LiveInputMode::Off;
+        }
         Ok(())
+    }
+
+    /// Put a seekable module source in slot 0 and live input in slot 1.
+    ///
+    /// Everything here allocates on the control thread. The fixed two-slot mux cannot be
+    /// full while these two inserts are made; the error arms keep that invariant explicit
+    /// without an `unwrap` becoming part of the host surface.
+    fn build_jam_source(
+        &self,
+        module: &RtArc<Module>,
+        frame: Frame,
+        module_source: Box<dyn EventSource>,
+    ) -> Result<(Box<dyn EventSource>, ExternalEventProducer), HostError> {
+        let rack = InstrumentRack::for_module(module, self.spec.sample_rate_hz);
+        let (producer, queue) = external_event_channel(EVENT_QUEUE_CAPACITY);
+        let mut midi_source = MidiSource::new(queue, rack, self.spec.sample_rate_hz);
+        midi_source.start_control_at(frame);
+        let mut mux = SourceMux::new(2);
+        mux.insert(module_source)
+            .map_err(|_| HostError::Backend(String::from("the jam source mux refused slot 0")))?;
+        mux.insert(Box::new(midi_source))
+            .map_err(|_| HostError::Backend(String::from("the jam source mux refused slot 1")))?;
+        Ok((Box::new(mux), producer))
     }
 
     /// The module currently loaded.
@@ -703,10 +778,9 @@ impl Player {
     /// instruments. Everything expensive happens on this thread — the rack, the queue's
     /// ring and the boxed source — and only a `Box` and an `Arc` cross to the audio side.
     ///
-    /// The module stops playing. Merging the two, so a keyboard can be jammed over a
-    /// playing module, is task E7's `SourceMux`; until then this is the honest half of it,
-    /// and it is what the CLI's `--midi` and the web player's keyboard toggle install.
-    /// [`Player::restore_module_source`] puts the module back.
+    /// The module stops playing. [`Player::jam`] is the public surface for putting the
+    /// same source beside a playing module; this lower-level mode remains useful to an
+    /// instrument-only host. [`Player::restore_module_source`] puts the module back.
     ///
     /// The transport has to be **running** for anything to sound: the musical clock is
     /// what a source is dispatched against, and it stops with the transport.
@@ -726,7 +800,45 @@ impl Player {
             .push(HostCommand::Load { module, source: Box::new(source) })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.events = Some(EventSender::new(producer, Arc::clone(&self.event_clock)));
-        self.live_input = true;
+        self.live_input = LiveInputMode::MidiOnly;
+        Ok(())
+    }
+
+    /// Enable or disable live input over the playing module.
+    ///
+    /// The module sequencer is always slot 0 and the MIDI source is slot 1, making a
+    /// same-frame collision deterministic. Both transitions rebuild the sequencer at the
+    /// sounding song position and on the current monotonic musical frame, so toggling jam
+    /// mode does not return the song to its first row. The seek mailbox stays inside slot
+    /// 0, and therefore order, row and elapsed-frame seeks keep working unchanged.
+    pub fn jam(&mut self, enabled: bool) -> Result<(), HostError> {
+        if enabled == (self.live_input == LiveInputMode::Jam) {
+            return Ok(());
+        }
+        let module = self.module.clone().ok_or(HostError::NoModule)?;
+        let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
+        let song_frame = self.telemetry.read().transport.song_frame;
+        self.handles.seek.clear();
+        let built = build_source(
+            RtArc::clone(&module),
+            self.spec.sample_rate_hz,
+            SeekKind::Frame(song_frame),
+            frame,
+            &self.handles,
+            self.scan.clone(),
+        )?;
+        let (source, events) = if enabled {
+            let (source, producer) = self.build_jam_source(&module, frame, built.source)?;
+            (source, Some(EventSender::new(producer, Arc::clone(&self.event_clock))))
+        } else {
+            (built.source, None)
+        };
+        self.commands
+            .push(HostCommand::Load { module, source })
+            .map_err(|_| HostError::ControlQueueFull)?;
+        self.scan = Some(built.scanned);
+        self.events = events;
+        self.live_input = if enabled { LiveInputMode::Jam } else { LiveInputMode::Off };
         Ok(())
     }
 
@@ -735,13 +847,20 @@ impl Player {
     /// The scan is reused — nothing the timeline depends on changed — so this costs a
     /// sequencer, not a rescan, and the song restarts from the top of the order list.
     pub fn restore_module_source(&mut self) -> Result<(), HostError> {
+        if self.live_input == LiveInputMode::Jam {
+            return self.jam(false);
+        }
         let module = self.module.clone().ok_or(HostError::NoModule)?;
         let cached_scan = self.scan.clone();
+        self.live_input = LiveInputMode::Off;
         self.install(module, SeekKind::None, cached_scan)
     }
 
     /// Whether the engine is playing a live-input source.
-    pub const fn is_midi_only(&self) -> bool { self.live_input }
+    pub const fn is_midi_only(&self) -> bool { matches!(self.live_input, LiveInputMode::MidiOnly) }
+
+    /// Whether live input and the module's sequencer share the source mux.
+    pub const fn is_jamming(&self) -> bool { matches!(self.live_input, LiveInputMode::Jam) }
 
     /// Queue one live event on MIDI channel `channel` (0–15), stamped
     /// `source_frame + lead`.

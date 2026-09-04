@@ -140,7 +140,7 @@ impl HostEngine {
     /// Build the arm `mode` names, at the maxima a persistent host takes.
     ///
     /// A host that plays many modules through one engine cannot ask a processor how wide
-    /// its pool should be, so it takes [`MAX_VOICE_CAPACITY`] and
+    /// its pool should be, so it takes [`MAX_VOICE_CAPACITY`] (including jam headroom) and
     /// [`ChannelTable::MAX_CHANNELS`] once. Both are allocated here, and the mixer and the
     /// telemetry view walk only what is *active*, so a wider pool changes no rendered
     /// sample — only how much memory the host holds.

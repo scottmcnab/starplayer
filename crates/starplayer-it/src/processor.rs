@@ -49,8 +49,8 @@ use starplayer_core::{
     VoiceId, VoiceParam, VoiceParams,
 };
 use starplayer_engine::{
-    EndOfSongPolicy, OrderEntry, PatternData, PatternFlowState, PatternSequencer, RowRef, SequencerSettings,
-    TickContext, TickOutcome, TrackerProcessor,
+    EndOfSongPolicy, MAX_VOICE_CAPACITY, OrderEntry, PatternData, PatternFlowState, PatternSequencer, RowRef,
+    SequencerSettings, TickContext, TickOutcome, TrackerProcessor,
 };
 #[cfg(feature = "trace")]
 use starplayer_engine::TraceChannelState;
@@ -68,9 +68,9 @@ use crate::pattern::{
 
 /// How many voices an IT module may sound at once.
 ///
-/// Impulse Tracker's own limit, and the length of [`ItProcessor`]'s parallel per-voice
-/// array. A pool smaller than this is legal — fewer voices sound; a larger one is legal
-/// too, and every id past the array is skipped.
+/// Impulse Tracker's own limit. The processor's parallel state is wider than this so a
+/// MIDI voice may occupy a low global slot without pushing a tracked IT voice past the
+/// array, but no more than this many slots may be IT-owned at once.
 pub const VIRTUAL_CHANNELS: usize = 256;
 
 /// The note at which a sample plays back at its own `C5Speed`: IT's `C-5`.
@@ -543,7 +543,9 @@ impl ItChannel {
 pub struct ItProcessor {
     module: Arc<Module>,
     channels: Box<[ItChannel]>,
-    /// One entry per pool slot, sized to [`VIRTUAL_CHANNELS`] and allocated once.
+    /// One entry per persistent-host pool slot, allocated once. IT owns at most
+    /// [`VIRTUAL_CHANNELS`] of them; the extra entries let live MIDI occupy arbitrary
+    /// global voice IDs without making an IT voice untracked.
     voices: Box<[ItVoiceState]>,
     sample_rate_hz: u32,
     /// `GV`, 0..=128.
@@ -588,7 +590,7 @@ impl ItProcessor {
         }
         ItProcessor {
             channels: channels.into_boxed_slice(),
-            voices: vec![ItVoiceState::default(); VIRTUAL_CHANNELS].into_boxed_slice(),
+            voices: vec![ItVoiceState::default(); MAX_VOICE_CAPACITY].into_boxed_slice(),
             sample_rate_hz,
             global_volume,
             song_speed: header.initial_speed,
@@ -1271,7 +1273,9 @@ impl ItProcessor {
         any.then_some((volume, panning, pitch))
     }
 
-    /// Allocate a voice, stealing a background one if the pool is full.
+    /// Allocate a voice, stealing a background one if the pool is full or IT already owns
+    /// its 256 virtual channels. The latter keeps the sixteen-slot jam reserve available
+    /// to MIDI even though both sources share one global pool.
     fn allocate_voice(
         &mut self,
         context: &mut TickContext<'_>,
@@ -1281,7 +1285,15 @@ impl ItProcessor {
         params: VoiceParams,
         offset: u32,
     ) -> Option<VoiceId> {
-        if let Some(voice) = context.trigger_channel(channel, tag, region, params, offset) {
+        // Replacing this channel's own foreground voice is net-zero — `trigger_channel`
+        // releases it before allocating — so it is always allowed and costs a lane read.
+        let replaces_owned_foreground = context.channels.foreground(channel).is_some_and(|voice| {
+            context.voices.get(voice).is_some()
+                && self.voices.get(voice.index() as usize).is_some_and(|state| state.owns(voice) && state.foreground)
+        });
+        if (replaces_owned_foreground || self.within_voice_quota(context))
+            && let Some(voice) = context.trigger_channel(channel, tag, region, params, offset)
+        {
             return Some(voice);
         }
         let victim = self.choose_victim(context)?;
@@ -1290,6 +1302,25 @@ impl ItProcessor {
         }
         context.voices.release(victim);
         context.trigger_channel(channel, tag, region, params, offset)
+    }
+
+    /// Whether IT may own one more voice: at most [`VIRTUAL_CHANNELS`] slots of a wider
+    /// global pool may be IT-owned, so a persistent host's sixteen jam slots stay
+    /// reachable by live MIDI.
+    ///
+    /// A pool holding fewer voices than the limit cannot be over it, and that integer
+    /// compare is the answer on every module short of a saturated IT, so the walk over
+    /// the pool is not on the ordinary trigger path.
+    fn within_voice_quota(&self, context: &TickContext<'_>) -> bool {
+        if context.voices.voices_active() < VIRTUAL_CHANNELS {
+            return true;
+        }
+        let owned_voice_count = context
+            .voices
+            .iter()
+            .filter(|(voice, _)| self.voices.get(voice.index() as usize).is_some_and(|state| state.owns(*voice)))
+            .count();
+        owned_voice_count < VIRTUAL_CHANNELS
     }
 
     /// Architecture open question **Q3**, settled by OpenMPT's `GetNNAChannel`
@@ -3296,17 +3327,77 @@ mod tests {
         assert_eq!(parse_filter_macro(b"FA", values(0x10)), (Some(127), Some(0)), "MIDI start resets both filter parameters");
     }
 
-    /// `VIRTUAL_CHANNELS` is both the recommended pool size and the length of the parallel
-    /// array, so the two can never disagree.
+    /// IT still recommends 256 owned voices, while a persistent jam host carries sixteen
+    /// extra global slots and enough parallel state to track IT voices at high IDs.
     #[test]
-    fn the_recommended_capacity_is_the_parallel_arrays_length() {
+    fn the_recommended_capacity_and_wider_parallel_state_have_distinct_limits() {
         let module = module_with(&[note_cell(60, 1)], NewNoteAction::Cut);
         let processor = ItProcessor::new(module, 44_100);
         assert_eq!(processor.recommended_voice_capacity(CHANNELS as usize), VIRTUAL_CHANNELS);
         assert_eq!(recommended_voice_capacity(CHANNELS as usize), VIRTUAL_CHANNELS);
-        assert_eq!(processor.voices.len(), VIRTUAL_CHANNELS);
-        // A voice id past the array is skipped rather than indexed.
-        assert!(processor.voice(VoiceId::new(VIRTUAL_CHANNELS as u16, 1)).is_none());
+        assert_eq!(processor.voices.len(), MAX_VOICE_CAPACITY);
+        assert!(processor.voice(VoiceId::new(MAX_VOICE_CAPACITY as u16, 1)).is_none(), "a voice id past the array is skipped");
+    }
+
+    #[test]
+    fn midi_low_slots_do_not_push_it_past_its_state_or_let_it_consume_the_reserve() {
+        let module = module_with(&[note_cell(60, 1)], NewNoteAction::Continue);
+        let mut processor = ItProcessor::new(module, 44_100);
+        let mut voices = VoicePool::new(MAX_VOICE_CAPACITY);
+        let mut channels = ChannelTable::new(ChannelTable::MAX_CHANNELS);
+        let region = SampleRegion::one_shot(0, 64);
+        let midi_tag = VoiceTag { channel: 48, instrument: 1, sample: 1, note: 60 };
+        for _ in 0..16 {
+            voices.allocate(midi_tag, region, VoiceParams::SILENT, 0).expect("the MIDI reserve has room");
+        }
+        let tracker_tag = VoiceTag { channel: 0, instrument: 1, sample: 1, note: 60 };
+        let mut highest = None;
+        for index in 0..VIRTUAL_CHANNELS {
+            let voice = voices.allocate(tracker_tag, region, VoiceParams::SILENT, 0).expect("all IT virtual channels fit");
+            processor.voices[voice.index() as usize] = ItVoiceState {
+                voice: Some(voice),
+                foreground: false,
+                real_volume: 1_024,
+                note_volume: 64,
+                fadeout: if index + 1 == VIRTUAL_CHANNELS { 0 } else { FADEOUT_FULL },
+                playing: true,
+                ..ItVoiceState::default()
+            };
+            highest = Some(voice);
+        }
+        let highest = highest.expect("there is a highest IT voice");
+        assert_eq!(highest.index() as usize, MAX_VOICE_CAPACITY - 1, "sixteen low MIDI IDs push the last IT state to slot 271");
+
+        let first_midi = voices.iter().next().map(|(voice, _)| voice).expect("a MIDI voice exists");
+        voices.release(first_midi);
+        assert_eq!(voices.voices_active(), MAX_VOICE_CAPACITY - 1, "one global reserve slot is free");
+        let allocated = {
+            let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+            processor
+                .allocate_voice(&mut context, ChannelId(0), tracker_tag, region, VoiceParams::SILENT, 0)
+                .expect("IT steals at its own limit")
+        };
+        assert_eq!(allocated.index(), highest.index(), "the fully faded high-ID IT background slot is reused first");
+        assert_ne!(allocated.generation(), highest.generation(), "the reused slot has a fresh generation");
+        assert_eq!(voices.voices_active(), MAX_VOICE_CAPACITY - 1, "quota replacement keeps the pool at 271 before the caller records the new IT state");
+        processor.voices[allocated.index() as usize] = ItVoiceState {
+            voice: Some(allocated),
+            foreground: false,
+            fadeout: FADEOUT_FULL,
+            playing: true,
+            ..ItVoiceState::default()
+        };
+        let owned_voice_count = voices
+            .iter()
+            .filter(|(voice, _)| processor.voices.get(voice.index() as usize).is_some_and(|state| state.owns(*voice)))
+            .count();
+        assert_eq!(owned_voice_count, VIRTUAL_CHANNELS, "the replacement restores exactly 256 IT-owned voices");
+        let replacement_midi = voices.allocate(midi_tag, region, VoiceParams::SILENT, 0).expect("the freed MIDI reserve slot remains available");
+        assert_eq!(replacement_midi.index(), first_midi.index());
+        assert_eq!(voices.voices_active(), MAX_VOICE_CAPACITY, "sixteen MIDI and 256 IT voices fit together");
+        for (voice, state) in voices.iter().take(16) {
+            assert_eq!(state.tag.channel, midi_tag.channel, "low slot {} remains MIDI-owned", voice.index());
+        }
     }
 
     /// A wider pool than the processor's array is legal, and so is a narrower one.
