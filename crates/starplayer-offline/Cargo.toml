@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-starplayer = { workspace = true, features = ["std"] }
+# `smf`: task E5's `.mid` render path (`render_smf_song`), always on rather than
+# feature-gated here — unlike `trace` and `telemetry` below, turning it on adds no
+# allocation or code to the tracker render path it does not already take, so there is
+# nothing here for a plain `cargo test --workspace` to want to avoid compiling.
+starplayer = { workspace = true, features = ["std", "smf"] }
 sha2 = { workspace = true }
 
 # `trace` must stay **optional**. Declared as an ordinary dependency feature it would be

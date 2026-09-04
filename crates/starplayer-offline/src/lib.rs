@@ -14,7 +14,10 @@ use std::fmt;
 use starplayer::core::quirks::{QuirkSelection, QuirkSet};
 use starplayer::core::{AtEnd, Error, Interpolator};
 use starplayer::dsp::{Interpolate, Linear, Nearest};
-use starplayer::engine::{EndReason, Engine, EngineSettings, EngineWarnings, EventSource, ScanLimits, SongTimeline};
+use starplayer::engine::{
+    ChannelTable, EndReason, Engine, EngineSettings, EngineWarnings, EventSource, InstrumentRack, MidiSource, ScanLimits,
+    SongTimeline,
+};
 use starplayer::mixer::{FixedPath, FloatPath, I24, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::Arc;
@@ -392,6 +395,68 @@ where
 /// The `i16` mono spelling, mirroring [`render_fixed_mono`].
 pub fn render_song_fixed_mono(format: GoldenFormat, bytes: &[u8], sample_rate_hz: u32, host_block_frames: usize, length: RenderLength) -> Result<Vec<i16>, RenderError> {
     render_song::<FixedPath, Linear, MonoI16>(format, bytes, sample_rate_hz, host_block_frames, length)
+}
+
+/// Render a Standard MIDI File (task E5 deliverable 4), through the instruments of a
+/// loaded module, from tick zero to the file's own length — [`Smf::length_frames`]
+/// (`starplayer::midi::Smf`), the latest `end_of_track` tick across every track. Unlike
+/// [`render_song`] an SMF carries no loop point of its own, so there is nothing for a
+/// [`RenderLength`] to compute: the render is exactly the file's length, once, with no
+/// fade.
+///
+/// `instruments_module_bytes` is any module this build can load; program numbers on the
+/// file's sixteen MIDI channels index its instruments (master-plan decision 5). Building
+/// the [`InstrumentRack`] and the playback [`Engine`] both happen here, the same shape
+/// `tests/render_allocation.rs`'s `rendering_a_midi_source_allocates_nothing` proved
+/// allocates nothing once `render()` is on the stack.
+pub fn render_smf_song<Path, Interp, Out>(
+    smf_bytes: &[u8],
+    instruments_module_bytes: &[u8],
+    sample_rate_hz: u32,
+    host_block_frames: usize,
+) -> Result<Vec<Out::Sample>, RenderError>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let smf = starplayer::midi::smf::parse_smf(smf_bytes).map_err(RenderError::Load)?;
+    let module = Arc::new(starplayer::load(instruments_module_bytes)?);
+    let sequencer = starplayer::midi::SmfSequencer::new(&smf, sample_rate_hz);
+    let total_frames = sequencer.length_frames() as usize;
+
+    let settings = EngineSettings {
+        sample_rate_hz,
+        // The MIDI lanes sit above a module's own (master-plan decision 3), so the
+        // channel table has to be the full width regardless of the instruments module's
+        // own channel count.
+        channel_count: ChannelTable::MAX_CHANNELS,
+        voice_capacity: recommended_voice_capacity(&module).max(16),
+        ..EngineSettings::default()
+    };
+    let mut engine: Engine<Path, Interp, Out, Arc<Module>> = Engine::with_settings(settings);
+    let mut control = engine.take_control().ok_or(RenderError::CommandQueue)?;
+    control.load_module(Arc::clone(&module)).map_err(|_| RenderError::CommandQueue)?;
+    let rack = InstrumentRack::for_module(&module, sample_rate_hz);
+    engine.set_source(Box::new(MidiSource::new(sequencer, rack, sample_rate_hz)));
+    engine.set_limiter(Limiter::Clamp);
+
+    let output_samples = total_frames.saturating_mul(Out::CHANNELS);
+    let block_samples = host_block_frames.max(1).saturating_mul(Out::CHANNELS).max(Out::CHANNELS);
+    let mut output = vec![Out::Sample::default(); output_samples];
+    for block in output.chunks_mut(block_samples) {
+        engine.render(block);
+    }
+    let warnings = engine.warnings();
+    if warnings.any() {
+        return Err(RenderError::EngineWarnings(warnings));
+    }
+    Ok(output)
+}
+
+/// The `i16` mono spelling of [`render_smf_song`], mirroring [`render_song_fixed_mono`].
+pub fn render_smf_song_fixed_mono(smf_bytes: &[u8], instruments_module_bytes: &[u8], sample_rate_hz: u32, host_block_frames: usize) -> Result<Vec<i16>, RenderError> {
+    render_smf_song::<FixedPath, Linear, MonoI16>(smf_bytes, instruments_module_bytes, sample_rate_hz, host_block_frames)
 }
 
 /// A linear fade over the last `fade_frames` frames, in Q16.16 with no floating-point

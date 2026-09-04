@@ -38,7 +38,47 @@ pub fn run(args: InfoArgs) -> Result<(), String> {
     }
 
     let module_bytes = archive::resolve_entry(&args.file, &bytes, args.entry)?;
+    if starplayer::probe_smf(&module_bytes) {
+        return print_smf_info(&module_bytes);
+    }
     print_module_info(&module_bytes)
+}
+
+/// `starplayer info` on a `.mid`: format, tracks, division, tempo changes and length
+/// (task E5 deliverable 4). A Standard MIDI File is not a
+/// [`Module`](starplayer::model::Module) — it carries no samples of its own — so its
+/// length is the file's own [`Smf::length_frames`](starplayer::midi::Smf::length_frames)
+/// rather than a scanned song timeline, and it names no playback quirks.
+fn print_smf_info(bytes: &[u8]) -> Result<(), String> {
+    let smf = starplayer::midi::smf::parse_smf(bytes).map_err(|error| error.to_string())?;
+
+    println!("format:       Standard MIDI File, format {}", smf.format());
+    println!("tracks:       {}", smf.track_count());
+    match smf.division() {
+        starplayer::midi::Division::TicksPerQuarterNote(ppqn) => println!("division:     {ppqn} ticks per quarter note"),
+        starplayer::midi::Division::Smpte { frames_per_second, ticks_per_frame } => {
+            println!("division:     SMPTE {} fps, {ticks_per_frame} ticks per frame", -(frames_per_second as i16));
+        }
+    }
+    println!("events:       {}", smf.event_count());
+
+    let tempo_changes = smf.tempo_changes();
+    if tempo_changes.is_empty() {
+        println!("tempo:        120 BPM (default, no set_tempo meta events)");
+    } else {
+        println!("tempo changes: {}", tempo_changes.len());
+        for change in tempo_changes {
+            let bpm = 60_000_000.0 / change.micros_per_quarter_note as f64;
+            println!("  tick {:<8} {bpm:.2} BPM ({} us/quarter)", change.tick, change.micros_per_quarter_note);
+        }
+    }
+
+    let length_frames = smf.length_frames(INFO_SCAN_SAMPLE_RATE_HZ);
+    let length_seconds = length_frames as f64 / INFO_SCAN_SAMPLE_RATE_HZ as f64;
+    println!("length:       {} ({length_frames} frames at {INFO_SCAN_SAMPLE_RATE_HZ} Hz)", format_duration(length_seconds));
+    println!("instruments:  none of its own; render or play it with --instruments <module>");
+
+    Ok(())
 }
 
 fn list_archive_entries(path: &std::path::Path, modules: &[starplayer_archive::ArchiveEntry]) {

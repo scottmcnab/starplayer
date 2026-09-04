@@ -89,8 +89,10 @@ const NO_STD_CRATES: &[&str] = &[
 /// target at all.
 ///
 /// `starplayer-engine/telemetry` is the first of these — it turns on the optional
-/// `starplayer-telemetry` edge (architecture §11, M1-B6).
-const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry")];
+/// `starplayer-telemetry` edge (architecture §11, M1-B6). `starplayer-midi/smf` is the
+/// second (task E5): it turns on the optional `starplayer-engine` edge `smf` needs for
+/// `EventFeed` and `midi_channel` (see `starplayer-midi/src/lib.rs`'s module doc).
+const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry"), ("starplayer-midi", "smf")];
 
 const JOBS: &[&str] = &["host-tests", "conformance", "rt-safety", "goldens", "fma-check", "trace-zero-cost", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
 

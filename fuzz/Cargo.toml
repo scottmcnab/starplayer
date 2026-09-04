@@ -29,6 +29,11 @@ starplayer-s3m = { path = "../crates/starplayer-s3m" }
 starplayer-mtm = { path = "../crates/starplayer-mtm" }
 starplayer-xm = { path = "../crates/starplayer-xm" }
 starplayer-it = { path = "../crates/starplayer-it" }
+# task E5: the SMF parser. `smf` pulls in `starplayer-engine` transitively (for
+# `EventFeed`), which the loader targets above never need — the one place in this crate
+# where the fuzzed code's own dependency graph, not a smaller one, is "the smallest graph
+# that contains the code being exercised".
+starplayer-midi = { path = "../crates/starplayer-midi", features = ["smf"] }
 
 [lib]
 path = "src/lib.rs"
@@ -110,6 +115,13 @@ bench = false
 [[bin]]
 name = "it_structured"
 path = "fuzz_targets/it_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smf"
+path = "fuzz_targets/smf.rs"
 test = false
 doc = false
 bench = false

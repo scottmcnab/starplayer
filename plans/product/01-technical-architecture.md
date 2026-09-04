@@ -1233,7 +1233,9 @@ crates/
   starplayer-mtm        MTM loader + effect processor             │
   starplayer-xm         XM  loader + effect processor             │
   starplayer-it         IT  loader + effect processor + NNA policy┘
-  starplayer-midi       MIDI byte codec + SMF parser + Event mapping  → core
+  starplayer-midi       MIDI byte codec + SMF parser + Event mapping  → core;
+                        the `smf` feature (parser + SmfSequencer) also → engine, for
+                        EventFeed and the MIDI_CHANNEL_BASE mapping (task E5)
   starplayer-telemetry  snapshot types shared by every UI             → core, rt
   starplayer            facade: re-exports + format autodetect. THE public crate.
   # ── std ─────────────────────────────────────────────────────────────────────

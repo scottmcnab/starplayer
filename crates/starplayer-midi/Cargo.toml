@@ -6,11 +6,18 @@ rust-version.workspace = true
 
 [dependencies]
 starplayer-core = { workspace = true }
+# Optional, and pulled in only by `smf` below: `EventFeed` (what `SmfSequencer`
+# implements) and the `MIDI_CHANNEL_BASE` channel mapping live in `starplayer-engine`. See
+# `src/lib.rs`'s module doc for why this edge exists — task E5 deviation from the
+# originally-drawn `→ core` crate layout. `no_std + alloc` with an empty default feature
+# set, so this does not threaten AGENTS.md design goal 4.
+starplayer-engine = { workspace = true, optional = true }
 
 [features]
 default = []
-std = ["starplayer-core/std"]
-alloc = ["starplayer-core/alloc"]
+std = ["starplayer-core/std", "starplayer-engine?/std"]
+alloc = ["starplayer-core/alloc", "starplayer-engine?/alloc"]
 serde = ["starplayer-core/serde"]
-# Standard MIDI File parsing on top of the byte codec.
-smf = []
+# Standard MIDI File parsing on top of the byte codec: the parser, the tempo map and
+# `SmfSequencer`.
+smf = ["dep:starplayer-engine"]

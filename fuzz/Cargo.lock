@@ -235,6 +235,7 @@ dependencies = [
  "libfuzzer-sys",
  "starplayer-core",
  "starplayer-it",
+ "starplayer-midi",
  "starplayer-mod",
  "starplayer-model",
  "starplayer-mtm",
@@ -248,8 +249,17 @@ version = "0.1.0"
 dependencies = [
  "starplayer-core",
  "starplayer-engine",
+ "starplayer-mixer",
  "starplayer-model",
  "starplayer-rt",
+]
+
+[[package]]
+name = "starplayer-midi"
+version = "0.1.0"
+dependencies = [
+ "starplayer-core",
+ "starplayer-engine",
 ]
 
 [[package]]
@@ -317,6 +327,7 @@ version = "0.1.0"
 dependencies = [
  "starplayer-core",
  "starplayer-engine",
+ "starplayer-mixer",
  "starplayer-model",
  "starplayer-rt",
 ]
