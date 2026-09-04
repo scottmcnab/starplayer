@@ -44,7 +44,10 @@ impl<'buses, Accumulator> BusSegment<'buses, Accumulator> {
 
     /// How many buses there are.
     pub const fn count(&self) -> usize {
-        if self.stride == 0 { 0 } else { self.buses.len() / self.stride }
+        match self.buses.len().checked_div(self.stride) {
+            Some(count) => count,
+            None => 0,
+        }
     }
 
     /// Frames in this segment.
@@ -926,7 +929,7 @@ mod tests {
             let mut pool = VoicePool::new(1);
             pool.allocate(VoiceTag { channel: 1, ..VoiceTag::default() }, region, sounding_params(), 0).expect("slot 0");
             let mut buses = vec![FixedFrame::default(); BUS_COUNT * QUANTUM];
-            let mut spill = vec![FixedFrame::default(); QUANTUM];
+            let mut spill = [FixedFrame::default(); QUANTUM];
             let mut offset = 0;
             for span in splits {
                 let mut view = BusSegment::new(&mut buses, QUANTUM, offset, *span);
