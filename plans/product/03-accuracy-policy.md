@@ -58,7 +58,7 @@ These are load-bearing. Removing any of them changes how real modules sound.
 | XM's volume-column pan slide left of zero sets the pan to zero outright | `ft2_replayer.c` `v_PanSlideLeft` (`includes an FT2 bug`) | FastTracker 2 behaviour |
 | A cell carrying both a volume-column `Mx` and an effect-column `3xx` **discards** the `3xx` parameter and applies the `Mx` rate twice in a tick | `ft2_replayer.c` `getNewNote` (the volume-column branch returns before the effect column's parameter is read); libxmp `read_event.c:522-529`; OpenMPT `GetVolCmdTonePorta` (`vol *= 2`, `clearEffectColumn`) | FastTracker 2 behaviour (`data/ft2_double_toneporta.xm`). ModPlug Tracker, MadTracker 2 and rst's SoundTracker give each column its own rate and apply the sum once, which is the `QuirkSet` field `xm_double_portamento_doubles_volume_column_rate` |
 | An XM `9xx` that points past the end of the sample **stops** the channel, and the note is not picked up by a later portamento | `ft2_replayer.c` `triggerNote` (`smpStartPos`) with the mixer's own bounds test; OpenMPT `kFT2ST3OffsetOutOfRange`; libxmp `read_event.c:714-726` | FastTracker 2 behaviour (`openmpt/xm/3xx-no-old-samp.xm`). Skale Tracker does not emulate it — Armada Tanks' music breaks if it is applied — which is the `QuirkSet` field `xm_offset_past_sample_end_stops_channel` |
-| An `E6x` loop jump leaves its **target row** in the shared break position, so the next pattern to end normally starts on that row rather than row zero | `ft2_replayer.c` `patternLoop` (`song.pBreakPos`) and `getNextPos`, which clears it only in the branch a position change takes; OpenMPT `kFT2LoopE60Restart` (`Snd_fx.cpp:6351`, `Sndmix.cpp:805-817`) | FastTracker 2 behaviour, and the `QuirkSet` field `xm_loop_target_becomes_next_break_row` for the trackers that do not have it. `openmpt/xm/PatLoop-Break.xm` and `PatLoop-Weird.xm` cannot see it yet — `conformance/known-failures.md` `F2-XM-009` — so `starplayer-xm`'s own tests pin it |
+| An `E6x` loop jump leaves its **target row** in the shared break position, so the next pattern to end normally starts on that row rather than row zero | `ft2_replayer.c` `patternLoop` (`song.pBreakPos`) and `getNextPos`, which clears it only in the branch a position change takes; OpenMPT `kFT2LoopE60Restart` (`Snd_fx.cpp:6351`, `Sndmix.cpp:805-817`) | FastTracker 2 behaviour, and the `QuirkSet` field `xm_loop_target_becomes_next_break_row` for the trackers that do not have it. Task F6's order-list wrap let both fixtures reach it: `openmpt/xm/PatLoop-Weird.xm` now passes, and `PatLoop-Break.xm` is where the carry crosses the wrap and libxmp does not follow — **D88** |
 | A note delay next to a **key-off** with no instrument column swallows the volume column's `Cxx` panning | `ft2_replayer.c` `noteDelay` writes `ch->outPan` without raising `CS_UPDATE_PAN`, and neither `triggerNote` (which returns early for a key-off) nor `resetVolumes` (which an instrument column would have run) raises it either; OpenMPT `kFT2PanWithDelayedNoteOff`; libxmp `read_event.c:511-518` | FastTracker 2 behaviour (`openmpt/xm/PanOff.xm`, `data/ft2_delay_volume_column.xm`). StarPlayer suppresses the write where FastTracker 2 suppresses only its visibility; the two could differ only on a channel whose panning envelope raises the flag every tick, and no corpus case has one |
 | An instrument number naming a slot the file does not hold still reloads a fadeout — the placeholder instrument's `0x80` — and the channel keeps that placeholder until a **note** moves it | `ft2_replayer.c` `triggerNote` (`ins = instr[0]`), `triggerInstrument` (`ch->fadeoutSpeed = ins->fadeout`), `allocateInstr` → `setStdEnvelope`; libxmp `read_event.c:580-583` ("unused instruments have fade 0x80") | FastTracker 2 behaviour, and the reason an instrument-without-note row after an out-of-range one fades at the placeholder's rate rather than its own (`data/ft2_instrument_fade_update.xm`) |
 | XM `Xxy` is restricted to `X1x` and `X2x`; every other sub-command is ignored | `ft2_replayer.c` `extraFinePitchSlide`; OpenMPT `kFT2RestrictXCommand` | FastTracker 2 behaviour. ModPlug's `X9E`/`X9F` extension is deviation D45 |
@@ -194,7 +194,7 @@ disagreements about Scream Tracker 3, D40 is a disagreement between the original
 both secondary oracles that no available reference can settle, and D41 is a MOD boundary
 the original got wrong in a way that happened to help. The rest record deliberate
 determinism/architecture choices or visible conformance gaps; none may be hidden behind
-an accuracy claim. D42–D47 and D75–D79 are M5's XM entries, and D80–D86 are M6's IT ones;
+an accuracy claim. D42–D47, D75–D79 and D87–D88 are M5's XM entries, and D80–D86 are M6's IT ones;
 both have the same shape as D33–D39:
 they are places where **libxmp**, the conformance oracle, represents or computes something
 differently from FastTracker 2, and the accuracy policy's own rule for XM — "the format
@@ -553,6 +553,47 @@ expression), so one envelope unit of disagreement is four pan units at the centr
 
 **Behaviour chosen.** OpenMPT's rounding, with the same **four**-unit `pan` tolerance XM
 already carries. A channel with no panning envelope is compared exactly on both sides.
+
+### D87 — libxmp's dump clock restarts at every pass of a wrapping module
+
+**Cause.** libxmp times each record with `xmp_frame_info.time`, which is the time of the
+*current position within the song* taken from its own scan, not elapsed output time. A
+module that wraps therefore replays the same timestamps: `openmpt/xm/PatLoop-Weird.data`
+runs 78, 156, 78, 156, 234, 312 … and `PatLoop-Break.data` reaches 2720 and then starts
+again at 140. StarPlayer's trace timestamps every tick with the monotonic output frame it
+was dispatched on, which is the only reading that keeps a trace comparable across host
+block sizes (design goal 3), so from the first wrap onward the two clocks cannot agree by
+construction.
+
+**Behaviour chosen.** The monotonic frame. The two fixtures that wrap —
+`openmpt-xm-patloop-weird` and `openmpt-xm-patloop-break` — waive `frame`, and the
+harness's `pair_by_time` re-anchor (the `C2-MOD-001` repair) then aligns their records on
+`(row, tick_in_row)`, which is the axis the fixtures are actually about. `position` is
+waived alongside it for D42's finetune reason. Every other field stays enforced, so the
+whole `0 3 1 0 3 1 2 3 1 2 3 1 2` row sequence, its notes, instruments, volumes, periods
+and pans are compared exactly.
+
+### D88 — FastTracker 2's carried pattern-loop break row survives the order-list wrap
+
+**Cause.** Section 1's `kFT2LoopE60Restart` entry: `patternLoop` leaves its target row in
+`song.pBreakPos`, and `getNextPos` clears that only in the branch a position change takes —
+the same branch that assigns `song.row = song.pBreakPos` and wraps `song.songPos` to
+`song.songLoopStart`. So when a pattern that has taken an `E6x` loop jump then ends
+normally *on the last order*, FastTracker 2 wraps to the restart order and starts it on the
+loop target row. `openmpt/xm/PatLoop-Break.xm` is exactly that shape: pattern 0 row 12
+carries `E60`, pattern 1 row 3 carries `E62`, and the `E62` jump back to row 12 is still in
+the break position when pattern 1 runs off the end of the two-entry order list. StarPlayer
+re-enters pattern 0 at row 12; libxmp's dump re-enters it at row 0, and every later record
+shifts with it (first divergence, with `frame` and `position` waived, at tick 174 channel 1
+field `instrument`, 1 expected against 3).
+
+**Behaviour chosen.** FastTracker 2's, unchanged — it is section 1's own rule, and
+`starplayer-xm`'s `a_pattern_loops_target_row_starts_the_next_pattern` pins it. libxmp does
+not carry the break position across the wrap, so `openmpt-xm-patloop-break` is an accepted
+deviation rather than a known failure; its sibling `openmpt-xm-patloop-weird`, whose wrap
+row comes from a `D03` rather than from a loop jump, passes with both players agreeing.
+What would settle it beyond the two sources already read is a capture from a real
+FastTracker 2.
 
 ## 4. Not offered at all
 

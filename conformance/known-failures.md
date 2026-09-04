@@ -91,13 +91,14 @@ MOD cases pass under per-field waivers naming accuracy-policy D15, D19, D36, D37
 the new D40. Every one of those is a representation or timeline difference against the
 oracle, not an engine gap.
 
-## M5 — XM (tasks F2 and F5)
+## M5 — XM (tasks F2, F5 and F6)
 
 Task F2 landed the XM effect processor and wired all 93 XM cases the pinned tree's
 `compare_mixer_data*` calls name; 72 passed and twenty were recorded here as `F2-XM-001`
-through `F2-XM-012`. Task F5 settled them: **87 of the 93 now pass**, two are accepted
-deviations (`libxmp-xm-reverse-xm` under D45 and `openmpt-xm-panmemory` under D79) and the
-four cases below are what is left.
+through `F2-XM-012`. Task F5 settled all but four of them, and task F6 — the order-list wrap
+on the conformance trace path — closed `F2-XM-009`: **88 of the 93 now pass**, three are
+accepted deviations (`libxmp-xm-reverse-xm` under D45, `openmpt-xm-panmemory` under D79 and
+`openmpt-xm-patloop-break` under D88) and the two cases below are what is left.
 
 | Record | Disposition |
 |---|---|
@@ -109,7 +110,7 @@ four cases below are what is left.
 | `F2-XM-006` — the volume column under a delayed note-off | **Fixed.** `kFT2PanWithDelayedNoteOff`. Both cases pass, `openmpt-xm-panoff` waiving `position` for D42 |
 | `F2-XM-007` — the Skale Tracker offset dialect | **Fixed.** `QuirkSet::xm_offset_past_sample_end_stops_channel`, off for every tracker that is not FastTracker 2. The case waives `position` and `active` for D42 |
 | `F2-XM-008` — the vibrato ramp amplitude | **Accuracy policy D76.** The amplitudes were never the problem: the two tables are the same values, and libxmp applies its vibrato on a row's tick zero where FastTracker 2 does not |
-| `F2-XM-009` — FastTracker 2's stale `song.pBreakPos` | **Half fixed, half sharpened.** `kFT2LoopE60Restart` is implemented and unit-tested; both fixtures are blocked behind the order-list wrap, below |
+| `F2-XM-009` — FastTracker 2's stale `song.pBreakPos` | **Closed by F6.** The conformance trace now follows each format's own end-of-song rule, so an XM wraps to its restart position instead of ending. `openmpt-xm-patloop-weird` passes; `openmpt-xm-patloop-break` is accuracy policy **D88**, where FastTracker 2 carries the loop target across the wrap and libxmp does not |
 | `F2-XM-010` — `ED0` is not a rogue note delay | **Accuracy policy D77.** `ED0` was never wrong: libxmp defers a delayed row's volume column to the delay tick and FastTracker 2 does not |
 | `F2-XM-011` — a looping envelope after 240 ticks | **Accuracy policy D78.** The tick a key-off resumes a sustained envelope on |
 | `F2-XM-012` — a zero-byte oracle | **Accuracy policy D79.** Confirmed as the corpus, not the harness: `PanMemory.data` is missing where `DelayCombination.data` is deliberately empty, and the case is now an accepted record rather than a failure |
@@ -155,34 +156,33 @@ at the loop start against the value at the loop end.
 sources available: ft2-clone's is a line-for-line disassembly and OpenMPT's is a model, and
 they disagree only when the remainder is exactly zero.
 
-## F2-XM-009 — the order list running out is not the end of an XM
+## F2-XM-009 — resolved by M5-F6: the order list running out is not the end of an XM
 
-`openmpt-xm-patloop-break` and `openmpt-xm-patloop-weird`. FastTracker 2's own
-`kFT2LoopE60Restart` — an `E6x` loop jump leaving its target row in `song.pBreakPos`, so the
-next pattern to end normally starts there — **is** implemented, is accuracy policy §1, and is
-pinned by `starplayer-xm`'s `a_pattern_loops_target_row_starts_the_next_pattern`. It is not
-what these two fixtures need.
+`openmpt-xm-patloop-break` and `openmpt-xm-patloop-weird` both run off the end of the order
+list. `PatLoop-Weird.xm` has a single order and a `D03` on row 0; `PatLoop-Break.xm` has two
+and its second pattern simply ends. FastTracker 2's `getNextPos` wraps in both cases — `if
+(++song.songPos >= song.songLength) song.songPos = song.songLoopStart;` — and the oracle
+records three passes of each, while the trace path built every sequencer with
+`EndOfSongPolicy::Stop` and stopped after the first pass.
 
-Both of them run off the end of the order list. `PatLoop-Weird.xm` has a single order and a
-`D03` on row 0; `PatLoop-Break.xm` has two and its second pattern simply ends. FastTracker
-2's `getNextPos` wraps in both cases — `if (++song.songPos >= song.songLength) song.songPos
-= song.songLoopStart;` — and the oracle records three passes of each. StarPlayer's sequencer
-treats the order list running out as the end of the song under `EndOfSongPolicy::Stop`
-(`PatternSequencer::move_to_order`), which is task D2's deliberate rule and the reason a
-song that simply ends no longer scans as looping, so the capture stops after the first pass.
+**Resolved in the trace path, not in the player.** `starplayer_offline`'s
+`trace_sequencer_settings` now chooses the end-of-song rule per format — an XM wraps to
+`XmFormatExtra::restart_position`, an IT wraps past its `0xFF` end marker, and MOD, S3M and
+MTM keep ending with the order list — through a new
+`EndOfSongPolicy::WrapKeepingBreakRow`, which is the reference players' own wrap: it carries
+the row a `Bxx` / `Cxx` / `Dxx` asked for across the wrap the way `getNextPos` applies
+`song.pBreakPos` to the order it lands on. Task D2's rule for *hosts* is untouched —
+`EndOfSongPolicy::Loop` and `Stop` behave exactly as before, no format crate's
+`sequencer_settings` changed, and the scan, the nine goldens and the web player are all
+unaffected.
 
-First divergence: tick 8 channel 1 field position for `PatLoop-Break.xm`, tick 1 channel 0
-for `PatLoop-Weird.xm` — both of them the D42 finetune drift rather than the flow, which is
-what makes the record legible: hand-simulating `PatLoop-Weird.xm` against `ft2_replayer.c`
-reproduces the oracle's whole `0 3 1 0 3 1 2 3 1 2 3 1 2` row sequence once the wrap is
-assumed, and needs no other change.
-
-**What would settle it:** a decision, in `starplayer-engine` rather than in `starplayer-xm`,
-about what a `Bxx`/`Cxx`/`Dxx` past the end of the order list means under
-`EndOfSongPolicy::Stop`. Every format has the same gap — ProTracker, Scream Tracker 3 and
-Impulse Tracker all wrap too — so it belongs to a sequencer task with its own effect on
-scanned song lengths, not to the XM processor. F5 deliberately did not reach for it: making
-the XM crate wrap on its own would give one format a rule the other four do not have.
+`openmpt-xm-patloop-weird` now passes, waiving `frame` for **D87** (libxmp's dump clock
+restarts at every pass of a wrapping module) and `position` for D42. `openmpt-xm-patloop-break`
+agrees for its whole first pass and then diverges on **D88**: FastTracker 2 carries the `E62`
+loop target left in `song.pBreakPos` across the wrap, so pattern 0 is re-entered at row 12
+where libxmp re-enters it at row 0. It is an accepted deviation, not a known failure — it is
+accuracy policy §1's own `kFT2LoopE60Restart` rule, which `starplayer-xm`'s
+`a_pattern_loops_target_row_starts_the_next_pattern` pins.
 
 ## M6 — IT (tasks G3 and G6)
 

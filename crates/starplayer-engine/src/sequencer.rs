@@ -573,6 +573,21 @@ pub enum EndOfSongPolicy {
     Loop,
     /// Stop. The sequencer reports no further events and the voices ring out.
     Stop,
+    /// Wrap to the restart order the way the reference players do, **keeping the row a
+    /// `Bxx` / `Cxx` / `Dxx` asked for** instead of restarting the pattern at row zero.
+    ///
+    /// FastTracker 2's `getNextPos` advances `song.songPos`, wraps it with
+    /// `if (++song.songPos >= song.songLength) song.songPos = song.songLoopStart;` and
+    /// then applies `song.pBreakPos` to the order it landed on, so a `D03` on the last
+    /// order re-enters the song at row 3. Impulse Tracker wraps past its `0xFF` end marker
+    /// the same way, and so do libxmp and OpenMPT.
+    ///
+    /// It exists for the **conformance trace** (`starplayer_offline::trace_module`), which
+    /// has to end where the oracle it is compared against ends. No playback path selects
+    /// it: task D2 gave the player [`EndOfSongPolicy::Loop`] and the rule that running out
+    /// of order list is the end of the song, and this variant deliberately leaves that
+    /// alone.
+    WrapKeepingBreakRow,
 }
 
 /// Everything about a sequencer that is not the module or the processor.
@@ -1195,16 +1210,19 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         }
         match self.end_of_song {
             EndOfSongPolicy::Stop => false,
-            EndOfSongPolicy::Loop => {
+            EndOfSongPolicy::Loop | EndOfSongPolicy::WrapKeepingBreakRow => {
                 self.song_looped = true;
                 // The order list came round. Whatever arrival got us here, *this* is the
                 // one the detector must see: it is what turns a wrap into the loop point.
                 self.last_arrival = RowArrival::Wrapped;
+                // `Loop` restarts the pattern; only the reference players' own wrap carries
+                // the break row across it.
+                let wrapped_row = if self.end_of_song == EndOfSongPolicy::WrapKeepingBreakRow { row } else { 0 };
                 // One retry, never a loop: if the restart point is itself unplayable the
                 // song stops rather than spinning inside the audio callback.
                 match self.resolve_order(self.restart_order) {
                     Some((order, pattern)) => {
-                        self.set_position(order, pattern, 0);
+                        self.set_position(order, pattern, wrapped_row);
                         true
                     }
                     None => false,
@@ -1541,6 +1559,24 @@ mod tests {
         assert!(sequencer.song_looped());
         assert!(sequencer.take_song_looped());
         assert!(!sequencer.song_looped(), "taking the flag clears it");
+    }
+
+    #[test]
+    fn only_the_reference_wrap_carries_a_break_row_past_the_end_of_the_order_list() {
+        // `openmpt/xm/PatLoop-Weird.xm` in miniature: one order, and row 0 breaks to row 3
+        // of the next one. FastTracker 2's `getNextPos` wraps `song.songPos` and then
+        // applies `song.pBreakPos` to the order it landed on, so the song re-enters its own
+        // pattern at row 3; `Loop` restarts it at row 0.
+        for (policy, expected_row) in [(EndOfSongPolicy::Loop, 0), (EndOfSongPolicy::WrapKeepingBreakRow, 3)] {
+            let mut data = DemoPatternData::new(1, 4, 1);
+            data.set(0, 0, 0, DemoCell::command(DEMO_BREAK_ROW, 3));
+            let mut sequencer = sequencer(data, SequencerSettings { end_of_song: policy, ..SequencerSettings::default() });
+            let mut harness = Harness::new();
+
+            harness.ticks(&mut sequencer, 6);
+            assert_eq!(sequencer.position(), SongPosition { order: 0, pattern: 0, row: expected_row }, "{policy:?} wraps to row {expected_row}");
+            assert!(sequencer.song_looped(), "{policy:?} wraps rather than stopping");
+        }
     }
 
     #[test]

@@ -72,7 +72,10 @@ pub const MAX_CAPTURE_TICKS: usize = 1_000_000;
 #[cfg(feature = "trace")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TraceOptions {
-    /// Stop after this many ticks. `None` follows the module until its end marker.
+    /// Stop after this many ticks. `None` follows the module until its end marker — which
+    /// an XM or IT capture reaches only if its order list does not wrap, because those two
+    /// follow their oracle's wrap (`trace_sequencer_settings`); a wrapping capture runs to
+    /// [`MAX_CAPTURE_TICKS`] and reports [`TraceError::TickLimit`].
     pub ticks: Option<usize>,
     /// Frames requested per host call. This cannot affect the resulting trace.
     pub host_block_frames: usize,
@@ -617,16 +620,7 @@ fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, Tra
     let mut control = engine.take_control().expect("a fresh offline engine owns its control handle");
     control.load_module(Arc::clone(&module)).map_err(|_| TraceError::Load(Error::Invalid("module command queue is full")))?;
 
-    // The one thing a trace needs that a playback sequencer does not: the order list
-    // running out is the end of the capture, not a loop back to the top.
-    let sequencer_settings = SequencerSettings {
-        sample_rate_hz: TRACE_SAMPLE_RATE_HZ,
-        first_tick_frame: Frame::ZERO,
-        initial_speed: module.header().initial_speed,
-        initial_tempo_bpm: module.header().initial_tempo,
-        restart_order: 0,
-        end_of_song: EndOfSongPolicy::Stop,
-    };
+    let sequencer_settings = trace_sequencer_settings(&module);
     let sequencer = NativeSequencer::with_settings(module, QuirkSelection::FromDialect, sequencer_settings)
         .map_err(|_| TraceError::Load(Error::Invalid("format has no offline native processor")))?;
     engine.set_source(Box::new(sequencer));
@@ -649,6 +643,48 @@ fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, Tra
         return Err(TraceError::TickLimit);
     }
     Ok(trace)
+}
+
+/// The end-of-song rule a capture follows — the **oracle's** rule, per format, rather than
+/// the player's.
+///
+/// A trace exists to be compared against another player's dump, so it has to end where
+/// that player ends. Task D2 gave the *player* a different rule — running out of order
+/// list is the end of the song, and the loop detector plus
+/// [`AtEnd`](starplayer::core::AtEnd) decide what happens next — and nothing here touches
+/// it: this is the trace path alone, and the scan, the goldens and every host still build
+/// their sequencers through each format crate's own `sequencer_settings`.
+///
+/// | Format | Rule | Reference |
+/// |---|---|---|
+/// | MOD, S3M, MTM | the order list running out ends the capture | unchanged; the 47 pinned cases of those three formats are measured against exactly this |
+/// | XM | wrap to the header's restart position | `ft2_replayer.c`'s `getNextPos`, `if (++song.songPos >= song.songLength) song.songPos = song.songLoopStart;` — and libxmp's dumps for `PatLoop-Break.xm` and `PatLoop-Weird.xm` record three passes of that wrap |
+/// | IT | wrap to order zero, past the `0xFF` end marker | `ITTECH.TXT`: the order list ends at `255` and Impulse Tracker restarts from the top, which is what OpenMPT and libxmp both do |
+///
+/// A wrapping capture no longer stops on its own, so a caller that asked for
+/// [`TraceOptions::ticks`] `None` runs to [`MAX_CAPTURE_TICKS`] and reports
+/// [`TraceError::TickLimit`] — the same outcome any module that jumps backwards has always
+/// had. The conformance harness always names a tick budget.
+#[cfg(feature = "trace")]
+fn trace_sequencer_settings(module: &Module) -> SequencerSettings {
+    let (end_of_song, restart_order) = match module.header().format {
+        // `PatternSequencer::new` starts the song at `restart_order`, so this also says
+        // where the capture begins. Every XM in the pinned corpus has a restart position
+        // of zero, and the XM *player* already reads the same field into the same setting
+        // (`starplayer_xm::processor::sequencer_settings`), so the trace and the player
+        // agree about a non-zero one rather than disagreeing.
+        ModuleFormat::Xm => (EndOfSongPolicy::WrapKeepingBreakRow, starplayer::xm::XmFormatExtra::from_header(module.header()).restart_position),
+        ModuleFormat::It => (EndOfSongPolicy::WrapKeepingBreakRow, 0),
+        _ => (EndOfSongPolicy::Stop, 0),
+    };
+    SequencerSettings {
+        sample_rate_hz: TRACE_SAMPLE_RATE_HZ,
+        first_tick_frame: Frame::ZERO,
+        initial_speed: module.header().initial_speed,
+        initial_tempo_bpm: module.header().initial_tempo,
+        restart_order,
+        end_of_song,
+    }
 }
 
 #[cfg(test)]

@@ -150,9 +150,13 @@ impl NativeSequencer {
 
     /// [`NativeSequencer::new`] with the [`SequencerSettings`] spelled out.
     ///
-    /// The one caller that needs this is the offline trace, which wants
-    /// [`EndOfSongPolicy::Stop`](starplayer_engine::EndOfSongPolicy::Stop) so a capture
-    /// ends with the order list instead of looping forever. Everything else — the speed,
+    /// The one caller that needs this is the offline trace, whose end-of-song rule is the
+    /// **oracle's** rather than the player's: MOD, S3M and MTM captures take
+    /// [`EndOfSongPolicy::Stop`](starplayer_engine::EndOfSongPolicy::Stop) so the capture
+    /// ends with the order list, while XM and IT take
+    /// [`WrapKeepingBreakRow`](starplayer_engine::EndOfSongPolicy::WrapKeepingBreakRow)
+    /// because FastTracker 2 and Impulse Tracker wrap there and their dumps run on past it
+    /// (`starplayer_offline`'s `trace_sequencer_settings`). Everything else — the speed,
     /// the tempo, the restart order — should be read off the module header, exactly as
     /// each format crate's private `sequencer_settings` reads it, or the sequencer starts
     /// on timing the module never asked for.
