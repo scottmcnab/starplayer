@@ -62,6 +62,10 @@ These are load-bearing. Removing any of them changes how real modules sound.
 | A note delay next to a **key-off** with no instrument column swallows the volume column's `Cxx` panning | `ft2_replayer.c` `noteDelay` writes `ch->outPan` without raising `CS_UPDATE_PAN`, and neither `triggerNote` (which returns early for a key-off) nor `resetVolumes` (which an instrument column would have run) raises it either; OpenMPT `kFT2PanWithDelayedNoteOff`; libxmp `read_event.c:511-518` | FastTracker 2 behaviour (`openmpt/xm/PanOff.xm`, `data/ft2_delay_volume_column.xm`). StarPlayer suppresses the write where FastTracker 2 suppresses only its visibility; the two could differ only on a channel whose panning envelope raises the flag every tick, and no corpus case has one |
 | An instrument number naming a slot the file does not hold still reloads a fadeout — the placeholder instrument's `0x80` — and the channel keeps that placeholder until a **note** moves it | `ft2_replayer.c` `triggerNote` (`ins = instr[0]`), `triggerInstrument` (`ch->fadeoutSpeed = ins->fadeout`), `allocateInstr` → `setStdEnvelope`; libxmp `read_event.c:580-583` ("unused instruments have fade 0x80") | FastTracker 2 behaviour, and the reason an instrument-without-note row after an out-of-range one fades at the placeholder's rate rather than its own (`data/ft2_instrument_fade_update.xm`) |
 | XM `Xxy` is restricted to `X1x` and `X2x`; every other sub-command is ignored | `ft2_replayer.c` `extraFinePitchSlide`; OpenMPT `kFT2RestrictXCommand` | FastTracker 2 behaviour. ModPlug's `X9E`/`X9F` extension is deviation D45 |
+| An IT filter whose cutoff is fully open with no resonance keeps the coefficients it already has; only a **note trigger** on the same tick disengages it | OpenMPT `Snd_flt.cpp` `SetupChannelFilter` (`kITFilterBehaviour` returns `-1` and only `chn.triggerNote` clears `CHN_FILTER`); libxmp `player.c:1334` spells it `cutoff < 0xfe \|\| resonance > 0 \|\| xc->filter.can_disable` | Impulse Tracker behaviour. `Z7F` next to a note switches the filter off; the same `Z7F` on its own does not (`filter-reset.it`, `filter-reset-carry.it`, `filter-nna.it`) |
+| IT's `SCx` zeroes the voice's increment and its fadeout but leaves the **note, instrument and sample on the channel**; a `^^` note cut takes the channel away | OpenMPT `Snd_fx.cpp` `NoteCut` under `kITSCxStopsSample`; libxmp reclaims a zero-volume voice only past the module's own tracks (`virtual.c:325`) | Impulse Tracker behaviour, and the reason a lone sample or instrument number after an `SCx` retriggers the note rather than doing nothing (`scx.it`, `SCx-Reset.it`) |
+| An IT MIDI macro's `u`, `v` and `y` letters read the channel's **previous tick** volume and pan, not the voice's current one | OpenMPT `MIDIMacroParser.cpp` (`chn.nCalcVolume`, `chn.nRealPan`, both written at the end of the tick); libxmp `xc->macro.finalvol`/`notepan` | Impulse Tracker behaviour. The macro runs at the top of the tick, so the value belongs to the channel and survives a note change and an idle row (`fltmacro.it`, `Volume-Macro-Letters.it`) |
+| An IT instrument's empty note-map slot leaves the **previous note playing** rather than cutting the channel | OpenMPT `Snd_fx.cpp` `NoteChange` under `kITEmptyNoteMapSlot` (`emptyslot.it`, `PortaInsNum.it`, `gxsmp.it`, `gxsmp2.it`) | Impulse Tracker behaviour per OpenMPT. libxmp's dumps show the channel cut, which is `conformance/known-failures.md` `G6-IT-002` and the open question G6 could not settle |
 
 ## 2. Deliberate quirks reproduced only under `quirks-starplayer`
 
@@ -190,7 +194,8 @@ disagreements about Scream Tracker 3, D40 is a disagreement between the original
 both secondary oracles that no available reference can settle, and D41 is a MOD boundary
 the original got wrong in a way that happened to help. The rest record deliberate
 determinism/architecture choices or visible conformance gaps; none may be hidden behind
-an accuracy claim. D42–D47 and D75–D79 are M5's XM entries and have the same shape as D33–D39:
+an accuracy claim. D42–D47 and D75–D79 are M5's XM entries, and D80–D86 are M6's IT ones;
+both have the same shape as D33–D39:
 they are places where **libxmp**, the conformance oracle, represents or computes something
 differently from FastTracker 2, and the accuracy policy's own rule for XM — "the format
 specifications and OpenMPT's documented compatibility behaviour are the reference" — makes
@@ -446,6 +451,108 @@ about StarPlayer is wrong; the sibling `openmpt-xm-panmemory2`, which OpenMPT ca
 thorough check of the same pan memory, passes with every field enforced. Regenerating the
 dump would need libxmp built and run against the pinned tree, which the corpus pin exists to
 avoid.
+
+### D80 — the last bit of IT's volume projection
+
+**Cause.** Impulse Tracker's final channel volume is one integer product —
+`muldiv(volume · globalVolume, channelVolume · instrumentVolume, 1 << 20)` in OpenMPT's
+`Sndmix.cpp` (`chn.nRealVolume`) — evaluated after the envelope and the fadeout have
+already scaled the 14-bit note volume. libxmp forms the same quantity in a different
+grouping and a different order (`src/player.c:1063-1099`: `finalvol` is scaled by the
+fadeout with a `>> 6`, then by `vol_envelope · gvol · mastervol` over `gvolbase` with a
+`>> 18`, then by `instrument->vol · gvl >> 12`), so the two chains round in different
+places. The trace then quantises whatever each side holds onto libxmp's own 0..64 column.
+
+**Behaviour chosen.** OpenMPT's single product, with a **one**-unit tolerance on the
+projected `volume` column for IT — the same shape as D44's for XM, and the only slack the
+IT comparison has. Every case whose volume is more than one unit out stays a known failure
+(`G6-IT-001`).
+
+### D81 — IT's row-delay tick counter against the engine's absolute row clock
+
+**Cause.** `SEx` repeats a row, and Impulse Tracker restarts the player-visible tick
+counter on every repeat, which is what libxmp's dump `frame` column carries. StarPlayer's
+`RowClock` deliberately exposes the **absolute** tick budget of the row so a processor can
+tell a repeated first tick from the row's real first tick — that distinction is what makes
+`FineVolRowDelayMultiple.it`-shaped fixtures decidable at all.
+
+**Behaviour chosen.** Keep the absolute clock in the engine and project it: the conformance
+adapter reduces IT's `tick_in_row` modulo the speed before comparing
+(`crates/starplayer-testkit/src/conformance.rs`, `project_tick_in_row`). This is a
+representation difference in a diagnostic column, not a playback difference — no audible
+state is derived from it.
+
+### D82 — ModPlug Tracker 1.16's IT pattern-loop profile
+
+**Cause.** libxmp gives every IT file `FLOW_MODE_IT_210` and narrows it only for Impulse
+Tracker's own early `Cwt/v` values (`src/loaders/it_load.c:351,394-400`), so a file written
+by ModPlug Tracker 1.16 gets Impulse Tracker's `SBx` flow. `pattern_loop_mpt.it` is exactly
+that file, and its expected row sequence is ModPlug's own: one channel at a time owns the
+loop, and a loop jump blocks every break or jump on the same row — the profile C5 already
+carries for S3M as `S3mLoopDialect::ModPlug116`.
+
+**Behaviour chosen.** `ItLoopDialect::ModPlug116`, selected by `FormatDialect::ModPlugIt`,
+so one detected tracker gets one flow profile in both formats it wrote. The case named by
+the field is `libxmp-it-pattern-loop-mpt`; `pattern_loop_it100/104/210.it` keep the
+Impulse Tracker profiles they name.
+
+### D83 — the ping-pong loop cycle and a reversed sample's start position
+
+**Cause.** Impulse Tracker's software mixer walks a ping-pong loop over `2L - 1` frames —
+it does not repeat the endpoint — where the reusable mixer reflects at both addressable
+endpoints, a `2L` cycle. `S9F` compounds it: a reversed voice that has not moved yet starts
+at the sample's *final fractional* position (OpenMPT `Snd_fx.cpp` `ExtendedChannelEffect`,
+`chn.position.Set(chn.nLength - 1, fractMax)`), so the two mixers' loop coordinates differ by
+up to one frame for the whole life of the note even though every other field agrees.
+
+**Behaviour chosen.** Keep the shared mixer's symmetric reflection — it is one loop
+implementation for five formats, and IT's asymmetry is a property of *its* mixer rather
+than of the module — and implement `S9E`/`S9F` direction and the reverse start position in
+the IT processor. `openmpt-it-bidi-loops`, `openmpt-it-sustain-after-loop` and
+`libxmp-it-reverse-it` waive only `position`; every other field is enforced.
+
+### D84 — libxmp's cutoff column cannot say "no filter" from "cutoff zero"
+
+**Cause.** The dump's `cutoff` column is a *mixer voice* field that libxmp writes only
+when the filter actually engages (`src/player.c:1330-1341`, the
+`libxmp_virt_seteffect(DSP_EFFECT_CUTOFF)` branch). A voice that never engaged one reports
+the zero it was allocated with, and so does a voice that genuinely engaged at cutoff zero —
+`ZxxSecrets.it` and `it_fade_env_reset.it` do exactly that, with a non-zero resonance beside
+it to prove the filter is running.
+
+**Behaviour chosen.** Read a zero in the column as "either", exactly as libxmp's own
+comparator already reads 254 and 255 as the same fully-open cutoff
+(`test-dev/compare_mixer_data.c:84-87`): the projection accepts our 0 and our fully-open
+255 against the oracle's 0, and enforces every other value exactly.
+
+### D85 — libxmp holds a filter envelope at its last value near the top of the axis
+
+**Cause.** libxmp only assigns `xc->filter.envelope = frq_envelope` when the envelope reads
+below `0xfe` (`src/player.c:1318`), having initialised it to `0x100` on the note
+(`src/read_event.c:134`). Impulse Tracker and OpenMPT feed the value straight through:
+`SetupChannelFilter` computes `cutoff · (envModifier + 256) / 256` with `envModifier` from
+`PitchEnv.GetValueFromPosition(envpos, 512, 64) - 256` (OpenMPT `Snd_flt.cpp`,
+`Sndmix.cpp` `ProcessPitchFilterEnvelope`).
+
+**Behaviour chosen.** OpenMPT's, with a **two**-step tolerance on the projected `cutoff`
+column for IT. The bound is derived, not chosen: the envelope axis is `0..=256` and the
+cutoff at most 254, so holding the two top envelope steps moves the cutoff by at most
+`254 · 2 / 256`, which is under two steps of libxmp's doubled cutoff axis — one whole IT
+cutoff unit.
+
+### D86 — IT's panning envelope against libxmp's whole-unit interpolation
+
+**Cause.** The same mechanism as D44, in IT's arithmetic. OpenMPT interpolates its
+envelopes in Q16.16 and rounds once on the way out
+(`ModInstrument.cpp` `InstrumentEnvelope::GetValueFromPosition`), where libxmp recomputes
+`y1 + (y2 - y1)·(x - x1)/(x2 - x1)` in whole envelope units with a division that truncates
+toward zero (`src/player.c:118`). IT applies the result as
+`pan += envelope · (256 - pan)/32` or `envelope · pan/32` (OpenMPT `Sndmix.cpp`
+`ProcessPanningEnvelope`; libxmp's `finalpan` at `src/player.c:1390` is the same
+expression), so one envelope unit of disagreement is four pan units at the centre.
+
+**Behaviour chosen.** OpenMPT's rounding, with the same **four**-unit `pan` tolerance XM
+already carries. A channel with no panning envelope is compared exactly on both sides.
 
 ## 4. Not offered at all
 

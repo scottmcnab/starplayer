@@ -169,6 +169,9 @@ pub enum ItLoopDialect {
     /// Impulse Tracker 1.00 to 1.03: one global loop target and counter for the whole
     /// song, as Scream Tracker 3 has.
     ImpulseTracker100,
+    /// ModPlug Tracker 1.16 and early OpenMPT: only one channel may own a loop,
+    /// and a loop jump blocks every break or jump on the same row.
+    ModPlug116,
 }
 
 impl ItLoopDialect {
@@ -191,6 +194,10 @@ impl ItLoopDialect {
             // FLOW_MODE_IT_100 = FLOW_LOOP_GLOBAL | FLOW_LOOP_UNSET_BREAK
             //                  | FLOW_LOOP_UNSET_JUMP | FLOW_JUMP_NO_ROW_SET
             ItLoopDialect::ImpulseTracker100 => PatternFlow { global_target: true, global_count: true, ..base },
+            ItLoopDialect::ModPlug116 => {
+                let flow = PatternFlow { one_at_a_time: true, jump_keeps_break_row: true, ..PatternFlow::generic() };
+                flow.with_no_break_jump()
+            }
         }
     }
 }
@@ -677,6 +684,11 @@ impl QuirkSet {
     pub const fn impulse_tracker_100() -> QuirkSet {
         QuirkSet { it_pattern_loop: ItLoopDialect::ImpulseTracker100, ..QuirkSet::impulse_tracker() }
     }
+
+    /// ModPlug Tracker 1.16's IT pattern-loop profile (accuracy policy D82).
+    pub const fn modplug_it() -> QuirkSet {
+        QuirkSet { it_pattern_loop: ItLoopDialect::ModPlug116, ..QuirkSet::impulse_tracker() }
+    }
 }
 
 /// Which tracker a loader decided wrote a module, from its file header alone.
@@ -820,10 +832,8 @@ impl FormatDialect {
             FormatDialect::ModPlugXm => QuirkSet::modplug_xm(),
             FormatDialect::SkaleTracker => QuirkSet::skale_tracker(),
             FormatDialect::UnknownXm => QuirkSet::other_xm_tracker(),
-            // libxmp gives every IT `FLOW_MODE_IT_210` and only narrows it for Impulse
-            // Tracker's own early `Cwt/v` values (`src/loaders/it_load.c:351,394-400`),
-            // so every clone lands on the 2.10 baseline.
-            FormatDialect::ImpulseTracker | FormatDialect::OpenMptIt | FormatDialect::SchismTracker | FormatDialect::ModPlugIt => QuirkSet::impulse_tracker(),
+            FormatDialect::ImpulseTracker | FormatDialect::OpenMptIt | FormatDialect::SchismTracker => QuirkSet::impulse_tracker(),
+            FormatDialect::ModPlugIt => QuirkSet::modplug_it(),
             FormatDialect::ImpulseTracker200 => QuirkSet::impulse_tracker_200(),
             FormatDialect::ImpulseTracker104 => QuirkSet::impulse_tracker_104(),
             FormatDialect::ImpulseTracker100 => QuirkSet::impulse_tracker_100(),
@@ -967,18 +977,19 @@ mod tests {
         assert_eq!(modplug, S3mLoopDialect::ModPlug116.flow(), "one ModPlug 1.16, two formats, one `FLOW_MODE_MPT_116`");
     }
 
-    /// Task G3: the IT dialects carry two fields, and both are named by a corpus case —
+    /// Task G3/G6: the IT dialects carry two fields, and both are named by a corpus case —
     /// the truncating tick length (accuracy policy §2, research point 4) and the `SBx`
     /// pattern-loop profile (**D65**, `data/pattern_loop_it1*.it`). Every clone takes the
-    /// 2.10 baseline, exactly as libxmp does (`src/loaders/it_load.c:351`).
+    /// 2.10 baseline except ModPlug's detected 1.16 files (D82).
     #[test]
     fn the_it_dialects_carry_the_truncating_tick_and_their_pattern_loop_profile() {
         let baseline = QuirkSet::impulse_tracker();
         assert_eq!(baseline.tempo_model, TempoModelId::ItModern, "Impulse Tracker truncates its tick length");
         assert_eq!(baseline.it_pattern_loop, ItLoopDialect::ImpulseTracker210);
-        for dialect in [FormatDialect::ImpulseTracker, FormatDialect::OpenMptIt, FormatDialect::SchismTracker, FormatDialect::ModPlugIt] {
+        for dialect in [FormatDialect::ImpulseTracker, FormatDialect::OpenMptIt, FormatDialect::SchismTracker] {
             assert_eq!(dialect.quirks(), baseline, "{dialect:?} plays as Impulse Tracker 2.10");
         }
+        assert_eq!(FormatDialect::ModPlugIt.quirks().it_pattern_loop, ItLoopDialect::ModPlug116);
         assert_eq!(FormatDialect::ImpulseTracker200.quirks().it_pattern_loop, ItLoopDialect::ImpulseTracker200);
         assert_eq!(FormatDialect::ImpulseTracker104.quirks().it_pattern_loop, ItLoopDialect::ImpulseTracker104);
         assert_eq!(FormatDialect::ImpulseTracker100.quirks().it_pattern_loop, ItLoopDialect::ImpulseTracker100);
@@ -1003,6 +1014,7 @@ mod tests {
         let it100 = ItLoopDialect::ImpulseTracker100.flow();
         assert!(it100.global_target && it100.global_count, "FLOW_MODE_IT_100 carries FLOW_LOOP_GLOBAL");
         assert_eq!(PatternFlow { global_target: false, global_count: false, ..it100 }, it104);
+        assert_eq!(ItLoopDialect::ModPlug116.flow(), S3mLoopDialect::ModPlug116.flow(), "ModPlug 1.16 uses one flow profile in IT and S3M");
     }
 
     /// Field for field against libxmp `src/common.h:353-443`.

@@ -184,90 +184,170 @@ Impulse Tracker all wrap too — so it belongs to a sequencer task with its own 
 scanned song lengths, not to the XM processor. F5 deliberately did not reach for it: making
 the XM crate wrap on its own would give one format a rule the other four do not have.
 
-## M6 — IT (task G3)
+## M6 — IT (tasks G3 and G6)
 
-Task G3 landed IT playback: the effect processor, instrument articulation, New Note
-Actions, duplicate checks and voice stealing, wired into 121 pinned corpus cases. Thirteen
-pass with every field enforced and twenty-six more pass with `position` waived under
-accuracy-policy entry **D67**. The eighty-two records below are the remainder, grouped by
-the first field that diverges once `position` is set aside, so each group is one piece of
-work rather than one case. They belong to **G6** (`plans/engine/M6-task-G6-*`), the
-conformance-repair task M6 exits through; none of them is an accepted deviation, and every
-excluded case is still executed on every run, so a fix makes its exclusion fail as stale.
+Task G3 landed IT playback and wired 121 pinned corpus cases into the harness; 39 passed
+and 82 were recorded here. Task G6 was the repair pass: **55 now pass** — 14 with every
+field enforced and 41 with `position` waived under accuracy-policy entry **D67** — and the
+66 records below are the remainder, regrouped by the first field that diverges once
+`position` is set aside. Each group is one piece of work rather than one case. None of them
+is an accepted deviation, and every excluded case is still executed on every run, so a fix
+makes its exclusion fail as stale.
+
+G6 landed, and the accuracy policy now carries, **D80** (the volume chain's last bit, a
+one-step `volume` tolerance), **D81** (the row-delay tick counter), **D82** (ModPlug Tracker
+1.16's IT pattern-loop profile), **D83** (the ping-pong cycle and `S9E`/`S9F`), **D84**
+(libxmp's ambiguous zero cutoff), **D85** (a two-step `cutoff` tolerance) and **D86** (a
+four-unit `pan` tolerance). The engine repairs G6 made are, in order of cases moved: the
+filter is left engaged when a fully-open cutoff arrives without a note trigger; `SCx`
+silences a voice without taking it off the channel; a lone *sample* number retriggers in
+sample mode on the same rule instrument mode already used; the `u`, `v` and `y` MIDI-macro
+letters read the channel's previous-tick volume and pan rather than the current voice's;
+Envelope Carry copies the preceding voice's counters; `S9E`/`S9F` reverse playback; and the
+`Zxx` macro parser handles every letter substitution and more than one internal message per
+macro.
 
 The categories were measured at the same commit as the exclusion rows. A case appears in
 exactly one group — the one its *first* divergence names — so fixing a group will move
 cases into another group before it moves them into the pass column.
 
-## G3-IT-001
+## G6-IT-001
 
-**The volume chain's last bit — 24 cases.** The first difference is one or two steps of
-the trace's 0..64 volume axis, usually while an envelope is attacking or a fadeout is
-running. StarPlayer implements OpenMPT's chain (`Vol · VEV · NFC · CV · SV · IV · GV`
-folded as `muldiv(vol14 · GV256, CV · insVol, 1 << 20)`); libxmp folds the sample and
-instrument global volumes in *after* the envelope and the fadeout
-(`QUIRK_INSVOL`, `src/player.c:1102`) and divides by different powers of two on the way.
-The quantisation to six bits then turns a sub-percent difference into a whole step. G6
-should settle which order Impulse Tracker itself uses — `it2play`'s `Music_*` volume code
-is the authority — and either match it or record the difference as a deviation with a
-one-step tolerance.
+**The volume chain — 21 cases.** `libxmp-it-channel-filter`,
+`libxmp-it-duplicate-check-transpose`, `libxmp-it-fade-env-reset`,
+`libxmp-it-finevolrowdelaymultiple`, `libxmp-it-note-delay-nna`,
+`libxmp-it-portamento-after-cut-fade-cg`, `libxmp-it-portamento-after-keyoff-cg`,
+`libxmp-it-portamento-envelope-reset-cg`, `libxmp-it-portamento-nna-sample`,
+`openmpt-it-cut-carry`, `openmpt-it-envelope-loops`, `openmpt-it-fade-portamento`,
+`openmpt-it-fine-volume-column-slide`, `openmpt-it-instrument-number-change`,
+`openmpt-it-macro-last-note`, `openmpt-it-note-off-portamento`, `openmpt-it-note-off-two`,
+`openmpt-it-off-portamento`, `openmpt-it-off-portamento-compatible-gxx`,
+`openmpt-it-volume-column-memory`, `openmpt-it-volume-envelope-carry`.
 
-## G3-IT-002
+D80 settled the *arithmetic*: the one-step tolerance covers the two chains' different
+grouping, and the volume products themselves now agree. What is left is **state**, not
+rounding — every remaining first difference is more than one step, and most are far more
+(`openmpt-it-off-portamento-compatible-gxx` is 55 against 4). The cases cluster on
+envelope and fadeout *reset* rules around note-off, note-cut and tone portamento
+(`kITResetFilterOnNoteOff`, `kITEnvelopeReset`, `kITPortamentoInstrument`), on volume
+column memory, and on Envelope Carry.
 
-**The filter envelope and the `Zxx` cutoff — 16 cases.** The first difference is two or
-three steps of the 0..255 cutoff axis while a filter envelope is running. Both players
-compute the same product — OpenMPT's `cutoff · (envModifier + 256) / 256` and libxmp's
-`filter.cutoff · filter.envelope >> 8` are algebraically identical — so the difference is
-the *envelope interpolation*: libxmp interpolates node values pre-multiplied by four
-(`src/loaders/it_load.c:664`) and StarPlayer interpolates the model's −32..32 values scaled
-by eight. libxmp's own `ZxxSecrets` test comment records that its filter-envelope handling
-is wrong ("libxmp right shifting the cutoff by the filter envelope range instead of
-deriving coefficients off of the product"), so G6 must decide this against OpenMPT rather
-than against the oracle, and may have to record it as a deviation.
+**What would settle it:** read OpenMPT's `NoteChange`/`InstrumentChange` reset matrix case
+by case against `ResetEnvNoteOffOldFx*.it`, `wnoteoff.it`, `noteoff3.it` and
+`CarryNNA.it`, and check each against the dump tick by tick. G6 fixed the two that had a
+common cause; the rest need one reading each.
 
-## G3-IT-003
+## G6-IT-002
 
-**The sounding voice set — 12 cases.** The first difference is a channel or a virtual
-channel that one player has sounding and the other does not: a New Note Action that should
-not have allocated a background voice, a voice that should have been freed when its fadeout
-reached zero, or a duplicate check that should have killed one. The virtual-channel
-numbering the adapter reproduces (research point 1) is only as good as the set of voices it
-is numbering, so a difference here also shifts every later background row.
+**The sounding voice set — 14 cases.** `libxmp-it-g00-nosuck`,
+`libxmp-it-instrument-memory-default`, `libxmp-it-l00-nosuck`, `libxmp-it-noteoff-nosuck`,
+`openmpt-it-empty-slot`, `openmpt-it-envelope-off-length`, `openmpt-it-gxx-test`,
+`openmpt-it-no-map`, `openmpt-it-note-off-instrument`,
+`openmpt-it-portamento-just-stopped-note`, `openmpt-it-s7x-instrument-number`,
+`openmpt-it-scx`, `openmpt-it-stopped-instrument-swap`, `openmpt-it-zxx-secrets`.
 
-## G3-IT-004
+Twelve of the fourteen are `expected false, actual true`: libxmp drops the channel's voice
+where StarPlayer keeps it sounding. G6 established the two halves of the rule that are
+certain — libxmp reclaims a zero-volume voice only when its channel index is past the
+module's own tracks (`libxmp_virt_setvol`, `src/virtual.c:325`), and OpenMPT's `NoteCut`
+leaves the note on the channel — and moving to it fixed `openmpt-it-scx`'s first four
+ticks. The remaining shape is a note whose instrument maps the note to **no sample**:
+OpenMPT's `kITEmptyNoteMapSlot` returns from `NoteChange` and leaves the old note playing
+(`Snd_fx.cpp:1883-1889`, test cases `emptyslot.it`, `PortaInsNum.it`, `gxsmp.it`), which is
+what StarPlayer does, while libxmp's dump shows the channel gone.
 
-**Note and sample selection — 10 cases.** The first difference is the note or the sample a
-channel is playing: the empty-note-map-slot rules (`kITEmptyNoteMapSlot`,
-`kITEmptyNoteMapSlotIgnoreCell`), the lone-instrument-number rules
-(`kITInstrWithoutNote`, `kITMultiSampleInstrumentNumber`), and the portamento sample-swap
-rules (`kITPortamentoInstrument`, `kITPortamentoSwapResetsPos`) interact, and G3 implements
-them from OpenMPT's description rather than from a per-case reading.
+**What would settle it:** whether libxmp cutting the channel on an empty note-map slot is
+Impulse Tracker's behaviour or libxmp's own. OpenMPT's comment and its four test cases say
+the note keeps playing; if that holds against a real IT 2.14 capture, twelve of these
+become a documented deviation rather than a repair, and the exclusion rows should say so.
+`openmpt-it-note-off-instrument` and `openmpt-it-portamento-just-stopped-note` are the
+opposite direction — libxmp keeps a voice we free — and are separate work.
 
-## G3-IT-005
+## G6-IT-003
 
-**Pitch — 8 cases.** The first difference is the `period` column by more than one whole
-period, so it is a real pitch error rather than D64's axis resolution: a slide that ran on
-the wrong tick, a portamento target that was not consumed, or an arpeggio phase that is out
-of step.
+**Pitch — 12 cases.** `libxmp-it-double-toneporta`, `libxmp-it-mpt-it-double-toneporta`,
+`libxmp-it-note-after-cut`, `libxmp-it-portamento-sustain`, `libxmp-it-storlek-01`,
+`libxmp-it-storlek-24`, `openmpt-it-carry-nna`, `openmpt-it-envelope-loop-escape`,
+`openmpt-it-portamento-instrument-number`, `openmpt-it-portamento-offset`,
+`openmpt-it-portamento-sample`, `openmpt-it-retrigger`.
 
-## G3-IT-006
+The first difference is the `period` column by more than one whole period, so it is a real
+pitch error rather than D64's axis resolution. Two sub-shapes: a *double tone portamento*
+(a `Gxx` in both the effect and the volume columns of one row — `libxmp-it-double-toneporta`
+and its ModPlug sibling), and a portamento whose **target** was taken from the wrong note or
+sample after an instrument or sample change (`openmpt-it-portamento-sample`,
+`openmpt-it-portamento-instrument-number`, `libxmp-it-storlek-24`). G6 corrected the linear
+slide's table domains — fine amounts below 16 index the fine table directly rather than
+splitting into coarse and fine factors — which is why `openmpt-it-retrigger` is now two
+units out rather than a whole semitone.
 
-**Row flow and the tick budget — 8 cases.** The first difference is `row`, `tick-in-row` or
-`frame`: a pattern loop, break or jump that resolved differently, or a row whose tick
-budget differs because `SEx`, `S6x` or a `Txx` tempo slide was counted differently. The
-four `pattern_loop_it*` fixtures that exercise D65's dialects are **not** in this group —
-three of them pass with the D67 waiver — so this is the `Cxx`/`Bxx`/`SBx` interaction
-rather than the dialect selection.
+**What would settle it:** `kITPortamentoInstrument` and `kITMultiSampleInstrumentNumber`
+read against `PortaInsNum.it` and `PortaSmpChange.it`, and a decision about which column's
+`Gxx` wins when a row carries two.
 
-## G3-IT-007
+## G6-IT-004
 
-**Panning — 1 case.** The first difference is the pan column outside surround, so it is the
-pan envelope's asymmetric scaling, pitch/pan separation, or the pan swing.
+**The filter envelope and the `Zxx` cutoff — 7 cases.** `libxmp-it-fade-env-reset-carry`,
+`libxmp-it-smooth-macro`, `openmpt-it-extreme-filter`, `openmpt-it-filter-envelope-carry`,
+`openmpt-it-filter-envelope-reset`, `openmpt-it-filter-nna`,
+`openmpt-it-filter-reset-carry`.
 
-## G3-IT-008
+G6 removed nine of the sixteen G3 recorded: D84 settled libxmp's ambiguous zero, D85 the
+`frq_envelope < 0xfe` hold, and the processor now leaves the filter engaged when a fully
+open cutoff arrives without a note trigger. Three of the seven left are the **carried**
+filter envelope: with Envelope Carry set, libxmp does not reset `xc->f_idx`
+(`src/read_event.c:112`), so on the *song's first note* it evaluates the envelope at tick
+1 where its uncarried counterpart would evaluate at tick 0 — its index is zeroed by
+`calloc` rather than set to `-1` — and the whole trace is one envelope tick ahead of ours.
+The other four are two to four cutoff steps out later in the trace, past D85's bound.
 
-**Sample position beyond the D67 waiver — 3 cases.** Two cases diverge on `position` by
-more than the accumulated-rounding difference D67 covers, so something other than the
-frequency's last bit moved the voice. The third, `openmpt-it-bidi-loops`, is the fixture
-that exists to test it: Impulse Tracker's software mixer plays a ping-pong loop **one
-sample short** of the file's, which OpenMPT emulates and G3 did not implement.
+**What would settle it:** for the carry three, whether OpenMPT starts a carried envelope at
+position 0 on the first note (it does, `chn.PitchEnv.nEnvPosition` is zero-initialised),
+which would make this a deviation and not a repair. For the other four, a tick-by-tick read
+of `filter-nna.it` and `extreme-filter-test-1.it` against OpenMPT's
+`SetupChannelFilter` return value.
+
+## G6-IT-005
+
+**Note and sample identity — 6 cases.** `libxmp-it-cut-invalid-ins`,
+`libxmp-it-portamento-after-cut-fade`, `libxmp-it-portamento-after-keyoff`,
+`libxmp-it-portamento-envelope-reset`, `libxmp-it-test-keyoff`,
+`openmpt-it-envelope-reset`.
+
+All six are `expected Some(n), actual None`: libxmp still names a note on the channel where
+StarPlayer's processor has already let go of its voice state, so the trace reports no note
+even though the mixer voice is alive. This is the same lifetime question as `G6-IT-002`
+seen from the other side, narrowed to the *fadeout* path — G6 fixed the `SCx` path but left
+a note whose fadeout reached zero being freed outright.
+
+**What would settle it:** deciding whether a foreground voice whose fadeout has reached
+zero stays on the channel (libxmp and OpenMPT both keep it) and, if so, when it is ever
+reclaimed. The naive change — keep every silent foreground voice — was measured during G6
+and regressed `libxmp-it-high-offset-memory`, so the reclaim rule has to come with it.
+
+## G6-IT-006
+
+**Row flow and the tick budget — 4 cases.** `libxmp-it-play-it-globalvol-marker`,
+`libxmp-it-storlek-17`, `libxmp-it-storlek-22`, `openmpt-it-s77`.
+
+The first difference is the `frame` column beyond its 45-frame tolerance, so it is a tick
+budget rather than a row sequence — `libxmp-it-storlek-22` is 7100 against 3445 at the very
+first tick, which is a whole row of speed. Three of these have an initial-speed or
+initial-tempo reading behind them; `openmpt-it-s77` drifts only after 192 ticks and is an
+envelope-pause interaction with the budget. D65's four `pattern_loop_it*` fixtures and
+D82's ModPlug one are **not** in this group: all five now agree on the row sequence.
+
+**What would settle it:** the `frame` column for tick 0 read against the module header's
+initial speed and tempo, and `S77`/`S79`/`S7B` against the row clock.
+
+## G6-IT-007
+
+**Panning — 2 cases.** `openmpt-it-gxx-sample-map`, `openmpt-it-gxx-sample-map-change`.
+
+D86's four-unit envelope tolerance settled five of the six panning cases G3 recorded. These
+two are 15 against 0 — a hard-panned voice, not an envelope step — on a `Gxx` that changes
+which sample the note maps to, so it is the sample's own default pan being applied (or not)
+across a portamento sample swap.
+
+**What would settle it:** `kITPortamentoSwapResetsPos` and the sample default-pan rule read
+against `gxsmp.it` and `gxsmp2.it`.
