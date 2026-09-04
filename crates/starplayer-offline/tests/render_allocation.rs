@@ -496,3 +496,69 @@ fn rendering_a_midi_source_allocates_nothing() {
         control.collect_all_garbage();
     }
 }
+
+/// Task E5's arm: `SmfSequencer` feeding the same `MidiSource` the test above proved
+/// clean, this time from a parsed Standard MIDI File rather than a live event ring.
+/// Parsing the file and converting it to frames both allocate, off the audio thread,
+/// before the watched region begins — exactly as building the previous test's rack and
+/// ring does.
+#[test]
+fn rendering_an_smf_source_allocates_nothing() {
+    use starplayer::core::Frame;
+    use starplayer::engine::{InstrumentRack, MidiSource};
+    use starplayer::midi::SmfSequencer;
+    use starplayer::midi::smf::parse_smf;
+
+    // One track, four channels, eight note on/off pairs and a controller message, all
+    // with explicit status bytes and small delta-times — enough channel voice traffic
+    // that a per-event allocation could not hide, without needing running status here
+    // (that shape is `starplayer-midi`'s own test suite's job).
+    let mut track = vec![0x00, 0x90, 60, 100, 0x00, 0xB0, 7, 100, 0x03, 0x80, 60, 0];
+    for (index, channel_status) in [0x91u8, 0x92, 0x93].into_iter().enumerate() {
+        let note = 65 + index as u8 * 5;
+        track.extend_from_slice(&[0x00, channel_status, note, 100, 0x06, channel_status - 0x10, note, 0]);
+    }
+    track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]); // end of track
+    let mut smf_bytes = Vec::new();
+    smf_bytes.extend_from_slice(b"MThd");
+    smf_bytes.extend_from_slice(&6u32.to_be_bytes());
+    smf_bytes.extend_from_slice(&0u16.to_be_bytes()); // format 0
+    smf_bytes.extend_from_slice(&1u16.to_be_bytes()); // one track
+    smf_bytes.extend_from_slice(&96u16.to_be_bytes()); // 96 PPQN
+    smf_bytes.extend_from_slice(b"MTrk");
+    smf_bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    smf_bytes.extend_from_slice(&track);
+
+    let module = Arc::new(starplayer::it::load(&starplayer_offline::fixtures::synthetic_it()).expect("the synthesised IT loads"));
+    let settings = EngineSettings {
+        sample_rate_hz: SAMPLE_RATE_HZ,
+        channel_count: starplayer::engine::ChannelTable::MAX_CHANNELS,
+        voice_capacity: starplayer::recommended_voice_capacity(&module).max(16),
+        ..EngineSettings::default()
+    };
+    let smf = parse_smf(&smf_bytes).expect("the hand-assembled file parses");
+
+    for host_block_frames in [128usize, 37, 4096] {
+        let mut engine: CorpusEngine = Engine::with_settings(settings);
+        let mut control = engine.take_control().expect("a fresh engine owns its control handle");
+        control.load_module(Arc::clone(&module)).map_err(|_| "full").expect("the ring has room");
+
+        // Everything the audio thread will touch is allocated here, before it goes over:
+        // the rack's boxed instruments, the sequencer's converted frame list, and the
+        // source itself.
+        let rack = InstrumentRack::for_module(&module, SAMPLE_RATE_HZ);
+        let sequencer = SmfSequencer::new(&smf, SAMPLE_RATE_HZ);
+        engine.set_source(Box::new(MidiSource::new(sequencer, rack, SAMPLE_RATE_HZ)));
+
+        let mut block = vec![0i16; host_block_frames * 2];
+        let blocks = FRAMES_PER_MODULE.div_ceil(host_block_frames);
+        let (_, report) = while_watching_for_allocations(|| {
+            for _ in 0..blocks {
+                engine.render(&mut block);
+            }
+        });
+        assert!(report.is_clean(), "render() allocated with an SMF source at block size {host_block_frames}: {report:?}");
+        assert!(engine.voices().voices_active() > 0 || engine.frame() > Frame(0), "the source drove the engine");
+        control.collect_all_garbage();
+    }
+}

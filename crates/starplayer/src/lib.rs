@@ -169,6 +169,20 @@ pub use starplayer_xm as xm;
 #[cfg(feature = "it")]
 pub use starplayer_it as it;
 
+/// The MIDI byte codec, and — with the `smf` feature — the Standard MIDI File parser and
+/// [`SmfSequencer`](starplayer_midi::SmfSequencer). A `.mid` is not a
+/// [`Module`](model::Module) (task E5 / architecture §2.3): it has no sample data of its
+/// own and plays a *loaded module's* instruments, so it gets [`probe_smf`] and
+/// `midi::smf::parse_smf` rather than an arm in [`load`].
+#[cfg(feature = "midi")]
+pub use starplayer_midi as midi;
+
+/// Whether `bytes` begins with a Standard MIDI File header (`MThd`) — the `.mid`
+/// counterpart to [`probe`], for the one format this facade can play that [`probe`] and
+/// [`load`] never will.
+#[cfg(feature = "smf")]
+pub fn probe_smf(bytes: &[u8]) -> bool { starplayer_midi::smf::probe(bytes) }
+
 /// One module's scanned song shape and the [`QuirkSet`](core::quirks::QuirkSet) it was
 /// scanned under.
 ///

@@ -83,6 +83,16 @@ pub struct PlayArgs {
     /// Print every output device on every backend this build can reach, and exit.
     #[arg(long)]
     pub list_devices: bool,
+    // ── task E5 ──────────────────────────────────────────────────────────────────────
+    /// The module whose instruments play a `.mid` file (task E5 deliverable 4).
+    /// Required when `file` is a Standard MIDI File; ignored, with no effect, for a
+    /// tracker module. `play` does not yet play a `.mid` through a device — that needs
+    /// `starplayer-host::Player` support E6/E7 land — so today this flag only lets a
+    /// `.mid` fail with a message naming `render` instead of the generic "not a module
+    /// format this build plays".
+    #[arg(long)]
+    pub instruments: Option<PathBuf>,
+    // ── end task E5 ──────────────────────────────────────────────────────────────────
 }
 
 pub fn run(args: PlayArgs) -> Result<(), String> {
@@ -95,6 +105,20 @@ pub fn run(args: PlayArgs) -> Result<(), String> {
         return Err(String::from("no module given; see --help"));
     };
     let bytes = archive::load_module_bytes(&file, args.entry)?;
+
+    // ── task E5: `play` cannot drive a `.mid` yet; fail clearly rather than through
+    // `Player::load`'s generic "not a module format this build plays". ──────────────
+    if starplayer::probe_smf(&bytes) {
+        return match &args.instruments {
+            None => Err(format!("{}: a Standard MIDI File needs --instruments <module> naming the module whose instruments play it", file.display())),
+            Some(_) => Err(format!(
+                "{}: `play` cannot drive a .mid through a device yet; render it instead: `starplayer render {} --instruments <module> -o out.wav`",
+                file.display(),
+                file.display()
+            )),
+        };
+    }
+    // ── end task E5 ────────────────────────────────────────────────────────────────
 
     let mut backend = CpalBackend::new().map_err(|error| error.to_string())?;
     let backend_name = backend.host_name();
@@ -264,7 +288,7 @@ mod tests {
     }
 
     fn default_args() -> PlayArgs {
-        PlayArgs { file: None, entry: None, device: None, rate: 48_000, buffer: DEFAULT_BUFFER_FRAMES, repeat: false, list_devices: false }
+        PlayArgs { file: None, entry: None, device: None, rate: 48_000, buffer: DEFAULT_BUFFER_FRAMES, repeat: false, list_devices: false, instruments: None }
     }
 
     /// Research point 1: a machine with no device fails `play` with one clear line
@@ -309,5 +333,49 @@ mod tests {
         // plumbing that carries the flag through to `Player::open` is in scope.
         let args = PlayArgs { device: Some(String::from("rdp")), ..default_args() };
         assert_eq!(args.device.as_deref(), Some("rdp"));
+    }
+
+    /// Task E5: a `.mid` with no `--instruments` fails `run` naming the flag, before
+    /// `run` ever opens a device — no `CpalBackend` is touched, so this runs without
+    /// a sound card exactly like the research-point-1 test above.
+    #[test]
+    fn a_mid_file_with_no_instruments_flag_names_it_in_the_error() {
+        let path = std::env::temp_dir().join("starplayer-e5-play-test.mid");
+        std::fs::write(&path, minimal_smf_bytes()).expect("can write a scratch file");
+
+        let error = run(PlayArgs { file: Some(path.clone()), ..default_args() }).expect_err("a .mid with no --instruments must fail");
+        assert!(error.contains("--instruments"), "the error must name the missing flag: {error:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Task E5: `play` does not yet drive a `.mid` through a device (that needs
+    /// `starplayer-host::Player` support E6/E7 land) — with `--instruments` given, the
+    /// error points at `render` instead of failing silently or panicking.
+    #[test]
+    fn a_mid_file_with_instruments_points_at_render_instead_of_playing() {
+        let path = std::env::temp_dir().join("starplayer-e5-play-test-2.mid");
+        std::fs::write(&path, minimal_smf_bytes()).expect("can write a scratch file");
+
+        let error = run(PlayArgs { file: Some(path.clone()), instruments: Some(PathBuf::from("module.it")), ..default_args() })
+            .expect_err("play cannot drive a .mid through a device yet");
+        assert!(error.contains("render"), "the error must point at `render` instead: {error:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The smallest legal Standard MIDI File: an empty format-0 track.
+    fn minimal_smf_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MThd");
+        bytes.extend_from_slice(&6u32.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&96u16.to_be_bytes());
+        bytes.extend_from_slice(b"MTrk");
+        let track: &[u8] = &[0x00, 0xFF, 0x2F, 0x00];
+        bytes.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(track);
+        bytes
     }
 }

@@ -130,10 +130,22 @@ pub struct RenderArgs {
     /// Which recognised entry of a ZIP archive to render.
     #[arg(long)]
     pub entry: Option<usize>,
+    /// The module whose instruments play a `.mid` file (task E5 deliverable 4). Required
+    /// when `file` is a Standard MIDI File; program numbers on its sixteen MIDI channels
+    /// index this module's instruments. Ignored, with no effect, for a tracker module.
+    #[arg(long)]
+    pub instruments: Option<PathBuf>,
 }
 
 pub fn run(args: RenderArgs) -> Result<(), String> {
     let bytes = archive::load_module_bytes(&args.file, args.entry)?;
+
+    // ── task E5: a `.mid` renders through a loaded module's instruments ──────────────
+    if starplayer::probe_smf(&bytes) {
+        return run_smf(&args, &bytes);
+    }
+    // ── end task E5 branch ────────────────────────────────────────────────────────────
+
     let format = starplayer::probe(&bytes)
         .and_then(golden_format)
         .ok_or_else(|| format!("{}: not a module format this build plays", args.file.display()))?;
@@ -201,6 +213,45 @@ fn run_golden(output: &Path, format: GoldenFormat, bytes: &[u8]) -> Result<(), S
         output.display()
     );
     println!("sha256: {}", starplayer_offline::sha256_hex(hash));
+    Ok(())
+}
+
+/// Task E5 deliverable 4: `render <file.mid> --instruments <module> -o out.wav`. A
+/// Standard MIDI File has no loop point of its own, so there is no `RenderLength` to
+/// build here — the render is exactly `--instruments`' rack playing the file once, from
+/// tick zero to its own `end_of_track`.
+fn run_smf(args: &RenderArgs, smf_bytes: &[u8]) -> Result<(), String> {
+    if args.golden {
+        return Err(format!("{}: --golden only renders a tracker module; render a .mid with --instruments <module> instead", args.file.display()));
+    }
+    let Some(instruments_path) = args.instruments.as_ref() else {
+        return Err(format!("{}: a Standard MIDI File needs --instruments <module> naming the module whose instruments play it", args.file.display()));
+    };
+    let instruments_bytes = archive::load_module_bytes(instruments_path, None)?;
+
+    let channels: u16 = if args.mono { 1 } else { 2 };
+    let host_block_frames = starplayer_offline::GOLDEN_HOST_BLOCK_FRAMES;
+
+    let (frames_written, hash) = render_dispatch_smf(RenderSmfTarget {
+        mix_path: args.mix_path,
+        interp: args.interp,
+        depth: args.depth,
+        channels,
+        smf_bytes,
+        instruments_bytes: &instruments_bytes,
+        rate: args.rate,
+        host_block_frames,
+        output: &args.output,
+    })?;
+
+    println!(
+        "wrote {} · {frames_written} frames · {:.3} s at {} Hz to {}",
+        describe(args.mix_path, args.interp, args.depth, channels),
+        frames_written as f64 / args.rate.max(1) as f64,
+        args.rate,
+        args.output.display()
+    );
+    println!("sha256: {hash}");
     Ok(())
 }
 
@@ -310,6 +361,75 @@ fn render_dispatch(target: RenderTarget<'_>) -> Result<(usize, String), String> 
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I32, 2) => render_and_write!(FixedPath, FixedOut<i32, 2>, Linear, 2),
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::F32, 1) => render_and_write!(FixedPath, FixedOut<f32, 1>, Linear, 1),
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::F32, 2) => render_and_write!(FixedPath, FixedOut<f32, 2>, Linear, 2),
+
+        (_, _, _, channels) => return Err(format!("internal error: unhandled channel count {channels}")),
+    };
+    Ok(result)
+}
+
+// ── task E5: rendering a Standard MIDI File ─────────────────────────────────────────
+
+/// [`render_dispatch_smf`]'s parameters, the `.mid` counterpart to [`RenderTarget`].
+struct RenderSmfTarget<'a> {
+    mix_path: MixPathArg,
+    interp: InterpArg,
+    depth: DepthArg,
+    channels: u16,
+    smf_bytes: &'a [u8],
+    instruments_bytes: &'a [u8],
+    rate: u32,
+    host_block_frames: usize,
+    output: &'a Path,
+}
+
+/// [`render_dispatch`]'s shape, calling [`starplayer_offline::render_smf_song`] instead
+/// of `render_song`: no `RenderLength` to dispatch on, since a `.mid` has no loop point.
+fn render_dispatch_smf(target: RenderSmfTarget<'_>) -> Result<(usize, String), String> {
+    let RenderSmfTarget { mix_path, interp, depth, channels, smf_bytes, instruments_bytes, rate, host_block_frames, output } = target;
+    macro_rules! render_and_write_smf {
+        ($path:ty, $out:ty, $interp:ty, $channels:expr) => {{
+            let samples = starplayer_offline::render_smf_song::<$path, $interp, $out>(smf_bytes, instruments_bytes, rate, host_block_frames).map_err(|error| error.to_string())?;
+            write_wav(output, rate, channels, &samples).map_err(|error| error.to_string())?;
+            (samples.len() / ($channels as usize), pcm_sha256(&samples))
+        }};
+    }
+
+    let result = match (mix_path, interp, depth, channels) {
+        (MixPathArg::Float, InterpArg::Nearest, DepthArg::I16, 1) => render_and_write_smf!(FloatPath, FloatOut<i16, 1>, Nearest, 1),
+        (MixPathArg::Float, InterpArg::Nearest, DepthArg::I16, 2) => render_and_write_smf!(FloatPath, FloatOut<i16, 2>, Nearest, 2),
+        (MixPathArg::Float, InterpArg::Nearest, DepthArg::I24, 1) => render_and_write_smf!(FloatPath, FloatOut<I24, 1>, Nearest, 1),
+        (MixPathArg::Float, InterpArg::Nearest, DepthArg::I24, 2) => render_and_write_smf!(FloatPath, FloatOut<I24, 2>, Nearest, 2),
+        (MixPathArg::Float, InterpArg::Nearest, DepthArg::I32, 1) => render_and_write_smf!(FloatPath, FloatOut<i32, 1>, Nearest, 1),
+        (MixPathArg::Float, InterpArg::Nearest, DepthArg::I32, 2) => render_and_write_smf!(FloatPath, FloatOut<i32, 2>, Nearest, 2),
+        (MixPathArg::Float, InterpArg::Nearest, DepthArg::F32, 1) => render_and_write_smf!(FloatPath, FloatOut<f32, 1>, Nearest, 1),
+        (MixPathArg::Float, InterpArg::Nearest, DepthArg::F32, 2) => render_and_write_smf!(FloatPath, FloatOut<f32, 2>, Nearest, 2),
+
+        (MixPathArg::Float, InterpArg::Linear, DepthArg::I16, 1) => render_and_write_smf!(FloatPath, FloatOut<i16, 1>, Linear, 1),
+        (MixPathArg::Float, InterpArg::Linear, DepthArg::I16, 2) => render_and_write_smf!(FloatPath, FloatOut<i16, 2>, Linear, 2),
+        (MixPathArg::Float, InterpArg::Linear, DepthArg::I24, 1) => render_and_write_smf!(FloatPath, FloatOut<I24, 1>, Linear, 1),
+        (MixPathArg::Float, InterpArg::Linear, DepthArg::I24, 2) => render_and_write_smf!(FloatPath, FloatOut<I24, 2>, Linear, 2),
+        (MixPathArg::Float, InterpArg::Linear, DepthArg::I32, 1) => render_and_write_smf!(FloatPath, FloatOut<i32, 1>, Linear, 1),
+        (MixPathArg::Float, InterpArg::Linear, DepthArg::I32, 2) => render_and_write_smf!(FloatPath, FloatOut<i32, 2>, Linear, 2),
+        (MixPathArg::Float, InterpArg::Linear, DepthArg::F32, 1) => render_and_write_smf!(FloatPath, FloatOut<f32, 1>, Linear, 1),
+        (MixPathArg::Float, InterpArg::Linear, DepthArg::F32, 2) => render_and_write_smf!(FloatPath, FloatOut<f32, 2>, Linear, 2),
+
+        (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I16, 1) => render_and_write_smf!(FixedPath, FixedOut<i16, 1>, Nearest, 1),
+        (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I16, 2) => render_and_write_smf!(FixedPath, FixedOut<i16, 2>, Nearest, 2),
+        (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I24, 1) => render_and_write_smf!(FixedPath, FixedOut<I24, 1>, Nearest, 1),
+        (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I24, 2) => render_and_write_smf!(FixedPath, FixedOut<I24, 2>, Nearest, 2),
+        (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I32, 1) => render_and_write_smf!(FixedPath, FixedOut<i32, 1>, Nearest, 1),
+        (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I32, 2) => render_and_write_smf!(FixedPath, FixedOut<i32, 2>, Nearest, 2),
+        (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::F32, 1) => render_and_write_smf!(FixedPath, FixedOut<f32, 1>, Nearest, 1),
+        (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::F32, 2) => render_and_write_smf!(FixedPath, FixedOut<f32, 2>, Nearest, 2),
+
+        (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I16, 1) => render_and_write_smf!(FixedPath, FixedOut<i16, 1>, Linear, 1),
+        (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I16, 2) => render_and_write_smf!(FixedPath, FixedOut<i16, 2>, Linear, 2),
+        (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I24, 1) => render_and_write_smf!(FixedPath, FixedOut<I24, 1>, Linear, 1),
+        (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I24, 2) => render_and_write_smf!(FixedPath, FixedOut<I24, 2>, Linear, 2),
+        (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I32, 1) => render_and_write_smf!(FixedPath, FixedOut<i32, 1>, Linear, 1),
+        (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I32, 2) => render_and_write_smf!(FixedPath, FixedOut<i32, 2>, Linear, 2),
+        (MixPathArg::Fixed, InterpArg::Linear, DepthArg::F32, 1) => render_and_write_smf!(FixedPath, FixedOut<f32, 1>, Linear, 1),
+        (MixPathArg::Fixed, InterpArg::Linear, DepthArg::F32, 2) => render_and_write_smf!(FixedPath, FixedOut<f32, 2>, Linear, 2),
 
         (_, _, _, channels) => return Err(format!("internal error: unhandled channel count {channels}")),
     };

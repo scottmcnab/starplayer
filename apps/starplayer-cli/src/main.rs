@@ -5,7 +5,9 @@
 //! ```text
 //! starplayer info <file> [--entry N]
 //!     Print a module's header, its resolved playback quirks, and its scanned length —
-//!     the same length and loop/end verdict the web player's progress slider shows.
+//!     the same length and loop/end verdict the web player's progress slider shows. For
+//!     a `.mid`, prints its format, track count, division, tempo changes and length
+//!     instead — a Standard MIDI File is not a module (task E5).
 //!
 //! starplayer render <file> -o <out.wav> [options]
 //!     Render a module to a WAV file with the offline renderer's deterministic
@@ -21,6 +23,12 @@
 //!     Every render prints the length written and the SHA-256 of its PCM payload, in the
 //!     same little-endian encoding a committed `.sha256` golden file holds.
 //!
+//!     `<file>` may instead be a `.mid`, with `--instruments <module>` naming the module
+//!     whose instruments play it (program numbers on its sixteen MIDI channels index
+//!     that module's instruments) — every other rendering knob but `--golden` still
+//!     applies:
+//!         starplayer render song.mid --instruments module.it -o out.wav
+//!
 //! starplayer trace <file> [--ticks N]
 //!     Print a per-tick diagnostic trace of the sequencer's state to stdout.
 //!
@@ -31,7 +39,10 @@
 //!     BPM/voices/peak on one updating line once a second. Stops at the song's natural
 //!     end or a detected loop's fade unless --repeat keeps it looping; Ctrl-C stops the
 //!     transport click-free and exits 0. --list-devices prints every output device on
-//!     every backend this build can reach, instead of playing anything.
+//!     every backend this build can reach, instead of playing anything. `--instruments`
+//!     is accepted for a `.mid` but playback through a device is not wired up yet
+//!     (task E5; needs `starplayer-host::Player` support E6/E7 land) — render it
+//!     instead.
 //! ```
 //!
 //! A ZIP archive is accepted anywhere a module file is. With more than one recognised

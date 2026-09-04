@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-starplayer = { workspace = true, features = ["std"] }
+# `smf`: task E5's `.mid` support in `info`/`render`. Resolver 2 already unifies this on
+# through `starplayer-offline` below, which needs it unconditionally; named here too so
+# this crate's own `use starplayer::midi::...` reads honestly against its own manifest.
+starplayer = { workspace = true, features = ["std", "smf"] }
 # `trace` is optional on `starplayer-offline` so that goldens never compile the per-tick
 # recorder in, and it is optional here for the same reason one level up: resolver 2
 # unifies features across a workspace build, so a CLI that always asked for it would put
