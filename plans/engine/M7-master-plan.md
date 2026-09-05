@@ -91,7 +91,7 @@ without a branch; the linear kernel never reads it, so the linear goldens do not
 | ID | Task | Depends on | Parallel with | Model |
 |---|---|---|---|---|
 | H1 (landed 2026-09-05) | [Channel buses, the `Insert` trait, install/param plumbing, smoothing](complete/M7-task-H1-channel-buses-and-insert-graph.md) | — | H2, H5 | Opus |
-| H2 | [DSP primitives: `DspSample`, tables, biquad, delay line, LFO](M7-task-H2-dsp-primitives.md) | — | H1, H5 | Sonnet |
+| H2 (landed 2026-09-05) | [DSP primitives: `DspSample`, tables, biquad, delay line, LFO](complete/M7-task-H2-dsp-primitives.md) | — | H1, H5 | Sonnet |
 | H3 | [EQ, delay, chorus](M7-task-H3-eq-delay-chorus.md) | H1, H2 | H4 | Opus |
 | H4 | [Reverb, compressor](M7-task-H4-reverb-and-compressor.md) | H1, H2 | H3 | Opus |
 | H5 | [Cubic and windowed-sinc interpolation, sample pre-roll](M7-task-H5-cubic-and-sinc-interpolation.md) | — | H1, H2 | Opus |

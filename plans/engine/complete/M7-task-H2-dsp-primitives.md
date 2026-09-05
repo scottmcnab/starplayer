@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M7 ([master plan](M7-master-plan.md), "The task graph" section) |
-| Status | Ready |
+| Status | Landed 2026-09-05 |
 | Depends on | — |
 | Blocks | H3, H4 |
 | Parallel with | H1, H5 |
