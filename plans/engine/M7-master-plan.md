@@ -94,7 +94,7 @@ without a branch; the linear kernel never reads it, so the linear goldens do not
 | H2 (landed 2026-09-05) | [DSP primitives: `DspSample`, tables, biquad, delay line, LFO](complete/M7-task-H2-dsp-primitives.md) | — | H1, H5 | Sonnet |
 | H3 | [EQ, delay, chorus](M7-task-H3-eq-delay-chorus.md) | H1, H2 | H4 | Opus |
 | H4 | [Reverb, compressor](M7-task-H4-reverb-and-compressor.md) | H1, H2 | H3 | Opus |
-| H5 | [Cubic and windowed-sinc interpolation, sample pre-roll](M7-task-H5-cubic-and-sinc-interpolation.md) | — | H1, H2 | Opus |
+| H5 (landed 2026-09-05) | [Cubic and windowed-sinc interpolation, sample pre-roll](complete/M7-task-H5-cubic-and-sinc-interpolation.md) | — | H1, H2 | Opus |
 | H6 | [SIMD kernels with the scalar-equivalence gate](M7-task-H6-simd-kernels.md) | H3, H4, H5 | — | Opus |
 | H7 | [Host wiring: `Player`, CLI, wasm host, web page](M7-task-H7-host-wiring.md) | H3, H4 | H6 | Sonnet |
 
@@ -108,3 +108,17 @@ Shared files (merge order H1, H2, H5, then H3, H4, then H7, H6):
 (H1) against `{kernel,sample}.rs` (H5), `crates/starplayer-engine/src/engine.rs` (H1)
 against the arms in `crates/starplayer-host/src/engine.rs` and the wasm host (H5, H7),
 `plans/product/01-technical-architecture.md` §7 (everyone — append, do not rewrite).
+
+## Follow-ups surfaced while landing (2026-09-05)
+
+- **CLI interpolator choice**: `apps/starplayer-cli`'s `InterpArg` still offers only nearest
+  and linear; cubic and sinc reach the hosts and the web page in H5 but the CLI's arms are
+  H7's.
+- **Deferred loop wrap residuals** (H5 research resolution): a ping-pong loop's bottom turn
+  still reads below `loop_start`, and a sustain-loop sample's guard is real tail PCM rather
+  than a loop copy, so a wide kernel plays up to three frames of tail per wrap. Fixing the
+  second needs `SampleRegion` to say whether its guard is a continuation. Not scheduled.
+- **IT loader pattern-blob amplification**: a fuzz-smoke run found a 37 KB input expanding to
+  a 23.6 MB pattern blob (4100 patterns, zero samples) that trips the harness memory cap. The
+  IT loader lacks the aggregate decoded-pattern budget the S3M loader has. Deserves its own
+  task under M6 acceptance; not part of M7.

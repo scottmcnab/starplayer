@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M7 ([master plan](M7-master-plan.md), "The task graph" section) |
-| Status | Ready |
+| Status | Landed 2026-09-05 |
 | Depends on | — |
 | Blocks | H6 (the SIMD pass vectorises whatever kernels exist), H7 (the web page's interpolator select) |
 | Parallel with | H1, H2 |
