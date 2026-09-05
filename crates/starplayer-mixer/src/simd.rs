@@ -45,22 +45,19 @@ pub fn scalar_add_block_i32(destination: &mut [Stereo<i32>], source: &[Stereo<i3
 #[cfg(feature = "simd")]
 pub fn wide_add_block_f32(destination: &mut [Stereo<f32>], source: &[Stereo<f32>]) {
     let paired = destination.len().min(source.len()) & !1;
-    let mut index = 0;
-    while index < paired {
-        let (Some(first), Some(second), Some(mine), Some(theirs)) =
-            (destination.get(index).copied(), destination.get(index + 1).copied(), source.get(index).copied(), source.get(index + 1).copied())
-        else {
-            break;
+    let (Some(head), Some(mine)) = (destination.get_mut(..paired), source.get(..paired)) else { return };
+    for (frames, added) in head.chunks_exact_mut(2).zip(mine.chunks_exact(2)) {
+        let (Some(first), Some(second), Some(third), Some(fourth)) = (frames.first().copied(), frames.get(1).copied(), added.first().copied(), added.get(1).copied()) else {
+            continue;
         };
-        let sum = f32x4::new([first.left, first.right, second.left, second.right]) + f32x4::new([mine.left, mine.right, theirs.left, theirs.right]);
+        let sum = f32x4::new([first.left, first.right, second.left, second.right]) + f32x4::new([third.left, third.right, fourth.left, fourth.right]);
         let [left, right, next_left, next_right] = sum.to_array();
-        if let Some(slot) = destination.get_mut(index) {
+        if let Some(slot) = frames.first_mut() {
             *slot = Stereo::new(left, right);
         }
-        if let Some(slot) = destination.get_mut(index + 1) {
+        if let Some(slot) = frames.get_mut(1) {
             *slot = Stereo::new(next_left, next_right);
         }
-        index += 2;
     }
     if let (Some(tail), Some(mine)) = (destination.get_mut(paired..), source.get(paired..)) {
         scalar_add_block_f32(tail, mine);
@@ -74,23 +71,20 @@ pub fn wide_add_block_f32(destination: &mut [Stereo<f32>], source: &[Stereo<f32>
 #[cfg(feature = "simd")]
 pub fn wide_add_block_i32(destination: &mut [Stereo<i32>], source: &[Stereo<i32>]) {
     let paired = destination.len().min(source.len()) & !1;
-    let mut index = 0;
-    while index < paired {
-        let (Some(first), Some(second), Some(mine), Some(theirs)) =
-            (destination.get(index).copied(), destination.get(index + 1).copied(), source.get(index).copied(), source.get(index + 1).copied())
-        else {
-            break;
+    let (Some(head), Some(mine)) = (destination.get_mut(..paired), source.get(..paired)) else { return };
+    for (frames, added) in head.chunks_exact_mut(2).zip(mine.chunks_exact(2)) {
+        let (Some(first), Some(second), Some(third), Some(fourth)) = (frames.first().copied(), frames.get(1).copied(), added.first().copied(), added.get(1).copied()) else {
+            continue;
         };
         let sum = i32x4::new([first.left, first.right, second.left, second.right])
-            .saturating_add(i32x4::new([mine.left, mine.right, theirs.left, theirs.right]));
+            .saturating_add(i32x4::new([third.left, third.right, fourth.left, fourth.right]));
         let [left, right, next_left, next_right] = sum.to_array();
-        if let Some(slot) = destination.get_mut(index) {
+        if let Some(slot) = frames.first_mut() {
             *slot = Stereo::new(left, right);
         }
-        if let Some(slot) = destination.get_mut(index + 1) {
+        if let Some(slot) = frames.get_mut(1) {
             *slot = Stereo::new(next_left, next_right);
         }
-        index += 2;
     }
     if let (Some(tail), Some(mine)) = (destination.get_mut(paired..), source.get(paired..)) {
         scalar_add_block_i32(tail, mine);
@@ -110,18 +104,18 @@ pub fn scalar_master_volume_f32(quantum: &mut [Stereo<f32>], volume: f32) {
 pub fn wide_master_volume_f32(quantum: &mut [Stereo<f32>], volume: f32) {
     let paired = quantum.len() & !1;
     let gain = f32x4::splat(volume);
-    let mut index = 0;
-    while index < paired {
-        let (Some(first), Some(second)) = (quantum.get(index).copied(), quantum.get(index + 1).copied()) else { break };
-        let scaled = f32x4::new([first.left, first.right, second.left, second.right]) * gain;
-        let [left, right, next_left, next_right] = scaled.to_array();
-        if let Some(slot) = quantum.get_mut(index) {
-            *slot = Stereo::new(left, right);
+    if let Some(head) = quantum.get_mut(..paired) {
+        for frames in head.chunks_exact_mut(2) {
+            let (Some(first), Some(second)) = (frames.first().copied(), frames.get(1).copied()) else { continue };
+            let scaled = f32x4::new([first.left, first.right, second.left, second.right]) * gain;
+            let [left, right, next_left, next_right] = scaled.to_array();
+            if let Some(slot) = frames.first_mut() {
+                *slot = Stereo::new(left, right);
+            }
+            if let Some(slot) = frames.get_mut(1) {
+                *slot = Stereo::new(next_left, next_right);
+            }
         }
-        if let Some(slot) = quantum.get_mut(index + 1) {
-            *slot = Stereo::new(next_left, next_right);
-        }
-        index += 2;
     }
     if let Some(tail) = quantum.get_mut(paired..) {
         scalar_master_volume_f32(tail, volume);
