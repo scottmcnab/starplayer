@@ -364,9 +364,9 @@ mod tests {
 
     #[test]
     fn cubic_passes_exactly_through_the_frame_it_sits_on() {
-        for index in 1..5 {
-            assert_eq!(Cubic::sample_fixed(&RAMP_WITH_ROOM, index, 0), RAMP_WITH_ROOM[index] as i32, "frame {index}");
-            assert_eq!(Cubic::sample_f32(&RAMP_WITH_ROOM, index, 0), RAMP_WITH_ROOM[index] as f32, "frame {index}");
+        for (index, frame) in RAMP_WITH_ROOM.iter().enumerate().take(5).skip(1) {
+            assert_eq!(Cubic::sample_fixed(&RAMP_WITH_ROOM, index, 0), *frame as i32, "frame {index}");
+            assert_eq!(Cubic::sample_f32(&RAMP_WITH_ROOM, index, 0), *frame as f32, "frame {index}");
         }
     }
 
@@ -464,10 +464,7 @@ mod tests {
         assert_eq!((Linear::GUARD_FRAMES_REQUIRED, Linear::LEADING_FRAMES), (1, 0));
         assert_eq!((Cubic::GUARD_FRAMES_REQUIRED, Cubic::LEADING_FRAMES), (2, 1));
         assert_eq!((Sinc::GUARD_FRAMES_REQUIRED, Sinc::LEADING_FRAMES), (4, 3));
-        // A forward loop's wrap is deferred by `LEADING_FRAMES`, so the widest read past
-        // `loop_end` is `LEADING_FRAMES - 1 + GUARD_FRAMES_REQUIRED`, which has to stay
-        // inside the guard the sample carries.
-        assert!(Sinc::LEADING_FRAMES + Sinc::GUARD_FRAMES_REQUIRED <= starplayer_core::GUARD_FRAMES);
-        assert!(Sinc::LEADING_FRAMES <= starplayer_core::PRE_ROLL_FRAMES);
+        // What those numbers have to fit inside is asserted at compile time, where the
+        // sample layout is: see `starplayer_mixer::sample`'s `const _: ()` block.
     }
 }
