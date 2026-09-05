@@ -73,6 +73,21 @@ jobs:
       - name: Compare WebAssembly hashes with the committed x86-64 contract
         run: wasmtime --dir=. target/wasm32-wasip1/release/starplayer-goldens.wasm --check
 
+  simd:
+    name: simd kernels (scalar equivalence)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install ALSA headers (cpal's PCM host and midir's sequencer host, via alsa-sys)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      # Every vectorised body against the scalar body that specifies it, the block-size
+      # determinism invariant and all eleven goldens with the feature on, and a bare-metal
+      # check of `wide`'s plain-array fallback (M7-H6).
+      - run: cargo xtask ci --job simd
+
   fma-check:
     name: float FMA contraction audit
     runs-on: ubuntu-latest
