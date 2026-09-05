@@ -100,6 +100,12 @@ pub enum HostError {
     /// The live-input queue is full: the caller is sending faster than the audio thread
     /// consumes. Counted rather than waited on — see [`crate::EventClock`].
     EventQueueFull,
+    /// The insert control ring was full (M7-H7): the audio thread is not draining it, or
+    /// the caller is installing effects and setting parameters faster than one quantum can
+    /// absorb.
+    InsertQueueFull,
+    /// A slot outside `0 ..= MAX_INSERTS_PER_CHAIN - 1` was named.
+    InvalidInsertSlot(u8),
 }
 
 impl fmt::Display for HostError {
@@ -116,6 +122,8 @@ impl fmt::Display for HostError {
             HostError::NoModule => formatter.write_str("no module is loaded"),
             HostError::NoEventQueue => formatter.write_str("no live-input queue is installed"),
             HostError::EventQueueFull => formatter.write_str("the live-input queue is full"),
+            HostError::InsertQueueFull => formatter.write_str("the insert control queue is full"),
+            HostError::InvalidInsertSlot(slot) => write!(formatter, "insert slot {slot} does not exist"),
         }
     }
 }

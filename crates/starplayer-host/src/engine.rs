@@ -19,7 +19,8 @@ use std::vec::Vec;
 use starplayer::core::{Interpolator, U0F16};
 use starplayer::dsp::{Cubic, Interpolate, Linear, Nearest, Sinc};
 use starplayer::engine::{
-    ChannelTable, Engine, EngineHandle, EngineSettings, EngineWarnings, EventSource, MixPathKind, MixerMode, OutputDepth,
+    ChannelTable, Engine, EngineHandle, EngineSettings, EngineWarnings, EventSource, InsertHandle, MixPathKind, MixerMode,
+    OutputDepth,
 };
 use starplayer::mixer::{Dither, FixedOut, FixedPath, FloatOut, FloatPath, MixPath, OutputFormat};
 use starplayer::model::Module;
@@ -29,6 +30,7 @@ use starplayer::{MAX_VOICE_CAPACITY, core::Frame};
 
 use crate::backend::HostError;
 use crate::depth::{dither_for, quantize_fixed_sample, quantize_float_sample};
+use crate::insert::HostInsertControl;
 use crate::transport::{TRANSPORT_GAIN_UNITY, Transport};
 
 /// Frames converted in one pass of the scratch buffers.
@@ -39,8 +41,10 @@ use crate::transport::{TRANSPORT_GAIN_UNITY, Transport};
 /// nothing allocates when it changes.
 pub const MAX_FRAMES_PER_RENDER: usize = 4_096;
 
-/// What building one typed arm hands back: the engine, its control handle, its reader.
-type BuiltEngine<Path, Interp, Out> = (Engine<Path, Interp, Out, Arc<Module>>, EngineHandle<Arc<Module>>, TelemetryReader);
+/// What building one typed arm hands back: the engine, its control handle, its insert
+/// control handle (M7-H7), its reader.
+type BuiltEngine<Path, Interp, Out> =
+    (Engine<Path, Interp, Out, Arc<Module>>, EngineHandle<Arc<Module>>, InsertHandle<<Path as MixPath>::Mono>, TelemetryReader);
 
 fn build_engine_arm<Path, Interp, Out>(settings: EngineSettings) -> BuiltEngine<Path, Interp, Out>
 where
@@ -50,8 +54,21 @@ where
 {
     let mut engine = Engine::<Path, Interp, Out, Arc<Module>>::with_settings(settings);
     let control = engine.take_control().expect("a new engine owns its control handle");
+    let insert_control = engine.take_insert_control().expect("a new engine owns its insert control handle");
     let telemetry = engine.telemetry_reader().expect("telemetry is enabled for the native host");
-    (engine, control, telemetry)
+    (engine, control, insert_control, telemetry)
+}
+
+/// Wrap an arm's own `InsertHandle<Path::Mono>` in the runtime enum a `Player` can hold
+/// without itself being generic over the sample type — dispatching on the same `float` /
+/// `fixed` token [`render_arm!`] already uses to tell the two mix paths apart.
+macro_rules! insert_control_variant {
+    (float, $handle:expr) => {
+        HostInsertControl::Float($handle)
+    };
+    (fixed, $handle:expr) => {
+        HostInsertControl::Fixed($handle)
+    };
 }
 
 macro_rules! render_arm {
@@ -73,11 +90,12 @@ macro_rules! define_arms {
         }
 
         impl EngineArm {
-            fn build(mode: MixerMode, settings: EngineSettings) -> Result<(EngineArm, EngineHandle<Arc<Module>>, TelemetryReader), HostError> {
+            fn build(mode: MixerMode, settings: EngineSettings) -> Result<(EngineArm, EngineHandle<Arc<Module>>, HostInsertControl, TelemetryReader), HostError> {
                 match (mode.path, mode.interpolator, mode.channels) {
                     $(($path_kind, $interpolator_kind, $channels) => {
-                        let (engine, control, telemetry) = build_engine_arm::<$path, $interpolator, $output>(settings);
-                        Ok((EngineArm::$variant(engine), control, telemetry))
+                        let (engine, control, insert_control, telemetry) = build_engine_arm::<$path, $interpolator, $output>(settings);
+                        let insert_control = insert_control_variant!($buffer, insert_control);
+                        Ok((EngineArm::$variant(engine), control, insert_control, telemetry))
                     },)+
                     _ => Err(HostError::UnsupportedMixerMode(mode.describe().to_string())),
                 }
@@ -152,14 +170,14 @@ impl HostEngine {
     /// [`ChannelTable::MAX_CHANNELS`] once. Both are allocated here, and the mixer and the
     /// telemetry view walk only what is *active*, so a wider pool changes no rendered
     /// sample — only how much memory the host holds.
-    pub fn build(mode: MixerMode, sample_rate_hz: u32) -> Result<(HostEngine, EngineHandle<Arc<Module>>, TelemetryReader), HostError> {
+    pub fn build(mode: MixerMode, sample_rate_hz: u32) -> Result<(HostEngine, EngineHandle<Arc<Module>>, HostInsertControl, TelemetryReader), HostError> {
         let settings = EngineSettings {
             sample_rate_hz,
             voice_capacity: MAX_VOICE_CAPACITY,
             channel_count: ChannelTable::MAX_CHANNELS,
             ..EngineSettings::default()
         };
-        let (arm, control, telemetry) = EngineArm::build(mode, settings)?;
+        let (arm, control, insert_control, telemetry) = EngineArm::build(mode, settings)?;
         let samples = MAX_FRAMES_PER_RENDER * mode.channels as usize;
         let engine = HostEngine {
             arm,
@@ -168,7 +186,7 @@ impl HostEngine {
             float_scratch: vec![0.0; samples],
             fixed_scratch: vec![0; samples],
         };
-        Ok((engine, control, telemetry))
+        Ok((engine, control, insert_control, telemetry))
     }
 
     /// The mixer mode this engine was built for.

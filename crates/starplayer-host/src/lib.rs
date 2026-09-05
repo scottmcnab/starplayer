@@ -81,6 +81,7 @@ mod depth;
 mod engine;
 mod events;
 mod format;
+mod insert;
 mod manual;
 mod player;
 mod source;
@@ -91,6 +92,7 @@ pub use depth::{DITHER_SEED, dither_for, quantize_fixed_sample, quantize_float_s
 pub use engine::{HostEngine, MAX_FRAMES_PER_RENDER, SUPPORTED_DEPTHS, supported_modes};
 pub use events::{DEFAULT_EVENT_LEAD_FRAMES, EVENT_QUEUE_CAPACITY, EventClock, EventSender};
 pub use format::format_seconds;
+pub use insert::{HostInsertControl, InsertLayout, InstalledInsert};
 pub use manual::{MANUAL_DEVICE_NAME, MANUAL_RATES, ManualBackend, ManualDriver};
 // E5 supersedes this re-export together with the module behind it.
 pub use starplayer::midi::MidiDecoder;
