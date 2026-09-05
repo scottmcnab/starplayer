@@ -1577,8 +1577,18 @@ fn wasm_simd128_build() -> bool {
 ///    the only check that runs a whole module through the vector build.
 /// 5. `cargo check` for the bare-metal target with the feature on, which is where `wide`'s
 ///    plain-array fallback is compiled.
+///
+/// Preceded by a clippy pass over the two crates with the feature on, because the
+/// workspace clippy job runs with default features and would otherwise never lint a line
+/// of the vector bodies.
 fn job_simd() -> bool {
     let mut all_succeeded = true;
+    // `job_clippy` lints the workspace with default features, which is the `simd` feature
+    // **off**: without these two passes the vector bodies and the equivalence tests are
+    // the only code in the tree clippy never sees.
+    for crate_name in ["starplayer-dsp", "starplayer-mixer"] {
+        all_succeeded &= cargo(&["clippy", "-p", crate_name, "--all-targets", "--features", "simd", "--", "-D", "warnings"]);
+    }
     all_succeeded &= cargo(&["test", "-p", "starplayer-dsp", "--features", "simd"]);
     all_succeeded &= cargo(&["test", "-p", "starplayer-mixer", "--features", "simd"]);
     all_succeeded &= cargo(&["test", "-p", "starplayer-engine", "--features", "simd", "--test", "block_size_determinism"]);

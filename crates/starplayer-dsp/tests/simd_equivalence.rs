@@ -60,7 +60,7 @@ fn assert_bits_equal(scalar: f32, vector: f32, what: &str) {
 
 #[test]
 fn the_comb_bank_kernel_agrees_bit_for_bit_on_the_float_path() {
-    let mut stream = Xorshift32::new(0x51D_C0DE);
+    let mut stream = Xorshift32::new(0x051D_C0DE);
     for block in 0..BLOCKS {
         let feedback_q24 = next_coefficient_q24(&mut stream);
         let damping_q24 = next_coefficient_q24(&mut stream);
@@ -88,7 +88,7 @@ fn the_comb_bank_kernel_agrees_bit_for_bit_on_the_float_path() {
 
 #[test]
 fn the_comb_bank_kernel_is_the_scalar_body_on_the_fixed_path() {
-    let mut stream = Xorshift32::new(0xC0FFEE);
+    let mut stream = Xorshift32::new(0x00C0_FFEE);
     for _ in 0..BLOCKS {
         let feedback_q24 = next_coefficient_q24(&mut stream);
         let damping_q24 = next_coefficient_q24(&mut stream);
@@ -112,7 +112,7 @@ fn the_comb_bank_kernel_is_the_scalar_body_on_the_fixed_path() {
 
 #[test]
 fn the_stereo_biquad_kernel_agrees_bit_for_bit_on_the_float_path() {
-    let mut stream = Xorshift32::new(0xB19_0AD5);
+    let mut stream = Xorshift32::new(0x0B19_0AD5);
     for block in 0..BLOCKS {
         // A biquad's coefficients live in `[-2, 2)` of Q8.24 rather than `[0, 1)`.
         let coefficients = BiquadCoefficients {
@@ -160,7 +160,7 @@ fn the_stereo_biquad_kernel_is_the_scalar_body_on_the_fixed_path() {
 
 #[test]
 fn the_fractional_tap_kernel_agrees_bit_for_bit_on_the_float_path() {
-    let mut stream = Xorshift32::new(0x7A9_5EED);
+    let mut stream = Xorshift32::new(0x07A9_5EED);
     for block in 0..BLOCKS * FRAMES / 16 {
         let mut current = [0.0f32; TAP_LANES];
         let mut next = [0.0f32; TAP_LANES];
@@ -219,7 +219,7 @@ fn the_sinc_dot_product_agrees_bit_for_bit() {
 fn the_vector_integer_multiply_is_exact() {
     use wide::i32x4;
 
-    let mut stream = Xorshift32::new(0x0B_5EED);
+    let mut stream = Xorshift32::new(0x000B_5EED);
     for _ in 0..10_000 {
         let mut left = [0i32; 4];
         let mut right = [0i32; 4];

@@ -59,6 +59,8 @@ alloc = [
     "starplayer-midi?/alloc",
     "starplayer-telemetry?/alloc",
 ]
+# M7-H6's vector kernels. Off by default: a host opts in, and the eleven goldens must
+# hash identically either way.
 simd = ["starplayer-dsp/simd", "starplayer-mixer/simd", "starplayer-engine/simd"]
 
 # Both mix paths may be enabled at once.

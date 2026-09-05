@@ -43,7 +43,7 @@ fn next_fixed(stream: &mut Xorshift32) -> i32 {
 
 #[test]
 fn the_float_bus_summation_agrees_bit_for_bit() {
-    let mut stream = Xorshift32::new(0xB05_0000);
+    let mut stream = Xorshift32::new(0x0B05_0000);
     for block in 0..BLOCKS {
         let length = LENGTHS[block % LENGTHS.len()];
         let source: Vec<Stereo<f32>> = (0..length).map(|_| Stereo::new(next_float(&mut stream), next_float(&mut stream))).collect();
@@ -66,7 +66,7 @@ fn the_float_bus_summation_agrees_bit_for_bit() {
 
 #[test]
 fn the_fixed_bus_summation_agrees_bit_for_bit_including_its_saturation() {
-    let mut stream = Xorshift32::new(0xB05_F1_ED);
+    let mut stream = Xorshift32::new(0x0B05_F1ED);
     for block in 0..BLOCKS {
         let length = LENGTHS[block % LENGTHS.len()];
         let source: Vec<Stereo<i32>> = (0..length).map(|_| Stereo::new(next_fixed(&mut stream), next_fixed(&mut stream))).collect();
@@ -85,7 +85,7 @@ fn the_fixed_bus_summation_agrees_bit_for_bit_including_its_saturation() {
 
 #[test]
 fn the_float_master_volume_agrees_bit_for_bit() {
-    let mut stream = Xorshift32::new(0x_A57E_2000);
+    let mut stream = Xorshift32::new(0xA57E_2000);
     for block in 0..BLOCKS {
         let length = LENGTHS[block % LENGTHS.len()];
         let volume = (stream.next_u32() >> 16) as f32 * (1.0 / 65_535.0);
@@ -106,7 +106,7 @@ fn the_float_master_volume_agrees_bit_for_bit() {
 /// appears it is compared too.
 #[test]
 fn the_fixed_master_bus_is_the_two_passes_the_single_frame_body_describes() {
-    let mut stream = Xorshift32::new(0x_A57E_F1ED);
+    let mut stream = Xorshift32::new(0xA57E_F1ED);
     for limiter in [Limiter::Clamp, Limiter::SoftKnee] {
         for _ in 0..BLOCKS {
             let settings = MasterSettings { volume: starplayer_core::U0F16::from_bits((stream.next_u32() >> 16) as u16), limiter };
