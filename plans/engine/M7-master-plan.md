@@ -96,7 +96,7 @@ without a branch; the linear kernel never reads it, so the linear goldens do not
 | H4 (landed 2026-09-05) | [Reverb, compressor](complete/M7-task-H4-reverb-and-compressor.md) | H1, H2 | H3 | Opus |
 | H5 (landed 2026-09-05) | [Cubic and windowed-sinc interpolation, sample pre-roll](complete/M7-task-H5-cubic-and-sinc-interpolation.md) | — | H1, H2 | Opus |
 | H6 | [SIMD kernels with the scalar-equivalence gate](M7-task-H6-simd-kernels.md) | H3, H4, H5 | — | Opus |
-| H7 | [Host wiring: `Player`, CLI, wasm host, web page](M7-task-H7-host-wiring.md) | H3, H4 | H6 | Sonnet |
+| H7 (landed 2026-09-06) | [Host wiring: `Player`, CLI, wasm host, web page](complete/M7-task-H7-host-wiring.md) | H3, H4 | H6 | Sonnet |
 
 ```
 main ── H1 ∥ H2 ∥ H5 ──→ H3 ∥ H4 ──→ H6 ∥ H7

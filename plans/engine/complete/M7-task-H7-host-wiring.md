@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M7 ([master plan](M7-master-plan.md), "The task graph" section) |
-| Status | Ready once H3 and H4 have landed |
+| Status | Landed 2026-09-06 |
 | Depends on | H1 (the insert control ring), H3, H4 (the effects to expose) |
 | Blocks | M7 exit ("reverb on channel 1 alone, audible" — the owner needs a way to switch it on) |
 | Parallel with | H6 |
