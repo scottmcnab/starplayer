@@ -633,6 +633,11 @@ Ordered by value per unit of effort. Full detail in `02-roadmap.md`.
 5. **Golden hashes** — SHA-256 of a fixed-point i16 mono 44100 Hz render, linear
    interpolation, DSP bypassed. The config is encoded in the filename so a change of
    interpolator is visibly a new golden rather than a silent break.
+   **Linear remains the canonical kernel.** M7-H5 added
+   `goldens/s3m/reflex__i16_mono_44100_{cubic,sinc}.sha256` beside the linear one; those
+   two are **cross-target pins for the wide kernels** — the thing they catch is a cubic or
+   sinc render that is not bit-identical on x86-64, aarch64 and wasm32 — not a second
+   reference render. Accuracy statements in this document are about the linear hashes.
 6. **Cross-target hash equality** — x86-64, aarch64 and wasm32 must agree bit-for-bit
    on the fixed-point path.
 7. **Perceptual comparison vs libopenmpt** on the float path — spectral distance /
