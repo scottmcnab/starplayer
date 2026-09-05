@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M7 ([master plan](M7-master-plan.md), "The task graph" section) |
-| Status | Ready once H1 and H2 have landed |
+| Status | Landed 2026-09-05 |
 | Depends on | H1 (the `Insert` trait, `SmoothedParam`, `InsertKind`/`build`), H2 (`DspSample`, tables, `BiquadCoefficients`, `DelayLine`, `Lfo`) |
 | Blocks | H6, H7 |
 | Parallel with | H4 |
