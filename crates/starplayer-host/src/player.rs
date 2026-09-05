@@ -916,11 +916,12 @@ impl Player {
             retired_module_dropped: snapshot.warnings.retired_module_dropped,
             unsupported_command: snapshot.warnings.unsupported_command,
             late_events: snapshot.warnings.late_events,
-            // `retired_insert_dropped` (M7-H1) has no telemetry field yet: the snapshot's
-            // `Warnings` is `starplayer-telemetry`'s and widening it is H7's, with the
-            // rest of the host's insert surface. Reported through
-            // `HostEngine::warnings()` on the audio side in the meantime.
-            ..EngineWarnings::default()
+            // `retired_insert_dropped` (M7-H1) now has a telemetry home: H7 widened
+            // `starplayer_telemetry::WarningFlags` with the same name, and it is folded
+            // into the snapshot on every publish (`starplayer-engine`'s
+            // `From<EngineWarnings> for WarningFlags`), so it reads back here exactly
+            // like every other sticky flag.
+            retired_insert_dropped: snapshot.warnings.retired_insert_dropped,
         }
     }
 

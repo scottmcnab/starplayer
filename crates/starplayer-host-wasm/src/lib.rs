@@ -425,7 +425,8 @@ impl Host {
             | ((snapshot.warnings.event_limit_reached as i32) << 1)
             | ((snapshot.warnings.retired_module_dropped as i32) << 2)
             | ((snapshot.warnings.unsupported_command as i32) << 3)
-            | ((snapshot.warnings.late_events as i32) << 4);
+            | ((snapshot.warnings.late_events as i32) << 4)
+            | ((snapshot.warnings.retired_insert_dropped as i32) << 5);
         let header = [
             snapshot.sequence as i32,
             snapshot.publishes_dropped as i32,
