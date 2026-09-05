@@ -20,23 +20,70 @@
 
 extern crate alloc;
 
+pub mod biquad;
+pub mod delay_line;
 pub mod effects;
 pub mod filter;
 pub mod frame;
 pub mod insert;
 pub mod interpolate;
+pub mod lfo;
 pub mod ramp;
 pub mod sample;
 pub mod smooth;
+pub mod tables;
 
-pub use effects::{InsertKind, build_insert};
-pub use filter::{
-    FILTER_FRACTION_BITS, FILTER_PREAMP_BITS, FilterCoefficients, IT_RESONANCE_TABLE_Q24, resonant_low_pass_f32,
-    resonant_low_pass_fixed, resonate_f32, resonate_fixed,
-};
+// One `pub use` item per line (not `{A, B, C}`): M7's tasks all add modules to this file
+// concurrently (M7 master plan, "Shared files"), and a one-item-per-line list makes every
+// addition a pure insertion, so a merge is a union rather than a conflict.
+pub use biquad::BiquadCoefficients;
+pub use biquad::BiquadCoefficientsF32;
+pub use delay_line::DelayLine;
+pub use delay_line::StereoDelayLine;
+pub use effects::InsertKind;
+pub use effects::build_insert;
+pub use filter::FILTER_FRACTION_BITS;
+pub use filter::FILTER_PREAMP_BITS;
+pub use filter::FilterCoefficients;
+pub use filter::IT_RESONANCE_TABLE_Q24;
+pub use filter::resonant_low_pass_f32;
+pub use filter::resonant_low_pass_fixed;
+pub use filter::resonate_f32;
+pub use filter::resonate_fixed;
 pub use frame::Stereo;
-pub use insert::{DSP_BLOCK_FRAMES, Insert, InsertDescriptor, ParamId, ParamSpec, ParamUnit};
-pub use interpolate::{Interpolate, Linear, Nearest, round_shift_nearest};
+pub use insert::DSP_BLOCK_FRAMES;
+pub use insert::Insert;
+pub use insert::InsertDescriptor;
+pub use insert::ParamId;
+pub use insert::ParamSpec;
+pub use insert::ParamUnit;
+pub use interpolate::Interpolate;
+pub use interpolate::Linear;
+pub use interpolate::Nearest;
+pub use interpolate::round_shift_nearest;
+pub use lfo::Lfo;
 pub use ramp::GainRamp;
-pub use sample::{DspSample, Q15_UNITY};
-pub use smooth::{SMOOTH_FRAMES, SmoothedParam};
+pub use sample::DspSample;
+pub use sample::Q15_UNITY;
+pub use smooth::SMOOTH_FRAMES;
+pub use smooth::SmoothedParam;
+pub use tables::CENTI_DB_MAX;
+pub use tables::CENTI_DB_MIN;
+pub use tables::cos_f32;
+pub use tables::cos_q15;
+pub use tables::db_to_gain_f32;
+pub use tables::db_to_gain_q15;
+pub use tables::exp_neg_f32;
+pub use tables::exp_neg_q24;
+pub use tables::gain_to_centi_db;
+pub use tables::gain_to_centi_db_f32;
+pub use tables::log2_f32;
+pub use tables::log2_q16;
+pub use tables::pow2_f32;
+pub use tables::pow2_q24;
+pub use tables::shelf_amplitude_f32;
+pub use tables::shelf_amplitude_q24;
+pub use tables::sin_f32;
+pub use tables::sin_q15;
+pub use tables::time_constant_f32;
+pub use tables::time_constant_q24;
