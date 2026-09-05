@@ -46,7 +46,11 @@ pub fn parse_insert_args(specs: &[String]) -> Result<Vec<InsertArg>, String> {
     Ok(parsed)
 }
 
-fn parse_one(spec: &str) -> Result<(InsertTarget, InsertKind, Vec<(ParamId, i32)>), String> {
+/// One parsed `--insert` flag before its slot is assigned: the target, the effect, and
+/// every `<param>=<value>` pair named in it.
+type ParsedInsert = (InsertTarget, InsertKind, Vec<(ParamId, i32)>);
+
+fn parse_one(spec: &str) -> Result<ParsedInsert, String> {
     let mut parts = spec.splitn(3, ':');
     let target_text = parts.next().filter(|text| !text.is_empty()).ok_or_else(|| format!("{spec}: empty --insert"))?;
     let effect_text = parts

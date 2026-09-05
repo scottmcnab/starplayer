@@ -62,9 +62,9 @@ const DEFAULT_BUFFER_FRAMES: u32 = 1_024;
 
 #[derive(clap::Args, Debug)]
 pub struct PlayArgs {
-    /// Module file, or a ZIP archive containing one. Not needed with `--list-devices`
-    /// or `--list-midi-ports`.
-    #[arg(required_unless_present_any = ["list_devices", "list_midi_ports"])]
+    /// Module file, or a ZIP archive containing one. Not needed with `--list-devices`,
+    /// `--list-midi-ports` or `--list-effects`.
+    #[arg(required_unless_present_any = ["list_devices", "list_midi_ports", "list_effects"])]
     pub file: Option<PathBuf>,
     /// Which recognised entry of a ZIP archive to play.
     #[arg(long)]
@@ -103,6 +103,18 @@ pub struct PlayArgs {
     /// Print every MIDI input port this build can see, and exit.
     #[arg(long)]
     pub list_midi_ports: bool,
+
+    // ── insert effects (M7-H7) ──────────────────────────────────────────────────────
+    /// Install an insert effect before playing: `<target>:<effect>[:<param>=<value>,...]`,
+    /// where `<target>` is a 1-based channel number or `master`, e.g.
+    /// `--insert 1:reverb:room=60,mix=50`. Repeatable: a second `--insert` naming the same
+    /// target fills the next slot of its chain.
+    #[arg(long = "insert")]
+    pub insert: Vec<String>,
+    /// Print every insert effect this build can install, its parameters, their units,
+    /// ranges and defaults, and exit.
+    #[arg(long)]
+    pub list_effects: bool,
 }
 
 pub fn run(args: PlayArgs) -> Result<(), String> {
@@ -112,6 +124,10 @@ pub fn run(args: PlayArgs) -> Result<(), String> {
     }
     if args.list_midi_ports {
         print_midi_ports();
+        return Ok(());
+    }
+    if args.list_effects {
+        print!("{}", crate::insert_arg::list_effects());
         return Ok(());
     }
 
@@ -184,6 +200,16 @@ fn play_on(backend: &mut dyn AudioBackend, backend_name: &str, file_display: &st
         player.set_fade_frames(LOOP_FADE_SECONDS.saturating_mul(spec.sample_rate_hz)).map_err(|error| error.to_string())?;
         player.set_at_end(AtEnd::FadeOut).map_err(|error| error.to_string())?;
     }
+
+    // ── insert effects (M7-H7) ───────────────────────────────────────────────────────
+    for insert in crate::insert_arg::parse_insert_args(&args.insert)? {
+        player.install_insert(insert.target, insert.slot, insert.kind).map_err(|error| error.to_string())?;
+        for (param, value) in insert.params {
+            player.set_insert_param(insert.target, insert.slot, param, value).map_err(|error| error.to_string())?;
+        }
+    }
+    // ── end of the insert effects block ─────────────────────────────────────────────
+
     // ── live MIDI input (task E6) ───────────────────────────────────────────────────
     //
     // `--midi` puts the module sequencer in slot 0 and its live-input instruments in slot
@@ -405,6 +431,8 @@ mod tests {
             instruments: None,
             midi: None,
             list_midi_ports: false,
+            insert: Vec::new(),
+            list_effects: false,
         }
     }
 
@@ -424,6 +452,40 @@ mod tests {
 
     #[test]
     fn print_devices_reports_an_empty_list_without_panicking() { print_devices(&[]); }
+
+    // ── insert effects (M7-H7) ──────────────────────────────────────────────────────
+
+    const REFLEX: &[u8] = include_bytes!("../../../crates/starplayer-s3m/tests/fixtures/REFLEX.S3M");
+
+    /// `--insert` parses and installs through `Player` before playing starts, and the
+    /// module still produces audio afterwards — proving the flag reaches the same
+    /// `Player::install_insert` surface `render`'s `--insert` does, rather than only
+    /// parsing correctly.
+    #[test]
+    fn an_insert_flag_installs_before_play_and_the_module_still_sounds() {
+        let spec = AudioSpec::stereo(44_100);
+        let mut backend = starplayer_host::ManualBackend::new();
+        let mut player = Player::open(&mut backend, None, spec, starplayer::engine::MixerMode::DEFAULT).expect("the manual backend opens");
+        player.load(REFLEX).expect("REFLEX loads");
+
+        let inserts = crate::insert_arg::parse_insert_args(&[String::from("1:reverb:room=60,mix=50")]).expect("the flag parses");
+        for insert in inserts {
+            player.install_insert(insert.target, insert.slot, insert.kind).expect("install queues");
+            for (param, value) in insert.params {
+                player.set_insert_param(insert.target, insert.slot, param, value).expect("set_param queues");
+            }
+        }
+        assert_eq!(
+            player.inserts().get(starplayer::engine::InsertTarget::Channel(starplayer::core::ChannelId(0)), 0).map(|installed| installed.kind),
+            Some(starplayer::dsp::InsertKind::Reverb)
+        );
+
+        player.play().expect("play");
+        let driver = backend.driver().expect("an open backend has a driver");
+        let mut output = vec![0.0f32; spec.samples_for(starplayer::engine::RENDER_QUANTUM * 64)];
+        driver.render(&mut output);
+        assert!(output.iter().any(|sample| *sample != 0.0), "the module still sounds with an insert installed");
+    }
 
     #[test]
     fn repeat_maps_to_at_end_continue_and_the_default_maps_to_fade_out() {
