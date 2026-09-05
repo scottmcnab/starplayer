@@ -414,11 +414,22 @@ fn every_arm_this_host_builds_opens_and_renders() {
 #[test]
 fn an_arm_the_host_cannot_build_is_refused_rather_than_guessed() {
     let mut backend = ManualBackend::new();
-    let cubic = MixerMode { interpolator: Interpolator::Cubic, ..MixerMode::DEFAULT };
-    assert!(Player::open(&mut backend, None, AudioSpec::stereo(48_000), cubic).is_err());
+    // Every interpolator has an arm since M7-task-H5, so the unbuildable mode is now a
+    // channel count no arm is instantiated for.
+    let six_channel = MixerMode { channels: 6, ..MixerMode::DEFAULT };
+    assert!(Player::open(&mut backend, None, AudioSpec::stereo(48_000), six_channel).is_err());
 
     let mismatched = MixerMode { channels: 1, ..MixerMode::DEFAULT };
     assert!(Player::open(&mut backend, None, AudioSpec::stereo(48_000), mismatched).is_err(), "a mono engine cannot feed a stereo device");
+}
+
+#[test]
+fn every_interpolator_the_engine_names_has_an_arm() {
+    for interpolator in [Interpolator::None, Interpolator::Linear, Interpolator::Cubic, Interpolator::Sinc] {
+        let mut backend = ManualBackend::new();
+        let mode = MixerMode { interpolator, ..MixerMode::DEFAULT };
+        assert!(Player::open(&mut backend, None, AudioSpec::stereo(48_000), mode).is_ok(), "{interpolator:?} has no arm");
+    }
 }
 
 #[test]

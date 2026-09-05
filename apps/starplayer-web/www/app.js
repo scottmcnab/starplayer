@@ -145,7 +145,7 @@ function sharedMemoryAvailable() {
 
 function mixerModeFromControls(channels = Number(elements.outputChannels.value) === 1 ? 1 : 2) {
     const path = elements.mixerPath.value === 'fixed' ? 1 : 0;
-    const interpolator = elements.mixerInterpolator.value === 'linear' ? 1 : 0;
+    const interpolator = { nearest: 0, linear: 1, cubic: 2, sinc: 3 }[elements.mixerInterpolator.value] ?? 1;
     const depth = { f32: 0, i32: 1, i24: 2, i16: 3, i8: 4 }[elements.mixerDepth.value] ?? 0;
     const dither = elements.mixerDither.value === 'tpdf' ? 1 : 0;
     return (path | (interpolator << 1) | (depth << 3) | (dither << 6) | (channels << 8)) >>> 0;

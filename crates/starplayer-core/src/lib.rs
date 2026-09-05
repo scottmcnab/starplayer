@@ -58,6 +58,6 @@ pub use quirks::{
 };
 pub use random::Xorshift32;
 pub use row_clock::{RowAdvance, RowClock};
-pub use sample::GUARD_FRAMES;
+pub use sample::{GUARD_FRAMES, PRE_ROLL_FRAMES};
 pub use tables::{PERIOD_TABLE, ST3_C4_SPEED, ST3_FREQUENCY_NUMERATOR, ST3_PERIOD_SCALE};
 pub use tempo::{ExactFixedPoint, ItModern, St3Truncating, TempoModel, TempoModelId};

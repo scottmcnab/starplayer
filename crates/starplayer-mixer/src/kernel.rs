@@ -53,7 +53,7 @@
 use starplayer_dsp::Interpolate;
 
 use crate::path::{MixPath, Stereo};
-use crate::sample::{LoopMode, LoopSpan, SampleData};
+use crate::sample::{LoopMode, LoopSpan, PRE_ROLL_FRAMES, SampleData};
 use crate::voice::Voice;
 
 /// Whether a voice survived a render segment.
@@ -100,6 +100,12 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     };
 
     let step = voice.params.step.to_bits();
+    // How many frames before the interpolation point this kernel reads. It is zero for
+    // `Nearest` and `Linear`, which is why everything below is the code those two have
+    // always executed; for the wide kernels it defers a forward loop's wrap by that many
+    // frames, so the frames *behind* the interpolation point are always real ones the
+    // voice has just played. See `starplayer_core::PRE_ROLL_FRAMES`.
+    let leading = Interp::LEADING_FRAMES as u32;
     let mut reverse = voice.is_reversed();
     let mut remaining: &mut [Path::Accumulator] = destination;
 
@@ -107,7 +113,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
     // the loop, and a previous segment may have left the voice at the very end of a
     // one-shot.
     let mut position = voice.position();
-    let mut ended = match cross_boundary(voice, pcm, &mut sample, position as i128, &mut reverse) {
+    let mut ended = match cross_boundary(voice, pcm, &mut sample, position as i128, &mut reverse, leading) {
         Some(normalised) => {
             position = normalised;
             false
@@ -120,7 +126,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
 
     while !ended && !finished_ramp && !remaining.is_empty() {
         // ── how long the next run is ────────────────────────────────────────────────
-        let limit = run_limit(sample, reverse);
+        let limit = run_limit(sample, reverse, leading);
         let ramp_frames = voice.gain_ramp_frames_remaining();
         let run = frames_before_limit(position, step, limit, reverse)
             .min(if ramp_frames == 0 { u64::MAX } else { ramp_frames as u64 })
@@ -130,7 +136,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
         remaining = rest;
 
         // ── the run itself ──────────────────────────────────────────────────────────
-        let frames = sample.frames();
+        let frames = sample.stored();
         let (gains, filter) = voice.run_state_mut();
         let path_filter = Path::path_filter(filter);
         let coefficients = path_filter.coefficients;
@@ -154,7 +160,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
         // that the position written back to the voice is always a real one.
         let travelled = run as i128 * step as i128;
         let advanced = if reverse { position as i128 - travelled } else { position as i128 + travelled };
-        match cross_boundary(voice, pcm, &mut sample, advanced, &mut reverse) {
+        match cross_boundary(voice, pcm, &mut sample, advanced, &mut reverse, leading) {
             Some(normalised) => position = normalised,
             None => {
                 position = clamp_position(advanced);
@@ -181,12 +187,13 @@ fn cross_boundary<'pcm>(
     sample: &mut SampleData<'pcm>,
     position: i128,
     reverse: &mut bool,
+    leading: u32,
 ) -> Option<u64> {
     if let Some(rebased) = take_queued_region(voice, pcm, sample, position) {
         *reverse = false;
         return rebased;
     }
-    normalise_position(position, reverse, *sample)
+    normalise_position(position, reverse, *sample, leading)
 }
 
 /// Apply a queued region if `position` has reached the boundary that releases it.
@@ -237,13 +244,18 @@ fn take_queued_region<'pcm>(voice: &mut Voice, pcm: &'pcm [i16], sample: &mut Sa
 /// the voice. Nothing here mutates anything: this is a pure read.
 pub fn folded_frame(sample: SampleData<'_>, position: i128, reverse: bool) -> Option<i16> {
     let mut reverse = reverse;
-    let normalised = normalise_position(position, &mut reverse, sample)?;
+    // No leading frames: the tap reads *one* frame rather than resampling, so it has no
+    // taps to keep behind it and wants the wrap where the sample says it is. A wide
+    // kernel's deferred wrap moves the fold by at most `LEADING_FRAMES` frames, and the
+    // guard frames it reads there are a copy of the loop, so the tap sees the same value
+    // either way.
+    let normalised = normalise_position(position, &mut reverse, sample, 0)?;
     sample.frames().get((normalised >> 32) as usize).copied()
 }
 
 /// Bring a position back inside the sample, and say which way a ping-pong loop is now
 /// travelling. `None` means a one-shot has run out and the voice is over.
-fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>) -> Option<u64> {
+fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>, leading: u32) -> Option<u64> {
     match sample.loop_span() {
         None => {
             if position >= frames_to_bits(sample.length_frames()) as i128 {
@@ -253,7 +265,7 @@ fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>
             }
         }
         Some(span) if span.mode() == LoopMode::Forward => {
-            if position >= frames_to_bits(span.end()) as i128 {
+            if position >= forward_wrap_bits(span, leading) as i128 {
                 Some(wrap_forward(position, span))
             } else {
                 Some(clamp_position(position))
@@ -278,10 +290,10 @@ fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>
 
 /// The position a run must stop at: the first position out of range going forwards, the
 /// last one still in range going backwards.
-fn run_limit(sample: SampleData<'_>, reverse: bool) -> u64 {
+fn run_limit(sample: SampleData<'_>, reverse: bool, leading: u32) -> u64 {
     match sample.loop_span() {
         None => frames_to_bits(sample.length_frames()),
-        Some(span) if span.mode() == LoopMode::Forward => frames_to_bits(span.end()),
+        Some(span) if span.mode() == LoopMode::Forward => forward_wrap_bits(span, leading),
         Some(span) => {
             if reverse {
                 frames_to_bits(span.start())
@@ -320,7 +332,10 @@ fn mix_run<Path: MixPath, Interp: Interpolate, const FILTERED: bool, const RAMPI
         } else {
             steady
         };
-        let value = Path::interpolate::<Interp>(frames, (position >> 32) as usize, position as u32);
+        // `frames` is the stored run, so frame 0 sits at index `PRE_ROLL_FRAMES` and a
+        // kernel reading `index - LEADING_FRAMES` stays inside the slice. The addition is
+        // loop-invariant and folds into the addressing mode.
+        let value = Path::interpolate::<Interp>(frames, ((position >> 32) as usize).wrapping_add(PRE_ROLL_FRAMES), position as u32);
         // Between the resampler and the pan gains, which is where IT puts it: OpenMPT's
         // `SampleLoop` runs `interpolate(); filter(); mix();` in that order.
         let value = if FILTERED { Path::filter(value, filter_state, coefficients) } else { value };
@@ -366,6 +381,24 @@ const fn frames_before_limit(position: u64, step: u64, limit: u64, reverse: bool
     } else {
         ((limit - position) as u128).div_ceil(step as u128) as u64
     }
+}
+
+/// The position at which a forward loop wraps, which is `loop_end` **plus the kernel's
+/// leading frames**.
+///
+/// Deferring the wrap is how a symmetric kernel gets the frames it needs *behind* the
+/// interpolation point without a second copy of them anywhere: the trailing guard already
+/// holds the loop's continuation, so a position `t < LEADING_FRAMES` frames past
+/// `loop_end` reads exactly the frames position `loop_start + t` would have, while the
+/// taps behind it are the real frames just before `loop_end`. The output is therefore the
+/// same sequence an unrolled loop produces, frame for frame, and the wrap lands
+/// `LEADING_FRAMES` frames further round the loop than it used to — `loop_start + t`
+/// rather than `loop_start`.
+///
+/// `Nearest` and `Linear` have no leading frames, so this is `loop_end` for them and the
+/// canonical goldens do not move.
+fn forward_wrap_bits(span: LoopSpan, leading: u32) -> u64 {
+    frames_to_bits(span.end()).saturating_add(frames_to_bits(leading))
 }
 
 /// Bring a position that has run past `loop_end` back into a forward loop.
@@ -417,7 +450,7 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
     use starplayer_core::{Step, U0F16, VoiceParams};
-    use starplayer_dsp::{Linear, Nearest};
+    use starplayer_dsp::{Cubic, Linear, Nearest, Sinc};
 
     use crate::gain::RAMP_FRAMES;
     use crate::path::{FixedFrame, FixedPath};
@@ -601,6 +634,110 @@ mod tests {
                 assert_eq!(render(chunk), whole, "{span:?} at chunk length {chunk}");
             }
         }
+    }
+
+    /// The wide kernels' half of the guard-frame contract, and the reason a forward
+    /// loop's wrap is deferred by `LEADING_FRAMES`.
+    ///
+    /// The fixture's run-in looks nothing like the frames before `loop_end`, so a kernel
+    /// that took its leading taps from the frames before `loop_start` — which is what a
+    /// silent pre-roll alone would give it — would differ audibly here. Rendering the
+    /// same loop **unrolled into a one-shot** is the reference: the deferred wrap has to
+    /// produce that byte for byte, not merely something without a step in it.
+    #[test]
+    fn a_wide_kernel_renders_a_loop_exactly_as_the_unrolled_loop_renders() {
+        let body: Vec<i16> = (0..32).map(|index: i32| ((index * 977) % 4_001 - 2_000) as i16).collect();
+        let (looping_blob, looping_region) = blob_with(&body, LoopSpan::new(8, 32));
+
+        let mut unrolled = body.clone();
+        for _ in 0..6 {
+            unrolled.extend_from_slice(body.get(8..32).expect("the loop body"));
+        }
+        let (unrolled_blob, unrolled_region) = blob_with(&unrolled, None);
+
+        fn render<Interp: Interpolate>(blob: &[i16], region: SampleRegion) -> [FixedFrame; 60] {
+            let mut voice = voice_for(region, Step::from_ratio(7, 3));
+            let mut output = [FixedFrame::default(); 60];
+            accumulate_voice::<FixedPath, Interp>(&mut voice, blob, &mut output, 44_100);
+            output
+        }
+
+        assert_eq!(render::<Cubic>(&looping_blob, looping_region), render::<Cubic>(&unrolled_blob, unrolled_region), "cubic");
+        assert_eq!(render::<Sinc>(&looping_blob, looping_region), render::<Sinc>(&unrolled_blob, unrolled_region), "sinc");
+        assert_eq!(render::<Linear>(&looping_blob, looping_region), render::<Linear>(&unrolled_blob, unrolled_region), "linear, which needs no deferral to agree");
+        assert_ne!(render::<Sinc>(&looping_blob, looping_region), render::<Linear>(&looping_blob, looping_region), "the kernels are not all rendering the same thing");
+    }
+
+    /// Task B5's verification, for the kernels that read behind themselves: no
+    /// discontinuity at the wrap beyond the kernel's own ripple.
+    #[test]
+    fn a_wide_kernel_has_no_step_at_the_wrap() {
+        // A triangle that joins to itself, as in `a_forward_loop_has_no_step_at_the_wrap`.
+        let pcm: Vec<i16> = (0..64).map(|index: i32| ((if index < 32 { index } else { 64 - index }) * 900) as i16).collect();
+        let (blob, region) = blob_with(&pcm, LoopSpan::new(0, 64));
+
+        fn largest_step<Interp: Interpolate>(blob: &[i16], region: SampleRegion) -> i32 {
+            let mut voice = voice_for(region, Step::from_ratio(7, 3));
+            let mut output = [FixedFrame::default(); 512];
+            accumulate_voice::<FixedPath, Interp>(&mut voice, blob, &mut output, 44_100);
+            output.windows(2)
+                .filter_map(|pair| match pair {
+                    [first, second] => Some((second.left - first.left).abs()),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+        }
+
+        // The waveform's own slope is 900 per source frame at 7/3 frames per output frame,
+        // so a continuous render steps by about 2100; the kernels' overshoot at the two
+        // corners of the triangle is the only thing above that.
+        assert!(largest_step::<Cubic>(&blob, region) <= 2_600, "cubic stepped by {}", largest_step::<Cubic>(&blob, region));
+        assert!(largest_step::<Sinc>(&blob, region) <= 2_600, "sinc stepped by {}", largest_step::<Sinc>(&blob, region));
+    }
+
+    #[test]
+    fn splitting_a_wide_kernels_run_anywhere_produces_the_same_frames() {
+        let pcm: Vec<i16> = (0..12).map(|index| 500 + 37 * index as i16).collect();
+
+        fn render<Interp: Interpolate>(blob: &[i16], region: SampleRegion, chunk: usize) -> [FixedFrame; 40] {
+            let mut voice = voice_for(region, Step::from_ratio(7, 3));
+            let mut output = [FixedFrame::default(); 40];
+            let mut written = 0;
+            while written < output.len() {
+                let end = (written + chunk).min(output.len());
+                if let Some(window) = output.get_mut(written..end) {
+                    accumulate_voice::<FixedPath, Interp>(&mut voice, blob, window, 44_100);
+                }
+                written = end;
+            }
+            output
+        }
+
+        for span in [LoopSpan::new(3, 12), LoopSpan::ping_pong(3, 12), None] {
+            let (blob, region) = blob_with(&pcm, span);
+            let whole_cubic = render::<Cubic>(&blob, region, 40);
+            let whole_sinc = render::<Sinc>(&blob, region, 40);
+            for chunk in [1usize, 3, 7, 11, 25] {
+                assert_eq!(render::<Cubic>(&blob, region, chunk), whole_cubic, "cubic, {span:?} at chunk length {chunk}");
+                assert_eq!(render::<Sinc>(&blob, region, chunk), whole_sinc, "sinc, {span:?} at chunk length {chunk}");
+            }
+        }
+    }
+
+    /// The pre-roll's own job: a note starts from nothing, so the frames a wide kernel
+    /// reads before frame 0 are silence rather than whatever the previous sample left in
+    /// the blob.
+    #[test]
+    fn a_wide_kernel_starts_a_note_from_silence_rather_than_from_the_sample_before_it() {
+        let mut blob = Vec::new();
+        append_guarded_sample(&mut blob, &[i16::MAX; 16], None);
+        let region = append_guarded_sample(&mut blob, &[0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000], None);
+
+        let mut voice = voice_for(region, Step::from_ratio(1, 4));
+        let mut output = [FixedFrame::default(); 4];
+        accumulate_voice::<FixedPath, Sinc>(&mut voice, &blob, &mut output, 44_100);
+        assert!(output.iter().all(|frame| frame.left.abs() < 2_000), "the loud sample before this one leaked into its attack: {output:?}");
     }
 
     #[test]

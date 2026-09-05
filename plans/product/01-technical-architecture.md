@@ -751,12 +751,28 @@ Generic over the accumulator type:
 Interpolators, as a monomorphised parameter of the inner loop (never a `dyn` call per
 sample):
 
-| Interpolator | Use |
-|---|---|
-| `None` (nearest) | retro character, cheapest |
-| `Linear` | default; the golden-hash reference |
-| `Cubic` (Hermite) | quality real-time |
-| `Sinc` (windowed) | offline / high-quality rendering |
+| Interpolator | Taps | Reads | Use | Landed |
+|---|---|---|---|---|
+| `None` (nearest) | 1 | `x[0]` | retro character, cheapest | M0 |
+| `Linear` | 2 | `x[0..1]` | default; the golden-hash reference | M0 |
+| `Cubic` (Hermite) | 4 | `x[-1..2]` | quality real-time | M7-H5 |
+| `Sinc` (windowed) | 8 | `x[-3..4]` | offline / high-quality rendering | M7-H5 |
+
+Cubic is Catmull-Rom; sinc is a Kaiser-β8-windowed sinc cut off at 0.9 Nyquist, 256
+phases, stored as committed Q1.15 generated data whose rows sum to exactly one so the
+fixed path's DC gain is exactly unity. Neither computes a transcendental at run time.
+
+**Where the frames on either side come from.** Every sample's stored run is
+`PRE_ROLL_FRAMES ‖ frames ‖ GUARD_FRAMES` — eight of each — with its `pcm_offset` still
+pointing at frame 0, so the leading taps of a note's first frames read silence and a note
+starts from nothing. A *loop's* leading frames are a different problem, because the frames
+before `loop_start` are the run-in rather than the loop's predecessor, and the answer is
+neither a second copy nor a branch in the inner loop: **a forward loop's wrap is deferred
+by the kernel's `LEADING_FRAMES`** (M7-H5). The run walks that far past `loop_end` into
+the trailing guard, which already holds the loop's continuation, so the taps behind the
+interpolation point are real frames the voice has just played and the output is exactly
+what an unrolled loop produces. `Nearest` and `Linear` have no leading frames and wrap
+where they always did, which is why the canonical goldens did not move.
 
 Output conversion handles 8/16/24/32-bit integer and f32, mono and stereo, with
 dithering for the reduced-depth cases.
@@ -767,11 +783,11 @@ are type parameters of `Engine`, so selecting one is a re-instantiation, not a f
 rebuild itself from inside its own command handler. `starplayer-engine` therefore exports
 only `MixerMode` — plain `no_std` data (path, interpolator, depth, dither, channels) with a
 stable `u32` wire encoding — and a host holds an enum over the instantiations it is willing
-to build. The web host's set is 2 paths × 2 interpolators × mono/stereo = 8 arms, built by
+to build. The web host's set is 2 paths × 4 interpolators × mono/stereo = 16 arms, built by
 a macro. Depth and dither are **not** arms: they are a post-quantisation stage in the host,
 applied with the mixer's own `HostSample` conversions and `Dither` after the output ring
 and before the buffer the audio callback reads. That gives five depths on every arm without
-forty instantiations, and leaves the fixed path's native `i16` untouched at `I16` depth, so
+eighty instantiations, and leaves the fixed path's native `i16` untouched at `I16` depth, so
 the golden bit-exact path stays bit-exact. Switching mode is a rebuild performed off the
 render path, keeping the same `Arc<Module>` and the scan of it (§4.1 — a song timeline
 depends on the output rate and the module's dialect, not on the mixer mode), seeking the

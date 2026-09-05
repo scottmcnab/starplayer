@@ -19,6 +19,11 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+// The windowed-sinc table's generator and the regeneration test that gates it run in
+// `f64` with `sin`, `sqrt` and a Bessel series. They exist only under `cargo test`; the
+// shipped crate is `no_std` and reads the committed table as data.
+#[cfg(test)]
+extern crate std;
 
 pub mod biquad;
 pub mod delay_line;
@@ -30,6 +35,7 @@ pub mod interpolate;
 pub mod lfo;
 pub mod ramp;
 pub mod sample;
+pub mod sinc_table;
 pub mod smooth;
 pub mod tables;
 
@@ -57,11 +63,16 @@ pub use insert::InsertDescriptor;
 pub use insert::ParamId;
 pub use insert::ParamSpec;
 pub use insert::ParamUnit;
+pub use interpolate::Cubic;
 pub use interpolate::Interpolate;
 pub use interpolate::Linear;
 pub use interpolate::Nearest;
+pub use interpolate::Sinc;
 pub use interpolate::round_shift_nearest;
 pub use lfo::Lfo;
+pub use sinc_table::SINC_PHASES;
+pub use sinc_table::SINC_TABLE_Q15;
+pub use sinc_table::SINC_TAPS;
 pub use ramp::GainRamp;
 pub use sample::DspSample;
 pub use sample::Q15_UNITY;

@@ -1,7 +1,7 @@
 //! Native MOD engine integration and output determinism.
 
 use starplayer_core::ExactFixedPoint;
-use starplayer_dsp::Linear;
+use starplayer_dsp::{Cubic, Interpolate, Linear, Sinc};
 use starplayer_engine::{Engine, EngineSettings};
 use starplayer_mixer::{FixedPath, StereoI16};
 use starplayer_model::Module;
@@ -12,7 +12,7 @@ const SAMPLE_RATE_HZ: u32 = 44_100;
 const OUTPUT_FRAMES: usize = SAMPLE_RATE_HZ as usize;
 const BLOCK_SIZES: [usize; 6] = [1, 3, 64, 128, 4096, 8191];
 
-type ModEngine = Engine<FixedPath, Linear, StereoI16, Arc<Module>>;
+type ModEngine<Interp> = Engine<FixedPath, Interp, StereoI16, Arc<Module>>;
 
 fn looping_mod() -> Vec<u8> {
     const SAMPLE_FRAMES: usize = 256;
@@ -32,7 +32,7 @@ fn looping_mod() -> Vec<u8> {
     bytes
 }
 
-fn render(block_frames: usize) -> (Vec<i16>, starplayer_engine::EngineWarnings) {
+fn render<Interp: Interpolate>(block_frames: usize) -> (Vec<i16>, starplayer_engine::EngineWarnings) {
     let module = Arc::new(starplayer_mod::load(&looping_mod()).expect("native MOD loads"));
     let settings = EngineSettings {
         sample_rate_hz: SAMPLE_RATE_HZ,
@@ -40,7 +40,7 @@ fn render(block_frames: usize) -> (Vec<i16>, starplayer_engine::EngineWarnings) 
         voice_capacity: module.header().channel_count as usize,
         ..EngineSettings::default()
     };
-    let mut engine: ModEngine = Engine::with_settings(settings);
+    let mut engine: ModEngine<Interp> = Engine::with_settings(settings);
     let mut control = engine.take_control().expect("control handle");
     control.load_module(Arc::clone(&module)).map_err(|_| "module command queued").expect("module command queued");
     engine.set_source(Box::new(starplayer_mod::sequencer_for(module, SAMPLE_RATE_HZ, ExactFixedPoint)));
@@ -55,14 +55,27 @@ fn render(block_frames: usize) -> (Vec<i16>, starplayer_engine::EngineWarnings) 
     (output, engine.warnings())
 }
 
+fn assert_block_size_independent<Interp: Interpolate>(kernel: &str) {
+    let (reference, warnings) = render::<Interp>(128);
+    assert!(!warnings.any(), "{kernel}: the reference render raises no engine warning");
+    assert!(reference.iter().any(|sample| *sample != 0), "{kernel}: the native MOD render is audible");
+    for block_frames in BLOCK_SIZES {
+        let (output, warnings) = render::<Interp>(block_frames);
+        assert!(!warnings.any(), "{kernel}: block size {block_frames} raises no engine warning");
+        assert_eq!(output, reference, "{kernel}: block size {block_frames} changed the byte-exact MOD render");
+    }
+}
+
 #[test]
 fn native_mod_audio_is_byte_identical_at_every_host_block_size() {
-    let (reference, warnings) = render(128);
-    assert!(!warnings.any(), "the reference render raises no engine warning");
-    assert!(reference.iter().any(|sample| *sample != 0), "the native MOD render is audible");
-    for block_frames in BLOCK_SIZES {
-        let (output, warnings) = render(block_frames);
-        assert!(!warnings.any(), "block size {block_frames} raises no engine warning");
-        assert_eq!(output, reference, "block size {block_frames} changed the byte-exact MOD render");
-    }
+    assert_block_size_independent::<Linear>("linear");
+}
+
+/// The wide kernels of M7-task-H5, on the same looping MOD: they read behind the
+/// interpolation point and defer the loop wrap, and neither may depend on the block.
+#[test]
+fn native_mod_audio_on_the_wide_kernels_is_byte_identical_at_every_host_block_size() {
+    assert_block_size_independent::<Cubic>("cubic");
+    assert_block_size_independent::<Sinc>("sinc");
+    assert_ne!(render::<Sinc>(128).0, render::<Linear>(128).0, "the kernels are not all rendering the same thing");
 }

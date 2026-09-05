@@ -8,7 +8,7 @@
 //! not a [`Module`] that makes the mixer read the wrong memory.
 
 use alloc::vec::Vec;
-use starplayer_core::{Error, GUARD_FRAMES, InstrumentId, SampleId};
+use starplayer_core::{Error, GUARD_FRAMES, InstrumentId, PRE_ROLL_FRAMES, SampleId};
 
 use crate::header::ModuleHeader;
 use crate::instrument::InstrumentDef;
@@ -42,7 +42,13 @@ impl ModuleBuilder {
     /// # The layout this writes
     ///
     /// Exactly what `starplayer_mixer::sample::SampleData::resolve` expects, which is why
-    /// this is the only supported way to build the blob:
+    /// this is the only supported way to build the blob. Every sample's stored run is
+    /// [`PRE_ROLL_FRAMES`] of silence, then its frames, then its [`GUARD_FRAMES`]; the
+    /// returned id's `pcm_offset` points at **frame 0**, so the pre-roll sits just before
+    /// it and every offset in the index means what it always meant. The pre-roll is what
+    /// lets a cubic or windowed-sinc kernel read `index - 1` or `index - 3` at the very
+    /// first frame of a sample; see [`PRE_ROLL_FRAMES`] for why it is silence and where a
+    /// *loop's* leading frames come from instead.
     ///
     /// * **[`LoopMode::Forward`], no sustain loop** — frames `0 .. loop_end` are stored
     ///   and the tail after the loop end is discarded, because a forward loop never plays
@@ -119,12 +125,16 @@ impl ModuleBuilder {
             }
         };
 
-        let pcm_offset = u32::try_from(self.pcm.len()).map_err(|_| Error::TooLarge("module PCM larger than 4 GFrames"))?;
-        let stored_total = (stored_frames as usize).checked_add(GUARD_FRAMES).ok_or(Error::TooLarge("sample length"))?;
-        let blob_end = (pcm_offset as usize).checked_add(stored_total).ok_or(Error::TooLarge("module PCM"))?;
+        let pre_roll_offset = u32::try_from(self.pcm.len()).map_err(|_| Error::TooLarge("module PCM larger than 4 GFrames"))?;
+        let pcm_offset = pre_roll_offset.checked_add(PRE_ROLL_FRAMES as u32).ok_or(Error::TooLarge("module PCM larger than 4 GFrames"))?;
+        let stored_total = (stored_frames as usize)
+            .checked_add(PRE_ROLL_FRAMES + GUARD_FRAMES)
+            .ok_or(Error::TooLarge("sample length"))?;
+        let blob_end = (pre_roll_offset as usize).checked_add(stored_total).ok_or(Error::TooLarge("module PCM"))?;
         u32::try_from(blob_end).map_err(|_| Error::TooLarge("module PCM larger than 4 GFrames"))?;
 
         let body = pcm.get(..stored_frames as usize).ok_or(Error::OutOfRange)?;
+        self.pcm.extend(core::iter::repeat_n(0, PRE_ROLL_FRAMES));
         self.pcm.extend_from_slice(body);
         match (has_sustain_loop, specification.loop_mode) {
             (true, _) => self.pcm.extend(core::iter::repeat_n(0, GUARD_FRAMES)),
@@ -305,7 +315,7 @@ mod tests {
         assert_eq!(module.sample_pcm(SampleId(0)).map(<[i16]>::len), Some(8 + GUARD_FRAMES));
 
         let one_shot = module.sample(SampleId(1)).expect("sample 1 exists");
-        assert_eq!(one_shot.pcm_offset(), 8 + GUARD_FRAMES as u32, "samples pack back to back, guard frames included");
+        assert_eq!(one_shot.pcm_offset(), (PRE_ROLL_FRAMES + 8 + GUARD_FRAMES + PRE_ROLL_FRAMES) as u32, "samples pack back to back, pre-roll and guard frames included");
         assert_eq!(module.sample_pcm(SampleId(1)).map(<[i16]>::len), Some(2 + GUARD_FRAMES));
 
         assert_eq!(module.pattern_bytes(PatternId(0)), Some(&[1u8, 2, 3, 4][..]));
@@ -330,7 +340,7 @@ mod tests {
         builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
         let module = builder.build().expect("a valid module");
 
-        assert_eq!(module.pcm(), &[0, 1, 2, 3, 4, 5, 6, 7, /* guard: */ 4, 5, 6, 7, 4, 5, 6, 7]);
+        assert_eq!(module.pcm(), &[/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, /* guard: */ 4, 5, 6, 7, 4, 5, 6, 7]);
     }
 
     #[test]
@@ -340,7 +350,7 @@ mod tests {
         builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
         let module = builder.build().expect("a valid module");
 
-        assert_eq!(module.pcm(), &[7, 8, 9, /* guard: */ 8, 9, 8, 9, 8, 9, 8, 9]);
+        assert_eq!(module.pcm(), &[/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 7, 8, 9, /* guard: */ 8, 9, 8, 9, 8, 9, 8, 9]);
     }
 
     #[test]
@@ -350,7 +360,7 @@ mod tests {
         builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
         let module = builder.build().expect("a valid module");
 
-        assert_eq!(module.pcm(), &[10, 20, 30, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(module.pcm(), &[/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 10, 20, 30, /* guard: */ 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -365,7 +375,7 @@ mod tests {
         // start=1, end=3: the reflection turns on frames 1 and 2, so the guard mirrors
         // pcm[1], pcm[2] forever — the same pattern
         // `a_ping_pong_guard_matches_the_mixers_own_arithmetic` derives independently.
-        assert_eq!(module.pcm(), &[1, 2, 3, /* guard: */ 2, 3, 2, 3, 2, 3, 2, 3]);
+        assert_eq!(module.pcm(), &[/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, /* guard: */ 2, 3, 2, 3, 2, 3, 2, 3]);
     }
 
     #[test]
@@ -405,7 +415,7 @@ mod tests {
         let sample = module.sample(id).expect("the sample exists");
         assert_eq!(sample.length_frames(), 10, "the sustain loop's end sits past loop_end, so the whole sample is stored");
         assert_eq!(sample.sustain_loop(), Some(SustainLoop { mode: LoopMode::Forward, start: 4, end: 8 }));
-        assert_eq!(module.pcm(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, /* guard: */ 0, 0, 0, 0, 0, 0, 0, 0], "a sustain loop's guard is silence");
+        assert_eq!(module.pcm(), &[/* pre-roll: */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, /* guard: */ 0, 0, 0, 0, 0, 0, 0, 0], "a sustain loop's guard is silence");
     }
 
     #[test]

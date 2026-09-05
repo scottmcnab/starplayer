@@ -12,8 +12,12 @@
 use std::fmt;
 
 use starplayer::core::quirks::{QuirkSelection, QuirkSet};
-use starplayer::core::{AtEnd, Error, Interpolator};
-use starplayer::dsp::{Interpolate, Linear, Nearest};
+use starplayer::core::{AtEnd, Error};
+
+/// Re-exported so a caller naming a golden's kernel — the goldens driver, a cross-target
+/// check — does not have to depend on `starplayer-core` directly.
+pub use starplayer::core::Interpolator;
+use starplayer::dsp::{Cubic, Interpolate, Linear, Nearest, Sinc};
 use starplayer::engine::{
     ChannelTable, EndReason, Engine, EngineSettings, EngineWarnings, EventSource, InstrumentRack, MidiSource, ScanLimits,
     SongTimeline,
@@ -157,7 +161,11 @@ pub enum RenderError {
     CommandQueue,
     /// The engine's safety guards fired during the supposedly canonical segment.
     EngineWarnings(EngineWarnings),
-    /// [`GOLDEN_INTERPOLATOR`] names a kernel this build has no implementation for.
+    /// A golden names a kernel this build has no implementation for.
+    ///
+    /// Every [`Interpolator`] has one since M7-task-H5, so nothing constructs this today.
+    /// It stays because a build that features a kernel out — an embedded target that
+    /// wants neither cubic nor sinc — needs somewhere to say so that is not a panic.
     /// The filename would promise audio the renderer cannot produce, so it refuses.
     UnimplementedInterpolator(Interpolator),
 }
@@ -168,7 +176,7 @@ impl fmt::Display for RenderError {
             RenderError::Load(error) => write!(formatter, "could not load module: {error}"),
             RenderError::CommandQueue => write!(formatter, "fresh offline engine rejected its module command"),
             RenderError::EngineWarnings(warnings) => write!(formatter, "offline render raised engine warnings: {warnings:?}"),
-            RenderError::UnimplementedInterpolator(kernel) => write!(formatter, "GOLDEN_INTERPOLATOR names {kernel:?}, which has no kernel in this build"),
+            RenderError::UnimplementedInterpolator(kernel) => write!(formatter, "the golden names {kernel:?}, which has no kernel in this build"),
         }
     }
 }
@@ -207,13 +215,24 @@ type TraceEngine = Engine<FixedPath, Linear, StereoI16, Arc<Module>>;
 /// master limiter bypassed in favour of a transparent clamp. Per-channel DSP is currently
 /// a no-op; when the graph lands, this entry point remains its explicit bypass boundary.
 pub fn render_fixed_mono(format: GoldenFormat, bytes: &[u8], host_block_frames: usize) -> Result<Vec<i16>, RenderError> {
-    render_golden::<FixedPath, MonoI16>(format, bytes, GOLDEN_RENDER_FRAMES, host_block_frames)
+    render_fixed_mono_with(format, bytes, host_block_frames, GOLDEN_INTERPOLATOR)
+}
+
+/// [`render_fixed_mono`] on a named kernel rather than the canonical one.
+///
+/// M7-task-H5 added the cubic and sinc goldens as **cross-target pins**, not as a second
+/// canonical render: linear is still the kernel [`GOLDEN_INTERPOLATOR`] names and the one
+/// the accuracy policy talks about. Everything else about the render — rate, duration,
+/// mono fold-down, limiter — is identical, which is what makes the extra hashes worth
+/// having: the only variable between them is the kernel.
+pub fn render_fixed_mono_with(format: GoldenFormat, bytes: &[u8], host_block_frames: usize, interpolator: Interpolator) -> Result<Vec<i16>, RenderError> {
+    render_golden::<FixedPath, MonoI16>(format, bytes, GOLDEN_RENDER_FRAMES, host_block_frames, interpolator)
 }
 
 /// Render the float path with the same rate, duration, interpolation, mono fold-down and
 /// DSP bypass as [`render_fixed_mono`].
 pub fn render_float_mono(format: GoldenFormat, bytes: &[u8], host_block_frames: usize) -> Result<Vec<f32>, RenderError> {
-    render_golden::<FloatPath, MonoF32>(format, bytes, GOLDEN_RENDER_FRAMES, host_block_frames)
+    render_golden::<FloatPath, MonoF32>(format, bytes, GOLDEN_RENDER_FRAMES, host_block_frames, GOLDEN_INTERPOLATOR)
 }
 
 /// SHA-256 over the canonical samples encoded as little-endian signed PCM words.
@@ -221,7 +240,14 @@ pub fn render_float_mono(format: GoldenFormat, bytes: &[u8], host_block_frames: 
 /// Hashing an explicit byte order, rather than the in-memory representation of `i16`, is
 /// what lets x86-64, aarch64 and wasm32 compare the same digest.
 pub fn canonical_sha256(format: GoldenFormat, bytes: &[u8], host_block_frames: usize) -> Result<[u8; 32], RenderError> {
-    let samples = render_fixed_mono(format, bytes, host_block_frames)?;
+    canonical_sha256_with(format, bytes, host_block_frames, GOLDEN_INTERPOLATOR)
+}
+
+/// [`canonical_sha256`] on a named kernel, which is what writes the extra cubic and sinc
+/// goldens. The kernel is part of the golden's filename, so a hash and the kernel that
+/// produced it cannot come apart.
+pub fn canonical_sha256_with(format: GoldenFormat, bytes: &[u8], host_block_frames: usize, interpolator: Interpolator) -> Result<[u8; 32], RenderError> {
+    let samples = render_fixed_mono_with(format, bytes, host_block_frames, interpolator)?;
     let mut hasher = Sha256::new();
     for sample in samples {
         hasher.update(sample.to_le_bytes());
@@ -522,11 +548,12 @@ pub fn golden_filename(module_stem: &str) -> String {
     golden_filename_for_interpolator(module_stem, GOLDEN_INTERPOLATOR)
 }
 
-/// The configuration filename an alternate interpolator would use.
+/// The configuration filename an alternate interpolator uses.
 ///
-/// Only linear is rendered canonically in C6. This mapping exists to make the filename
-/// transition testable: selecting another kernel creates a missing new golden instead of
-/// comparing its bytes against the linear hash.
+/// Linear is still the canonical kernel; the cubic and sinc goldens M7-task-H5 added for
+/// `reflex.s3m` are cross-target pins beside it. This mapping is what keeps the two
+/// apart: selecting another kernel names a different file rather than comparing its bytes
+/// against the linear hash.
 pub fn golden_filename_for_interpolator(module_stem: &str, interpolator: Interpolator) -> String {
     let label = match interpolator {
         Interpolator::None => "nearest",
@@ -575,21 +602,22 @@ pub fn segmental_snr_db(fixed: &[i16], float: &[f32], segment_frames: usize) -> 
     if compared_segments == 0 { None } else { Some(total_db / compared_segments as f64) }
 }
 
-/// Dispatch the canonical render on [`GOLDEN_INTERPOLATOR`].
+/// Dispatch a golden render on the [`Interpolator`] its filename names.
 ///
-/// This `match` is the whole point of the constant: the same value that names the golden
-/// file selects the kernel that produces its bytes, so the two cannot disagree. Adding a
-/// kernel to `starplayer-dsp` means adding one arm here, and nothing else in this crate
-/// may name an interpolator type.
-fn render_golden<Path, Out>(format: GoldenFormat, bytes: &[u8], frames: usize, host_block_frames: usize) -> Result<Vec<Out::Sample>, RenderError>
+/// This `match` is the whole point of naming the kernel in the filename: the same value
+/// that picks the file picks the code that produces its bytes, so the two cannot
+/// disagree. Adding a kernel to `starplayer-dsp` means adding one arm here, and nothing
+/// else in this crate may name an interpolator type.
+fn render_golden<Path, Out>(format: GoldenFormat, bytes: &[u8], frames: usize, host_block_frames: usize, interpolator: Interpolator) -> Result<Vec<Out::Sample>, RenderError>
 where
     Path: MixPath,
     Out: OutputFormat<Accumulator = Path::Accumulator>,
 {
-    match GOLDEN_INTERPOLATOR {
+    match interpolator {
         Interpolator::None => render_with_kernel::<Path, Nearest, Out>(format, bytes, frames, host_block_frames),
         Interpolator::Linear => render_with_kernel::<Path, Linear, Out>(format, bytes, frames, host_block_frames),
-        kernel => Err(RenderError::UnimplementedInterpolator(kernel)),
+        Interpolator::Cubic => render_with_kernel::<Path, Cubic, Out>(format, bytes, frames, host_block_frames),
+        Interpolator::Sinc => render_with_kernel::<Path, Sinc, Out>(format, bytes, frames, host_block_frames),
     }
 }
 
