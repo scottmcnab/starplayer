@@ -162,6 +162,10 @@ pub struct HostEngine {
     fixed_scratch: Vec<i16>,
 }
 
+/// What [`HostEngine::build`] hands back: the engine, its module control handle, its
+/// insert control handle (M7-H7), its telemetry reader.
+type BuiltHost = (HostEngine, EngineHandle<Arc<Module>>, HostInsertControl, TelemetryReader);
+
 impl HostEngine {
     /// Build the arm `mode` names, at the maxima a persistent host takes.
     ///
@@ -170,7 +174,7 @@ impl HostEngine {
     /// [`ChannelTable::MAX_CHANNELS`] once. Both are allocated here, and the mixer and the
     /// telemetry view walk only what is *active*, so a wider pool changes no rendered
     /// sample — only how much memory the host holds.
-    pub fn build(mode: MixerMode, sample_rate_hz: u32) -> Result<(HostEngine, EngineHandle<Arc<Module>>, HostInsertControl, TelemetryReader), HostError> {
+    pub fn build(mode: MixerMode, sample_rate_hz: u32) -> Result<BuiltHost, HostError> {
         let settings = EngineSettings {
             sample_rate_hz,
             voice_capacity: MAX_VOICE_CAPACITY,
