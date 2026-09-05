@@ -29,11 +29,18 @@
 //!     applies:
 //!         starplayer render song.mid --instruments module.it -o out.wav
 //!
+//!     --insert <target>:<effect>[:<param>=<value>,...] installs an insert effect before
+//!     rendering (M7-H7), repeatably; --list-effects prints every effect this build can
+//!     install and exits. See `src/insert_arg.rs`'s module doc for the grammar. Conflicts
+//!     with --golden, which is DSP-bypassed by policy:
+//!         starplayer render <file> -o out.wav --insert 1:reverb:room=60,mix=50
+//!
 //! starplayer trace <file> [--ticks N]
 //!     Print a per-tick diagnostic trace of the sequencer's state to stdout.
 //!
 //! starplayer play <file> [--entry N] [--device NAME] [--rate HZ] [--buffer FRAMES]
 //!                         [--repeat] [--list-devices] [--midi PORT] [--list-midi-ports]
+//!                         [--insert TARGET:EFFECT[:PARAM=VALUE,...]] [--list-effects]
 //!     Play a module on an audio output device through starplayer-host-cpal. Prints
 //!     the title and the negotiated stream spec once, then order/pattern/row/speed/
 //!     BPM/voices/peak on one updating line once a second. Stops at the song's natural
@@ -48,6 +55,9 @@
 //!     --list-midi-ports prints what this machine has.
 //!
 //!     --instruments MODULE names the module whose instruments play a `.mid` (task E5).
+//!
+//!     --insert and --list-effects are the same flags `render` takes (M7-H7), installed
+//!     through `Player` before playback starts.
 //! ```
 //!
 //! A ZIP archive is accepted anywhere a module file is. With more than one recognised
