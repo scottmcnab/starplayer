@@ -62,6 +62,7 @@
 
 mod archive;
 mod info;
+mod insert_arg;
 mod play;
 mod render;
 mod trace;
