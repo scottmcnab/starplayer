@@ -18,8 +18,10 @@
 
 use starplayer_core::{ChannelId, ExactFixedPoint, FilterParams, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
 use starplayer_dsp::effects::chorus::{CHORUS_DEPTH_PARAM, CHORUS_RATE_PARAM};
+use starplayer_dsp::effects::compressor::{COMPRESSOR_RATIO_PARAM, COMPRESSOR_THRESHOLD_PARAM};
 use starplayer_dsp::effects::delay::{DELAY_MIX_PARAM, DELAY_TIME_PARAM};
 use starplayer_dsp::effects::eq::{EQ_HIGH_GAIN_PARAM, EQ_PEAK_GAIN_PARAM};
+use starplayer_dsp::effects::reverb::{REVERB_MIX_PARAM, REVERB_ROOM_PARAM};
 use starplayer_dsp::effects::{GAIN_MIN_CENTI_DB, GAIN_PARAM};
 use starplayer_dsp::{Cubic, InsertKind, Interpolate, Linear, Nearest, Sinc, build_insert};
 use starplayer_engine::demo::{
@@ -628,6 +630,105 @@ fn an_eq_delay_and_chorus_chain_is_byte_identical_at_every_host_block_size() {
     assert_h3_block_size_independent::<FloatPath, Linear, StereoF32>("h3 float / linear / stereo f32");
     assert_h3_block_size_independent::<FixedPath, Linear, StereoI16>("h3 fixed / linear / stereo i16");
     assert_h3_block_size_independent::<FixedPath, Nearest, MonoI16>("h3 fixed / nearest / mono i16");
+}
+
+// ── and again with the H4 effects live (M7-H4 deliverable 4) ────────────────────────
+//
+// The H3 scenario proved a biquad cascade, a fractionally-read ring and an LFO phase are
+// each block-size independent. These two carry the state H3's did not: the reverb
+// twenty-four recursive delay lines whose feedback multiplies have rounding fixed points
+// the effect deliberately flushes, and the compressor a **sub-block control signal** —
+// a peak detector, a log-domain gain computer and an attack/release one-pole that step
+// every 32 frames and drive a gain ramped across the frames between. A control signal
+// derived from anything but "frames rendered" would show up here and nowhere else.
+
+/// The reverb's room size is opened up here, which changes every comb's feedback.
+const H4_FIRST_PHASE_FRAMES: usize = 40 * RENDER_QUANTUM;
+
+/// The compressor's threshold is dropped here, so it starts taking real gain off.
+const H4_SECOND_PHASE_FRAMES: usize = 80 * RENDER_QUANTUM;
+
+/// And its ratio is steepened here, mid-reduction.
+const H4_THIRD_PHASE_FRAMES: usize = 120 * RENDER_QUANTUM;
+
+const _: () = assert!(H4_THIRD_PHASE_FRAMES < TOTAL_FRAMES, "every phase has to fall inside the render");
+
+/// Two looping voices, a reverb on channel 1 and a compressor on the master, with a
+/// parameter sweep queued at each of three phase boundaries.
+fn render_with_h4_effects_at_block_size<Path, Interp, Out>(block_frames: usize) -> Vec<Out::Sample>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let (blob, region) = looping_blob();
+    let mut engine: Engine<Path, Interp, Out> = Engine::new(VOICE_CAPACITY);
+    engine.set_pcm(blob);
+    let mut inserts = engine.take_insert_control().expect("a fresh engine owns its insert handle");
+
+    for channel in [0u8, INSERT_CHANNEL as u8] {
+        let tag = VoiceTag { channel, instrument: 1, sample: 1, note: 60 };
+        engine.voices_mut().allocate(tag, region, voice_params(), 0).expect("a fresh pool has room");
+    }
+    engine.set_source(Box::new(ScriptedSource::new(Vec::new())));
+
+    // Built here, on the "control thread": the reverb allocates a fifth of a megabyte of
+    // ring buffer, which is exactly why an effect crosses to the engine boxed.
+    let reverberated = InsertTarget::Channel(ChannelId(INSERT_CHANNEL));
+    let mut reverb = build_insert::<Path::Mono>(InsertKind::Reverb, 44_100);
+    // Wet enough to hear, and a tail long enough to run across several phase boundaries.
+    reverb.set_param(REVERB_MIX_PARAM, 50);
+    reverb.reset();
+    inserts.install(reverberated, 0, reverb).map_err(|_| "full").expect("the ring has room");
+
+    let mut compressor = build_insert::<Path::Mono>(InsertKind::Compressor, 44_100);
+    // Low enough that the gain computer is working for the whole render rather than
+    // sitting at unity where its output would be bit-transparent whatever it did.
+    compressor.set_param(COMPRESSOR_THRESHOLD_PARAM, -3_000);
+    compressor.set_param(COMPRESSOR_RATIO_PARAM, 800);
+    compressor.reset();
+    inserts.install(InsertTarget::Master, 0, compressor).map_err(|_| "full").expect("the ring has room");
+
+    let mut output = vec![Out::Sample::default(); TOTAL_FRAMES * Out::CHANNELS];
+    let phases = [
+        (H4_FIRST_PHASE_FRAMES, Some(InsertCommand::SetParam { target: reverberated, slot: 0, param: REVERB_ROOM_PARAM, value: 90 })),
+        (H4_SECOND_PHASE_FRAMES, Some(InsertCommand::SetParam { target: InsertTarget::Master, slot: 0, param: COMPRESSOR_THRESHOLD_PARAM, value: -4_500 })),
+        (H4_THIRD_PHASE_FRAMES, Some(InsertCommand::SetParam { target: InsertTarget::Master, slot: 0, param: COMPRESSOR_RATIO_PARAM, value: 1_600 })),
+        (TOTAL_FRAMES, Some(InsertCommand::SetParam { target: reverberated, slot: 0, param: REVERB_MIX_PARAM, value: 100 })),
+    ];
+    render_phases::<Path, Interp, Out>(&mut engine, &mut inserts, &mut output, block_frames, phases);
+
+    assert!(!engine.warnings().any(), "the insert graph raised no warnings: {:?}", engine.warnings());
+    inserts.collect_all_garbage();
+    output
+}
+
+fn assert_h4_block_size_independent<Path, Interp, Out>(what: &str)
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: BitPattern + Default,
+{
+    let reference = render_with_h4_effects_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM);
+    let plain = render_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM, false);
+    assert!(first_difference(&reference, &plain).is_some(), "{what}: the effects have to actually change the sound");
+
+    for block_frames in BLOCK_SIZES {
+        let output = render_with_h4_effects_at_block_size::<Path, Interp, Out>(block_frames);
+        let difference = first_difference(&output, &reference);
+        assert_eq!(difference, None, "{what}: block size {block_frames} changed the output at sample {difference:?}");
+        assert_eq!(byte_image(&output), byte_image(&reference), "{what}: block size {block_frames} is not byte-identical");
+    }
+}
+
+/// A reverb and a compressor, both live, with a parameter sweep on each, at every host
+/// block size on both mixing paths.
+#[test]
+fn a_reverb_and_a_compressor_are_byte_identical_at_every_host_block_size() {
+    assert_h4_block_size_independent::<FloatPath, Linear, StereoF32>("h4 float / linear / stereo f32");
+    assert_h4_block_size_independent::<FixedPath, Linear, StereoI16>("h4 fixed / linear / stereo i16");
+    assert_h4_block_size_independent::<FixedPath, Nearest, MonoI16>("h4 fixed / nearest / mono i16");
 }
 
 /// The same scenario as [`render_at_block_size`], on an engine sized by `settings` rather

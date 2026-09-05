@@ -26,9 +26,29 @@ use crate::sample::DspSample;
 /// compile time. An effect may rely on it: `block.len()` is this, every call.
 pub const DSP_BLOCK_FRAMES: usize = 128;
 
-/// Which parameter of an effect, by position in its [`InsertDescriptor::params`].
+/// Which parameter of an effect, by position in its [`InsertDescriptor::params`] — or, at
+/// or above [`ParamId::METER_BASE`], one of the read-only meters an effect publishes.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParamId(pub u8);
+
+impl ParamId {
+    /// The first identifier reserved for a **meter**: a value an effect measures and a host
+    /// displays, read through [`Insert::param`] like any other parameter but never listed
+    /// in [`InsertDescriptor::params`] and never accepted by [`Insert::set_param`].
+    ///
+    /// The reserved range sits far above any real parameter position — the largest
+    /// descriptor in this crate has ten — so a meter never collides with a slider, an
+    /// effect that has no meters is unchanged, and `param(ParamId(params.len()))` still
+    /// reads back `None` the way [`assert_descriptor_roundtrip`] requires.
+    pub const METER_BASE: ParamId = ParamId(0xF0);
+
+    /// How much gain a dynamics processor is currently taking off, in centi-decibels and
+    /// **positive** (`600` is 6 dB of reduction). H4's compressor publishes it; H7 draws it.
+    pub const GAIN_REDUCTION: ParamId = ParamId(0xF0);
+
+    /// Whether this identifier names a read-only meter rather than a settable parameter.
+    pub const fn is_meter(self) -> bool { self.0 >= ParamId::METER_BASE.0 }
+}
 
 /// What an effect parameter's integer value means.
 ///
@@ -105,10 +125,13 @@ pub trait Insert<Sample: DspSample>: Send {
     fn process(&mut self, block: &mut [Stereo<Sample>]);
 
     /// Set one parameter. **Real-time safe**: a copy and the start of a smoothing ramp,
-    /// never an allocation. An out-of-range value is clamped rather than refused.
+    /// never an allocation. An out-of-range value is clamped rather than refused, and an
+    /// identifier the effect does not have — including any meter (see
+    /// [`ParamId::METER_BASE`]) — is ignored.
     fn set_param(&mut self, id: ParamId, value: i32);
 
-    /// The parameter's target value, or `None` if this effect has no such parameter.
+    /// The parameter's target value, or the current reading of one of this effect's meters,
+    /// or `None` if it has neither under that identifier.
     fn param(&self, id: ParamId) -> Option<i32>;
 
     /// Clear every delay line and envelope; parameters keep their values, landing on

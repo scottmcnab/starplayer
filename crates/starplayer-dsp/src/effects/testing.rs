@@ -48,6 +48,37 @@ pub fn white_noise(frames: usize, amplitude: i32) -> Vec<i32> {
         .collect()
 }
 
+/// `frames` of a synthetic drum loop on the raw `i16` scale: a half-second bar with a hit
+/// on each beat, each hit a noise burst under an exponential decay.
+///
+/// H4's fixed-versus-float measurements ask for a drum loop rather than white noise
+/// because a reverb's recursion amplifies rounding, and what that costs depends on the
+/// signal's crest factor: steady noise never leaves the recursion quiet enough for its own
+/// error floor to matter, and a drum loop does. Built from the same fixed-seed
+/// [`Xorshift32`] [`white_noise`] uses, so the loop is identical on x86, ARM and WASM.
+pub fn drum_loop(frames: usize) -> Vec<i32> {
+    /// `(offset in the bar as a fraction of 16, peak amplitude, decay time constant in frames)`.
+    const HITS: [(usize, i32, f64); 5] = [(0, 26_000, 2_600.0), (4, 13_000, 700.0), (8, 22_000, 2_000.0), (12, 13_000, 700.0), (14, 9_000, 400.0)];
+    let bar = (RATE as usize / 2).max(16);
+    let mut stream = Xorshift32::new(0x0D12_5EED);
+    let mut samples = vec![0i32; frames];
+    let mut bar_start = 0usize;
+    while bar_start < frames {
+        for (sixteenth, peak, decay) in HITS {
+            let start = bar_start + sixteenth * bar / 16;
+            for offset in 0..frames.saturating_sub(start).min((decay * 6.0) as usize) {
+                let envelope = (-(offset as f64) / decay).exp();
+                let noise = ((stream.next_u32() >> 8) as f64 / (1u32 << 23) as f64) - 1.0;
+                if let Some(slot) = samples.get_mut(start + offset) {
+                    *slot = (*slot + (noise * envelope * peak as f64) as i32).clamp(-32_767, 32_767);
+                }
+            }
+        }
+        bar_start += bar;
+    }
+    samples
+}
+
 /// Run `input` through `insert` a whole block at a time, both stereo channels carrying the
 /// same signal, and hand back the left channel.
 ///

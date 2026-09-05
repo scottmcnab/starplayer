@@ -5,15 +5,19 @@
 //! [`build`] grow one arm each time, and a host never names a concrete effect type.
 
 pub mod chorus;
+pub mod compressor;
 pub mod delay;
 pub mod eq;
 pub mod gain;
+pub mod reverb;
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use chorus::Chorus;
+pub use compressor::Compressor;
 pub use delay::Delay;
 pub use eq::Eq;
+pub use reverb::Reverb;
 pub use gain::{GAIN_MAX_CENTI_DB, GAIN_MIN_CENTI_DB, GAIN_PARAM, GainInsert, fader_gain_q15};
 
 use alloc::boxed::Box;
@@ -33,6 +37,10 @@ pub enum InsertKind {
     Delay,
     /// Two or three modulated taps per channel ([`Chorus`]).
     Chorus,
+    /// Freeverb: eight combs into four allpasses per channel ([`Reverb`]).
+    Reverb,
+    /// A feed-forward, stereo-linked peak compressor ([`Compressor`]).
+    Compressor,
 }
 
 /// Build one effect, boxed for a chain slot.
@@ -49,6 +57,8 @@ pub fn build_insert<Sample: DspSample>(kind: InsertKind, sample_rate_hz: u32) ->
         InsertKind::Eq => Box::new(Eq::new(sample_rate_hz)),
         InsertKind::Delay => Box::new(Delay::new(sample_rate_hz)),
         InsertKind::Chorus => Box::new(Chorus::new(sample_rate_hz)),
+        InsertKind::Reverb => Box::new(Reverb::new(sample_rate_hz)),
+        InsertKind::Compressor => Box::new(Compressor::new(sample_rate_hz)),
     }
 }
 
@@ -66,7 +76,7 @@ mod tests {
 
     #[test]
     fn every_kind_builds_on_both_paths_at_its_own_defaults() {
-        for kind in [InsertKind::Gain, InsertKind::Eq, InsertKind::Delay, InsertKind::Chorus] {
+        for kind in [InsertKind::Gain, InsertKind::Eq, InsertKind::Delay, InsertKind::Chorus, InsertKind::Reverb, InsertKind::Compressor] {
             let float: Box<dyn Insert<f32>> = build_insert(kind, 44_100);
             let fixed: Box<dyn Insert<i32>> = build_insert(kind, 44_100);
             assert_eq!(float.descriptor(), fixed.descriptor(), "{kind:?} describes itself differently on the two paths");
