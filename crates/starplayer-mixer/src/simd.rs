@@ -136,7 +136,7 @@ pub fn wide_master_volume_f32(quantum: &mut [Stereo<f32>], volume: f32) {
 /// which is what lets the volume and the limiter be two passes over the quantum rather
 /// than one fused expression.
 ///
-/// Scalar, and staying scalar: `wide` widens (`i32x4::mul_widen`) but cannot narrow an
+/// Scalar, and staying scalar: `wide` widens (`i32x4::widening_mul`) but cannot narrow an
 /// `i64x4` back, so the rounding shift would have to leave the vector through memory for
 /// every frame.
 pub fn scalar_master_volume_fixed(quantum: &mut [Stereo<i32>], volume: i64) {

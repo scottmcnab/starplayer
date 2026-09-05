@@ -28,7 +28,7 @@
 //!
 //! Every fixed-path primitive that is not a bare add is a **widening** multiply followed
 //! by [`round_shift_nearest`](crate::interpolate::round_shift_nearest) and a clamp back
-//! into `i32`. `wide` can widen (`i32x4::mul_widen` → `i64x4`) but offers no narrowing
+//! into `i32`. `wide` can widen (`i32x4::widening_mul` → `i64x4`) but offers no narrowing
 //! conversion back, so an exact `i32` result has to leave the vector through
 //! `i64x4::to_array` — a memory round trip per multiply, which is strictly worse than the
 //! scalar body it replaces. The one fixed-path operation that *does* map one-to-one is
