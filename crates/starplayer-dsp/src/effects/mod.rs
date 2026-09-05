@@ -43,6 +43,35 @@ pub enum InsertKind {
     Compressor,
 }
 
+impl InsertKind {
+    /// Every effect this crate builds, in the order a host should list them.
+    ///
+    /// H7 uses this so `--list-effects`, the wasm host's descriptor export and the web
+    /// page's effect selector all enumerate the same six things without duplicating the
+    /// list a fourth time.
+    pub const ALL: [InsertKind; 6] =
+        [InsertKind::Gain, InsertKind::Eq, InsertKind::Delay, InsertKind::Chorus, InsertKind::Reverb, InsertKind::Compressor];
+
+    /// The short lower-case name a built effect's own [`InsertDescriptor::name`] reads —
+    /// stated here as a `const fn` so a host can name a target before it has built
+    /// anything.
+    pub const fn name(self) -> &'static str {
+        match self {
+            InsertKind::Gain => "gain",
+            InsertKind::Eq => "eq",
+            InsertKind::Delay => "delay",
+            InsertKind::Chorus => "chorus",
+            InsertKind::Reverb => "reverb",
+            InsertKind::Compressor => "compressor",
+        }
+    }
+
+    /// The kind named `name`, or `None` for anything else. The inverse of
+    /// [`InsertKind::name`]; a host parsing a `--insert channel:effect:...` flag or a wire
+    /// message uses this rather than building one of everything to compare descriptors.
+    pub fn from_name(name: &str) -> Option<InsertKind> { InsertKind::ALL.into_iter().find(|kind| kind.name() == name) }
+}
+
 /// Build one effect, boxed for a chain slot.
 ///
 /// **Off the audio thread.** Building an effect allocates — its delay lines, from H3
@@ -76,7 +105,7 @@ mod tests {
 
     #[test]
     fn every_kind_builds_on_both_paths_at_its_own_defaults() {
-        for kind in [InsertKind::Gain, InsertKind::Eq, InsertKind::Delay, InsertKind::Chorus, InsertKind::Reverb, InsertKind::Compressor] {
+        for kind in InsertKind::ALL {
             let float: Box<dyn Insert<f32>> = build_insert(kind, 44_100);
             let fixed: Box<dyn Insert<i32>> = build_insert(kind, 44_100);
             assert_eq!(float.descriptor(), fixed.descriptor(), "{kind:?} describes itself differently on the two paths");
@@ -84,6 +113,16 @@ mod tests {
                 assert_eq!(float.param(ParamId(index as u8)), Some(spec.default), "{kind:?}.{} is not at its default", spec.name);
             }
         }
+    }
+
+    #[test]
+    fn every_kind_names_itself_the_way_its_own_descriptor_does_and_round_trips_through_from_name() {
+        for kind in InsertKind::ALL {
+            let built: Box<dyn Insert<f32>> = build_insert(kind, 44_100);
+            assert_eq!(kind.name(), built.descriptor().name, "{kind:?}.name() disagrees with its own descriptor");
+            assert_eq!(InsertKind::from_name(kind.name()), Some(kind));
+        }
+        assert_eq!(InsertKind::from_name("not-an-effect"), None);
     }
 
     #[test]
