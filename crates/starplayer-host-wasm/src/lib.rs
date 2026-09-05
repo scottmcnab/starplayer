@@ -50,7 +50,8 @@ use std::vec::Vec;
 use backend::WorkletBackend;
 use command::{CommandRing, WireCommand};
 use starplayer::core::{AtEnd, ChannelId, U0F16};
-use starplayer::engine::{MixerMode, RENDER_QUANTUM};
+use starplayer::dsp::{InsertKind, ParamId};
+use starplayer::engine::{InsertTarget, MixerMode, RENDER_QUANTUM};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::{Arc, TAP_BUCKET_FRAMES, TapReader};
 use starplayer::telemetry::{Snapshot, SongEnd};
@@ -100,6 +101,34 @@ const OPCODE_AT_END: u8 = 9;
 /// instrument rack allocates, so that is [`exports::set_midi_input`], called from a worklet
 /// message task exactly as `set_mixer_mode` is.
 const OPCODE_MIDI_EVENT: u8 = 10;
+/// Change one parameter of an already-installed insert effect (M7-H7). `argument` packs
+/// the target in bits 0–7, the slot in bits 8–11 and the [`ParamId`] in bits 12–19;
+/// `extra` is the new value, in the parameter's own fixed unit, reinterpreted as `i32`.
+///
+/// Rides the ordinary command ring for the same reason [`OPCODE_MIDI_EVENT`] does: it is
+/// bounded, decoded between render quanta, and turned into one allocation-free
+/// `Player::set_insert_param` call. What it is not is the *install* — building an effect
+/// allocates its delay lines, so that is [`exports::install_insert`], called from a
+/// worklet message task exactly as [`exports::set_midi_input`] is.
+const OPCODE_INSERT_PARAM: u8 = 11;
+/// Skip, or stop skipping, an already-installed insert effect. `argument` packs the target
+/// and slot exactly as [`OPCODE_INSERT_PARAM`] does; `extra` is `0` or `1`.
+const OPCODE_INSERT_BYPASS: u8 = 12;
+
+/// The one reserved value of an insert wire target's low byte that does not name a
+/// channel: the master bus. Channel indices are `0..64` ([`ChannelTable::MAX_CHANNELS`](starplayer::engine::ChannelTable::MAX_CHANNELS)),
+/// so this sits far above any real one and still fits the 8-bit field
+/// [`OPCODE_INSERT_PARAM`] and [`OPCODE_INSERT_BYPASS`] pack it into.
+const INSERT_TARGET_MASTER: u32 = 0xFF;
+
+/// Decode an insert wire target's low byte into an [`InsertTarget`].
+const fn insert_target_from_wire(value: u32) -> InsertTarget {
+    if value == INSERT_TARGET_MASTER { InsertTarget::Master } else { InsertTarget::Channel(ChannelId(value as u16)) }
+}
+
+/// The wire spelling of [`InsertKind`]: its position in [`InsertKind::ALL`], which
+/// [`exports::effects_json`] also reports so the page never has to guess the numbering.
+fn insert_kind_from_wire(value: u32) -> Option<InsertKind> { InsertKind::ALL.get(value as usize).copied() }
 
 /// Wire spelling of [`AtEnd`], chosen so the page's default repeat-off value is zero.
 const AT_END_FADE_OUT: u32 = 0;
@@ -296,6 +325,19 @@ impl Host {
         Ok(self.player.is_jamming())
     }
 
+    /// Build `kind` and install it in `slot` of `target`'s chain, from a worklet message
+    /// task. Allocates the effect's delay lines, so — like [`Host::set_midi_input`] — this
+    /// must never be called from `process()`.
+    fn install_insert(&mut self, target: u32, slot: u32, kind: u32) -> Result<(), String> {
+        let kind = insert_kind_from_wire(kind).ok_or_else(|| format!("{kind}: not a known effect kind"))?;
+        self.player.install_insert(insert_target_from_wire(target), slot as u8, kind).map_err(|error| error.to_string())
+    }
+
+    /// Take whatever is in `slot` of `target`'s chain out and retire it.
+    fn remove_insert(&mut self, target: u32, slot: u32) -> Result<(), String> {
+        self.player.remove_insert(insert_target_from_wire(target), slot as u8).map_err(|error| error.to_string())
+    }
+
     fn enqueue(&mut self, command: WireCommand) -> bool { self.commands.push(command) }
 
     /// Turn each staged wire record into one call on the player.
@@ -342,6 +384,17 @@ impl Host {
             // Handled synchronously by the worklet message handler, because rebuilding a
             // typed engine allocates; it must never reach the render path.
             OPCODE_SET_MIXER_MODE => return false,
+            OPCODE_INSERT_PARAM => {
+                let target = insert_target_from_wire(wire.argument & 0xFF);
+                let slot = ((wire.argument >> 8) & 0xF) as u8;
+                let param = ParamId(((wire.argument >> 12) & 0xFF) as u8);
+                self.player.set_insert_param(target, slot, param, wire.extra as i32)
+            }
+            OPCODE_INSERT_BYPASS => {
+                let target = insert_target_from_wire(wire.argument & 0xFF);
+                let slot = ((wire.argument >> 8) & 0xF) as u8;
+                self.player.bypass_insert(target, slot, wire.extra != 0)
+            }
             _ => return false,
         };
         queued.is_ok()
@@ -632,6 +685,67 @@ mod exports {
             let host = slot.as_mut().ok_or_else(|| JsValue::from_str("the worklet host is not initialized"))?;
             host.set_midi_input(enabled).map_err(|message| JsValue::from_str(&message))
         })
+    }
+
+    /// Build an effect and install it, outside `process()` (M7-H7). `target` is a channel
+    /// index, or `0xFF` for the master bus; `kind` is the effect's position in
+    /// `InsertKind::ALL`, the same numbering [`effects_json`] reports.
+    #[wasm_bindgen]
+    pub fn install_insert(target: u32, slot: u32, kind: u32) -> Result<(), JsValue> {
+        HOST.with(|cell| {
+            let mut slot_ref = cell.try_borrow_mut().map_err(|_| JsValue::from_str("the worklet host is busy"))?;
+            let host = slot_ref.as_mut().ok_or_else(|| JsValue::from_str("the worklet host is not initialized"))?;
+            host.install_insert(target, slot, kind).map_err(|message| JsValue::from_str(&message))
+        })
+    }
+
+    /// Take whatever is installed out and retire it, outside `process()`.
+    #[wasm_bindgen]
+    pub fn remove_insert(target: u32, slot: u32) -> Result<(), JsValue> {
+        HOST.with(|cell| {
+            let mut slot_ref = cell.try_borrow_mut().map_err(|_| JsValue::from_str("the worklet host is busy"))?;
+            let host = slot_ref.as_mut().ok_or_else(|| JsValue::from_str("the worklet host is not initialized"))?;
+            host.remove_insert(target, slot).map_err(|message| JsValue::from_str(&message))
+        })
+    }
+
+    /// Every effect this build can install, its parameters, their units, ranges and
+    /// defaults, as a JSON array — read straight from each effect's own
+    /// `InsertDescriptor`, so the page's Effects panel can never drift from what
+    /// `install_insert` and `OPCODE_INSERT_PARAM` actually accept.
+    ///
+    /// One object per effect, in [`InsertKind::ALL`] order: `{"name", "wire", "params":
+    /// [{"name", "unit", "min", "max", "default"}]}`. `wire` is the `kind` `install_insert`
+    /// takes; `unit` is the `ParamUnit` variant's own name (`"CentiDecibels"`, `"Percent"`,
+    /// …), left as an enum tag rather than a display string so the page chooses its own
+    /// wording. Callable before [`init`] — it names what this build can do, not what any
+    /// particular host instance has done.
+    #[wasm_bindgen]
+    pub fn effects_json() -> String {
+        use std::fmt::Write;
+
+        let mut json = String::from("[");
+        for (wire, kind) in starplayer::dsp::InsertKind::ALL.into_iter().enumerate() {
+            let described: Box<dyn starplayer::dsp::Insert<f32>> = starplayer::dsp::build_insert(kind, 44_100);
+            let descriptor = described.descriptor();
+            if wire > 0 {
+                json.push(',');
+            }
+            let _ = write!(json, r#"{{"name":"{}","wire":{wire},"params":["#, descriptor.name);
+            for (index, parameter) in descriptor.params.iter().enumerate() {
+                if index > 0 {
+                    json.push(',');
+                }
+                let _ = write!(
+                    json,
+                    r#"{{"name":"{}","unit":"{:?}","min":{},"max":{},"default":{}}}"#,
+                    parameter.name, parameter.unit, parameter.min, parameter.max, parameter.default
+                );
+            }
+            json.push_str("]}");
+        }
+        json.push(']');
+        json
     }
 
     /// How far ahead of the audio clock a live event is stamped, in frames — the latency
@@ -1362,5 +1476,68 @@ mod tests {
         for _ in 0..20 { again |= host.process(RENDER_QUANTUM) > 0.0; }
         assert!(again, "Play brings it back");
         assert!(host.player.is_playing());
+    }
+
+    // ── M7-H7: the insert graph over the wire protocol ──────────────────────────────
+
+    #[test]
+    fn install_insert_builds_the_effect_and_the_layout_reports_it() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+
+        let reverb_wire = InsertKind::ALL.iter().position(|kind| *kind == InsertKind::Reverb).unwrap() as u32;
+        host.install_insert(0, 0, reverb_wire).expect("install queues");
+        assert_eq!(
+            host.player.inserts().get(InsertTarget::Channel(ChannelId(0)), 0).map(|installed| installed.kind),
+            Some(InsertKind::Reverb)
+        );
+
+        host.remove_insert(0, 0).expect("remove queues");
+        assert!(host.player.inserts().get(InsertTarget::Channel(ChannelId(0)), 0).is_none());
+    }
+
+    #[test]
+    fn an_unknown_kind_is_refused_rather_than_guessed() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        assert!(host.install_insert(0, 0, 999).is_err());
+    }
+
+    #[test]
+    fn the_master_target_wire_value_installs_on_the_master_bus() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        let gain_wire = InsertKind::ALL.iter().position(|kind| *kind == InsertKind::Gain).unwrap() as u32;
+        host.install_insert(INSERT_TARGET_MASTER, 0, gain_wire).expect("install queues");
+        assert_eq!(host.player.inserts().get(InsertTarget::Master, 0).map(|installed| installed.kind), Some(InsertKind::Gain));
+    }
+
+    #[test]
+    fn opcode_insert_param_and_opcode_insert_bypass_reach_the_player() {
+        let mut host = Host::new(48_000);
+        assert!(host.load_module(FIXTURE).is_ok());
+        let reverb_wire = InsertKind::ALL.iter().position(|kind| *kind == InsertKind::Reverb).unwrap() as u32;
+        host.install_insert(0, 0, reverb_wire).expect("install queues");
+
+        // room is ParamId(0): target 0, slot 0, param 0 all pack to argument 0; value 80.
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_INSERT_PARAM, argument: 0, extra: 80u32 }));
+        host.process(RENDER_QUANTUM);
+        assert_eq!(
+            host.player.inserts().get(InsertTarget::Channel(ChannelId(0)), 0).and_then(|installed| installed.param(ParamId(0))),
+            Some(80)
+        );
+
+        assert!(host.enqueue(WireCommand { opcode: OPCODE_INSERT_BYPASS, argument: 0, extra: 1 }));
+        host.process(RENDER_QUANTUM);
+        assert!(host.player.inserts().get(InsertTarget::Channel(ChannelId(0)), 0).unwrap().bypassed);
+    }
+
+    #[test]
+    fn effects_json_names_every_effect_and_its_wire_number() {
+        let json = exports::effects_json();
+        for (wire, kind) in InsertKind::ALL.into_iter().enumerate() {
+            assert!(json.contains(&format!(r#""name":"{}""#, kind.name())), "{}: missing from effects_json", kind.name());
+            assert!(json.contains(&format!(r#""wire":{wire}"#)), "{}: wrong wire position in effects_json", kind.name());
+        }
     }
 }
