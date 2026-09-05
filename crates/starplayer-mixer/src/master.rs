@@ -162,9 +162,12 @@ pub fn soft_knee_f32(magnitude: f32) -> f32 {
     (from + (to - from) * fraction) * (1.0 / 32_767.0)
 }
 
+/// The float master volume as a multiplier.
+fn float_volume(settings: MasterSettings) -> f32 { settings.volume.to_bits() as f32 * (1.0 / 65_535.0) }
+
 /// Master volume then limiting, on one float frame.
 pub fn process_float(frame: Stereo<f32>, settings: MasterSettings) -> Stereo<f32> {
-    let volume = settings.volume.to_bits() as f32 * (1.0 / 65_535.0);
+    let volume = float_volume(settings);
     Stereo::new(bound_f32(frame.left * volume, settings.limiter), bound_f32(frame.right * volume, settings.limiter))
 }
 
@@ -172,7 +175,36 @@ pub fn process_float(frame: Stereo<f32>, settings: MasterSettings) -> Stereo<f32
 /// path — it is the canonical bit-exact reference (architecture §7.3).
 pub fn process_fixed(frame: Stereo<i32>, settings: MasterSettings) -> Stereo<i32> {
     let volume = settings.volume.to_bits() as i64;
-    Stereo::new(bound_fixed(frame.left, volume, settings.limiter), bound_fixed(frame.right, volume, settings.limiter))
+    Stereo::new(limit_fixed(scale_fixed(frame.left, volume), settings.limiter), limit_fixed(scale_fixed(frame.right, volume), settings.limiter))
+}
+
+/// Master volume then limiting, over a whole float quantum (M7-H6).
+///
+/// **Two passes, not one fused expression**: the volume multiply is elementwise and
+/// vectorises, the limiter is a table lookup and does not. Storing the scaled frame back
+/// between them changes nothing — an `f32` store is exact — and each frame is independent
+/// of every other, so this is the same arithmetic `process_float` does one frame at a time.
+pub fn master_block_float(quantum: &mut [Stereo<f32>], settings: MasterSettings) {
+    #[cfg(not(feature = "simd"))]
+    crate::simd::scalar_master_volume_f32(quantum, float_volume(settings));
+    #[cfg(feature = "simd")]
+    crate::simd::wide_master_volume_f32(quantum, float_volume(settings));
+
+    for frame in quantum.iter_mut() {
+        *frame = Stereo::new(bound_f32(frame.left, settings.limiter), bound_f32(frame.right, settings.limiter));
+    }
+}
+
+/// Master volume then limiting, over a whole fixed quantum (M7-H6).
+///
+/// The same two passes as [`master_block_float`]. The intermediate is stored back as an
+/// `i32` rather than kept as the `i64` `process_fixed` carries, which is lossless: a Q0.16
+/// volume is at most `65535/65536`, so the scaled magnitude never exceeds the input's.
+pub fn master_block_fixed(quantum: &mut [Stereo<i32>], settings: MasterSettings) {
+    crate::simd::scalar_master_volume_fixed(quantum, settings.volume.to_bits() as i64);
+    for frame in quantum.iter_mut() {
+        *frame = Stereo::new(limit_fixed(frame.left, settings.limiter), limit_fixed(frame.right, settings.limiter));
+    }
 }
 
 fn bound_f32(value: f32, limiter: Limiter) -> f32 {
@@ -188,14 +220,16 @@ fn bound_f32(value: f32, limiter: Limiter) -> f32 {
     }
 }
 
-fn bound_fixed(value: i32, volume: i64, limiter: Limiter) -> i32 {
-    // Q0.16 master volume, reduced with the same round-to-nearest rule as voice gain and
-    // interpolation. This is part of the C6 golden contract.
-    let scaled = round_shift_nearest(value as i64 * volume, 16);
+/// Q0.16 master volume, reduced with the same round-to-nearest rule as voice gain and
+/// interpolation. This is part of the C6 golden contract.
+fn scale_fixed(value: i32, volume: i64) -> i32 { round_shift_nearest(value as i64 * volume, 16) as i32 }
+
+/// The limiter, on a sample the master volume has already been applied to.
+fn limit_fixed(scaled: i32, limiter: Limiter) -> i32 {
     match limiter {
-        Limiter::Clamp => scaled.clamp(-32_767, 32_767) as i32,
+        Limiter::Clamp => scaled.clamp(-32_767, 32_767),
         Limiter::SoftKnee => {
-            let magnitude = scaled.unsigned_abs().min(i32::MAX as u64) as i32;
+            let magnitude = scaled.unsigned_abs().min(i32::MAX as u32) as i32;
             let bounded = soft_knee_fixed(magnitude);
             if scaled < 0 { -bounded } else { bounded }
         }
@@ -205,6 +239,11 @@ fn bound_fixed(value: i32, volume: i64, limiter: Limiter) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Master volume then limiting on one fixed sample, as it read before M7-H6 split the
+    /// two into separate passes over the quantum. The tests below are about the curve, and
+    /// this keeps them written in the curve's own terms.
+    fn bound_fixed(value: i32, volume: i64, limiter: Limiter) -> i32 { limit_fixed(scale_fixed(value, volume), limiter) }
 
     #[test]
     fn the_curve_is_the_identity_below_the_knee() {

@@ -21,6 +21,7 @@
 //! * [`kernel`] — the voice render loop itself: bounded runs, loop wrapping, ramping.
 //! * [`master`] — master volume and the table-driven soft limiter.
 //! * [`output`] — accumulator frames to host samples, at every depth, with dither.
+//! * [`simd`] — the bus-summation and master-volume kernels, scalar and vector (M7-H6).
 //!
 //! # Per-channel buses (M7-H1)
 //!
@@ -43,6 +44,7 @@ pub mod master;
 pub mod output;
 pub mod path;
 pub mod sample;
+pub mod simd;
 pub mod voice;
 
 pub use gain::{GAIN_UNITY, RAMP_FRAMES, pan_gains_q15, voice_gain_units};

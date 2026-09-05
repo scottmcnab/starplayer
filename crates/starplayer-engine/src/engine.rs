@@ -631,9 +631,7 @@ where
         // their own buses, then the channel-major sum into the pre-master mix, then the
         // spill lane, then the master chain, then master volume and the limiter.
         Self::process_channel_inserts(&mut self.buses, &mut self.chains, &mut self.accumulator);
-        for (mixed, spilled) in self.accumulator.iter_mut().zip(self.spill.iter()) {
-            Path::add_frame(mixed, *spilled);
-        }
+        Path::add_block(&mut self.accumulator, &self.spill);
         if let Some(master_chain) = self.chains.get_mut(self.bus_count)
             && !master_chain.is_empty()
         {
@@ -859,9 +857,7 @@ where
             {
                 chain.process(Path::as_frames(bus));
             }
-            for (mixed, mine) in mix.iter_mut().zip(bus.iter()) {
-                Path::add_frame(mixed, *mine);
-            }
+            Path::add_block(mix, bus);
         }
     }
 
