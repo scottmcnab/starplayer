@@ -12,7 +12,7 @@
 //! long as the stream is open. Once [`Player::open`] returns, the audio side is
 //! unreachable from this thread — which is the point.
 //!
-//! Four things cross, and each has exactly one mechanism:
+//! Several things cross, and each has exactly one mechanism:
 //!
 //! | | direction | mechanism |
 //! |---|---|---|
@@ -21,6 +21,8 @@
 //! | retired modules and retired sources | audio → control | an SPSC ring; **dropped here**, never there |
 //! | telemetry, position, peak | audio → control | a snapshot channel and a handful of atomics |
 //! | live MIDI and keyboard events | control (or any thread) → audio | an [`ExternalEventQueue`](starplayer::engine::ExternalEventQueue) of absolutely-stamped events; see `src/events.rs` |
+//! | insert commands (install, remove, set a parameter, bypass, reset) | control → audio | [`HostInsertControl`](crate::HostInsertControl) directly onto the engine's own insert ring — `Player` holds the handle itself rather than routing through `HostCommand`, because unlike the transport an insert change has no ramp to sequence around (M7-H7) |
+//! | retired insert effects | audio → control | the engine's insert garbage channel, drained by [`Player::collect_garbage`] alongside retired modules |
 //!
 //! # Why the module travels over the ring rather than through `EngineHandle`
 //!
