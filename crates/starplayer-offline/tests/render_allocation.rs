@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 
 use starplayer::core::{ChannelId, ExactFixedPoint};
 use starplayer::dsp::effects::GAIN_PARAM;
+use starplayer::dsp::effects::eq::EQ_PEAK_GAIN_PARAM;
 use starplayer::dsp::{InsertKind, Linear, build_insert};
 use starplayer::engine::{Engine, EngineSettings, EventSource, InsertCommand, InsertTarget};
 use starplayer::mixer::{FixedPath, StereoI16};
@@ -455,6 +456,57 @@ fn rendering_with_an_insert_on_every_channel_allocates_nothing() {
     assert!(report.is_clean(), "render() with the insert graph live allocated: {report:?}");
     assert!(!engine.warnings().any(), "the insert graph raised an engine warning: {:?}", engine.warnings());
     assert_eq!(inserts.pending_garbage(), 0, "nothing was retired, so nothing is waiting");
+    control.collect_all_garbage();
+    inserts.collect_all_garbage();
+}
+
+/// M7-H3: the same, with the three stateful effects installed.
+///
+/// The gain insert allocates nothing to build and has no state, so the H1 test above could
+/// not have caught an effect that allocated a ring buffer lazily on its first `process`, or
+/// that grew a `Vec` while re-cooking. An EQ, a delay and a chorus between them cover both:
+/// the delay and the chorus each allocate a ring at construction and must never touch the
+/// allocator again, and the EQ re-cooks three RBJ biquads every sixteen frames throughout.
+/// The sweep queued below keeps all three re-cooking for the whole render rather than
+/// settling into the branch where nothing moves.
+#[test]
+fn rendering_with_an_eq_a_delay_and_a_chorus_allocates_nothing() {
+    let module = Arc::new(starplayer::mod_file::load(&starplayer_offline::fixtures::synthetic_mod()).expect("the synthesised MOD loads"));
+    let channel_count = (module.header().channel_count as usize).max(1);
+    let settings = EngineSettings {
+        sample_rate_hz: SAMPLE_RATE_HZ,
+        channel_count,
+        voice_capacity: starplayer::recommended_voice_capacity(&module).max(1),
+        insert_command_capacity: 128,
+        ..EngineSettings::default()
+    };
+    let mut engine: CorpusEngine = Engine::with_settings(settings);
+    let mut control = engine.take_control().expect("a fresh engine owns its control handle");
+    let mut inserts = engine.take_insert_control().expect("a fresh engine owns its insert handle");
+    control.load_module(Arc::clone(&module)).map_err(|_| "full").expect("the ring has room");
+    engine.set_source(source_for(ModuleFormat::Mod, Arc::clone(&module)).expect("a MOD sequencer"));
+
+    // Every ring buffer this test will ever use is allocated here, before the hook is armed.
+    let equalised = InsertTarget::Channel(ChannelId(0));
+    inserts.install(equalised, 0, build_insert::<i32>(InsertKind::Eq, SAMPLE_RATE_HZ)).map_err(|_| "full").expect("the ring has room");
+    let delayed = InsertTarget::Channel(ChannelId((channel_count.saturating_sub(1)) as u16));
+    inserts.install(delayed, 1, build_insert::<i32>(InsertKind::Delay, SAMPLE_RATE_HZ)).map_err(|_| "full").expect("the ring has room");
+    inserts.install(InsertTarget::Master, 0, build_insert::<i32>(InsertKind::Chorus, SAMPLE_RATE_HZ)).map_err(|_| "full").expect("the ring has room");
+
+    let mut block = vec![0i16; 128 * 2];
+    let blocks = FRAMES_PER_MODULE.div_ceil(128);
+    let (_, report) = while_watching_for_allocations(|| {
+        for index in 0..blocks {
+            // A slider being dragged on the EQ's bell, so its cooking branch is live the
+            // whole way through rather than settling after the first ramp.
+            let value = -2_400 + (index % 49) as i32 * 100;
+            let _ = inserts.send(InsertCommand::SetParam { target: equalised, slot: 0, param: EQ_PEAK_GAIN_PARAM, value });
+            engine.render(&mut block);
+        }
+    });
+
+    assert!(report.is_clean(), "render() with the H3 effects live allocated: {report:?}");
+    assert!(!engine.warnings().any(), "the insert graph raised an engine warning: {:?}", engine.warnings());
     control.collect_all_garbage();
     inserts.collect_all_garbage();
 }
