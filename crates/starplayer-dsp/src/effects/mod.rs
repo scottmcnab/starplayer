@@ -4,9 +4,17 @@
 //! against, H3 the EQ, delay and chorus, H4 the reverb and compressor. [`InsertKind`] and
 //! [`build`] grow one arm each time, and a host never names a concrete effect type.
 
+pub mod chorus;
+pub mod delay;
+pub mod eq;
 pub mod gain;
+#[cfg(test)]
+pub(crate) mod testing;
 
-pub use gain::{GAIN_MAX_CENTI_DB, GAIN_MIN_CENTI_DB, GAIN_PARAM, GainInsert, db_to_gain_q15};
+pub use chorus::Chorus;
+pub use delay::Delay;
+pub use eq::Eq;
+pub use gain::{GAIN_MAX_CENTI_DB, GAIN_MIN_CENTI_DB, GAIN_PARAM, GainInsert, fader_gain_q15};
 
 use alloc::boxed::Box;
 
@@ -19,6 +27,12 @@ pub enum InsertKind {
     /// A smoothed gain trim in centi-decibels ([`GainInsert`]).
     #[default]
     Gain,
+    /// A three-band shelving/peaking equaliser ([`Eq`]).
+    Eq,
+    /// A stereo delay with damped feedback and an optional ping-pong ([`Delay`]).
+    Delay,
+    /// Two or three modulated taps per channel ([`Chorus`]).
+    Chorus,
 }
 
 /// Build one effect, boxed for a chain slot.
@@ -30,9 +44,11 @@ pub enum InsertKind {
 /// `sample_rate_hz` is the rate the effect will run at; a time-based effect sizes its
 /// delay lines from it. The gain trim has no use for it.
 pub fn build_insert<Sample: DspSample>(kind: InsertKind, sample_rate_hz: u32) -> Box<dyn Insert<Sample>> {
-    let _ = sample_rate_hz;
     match kind {
         InsertKind::Gain => Box::new(GainInsert::new()),
+        InsertKind::Eq => Box::new(Eq::new(sample_rate_hz)),
+        InsertKind::Delay => Box::new(Delay::new(sample_rate_hz)),
+        InsertKind::Chorus => Box::new(Chorus::new(sample_rate_hz)),
     }
 }
 
@@ -46,6 +62,18 @@ mod tests {
         let insert: Box<dyn Insert<f32>> = build_insert(InsertKind::Gain, 44_100);
         assert_eq!(insert.descriptor().name, "gain");
         assert_eq!(insert.param(ParamId(0)), Some(0));
+    }
+
+    #[test]
+    fn every_kind_builds_on_both_paths_at_its_own_defaults() {
+        for kind in [InsertKind::Gain, InsertKind::Eq, InsertKind::Delay, InsertKind::Chorus] {
+            let float: Box<dyn Insert<f32>> = build_insert(kind, 44_100);
+            let fixed: Box<dyn Insert<i32>> = build_insert(kind, 44_100);
+            assert_eq!(float.descriptor(), fixed.descriptor(), "{kind:?} describes itself differently on the two paths");
+            for (index, spec) in float.descriptor().params.iter().enumerate() {
+                assert_eq!(float.param(ParamId(index as u8)), Some(spec.default), "{kind:?}.{} is not at its default", spec.name);
+            }
+        }
     }
 
     #[test]

@@ -421,9 +421,112 @@ pub fn time_constant_q24(milliseconds: i32, sample_rate_hz: u32) -> i32 {
 /// `time_constant_q24`, cast to `f32`.
 pub fn time_constant_f32(milliseconds: i32, sample_rate_hz: u32) -> f32 { time_constant_q24(milliseconds, sample_rate_hz) as f32 * Q24_TO_F32 }
 
+// ---------------------------------------------------------------------------------------
+// Effect-parameter conversions — one_pole_cutoff_q24, equal_power_q15
+// ---------------------------------------------------------------------------------------
+
+/// `2π` in Q16.16.
+const TWO_PI_Q16: i64 = 411_775;
+
+/// The one-pole low-pass coefficient `a = 1 − e^(−2π·cutoff/sample_rate)` in Q8.24, for the
+/// recursion `y[n] = y[n−1] + a·(x[n] − y[n−1])`.
+///
+/// This is the damping filter H3's delay puts in its feedback path: one multiply per
+/// sample, no state beyond `y[n−1]`, and a coefficient that comes from [`exp_neg_q24`]
+/// rather than from `libm` (architecture §7.3).
+///
+/// **A cutoff at or above Nyquist returns exactly unity** (`1 << 24`), which makes the
+/// recursion `y = x` — the filter is *off* rather than merely wide open, so an effect can
+/// offer "no damping" at the top of its own cutoff range and be bit-transparent there.
+pub fn one_pole_cutoff_q24(cutoff_hz: i32, sample_rate_hz: u32) -> i32 {
+    let sample_rate_hz = sample_rate_hz.max(1) as i64;
+    if cutoff_hz <= 0 {
+        return 0;
+    }
+    if cutoff_hz as i64 * 2 >= sample_rate_hz {
+        return 1 << POW2_FRACTION_BITS;
+    }
+    // `x = 2π·cutoff/sample_rate` in Q16.16, rounded to nearest.
+    let numerator = cutoff_hz as i64 * TWO_PI_Q16;
+    let x_q16 = ((numerator + sample_rate_hz / 2) / sample_rate_hz) as i32;
+    ((1 << POW2_FRACTION_BITS) - exp_neg_q24(x_q16)).clamp(0, 1 << POW2_FRACTION_BITS)
+}
+
+/// The equal-power dry/wet pair for a `0 ..= 100` percent mix control, both in Q1.15.
+///
+/// `dry = cos(π/2 · mix)`, `wet = sin(π/2 · mix)`, so `dry² + wet²` is constant across the
+/// sweep and a mix knob does not dip in the middle the way a linear crossfade does. Both
+/// come from [`sin_q15`], so there is no transcendental here either.
+///
+/// [`sin_q15`]'s own peak is `32767` rather than [`Q15_UNITY`](crate::sample::Q15_UNITY),
+/// which would leave a fully dry effect one LSB quieter than its input. The peak is
+/// therefore lifted to `32768`, so **mix 0 is bit-transparent on both paths** — the same
+/// property `GainInsert` has at unity, and what lets a host install a delay or a chorus at
+/// zero mix without changing a bus at all.
+pub fn equal_power_q15(mix_percent: i32) -> (i32, i32) {
+    let percent = mix_percent.clamp(0, 100) as u32;
+    // A quarter turn is `1 << 30`; `percent/100` of it, rounded to nearest.
+    let phase = ((percent as u64 * (1u64 << 30) + 50) / 100) as u32;
+    (lift_unity(cos_q15(phase)), lift_unity(sin_q15(phase)))
+}
+
+/// [`sin_q15`]'s peak, `32767`, read as the Q1.15 unity `32768` that
+/// [`DspSample::scale_q15`](crate::sample::DspSample::scale_q15) is the identity at.
+fn lift_unity(value: i32) -> i32 { if value >= SINE_UNITY { crate::sample::Q15_UNITY } else { value } }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_one_pole_cutoff_at_or_past_nyquist_is_off() {
+        assert_eq!(one_pole_cutoff_q24(22_050, 44_100), 1 << 24, "exactly Nyquist is off");
+        assert_eq!(one_pole_cutoff_q24(30_000, 44_100), 1 << 24, "past Nyquist is off");
+        assert_eq!(one_pole_cutoff_q24(0, 44_100), 0, "a zero cutoff passes nothing through");
+        assert!(one_pole_cutoff_q24(1_000, 44_100) < 1 << 24);
+    }
+
+    #[test]
+    fn a_one_pole_cutoff_matches_the_f64_reference() {
+        for (cutoff_hz, sample_rate_hz) in [(100i32, 44_100u32), (1_000, 44_100), (8_000, 44_100), (500, 8_000), (12_000, 96_000)] {
+            let measured = one_pole_cutoff_q24(cutoff_hz, sample_rate_hz) as f64 / (1u32 << 24) as f64;
+            let reference = 1.0 - (-core::f64::consts::TAU * cutoff_hz as f64 / sample_rate_hz as f64).exp();
+            assert!((measured - reference).abs() < 1.0e-4, "{cutoff_hz} Hz at {sample_rate_hz}: {measured} vs {reference}");
+        }
+    }
+
+    #[test]
+    fn a_one_pole_cutoff_rises_with_the_cutoff() {
+        let mut previous = 0;
+        for cutoff_hz in [100i32, 200, 500, 1_000, 4_000, 10_000, 20_000] {
+            let coefficient = one_pole_cutoff_q24(cutoff_hz, 44_100);
+            assert!(coefficient > previous, "{cutoff_hz} Hz did not open the filter further");
+            previous = coefficient;
+        }
+    }
+
+    #[test]
+    fn the_equal_power_mix_is_unity_at_both_ends_and_constant_power_between() {
+        assert_eq!(equal_power_q15(0), (crate::sample::Q15_UNITY, 0), "fully dry has to be bit-transparent");
+        assert_eq!(equal_power_q15(100), (0, crate::sample::Q15_UNITY), "fully wet has to be bit-transparent too");
+        assert_eq!(equal_power_q15(-5), equal_power_q15(0), "below the range is clamped");
+        assert_eq!(equal_power_q15(500), equal_power_q15(100), "above the range is clamped");
+        for percent in 0..=100 {
+            let (dry, wet) = equal_power_q15(percent);
+            let power = (dry as f64 / 32_768.0).powi(2) + (wet as f64 / 32_768.0).powi(2);
+            assert!((power - 1.0).abs() < 2.0e-4, "{percent} %: dry {dry} and wet {wet} sum to {power} of a unit of power");
+        }
+    }
+
+    #[test]
+    fn the_equal_power_mix_moves_monotonically() {
+        let mut previous_wet = -1;
+        for percent in 0..=100 {
+            let (_, wet) = equal_power_q15(percent);
+            assert!(wet > previous_wet, "the wet gain did not rise at {percent} %");
+            previous_wet = wet;
+        }
+    }
 
     #[test]
     fn pow2_is_exact_at_whole_numbers() {

@@ -17,6 +17,9 @@
 //! `0.0 == -0.0` and reject two identical NaNs, and byte identity is the actual claim.
 
 use starplayer_core::{ChannelId, ExactFixedPoint, FilterParams, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
+use starplayer_dsp::effects::chorus::{CHORUS_DEPTH_PARAM, CHORUS_RATE_PARAM};
+use starplayer_dsp::effects::delay::{DELAY_MIX_PARAM, DELAY_TIME_PARAM};
+use starplayer_dsp::effects::eq::{EQ_HIGH_GAIN_PARAM, EQ_PEAK_GAIN_PARAM};
 use starplayer_dsp::effects::{GAIN_MIN_CENTI_DB, GAIN_PARAM};
 use starplayer_dsp::{Cubic, InsertKind, Interpolate, Linear, Nearest, Sinc, build_insert};
 use starplayer_engine::demo::{
@@ -374,7 +377,7 @@ fn render_phases<Path, Interp, Out>(
     inserts: &mut InsertHandle<Path::Mono>,
     output: &mut [Out::Sample],
     block_frames: usize,
-    phases: [(usize, Option<InsertCommand<Path::Mono>>); 3],
+    phases: impl IntoIterator<Item = (usize, Option<InsertCommand<Path::Mono>>)>,
 ) where
     Path: MixPath,
     Interp: Interpolate,
@@ -523,6 +526,108 @@ where
 fn a_gain_insert_at_the_bottom_of_its_fader_silences_one_bus_only() {
     assert_a_silenced_channel_leaves_the_others_alone::<FloatPath, Linear, StereoF32>("float / linear / stereo f32");
     assert_a_silenced_channel_leaves_the_others_alone::<FixedPath, Linear, StereoI16>("fixed / linear / stereo i16");
+}
+
+// ── the same invariant again, with the H3 effects live (M7-H3 deliverable 5) ─────────
+//
+// A gain insert is a per-frame multiply and nothing else: it has no memory, so it could
+// not have caught an effect whose *state* depended on where a host block boundary fell.
+// These three do have state, and each has a different kind of it — the EQ two biquad words
+// per band per channel, the delay a ring buffer read at a smoothed fractional position, the
+// chorus an integer LFO phase and three modulated taps. All three are also cooked at a
+// sub-block rate, which is the other thing this proves is block-size independent: a
+// coefficient re-cooked every sixteen frames is still re-cooked at the same *frames*
+// whatever size the host asked in, because an insert only ever sees whole quanta.
+
+/// The EQ's bell is boosted here, part way through.
+const H3_FIRST_PHASE_FRAMES: usize = 40 * RENDER_QUANTUM;
+
+/// The delay's time is moved here, which starts a fractional read-head sweep.
+const H3_SECOND_PHASE_FRAMES: usize = 80 * RENDER_QUANTUM;
+
+/// The chorus's rate is moved here, which re-cooks its LFO increment.
+const H3_THIRD_PHASE_FRAMES: usize = 120 * RENDER_QUANTUM;
+
+const _: () = assert!(H3_THIRD_PHASE_FRAMES < TOTAL_FRAMES, "every phase has to fall inside the render");
+
+/// Two looping voices, an EQ on channel 0, a delay on channel 1 and a chorus on the master,
+/// with a parameter sweep queued at each of three phase boundaries.
+fn render_with_h3_effects_at_block_size<Path, Interp, Out>(block_frames: usize) -> Vec<Out::Sample>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+{
+    let (blob, region) = looping_blob();
+    let mut engine: Engine<Path, Interp, Out> = Engine::new(VOICE_CAPACITY);
+    engine.set_pcm(blob);
+    let mut inserts = engine.take_insert_control().expect("a fresh engine owns its insert handle");
+
+    for channel in [0u8, INSERT_CHANNEL as u8] {
+        let tag = VoiceTag { channel, instrument: 1, sample: 1, note: 60 };
+        engine.voices_mut().allocate(tag, region, voice_params(), 0).expect("a fresh pool has room");
+    }
+    engine.set_source(Box::new(ScriptedSource::new(Vec::new())));
+
+    // Built here, on the "control thread": each of these allocates, the delay a megabyte
+    // of ring buffer, which is exactly why an effect crosses to the engine boxed.
+    let equalised = InsertTarget::Channel(ChannelId(0));
+    let delayed = InsertTarget::Channel(ChannelId(INSERT_CHANNEL));
+    let mut equaliser = build_insert::<Path::Mono>(InsertKind::Eq, 44_100);
+    equaliser.set_param(EQ_HIGH_GAIN_PARAM, -800);
+    inserts.install(equalised, 0, equaliser).map_err(|_| "full").expect("the ring has room");
+
+    let mut delay = build_insert::<Path::Mono>(InsertKind::Delay, 44_100);
+    // Short enough that several repeats land inside the render, and wet enough to hear.
+    delay.set_param(DELAY_TIME_PARAM, 47);
+    delay.set_param(DELAY_MIX_PARAM, 60);
+    delay.reset();
+    inserts.install(delayed, 0, delay).map_err(|_| "full").expect("the ring has room");
+
+    let mut chorus = build_insert::<Path::Mono>(InsertKind::Chorus, 44_100);
+    chorus.reset();
+    inserts.install(InsertTarget::Master, 0, chorus).map_err(|_| "full").expect("the ring has room");
+
+    let mut output = vec![Out::Sample::default(); TOTAL_FRAMES * Out::CHANNELS];
+    let phases = [
+        (H3_FIRST_PHASE_FRAMES, Some(InsertCommand::SetParam { target: equalised, slot: 0, param: EQ_PEAK_GAIN_PARAM, value: 1_200 })),
+        (H3_SECOND_PHASE_FRAMES, Some(InsertCommand::SetParam { target: delayed, slot: 0, param: DELAY_TIME_PARAM, value: 93 })),
+        (H3_THIRD_PHASE_FRAMES, Some(InsertCommand::SetParam { target: InsertTarget::Master, slot: 0, param: CHORUS_RATE_PARAM, value: 300 })),
+        (TOTAL_FRAMES, Some(InsertCommand::SetParam { target: InsertTarget::Master, slot: 0, param: CHORUS_DEPTH_PARAM, value: 400 })),
+    ];
+    render_phases::<Path, Interp, Out>(&mut engine, &mut inserts, &mut output, block_frames, phases);
+
+    assert!(!engine.warnings().any(), "the insert graph raised no warnings: {:?}", engine.warnings());
+    inserts.collect_all_garbage();
+    output
+}
+
+fn assert_h3_block_size_independent<Path, Interp, Out>(what: &str)
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: BitPattern + Default,
+{
+    let reference = render_with_h3_effects_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM);
+    let plain = render_at_block_size::<Path, Interp, Out>(RENDER_QUANTUM, false);
+    assert!(first_difference(&reference, &plain).is_some(), "{what}: the effects have to actually change the sound");
+
+    for block_frames in BLOCK_SIZES {
+        let output = render_with_h3_effects_at_block_size::<Path, Interp, Out>(block_frames);
+        let difference = first_difference(&output, &reference);
+        assert_eq!(difference, None, "{what}: block size {block_frames} changed the output at sample {difference:?}");
+        assert_eq!(byte_image(&output), byte_image(&reference), "{what}: block size {block_frames} is not byte-identical");
+    }
+}
+
+/// An EQ, a delay and a chorus, all live, with a parameter sweep on each, at every host
+/// block size on both mixing paths.
+#[test]
+fn an_eq_delay_and_chorus_chain_is_byte_identical_at_every_host_block_size() {
+    assert_h3_block_size_independent::<FloatPath, Linear, StereoF32>("h3 float / linear / stereo f32");
+    assert_h3_block_size_independent::<FixedPath, Linear, StereoI16>("h3 fixed / linear / stereo i16");
+    assert_h3_block_size_independent::<FixedPath, Nearest, MonoI16>("h3 fixed / nearest / mono i16");
 }
 
 /// The same scenario as [`render_at_block_size`], on an engine sized by `settings` rather

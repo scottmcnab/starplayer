@@ -857,6 +857,70 @@ boundary fell. `tests/block_size_determinism.rs` carries a scenario with a chann
 master chain, a mid-song `SetParam` and a later `Remove`, byte-identical at every block size
 on both paths.
 
+#### The effect set as it landed (M7-H3)
+
+Three effects so far, all generic over `DspSample` so each exists on both mixing paths from
+the day it lands, all reading H2's tables rather than `libm`, none allocating after
+`build_insert`, and every audible parameter smoothed with `SmoothedParam`.
+
+| effect | parameters (in `ParamId` order) | cooked | state |
+|---|---|---|---|
+| `eq` | `enabled`, then `frequency` (Hz 20–20000), `gain` (centi-dB ±2400) and `slope`/`q` (×100) for a low shelf, a bell and a high shelf | RBJ coefficients, **every 16 frames**, and only for a band whose smoothed values moved | `[Sample; 2]` per band per stereo channel |
+| `delay` | `time` (ms 1–2000), `feedback` (%), `mix` (%), `ping_pong`, `damping` (Hz) | the feedback one-pole, **per block** | two rings of `2 × sample_rate` frames, two one-pole words |
+| `chorus` | `voices` (2–3), `rate` (centi-Hz 5–500), `depth` (centi-ms), `base` (centi-ms), `mix` (%), `spread` (%) | the LFO increment, **per block** | two rings of ~60 ms, one `u32` LFO phase |
+
+**Gains are per frame; coefficients are cooked at a sub-block rate.** A Q1.15 gain is a
+table lookup and a multiply, so a wet/dry mix or a feedback amount is recomputed every
+frame from the smoothed parameter. A filter coefficient is not: an RBJ cooker takes an
+integer square root by Newton's method, so cooking it per frame would cost more than the
+rest of the mixer. The EQ's interval is **16 frames**, chosen by measurement rather than by
+taste — sweeping a bell across its whole ±24 dB range over `SMOOTH_FRAMES` gives a largest
+sample-to-sample output step of 1251 units cooking per frame, 1635 at sixteen frames, 2990
+at thirty-two and 7304 at a whole block, the last overshooting the settled output by 7 dB.
+Sixteen divides `RENDER_QUANTUM`, so the split is still a function of frames rendered and
+nothing about it depends on the host's buffer size. A band whose three smoothed values have
+not moved is not re-cooked at all, so a steady EQ costs three comparisons a span.
+
+**The EQ's fixed path filters six bits above the sample.** A biquad at a low corner
+frequency has its poles close to `z = 1`, where a direct form's quantisation noise is
+amplified by roughly `1/(1 − p)²` — about 70 dB for a 120 Hz shelf at 44.1 kHz. Measured,
+that put fixed-versus-float agreement at 38 dB; pre-amplifying by `2^6` on the way into the
+cascade and dividing by it on the way out moves it to 73.5 dB. Six bits because the scaling
+goes through `DspSample::mul_q24`, whose Q8.24 coefficient is an `i32`, and because it
+leaves 256× of headroom over full scale. This is the same device `crate::filter` uses for
+IT's voice filter, which pre-amplifies its delay line by 256.
+
+**The delay's feedback cannot run away on the fixed path**, three ways over: 100 % on the
+knob is a gain of 0.95 rather than 1.0; what is written to the line is saturated to the
+path's full scale, so the loop gain always applies to a bounded value; and a feedback
+multiply that leaves a sample exactly where it was flushes it to silence. That last one is
+not belt-and-braces — `scale_q15` rounds to nearest with ties away from zero, so every gain
+at or above 0.5 has small fixed points (`v = 10` at 0.95, `v = 1` at 0.5) which would ring
+at −70 dBFS for ever. On the float path a below-unity multiply leaves only zero unchanged,
+so the flush is a no-op there.
+
+**The delay's time is smoothed in Q8 frames, not in milliseconds.** `SmoothedParam`'s unit
+is the caller's, and one millisecond is forty-four frames: a millisecond-resolution ramp
+would move the read head in forty-four-frame jumps, which is the crackle smoothing exists
+to prevent. The host-facing parameter is still whole milliseconds; what ramps is the delay
+in 1/256ths of a frame, read back through `DelayLine::read_fractional`, so a time sweep
+pitch-shifts like tape. The chorus does the same in Q16 frames, which its 60 ms maximum
+leaves room for and the delay's two seconds does not.
+
+**Wet/dry is equal power**, `cos`/`sin` of a quarter turn from `tables::equal_power_q15`,
+with both endpoints lifted from `sin_q15`'s own 32767 peak to `Q15_UNITY` — so a delay or a
+chorus at zero mix is **bit-transparent**, the same property `GainInsert` has at unity.
+
+**Measured, on both paths** (`crates/starplayer-dsp/src/effects/`): a +12 dB bell at 1 kHz
+on white noise raises the 1 kHz band by 11.97 dB and moves 100 Hz by 0.10 dB and 10 kHz by
+0.11 dB; an impulse into a 300 ms / 50 % / fully wet delay comes back at exactly 20000,
+10000 and 5000 units of a 20000-unit impulse, and ping-pong alternates the channels; a
+1 kHz sine through the chorus keeps its energy within ±54 Hz of 1 kHz with every measured
+frequency 150 Hz away at least 70 dB down. Fixed against float, by segmental SNR: EQ
+73.5 dB, delay 79.9 dB, chorus 76.8 dB, against a 60 dB requirement. No float enters the
+fixed path in any of the three, so its output is bit-identical across x86, ARM and WASM by
+construction (§7.3).
+
 #### IT's resonant filter is a *voice*-level filter, not an insert (M6-G2, landed)
 
 It sits inside the render kernel, between the resampler and the pan gains — which is where
