@@ -42,6 +42,7 @@ impl From<EngineWarnings> for WarningFlags {
             retired_module_dropped: warnings.retired_module_dropped,
             unsupported_command: warnings.unsupported_command,
             late_events: warnings.late_events,
+            retired_insert_dropped: warnings.retired_insert_dropped,
         }
     }
 }

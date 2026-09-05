@@ -17,15 +17,35 @@ use starplayer::core::{AtEnd, Error};
 /// Re-exported so a caller naming a golden's kernel — the goldens driver, a cross-target
 /// check — does not have to depend on `starplayer-core` directly.
 pub use starplayer::core::Interpolator;
-use starplayer::dsp::{Cubic, Interpolate, Linear, Nearest, Sinc};
+use starplayer::dsp::{Cubic, InsertKind, Interpolate, Linear, Nearest, ParamId, Sinc, build_insert};
 use starplayer::engine::{
-    ChannelTable, EndReason, Engine, EngineSettings, EngineWarnings, EventSource, InstrumentRack, MidiSource, ScanLimits,
-    SongTimeline,
+    ChannelTable, EndReason, Engine, EngineSettings, EngineWarnings, EventSource, InsertCommand, InsertTarget,
+    InstrumentRack, MidiSource, ScanLimits, SongTimeline,
 };
 use starplayer::mixer::{FixedPath, FloatPath, I24, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
 use starplayer::model::{Module, ModuleFormat};
 use starplayer::rt::Arc;
 use starplayer::{NativeSequencer, ScannedSong, recommended_voice_capacity, scan_song};
+
+/// One insert to install before a [`render_song`] render begins (M7-H7), so the CLI's
+/// `--insert` flag and a test share exactly the same shape rather than each building an
+/// effect its own way.
+///
+/// Installed, and every parameter set, **before the first frame renders** — never mid-song
+/// — so the effect is present from sample zero whatever host block size the render walks
+/// in, which is what keeps a render with `inserts` non-empty just as
+/// buffer-size-independent as one with none.
+#[derive(Clone, Debug)]
+pub struct InsertSpec {
+    /// Which bus.
+    pub target: InsertTarget,
+    /// Which of the four ordered slots.
+    pub slot: u8,
+    /// Which effect.
+    pub kind: InsertKind,
+    /// Parameters to set after installing, away from the effect's own defaults.
+    pub params: Vec<(ParamId, i32)>,
+}
 
 // The per-tick trace is a diagnostic build only. Everything it needs sits behind the
 // `trace` feature, so an ordinary `cargo test --workspace` — and every golden render —
@@ -387,6 +407,26 @@ where
     Out: OutputFormat<Accumulator = Path::Accumulator>,
     Out::Sample: FadeSample,
 {
+    render_song_with_inserts::<Path, Interp, Out>(format, bytes, sample_rate_hz, host_block_frames, length, &[])
+}
+
+/// [`render_song`] with insert effects installed before the first frame renders (M7-H7):
+/// the CLI's `--insert` flag and the offline exit-criterion tests share this entry point
+/// rather than each poking at `Engine::take_insert_control` its own way.
+pub fn render_song_with_inserts<Path, Interp, Out>(
+    format: GoldenFormat,
+    bytes: &[u8],
+    sample_rate_hz: u32,
+    host_block_frames: usize,
+    length: RenderLength,
+    inserts: &[InsertSpec],
+) -> Result<Vec<Out::Sample>, RenderError>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: FadeSample,
+{
     let module = Arc::new(load_golden(format, bytes)?);
     let scanned = scanned_song(&module, sample_rate_hz)?;
     let (total_frames, fade_frames) = length.frames_for(&scanned.timeline);
@@ -402,6 +442,23 @@ where
     control.load_module(Arc::clone(&module)).map_err(|_| RenderError::CommandQueue)?;
     engine.set_source(playback_source(module, sample_rate_hz, scanned)?);
     engine.set_limiter(Limiter::Clamp);
+
+    if !inserts.is_empty() {
+        let mut insert_control = engine.take_insert_control().ok_or(RenderError::CommandQueue)?;
+        for spec in inserts {
+            let boxed = build_insert::<Path::Mono>(spec.kind, sample_rate_hz);
+            insert_control.install(spec.target, spec.slot, boxed).map_err(|_| RenderError::CommandQueue)?;
+            for &(param, value) in &spec.params {
+                insert_control
+                    .send(InsertCommand::SetParam { target: spec.target, slot: spec.slot, param, value })
+                    .map_err(|_| RenderError::CommandQueue)?;
+            }
+        }
+        // Dropped here rather than held: nothing after this point installs, removes or
+        // parameterises another insert, so there is nothing left for the control side to
+        // do — and holding it would only postpone the retired-insert collection this
+        // render never produces any of anyway.
+    }
 
     let output_samples = total_frames.saturating_mul(Out::CHANNELS);
     let block_samples = host_block_frames.max(1).saturating_mul(Out::CHANNELS).max(Out::CHANNELS);
@@ -1366,5 +1423,54 @@ mod tests {
         for host_block_frames in [1, 3, 64, 128, 4096, 8191] {
             assert_eq!(render_mtm_with_block_size(&module, host_block_frames), reference, "host block size {host_block_frames} changed MTM PCM");
         }
+    }
+
+    // ── M7-H7: `render_song_with_inserts`, the CLI's `--insert` code path ───────────
+
+    /// An insert installed through `render_song_with_inserts` is present from the very
+    /// first frame — never mid-song — so the render stays buffer-size-independent exactly
+    /// as `render_song` with no inserts does (design goal 3).
+    #[test]
+    fn a_render_with_an_insert_installed_is_still_block_size_independent() {
+        use starplayer::dsp::InsertKind;
+        use starplayer::dsp::effects::reverb::REVERB_MIX_PARAM;
+        use starplayer::engine::InsertTarget;
+
+        let inserts = [InsertSpec {
+            target: InsertTarget::Channel(starplayer::core::ChannelId(0)),
+            slot: 0,
+            kind: InsertKind::Reverb,
+            params: vec![(REVERB_MIX_PARAM, 50)],
+        }];
+        let length = RenderLength { max_frames: 4 * GOLDEN_SAMPLE_RATE_HZ as u64, fade_frames: 0, ..RenderLength::default_for(GOLDEN_SAMPLE_RATE_HZ) };
+
+        let reference = render_song_with_inserts::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, 128, length, &inserts)
+            .expect("REFLEX renders with a reverb installed");
+        assert!(reference.iter().any(|sample| *sample != 0), "an inserted reverb still produced audible output");
+
+        for host_block_frames in [1, 3, 64, 128, 4_096, 8_191] {
+            let rendered = render_song_with_inserts::<FixedPath, Linear, MonoI16>(
+                GoldenFormat::S3m,
+                REFLEX,
+                GOLDEN_SAMPLE_RATE_HZ,
+                host_block_frames,
+                length,
+                &inserts,
+            )
+            .expect("REFLEX renders with a reverb installed");
+            assert_eq!(rendered, reference, "host block size {host_block_frames} changed a render with an insert installed");
+        }
+    }
+
+    /// `render_song` with an empty insert slice is exactly `render_song_with_inserts` with
+    /// none — the two must not silently diverge now that one is defined in terms of the
+    /// other.
+    #[test]
+    fn render_song_with_no_inserts_matches_render_song() {
+        let length = RenderLength { max_frames: 2 * GOLDEN_SAMPLE_RATE_HZ as u64, fade_frames: 0, ..RenderLength::default_for(GOLDEN_SAMPLE_RATE_HZ) };
+        let plain = render_song::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, 128, length).expect("renders");
+        let via_inserts =
+            render_song_with_inserts::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, 128, length, &[]).expect("renders");
+        assert_eq!(plain, via_inserts);
     }
 }

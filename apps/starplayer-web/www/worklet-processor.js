@@ -61,6 +61,12 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             scopeTransport: this.scope ? 'SharedArrayBuffer' : 'postMessage',
             scopeBucketFrames: this.scopeBucketFrames,
             scopeWindowBuckets: this.wasm.scope_window_buckets(),
+            // M7-H7: every effect this build can install, its parameters, their units,
+            // ranges and defaults, as JSON — read straight from the wasm host's own
+            // `InsertDescriptor`s so the page's Effects panel can never drift from what
+            // `install_insert` and `OPCODE_INSERT_PARAM` actually accept. Needs no loaded
+            // module and no prior state, so it rides the very first message.
+            effects: this.wasm.effects_json(),
         });
     }
 
@@ -157,6 +163,40 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                 this.port.postMessage({
                     type: 'midiInputError',
                     requested: message.enabled === true,
+                    reason: error && error.message ? error.message : String(error),
+                });
+            }
+        } else if (message.type === 'inserts') {
+            // Building an effect allocates its delay lines (M7-H1), so install and remove
+            // both happen here — in a message task — exactly as `midiInput` and a
+            // mixer-mode rebuild do. A parameter change or a bypass flip is not this
+            // message at all: those are OPCODE_INSERT_PARAM / OPCODE_INSERT_BYPASS on the
+            // ordinary command ring, applied in `process()` like every other opcode.
+            try {
+                if (message.action === 'install') {
+                    this.wasm.install_insert(message.target, message.slot, message.kind);
+                } else if (message.action === 'remove') {
+                    this.wasm.remove_insert(message.target, message.slot);
+                }
+                // Installing may consume more of the pre-reserved heap; rebind here,
+                // outside process(), for the same reason module activation does.
+                this.bindViews();
+                this.port.postMessage({
+                    type: 'insertsApplied',
+                    requestId: message.requestId,
+                    action: message.action,
+                    target: message.target,
+                    slot: message.slot,
+                    kind: message.kind,
+                    memoryBytes: this.stableMemoryBytes,
+                });
+            } catch (error) {
+                this.port.postMessage({
+                    type: 'insertsError',
+                    requestId: message.requestId,
+                    action: message.action,
+                    target: message.target,
+                    slot: message.slot,
                     reason: error && error.message ? error.message : String(error),
                 });
             }

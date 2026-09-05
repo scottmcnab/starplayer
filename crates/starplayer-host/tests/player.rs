@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use starplayer::core::{AtEnd, ChannelId, Interpolator, U0F16};
-use starplayer::engine::{EndReason, MixPathKind, MixerMode, OutputDepth, RENDER_QUANTUM};
+use starplayer::dsp::InsertKind;
+use starplayer::dsp::effects::reverb::REVERB_MIX_PARAM;
+use starplayer::engine::{EndReason, InsertTarget, MixPathKind, MixerMode, OutputDepth, RENDER_QUANTUM};
 use starplayer::rt::Arc as RtArc;
 use starplayer_host::{AudioSpec, ManualBackend, ManualDriver, Player, SeekKind, TRANSPORT_RAMP_FRAMES};
 
@@ -443,4 +445,117 @@ fn a_bad_load_leaves_the_previous_module_playing() {
     let mut output = vec![0.0f32; spec.samples_for(RENDER_QUANTUM * 64)];
     driver.render(&mut output);
     assert!(output.iter().any(|sample| *sample != 0.0), "the previous module is still playing");
+}
+
+// ── M7-H7: the insert graph, reached through `Player` ───────────────────────────────
+//
+// `reflex.s3m` has three channels. `Player` exposes no way to read one channel's bus
+// back on its own — the buses are summed inside `render()`, exactly as
+// `starplayer-offline/tests/reverb_exit_criterion.rs`'s own comment explains — but
+// `Player::mute` reaches the same `is_muted`-before-a-bus check H1 built
+// (`VoicePool::accumulate_masked`), so soloing one channel through the host's own mute
+// command gets to the same measurement H4's engine-level test makes, through the surface
+// an owner's CLI or web page actually calls.
+
+/// Render `bytes` with every channel muted except `solo`, optionally with a reverb
+/// installed on `reverb_channel`'s own chain — which may or may not be `solo`. Mutes and
+/// the insert are all queued before `play()`, so — like the fixture's own note-off in
+/// `reverb_exit_criterion.rs` — they are in force from the render's first frame rather
+/// than from whenever the command ring happened to drain.
+fn render_soloed(spec: AudioSpec, mode: MixerMode, channel_count: u16, solo: ChannelId, reverb_channel: Option<ChannelId>, frames: usize) -> Vec<f32> {
+    let (_backend, mut player, driver) = open(spec, mode);
+    player.load(REFLEX).expect("REFLEX loads");
+    for index in 0..channel_count {
+        let channel = ChannelId(index);
+        player.mute(channel, channel != solo).expect("mute queues");
+    }
+    if let Some(target) = reverb_channel {
+        player.install_insert(InsertTarget::Channel(target), 0, InsertKind::Reverb).expect("install queues");
+        player.set_insert_param(InsertTarget::Channel(target), 0, REVERB_MIX_PARAM, 50).expect("set_param queues");
+    }
+    player.play().expect("play");
+    driver.render_blocks(spec, frames, 128)
+}
+
+/// The host-level form of M7's exit criterion: a reverb installed through
+/// [`Player::install_insert`] on one channel changes that channel's own contribution to
+/// the mix and leaves every other channel's contribution — measured by soloing it through
+/// [`Player::mute`] — bit-identical to a render with no insert installed at all.
+#[test]
+fn a_reverb_installed_through_the_player_on_one_channel_does_not_change_the_others() {
+    let spec = AudioSpec::stereo(44_100);
+    let mode = MixerMode::DEFAULT;
+    let channel_count: u16 = 3;
+    let reverb_channel = ChannelId(1);
+    let frames = RENDER_QUANTUM * 400;
+
+    for other in [ChannelId(0), ChannelId(2)] {
+        let without_insert = render_soloed(spec, mode, channel_count, other, None, frames);
+        let with_reverb_elsewhere = render_soloed(spec, mode, channel_count, other, Some(reverb_channel), frames);
+        assert_eq!(with_reverb_elsewhere, without_insert, "channel {other:?} changed when a reverb was installed on a different channel");
+    }
+
+    let reverb_channel_plain = render_soloed(spec, mode, channel_count, reverb_channel, None, frames);
+    let reverb_channel_with_reverb = render_soloed(spec, mode, channel_count, reverb_channel, Some(reverb_channel), frames);
+    assert_ne!(reverb_channel_with_reverb, reverb_channel_plain, "installing a reverb on its own channel changed nothing audible");
+}
+
+/// [`Player::inserts`] reports back what was installed, including after a slot is
+/// removed and after the bypass bit flips — the host-side bookkeeping
+/// [`Player::set_mixer_mode`] replays across a rebuild.
+#[test]
+fn the_player_reports_back_what_it_believes_is_installed() {
+    let spec = AudioSpec::stereo(44_100);
+    let (_backend, mut player, _driver) = open(spec, MixerMode::DEFAULT);
+    player.load(REFLEX).expect("REFLEX loads");
+    let target = InsertTarget::Channel(ChannelId(0));
+
+    assert!(player.inserts().get(target, 0).is_none());
+    player.install_insert(target, 0, InsertKind::Reverb).expect("install queues");
+    assert_eq!(player.inserts().get(target, 0).map(|insert| insert.kind), Some(InsertKind::Reverb));
+
+    player.set_insert_param(target, 0, REVERB_MIX_PARAM, 42).expect("set_param queues");
+    assert_eq!(player.inserts().get(target, 0).and_then(|insert| insert.param(REVERB_MIX_PARAM)), Some(42));
+
+    player.bypass_insert(target, 0, true).expect("bypass queues");
+    assert!(player.inserts().get(target, 0).unwrap().bypassed);
+
+    player.remove_insert(target, 0).expect("remove queues");
+    assert!(player.inserts().get(target, 0).is_none());
+}
+
+/// A slot outside the fixed topology is refused rather than silently retiring whatever the
+/// engine would have built.
+#[test]
+fn an_out_of_range_insert_slot_is_refused() {
+    let spec = AudioSpec::stereo(44_100);
+    let (_backend, mut player, _driver) = open(spec, MixerMode::DEFAULT);
+    player.load(REFLEX).expect("REFLEX loads");
+    let target = InsertTarget::Channel(ChannelId(0));
+    assert!(player.install_insert(target, 4, InsertKind::Gain).is_err(), "there are only four slots, 0..=3");
+}
+
+/// [`Player::set_mixer_mode`] replays the insert layout into the rebuilt engine, so the
+/// effect keeps sounding across a mode change exactly as the module itself does.
+#[test]
+fn the_insert_layout_survives_a_mixer_mode_rebuild() {
+    let spec = AudioSpec::stereo(44_100);
+    let mut backend = ManualBackend::new();
+    let mut player = Player::open(&mut backend, None, spec, MixerMode::DEFAULT).expect("open");
+    player.load(REFLEX).expect("REFLEX loads");
+    let target = InsertTarget::Channel(ChannelId(1));
+    player.install_insert(target, 0, InsertKind::Reverb).expect("install queues");
+    player.set_insert_param(target, 0, REVERB_MIX_PARAM, 60).expect("set_param queues");
+
+    let fixed = MixerMode { path: MixPathKind::Fixed, depth: OutputDepth::I16, ..MixerMode::DEFAULT };
+    player.set_mixer_mode(&mut backend, None, fixed).expect("rebuild");
+
+    assert_eq!(player.inserts().get(target, 0).map(|insert| insert.kind), Some(InsertKind::Reverb));
+    assert_eq!(player.inserts().get(target, 0).and_then(|insert| insert.param(REVERB_MIX_PARAM)), Some(60));
+
+    player.play().expect("play");
+    let driver = backend.driver().expect("driver");
+    let mut output = vec![0.0f32; spec.samples_for(RENDER_QUANTUM * 64)];
+    driver.render(&mut output);
+    assert!(output.iter().any(|sample| *sample != 0.0), "the rebuilt engine, with the replayed reverb, still produces audio");
 }

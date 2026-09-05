@@ -29,11 +29,18 @@
 //!     applies:
 //!         starplayer render song.mid --instruments module.it -o out.wav
 //!
+//!     --insert <target>:<effect>[:<param>=<value>,...] installs an insert effect before
+//!     rendering (M7-H7), repeatably; --list-effects prints every effect this build can
+//!     install and exits. See `src/insert_arg.rs`'s module doc for the grammar. Conflicts
+//!     with --golden, which is DSP-bypassed by policy:
+//!         starplayer render <file> -o out.wav --insert 1:reverb:room=60,mix=50
+//!
 //! starplayer trace <file> [--ticks N]
 //!     Print a per-tick diagnostic trace of the sequencer's state to stdout.
 //!
 //! starplayer play <file> [--entry N] [--device NAME] [--rate HZ] [--buffer FRAMES]
 //!                         [--repeat] [--list-devices] [--midi PORT] [--list-midi-ports]
+//!                         [--insert TARGET:EFFECT[:PARAM=VALUE,...]] [--list-effects]
 //!     Play a module on an audio output device through starplayer-host-cpal. Prints
 //!     the title and the negotiated stream spec once, then order/pattern/row/speed/
 //!     BPM/voices/peak on one updating line once a second. Stops at the song's natural
@@ -48,6 +55,9 @@
 //!     --list-midi-ports prints what this machine has.
 //!
 //!     --instruments MODULE names the module whose instruments play a `.mid` (task E5).
+//!
+//!     --insert and --list-effects are the same flags `render` takes (M7-H7), installed
+//!     through `Player` before playback starts.
 //! ```
 //!
 //! A ZIP archive is accepted anywhere a module file is. With more than one recognised
@@ -62,6 +72,7 @@
 
 mod archive;
 mod info;
+mod insert_arg;
 mod play;
 mod render;
 mod trace;
@@ -78,7 +89,12 @@ use clap::{Parser, Subcommand};
 #[command(name = "starplayer", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+    /// Print every insert effect this build can install (M7-H7), its parameters, their
+    /// units, ranges and defaults, and exit. Needs no subcommand; `render --list-effects`
+    /// and `play --list-effects` do the same for a caller already typing one of those.
+    #[arg(long)]
+    list_effects: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -96,7 +112,19 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let result = match cli.command {
+    // A top-level `starplayer --list-effects` needs no subcommand at all (M7-H7); `render
+    // --list-effects` and `play --list-effects` are each subcommand's own copy of the same
+    // flag, for a caller already typing one of those.
+    if cli.list_effects {
+        print!("{}", insert_arg::list_effects());
+        return ExitCode::SUCCESS;
+    }
+    let Some(command) = cli.command else {
+        eprintln!("starplayer: no subcommand given; see --help");
+        return ExitCode::FAILURE;
+    };
+
+    let result = match command {
         Command::Info(args) => info::run(args),
         Command::Render(args) => render::run(args),
         Command::Trace(args) => trace::run(args),

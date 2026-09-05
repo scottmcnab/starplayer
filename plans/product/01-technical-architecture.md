@@ -1290,6 +1290,28 @@ rebuilding a typed engine allocates (§7.1), so whichever drain sees it only ret
 scalar, and the rebuild runs in a worklet message task — the page follows a ring push with
 a `flushCommands` message to provide one.
 
+**Insert effects (M7-H7)** add two opcodes to the same ring rather than a second one, for
+the same reason `OPCODE_MIDI_EVENT` does: a parameter change is bounded, decoded between
+render quanta, and turned into one allocation-free `Player` call. `OPCODE_INSERT_PARAM`
+(11) packs a target byte (bits 0–7: a channel index `0..64`, or `0xFF` for the master bus),
+a slot nibble (bits 8–11, `0..4`) and a `ParamId` byte (bits 12–19) into `argument`; `extra`
+is the new value in the parameter's own fixed unit, carried as a raw 32-bit pattern so a
+negative centi-decibel threshold crosses exactly as a positive percentage does.
+`OPCODE_INSERT_BYPASS` (12) packs the same target and slot into `argument`; `extra` is `0`
+or `1`. **Installing or removing an effect is not an opcode**, for the reason
+`SET_MIXER_MODE` is not one: building an effect allocates its delay lines (H1 deliverable
+4), so `install_insert(target, slot, kind)` and `remove_insert(target, slot)` are exports
+called from a worklet message task, exactly as `set_midi_input` is. `kind` is the effect's
+position in `InsertKind::ALL` (gain 0, eq 1, delay 2, chorus 3, reverb 4, compressor 5), the
+same numbering a third export, `effects_json()`, reports alongside every effect's
+parameters — name, `ParamUnit` variant, range and default — read straight from
+`build_insert(kind, _).descriptor()` so the page's Effects panel can never drift from what
+the two opcodes above and the two allocating exports actually accept. `effects_json` needs
+no loaded module and no prior `init()`: it names what the build can do, not what any one
+host instance has done. The page tracks its own belief of what is installed per
+target/slot — nothing reads the engine's chain back over the wire, the same one-way
+arrangement `InsertLayout` keeps on the native host.
+
 **Snapshots** cross as a flat `Int32Array`: a 22-word header (sequence, dropped publishes,
 channel count, voices, order, pattern, row, tick, speed, BPM, global volume, warning bits,
 engine frame, pending garbage, module generation, playing, master peak, retired modules,
@@ -1456,7 +1478,8 @@ crates/
   # ── std ─────────────────────────────────────────────────────────────────────
   starplayer-host       AudioBackend trait, AudioSpec/DeviceInfo/Stream, the
                         backend-neutral Player: engine + transport + seek
-                        mailbox + output depth.                   → starplayer
+                        mailbox + output depth + insert control (M7-H7,
+                        HostInsertControl + InsertLayout).         → starplayer
   starplayer-host-cpal  native audio output          → starplayer, starplayer-host, cpal
   starplayer-midi-native  native MIDI *input*: a midir port decoded onto a Player's
                         live-input queue (M4-E6). Not part of the cpal crate: it is not

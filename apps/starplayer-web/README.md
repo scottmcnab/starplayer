@@ -167,6 +167,37 @@ exercise.
 Every one of those choices is written to `localStorage` (in a try/catch — a
 storage-blocked page still works, it just forgets). The module is never persisted.
 
+## Effects (M7-H7)
+
+A panel beside Mixer exposes the insert graph: a **Target** select (Master, plus one entry
+per channel the loaded module actually has, read from the live telemetry) and four ordered
+slot rows, always visible, each an effect select (`None` plus every effect the build can
+install), a **Bypass** checkbox, and — once an effect is chosen — one range input per
+parameter.
+
+Nothing about a specific effect is hand-written here. `worklet-processor.js` carries the
+wasm host's own `effects_json()` on its very first `ready` message — every effect's name,
+its position in `InsertKind::ALL` (the `kind` `install_insert` takes), and every
+parameter's name, `ParamUnit` variant, range and default — and the panel is built entirely
+from that. Reordering or renaming an effect on the Rust side changes what the page shows
+without a line of JavaScript changing.
+
+Choosing an effect (or `None`) posts an `inserts` message and rebuilds the slot's sliders
+from that effect's own defaults; like `midiInput`, this is a worklet message task rather
+than a wire opcode, because building an effect allocates its delay lines. Moving a slider
+sends `OPCODE_INSERT_PARAM`; the Bypass checkbox sends `OPCODE_INSERT_BYPASS`. Both pack
+the target and slot into the same twelve bits, exactly as `plans/product/01-technical-architecture.md`
+§9.2 describes, and ride the ordinary command ring — no allocation, no worklet message,
+applied in `process()` like a mute or a master-volume change.
+
+The page keeps its own record of what it believes is installed, per target and slot —
+nothing reads the engine's insert chain back over the wire, so there is nowhere else that
+belief could live. A rejected install or remove (`insertsError`) puts it back the way it
+was rather than leaving the panel claiming an effect that never took. The compressor's
+gain-reduction meter is not shown: this build's telemetry snapshot does not carry it (H4
+did not widen it, and H7 did not either), which the task's own deliverable allows —
+"otherwise omitted."
+
 ### Why the host owns the mixer mode
 
 The engine's path, interpolator and output format are **type parameters**, so changing one
@@ -257,8 +288,11 @@ not move, loads a second module over the top of the first and waits for the reti
 drops a deliberately broken file and checks that playback survives it, rebuilds the graph
 at 22050 Hz and checks the song comes back at the order that was sounding, switches the
 mixer to `fixed · nearest · 8-bit · stereo` and then to mono and checks both round-trip
-through the telemetry header without growing wasm memory, and finally shrinks the viewport
-to 390×844 and asserts nothing overflows horizontally.
+through the telemetry header without growing wasm memory, selects channel 1 in the Effects
+panel and reverb by name in its first slot (M7-H7 — never by the wire number
+`InsertKind::ALL` happens to give it), samples the master peak for two seconds and asserts
+it never drops to zero, then removes it the same way and checks its sliders disappear, and
+finally shrinks the viewport to 390×844 and asserts nothing overflows horizontally.
 
 The Node worklet harness does not need a browser: it stubs `AudioWorkletGlobalScope`,
 hides Node's `TextDecoder` so the bundle has to supply its own, loads a real bundled

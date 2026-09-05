@@ -196,6 +196,11 @@ pub struct WarningFlags {
     /// An external event was stamped for a frame that had already passed and dispatched at
     /// the current one. The host's event lead is too short.
     pub late_events: bool,
+    /// A retired insert effect was dropped on the audio thread because its garbage
+    /// channel was full (M7-H1 `EngineWarnings::retired_insert_dropped`). A host bug — the
+    /// control side has stopped calling its insert handle's garbage collection — not a
+    /// module or effect bug.
+    pub retired_insert_dropped: bool,
 }
 
 impl WarningFlags {
@@ -206,6 +211,7 @@ impl WarningFlags {
         retired_module_dropped: false,
         unsupported_command: false,
         late_events: false,
+        retired_insert_dropped: false,
     };
 
     /// Whether anything has been flagged.
@@ -215,6 +221,7 @@ impl WarningFlags {
             || self.retired_module_dropped
             || self.unsupported_command
             || self.late_events
+            || self.retired_insert_dropped
     }
 }
 

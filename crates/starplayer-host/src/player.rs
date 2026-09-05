@@ -12,7 +12,7 @@
 //! long as the stream is open. Once [`Player::open`] returns, the audio side is
 //! unreachable from this thread — which is the point.
 //!
-//! Four things cross, and each has exactly one mechanism:
+//! Several things cross, and each has exactly one mechanism:
 //!
 //! | | direction | mechanism |
 //! |---|---|---|
@@ -21,6 +21,8 @@
 //! | retired modules and retired sources | audio → control | an SPSC ring; **dropped here**, never there |
 //! | telemetry, position, peak | audio → control | a snapshot channel and a handful of atomics |
 //! | live MIDI and keyboard events | control (or any thread) → audio | an [`ExternalEventQueue`](starplayer::engine::ExternalEventQueue) of absolutely-stamped events; see `src/events.rs` |
+//! | insert commands (install, remove, set a parameter, bypass, reset) | control → audio | [`HostInsertControl`](crate::HostInsertControl) directly onto the engine's own insert ring — `Player` holds the handle itself rather than routing through `HostCommand`, because unlike the transport an insert change has no ramp to sequence around (M7-H7) |
+//! | retired insert effects | audio → control | the engine's insert garbage channel, drained by [`Player::collect_garbage`] alongside retired modules |
 //!
 //! # Why the module travels over the ring rather than through `EngineHandle`
 //!
@@ -38,9 +40,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::vec::Vec;
 
 use starplayer::core::{AtEnd, ChannelId, Command, Event, Frame, U0F16};
+use starplayer::dsp::{InsertKind, ParamId};
 use starplayer::engine::{
-    EngineHandle, EngineWarnings, EventSource, ExternalEventProducer, InstrumentRack, MidiSource, MixerMode,
-    RENDER_QUANTUM, SourceMux, external_event_channel,
+    EngineHandle, EngineWarnings, EventSource, ExternalEventProducer, InsertTarget, InstrumentRack, MAX_INSERTS_PER_CHAIN,
+    MidiSource, MixerMode, RENDER_QUANTUM, SourceMux, external_event_channel,
 };
 use starplayer::model::Module;
 use starplayer::rt::{
@@ -52,6 +55,7 @@ use starplayer::{ScannedSong, recommended_voice_capacity};
 use crate::backend::{AudioBackend, AudioSpec, HostError, Stream, StreamHealth};
 use crate::engine::HostEngine;
 use crate::events::{EVENT_QUEUE_CAPACITY, EventClock, EventSender};
+use crate::insert::{HostInsertControl, InsertLayout};
 use crate::source::{SeekKind, SeekRequest, SourceHandles, build_source};
 use crate::transport::Transport;
 
@@ -363,6 +367,12 @@ struct ControlSide {
     /// it exists on this thread.
     scopes: Option<Box<[TapReader]>>,
     event_clock: Arc<EventClock>,
+    /// The insert graph's control handle (M7-H7). Unlike [`EngineHandle`] this is held by
+    /// `Player` itself rather than by [`RenderState`]: installing an effect is a plain
+    /// control-thread action with no transport ramp to sequence around, so there is no
+    /// reason to route it through [`HostCommand`] and the render callback the way a
+    /// `Command::LoadModule` has to be.
+    insert_control: HostInsertControl,
 }
 
 /// Build both sides of one engine at `spec`'s rate, in `mode`.
@@ -374,7 +384,7 @@ fn build_sides(mode: MixerMode, spec: AudioSpec) -> Result<(RenderState, Control
         let reason = std::format!("the engine renders {} channels, the device wants {}", mode.channels, spec.channels);
         return Err(HostError::UnsupportedSpec { requested: spec, reason });
     }
-    let (mut engine, mut control, telemetry) = HostEngine::build(mode, spec.sample_rate_hz)?;
+    let (mut engine, mut control, insert_control, telemetry) = HostEngine::build(mode, spec.sample_rate_hz)?;
     let scopes = engine.scope_readers();
     // Freeze the musical clock until the first Play. Without this a stream that is started
     // as soon as it is open plays the song silently while the caller is still deciding.
@@ -412,6 +422,7 @@ fn build_sides(mode: MixerMode, spec: AudioSpec) -> Result<(RenderState, Control
         handles,
         scopes,
         event_clock,
+        insert_control,
     };
     Ok((render, control_side))
 }
@@ -460,6 +471,13 @@ pub struct Player {
     /// Whether live input is alone or sharing a mux with the module. Not the same question
     /// as `events.is_some()`, which goes false the moment a caller takes the sender.
     live_input: LiveInputMode,
+    /// The insert graph's control handle (M7-H7): whichever mix path this engine's arm
+    /// resolved to.
+    insert_control: HostInsertControl,
+    /// What this host believes is installed, per target and slot — replayed into a
+    /// freshly built engine across [`Player::set_mixer_mode`] and
+    /// [`Player::reopen`] (research point 1: the layout lives in `Player`, not the engine).
+    insert_layout: InsertLayout,
 }
 
 impl Player {
@@ -504,6 +522,8 @@ impl Player {
             event_clock: control.event_clock,
             events: None,
             live_input: LiveInputMode::Off,
+            insert_control: control.insert_control,
+            insert_layout: InsertLayout::default(),
         })
     }
 
@@ -565,6 +585,10 @@ impl Player {
         let collected = self.collected;
         let requested_lead = self.event_clock.requested_lead_frames();
         let live_input = self.live_input;
+        // What this host believes is installed survives the rebuild (research point 1: the
+        // layout lives in `Player`), replayed into the freshly built engine below — a new
+        // engine's insert graph starts empty, exactly as a new engine's module does.
+        let insert_layout = self.insert_layout.clone();
         let mut rebuilt = Player::open(backend, device, requested, plan.mode)?;
         // Carried, not restarted: the count is what a caller reports as "modules dropped on
         // this thread since start-up", and a rebuild is not a fresh start-up.
@@ -593,6 +617,21 @@ impl Player {
             LiveInputMode::Off => {}
             LiveInputMode::MidiOnly => rebuilt.midi_only()?,
             LiveInputMode::Jam => {}
+        }
+        // Replay every insert this host believes is installed into the freshly built
+        // engine: install, then every parameter this host has explicitly set, then the
+        // bypass bit. `rebuilt.insert_layout` is left at its own fresh default by
+        // `Player::open` and each of these calls updates it exactly as a caller's own
+        // would, so the copy of `insert_layout` captured above is only needed to iterate —
+        // it is not written back.
+        for (target, slot, insert) in insert_layout.iter() {
+            rebuilt.install_insert(target, slot, insert.kind)?;
+            for &(param, value) in insert.params() {
+                rebuilt.set_insert_param(target, slot, param, value)?;
+            }
+            if insert.bypassed {
+                rebuilt.bypass_insert(target, slot, true)?;
+            }
         }
         if plan.resume {
             rebuilt.play()?;
@@ -732,6 +771,12 @@ impl Player {
             return Err(HostError::NoModule);
         }
         self.handles.seek.request(SeekRequest { kind, frame: Frame(self.taps.source_frame.load(Ordering::Relaxed)) });
+        // A seek jumps every delay line and envelope to a different musical moment, so an
+        // installed effect's state — a reverb tail, a delay's feedback loop — has to be
+        // cleared with it or it carries audio from the position the ear just left into the
+        // position it landed on. Parameters are untouched: `InsertCommand::ResetAll` clears
+        // state only.
+        let _ = self.insert_control.reset_all();
         Ok(())
     }
 
@@ -916,11 +961,12 @@ impl Player {
             retired_module_dropped: snapshot.warnings.retired_module_dropped,
             unsupported_command: snapshot.warnings.unsupported_command,
             late_events: snapshot.warnings.late_events,
-            // `retired_insert_dropped` (M7-H1) has no telemetry field yet: the snapshot's
-            // `Warnings` is `starplayer-telemetry`'s and widening it is H7's, with the
-            // rest of the host's insert surface. Reported through
-            // `HostEngine::warnings()` on the audio side in the meantime.
-            ..EngineWarnings::default()
+            // `retired_insert_dropped` (M7-H1) now has a telemetry home: H7 widened
+            // `starplayer_telemetry::WarningFlags` with the same name, and it is folded
+            // into the snapshot on every publish (`starplayer-engine`'s
+            // `From<EngineWarnings> for WarningFlags`), so it reads back here exactly
+            // like every other sticky flag.
+            retired_insert_dropped: snapshot.warnings.retired_insert_dropped,
         }
     }
 
@@ -956,15 +1002,74 @@ impl Player {
 
     /// Drop everything the audio thread has finished with, and report the running total.
     ///
-    /// **Call this regularly.** It is the only place a retired module or sequencer is
-    /// returned to the allocator.
+    /// **Call this regularly.** It is the only place a retired module, sequencer or insert
+    /// effect is returned to the allocator — a retired reverb's delay lines are exactly as
+    /// real an allocation as a retired module, and [`HostInsertControl::collect_all_garbage`]
+    /// is what frees them.
     pub fn collect_garbage(&mut self) -> usize {
         while let Some(retired) = self.retired.pop() {
             drop(retired);
             self.collected = self.collected.saturating_add(1);
         }
+        self.insert_control.collect_all_garbage();
         self.collected
     }
+
+    // ── inserts ─────────────────────────────────────────────────────────────────────
+    //
+    // M7-H7. `InsertHandle::install`/`send` push onto the audio side's insert ring
+    // directly from this thread — unlike `Command`, an insert change has no transport
+    // ramp to sequence around, so there is nothing for `HostCommand` to add. Building an
+    // effect happens **here**, in `HostInsertControl::install`, never inside a render
+    // callback or the ring's own drain.
+
+    /// A slot outside `0 ..= starplayer_engine::insert::MAX_INSERTS_PER_CHAIN - 1` refuses
+    /// rather than silently retiring whatever the engine would build for it.
+    fn validate_insert_slot(slot: u8) -> Result<(), HostError> {
+        if (slot as usize) < MAX_INSERTS_PER_CHAIN { Ok(()) } else { Err(HostError::InvalidInsertSlot(slot)) }
+    }
+
+    /// Build `kind` off the audio thread and install it in `slot` of `target`'s chain,
+    /// retiring whatever was there. See `starplayer_engine::insert` for the fixed
+    /// topology: four ordered slots per channel bus, four more on the master, ahead of the
+    /// master volume and the limiter.
+    pub fn install_insert(&mut self, target: InsertTarget, slot: u8, kind: InsertKind) -> Result<(), HostError> {
+        Player::validate_insert_slot(slot)?;
+        self.insert_control.install(target, slot, kind, self.spec.sample_rate_hz)?;
+        self.insert_layout.record_install(target, slot, kind);
+        Ok(())
+    }
+
+    /// Take whatever is in `slot` of `target`'s chain out and retire it.
+    pub fn remove_insert(&mut self, target: InsertTarget, slot: u8) -> Result<(), HostError> {
+        Player::validate_insert_slot(slot)?;
+        self.insert_control.remove(target, slot)?;
+        self.insert_layout.record_remove(target, slot);
+        Ok(())
+    }
+
+    /// Set one parameter of the effect in `slot` of `target`'s chain, in the parameter's
+    /// own fixed unit (its `InsertDescriptor::params` entry says which). Real-time safe on
+    /// the audio side: a copy and the start of a smoothing ramp, never a rebuild.
+    pub fn set_insert_param(&mut self, target: InsertTarget, slot: u8, param: ParamId, value: i32) -> Result<(), HostError> {
+        Player::validate_insert_slot(slot)?;
+        self.insert_control.set_param(target, slot, param, value)?;
+        self.insert_layout.record_param(target, slot, param, value);
+        Ok(())
+    }
+
+    /// Skip, or stop skipping, the effect in `slot` of `target`'s chain. A bypassed effect
+    /// still receives parameter changes and is still reset by a seek, so un-bypassing it
+    /// does not step into a stale state.
+    pub fn bypass_insert(&mut self, target: InsertTarget, slot: u8, bypassed: bool) -> Result<(), HostError> {
+        Player::validate_insert_slot(slot)?;
+        self.insert_control.bypass(target, slot, bypassed)?;
+        self.insert_layout.record_bypassed(target, slot, bypassed);
+        Ok(())
+    }
+
+    /// What this host believes is installed, per target and slot.
+    pub fn inserts(&self) -> &InsertLayout { &self.insert_layout }
 
     /// One [`TapReader`] per channel, claimed once (architecture §9(b)).
     ///

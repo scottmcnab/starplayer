@@ -37,13 +37,14 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use starplayer::core::AtEnd;
-use starplayer::dsp::{Linear, Nearest};
+use starplayer::dsp::{Cubic, Linear, Nearest, Sinc};
 use starplayer::mixer::{FixedOut, FixedPath, FloatOut, FloatPath, I24};
 use starplayer::model::ModuleFormat;
 use starplayer_offline::wav::{WavSample, write_wav};
-use starplayer_offline::{GoldenFormat, RenderLength};
+use starplayer_offline::{GoldenFormat, InsertSpec, RenderLength};
 
 use crate::archive;
+use crate::insert_arg;
 
 /// Voice-accumulation path.
 #[derive(clap::ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
@@ -61,6 +62,10 @@ pub enum InterpArg {
     Nearest,
     /// Linear. The default, and the golden-hash reference.
     Linear,
+    /// Four-point cubic (M7-task-H5).
+    Cubic,
+    /// Windowed-sinc (M7-task-H5).
+    Sinc,
 }
 
 /// Output bit depth.
@@ -87,11 +92,12 @@ pub enum AtEndArg {
 
 #[derive(clap::Args, Debug)]
 pub struct RenderArgs {
-    /// Module file, or a ZIP archive containing one.
-    pub file: PathBuf,
-    /// Output WAV file.
-    #[arg(short = 'o', long = "output")]
-    pub output: PathBuf,
+    /// Module file, or a ZIP archive containing one. Not needed with `--list-effects`.
+    #[arg(required_unless_present = "list_effects")]
+    pub file: Option<PathBuf>,
+    /// Output WAV file. Not needed with `--list-effects`.
+    #[arg(short = 'o', long = "output", required_unless_present = "list_effects")]
+    pub output: Option<PathBuf>,
     /// Output sample rate in Hz.
     #[arg(long, default_value_t = 44_100, conflicts_with = "golden")]
     pub rate: u32,
@@ -135,24 +141,44 @@ pub struct RenderArgs {
     /// index this module's instruments. Ignored, with no effect, for a tracker module.
     #[arg(long)]
     pub instruments: Option<PathBuf>,
+    /// Install an insert effect before rendering (M7-H7): `<target>:<effect>[:<param>=<value>,...]`,
+    /// where `<target>` is a 1-based channel number or `master`, e.g.
+    /// `--insert 1:reverb:room=60,mix=50`. Repeatable: a second `--insert` naming the same
+    /// target fills the next slot of its chain. The eleven goldens are DSP-bypassed by
+    /// policy, so this conflicts with `--golden`.
+    #[arg(long = "insert", conflicts_with = "golden")]
+    pub insert: Vec<String>,
+    /// Print every insert effect this build can install, its parameters, their units,
+    /// ranges and defaults, and exit.
+    #[arg(long)]
+    pub list_effects: bool,
 }
 
 pub fn run(args: RenderArgs) -> Result<(), String> {
-    let bytes = archive::load_module_bytes(&args.file, args.entry)?;
+    // `--list-effects` names no file and renders nothing (M7-H7).
+    if args.list_effects {
+        print!("{}", insert_arg::list_effects());
+        return Ok(());
+    }
+    let file = args.file.clone().ok_or_else(|| String::from("no module given; see --help"))?;
+    let output = args.output.clone().ok_or_else(|| String::from("no output file given; see --help"))?;
+    let bytes = archive::load_module_bytes(&file, args.entry)?;
 
     // ── task E5: a `.mid` renders through a loaded module's instruments ──────────────
     if starplayer::probe_smf(&bytes) {
-        return run_smf(&args, &bytes);
+        return run_smf(&args, &file, &output, &bytes);
     }
     // ── end task E5 branch ────────────────────────────────────────────────────────────
 
     let format = starplayer::probe(&bytes)
         .and_then(golden_format)
-        .ok_or_else(|| format!("{}: not a module format this build plays", args.file.display()))?;
+        .ok_or_else(|| format!("{}: not a module format this build plays", file.display()))?;
 
     if args.golden {
-        return run_golden(&args.output, format, &bytes);
+        return run_golden(&output, format, &bytes);
     }
+
+    let inserts = parse_inserts(&args.insert)?;
 
     let mut length = RenderLength::default_for(args.rate);
     length.repeat_count = args.repeat;
@@ -184,7 +210,8 @@ pub fn run(args: RenderArgs) -> Result<(), String> {
         rate: args.rate,
         host_block_frames,
         length,
-        output: &args.output,
+        output: &output,
+        inserts: &inserts,
     })?;
 
     println!(
@@ -192,10 +219,18 @@ pub fn run(args: RenderArgs) -> Result<(), String> {
         describe(args.mix_path, args.interp, args.depth, channels),
         frames_written as f64 / args.rate.max(1) as f64,
         args.rate,
-        args.output.display()
+        output.display()
     );
     println!("sha256: {hash}");
     Ok(())
+}
+
+/// Parse every `--insert` flag into the shape `starplayer_offline::render_song_with_inserts`
+/// takes, naming the flag's own text in any error so it is obvious which repeat was wrong.
+fn parse_inserts(specs: &[String]) -> Result<Vec<InsertSpec>, String> {
+    insert_arg::parse_insert_args(specs).map(|parsed| {
+        parsed.into_iter().map(|arg| InsertSpec { target: arg.target, slot: arg.slot, kind: arg.kind, params: arg.params }).collect()
+    })
 }
 
 /// `--golden`: the literal golden-generation functions, not `render_song`.
@@ -220,12 +255,15 @@ fn run_golden(output: &Path, format: GoldenFormat, bytes: &[u8]) -> Result<(), S
 /// Standard MIDI File has no loop point of its own, so there is no `RenderLength` to
 /// build here — the render is exactly `--instruments`' rack playing the file once, from
 /// tick zero to its own `end_of_track`.
-fn run_smf(args: &RenderArgs, smf_bytes: &[u8]) -> Result<(), String> {
+fn run_smf(args: &RenderArgs, file: &Path, output: &Path, smf_bytes: &[u8]) -> Result<(), String> {
     if args.golden {
-        return Err(format!("{}: --golden only renders a tracker module; render a .mid with --instruments <module> instead", args.file.display()));
+        return Err(format!("{}: --golden only renders a tracker module; render a .mid with --instruments <module> instead", file.display()));
+    }
+    if !args.insert.is_empty() {
+        return Err(String::from("--insert only applies to a tracker module render, not a Standard MIDI File"));
     }
     let Some(instruments_path) = args.instruments.as_ref() else {
-        return Err(format!("{}: a Standard MIDI File needs --instruments <module> naming the module whose instruments play it", args.file.display()));
+        return Err(format!("{}: a Standard MIDI File needs --instruments <module> naming the module whose instruments play it", file.display()));
     };
     let instruments_bytes = archive::load_module_bytes(instruments_path, None)?;
 
@@ -241,7 +279,7 @@ fn run_smf(args: &RenderArgs, smf_bytes: &[u8]) -> Result<(), String> {
         instruments_bytes: &instruments_bytes,
         rate: args.rate,
         host_block_frames,
-        output: &args.output,
+        output,
     })?;
 
     println!(
@@ -249,7 +287,7 @@ fn run_smf(args: &RenderArgs, smf_bytes: &[u8]) -> Result<(), String> {
         describe(args.mix_path, args.interp, args.depth, channels),
         frames_written as f64 / args.rate.max(1) as f64,
         args.rate,
-        args.output.display()
+        output.display()
     );
     println!("sha256: {hash}");
     Ok(())
@@ -269,7 +307,7 @@ fn seconds_to_frames(seconds: f64, rate: u32) -> u64 { (seconds.max(0.0) * rate 
 
 fn describe(mix_path: MixPathArg, interp: InterpArg, depth: DepthArg, channels: u16) -> String {
     let mix_path = match mix_path { MixPathArg::Float => "float", MixPathArg::Fixed => "fixed" };
-    let interp = match interp { InterpArg::Nearest => "nearest", InterpArg::Linear => "linear" };
+    let interp = match interp { InterpArg::Nearest => "nearest", InterpArg::Linear => "linear", InterpArg::Cubic => "cubic", InterpArg::Sinc => "sinc" };
     let depth = match depth { DepthArg::I16 => "16-bit", DepthArg::I24 => "24-bit", DepthArg::I32 => "32-bit", DepthArg::F32 => "f32" };
     let channels = if channels == 1 { "mono" } else { "stereo" };
     format!("{mix_path} · {interp} · {depth} · {channels}")
@@ -310,16 +348,18 @@ struct RenderTarget<'a> {
     host_block_frames: usize,
     length: RenderLength,
     output: &'a Path,
+    inserts: &'a [InsertSpec],
 }
 
 /// Render then write the WAV file, dispatching the compile-time mixer path,
 /// interpolator, sample type and channel count that the runtime arguments named. Returns
 /// the number of frames written and the hex SHA-256 of its PCM payload.
 fn render_dispatch(target: RenderTarget<'_>) -> Result<(usize, String), String> {
-    let RenderTarget { mix_path, interp, depth, channels, format, bytes, rate, host_block_frames, length, output } = target;
+    let RenderTarget { mix_path, interp, depth, channels, format, bytes, rate, host_block_frames, length, output, inserts } = target;
     macro_rules! render_and_write {
         ($path:ty, $out:ty, $interp:ty, $channels:expr) => {{
-            let samples = starplayer_offline::render_song::<$path, $interp, $out>(format, bytes, rate, host_block_frames, length).map_err(|error| error.to_string())?;
+            let samples = starplayer_offline::render_song_with_inserts::<$path, $interp, $out>(format, bytes, rate, host_block_frames, length, inserts)
+                .map_err(|error| error.to_string())?;
             write_wav(output, rate, channels, &samples).map_err(|error| error.to_string())?;
             (samples.len() / ($channels as usize), pcm_sha256(&samples))
         }};
@@ -344,6 +384,24 @@ fn render_dispatch(target: RenderTarget<'_>) -> Result<(usize, String), String> 
         (MixPathArg::Float, InterpArg::Linear, DepthArg::F32, 1) => render_and_write!(FloatPath, FloatOut<f32, 1>, Linear, 1),
         (MixPathArg::Float, InterpArg::Linear, DepthArg::F32, 2) => render_and_write!(FloatPath, FloatOut<f32, 2>, Linear, 2),
 
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I16, 1) => render_and_write!(FloatPath, FloatOut<i16, 1>, Cubic, 1),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I16, 2) => render_and_write!(FloatPath, FloatOut<i16, 2>, Cubic, 2),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I24, 1) => render_and_write!(FloatPath, FloatOut<I24, 1>, Cubic, 1),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I24, 2) => render_and_write!(FloatPath, FloatOut<I24, 2>, Cubic, 2),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I32, 1) => render_and_write!(FloatPath, FloatOut<i32, 1>, Cubic, 1),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I32, 2) => render_and_write!(FloatPath, FloatOut<i32, 2>, Cubic, 2),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::F32, 1) => render_and_write!(FloatPath, FloatOut<f32, 1>, Cubic, 1),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::F32, 2) => render_and_write!(FloatPath, FloatOut<f32, 2>, Cubic, 2),
+
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I16, 1) => render_and_write!(FloatPath, FloatOut<i16, 1>, Sinc, 1),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I16, 2) => render_and_write!(FloatPath, FloatOut<i16, 2>, Sinc, 2),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I24, 1) => render_and_write!(FloatPath, FloatOut<I24, 1>, Sinc, 1),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I24, 2) => render_and_write!(FloatPath, FloatOut<I24, 2>, Sinc, 2),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I32, 1) => render_and_write!(FloatPath, FloatOut<i32, 1>, Sinc, 1),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I32, 2) => render_and_write!(FloatPath, FloatOut<i32, 2>, Sinc, 2),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::F32, 1) => render_and_write!(FloatPath, FloatOut<f32, 1>, Sinc, 1),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::F32, 2) => render_and_write!(FloatPath, FloatOut<f32, 2>, Sinc, 2),
+
         (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I16, 1) => render_and_write!(FixedPath, FixedOut<i16, 1>, Nearest, 1),
         (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I16, 2) => render_and_write!(FixedPath, FixedOut<i16, 2>, Nearest, 2),
         (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I24, 1) => render_and_write!(FixedPath, FixedOut<I24, 1>, Nearest, 1),
@@ -361,6 +419,24 @@ fn render_dispatch(target: RenderTarget<'_>) -> Result<(usize, String), String> 
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I32, 2) => render_and_write!(FixedPath, FixedOut<i32, 2>, Linear, 2),
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::F32, 1) => render_and_write!(FixedPath, FixedOut<f32, 1>, Linear, 1),
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::F32, 2) => render_and_write!(FixedPath, FixedOut<f32, 2>, Linear, 2),
+
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I16, 1) => render_and_write!(FixedPath, FixedOut<i16, 1>, Cubic, 1),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I16, 2) => render_and_write!(FixedPath, FixedOut<i16, 2>, Cubic, 2),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I24, 1) => render_and_write!(FixedPath, FixedOut<I24, 1>, Cubic, 1),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I24, 2) => render_and_write!(FixedPath, FixedOut<I24, 2>, Cubic, 2),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I32, 1) => render_and_write!(FixedPath, FixedOut<i32, 1>, Cubic, 1),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I32, 2) => render_and_write!(FixedPath, FixedOut<i32, 2>, Cubic, 2),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::F32, 1) => render_and_write!(FixedPath, FixedOut<f32, 1>, Cubic, 1),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::F32, 2) => render_and_write!(FixedPath, FixedOut<f32, 2>, Cubic, 2),
+
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I16, 1) => render_and_write!(FixedPath, FixedOut<i16, 1>, Sinc, 1),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I16, 2) => render_and_write!(FixedPath, FixedOut<i16, 2>, Sinc, 2),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I24, 1) => render_and_write!(FixedPath, FixedOut<I24, 1>, Sinc, 1),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I24, 2) => render_and_write!(FixedPath, FixedOut<I24, 2>, Sinc, 2),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I32, 1) => render_and_write!(FixedPath, FixedOut<i32, 1>, Sinc, 1),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I32, 2) => render_and_write!(FixedPath, FixedOut<i32, 2>, Sinc, 2),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::F32, 1) => render_and_write!(FixedPath, FixedOut<f32, 1>, Sinc, 1),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::F32, 2) => render_and_write!(FixedPath, FixedOut<f32, 2>, Sinc, 2),
 
         (_, _, _, channels) => return Err(format!("internal error: unhandled channel count {channels}")),
     };
@@ -413,6 +489,24 @@ fn render_dispatch_smf(target: RenderSmfTarget<'_>) -> Result<(usize, String), S
         (MixPathArg::Float, InterpArg::Linear, DepthArg::F32, 1) => render_and_write_smf!(FloatPath, FloatOut<f32, 1>, Linear, 1),
         (MixPathArg::Float, InterpArg::Linear, DepthArg::F32, 2) => render_and_write_smf!(FloatPath, FloatOut<f32, 2>, Linear, 2),
 
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I16, 1) => render_and_write_smf!(FloatPath, FloatOut<i16, 1>, Cubic, 1),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I16, 2) => render_and_write_smf!(FloatPath, FloatOut<i16, 2>, Cubic, 2),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I24, 1) => render_and_write_smf!(FloatPath, FloatOut<I24, 1>, Cubic, 1),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I24, 2) => render_and_write_smf!(FloatPath, FloatOut<I24, 2>, Cubic, 2),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I32, 1) => render_and_write_smf!(FloatPath, FloatOut<i32, 1>, Cubic, 1),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::I32, 2) => render_and_write_smf!(FloatPath, FloatOut<i32, 2>, Cubic, 2),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::F32, 1) => render_and_write_smf!(FloatPath, FloatOut<f32, 1>, Cubic, 1),
+        (MixPathArg::Float, InterpArg::Cubic, DepthArg::F32, 2) => render_and_write_smf!(FloatPath, FloatOut<f32, 2>, Cubic, 2),
+
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I16, 1) => render_and_write_smf!(FloatPath, FloatOut<i16, 1>, Sinc, 1),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I16, 2) => render_and_write_smf!(FloatPath, FloatOut<i16, 2>, Sinc, 2),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I24, 1) => render_and_write_smf!(FloatPath, FloatOut<I24, 1>, Sinc, 1),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I24, 2) => render_and_write_smf!(FloatPath, FloatOut<I24, 2>, Sinc, 2),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I32, 1) => render_and_write_smf!(FloatPath, FloatOut<i32, 1>, Sinc, 1),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::I32, 2) => render_and_write_smf!(FloatPath, FloatOut<i32, 2>, Sinc, 2),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::F32, 1) => render_and_write_smf!(FloatPath, FloatOut<f32, 1>, Sinc, 1),
+        (MixPathArg::Float, InterpArg::Sinc, DepthArg::F32, 2) => render_and_write_smf!(FloatPath, FloatOut<f32, 2>, Sinc, 2),
+
         (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I16, 1) => render_and_write_smf!(FixedPath, FixedOut<i16, 1>, Nearest, 1),
         (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I16, 2) => render_and_write_smf!(FixedPath, FixedOut<i16, 2>, Nearest, 2),
         (MixPathArg::Fixed, InterpArg::Nearest, DepthArg::I24, 1) => render_and_write_smf!(FixedPath, FixedOut<I24, 1>, Nearest, 1),
@@ -430,6 +524,24 @@ fn render_dispatch_smf(target: RenderSmfTarget<'_>) -> Result<(usize, String), S
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::I32, 2) => render_and_write_smf!(FixedPath, FixedOut<i32, 2>, Linear, 2),
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::F32, 1) => render_and_write_smf!(FixedPath, FixedOut<f32, 1>, Linear, 1),
         (MixPathArg::Fixed, InterpArg::Linear, DepthArg::F32, 2) => render_and_write_smf!(FixedPath, FixedOut<f32, 2>, Linear, 2),
+
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I16, 1) => render_and_write_smf!(FixedPath, FixedOut<i16, 1>, Cubic, 1),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I16, 2) => render_and_write_smf!(FixedPath, FixedOut<i16, 2>, Cubic, 2),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I24, 1) => render_and_write_smf!(FixedPath, FixedOut<I24, 1>, Cubic, 1),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I24, 2) => render_and_write_smf!(FixedPath, FixedOut<I24, 2>, Cubic, 2),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I32, 1) => render_and_write_smf!(FixedPath, FixedOut<i32, 1>, Cubic, 1),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::I32, 2) => render_and_write_smf!(FixedPath, FixedOut<i32, 2>, Cubic, 2),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::F32, 1) => render_and_write_smf!(FixedPath, FixedOut<f32, 1>, Cubic, 1),
+        (MixPathArg::Fixed, InterpArg::Cubic, DepthArg::F32, 2) => render_and_write_smf!(FixedPath, FixedOut<f32, 2>, Cubic, 2),
+
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I16, 1) => render_and_write_smf!(FixedPath, FixedOut<i16, 1>, Sinc, 1),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I16, 2) => render_and_write_smf!(FixedPath, FixedOut<i16, 2>, Sinc, 2),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I24, 1) => render_and_write_smf!(FixedPath, FixedOut<I24, 1>, Sinc, 1),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I24, 2) => render_and_write_smf!(FixedPath, FixedOut<I24, 2>, Sinc, 2),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I32, 1) => render_and_write_smf!(FixedPath, FixedOut<i32, 1>, Sinc, 1),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::I32, 2) => render_and_write_smf!(FixedPath, FixedOut<i32, 2>, Sinc, 2),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::F32, 1) => render_and_write_smf!(FixedPath, FixedOut<f32, 1>, Sinc, 1),
+        (MixPathArg::Fixed, InterpArg::Sinc, DepthArg::F32, 2) => render_and_write_smf!(FixedPath, FixedOut<f32, 2>, Sinc, 2),
 
         (_, _, _, channels) => return Err(format!("internal error: unhandled channel count {channels}")),
     };

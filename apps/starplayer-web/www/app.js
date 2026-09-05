@@ -49,6 +49,8 @@ const elements = {
     outputChannels: byId('output-channels'), applyChannels: byId('apply-channels'), mixerPath: byId('mixer-path'),
     mixerInterpolator: byId('mixer-interpolator'), mixerDepth: byId('mixer-depth'), mixerDither: byId('mixer-dither'),
     applyMixer: byId('apply-mixer'), modHeadphonePanning: byId('mod-headphone-panning'),
+    // Insert effects (M7-H7).
+    effectsTarget: byId('effects-target'), effectsSlots: byId('effects-slots'),
     // Live input (task E6).
     liveInputStatus: byId('live-input-status'), keyboardEnable: byId('keyboard-enable'), eventLead: byId('event-lead'),
     midiInput: byId('midi-input'), enableMidi: byId('enable-midi'), midiNote: byId('midi-note'),
@@ -121,6 +123,22 @@ const state = {
     keyboardInstrument: 0,
     keysDown: new Map(),
     eventsSent: 0,
+    // ── insert effects (M7-H7) ──────────────────────────────────────────────────────
+    /// Every effect this build can install, parsed from the wasm host's own
+    /// `effects_json()`: `[{name, wire, params: [{name, unit, min, max, default}]}]`, in
+    /// `InsertKind::ALL` order. Never transcribed by hand, so the panel cannot drift from
+    /// what `install_insert` and `OPCODE_INSERT_PARAM` actually accept.
+    effects: [],
+    /// The page's own belief of what is installed, per `"target:slot"` key — nothing reads
+    /// the engine's chain back over the wire, so this is the only source of truth for the
+    /// panel's own controls (the same one-way arrangement `InsertLayout` keeps natively).
+    insertLayout: new Map(),
+    /// Channels the target `<select>` was last built for, so it is only rebuilt when the
+    /// module's own channel count changes.
+    effectsChannelCount: -1,
+    /// Whether the four slot rows have been built yet (`state.effects` arrives with the
+    /// worklet's `ready` message, which can race the panel's own first render).
+    effectsSlotsBuilt: false,
 };
 
 const loaderReady = initLoader().then(loadEffectNames);
@@ -652,6 +670,17 @@ function onWorkletMessage(message, node) {
             elements.quantum.textContent = `${message.renderQuantum} frames`;
             updateOutputPanel();
         }
+        // The effect list is the same for every node this build creates — a build-time
+        // fact, not a per-instance one — so it is parsed once and never re-parsed on a
+        // later rebuild's own 'ready'.
+        if (state.effects.length === 0 && message.effects) {
+            try {
+                state.effects = JSON.parse(message.effects);
+            } catch (error) {
+                showError(`Could not parse the effect list: ${error && error.message ? error.message : error}`);
+            }
+            ensureEffectsSlots();
+        }
     } else if (message.type === 'quantum') {
         if (node !== state.node) return;
         elements.quantum.textContent = `${message.frames} frames${message.matchesEngine ? '' : ' (unexpected)'}`;
@@ -702,6 +731,19 @@ function onWorkletMessage(message, node) {
         elements.keyboardEnable.checked = false;
         showError(`Could not switch live input: ${message.reason}`);
         updateLiveInputPanel();
+    } else if (message.type === 'insertsApplied') {
+        if (node !== state.node) return;
+        state.activationMemoryBytes = message.memoryBytes;
+        renderEffectSlotRows();
+    } else if (message.type === 'insertsError') {
+        if (node !== state.node) return;
+        // The install or remove did not happen, so the page's own belief has to be put
+        // back the way it was before the optimistic UI update — never left claiming an
+        // effect is installed that the engine refused.
+        const key = `${message.target}:${message.slot}`;
+        if (message.action === 'install') state.insertLayout.delete(key);
+        showError(`Could not ${message.action} the insert effect: ${message.reason}`);
+        renderEffectSlotRows();
     }
 }
 
@@ -1187,6 +1229,189 @@ function applyMixerMode() {
     if (state.commandRing !== null) state.node.port.postMessage({ type: 'flushCommands' });
 }
 
+// ── insert effects (M7-H7) ───────────────────────────────────────────────────────────
+//
+// Four ordered slots per bus (`starplayer_engine::insert::MAX_INSERTS_PER_CHAIN`).
+// Installing or removing an effect allocates its delay lines, so it crosses as a worklet
+// message exactly as `midiInput` does; a parameter change or a bypass flip is
+// `OPCODE_INSERT_PARAM` / `OPCODE_INSERT_BYPASS` on the ordinary command ring, applied in
+// `process()` like every other opcode. Nothing about a specific effect's name, unit,
+// range or default is known here — all of it comes from `state.effects`, itself the wasm
+// host's own `effects_json()`, so this panel cannot drift from what the wire actually
+// accepts.
+//
+// Nothing reads the engine's insert chain back over the wire, so `state.insertLayout` —
+// keyed by `"target:slot"` — is the page's *own* belief of what is installed, the same
+// one-way arrangement `starplayer_host::InsertLayout` keeps natively. A rejected install
+// or remove (`insertsError`) puts that belief back the way it was.
+
+const INSERT_SLOT_COUNT = 4;
+
+function insertLayoutKey(target, slot) {
+    return `${target}:${slot}`;
+}
+
+/** Build the four slot rows once `state.effects` has arrived. Each row: an effect select
+ *  (`None` plus every entry `effects_json()` reported), a Bypass checkbox, and a container
+ *  the selected effect's own parameter sliders are generated into. */
+function ensureEffectsSlots() {
+    if (state.effectsSlotsBuilt || state.effects.length === 0) return;
+    state.effectsSlotsBuilt = true;
+    elements.effectsSlots.replaceChildren();
+    for (let slot = 0; slot < INSERT_SLOT_COUNT; slot += 1) {
+        const row = document.createElement('div');
+        row.className = 'effects-slot';
+
+        const heading = document.createElement('div');
+        heading.className = 'effects-slot-heading';
+        const label = document.createElement('span');
+        label.textContent = `Slot ${slot + 1}`;
+        const select = document.createElement('select');
+        select.append(new Option('None', ''));
+        for (const effect of state.effects) select.append(new Option(effect.name, String(effect.wire)));
+        const bypassLabel = document.createElement('label');
+        bypassLabel.className = 'effects-bypass';
+        const bypassInput = document.createElement('input');
+        bypassInput.type = 'checkbox';
+        bypassInput.disabled = true;
+        bypassLabel.append(bypassInput, document.createTextNode(' Bypass'));
+        heading.append(label, select, bypassLabel);
+
+        const params = document.createElement('div');
+        params.className = 'effects-params';
+        row.append(heading, params);
+        elements.effectsSlots.append(row);
+
+        select.addEventListener('change', () => onEffectSelectChanged(slot, select));
+        bypassInput.addEventListener('change', () => onBypassChanged(slot, bypassInput));
+    }
+    renderEffectSlotRows();
+}
+
+/** Rebuild the target `<select>`'s channel options when the loaded module's own channel
+ *  count changes — cheap, and called every telemetry update, unlike `renderEffectSlotRows`
+ *  which rebuilds slider DOM and must not run at that rate (it would fight a drag in
+ *  progress). */
+function refreshEffectsTargetOptions() {
+    if (!state.effectsSlotsBuilt) return;
+    const channelCount = state.latest?.channelCount ?? 0;
+    if (channelCount === state.effectsChannelCount) return;
+    state.effectsChannelCount = channelCount;
+    const chosen = elements.effectsTarget.value;
+    elements.effectsTarget.replaceChildren(new Option('Master', String(Ring.INSERT_TARGET_MASTER)));
+    for (let channel = 0; channel < channelCount; channel += 1) {
+        elements.effectsTarget.append(new Option(`Channel ${channel + 1}`, String(channel)));
+    }
+    if ([...elements.effectsTarget.options].some((option) => option.value === chosen)) elements.effectsTarget.value = chosen;
+    renderEffectSlotRows();
+}
+
+/** Reflect `state.insertLayout` into the four slot rows for whichever target is currently
+ *  selected. Rebuilds every parameter slider, so this is called only on a real change —
+ *  the panel first appearing, a target switch, an install/remove round trip settling — and
+ *  never once per telemetry tick. */
+function renderEffectSlotRows() {
+    if (!state.effectsSlotsBuilt) return;
+    const target = Number(elements.effectsTarget.value);
+    const rows = elements.effectsSlots.children;
+    for (let slot = 0; slot < rows.length; slot += 1) {
+        const row = rows[slot];
+        const select = row.querySelector('select');
+        const bypassInput = row.querySelector('input[type="checkbox"]');
+        const params = row.querySelector('.effects-params');
+        const installed = state.insertLayout.get(insertLayoutKey(target, slot));
+        select.value = installed ? String(installed.wire) : '';
+        bypassInput.checked = installed ? installed.bypassed : false;
+        bypassInput.disabled = !installed;
+        renderEffectParams(params, target, slot, installed);
+    }
+}
+
+function renderEffectParams(container, target, slot, installed) {
+    container.replaceChildren();
+    if (!installed) return;
+    const effect = state.effects.find((candidate) => candidate.wire === installed.wire);
+    if (!effect) return;
+    effect.params.forEach((spec, paramId) => {
+        const value = installed.params[paramId] ?? spec.default;
+        const row = document.createElement('label');
+        row.className = 'effects-param';
+        const name = document.createElement('span');
+        name.textContent = spec.name.replace(/_/g, ' ');
+        const input = document.createElement('input');
+        input.type = 'range';
+        input.min = String(spec.min);
+        input.max = String(spec.max);
+        input.step = '1';
+        input.value = String(value);
+        const readout = document.createElement('span');
+        readout.className = 'effects-param-value';
+        readout.textContent = formatParamValue(spec, value);
+        input.addEventListener('input', () => {
+            const newValue = Number(input.value);
+            installed.params[paramId] = newValue;
+            readout.textContent = formatParamValue(spec, newValue);
+            queueCommand(Ring.OPCODE_INSERT_PARAM, Ring.packInsertParamArgument(target, slot, paramId), newValue);
+        });
+        row.append(name, input, readout);
+        container.append(row);
+    });
+}
+
+/** A short display suffix for a parameter's own `ParamUnit` — the Rust enum's variant
+ *  name, read from `effects_json()` — used only to format the readout, never to decide
+ *  what crosses the wire (that is always the raw integer the slider holds). */
+function formatParamValue(spec, value) {
+    switch (spec.unit) {
+        case 'CentiDecibels': return `${(value / 100).toFixed(2)} dB`;
+        case 'CentiMilliseconds': return `${(value / 100).toFixed(2)} ms`;
+        case 'CentiHertz': return `${(value / 100).toFixed(2)} Hz`;
+        case 'Ratio': return `${(value / 100).toFixed(2)}:1`;
+        case 'Milliseconds': return `${value} ms`;
+        case 'Hertz': return `${value} Hz`;
+        case 'Cents': return `${value} ct`;
+        case 'Frames': return `${value} fr`;
+        case 'Switch': return value !== 0 ? 'on' : 'off';
+        default: return String(value);
+    }
+}
+
+function onEffectSelectChanged(slot, select) {
+    const target = Number(elements.effectsTarget.value);
+    const key = insertLayoutKey(target, slot);
+    if (select.value === '') {
+        if (state.insertLayout.has(key)) {
+            state.insertLayout.delete(key);
+            sendInsertMessage('remove', target, slot, 0);
+        }
+        renderEffectSlotRows();
+        return;
+    }
+    const wire = Number(select.value);
+    const effect = state.effects.find((candidate) => candidate.wire === wire);
+    if (!effect) return;
+    const defaults = {};
+    effect.params.forEach((spec, index) => { defaults[index] = spec.default; });
+    state.insertLayout.set(key, { wire, params: defaults, bypassed: false });
+    sendInsertMessage('install', target, slot, wire);
+    renderEffectSlotRows();
+}
+
+function onBypassChanged(slot, bypassInput) {
+    const target = Number(elements.effectsTarget.value);
+    const installed = state.insertLayout.get(insertLayoutKey(target, slot));
+    if (!installed) return;
+    installed.bypassed = bypassInput.checked;
+    queueCommand(Ring.OPCODE_INSERT_BYPASS, Ring.packInsertSlotArgument(target, slot), bypassInput.checked ? 1 : 0);
+}
+
+/** The allocating half: install or remove, from a worklet message task. */
+function sendInsertMessage(action, target, slot, kind) {
+    if (state.node === null) return;
+    const requestId = state.nextRequestId++;
+    state.node.port.postMessage({ type: 'inserts', action, target, slot, kind, requestId });
+}
+
 async function refreshOutputDevices() {
     const sinkSupported = typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype;
     const selectorSupported = navigator.mediaDevices && typeof navigator.mediaDevices.selectAudioOutput === 'function';
@@ -1397,6 +1622,7 @@ function drawScopes() {
 
 function updateChannels(snapshot) {
     ensureChannelRows(snapshot.channelCount);
+    refreshEffectsTargetOptions();
     for (let index = 0; index < state.channelRows.length; index += 1) {
         const view = state.channelRows[index];
         const channel = snapshot.channels[index];
@@ -1702,6 +1928,7 @@ elements.applyOutputDevice.addEventListener('click', () => applyOutputDevice().c
 elements.chooseOutputDevice.addEventListener('click', () => chooseOutputDevice().catch(showError));
 elements.applyMixer.addEventListener('click', applyMixerMode);
 elements.modHeadphonePanning.addEventListener('change', () => applyModPanningPreference().catch(showError));
+elements.effectsTarget.addEventListener('change', renderEffectSlotRows);
 // A choice is remembered as it is made, not only when it is applied: the owner's test
 // setup should survive a reload even if the page is reloaded mid-comparison.
 for (const select of [elements.sampleRate, elements.outputChannels, elements.mixerPath, elements.mixerInterpolator, elements.mixerDepth, elements.mixerDither]) {
