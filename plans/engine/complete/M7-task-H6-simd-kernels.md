@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M7 ([master plan](M7-master-plan.md), "The task graph" section) |
-| Status | Ready once H3, H4 and H5 have landed |
+| Status | Landed 2026-09-06 |
 | Depends on | H3, H4 (the effects to vectorise), H5 (the kernels to vectorise), H1 (the bus summation) |
 | Blocks | M7 exit ("SIMD and scalar paths agree") |
 | Parallel with | H7 |

@@ -95,7 +95,7 @@ without a branch; the linear kernel never reads it, so the linear goldens do not
 | H3 (landed 2026-09-05) | [EQ, delay, chorus](complete/M7-task-H3-eq-delay-chorus.md) | H1, H2 | H4 | Opus |
 | H4 (landed 2026-09-05) | [Reverb, compressor](complete/M7-task-H4-reverb-and-compressor.md) | H1, H2 | H3 | Opus |
 | H5 (landed 2026-09-05) | [Cubic and windowed-sinc interpolation, sample pre-roll](complete/M7-task-H5-cubic-and-sinc-interpolation.md) | — | H1, H2 | Opus |
-| H6 | [SIMD kernels with the scalar-equivalence gate](M7-task-H6-simd-kernels.md) | H3, H4, H5 | — | Opus |
+| H6 (landed 2026-09-06) | [SIMD kernels with the scalar-equivalence gate](complete/M7-task-H6-simd-kernels.md) | H3, H4, H5 | — | Opus |
 | H7 (landed 2026-09-06) | [Host wiring: `Player`, CLI, wasm host, web page](complete/M7-task-H7-host-wiring.md) | H3, H4 | H6 | Sonnet |
 
 ```
@@ -131,3 +131,20 @@ against the arms in `crates/starplayer-host/src/engine.rs` and the wasm host (H5
   a 23.6 MB pattern blob (4100 patterns, zero samples) that trips the harness memory cap. The
   IT loader lacks the aggregate decoded-pattern budget the S3M loader has. Deserves its own
   task under M6 acceptance; not part of M7.
+- **Vectorised steady `mix_run`** (H6 deliverable 6): prototyped at 1.65× and bit-identical
+  for `FloatPath + Linear`, not landed because it needs 4-at-a-time methods on both
+  `Interpolate` and `MixPath`. Its own task if a voice-bound render ever needs the ~6 %.
+- **Bus/master SIMD kernels are a 1–3 % loss** against LLVM's scalar loops on x86-64 and
+  are kept only because the task asked for them; deleting the two `wide_*` bodies is the
+  honest fix if that ever matters.
+- **Compressor gain-reduction meter** is computed (`ParamId::METER_BASE`) but reaches no
+  host; needs a telemetry field and a wire word.
+
+## Status (2026-09-06)
+
+**Landed.** H1–H7 all merged `--no-ff` and archived. Exit criteria: reverb on channel 1
+alone is an offline test (`reverb_exit_criterion.rs`) and reachable from the CLI
+(`render --insert 1:reverb:room=60,mix=50`) and the web page's Effects panel; the block-size
+determinism test runs with every effect active on both paths; SIMD and scalar paths are
+bit-identical and the eleven goldens hold with the feature off and on. Owner listening check
+outstanding.
