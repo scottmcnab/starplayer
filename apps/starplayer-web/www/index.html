@@ -219,6 +219,18 @@
                 <button id="apply-mixer" class="primary" type="button">Apply mixer</button>
             </div>
         </article>
+        <!-- M7-H7. Four ordered insert slots per channel bus and four more on the master,
+             ahead of the master volume and the limiter (starplayer_engine::insert). The
+             effect list and every parameter's unit/range/default come from the wasm
+             host's own effects_json() export, never transcribed here, so this panel can
+             never drift from what install_insert and OPCODE_INSERT_PARAM actually accept. -->
+        <article class="panel diagnostics effects-panel" aria-labelledby="effects-heading">
+            <div class="panel-heading"><h2 id="effects-heading">Effects</h2><span>four slots, in processing order</span></div>
+            <label>Target
+                <select id="effects-target"><option value="255">Master</option></select>
+            </label>
+            <div id="effects-slots" class="effects-slots"></div>
+        </article>
         <!-- Task E6. Live input plays the module's *instruments*: the keyboard and a MIDI
              port sound its samples while its pattern data stays silent. Hearing both at
              once is task E7's jam mode. -->

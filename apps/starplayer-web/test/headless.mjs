@@ -611,6 +611,61 @@ async function run(executable, mode) {
         report.memory = baselineMemory;
         report.title = playing.title;
 
+        // ── insert effects (M7-H7): a reverb on channel 1, installed through the page ──
+        //
+        // The target and effect selects are driven exactly as a person would use them —
+        // by name, not by the wire number `InsertKind::ALL` happens to give reverb — so a
+        // reordering of the effect list would fail this test rather than silently install
+        // the wrong effect.
+        await page.evaluate(`
+            const targetSelect = document.getElementById('effects-target');
+            targetSelect.value = '0';
+            targetSelect.dispatchEvent(new Event('change'));
+            return true;
+        `);
+        const slotCount = await page.evaluate("return document.querySelectorAll('#effects-slots .effects-slot').length;");
+        assert.equal(slotCount, 4, 'the four insert slot rows are built');
+        const reverbSelected = await page.evaluate(`
+            const slot = document.querySelectorAll('#effects-slots .effects-slot')[0];
+            const select = slot.querySelector('select');
+            const option = [...select.options].find((candidate) => candidate.textContent === 'reverb');
+            if (!option) return false;
+            select.value = option.value;
+            select.dispatchEvent(new Event('change'));
+            return select.value === option.value;
+        `);
+        assert.equal(reverbSelected, true, 'reverb is one of the effect select\'s options and was chosen');
+        await page.waitFor(
+            'the reverb’s parameters to appear (the panel installs optimistically, before the worklet confirms)',
+            "document.querySelectorAll('#effects-slots .effects-slot')[0].querySelectorAll('.effects-param').length > 0",
+        );
+        assert.equal(await page.evaluate(READ_STATE).then((state) => state.errorShown), false, 'installing the reverb raised no page error');
+
+        let insertPeakSeen = 0;
+        for (let sample = 0; sample < 2 * samplesPerSecond; sample += 1) {
+            await delay(1000 / samplesPerSecond);
+            const state = await page.evaluate(READ_STATE);
+            insertPeakSeen = Math.max(insertPeakSeen, state.masterPeak);
+            assert.equal(state.errorShown, false, `an error appeared after installing the reverb: ${state.errorText}`);
+        }
+        assert.ok(insertPeakSeen > 0, 'the audio peak did not drop to zero after installing a reverb on channel 1');
+        report.insertEffectPeak = insertPeakSeen;
+
+        // Removing it the same way proves the None option round-trips too, and leaves the
+        // graph in the state the rest of this run expects.
+        const reverbRemoved = await page.evaluate(`
+            const slot = document.querySelectorAll('#effects-slots .effects-slot')[0];
+            const select = slot.querySelector('select');
+            select.value = '';
+            select.dispatchEvent(new Event('change'));
+            return select.value === '';
+        `);
+        assert.equal(reverbRemoved, true, 'choosing None removes the installed effect');
+        await page.waitFor(
+            'the reverb’s parameters to disappear',
+            "document.querySelectorAll('#effects-slots .effects-slot')[0].querySelectorAll('.effects-param').length === 0",
+        );
+
         // ── transport ───────────────────────────────────────────────────────────────
         await page.evaluate("document.getElementById('stop').click(); return true;");
         await page.waitFor('the transport to stop', "document.getElementById('transport-chip').textContent === 'stopped'");

@@ -31,6 +31,19 @@
     // engine's live-input queue. Installing that queue is a `midiInput` port message
     // instead, because building the instrument rack allocates.
     const OPCODE_MIDI_EVENT = 10;
+    // Change one parameter of an already-installed insert effect (M7-H7). `argument`
+    // packs the target (bits 0-7), the slot (bits 8-11) and the ParamId (bits 12-19);
+    // `extra` is the new value in the parameter's own fixed unit — some are negative
+    // (a compressor threshold in centi-dB), which crosses exactly as a positive one does,
+    // since the ring and `enqueue_command` both carry raw 32-bit patterns. Rides this
+    // ring for the same reason OPCODE_MIDI_EVENT does: bounded, decoded between render
+    // quanta, one allocation-free `Player::set_insert_param` call.
+    const OPCODE_INSERT_PARAM = 11;
+    // Skip, or stop skipping, an already-installed insert effect. `argument` packs the
+    // same target and slot as OPCODE_INSERT_PARAM; `extra` is 0 or 1.
+    const OPCODE_INSERT_BYPASS = 12;
+    // The reserved target byte naming the master bus, rather than a channel index.
+    const INSERT_TARGET_MASTER = 0xFF;
 
     // Arguments for OPCODE_AT_END; `extra` carries the fade length in frames.
     const AT_END_FADE_OUT = 0;
@@ -42,6 +55,17 @@
      *  field. */
     function packMidiMessage(status, data1, data2) {
         return ((status & 0xFF) | ((data1 & 0x7F) << 8) | ((data2 & 0x7F) << 16)) >>> 0;
+    }
+
+    /** Pack an insert target and slot into the low 12 bits OPCODE_INSERT_BYPASS reads. */
+    function packInsertSlotArgument(target, slot) {
+        return ((target & 0xFF) | ((slot & 0xF) << 8)) >>> 0;
+    }
+
+    /** Pack an insert target, slot and ParamId into the `argument` OPCODE_INSERT_PARAM
+     *  reads. */
+    function packInsertParamArgument(target, slot, paramId) {
+        return ((target & 0xFF) | ((slot & 0xF) << 8) | ((paramId & 0xFF) << 12)) >>> 0;
     }
 
     function viewCommandRing(buffer) {
@@ -325,6 +349,9 @@
         OPCODE_SEEK_FRAME,
         OPCODE_AT_END,
         OPCODE_MIDI_EVENT,
+        OPCODE_INSERT_PARAM,
+        OPCODE_INSERT_BYPASS,
+        INSERT_TARGET_MASTER,
         AT_END_FADE_OUT,
         AT_END_CONTINUE,
         AT_END_STOP,
@@ -341,6 +368,8 @@
         viewCommandRing,
         createCommandRing,
         packMidiMessage,
+        packInsertSlotArgument,
+        packInsertParamArgument,
         pushCommand,
         drainCommands,
         drainFallbackCommands,
