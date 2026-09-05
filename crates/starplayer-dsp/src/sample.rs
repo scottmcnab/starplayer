@@ -59,7 +59,10 @@
 /// Q1.15 unity: the `scale_q15` gain that is the identity on both paths.
 pub const Q15_UNITY: i32 = 1 << 15;
 
-pub trait DspSample: Copy + Default + Send + PartialEq + core::fmt::Debug {
+/// The `'static` bound is what lets an effect that *holds* a `Sample` — H3's EQ state, a
+/// delay line — be coerced to `Box<dyn Insert<Sample>>`, which is a `'static` trait object.
+/// Both implementations are plain scalars, so it costs nothing.
+pub trait DspSample: Copy + Default + Send + PartialEq + core::fmt::Debug + 'static {
     /// Silence.
     const ZERO: Self;
 

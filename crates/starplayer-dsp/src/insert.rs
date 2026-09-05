@@ -46,6 +46,16 @@ pub enum ParamUnit {
     Percent,
     /// Whole milliseconds.
     Milliseconds,
+    /// Hundredths of a millisecond. `200` is 2 ms — the resolution a chorus's depth needs
+    /// and a delay's time does not.
+    CentiMilliseconds,
+    /// Whole hertz: a filter cutoff, or an equaliser band's centre.
+    Hertz,
+    /// Hundredths of a hertz. `60` is 0.6 Hz — an LFO rate, which is a fraction of a hertz
+    /// at every setting a chorus has a use for.
+    CentiHertz,
+    /// A whole count of something an effect has several of, such as a chorus's taps.
+    Count,
     /// A ratio times 100: `400` is 4:1.
     Ratio,
     /// Off when zero, on otherwise.
@@ -107,4 +117,46 @@ pub trait Insert<Sample: DspSample>: Send {
 
     /// What this effect is.
     fn descriptor(&self) -> &'static InsertDescriptor;
+}
+
+/// Every effect's `descriptor_roundtrip` test, written once (H3 deliverable 4).
+///
+/// Asserts three things about a freshly built effect, for whichever mix path the caller
+/// instantiates it on: every parameter reads back the `default` its [`ParamSpec`] states;
+/// `set_param` at each bound is accepted and reads back exactly that bound; and a value
+/// past either bound is *clamped* rather than refused, which is what [`ParamSpec`]'s own
+/// contract promises a host.
+///
+/// A parameter is read back through [`Insert::param`] straight after [`Insert::reset`], so
+/// the smoothing ramp a `set_param` starts cannot make the answer depend on how many
+/// frames have been rendered.
+#[cfg(test)]
+pub(crate) fn assert_descriptor_roundtrip<Sample: DspSample>(insert: &mut dyn Insert<Sample>, name: &str) {
+    let descriptor = insert.descriptor();
+    assert_eq!(descriptor.name, name, "the descriptor names a different effect");
+    assert!(!descriptor.params.is_empty(), "{name}: an effect with no parameters needs no descriptor");
+
+    for (index, spec) in descriptor.params.iter().enumerate() {
+        let id = ParamId(index as u8);
+        assert_eq!(insert.param(id), Some(spec.default), "{name}.{}: a fresh effect is not at its stated default", spec.name);
+        assert!(spec.min <= spec.default && spec.default <= spec.max, "{name}.{}: the default is outside its own range", spec.name);
+    }
+
+    for (index, spec) in descriptor.params.iter().enumerate() {
+        let id = ParamId(index as u8);
+        for bound in [spec.min, spec.max] {
+            insert.set_param(id, bound);
+            assert_eq!(insert.param(id), Some(bound), "{name}.{}: the bound {bound} was not accepted", spec.name);
+        }
+        insert.set_param(id, spec.min.saturating_sub(1_000_000));
+        assert_eq!(insert.param(id), Some(spec.min), "{name}.{}: a value below the range was not clamped up", spec.name);
+        insert.set_param(id, spec.max.saturating_add(1_000_000));
+        assert_eq!(insert.param(id), Some(spec.max), "{name}.{}: a value above the range was not clamped down", spec.name);
+        insert.set_param(id, spec.default);
+    }
+
+    let past_the_end = ParamId(descriptor.params.len() as u8);
+    insert.set_param(past_the_end, 1);
+    assert_eq!(insert.param(past_the_end), None, "{name}: a parameter this effect does not have must read back as None");
+    insert.reset();
 }

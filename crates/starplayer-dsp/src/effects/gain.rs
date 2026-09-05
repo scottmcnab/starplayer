@@ -19,7 +19,7 @@
 //! bit-identical, on the fixed path *and* the float one.
 
 use crate::insert::{DSP_BLOCK_FRAMES, Insert, InsertDescriptor, ParamId, ParamSpec, ParamUnit};
-use crate::sample::{DspSample, Q15_UNITY};
+use crate::sample::DspSample;
 use crate::smooth::{SMOOTH_FRAMES, SmoothedParam};
 use crate::frame::Stereo;
 
@@ -84,7 +84,7 @@ impl<Sample: DspSample> Insert<Sample> for GainInsert {
         debug_assert_eq!(block.len(), DSP_BLOCK_FRAMES, "an insert only ever sees a whole DSP block");
         if self.gain.is_moving() {
             for frame in block.iter_mut() {
-                let gain = db_to_gain_q15(self.gain.advance());
+                let gain = fader_gain_q15(self.gain.advance());
                 frame.left = frame.left.scale_q15(gain);
                 frame.right = frame.right.scale_q15(gain);
             }
@@ -92,7 +92,7 @@ impl<Sample: DspSample> Insert<Sample> for GainInsert {
             // Hoisted, exactly as the mixer's kernel hoists a gain that is not ramping.
             // A ramp that has just landed produces the frame this branch would have, so
             // splitting a ramp across the hoist boundary changes nothing.
-            let gain = db_to_gain_q15(self.gain.current());
+            let gain = fader_gain_q15(self.gain.current());
             for frame in block.iter_mut() {
                 frame.left = frame.left.scale_q15(gain);
                 frame.right = frame.right.scale_q15(gain);
@@ -115,63 +115,38 @@ impl<Sample: DspSample> Insert<Sample> for GainInsert {
     fn descriptor(&self) -> &'static InsertDescriptor { &GAIN_DESCRIPTOR }
 }
 
-/// Decibels to a Q15 linear gain, from a table with no transcendental in sight
-/// (architecture §7.3).
+/// The fader's centi-decibel to Q1.15 gain curve: [`crate::tables::db_to_gain_q15`] with a
+/// floor at [`GAIN_MIN_CENTI_DB`] and a ceiling at [`GAIN_MAX_CENTI_DB`].
 ///
-/// Whole decibels come from [`GAIN_Q15_TABLE`]; the centi-decibel remainder interpolates
-/// linearly between two entries. Linear interpolation of an exponential understates the
-/// curve by at most 0.03 % within one decibel — a third of an LSB at unity — which is
-/// below the resolution of anything downstream.
+/// H1 carried its own 73-entry whole-decibel table here, with the comment that it was H2's
+/// `db_to_gain_q15` living in advance of H2 landing. H2 landed it, so this now calls
+/// through and the duplicate table is gone. Two things had to be checked before the switch
+/// and both hold:
 ///
-/// **This is H2's `db_to_gain_q15`.** Until H2 merges it lives here; the table is the
-/// same numbers either way.
+/// * **Unity is still bit-exact.** `fader_gain_q15(0)` is 32768 in the table version and
+///   32768 through [`crate::tables::pow2_q24`], so a gain insert at its default still
+///   leaves a bus bit-identical on both paths — the property the whole insert graph's
+///   "buses are always on" argument rests on. `+12 dB` is 130452 either way as well.
+/// * **The bottom of the fader is still silence**, not −60 dB.
+///   [`crate::tables::db_to_gain_q15`] has no notion of an −∞ fader position — its own floor
+///   is −96 dB, where it returns 33 — so the early return below is what keeps
+///   [`GAIN_MIN_CENTI_DB`] meaning "muted".
 ///
-/// The two array reads are direct rather than through `get`, because `<[T]>::get` is not
-/// a `const fn`. Both indices are inside the table for every input: the clamps above put
-/// `whole_db` in `-60 ..= 12`, and the second read is only reached when there is a
-/// remainder, which excludes the top entry.
-#[allow(clippy::indexing_slicing)]
-pub const fn db_to_gain_q15(centi_db: i32) -> i32 {
+/// What did move: at a *fractional* decibel the two disagree by up to 203 in Q1.15 (0.6 %),
+/// because the table version interpolated a chord under the exponential between whole
+/// decibels and this one evaluates the exponential itself. Nothing pins those values — no
+/// golden installs an insert — and the new numbers are the more accurate ones.
+pub fn fader_gain_q15(centi_db: i32) -> i32 {
     if centi_db <= GAIN_MIN_CENTI_DB {
         return 0;
     }
-    let centi_db = if centi_db > GAIN_MAX_CENTI_DB { GAIN_MAX_CENTI_DB } else { centi_db };
-    let whole_db = centi_db.div_euclid(100);
-    let remainder = centi_db.rem_euclid(100);
-    let index = (whole_db - GAIN_TABLE_MIN_DB) as usize;
-    // `whole_db` is inside the table by the clamps above, so both reads are in range; the
-    // upper one is only reached when there is a remainder to interpolate.
-    let low = GAIN_Q15_TABLE[index];
-    if remainder == 0 {
-        return low;
-    }
-    let high = GAIN_Q15_TABLE[index + 1];
-    low + ((high - low) as i64 * remainder as i64 / 100) as i32
+    crate::tables::db_to_gain_q15(centi_db.min(GAIN_MAX_CENTI_DB))
 }
-
-/// The decibel the first table entry describes.
-const GAIN_TABLE_MIN_DB: i32 = -60;
-
-/// `round(32768 x 10^(dB/20))` for every whole decibel from −60 to +12, so `0` dB is
-/// exactly [`Q15_UNITY`] and the conversion at unity is the identity.
-const GAIN_Q15_TABLE: [i32; 73] = [
-    33, 37, 41, 46, 52, 58, 65, 73,
-    82, 92, 104, 116, 130, 146, 164, 184,
-    207, 232, 260, 292, 328, 368, 413, 463,
-    519, 583, 654, 734, 823, 924, 1036, 1163,
-    1305, 1464, 1642, 1843, 2068, 2320, 2603, 2920,
-    3277, 3677, 4125, 4629, 5193, 5827, 6538, 7336,
-    8231, 9235, 10362, 11627, 13045, 14637, 16423, 18427,
-    20675, 23198, 26029, 29205, 32768, 36766, 41252, 46286,
-    51934, 58271, 65381, 73358, 82309, 92353, 103622, 116265,
-    130452,
-];
-
-const _: () = assert!(GAIN_Q15_TABLE[(0 - GAIN_TABLE_MIN_DB) as usize] == Q15_UNITY, "0 dB must be exactly unity");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sample::Q15_UNITY;
     use alloc::boxed::Box;
     use alloc::vec;
 
@@ -181,25 +156,25 @@ mod tests {
 
     #[test]
     fn the_bottom_of_the_fader_is_silence_not_minus_sixty_decibels() {
-        assert_eq!(db_to_gain_q15(GAIN_MIN_CENTI_DB), 0);
-        assert_eq!(db_to_gain_q15(GAIN_MIN_CENTI_DB - 1), 0);
-        assert!(db_to_gain_q15(GAIN_MIN_CENTI_DB + 1) > 0, "one centi-decibel up is audible again");
+        assert_eq!(fader_gain_q15(GAIN_MIN_CENTI_DB), 0);
+        assert_eq!(fader_gain_q15(GAIN_MIN_CENTI_DB - 1), 0);
+        assert!(fader_gain_q15(GAIN_MIN_CENTI_DB + 1) > 0, "one centi-decibel up is audible again");
     }
 
     #[test]
-    fn whole_decibels_come_straight_from_the_table() {
-        assert_eq!(db_to_gain_q15(0), Q15_UNITY);
-        assert_eq!(db_to_gain_q15(-600), 16_423);
-        assert_eq!(db_to_gain_q15(1_200), 130_452);
-        assert_eq!(db_to_gain_q15(9_000), 130_452, "past the top of the fader is the top of the fader");
+    fn whole_decibels_are_the_tables_own_numbers() {
+        assert_eq!(fader_gain_q15(0), Q15_UNITY, "unity has to be bit-exact, or an insert at its default is not transparent");
+        assert_eq!(fader_gain_q15(-600), crate::tables::db_to_gain_q15(-600));
+        assert_eq!(fader_gain_q15(1_200), 130_452);
+        assert_eq!(fader_gain_q15(9_000), 130_452, "past the top of the fader is the top of the fader");
     }
 
     #[test]
     fn a_centi_decibel_remainder_interpolates_between_two_entries() {
-        let half = db_to_gain_q15(-50);
-        assert!(half > db_to_gain_q15(-100) && half < db_to_gain_q15(0), "half a decibel down sits between its neighbours");
-        // −0.5 dB is 0.9440 linear; the interpolation is a chord under the curve.
-        assert!((half - 30_935).abs() <= 120, "half a decibel down came out at {half}");
+        let half = fader_gain_q15(-50);
+        assert!(half > fader_gain_q15(-100) && half < fader_gain_q15(0), "half a decibel down sits between its neighbours");
+        // −0.5 dB is 0.94406 linear, which is 30,935 in Q1.15.
+        assert!((half - 30_935).abs() <= 2, "half a decibel down came out at {half}");
     }
 
     #[test]
