@@ -106,6 +106,52 @@ pub trait DspSample: Copy + Default + Send + PartialEq + core::fmt::Debug + 'sta
     /// of the `i16` scale (−90 dBFS) reads as zero; no threshold this crate offers is
     /// anywhere near there.
     fn magnitude_i32(self) -> i32;
+
+    // ── the SIMD dispatch seam (M7-H6) ──────────────────────────────────────────────
+    //
+    // Three block kernels with **provided** bodies that call the scalar functions in
+    // `crate::simd`. `impl DspSample for f32` overrides them, under
+    // `#[cfg(feature = "simd")]` only, with that module's `wide_*` bodies; the fixed path
+    // never overrides them, for the reason `crate::simd`'s module documentation gives.
+    //
+    // They are on this trait rather than on one of their own because an effect is generic
+    // over exactly this bound: putting the seam anywhere else would put a second bound on
+    // every effect, every insert chain and every engine, to say nothing new.
+
+    /// One step of [`crate::simd::COMB_LANES`] lowpass-feedback combs sharing an input.
+    /// See [`crate::simd::scalar_comb_bank_step`], which is this method's specification.
+    fn comb_bank_step(
+        input: Self,
+        delayed: [Self; crate::simd::COMB_LANES],
+        stores: &mut [Self; crate::simd::COMB_LANES],
+        feedback_q24: i32,
+        damping_q24: i32,
+        damping_complement_q24: i32,
+        saturation_bound: i32,
+    ) -> [Self; crate::simd::COMB_LANES] {
+        crate::simd::scalar_comb_bank_step(input, delayed, stores, feedback_q24, damping_q24, damping_complement_q24, saturation_bound)
+    }
+
+    /// One transposed-Direct-Form-II biquad step on a stereo pair.
+    /// See [`crate::simd::scalar_biquad_stereo_step`].
+    fn biquad_stereo_step(
+        coefficients: &crate::biquad::BiquadCoefficients,
+        input: crate::frame::Stereo<Self>,
+        left_state: &mut [Self; 2],
+        right_state: &mut [Self; 2],
+    ) -> crate::frame::Stereo<Self> {
+        crate::simd::scalar_biquad_stereo_step(coefficients, input, left_state, right_state)
+    }
+
+    /// [`crate::simd::TAP_LANES`] linear fractional delay reads.
+    /// See [`crate::simd::scalar_interpolate_taps`].
+    fn interpolate_taps(
+        current: [Self; crate::simd::TAP_LANES],
+        next: [Self; crate::simd::TAP_LANES],
+        fraction_q16: [i32; crate::simd::TAP_LANES],
+    ) -> [Self; crate::simd::TAP_LANES] {
+        crate::simd::scalar_interpolate_taps(current, next, fraction_q16)
+    }
 }
 
 /// `2^-24`, exact in `f32`: what a Q8.24 coefficient is divided by on the float path.
@@ -143,6 +189,40 @@ impl DspSample for f32 {
     // to integer `as` cast saturates and maps NaN to zero, both of which are what a level
     // detector wants.
     fn magnitude_i32(self) -> i32 { f32::from_bits(self.to_bits() & 0x7FFF_FFFF) as i32 }
+
+    // The three vector bodies. Cfg'd out, the trait's own scalar defaults stand — which
+    // is what makes `cargo test` compile and exercise both in one binary.
+    #[cfg(feature = "simd")]
+    fn comb_bank_step(
+        input: f32,
+        delayed: [f32; crate::simd::COMB_LANES],
+        stores: &mut [f32; crate::simd::COMB_LANES],
+        feedback_q24: i32,
+        damping_q24: i32,
+        damping_complement_q24: i32,
+        saturation_bound: i32,
+    ) -> [f32; crate::simd::COMB_LANES] {
+        crate::simd::wide_comb_bank_step_f32(input, delayed, stores, feedback_q24, damping_q24, damping_complement_q24, saturation_bound)
+    }
+
+    #[cfg(feature = "simd")]
+    fn biquad_stereo_step(
+        coefficients: &crate::biquad::BiquadCoefficients,
+        input: crate::frame::Stereo<f32>,
+        left_state: &mut [f32; 2],
+        right_state: &mut [f32; 2],
+    ) -> crate::frame::Stereo<f32> {
+        crate::simd::wide_biquad_stereo_step_f32(coefficients, input, left_state, right_state)
+    }
+
+    #[cfg(feature = "simd")]
+    fn interpolate_taps(
+        current: [f32; crate::simd::TAP_LANES],
+        next: [f32; crate::simd::TAP_LANES],
+        fraction_q16: [i32; crate::simd::TAP_LANES],
+    ) -> [f32; crate::simd::TAP_LANES] {
+        crate::simd::wide_interpolate_taps_f32(current, next, fraction_q16)
+    }
 }
 
 impl DspSample for i32 {

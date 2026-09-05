@@ -46,6 +46,7 @@ use crate::frame::Stereo;
 use crate::insert::{DSP_BLOCK_FRAMES, Insert, InsertDescriptor, ParamId, ParamSpec, ParamUnit};
 use crate::lfo::Lfo;
 use crate::sample::{DspSample, Q15_UNITY};
+use crate::simd::TAP_LANES;
 use crate::smooth::{SMOOTH_FRAMES, SmoothedParam};
 use crate::tables::{equal_power_q15, sin_q15};
 
@@ -213,15 +214,41 @@ impl<Sample: DspSample> Insert<Sample> for Chorus<Sample> {
             // sample before the write the way `super::delay` does.
             self.line.write(frame.left, frame.right);
 
-            let mut wet_left = Sample::ZERO;
-            let mut wet_right = Sample::ZERO;
+            // Every tap's two frames are gathered first — they sit at arbitrary
+            // distances in the ring and no vector load can reach them — and the
+            // interpolation itself goes through one `interpolate_taps` call per channel
+            // (M7-H6). A chorus has at most `CHORUS_MAX_VOICES` taps, which is inside
+            // `TAP_LANES`; the lanes past `voices` stay silent and are never summed.
+            let mut left_current = [Sample::ZERO; TAP_LANES];
+            let mut left_next = [Sample::ZERO; TAP_LANES];
+            let mut left_fraction = [0i32; TAP_LANES];
+            let mut right_current = [Sample::ZERO; TAP_LANES];
+            let mut right_next = [Sample::ZERO; TAP_LANES];
+            let mut right_fraction = [0i32; TAP_LANES];
             for tap in 0..voices {
+                let lane = tap.max(0) as usize;
                 let left_phase = phase.wrapping_add(self.tap_offset(tap));
                 let right_phase = left_phase.wrapping_add(spread);
                 let left_delay = self.tap_delay_q16(base_q16, depth_q16, left_phase);
                 let right_delay = self.tap_delay_q16(base_q16, depth_q16, right_phase);
-                wet_left = wet_left.add(self.line.left.read_fractional(left_delay).scale_q15(tap_gain));
-                wet_right = wet_right.add(self.line.right.read_fractional(right_delay).scale_q15(tap_gain));
+                let (current, next, fraction) = self.line.left.read_fractional_parts(left_delay);
+                if let (Some(a), Some(b), Some(c)) = (left_current.get_mut(lane), left_next.get_mut(lane), left_fraction.get_mut(lane)) {
+                    (*a, *b, *c) = (current, next, fraction);
+                }
+                let (current, next, fraction) = self.line.right.read_fractional_parts(right_delay);
+                if let (Some(a), Some(b), Some(c)) = (right_current.get_mut(lane), right_next.get_mut(lane), right_fraction.get_mut(lane)) {
+                    (*a, *b, *c) = (current, next, fraction);
+                }
+            }
+            let left_taps = Sample::interpolate_taps(left_current, left_next, left_fraction);
+            let right_taps = Sample::interpolate_taps(right_current, right_next, right_fraction);
+
+            let mut wet_left = Sample::ZERO;
+            let mut wet_right = Sample::ZERO;
+            for tap in 0..voices {
+                let lane = tap.max(0) as usize;
+                wet_left = wet_left.add(left_taps.get(lane).copied().unwrap_or(Sample::ZERO).scale_q15(tap_gain));
+                wet_right = wet_right.add(right_taps.get(lane).copied().unwrap_or(Sample::ZERO).scale_q15(tap_gain));
             }
 
             let (dry, wet) = equal_power_q15(self.mix_percent.advance());

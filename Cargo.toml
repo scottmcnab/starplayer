@@ -25,6 +25,12 @@ rust-version = "1.97"
 # keeps design goal 4 (no default feature transitively enables `std`) satisfiable.
 fixed = { version = "1.31", default-features = false }
 bitflags = { version = "2.13", default-features = false }
+# The SIMD backend behind the `simd` feature (M7-H6). `core::simd` is nightly-only and the
+# toolchain is pinned to stable 1.97, so `wide` stands in: `no_std`, safe to call from a
+# `#![forbid(unsafe_code)]` crate, SSE2/NEON/simd128 backends and a plain-array fallback on
+# every other target. Its own `std` and `serde` features stay off, so it cannot threaten
+# design goal 4.
+wide = { version = "1.7", default-features = false }
 
 # Archive decoding stays on the pure-Rust miniz_oxide path for native and wasm builds.
 # Do not use zip's broad `deflate` feature: it also enables compressor and zlib-rs code

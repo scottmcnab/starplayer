@@ -237,8 +237,17 @@ impl<Sample: DspSample> Insert<Sample> for Delay<Sample> {
         for frame in block.iter_mut() {
             let delay_q8 = self.time_q8.advance();
             let index_q16 = self.delay_index_q16(delay_q8);
-            let delayed_left = self.line.left.read_fractional(index_q16);
-            let delayed_right = self.line.right.read_fractional(index_q16);
+            // Both channels read at the same position, so the two taps are two lanes of
+            // one `interpolate_taps` call (M7-H6); the remaining lanes stay silent.
+            let (left_current, left_next, fraction) = self.line.left.read_fractional_parts(index_q16);
+            let (right_current, right_next, _) = self.line.right.read_fractional_parts(index_q16);
+            let taps = Sample::interpolate_taps(
+                [left_current, right_current, Sample::ZERO, Sample::ZERO],
+                [left_next, right_next, Sample::ZERO, Sample::ZERO],
+                [fraction, fraction, 0, 0],
+            );
+            let delayed_left = taps.first().copied().unwrap_or(Sample::ZERO);
+            let delayed_right = taps.get(1).copied().unwrap_or(Sample::ZERO);
 
             let damped_left = one_pole(&mut self.damping_state_left, delayed_left, damping_q24);
             let damped_right = one_pole(&mut self.damping_state_right, delayed_right, damping_q24);
