@@ -17,6 +17,9 @@ starplayer-telemetry = { workspace = true, optional = true }
 default = []
 std = ["starplayer-core/std", "starplayer-rt/std", "starplayer-dsp/std", "starplayer-mixer/std", "starplayer-model/std", "starplayer-telemetry?/std"]
 alloc = ["starplayer-core/alloc", "starplayer-rt/alloc", "starplayer-dsp/alloc", "starplayer-mixer/alloc", "starplayer-model/alloc", "starplayer-telemetry?/alloc"]
+# M7-H6's vector kernels, in the dsp and mixer crates below. Off by default everywhere;
+# the engine itself has none of its own, but its bus loop calls `MixPath::add_block`, which
+# does.
 simd = ["starplayer-dsp/simd", "starplayer-mixer/simd"]
 float-mix = ["starplayer-dsp/float-mix", "starplayer-mixer/float-mix"]
 fixed-mix = ["starplayer-dsp/fixed-mix", "starplayer-mixer/fixed-mix"]

@@ -794,8 +794,42 @@ depends on the output rate and the module's dialect, not on the mixer mode), see
 rebuilt sequencer to the song frame that was sounding and restarting its clock at the new
 engine's frame.
 
-SIMD (via `core::simd` behind a feature) is an optimisation *inside* the monomorphised
-loop, never a semantic change. A scalar-equivalence test gates it.
+SIMD is an optimisation *inside* the monomorphised loop, never a semantic change. A
+scalar-equivalence test gates it.
+
+#### SIMD as it landed (M7-H6)
+
+**Via the `wide` crate, not `core::simd`.** `core::simd` is nightly-only and
+`rust-toolchain.toml` pins stable 1.97, so `wide` stands in (M7 master-plan decision 6): it
+is `no_std`, it is safe to call from a `#![forbid(unsafe_code)]` crate, it has SSE2 / NEON /
+simd128 backends, and on a target with no vector unit — `riscv32imc-unknown-none-elf` — it
+falls back to plain arrays, so the `simd` feature compiles everywhere rather than being
+refused anywhere.
+
+**Every kernel exists twice**, in `starplayer_dsp::simd` and `starplayer_mixer::simd`: a
+`scalar_*` body compiled into *every* build, and a `wide_*` body the feature selects. The
+seam is three provided methods on `DspSample` whose defaults call the scalar body and which
+`impl DspSample for f32` overrides only under `#[cfg(feature = "simd")]`, so an effect stays
+one generic body and never names a vector type. `crates/starplayer-{dsp,mixer}/tests/simd_equivalence.rs`
+runs both bodies in one binary and compares **bit patterns**; `cargo xtask ci --job simd`
+adds the block-size determinism invariant and all eleven goldens with the feature on.
+
+**What is vectorised**: the reverb's eight-comb bank, the equaliser's stereo biquad pair, the
+fractional delay taps of the delay, chorus and reverb pre-delay, the windowed sinc's dot
+product, the channel-major bus summation and the master volume. The sinc reduction is a
+**fixed** binary tree in both bodies, because float addition is not associative; the reverb's
+comb *outputs* are still summed in comb order for the same reason. The limiter's table lookup
+stays scalar: it is a gather, not arithmetic.
+
+**Only the float path is vectorised**, plus the fixed path's bus summation. Every other
+fixed-path primitive is a widening multiply followed by a round-to-nearest narrowing back
+into `i32`, and `wide` can widen (`i32x4::widening_mul`) but offers no narrowing conversion,
+so an exact vector form would have to leave the vector through memory for every multiply.
+`i32x4::saturating_add` is the one fixed-path operation that maps one-to-one, and it is
+exactly what the bus summation is made of.
+
+`simd` is **off by default everywhere** — including in the packaged web player — and the
+goldens are byte-identical with it on and off.
 
 ### 7.2 DSP graph
 
@@ -1456,7 +1490,7 @@ crates/
                         portable-atomic shim.                    → core
   starplayer-dsp        interpolators, ramping, IT resonant filter, biquad,
                         reverb / chorus / delay / compressor,
-                        SIMD backends (scalar / sse2 / neon / simd128).  → core
+                        SIMD kernels (`wide`: scalar / sse2 / neon / simd128).  → core
   starplayer-mixer      VoicePool, voice render kernels, buses,
                         output formats i8/i16/i24/i32/f32, mono & stereo. → core, dsp
   starplayer-model      shared Module (blob + u32 offsets), Sample, Envelope,

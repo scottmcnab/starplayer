@@ -17,3 +17,12 @@ starplayer = { workspace = true, features = ["std", "telemetry"] }
 # the song fade, the seek mailbox and the output-depth post-stage all live there (task D9).
 starplayer-host = { workspace = true }
 wasm-bindgen = { workspace = true }
+
+[features]
+default = []
+# M7-H6's vector kernels, on the browser's simd128 backend. Off by default and **not**
+# what the packaged web player is built with — that stays H7's build — but
+# `cargo xtask ci --job wasm-build` compiles this arm with
+# `RUSTFLAGS=-C target-feature=+simd128`, which is the only place `wide`'s wasm backend is
+# exercised at all.
+simd = ["starplayer/simd"]

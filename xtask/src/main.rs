@@ -94,7 +94,15 @@ const NO_STD_CRATES: &[&str] = &[
 /// `EventFeed` and `midi_channel` (see `starplayer-midi/src/lib.rs`'s module doc).
 const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry"), ("starplayer-midi", "smf")];
 
-const JOBS: &[&str] = &["host-tests", "conformance", "rt-safety", "goldens", "fma-check", "trace-zero-cost", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
+/// The `no_std` crates that have a `simd` feature, in dependency order (M7-H6).
+///
+/// `cargo xtask ci --job simd` compiles each of them for the bare-metal target with the
+/// feature on, which is the only place `wide`'s plain-array fallback — `riscv32imc` has no
+/// vector unit at all — is built. The rest of [`NO_STD_CRATES`] have no such feature and
+/// would fail the check with "none of the selected packages contains this feature".
+const SIMD_NO_STD_CRATES: &[&str] = &["starplayer-dsp", "starplayer-mixer", "starplayer-engine", "starplayer"];
+
+const JOBS: &[&str] = &["host-tests", "conformance", "rt-safety", "goldens", "simd", "fma-check", "trace-zero-cost", "wasm-build", "no-std-check", "clippy", "no-std-purity"];
 
 /// Jobs `cargo xtask ci` does **not** run in its default sweep, but `--job` still accepts.
 ///
@@ -177,23 +185,45 @@ const FP_CONTRACT_FLAG: &str = "-fp-contract=off";
 /// with `+fma` at all.
 struct FmaPass {
     package: &'static str,
+    /// Cargo features the pass is built with. `-fp-contract=off` has to hold for the
+    /// vector bodies too (M7-H6), and those only exist with `simd` on, so a pass that
+    /// audits them has to ask for the feature.
+    features: &'static [&'static str],
     /// Whether an optimized build of this crate on its own must contain an `f32` multiply
     /// for its scan to mean anything.
     requires_float_multiply: bool,
 }
 
+impl FmaPass {
+    /// A label that distinguishes this pass's audit directory and its report line from
+    /// another pass over the same package with different features.
+    fn label(&self) -> String {
+        if self.features.is_empty() { self.package.to_string() } else { format!("{} +{}", self.package, self.features.join(",")) }
+    }
+}
+
 const FMA_PASSES: &[FmaPass] = &[
     // Monomorphises the whole float voice path: `FloatPath::mix::<Linear>`,
     // `Linear::sample_f32`, the master bus and the host output conversions.
-    FmaPass { package: "starplayer-offline", requires_float_multiply: true },
+    FmaPass { package: "starplayer-offline", features: &[], requires_float_multiply: true },
     // The non-generic float master bus itself — `process_float`, `soft_knee_f32` and
     // `bound_f32` — which no C6 pass ever compiled with `+fma`.
-    FmaPass { package: "starplayer-mixer", requires_float_multiply: true },
-    // Every float expression in `starplayer-dsp` sits in a generic or trait-impl method,
-    // so the crate's own rlib codegens none of them and this scan finds nothing today;
-    // those instantiations are audited by the two passes above. The pass runs anyway, so
-    // the first non-generic float helper added here is covered from that commit onwards.
-    FmaPass { package: "starplayer-dsp", requires_float_multiply: false },
+    FmaPass { package: "starplayer-mixer", features: &[], requires_float_multiply: true },
+    // `starplayer-dsp` used to have no float codegen of its own — every float expression
+    // sat in a generic or trait-impl method — and this pass ran anyway so that the first
+    // non-generic helper would be covered from the commit that added it. M7-H6 is that
+    // commit: `simd::scalar_sinc_dot_f32` is non-generic, so the crate's own rlib now
+    // contains `mulss`, and the pass is conclusive rather than merely present.
+    FmaPass { package: "starplayer-dsp", features: &[], requires_float_multiply: true },
+    // The same two crates with M7-H6's vector bodies compiled in. These are the passes
+    // that matter for `simd`: `wide_*` is non-generic, so it codegens in the crate's own
+    // rlib, and a contracted vector multiply-add would be exactly as much of an
+    // architecture §7.3 violation as a scalar one. The mnemonics the scan already looks
+    // for cover both — FMA3 spells the scalar and the packed form with the same stem
+    // (`vfmadd213ss` against `vfmadd213ps`) — and `mulss`/`mulps` likewise match their
+    // VEX-encoded `vmulss`/`vmulps` forms.
+    FmaPass { package: "starplayer-mixer", features: &["simd"], requires_float_multiply: true },
+    FmaPass { package: "starplayer-dsp", features: &["simd"], requires_float_multiply: true },
 ];
 
 /// Crates whose tracker processors carry a `#[cfg(feature = "trace")]` per-channel report
@@ -237,7 +267,8 @@ fn print_usage() {
     println!("  conformance [--offline|--fetch-only] [--strict] [--archive PATH]   acquire and run the pinned tracker corpora");
     println!("  fuzz [--seed] [--target NAME] [--seconds N]   seed the loader corpora and run cargo-fuzz over them");
     println!("                     needs a nightly toolchain and `cargo install cargo-fuzz`; see fuzz/README.md");
-    println!("  goldens [--check]  regenerate canonical SHA-256 renders, or verify them");
+    println!("  goldens [--check] [--simd]   regenerate canonical SHA-256 renders, or verify them;");
+    println!("                     --simd verifies them with the vector kernels compiled in (M7-H6)");
     println!("  openmpt [--offline|--fetch-only]   build the pinned libopenmpt's openmpt123 into target/openmpt");
     println!("  perceptual [--corpus PATH]... [--threshold-snr DB] [--offline]");
     println!("                     score the float render against libopenmpt's; nightly report, never a gate");
@@ -293,15 +324,25 @@ fn run_trace(arguments: &[String]) -> bool {
 /// A dedicated target directory avoids recursively waiting on the parent cargo process's
 /// target-directory lock.
 fn run_goldens(arguments: &[String]) -> bool {
-    if !(arguments.is_empty() || matches!(arguments, [flag] if flag == "--check")) {
-        eprintln!("xtask goldens: usage: cargo xtask goldens [--check]");
+    // `--simd` is ours, not the driver's: it selects the *build*, so it is stripped here
+    // and turned into a feature. The driver sees only `--check`.
+    let simd = arguments.iter().any(|argument| argument == "--simd");
+    let driver_arguments: Vec<&String> = arguments.iter().filter(|argument| *argument != "--simd").collect();
+    if !(driver_arguments.is_empty() || matches!(driver_arguments.as_slice(), [flag] if *flag == "--check")) {
+        eprintln!("xtask goldens: usage: cargo xtask goldens [--check] [--simd]");
         return false;
     }
+    // A separate target directory for the `simd` build, so the two do not evict each
+    // other's artifacts every time the check is run both ways (M7-H6).
+    let target_directory = if simd { "target/xtask-goldens-simd" } else { "target/xtask-goldens" };
+    let feature_arguments: &[&str] = if simd { &["--features", "simd"] } else { &[] };
     let mut command = Command::new(cargo_binary());
     command
         .current_dir(workspace_root())
-        .args(["run", "--quiet", "--target-dir", "target/xtask-goldens", "-p", "starplayer-offline", "--bin", "starplayer-goldens", "--"])
-        .args(arguments);
+        .args(["run", "--quiet", "--target-dir", target_directory, "-p", "starplayer-offline", "--bin", "starplayer-goldens"])
+        .args(feature_arguments)
+        .args(["--"])
+        .args(driver_arguments);
     match command.status() {
         Ok(status) if status.success() => true,
         Ok(status) => {
@@ -1034,6 +1075,7 @@ fn run_ci(arguments: &[String]) -> bool {
             "wasm-build" => job_wasm_build(),
             "no-std-check" => job_no_std_check(),
             "clippy" => job_clippy(),
+            "simd" => job_simd(),
             "no-std-purity" => job_no_std_purity(),
             other => {
                 eprintln!("xtask ci: unknown job `{other}`");
@@ -1187,8 +1229,10 @@ fn job_fma_check() -> bool {
 }
 
 fn run_fma_pass(pass: &FmaPass) -> bool {
-    let Some(target_directory) = fresh_audit_directory("fma-check", pass.package) else { return false };
-    let findings = fma_findings(pass.package, &target_directory, None);
+    let label = pass.label();
+    let directory_name = if pass.features.is_empty() { format!("fma-check-{}", pass.package) } else { format!("fma-check-{}-{}", pass.package, pass.features.join("-")) };
+    let Some(target_directory) = fresh_audit_directory(&directory_name, pass.package) else { return false };
+    let findings = fma_findings(pass.package, pass.features, &target_directory, None);
     let succeeded = match findings {
         Err(message) => {
             eprintln!("     {message}");
@@ -1197,17 +1241,17 @@ fn run_fma_pass(pass: &FmaPass) -> bool {
         Ok(findings) => {
             let mut succeeded = true;
             for violation in &findings.violations {
-                eprintln!("     {}: {violation}", pass.package);
+                eprintln!("     {label}: {violation}");
                 succeeded = false;
             }
             if pass.requires_float_multiply && !(findings.saw_assembly_float_multiply && findings.saw_ir_float_multiply) {
-                eprintln!("     {}: audit inconclusive — the optimized build contains no f32 multiply", pass.package);
+                eprintln!("     {label}: audit inconclusive — the optimized build contains no f32 multiply");
                 succeeded = false;
             }
             if succeeded && findings.saw_assembly_float_multiply {
-                println!("     {}: separate multiply, no contraction marker, intrinsic or fused mnemonic", pass.package);
+                println!("     {label}: separate multiply, no contraction marker, intrinsic or fused mnemonic");
             } else if succeeded {
-                println!("     {}: no float codegen of its own; scanned anyway so a future non-generic helper is covered", pass.package);
+                println!("     {label}: no float codegen of its own; scanned anyway so a future non-generic helper is covered");
             }
             succeeded
         }
@@ -1221,7 +1265,7 @@ fn run_fma_negative_control() -> bool {
     const PACKAGE: &str = "starplayer-mixer";
     let Some(target_directory) = fresh_audit_directory("fma-control", PACKAGE) else { return false };
     println!("     negative control: RUSTFLAGS=\"-C llvm-args=-fp-contract=fast\" (a fused mnemonic is required)");
-    let findings = fma_findings(PACKAGE, &target_directory, Some("-C llvm-args=-fp-contract=fast"));
+    let findings = fma_findings(PACKAGE, &[], &target_directory, Some("-C llvm-args=-fp-contract=fast"));
     let succeeded = match findings {
         Err(message) => {
             eprintln!("     {message}");
@@ -1248,13 +1292,18 @@ struct FmaFindings {
     saw_ir_float_multiply: bool,
 }
 
-fn fma_findings(package: &str, target_directory: &Path, rustflags: Option<&str>) -> Result<FmaFindings, String> {
-    println!("     cargo rustc -p {package} --release --lib -- -C target-feature=+fma --emit=asm,llvm-ir");
+fn fma_findings(package: &str, features: &[&str], target_directory: &Path, rustflags: Option<&str>) -> Result<FmaFindings, String> {
+    let joined_features = features.join(",");
+    let feature_arguments: Vec<&str> = if features.is_empty() { Vec::new() } else { vec!["--features", joined_features.as_str()] };
+    let printed_features = if features.is_empty() { String::new() } else { format!(" --features {joined_features}") };
+    println!("     cargo rustc -p {package} --release --lib{printed_features} -- -C target-feature=+fma --emit=asm,llvm-ir");
     let mut command = Command::new(cargo_binary());
     command
         .current_dir(workspace_root())
         .env("CARGO_TARGET_DIR", target_directory)
-        .args(["rustc", "-p", package, "--release", "--lib", "--", "-C", "target-feature=+fma", "--emit=asm,llvm-ir"]);
+        .args(["rustc", "-p", package, "--release", "--lib"])
+        .args(&feature_arguments)
+        .args(["--", "-C", "target-feature=+fma", "--emit=asm,llvm-ir"]);
     if let Some(rustflags) = rustflags {
         command.env("RUSTFLAGS", rustflags);
     }
@@ -1470,9 +1519,84 @@ fn job_fuzz_smoke() -> bool {
 /// The web build has to keep working on every commit, both for the facade the app
 /// consumes and for the AudioWorklet glue that wraps it.
 fn job_wasm_build() -> bool {
-    cargo(&["build", "--target", WASM_TARGET, "-p", "starplayer"])
+    let plain = cargo(&["build", "--target", WASM_TARGET, "-p", "starplayer"])
         && cargo(&["build", "--target", WASM_TARGET, "-p", "starplayer-host-wasm"])
-        && cargo(&["build", "--target", WASM_TARGET, "-p", "starplayer-web"])
+        && cargo(&["build", "--target", WASM_TARGET, "-p", "starplayer-web"]);
+
+    // And once more with M7-H6's vector kernels on the simd128 backend. The web page is
+    // **not** switched to this build — that is H7's, and `simd` stays off by default
+    // everywhere — but the arm has to compile, and it is the only place `wide`'s wasm
+    // backend is exercised at all.
+    plain & wasm_simd128_build()
+}
+
+/// `cargo build --target wasm32-unknown-unknown --features simd` with simd128 on.
+///
+/// `RUSTFLAGS` **replaces** `[build] rustflags` from `.cargo/config.toml` rather than
+/// merging with it, so `-fp-contract=off` is restated here: dropping it silently is
+/// exactly what `assert_rustflags_keep_the_fp_contract_policy` exists to prevent.
+fn wasm_simd128_build() -> bool {
+    const RUSTFLAGS: &str = "-C llvm-args=-fp-contract=off -C target-feature=+simd128";
+    for package in ["starplayer", "starplayer-host-wasm"] {
+        let arguments = ["build", "--target", WASM_TARGET, "-p", package, "--features", "simd"];
+        println!("     RUSTFLAGS=\"{RUSTFLAGS}\" cargo {}", arguments.join(" "));
+        let status = Command::new(cargo_binary())
+            .current_dir(workspace_root())
+            .env("RUSTFLAGS", RUSTFLAGS)
+            .env("CARGO_TARGET_DIR", "target/xtask-wasm-simd")
+            .args(arguments)
+            .status();
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!("     the simd128 wasm build of `{package}` exited with {status}");
+                return false;
+            }
+            Err(error) => {
+                eprintln!("     the simd128 wasm build of `{package}` failed to start: {error}");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The `simd` gate (M7-H6): everything that has to hold with the vector kernels compiled
+/// in, in one job.
+///
+/// Five checks, in the order a failure is cheapest to read:
+///
+/// 1. The **scalar-equivalence** tests in `starplayer-dsp` and `starplayer-mixer`. Every
+///    vectorised body against the scalar body that specifies it, bit for bit.
+/// 2. The rest of those two crates' suites with the feature on, because a kernel that
+///    agrees with its scalar twin can still have been wired into the wrong caller.
+/// 3. **Block-size determinism** with the feature on — architecture §1.4's invariant, and
+///    the one thing a vector body that reads past a block boundary would break.
+/// 4. The **goldens**, with the feature on. The fixed path is not vectorised except for
+///    the bus summation, so this is mostly a statement that it stayed that way; it is also
+///    the only check that runs a whole module through the vector build.
+/// 5. `cargo check` for the bare-metal target with the feature on, which is where `wide`'s
+///    plain-array fallback is compiled.
+///
+/// Preceded by a clippy pass over the two crates with the feature on, because the
+/// workspace clippy job runs with default features and would otherwise never lint a line
+/// of the vector bodies.
+fn job_simd() -> bool {
+    let mut all_succeeded = true;
+    // `job_clippy` lints the workspace with default features, which is the `simd` feature
+    // **off**: without these two passes the vector bodies and the equivalence tests are
+    // the only code in the tree clippy never sees.
+    for crate_name in ["starplayer-dsp", "starplayer-mixer"] {
+        all_succeeded &= cargo(&["clippy", "-p", crate_name, "--all-targets", "--features", "simd", "--", "-D", "warnings"]);
+    }
+    all_succeeded &= cargo(&["test", "-p", "starplayer-dsp", "--features", "simd"]);
+    all_succeeded &= cargo(&["test", "-p", "starplayer-mixer", "--features", "simd"]);
+    all_succeeded &= cargo(&["test", "-p", "starplayer-engine", "--features", "simd", "--test", "block_size_determinism"]);
+    all_succeeded &= run_goldens(&["--check".to_string(), "--simd".to_string()]);
+    for crate_name in SIMD_NO_STD_CRATES {
+        all_succeeded &= cargo(&["check", "--target", BARE_METAL_TARGET, "-p", crate_name, "--features", "simd"]);
+    }
+    all_succeeded
 }
 
 /// Each `no_std` crate must compile for a bare-metal target with its features stripped

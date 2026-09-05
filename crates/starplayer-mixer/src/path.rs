@@ -77,7 +77,7 @@ use starplayer_dsp::{
 pub use starplayer_dsp::Stereo;
 
 use crate::gain::{GAIN_FRACTION_BITS, GAIN_UNITY, voice_gain_units};
-use crate::master::{MasterSettings, process_fixed, process_float};
+use crate::master::{MasterSettings, master_block_fixed, master_block_float};
 use crate::voice::{PathFilter, VoiceFilter};
 
 /// One accumulated output frame on the float path.
@@ -157,6 +157,15 @@ pub trait MixPath {
     /// same place the voice accumulation's does.
     fn add_frame(destination: &mut Self::Accumulator, source: Self::Accumulator);
 
+    /// [`MixPath::add_frame`] over a whole block, which is how the engine sums a channel
+    /// bus into the pre-master mix (M7-H6).
+    ///
+    /// A separate method rather than a loop at the call site because this is the mixer's
+    /// hottest elementwise operation — one call per bus per quantum, up to 64 of them —
+    /// and therefore the one worth vectorising; `crate::simd` holds both bodies. Frames
+    /// past the shorter of the two slices are left alone, exactly as a `zip` would.
+    fn add_block(destination: &mut [Self::Accumulator], source: &[Self::Accumulator]);
+
     /// One bus, as the DSP graph sees it.
     ///
     /// `Accumulator` *is* `Stereo<Mono>` on both paths, but the trait cannot say so
@@ -216,13 +225,15 @@ impl MixPath for FloatPath {
         destination.right += source.right;
     }
 
+    #[cfg(not(feature = "simd"))]
+    fn add_block(destination: &mut [FloatFrame], source: &[FloatFrame]) { crate::simd::scalar_add_block_f32(destination, source) }
+
+    #[cfg(feature = "simd")]
+    fn add_block(destination: &mut [FloatFrame], source: &[FloatFrame]) { crate::simd::wide_add_block_f32(destination, source) }
+
     fn as_frames(bus: &mut [FloatFrame]) -> &mut [Stereo<f32>] { bus }
 
-    fn master(quantum: &mut [FloatFrame], settings: MasterSettings) {
-        for frame in quantum.iter_mut() {
-            *frame = process_float(*frame, settings);
-        }
-    }
+    fn master(quantum: &mut [FloatFrame], settings: MasterSettings) { master_block_float(quantum, settings) }
 }
 
 /// The fixed-point mixing path: `i16` sample, `i32` accumulator, integer arithmetic only.
@@ -266,13 +277,15 @@ impl MixPath for FixedPath {
         destination.right = destination.right.saturating_add(source.right);
     }
 
+    #[cfg(not(feature = "simd"))]
+    fn add_block(destination: &mut [FixedFrame], source: &[FixedFrame]) { crate::simd::scalar_add_block_i32(destination, source) }
+
+    #[cfg(feature = "simd")]
+    fn add_block(destination: &mut [FixedFrame], source: &[FixedFrame]) { crate::simd::wide_add_block_i32(destination, source) }
+
     fn as_frames(bus: &mut [FixedFrame]) -> &mut [Stereo<i32>] { bus }
 
-    fn master(quantum: &mut [FixedFrame], settings: MasterSettings) {
-        for frame in quantum.iter_mut() {
-            *frame = process_fixed(*frame, settings);
-        }
-    }
+    fn master(quantum: &mut [FixedFrame], settings: MasterSettings) { master_block_fixed(quantum, settings) }
 }
 
 /// Gain units to a float multiplier.

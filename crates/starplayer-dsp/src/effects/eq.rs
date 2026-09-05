@@ -313,19 +313,19 @@ impl<Sample: DspSample> Insert<Sample> for Eq<Sample> {
                 continue;
             }
             for frame in span.iter_mut() {
-                let mut left = frame.left.mul_q24(EQ_PREAMP_Q24);
-                let mut right = frame.right.mul_q24(EQ_PREAMP_Q24);
+                // The three bands are in series and cannot be parallelised; the stereo
+                // pair inside one band can be, and is — M7-H6's `biquad_stereo_step`,
+                // whose scalar body is these two `BiquadCoefficients::step` calls.
+                let mut pair = Stereo::new(frame.left.mul_q24(EQ_PREAMP_Q24), frame.right.mul_q24(EQ_PREAMP_Q24));
                 for index in 0..BAND_COUNT {
                     let Some(band) = self.bands.get(index) else { continue };
-                    if let Some(state) = self.left_state.get_mut(index) {
-                        left = band.coefficients.step(left, state);
-                    }
-                    if let Some(state) = self.right_state.get_mut(index) {
-                        right = band.coefficients.step(right, state);
-                    }
+                    let (Some(left_state), Some(right_state)) = (self.left_state.get_mut(index), self.right_state.get_mut(index)) else {
+                        continue;
+                    };
+                    pair = Sample::biquad_stereo_step(&band.coefficients, pair, left_state, right_state);
                 }
-                frame.left = left.mul_q24(EQ_POSTAMP_Q24);
-                frame.right = right.mul_q24(EQ_POSTAMP_Q24);
+                frame.left = pair.left.mul_q24(EQ_POSTAMP_Q24);
+                frame.right = pair.right.mul_q24(EQ_POSTAMP_Q24);
             }
         }
     }

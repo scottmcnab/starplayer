@@ -7,12 +7,16 @@ rust-version.workspace = true
 [dependencies]
 starplayer-core = { workspace = true }
 starplayer-dsp = { workspace = true }
+# The SIMD backend, exactly as `starplayer-dsp` takes it — see that manifest.
+wide = { workspace = true, optional = true }
 
 [features]
 default = []
 std = ["starplayer-core/std", "starplayer-dsp/std"]
 alloc = ["starplayer-core/alloc", "starplayer-dsp/alloc"]
-simd = ["starplayer-dsp/simd"]
+# The vector kernels in `src/simd.rs`. Never on by default; the scalar bodies stay
+# compiled either way, and `tests/simd_equivalence.rs` is the gate that says they agree.
+simd = ["dep:wide", "starplayer-dsp/simd"]
 float-mix = ["starplayer-dsp/float-mix"]
 fixed-mix = ["starplayer-dsp/fixed-mix"]
 linear-interp = ["starplayer-dsp/linear-interp"]

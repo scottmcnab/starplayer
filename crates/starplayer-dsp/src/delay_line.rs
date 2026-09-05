@@ -72,14 +72,25 @@ impl<S: DspSample> DelayLine<S> {
     /// falls between. `delay_q16` is Q16.16 frames: `0` is [`DelayLine::read`]`(0)`,
     /// `1 << 16` is one frame further back, and so on.
     pub fn read_fractional(&self, delay_q16: u32) -> S {
-        let whole_frames = delay_q16 >> 16;
-        let fraction = (delay_q16 & 0xFFFF) as i32;
-        let current = self.read(whole_frames);
+        let (current, next, fraction) = self.read_fractional_parts(delay_q16);
         if fraction == 0 {
             return current;
         }
-        let next = self.read(whole_frames + 1);
         current.add(scale_by_q16_fraction(next.sub(current), fraction))
+    }
+
+    /// The two frames a fractional delay falls between, and the Q0.16 weight between them
+    /// — the *gather* half of [`DelayLine::read_fractional`] (M7-H6).
+    ///
+    /// A caller with several taps to interpolate reads each tap's parts with this and
+    /// hands them all to [`DspSample::interpolate_taps`](crate::sample::DspSample::interpolate_taps)
+    /// in one call, which is the only part of a fractional read a vector unit can do: the
+    /// two loads are at arbitrary distances in a ring buffer and stay scalar whatever the
+    /// backend.
+    pub fn read_fractional_parts(&self, delay_q16: u32) -> (S, S, i32) {
+        let whole_frames = delay_q16 >> 16;
+        let fraction = (delay_q16 & 0xFFFF) as i32;
+        (self.read(whole_frames), self.read(whole_frames + 1), fraction)
     }
 
     /// Zero every frame and rewind the cursor, without reallocating.

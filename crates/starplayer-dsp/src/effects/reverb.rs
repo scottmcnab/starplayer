@@ -77,6 +77,7 @@ use crate::delay_line::{DelayLine, StereoDelayLine};
 use crate::frame::Stereo;
 use crate::insert::{DSP_BLOCK_FRAMES, Insert, InsertDescriptor, ParamId, ParamSpec, ParamUnit};
 use crate::sample::{DspSample, Q15_UNITY};
+use crate::simd::{COMB_LANES, attenuate_q24};
 use crate::smooth::{SMOOTH_FRAMES, SmoothedParam};
 use crate::tables::equal_power_q15;
 
@@ -164,39 +165,30 @@ pub static REVERB_DESCRIPTOR: InsertDescriptor = InsertDescriptor {
     ],
 };
 
-/// One lowpass-feedback comb filter: a delay line, its damping one-pole's state, and the
-/// delay it is read at.
+/// One lowpass-feedback comb filter's delay line and the delay it is read at.
+///
+/// The damping one-pole's state lives in [`Tank::stores`] rather than here, so that all
+/// eight can be handed to [`DspSample::comb_bank_step`] as one array — M7-H6's vector
+/// kernel, whose scalar body is `crate::simd::scalar_comb_bank_step` and is what this
+/// comb's arithmetic now reads as. The eight lines themselves stay separate: they have
+/// eight different lengths and eight cursors, which no vector load can address.
 #[derive(Clone, Debug)]
 struct Comb<Sample: DspSample> {
     line: DelayLine<Sample>,
     length: u32,
-    store: Sample,
 }
 
 impl<Sample: DspSample> Comb<Sample> {
     fn new(length: u32) -> Comb<Sample> {
         let length = length.max(1);
-        Comb { line: DelayLine::new(length as usize), length, store: Sample::ZERO }
+        Comb { line: DelayLine::new(length as usize), length }
     }
 
-    /// `y = x + f·((1 − d)·y[n − L] + d·store)`, Jezar's comb exactly, with the write
-    /// saturated at the headroom's own full scale and the feedback multiply flushed.
-    ///
-    /// The line is read *before* it is written, so a delay of `L` frames reads at `L − 1`
-    /// — the same off-by-one H3's delay spells out rather than leaving to be rediscovered.
-    fn step(&mut self, input: Sample, feedback_q24: i32, damping_q24: i32, damping_complement_q24: i32) -> Sample {
-        let delayed = self.line.read(self.length - 1);
-        self.store = delayed.mul_q24(damping_complement_q24).add(self.store.mul_q24(damping_q24));
-        let written = input.add(attenuate_q24(self.store, feedback_q24));
-        self.line.write(written.saturate_at(COMB_SATURATION_BOUND));
-        delayed
-    }
-
-    fn reset(&mut self) {
-        self.line.reset();
-        self.store = Sample::ZERO;
-    }
+    fn reset(&mut self) { self.line.reset(); }
 }
+
+/// The comb kernel is written for exactly [`COMB_LANES`] combs, which is Freeverb's eight.
+const _: () = assert!(COMB_COUNT == COMB_LANES, "the comb kernel is one bank of COMB_LANES combs");
 
 /// One Schroeder allpass, at Freeverb's fixed feedback of a half.
 #[derive(Clone, Debug)]
@@ -224,6 +216,8 @@ impl<Sample: DspSample> Allpass<Sample> {
 #[derive(Clone, Debug)]
 struct Tank<Sample: DspSample> {
     combs: [Comb<Sample>; COMB_COUNT],
+    /// Each comb's damping one-pole state, in comb order — see [`Comb`].
+    stores: [Sample; COMB_COUNT],
     allpasses: [Allpass<Sample>; ALLPASS_COUNT],
 }
 
@@ -233,15 +227,33 @@ impl<Sample: DspSample> Tank<Sample> {
     fn new(sample_rate_hz: u32, offset: u32) -> Tank<Sample> {
         Tank {
             combs: core::array::from_fn(|index| Comb::new(scaled_length(COMB_TUNING_44100.get(index).copied().unwrap_or(1_116), sample_rate_hz) + offset)),
+            stores: [Sample::ZERO; COMB_COUNT],
             allpasses: core::array::from_fn(|index| Allpass::new(scaled_length(ALLPASS_TUNING_44100.get(index).copied().unwrap_or(556), sample_rate_hz) + offset)),
         }
     }
 
     /// Steps 3 to 5 of the module documentation's signal path.
+    ///
+    /// Every comb is read before any is written, which is the same arithmetic as reading
+    /// and writing them one at a time — the eight lines are independent — and is what lets
+    /// the state update go through [`DspSample::comb_bank_step`] as one bank. The **sum**
+    /// stays in comb order: float addition is not associative, so re-associating it here
+    /// would move the float path's last bits for no gain.
     fn step(&mut self, input: Sample, feedback_q24: i32, damping_q24: i32, damping_complement_q24: i32) -> Sample {
+        let mut delayed = [Sample::ZERO; COMB_COUNT];
+        for (slot, comb) in delayed.iter_mut().zip(self.combs.iter()) {
+            // The line is read *before* it is written, so a delay of `L` frames reads at
+            // `L − 1` — the same off-by-one H3's delay spells out.
+            *slot = comb.line.read(comb.length - 1);
+        }
+        let written = Sample::comb_bank_step(input, delayed, &mut self.stores, feedback_q24, damping_q24, damping_complement_q24, COMB_SATURATION_BOUND);
+        for (comb, value) in self.combs.iter_mut().zip(written.iter()) {
+            comb.line.write(*value);
+        }
+
         let mut sum = Sample::ZERO;
-        for comb in self.combs.iter_mut() {
-            sum = sum.add(comb.step(input, feedback_q24, damping_q24, damping_complement_q24));
+        for value in delayed.iter() {
+            sum = sum.add(*value);
         }
         let mut value = sum.mul_q24(COMB_SUM_SCALE_Q24);
         for allpass in self.allpasses.iter_mut() {
@@ -254,6 +266,7 @@ impl<Sample: DspSample> Tank<Sample> {
         for comb in self.combs.iter_mut() {
             comb.reset();
         }
+        self.stores = [Sample::ZERO; COMB_COUNT];
         for allpass in self.allpasses.iter_mut() {
             allpass.reset();
         }
@@ -393,14 +406,6 @@ fn default_at(index: usize) -> i32 { REVERB_DESCRIPTOR.params.get(index).map_or(
 /// The descriptor's clamp for one parameter position.
 fn clamp_at(index: usize, value: i32) -> i32 { REVERB_DESCRIPTOR.params.get(index).map_or(value, |spec| spec.clamp(value)) }
 
-/// `value × coefficient`, with the fixed path's rounding fixed points flushed to silence —
-/// see "Research point 1" in the module documentation. At unity (which is what `freeze`
-/// sets the comb feedback to) the multiply is exact and the flush cannot fire.
-fn attenuate_q24<Sample: DspSample>(value: Sample, coefficient_q24: i32) -> Sample {
-    let scaled = value.mul_q24(coefficient_q24);
-    if coefficient_q24 < 1 << 24 && scaled == value { Sample::ZERO } else { scaled }
-}
-
 impl<Sample: DspSample> Insert<Sample> for Reverb<Sample> {
     fn process(&mut self, block: &mut [Stereo<Sample>]) {
         debug_assert_eq!(block.len(), DSP_BLOCK_FRAMES, "an insert only ever sees a whole DSP block");
@@ -424,8 +429,17 @@ impl<Sample: DspSample> Insert<Sample> for Reverb<Sample> {
             let position_q8 = self.pre_delay_q8.advance().clamp(0, self.max_pre_delay_q8);
             self.pre_delay.write(frame.left, frame.right);
             let index_q16 = (position_q8 as u32) << 8;
-            let pre_left = self.pre_delay.left.read_fractional(index_q16);
-            let pre_right = self.pre_delay.right.read_fractional(index_q16);
+            // Both channels read at the same position, so the two taps are two lanes of
+            // one `interpolate_taps` call (M7-H6); the remaining lanes stay silent.
+            let (left_current, left_next, fraction) = self.pre_delay.left.read_fractional_parts(index_q16);
+            let (right_current, right_next, _) = self.pre_delay.right.read_fractional_parts(index_q16);
+            let taps = Sample::interpolate_taps(
+                [left_current, right_current, Sample::ZERO, Sample::ZERO],
+                [left_next, right_next, Sample::ZERO, Sample::ZERO],
+                [fraction, fraction, 0, 0],
+            );
+            let pre_left = taps.first().copied().unwrap_or(Sample::ZERO);
+            let pre_right = taps.get(1).copied().unwrap_or(Sample::ZERO);
 
             let tank_input = pre_left.add(pre_right).mul_q24(input_gain_q24);
             let wet_left = self.left.step(tank_input, feedback_q24, damping_q24, damping_complement_q24).mul_q24(WET_SCALE_Q24);

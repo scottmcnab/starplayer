@@ -27,6 +27,10 @@ trace = ["starplayer/trace"]
 # golden render would carry the publisher. `cargo xtask ci --job rt-safety` runs the suite
 # once without it and once with it.
 telemetry = ["starplayer/telemetry"]
+# M7-H6's vector kernels, for `cargo xtask goldens --check --simd` and the render
+# benchmark. Off by default, like every other `simd` feature in this workspace; the eleven
+# goldens must hash identically with it on and off.
+simd = ["starplayer/simd"]
 
 [[bin]]
 name = "starplayer-trace"

@@ -6,6 +6,12 @@
 //! still resolve to this type.
 
 /// A left/right pair of whatever the path uses for gain or for accumulated signal.
+///
+/// `#[repr(C)]` so that `left` and `right` are adjacent in that order, whatever `T` is.
+/// A bus is a slice of these, and M7-H6's vector kernels build a four-lane vector from two
+/// consecutive frames; with the default representation the compiler is free to reorder the
+/// two fields and the four loads stay four loads.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Stereo<T> {
     /// Left channel.

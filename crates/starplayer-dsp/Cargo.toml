@@ -6,12 +6,21 @@ rust-version.workspace = true
 
 [dependencies]
 starplayer-core = { workspace = true }
+# The SIMD backend (M7-H6, master-plan decision 6). Optional and off by default: it is
+# only ever compiled when the `simd` feature below is on. `no_std`, safe to call from a
+# `#![forbid(unsafe_code)]` crate, and it falls back to plain arrays on a target with no
+# vector unit, which is what `riscv32imc-unknown-none-elf` gets.
+wide = { workspace = true, optional = true }
 
 [features]
 default = []
 std = ["starplayer-core/std"]
 alloc = ["starplayer-core/alloc"]
-simd = []
+# The vector kernels in `src/simd.rs`. **Never on by default anywhere.** The scalar
+# bodies stay compiled either way; this feature only chooses which one the effects call,
+# and `crates/starplayer-dsp/tests/simd_equivalence.rs` is the gate that says they agree
+# bit for bit.
+simd = ["dep:wide"]
 # Both mix paths may be enabled at once; the caller picks per render.
 float-mix = []
 fixed-mix = []

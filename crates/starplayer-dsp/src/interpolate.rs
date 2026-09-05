@@ -35,6 +35,18 @@
 
 use crate::sinc_table::{SINC_FRACTION_BITS, SINC_TABLE_Q15, SINC_TAPS};
 
+/// The eight-tap dot product's float body: the vector one when the `simd` feature is on,
+/// the scalar one otherwise. Both live in [`crate::simd`], reduce in the same fixed binary
+/// tree, and are compared bit for bit by `tests/simd_equivalence.rs`.
+///
+/// The fixed twin below stays scalar: its accumulator is `i64` and `wide` has no narrowing
+/// conversion back from `i64x4`, so an exact vector form would have to leave the vector
+/// through memory for every sample. `crate::simd`'s module documentation states the rule.
+#[cfg(not(feature = "simd"))]
+use crate::simd::scalar_sinc_dot_f32 as sinc_dot_f32;
+#[cfg(feature = "simd")]
+use crate::simd::wide_sinc_dot_f32 as sinc_dot_f32;
+
 /// A resampling kernel.
 ///
 /// `fraction_bits` is the Q0.32 fractional part of the sample position: `0` sits exactly
@@ -235,12 +247,7 @@ impl Interpolate for Sinc {
     fn sample_f32(frames: &[i16], index: usize, fraction_bits: u32) -> f32 {
         let taps = sinc_taps(frames, index);
         let Some(coefficients) = SINC_TABLE_Q15.get(sinc_phase(fraction_bits)) else { return 0.0 };
-        let mut accumulator = 0.0f32;
-        for (frame, coefficient) in taps.iter().zip(coefficients.iter()) {
-            accumulator += *frame as f32 * *coefficient as f32;
-        }
-        // `2^-15` is exact in `f32`, so the scaling is a rounding-free exponent change.
-        accumulator * SINC_SCALE_F32
+        sinc_dot_f32(&taps, coefficients)
     }
 
     fn sample_fixed(frames: &[i16], index: usize, fraction_bits: u32) -> i32 {
@@ -281,9 +288,6 @@ fn sinc_taps(frames: &[i16], index: usize) -> [i16; SINC_TAPS] {
     }
     taps
 }
-
-/// `1.0 / 2^15`, exact in `f32`: the Q1.15 coefficient scale.
-const SINC_SCALE_F32: f32 = 1.0 / 32_768.0;
 
 /// Remove fractional bits with the canonical fixed-mixer rounding rule: nearest, with
 /// exact half-way values rounded away from zero.
