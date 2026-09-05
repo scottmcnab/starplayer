@@ -87,6 +87,25 @@ pub trait DspSample: Copy + Default + Send + PartialEq + core::fmt::Debug + 'sta
 
     /// Bound to the path's full scale (fixed: `i32` saturating; float: identity).
     fn saturate(self) -> Self;
+
+    /// Bound to `±bound` rather than to the path's own full scale (fixed: a clamp; float:
+    /// identity, exactly as [`DspSample::saturate`] is).
+    ///
+    /// H4's reverb needs this: its comb bank runs six bits above the sample the way H3's
+    /// EQ does, so "the comb state saturates" means at `32767 << 6`, not at 32767.
+    /// `bound` is a magnitude and is read as `|bound|`.
+    fn saturate_at(self, bound: i32) -> Self;
+
+    /// This sample's magnitude on the raw `i16` scale, as an integer — what a level
+    /// detector compares against a threshold and hands to
+    /// [`gain_to_centi_db`](crate::tables::gain_to_centi_db).
+    ///
+    /// The only place H4's compressor differs between the two paths: everything after it —
+    /// the envelope, the log-domain gain computer, the Q1.15 gain — is integer arithmetic
+    /// shared by both. The float path truncates towards zero, so a sample below one unit
+    /// of the `i16` scale (−90 dBFS) reads as zero; no threshold this crate offers is
+    /// anywhere near there.
+    fn magnitude_i32(self) -> i32;
 }
 
 /// `2^-24`, exact in `f32`: what a Q8.24 coefficient is divided by on the float path.
@@ -116,6 +135,14 @@ impl DspSample for f32 {
     fn scale_q15(self, gain: i32) -> f32 { self * (gain as f32 * Q15_TO_F32) }
 
     fn saturate(self) -> f32 { self }
+
+    fn saturate_at(self, _bound: i32) -> f32 { self }
+
+    // `f32::abs` is an inherent `std` method, not a `core` one, so the sign bit is cleared
+    // directly — the same reason `crate::tables` builds its own transcendentals. A float
+    // to integer `as` cast saturates and maps NaN to zero, both of which are what a level
+    // detector wants.
+    fn magnitude_i32(self) -> i32 { f32::from_bits(self.to_bits() & 0x7FFF_FFFF) as i32 }
 }
 
 impl DspSample for i32 {
@@ -138,6 +165,13 @@ impl DspSample for i32 {
     }
 
     fn saturate(self) -> i32 { self.clamp(-FIXED_SATURATION_BOUND, FIXED_SATURATION_BOUND) }
+
+    fn saturate_at(self, bound: i32) -> i32 {
+        let magnitude = bound.saturating_abs();
+        self.clamp(-magnitude, magnitude)
+    }
+
+    fn magnitude_i32(self) -> i32 { self.saturating_abs() }
 }
 
 #[cfg(test)]
@@ -199,6 +233,32 @@ mod tests {
         assert_eq!((-100_000i32).saturate(), -FIXED_SATURATION_BOUND);
         assert_eq!(1_234i32.saturate(), 1_234, "within scale is untouched");
         assert_eq!(100_000.0f32.saturate(), 100_000.0, "the float path never clamps here");
+    }
+
+    #[test]
+    fn saturate_at_bounds_the_fixed_path_at_the_callers_own_scale() {
+        // H4's reverb runs its comb bank six bits above the sample, so its own bound is
+        // `32767 << 6` rather than `DspSample::saturate`'s 32767.
+        const HEADROOM_BOUND: i32 = (i16::MAX as i32) << 6;
+        assert_eq!(10_000_000i32.saturate_at(HEADROOM_BOUND), HEADROOM_BOUND);
+        assert_eq!((-10_000_000i32).saturate_at(HEADROOM_BOUND), -HEADROOM_BOUND);
+        assert_eq!(1_000_000i32.saturate_at(HEADROOM_BOUND), 1_000_000, "within the bound is untouched");
+        assert_eq!(10_000_000.0f32.saturate_at(HEADROOM_BOUND), 10_000_000.0, "the float path never clamps here either");
+        assert_eq!(5i32.saturate_at(i32::MIN), 5, "a bound of i32::MIN saturates to i32::MAX rather than panicking");
+    }
+
+    #[test]
+    fn magnitude_is_the_i16_scale_magnitude_on_both_paths() {
+        for value in [0i32, 1, -1, 20_000, -20_000, 100_000, -100_000] {
+            assert_eq!(value.magnitude_i32(), value.abs());
+        }
+        assert_eq!(i32::MIN.magnitude_i32(), i32::MAX, "the one value whose negation does not fit saturates");
+        assert_eq!(0.0f32.magnitude_i32(), 0);
+        assert_eq!((-20_000.5f32).magnitude_i32(), 20_000, "the float path truncates towards zero");
+        assert_eq!(20_000.5f32.magnitude_i32(), 20_000);
+        assert_eq!((-0.5f32).magnitude_i32(), 0, "below one unit of the i16 scale reads as zero");
+        assert_eq!(f32::NAN.magnitude_i32(), 0);
+        assert_eq!(f32::INFINITY.magnitude_i32(), i32::MAX, "an `as` cast saturates rather than wrapping");
     }
 
     #[test]
