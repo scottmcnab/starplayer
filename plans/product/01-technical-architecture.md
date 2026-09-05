@@ -921,6 +921,84 @@ frequency 150 Hz away at least 70 dB down. Fixed against float, by segmental SNR
 fixed path in any of the three, so its output is bit-identical across x86, ARM and WASM by
 construction (§7.3).
 
+#### The reverb and the compressor (M7-H4)
+
+| effect | parameters (in `ParamId` order) | cooked | state |
+|---|---|---|---|
+| `reverb` | `room` (%), `damping` (%), `width` (%), `mix` (%), `pre_delay` (ms 0–100), `freeze` | the comb feedback and damping coefficients, **per block** | eight combs and four allpasses per channel, plus a stereo pre-delay — **211 KB** at 48 kHz |
+| `compressor` | `threshold` (centi-dB), `ratio` (×100), `attack`/`release` (ms), `knee` (centi-dB), `makeup` (centi-dB), `auto_makeup`, `limit` | the whole gain computer, **every 32 frames** | one Q8 centi-dB reduction and one Q1.15 gain — no delay line at all |
+
+**The reverb is Freeverb**, Jezar at Dreampoint's public-domain design: per channel eight
+parallel lowpass-feedback combs into four series allpasses, the right channel's lengths
+offset by 23 frames, every length scaled from the 44.1 kHz tuning at `build_insert`. It was
+chosen for being table-free, integer-friendly and unmistakably "a reverb", which is what the
+milestone's exit criterion asks the owner to listen for. Room size is the comb feedback,
+0.7 to 0.98; damping is the comb's one-pole, 0 to 0.4; `freeze` is unity feedback, no
+damping and no new input, and because `mul_q24(1 << 24)` is exact on both paths a frozen
+tail circulates without losing a bit (measured: 0.06 dB of drift over five seconds).
+
+**Its memory is the price of the topology.** Every line is a power-of-two ring, so the wrap
+is a mask: sixteen comb rings of 2048 frames, eight allpass rings, and a 100 ms stereo
+pre-delay come to **216,064 bytes** per instance at 48 kHz — inside the 256 KB above which
+H4 would have had to add a `DelayLine::with_exact_capacity` that wraps by conditional
+subtraction instead.
+
+**The reverb's comb bank runs six bits above the sample**, the same device as the EQ's
+cascade and IT's voice filter, and here it costs *nothing*: Freeverb's input gain of 0.015
+absorbs the multiplication and the wet scale absorbs the division, so there is no extra
+multiply per frame. It buys two things. Fixed-versus-float agreement on a drum loop moves
+from 60.6 dB to **84.4 dB**; and the rounding fixed points of the Q8.24 feedback multiply —
+`round(v · 0.98) == v` for every `|v| ≤ 24`, the same trap H3's delay found — move from
+−62.7 dBFS to −98.7 dBFS. They are then flushed to silence as the delay's are, so an idle
+reverb's noise floor is **exactly zero** rather than merely inaudible. The eight combs are
+summed in `i32` and scaled by exactly `2^-3` through `mul_q24`, so the wet signal is their
+*mean*: integer addition is associative, so a wide sum may reduce them in any order.
+
+**The compressor's ballistics smooth the gain, not the level.** The textbook feed-forward
+arrangement puts the attack/release one-pole on the level and computes the gain from the
+smoothed level; that cannot meet a timing requirement stated about the gain, because the
+gain is a *logarithm* of the level and a logarithm compresses the end of an exponential
+approach — the same one-pole then reaches 90 % of its gain change in 1.5 τ on attack and
+3.6 τ on release. The one-pole therefore sits on the reduction in **Q8 centi-decibels**
+(Q8 because near the end of a long attack the step is smaller than a centi-decibel, and
+rounding each step to the nearest one measurably slows the ballistics), driven at the
+control rate — the sample rate divided by the 32-frame interval — so `attack` and `release`
+mean the milliseconds they say and 90 % lands at 2.3 τ either way. Measured on a −20 → 0 dBFS
+step at threshold −20 / 4:1, frames to 90 % of the reduction against the continuous ideal:
+1023 against 1014 at 10 ms, 2032 against 2029 at 20 ms, 5087 against 5071 at 50 ms, and
+10143 against 10143 at 100 ms.
+
+**Peak, not RMS, and no look-ahead.** The compressor sits in the master chain ahead of the
+mixer's soft limiter and must not fight it, which means catching the peaks the limiter would
+otherwise have to; on this crate's drum-loop fixture the crest factor is 9.8 dB, which is
+what an RMS detector at the same threshold would hand the limiter unseen. There is no delay
+line in the effect at all, so the master chain does not delay the mix against the scope taps
+and the telemetry (§9.3). What replaces look-ahead is taking the peak of the interval about
+to be processed. Gain reduction is published through `ParamId::GAIN_REDUCTION`, a reserved
+**meter** identifier at or above `ParamId::METER_BASE` that a host reads like a parameter
+and can never write, and which is deliberately not in `InsertDescriptor::params`.
+
+**32 frames, and what actually decided it.** Compared against a per-frame gain computer on a
+click train riding a steady carrier at the fastest attack the effect offers, the agreement
+is 15.1 dB at 2 frames, 10.2 at 4, 5.5 at 8, 3.2 at 16, 2.1 at 32, 1.6 at 64 and 1.4 at a
+whole block: monotone, with **no knee**, because at a 1 ms attack the interval's own peak
+hold is comparable to the attack. What the interval does decide is the timing quantisation
+of attack and release — two intervals, since an update's value is reached one interval after
+it is computed — which at 32 frames is 6 % of the default 10 ms attack's 2.3 τ and at a
+whole block would be 25 %.
+
+**Measured, on both paths** (`crates/starplayer-dsp/src/effects/`): an impulse into a 50 %
+room decays monotonically per 100 ms window with an **RT60 of 1.14 s** fixed and 1.13 s
+float; the smallest room with full damping is at −75.4 dBFS averaged over everything past
+300 ms, having crossed −60 dBFS at about 270 ms; a frozen tail holds within 0.06 dB over
+five seconds. The compressor's static curve at threshold −20 / 4:1 / hard knee puts −40,
+−20, −10 and 0 dBFS out at −40.00, −20.00, −17.50 and −15.00 dBFS on both paths, and the
+gain-reduction meter reads back the 15.00 dB the output actually lost. Fixed against float
+by segmental SNR on a drum loop: reverb **84.4 dB**, compressor **79.2 dB**, against a
+50 dB requirement. `starplayer_dsp::DspSample` gained `saturate_at` (the reverb's comb state
+saturates at the headroom's own full scale) and `magnitude_i32` (the single place the
+compressor's two paths differ); no float enters the fixed path in either effect.
+
 #### IT's resonant filter is a *voice*-level filter, not an insert (M6-G2, landed)
 
 It sits inside the render kernel, between the resampler and the pan gains — which is where
