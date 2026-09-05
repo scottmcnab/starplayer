@@ -47,3 +47,66 @@ every module that contains it, which in a real MOD library is a large multiplier
 ## Exit criteria
 
 None — this milestone is a backlog. Each pulled item has its own.
+
+## The task graph (planned 2026-09-05)
+
+Planned at the owner's request while M7 was landing. Task letter **K**. Each item is still
+independently pullable; the order below is the one that answers Q4 cheapest first.
+Decisions taken while planning:
+
+1. **Q4 is answered by K1, and the expected answer is "the trait survives with one
+   change".** `Instrument` today is `&self` because both sample instruments are immutable
+   knowledge about a module; a wavetable morph, an ADSR and an FM operator stack all need
+   per-voice state that outlives `note_on`. The format crates solve this with a parallel
+   array indexed by `VoiceId::index()` and validated by the generation (§5.3), and that
+   array needs `&mut self` on `control_tick`, `note_on`, `note_off` and `set_bend`. The
+   rack owns each instrument as a `Box<dyn Instrument>`, so `&mut self` costs nothing.
+   K1 makes that change with the first instrument that needs it and records it in §5.3;
+   if the wavetable turns out not to need it, K1 says so and K2 makes it instead.
+2. **Two ways to be a non-sample instrument, and both are used.** *Sample-backed*
+   synthesis renders its waveforms into a `Module`'s PCM blob at build time (wavetables
+   are single-cycle looped samples; SoundFonts are samples) and drives ordinary voices —
+   nothing in the mixer changes and the goldens cannot move. *Generator* synthesis (FM,
+   SID, Karplus-Strong) needs a per-frame oscillator, so K2 adds a `VoiceSource` to the
+   mixer's `Voice`: `Sample(SampleRegion)` or `Generator(GeneratorState)`, a fixed-size
+   enum of built-in generators with no `dyn` and no allocation, rendered by a second arm of
+   `accumulate_voice` while the sample arm stays textually what it is. A generator voice
+   still goes through the gain ramps, the IT resonant filter and the pan law, so an FM
+   voice gets a resonant filter for free.
+3. **Generators are integer-only.** A generator produces `i16`-scale `i32` samples from
+   tables (`sin_q15`, `pow2_q24` from M7-H2) on both mix paths; the float path converts
+   the integer sample. That keeps every generator bit-identical across targets and both
+   paths, at the cost of the float path hearing 16-bit-quantised synthesis, which is what
+   the hardware these emulate did anyway.
+4. **A shared `Adsr` runner lives in `starplayer-synth`**, not in the engine: the engine
+   still runs no envelope (§5.3). Format-driven MIDI instruments (M11) keep their formats'
+   envelopes; synths use the ADSR. Advanced on `Instrument::control_tick`, so it runs at
+   the MIDI source's ~1 ms control rate (§5.4).
+5. **`InstrumentBank` is a `Module` with no patterns.** M11 and K4 (SoundFont) should share
+   one "where instruments come from" concept; whichever lands first introduces
+   `starplayer_model::InstrumentBank` as a newtype over `Module` (samples, instruments,
+   `format_data`, no orders) plus a manifest, and the rack's `for_bank` beside
+   `for_module`. K4 does not wait for M11.
+6. **Enhancement is a load-time transform with two real implementations** (goal 8): a
+   windowed-sinc upsampler and a loop-seam smoother, both deterministic, both in a
+   std-capable crate the builder calls before the PCM is committed. Goldens never see an
+   enhancer; an enhanced render is a different configuration and gets a different name.
+
+| ID | Task | Depends on | Parallel with | Model |
+|---|---|---|---|---|
+| K1 | [Wavetable instrument, the `Adsr` runner, and Q4](M10-task-K1-wavetable-and-q4.md) | M4 (landed), M7-H2 (tables) | K5 | Opus |
+| K2 | [Generator voices in the mixer, and the FM instrument](M10-task-K2-generator-voices-and-fm.md) | K1 | K5 | Opus |
+| K3 | [SID voice emulation as an instrument](M10-task-K3-sid-instrument.md) | K2 | K4, K6 | Opus |
+| K4 | [SoundFont 2 → `InstrumentBank`](M10-task-K4-soundfont.md) | K1 | K3, K6 | Opus |
+| K5 | [The sample-enhancement API](M10-task-K5-sample-enhancement.md) | — | K1, K2 | Sonnet |
+| K6 | [Karplus-Strong plucked string](M10-task-K6-karplus-strong.md) | K2 | K3, K4 | Sonnet |
+
+```
+K5 ──────────────────────────────────┐
+K1 ──→ K2 ──→ K3 ∥ K6                │
+   └──→ K4                            ┘
+```
+
+Granular and spectral synthesis stay a backlog row: their control-rate story (grain
+scheduling at sub-millisecond rates, spectral frames at hop size) is the thing Q4 cannot
+settle from these six, and a task file written now would be speculation.
