@@ -118,6 +118,15 @@ against the arms in `crates/starplayer-host/src/engine.rs` and the wasm host (H5
   still reads below `loop_start`, and a sustain-loop sample's guard is real tail PCM rather
   than a loop copy, so a wide kernel plays up to three frames of tail per wrap. Fixing the
   second needs `SampleRegion` to say whether its guard is a continuation. Not scheduled.
+- **A vectorised steady `mix_run`** (H6 deliverable 6): prototyped and measured at **1.65x**
+  on x86-64, bit-identical, but not landed. It is valid only for `FloatPath` + `Linear`, and
+  reaching it needs two new trait seams — a four-at-a-time `Interpolate` method and a
+  four-at-a-time `MixPath::accumulate` — or the run loop moved into `MixPath`. That is a
+  change to two load-bearing traits and deserves its own task with the trait change stated
+  up front; the numbers are in H6's research resolution. Estimated at about 6% of a
+  voice-bound render and near nothing on an effect-bound one.
+- **aarch64 and wasm benchmark numbers** for `examples/bench_render` (H6 deliverable 4). The
+  x86-64 numbers are recorded; neither other host was available in the H6 worktree.
 - **IT loader pattern-blob amplification**: a fuzz-smoke run found a 37 KB input expanding to
   a 23.6 MB pattern blob (4100 patterns, zero samples) that trips the harness memory cap. The
   IT loader lacks the aggregate decoded-pattern budget the S3M loader has. Deserves its own
