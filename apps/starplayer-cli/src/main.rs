@@ -89,7 +89,12 @@ use clap::{Parser, Subcommand};
 #[command(name = "starplayer", version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+    /// Print every insert effect this build can install (M7-H7), its parameters, their
+    /// units, ranges and defaults, and exit. Needs no subcommand; `render --list-effects`
+    /// and `play --list-effects` do the same for a caller already typing one of those.
+    #[arg(long)]
+    list_effects: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -107,7 +112,19 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let result = match cli.command {
+    // A top-level `starplayer --list-effects` needs no subcommand at all (M7-H7); `render
+    // --list-effects` and `play --list-effects` are each subcommand's own copy of the same
+    // flag, for a caller already typing one of those.
+    if cli.list_effects {
+        print!("{}", insert_arg::list_effects());
+        return ExitCode::SUCCESS;
+    }
+    let Some(command) = cli.command else {
+        eprintln!("starplayer: no subcommand given; see --help");
+        return ExitCode::FAILURE;
+    };
+
+    let result = match command {
         Command::Info(args) => info::run(args),
         Command::Render(args) => render::run(args),
         Command::Trace(args) => trace::run(args),

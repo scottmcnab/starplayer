@@ -58,7 +58,18 @@ fn an_insert_changes_the_rendered_audio() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
-/// `--list-effects` needs no `file` or `-o`, and prints every effect's name.
+/// A top-level `starplayer --list-effects` needs no subcommand at all.
+#[test]
+fn top_level_list_effects_needs_no_subcommand() {
+    let cli_output = Command::new(env!("CARGO_BIN_EXE_starplayer-cli")).args(["--list-effects"]).output().expect("the CLI binary runs");
+    assert!(cli_output.status.success(), "--list-effects exited with {}: {}", cli_output.status, String::from_utf8_lossy(&cli_output.stderr));
+    let stdout = String::from_utf8_lossy(&cli_output.stdout);
+    for name in ["gain", "eq", "delay", "chorus", "reverb", "compressor"] {
+        assert!(stdout.contains(name), "top-level --list-effects did not list `{name}`:\n{stdout}");
+    }
+}
+
+/// `render --list-effects` needs no `file` or `-o`, and prints every effect's name.
 #[test]
 fn list_effects_needs_no_file_and_names_every_effect() {
     let cli_output = Command::new(env!("CARGO_BIN_EXE_starplayer-cli")).args(["render", "--list-effects"]).output().expect("the CLI binary runs");
