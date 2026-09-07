@@ -19,19 +19,20 @@
 //! `EndOfSongPolicy::Loop`, which wraps back to the restart order and keeps generating
 //! audio if the song's own pass is shorter than ten seconds.
 //!
-//! For four of the five owner S3Ms `--path fixed --depth 16 --mono --rate 44100
-//! --max-seconds 10 --at-end cut` happens to reproduce a golden anyway, because their own
-//! pass is *longer* than ten seconds: the render never reaches the natural end, so
-//! `frames_for`'s cap at `max_frames` and the golden's raw frame count agree. `MOVEMENT.
-//! S3M`'s pass is 9.32 s, so that recipe cuts its render 29,971 frames short of the
-//! golden's window — a real discrepancy, not a rounding difference. Reaching the golden
-//! for a song of *any* length through the general knobs alone would need a `--repeat`
-//! count large enough to guarantee `body >= max_frames` regardless of the song's own
-//! length, which is exactly the kind of flag surface this task's research point warns
-//! against ("keeps the flag surface honest"). `--golden` is the dedicated switch instead:
-//! it bypasses `render_song` entirely and calls `render_fixed_mono` /
-//! `canonical_sha256` — the literal functions the goldens are generated from — so every
-//! module reproduces its golden exactly, regardless of how long one pass of it is.
+//! For a song whose own pass is *longer* than ten seconds `--path fixed --depth 16 --mono
+//! --rate 44100 --max-seconds 10 --at-end cut` happens to reproduce its golden anyway: the
+//! render never reaches the natural end, so `frames_for`'s cap at `max_frames` and the
+//! golden's raw frame count agree. A song whose pass is *shorter* than ten seconds cannot
+//! be reproduced that way — `--at-end cut` stops the render at the song's own end, leaving
+//! it short of the golden's window by however many frames the golden kept generating past
+//! it, a real discrepancy rather than a rounding difference. Reaching the golden for a
+//! song of *any* length through the general knobs alone would need a `--repeat` count
+//! large enough to guarantee `body >= max_frames` regardless of the song's own length,
+//! which is exactly the kind of flag surface this task's research point warns against
+//! ("keeps the flag surface honest"). `--golden` is the dedicated switch instead: it
+//! bypasses `render_song` entirely and calls `render_fixed_mono` / `canonical_sha256` —
+//! the literal functions the goldens are generated from — so every module reproduces its
+//! golden exactly, regardless of how long one pass of it is.
 
 use std::path::{Path, PathBuf};
 

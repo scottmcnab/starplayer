@@ -30,7 +30,7 @@ const REPOSITORY_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const DEV_SERVER = join(REPOSITORY_ROOT, 'apps/starplayer-web/dev-server.mjs');
 const DIST = join(REPOSITORY_ROOT, 'apps/starplayer-web/dist');
 const FIRST_MODULE = 'REFLEX.S3M';
-const SECOND_MODULE = 'MOVEMENT.S3M';
+const SECOND_MODULE = 'PETRI.S3M';
 const PHONE_VIEWPORT = { width: 390, height: 844 };
 
 const options = parseArguments(process.argv.slice(2));
@@ -801,7 +801,7 @@ async function run(executable, mode) {
         assert.equal(pickerState.chip, 'playing', 'the current module keeps playing behind the picker');
         const pickerEntries = await page.evaluate("return [...document.getElementById('archive-entries').options].map((option) => option.textContent);");
         assert.equal(pickerEntries.length, 2);
-        assert.match(pickerEntries[1], /MOVEMENT\.S3M/);
+        assert.match(pickerEntries[1], /PETRI\.S3M/);
         await page.waitFor('playback to advance behind the picker', `document.getElementById('row').textContent !== ${JSON.stringify(pickerState.row)}`);
         await page.evaluate("document.getElementById('archive-cancel').click(); return true;");
         const afterCancel = await page.evaluate(READ_STATE);
@@ -810,7 +810,7 @@ async function run(executable, mode) {
         await loadFile(page, twoModuleZip, 'two-modules.zip');
         await page.waitFor('the reopened archive picker', "document.getElementById('archive-picker').hidden === false");
         await page.evaluate("document.getElementById('archive-entries').selectedIndex = 1; document.getElementById('archive-load').click(); return true;");
-        await page.waitFor('the selected second ZIP module', "document.getElementById('module-detail').textContent.includes('MOVEMENT.S3M (from two-modules.zip)')");
+        await page.waitFor('the selected second ZIP module', "document.getElementById('module-detail').textContent.includes('PETRI.S3M (from two-modules.zip)')");
         await page.waitFor('the retired module to be collected', "parseInt(document.getElementById('retired').textContent, 10) >= 1");
         await delay(2000);
         const swapped = await page.evaluate(READ_STATE);
@@ -835,7 +835,7 @@ async function run(executable, mode) {
         assert.equal(trackPicker.buttonHidden, false, 'the retained-archive load button stays on the page');
         assert.match(trackPicker.options[0], /two-modules\.zip/, 'the placeholder names the retained archive');
         assert.deepEqual(trackPicker.options.slice(1), pickerEntries, 'the dropdown lists what the modal listed');
-        assert.match(trackPicker.selected, /MOVEMENT\.S3M/, 'the playing entry is selected in the dropdown');
+        assert.match(trackPicker.selected, /PETRI\.S3M/, 'the playing entry is selected in the dropdown');
 
         await page.evaluate("document.getElementById('archive-tracks').value = '0'; document.getElementById('load-archive-track').click(); return true;");
         await page.waitFor('the other ZIP track, loaded from the dropdown', "document.getElementById('module-detail').textContent.includes('REFLEX.S3M (from two-modules.zip)')");

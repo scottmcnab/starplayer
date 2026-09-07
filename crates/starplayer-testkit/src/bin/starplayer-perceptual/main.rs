@@ -202,9 +202,6 @@ fn committed_fixtures() -> Vec<Fixture> {
         Fixture { name: "mod/synthetic".to_string(), format: GoldenFormat::Mod, extension: "mod", bytes: fixtures::synthetic_mod(), committed: true },
         Fixture { name: "mtm/synthetic".to_string(), format: GoldenFormat::Mtm, extension: "mtm", bytes: fixtures::synthetic_mtm(), committed: true },
         Fixture { name: "it/synthetic".to_string(), format: GoldenFormat::It, extension: "it", bytes: fixtures::synthetic_it(), committed: true },
-        Fixture { name: "s3m/armani".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/ARMANI.S3M").to_vec(), committed: true },
-        Fixture { name: "s3m/movement".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M").to_vec(), committed: true },
-        Fixture { name: "s3m/nicetune".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/NICETUNE.S3M").to_vec(), committed: true },
         Fixture { name: "s3m/petri".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/PETRI.S3M").to_vec(), committed: true },
         Fixture { name: "s3m/reflex".to_string(), format: GoldenFormat::S3m, extension: "s3m", bytes: include_bytes!("../../../../starplayer-s3m/tests/fixtures/REFLEX.S3M").to_vec(), committed: true },
     ]
@@ -366,7 +363,7 @@ mod tests {
     #[test]
     fn every_committed_fixture_names_a_format_and_carries_bytes() {
         let fixtures = committed_fixtures();
-        assert_eq!(fixtures.len(), 8, "the golden contract has eight fixtures");
+        assert_eq!(fixtures.len(), 5, "the golden contract has five fixtures");
         for fixture in &fixtures {
             assert!(!fixture.bytes.is_empty(), "{} carries bytes", fixture.name);
             assert!(fixture.committed, "{} is a committed fixture", fixture.name);

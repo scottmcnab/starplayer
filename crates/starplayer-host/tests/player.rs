@@ -15,7 +15,7 @@ use starplayer::engine::{EndReason, InsertTarget, MixPathKind, MixerMode, Output
 use starplayer::rt::Arc as RtArc;
 use starplayer_host::{AudioSpec, ManualBackend, ManualDriver, Player, SeekKind, TRANSPORT_RAMP_FRAMES};
 
-const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/NICETUNE.S3M");
+const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M");
 const REFLEX: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
 
 /// The six block sizes design goal 3 names, plus the two the engine's own determinism test
@@ -236,7 +236,7 @@ fn the_song_is_scanned_at_the_rate_the_device_agreed_to_not_the_rate_that_was_as
     player.load(FIXTURE).expect("the fixture loads");
     let at_44100 = player.song_length().expect("scanned");
     let scanned = Arc::clone(player.scan().expect("the player keeps the scan"));
-    assert_eq!(scanned.timeline.end(), EndReason::Ended, "NICETUNE runs out of order list");
+    assert_eq!(scanned.timeline.end(), EndReason::Ended, "PETRI runs out of order list");
 
     // A song's length in *frames* is a function of the output rate, so the same song at
     // twice the rate is twice as many frames — within a tick.

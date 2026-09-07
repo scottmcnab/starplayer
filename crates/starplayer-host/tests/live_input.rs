@@ -11,7 +11,7 @@ use starplayer::core::{Event, Frame, InstrumentId, Note, U0F16};
 use starplayer::engine::{MixerMode, RENDER_QUANTUM};
 use starplayer_host::{AudioSpec, HostError, ManualBackend, ManualDriver, Player};
 
-const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/NICETUNE.S3M");
+const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M");
 
 fn open(spec: AudioSpec) -> (ManualBackend, Player, ManualDriver) {
     let mut backend = ManualBackend::new();
@@ -239,7 +239,9 @@ fn seek_and_disabling_jam_preserve_the_song_position() {
     player.seek_frame(10_000).expect("the slot-0 seek mailbox remains reachable");
     driver.render(&mut output);
     let after_seek = player.song_frame();
-    assert!((10_000..20_000).contains(&after_seek), "the jammed tracker consumed the seek: {after_seek}");
+    // `song_frame` reports a tick boundary, and the fixture's tick is 857 frames at
+    // 48 kHz, so the seek lands on the tick just below the request rather than on it.
+    assert!((9_000..20_000).contains(&after_seek), "the jammed tracker consumed the seek: {after_seek}");
 
     player.jam(false).expect("jam mode disables at the sounding position");
     driver.render(&mut output);

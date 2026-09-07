@@ -8,7 +8,7 @@ const bundle = await readFile(new URL('starplayer-worklet.js', root), 'utf8').ca
 });
 const wasmBytes = await readFile(new URL('starplayer_host_wasm_bg.wasm', root));
 const firstFixture = await readFile(new URL('modules/REFLEX.S3M', root));
-const secondFixture = await readFile(new URL('modules/MOVEMENT.S3M', root));
+const secondFixture = await readFile(new URL('modules/PETRI.S3M', root));
 
 function syntheticMod() {
     const headerBytes = 1084;

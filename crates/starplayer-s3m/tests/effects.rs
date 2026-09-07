@@ -103,8 +103,8 @@ fn reflex_renders_ten_seconds_byte_identically_at_every_host_block_size() {
 }
 
 #[test]
-fn movement_renders_ten_seconds_byte_identically_at_every_host_block_size() {
-    assert_real_module_is_deterministic(include_bytes!("fixtures/MOVEMENT.S3M"), "MOVEMENT.S3M");
+fn petri_renders_ten_seconds_byte_identically_at_every_host_block_size() {
+    assert_real_module_is_deterministic(include_bytes!("fixtures/PETRI.S3M"), "PETRI.S3M");
 }
 
 #[test]

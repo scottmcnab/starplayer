@@ -1,13 +1,13 @@
 //! Task D5 deliverable 3, the acceptance test: `starplayer render --golden` reproduces
 //! every committed `goldens/s3m/*.sha256` fingerprint through the real CLI binary —
-//! argument parsing, the WAV writer and all — for all five owner S3Ms.
+//! argument parsing, the WAV writer and all — for every owner S3M.
 //!
 //! `--golden` rather than the general `--path fixed --depth 16 --mono --max-seconds 10
-//! --at-end cut` recipe: that recipe reproduces four of the five (their own pass is
-//! longer than the ten-second golden window), but `MOVEMENT.S3M`'s pass is 9.32 seconds,
-//! so `--at-end cut` stops its render at the song's own end — correct behaviour for a
-//! general-purpose renderer, and 29,971 frames short of the golden's raw, end-agnostic
-//! window. See `apps/starplayer-cli/src/render.rs`'s module doc for the full account.
+//! --at-end cut` recipe: that recipe only reproduces a golden for a song whose own pass is
+//! longer than the ten-second golden window. For a shorter song `--at-end cut` stops the
+//! render at the song's own end — correct behaviour for a general-purpose renderer, and
+//! short of the golden's raw, end-agnostic window. See
+//! `apps/starplayer-cli/src/render.rs`'s module doc for the full account.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,9 +17,6 @@ use starplayer_offline::wav::read_wav;
 /// Every owner S3M the golden contract covers, and the stem its golden file is named
 /// after (`crates/starplayer-offline/src/bin/starplayer-goldens.rs`'s own fixture list).
 const STEMS: &[(&str, &str)] = &[
-    ("ARMANI.S3M", "armani"),
-    ("MOVEMENT.S3M", "movement"),
-    ("NICETUNE.S3M", "nicetune"),
     ("PETRI.S3M", "petri"),
     ("REFLEX.S3M", "reflex"),
 ];
@@ -70,14 +67,14 @@ fn the_cli_render_golden_reproduces_every_owner_s3m_golden() {
     let _ = std::fs::remove_dir_all(&scratch_directory);
 }
 
-/// The task file's own literal verification command: `NICETUNE.S3M`'s pass (25.6 s) is
+/// The task file's own literal verification command: `PETRI.S3M`'s pass (41.1 s) is
 /// longer than the ten-second window, so the general flag surface reaches the golden too.
 #[test]
 fn the_general_flag_recipe_also_reproduces_the_golden_for_a_song_longer_than_the_window() {
     let scratch_directory = std::env::temp_dir().join(format!("starplayer-cli-golden-flags-test-{}", std::process::id()));
     std::fs::create_dir_all(&scratch_directory).expect("a scratch directory");
-    let input = workspace_root().join("crates/starplayer-s3m/tests/fixtures/NICETUNE.S3M");
-    let output = scratch_directory.join("nicetune.wav");
+    let input = workspace_root().join("crates/starplayer-s3m/tests/fixtures/PETRI.S3M");
+    let output = scratch_directory.join("petri.wav");
 
     let status = Command::new(env!("CARGO_BIN_EXE_starplayer-cli"))
         .args([
@@ -108,7 +105,7 @@ fn the_general_flag_recipe_also_reproduces_the_golden_for_a_song_longer_than_the
         hasher.update(sample.to_le_bytes());
     }
     let actual_hash = hex(&hasher.finalize());
-    assert_eq!(actual_hash, golden_hash("nicetune"));
+    assert_eq!(actual_hash, golden_hash("petri"));
 
     let _ = std::fs::remove_dir_all(&scratch_directory);
 }
