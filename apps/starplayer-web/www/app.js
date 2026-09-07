@@ -1841,6 +1841,34 @@ function effectName(code, param) {
     return EFFECT_NAMES.get(`${code}.${param >> 4}`) || EFFECT_NAMES.get(`${code}`) || '';
 }
 
+// The packaging step decides what, if anything, is bundled: `cargo xtask wasm` writes
+// `modules/index.json` beside the fixtures, `cargo xtask wasm --pages` ships neither. A
+// 404 is therefore the normal state of the public build, not an error worth reporting —
+// the menu and its button simply are not part of that page.
+async function populateFixtureMenu() {
+    let names = null;
+    try {
+        const response = await fetch('modules/index.json');
+        if (response.ok) {
+            const parsed = await response.json();
+            if (Array.isArray(parsed)) names = parsed;
+        }
+    } catch {
+        names = null;
+    }
+
+    if (names === null || names.length === 0) {
+        elements.fixturePicker.hidden = true;
+        elements.loadFixture.hidden = true;
+        return;
+    }
+    for (const name of names) {
+        const option = document.createElement('option');
+        option.textContent = String(name);
+        elements.fixturePicker.append(option);
+    }
+}
+
 async function loadFixture() {
     const name = elements.fixturePicker.value;
     if (!name) {
@@ -1967,6 +1995,10 @@ updateOutputPanel();
 updateLiveInputPanel();
 refreshOutputDevices().catch(() => {});
 requestAnimationFrame(refresh);
+
+// The fixture menu is part of start-up, not a background nicety: the harness picks an
+// entry the moment `playerReady` appears, so the fetch has to have settled before it does.
+await populateFixtureMenu();
 
 // `app.js` is a module and therefore deferred. This is the one honest signal that its
 // listeners are attached, which is what the headless harness waits on before clicking.

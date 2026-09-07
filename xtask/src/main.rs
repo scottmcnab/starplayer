@@ -273,7 +273,9 @@ fn print_usage() {
     println!("  perceptual [--corpus PATH]... [--threshold-snr DB] [--offline]");
     println!("                     score the float render against libopenmpt's; nightly report, never a gate");
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
-    println!("  wasm [--serve]     build and package the web player into apps/starplayer-web/dist");
+    println!("  wasm [--serve] [--pages]   build and package the web player into apps/starplayer-web/dist");
+    println!("                     --pages packages it for GitHub Pages: no bundled fixtures, and index.html");
+    println!("                     loads the coi-serviceworker shim that supplies the COOP/COEP headers Pages cannot");
     println!("  serve [--port N] [--host ADDR]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
     println!("                     --host 0.0.0.0 exposes it to the LAN; add --tls [--tls-san ip,ip] there, since AudioWorklet");
     println!("                     and SharedArrayBuffer only exist in a secure context (https or localhost)");
@@ -1819,6 +1821,17 @@ const DEV_SERVER_SCRIPT: &str = "apps/starplayer-web/dev-server.mjs";
 const FIXTURE_SOURCE_DIRECTORY: &str = "crates/starplayer-s3m/tests/fixtures";
 /// Where those fixtures are served from, relative to the document root.
 const PACKAGED_MODULE_DIRECTORY: &str = "modules";
+/// The manifest the page fetches to discover what was packaged. Its absence is what tells
+/// the page to hide the fixture menu, which is the normal state of the Pages build.
+const PACKAGED_MODULE_INDEX: &str = "index.json";
+
+/// GitHub Pages cannot send COOP/COEP, so the Pages build — and only the Pages build —
+/// loads the `coi-serviceworker` shim in place of this marker line in `index.html`.
+const COI_MARKER: &str = "<!-- xtask:coi -->";
+const COI_SHIM_SOURCE: &str = "coi-serviceworker.js";
+const COI_SCRIPT_TAG: &str = "<script src=\"coi-serviceworker.js\"></script>";
+/// The one page the `--pages` post-processing rewrites.
+const WEB_INDEX_PAGE: &str = "index.html";
 
 /// The crate compiled to wasm, and the file names `wasm-bindgen` derives from it.
 const WASM_CRATE: &str = "starplayer-host-wasm";
@@ -1855,14 +1868,25 @@ const DEFAULT_SERVE_HOST: &str = "127.0.0.1";
 /// second place where the `wasm-bindgen` version is decided. `cargo build` plus
 /// `wasm-bindgen-cli` is the whole job, and the version pin then lives in exactly one
 /// place — `[workspace.dependencies]` — which this function checks the CLI against.
+///
+/// `--pages` packages the same build for GitHub Pages, which differs in exactly two ways:
+/// the S3M fixture corpus is not shipped (its licensing is deferred, so it stays a testing
+/// artefact), and `index.html`'s `<!-- xtask:coi -->` marker becomes the
+/// `coi-serviceworker` script tag, since Pages cannot send the COOP/COEP headers
+/// `SharedArrayBuffer` needs. The development build leaves both alone.
 fn run_wasm(arguments: &[String]) -> bool {
     let mut serve_afterwards = false;
+    let mut pages_build = false;
     let mut port = DEFAULT_SERVE_PORT;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--serve" => {
                 serve_afterwards = true;
+                index += 1;
+            }
+            "--pages" => {
+                pages_build = true;
                 index += 1;
             }
             "--port" => {
@@ -1936,10 +1960,10 @@ fn run_wasm(arguments: &[String]) -> bool {
     if !build_page_loader(&root, &output_directory) {
         return false;
     }
-    if !copy_web_sources(&root, &output_directory) {
+    if !copy_web_sources(&root, &output_directory, pages_build) {
         return false;
     }
-    if !copy_fixture_modules(&root, &output_directory) {
+    if !pages_build && !copy_fixture_modules(&root, &output_directory) {
         return false;
     }
     if !report_output(&output_directory) {
@@ -2096,7 +2120,10 @@ fn build_worklet_bundle(root: &Path, output_directory: &Path) -> bool {
 
 /// Copy the hand-written page into the output directory. Flat by design: this is four
 /// files, and a recursive copy would only hide that.
-fn copy_web_sources(root: &Path, output_directory: &Path) -> bool {
+///
+/// For a Pages build `index.html` is rewritten on the way through rather than copied, so
+/// the shim's script tag exists only in the artefact GitHub serves and never in `www/`.
+fn copy_web_sources(root: &Path, output_directory: &Path, pages_build: bool) -> bool {
     let source_directory = root.join(WEB_SOURCE_DIRECTORY);
     let entries = match std::fs::read_dir(&source_directory) {
         Ok(entries) => entries,
@@ -2116,6 +2143,12 @@ fn copy_web_sources(root: &Path, output_directory: &Path) -> bool {
         if WORKLET_ONLY_SOURCES.iter().any(|only| std::ffi::OsStr::new(only) == name) {
             continue;
         }
+        if pages_build && std::ffi::OsStr::new(WEB_INDEX_PAGE) == name {
+            if !write_pages_index(&path, &output_directory.join(name)) {
+                all_succeeded = false;
+            }
+            continue;
+        }
         if let Err(error) = std::fs::copy(&path, output_directory.join(name)) {
             eprintln!("xtask wasm: cannot copy `{}`: {error}", path.display());
             all_succeeded = false;
@@ -2124,9 +2157,39 @@ fn copy_web_sources(root: &Path, output_directory: &Path) -> bool {
     all_succeeded
 }
 
+/// Swap `index.html`'s isolation marker for the shim's script tag. A missing marker is a
+/// hard failure for the same reason `build_worklet_bundle` refuses an unfamiliar glue
+/// shape: the build would otherwise succeed and produce a page that quietly falls back to
+/// `postMessage` on the live site, which is exactly what the shim is there to prevent.
+fn write_pages_index(source: &Path, destination: &Path) -> bool {
+    let markup = match std::fs::read_to_string(source) {
+        Ok(markup) => markup,
+        Err(error) => {
+            eprintln!("xtask wasm: cannot read `{}`: {error}", source.display());
+            return false;
+        }
+    };
+    if !markup.contains(COI_MARKER) {
+        eprintln!("xtask wasm --pages: `{}` has no `{COI_MARKER}` line to replace.", source.display());
+        eprintln!("     the Pages build loads {COI_SHIM_SOURCE} in its place; restore the marker in <head>, before the stylesheet link.");
+        return false;
+    }
+    let rewritten = markup.replace(COI_MARKER, COI_SCRIPT_TAG);
+    if let Err(error) = std::fs::write(destination, rewritten) {
+        eprintln!("xtask wasm: cannot write `{}`: {error}", destination.display());
+        return false;
+    }
+    println!("     pages build: {COI_MARKER} → {COI_SCRIPT_TAG}");
+    true
+}
+
 /// Ship the five licensed test modules as one-click smoke fixtures. The source remains
 /// the format crate's corpus; packaging copies it rather than creating a second checked-in
 /// set that could drift.
+///
+/// `index.json` beside them is the page's only way to know what was packaged: the fixture
+/// menu is built from it, and a build that skips this step (`--pages`) leaves the page
+/// with a 404 it reads as "no fixtures" rather than as an error.
 fn copy_fixture_modules(root: &Path, output_directory: &Path) -> bool {
     let source = root.join(FIXTURE_SOURCE_DIRECTORY);
     let destination = output_directory.join(PACKAGED_MODULE_DIRECTORY);
@@ -2141,7 +2204,15 @@ fn copy_fixture_modules(root: &Path, output_directory: &Path) -> bool {
             return false;
         }
     }
-    println!("     packaged {} S3M fixtures", names.len());
+    // Hand-rolled rather than pulling in a JSON crate: xtask stays dependency-free, and
+    // these names are fixed ASCII file names with nothing to escape.
+    let manifest = format!("[{}]\n", names.map(|name| format!("\"{name}\"")).join(", "));
+    let manifest_path = destination.join(PACKAGED_MODULE_INDEX);
+    if let Err(error) = std::fs::write(&manifest_path, manifest) {
+        eprintln!("xtask wasm: cannot write `{}`: {error}", manifest_path.display());
+        return false;
+    }
+    println!("     packaged {} S3M fixtures and {PACKAGED_MODULE_DIRECTORY}/{PACKAGED_MODULE_INDEX}", names.len());
     true
 }
 

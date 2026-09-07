@@ -1,0 +1,71 @@
+# Publishes the web player to https://scottmcnab.github.io/starplayer/.
+#
+# It runs off CI rather than off the push, so nothing reaches the public site until the
+# `CI` workflow has gone green on `main`; `workflow_dispatch` is the manual escape hatch.
+# The build is `cargo xtask wasm --pages`: no bundled fixtures, and `index.html` loads the
+# coi-serviceworker shim, since GitHub Pages cannot send the COOP/COEP headers
+# `SharedArrayBuffer` needs.
+#
+# The one-time repository setting this depends on is Settings → Pages → Source:
+# **GitHub Actions**.
+
+name: Pages
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build the Pages artefact
+    # A failed or cancelled CI run must not publish. A manual dispatch carries no
+    # `workflow_run` to inspect and is trusted on its own.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The commit CI actually passed on, not whatever `main` has moved to since.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Install ALSA headers (cpal's PCM host and midir's sequencer host, via alsa-sys)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the pinned wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          # Must match the exact pin in the workspace `Cargo.toml`; `cargo xtask wasm`
+          # refuses to build against any other version.
+          tool: wasm-bindgen@0.2.127
+      - run: cargo xtask wasm --pages
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/starplayer-web/dist
+
+  deploy:
+    name: deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
