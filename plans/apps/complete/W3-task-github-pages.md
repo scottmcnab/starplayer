@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player maintenance (follows W2) |
-| Status | In progress 2026-09-07 |
+| Status | Landed 2026-09-07; owner: enable Pages source (Settings → Pages → GitHub Actions) and check the live site |
 | Depends on | Web player as landed by [M1-B7](../engine/complete/M1-task-B7-web-player.md); `cargo xtask wasm` |
 | Blocks | — |
 | Recommended model | Claude Opus |
