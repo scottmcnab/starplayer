@@ -50,7 +50,7 @@ const elements = {
     mixerInterpolator: byId('mixer-interpolator'), mixerDepth: byId('mixer-depth'), mixerDither: byId('mixer-dither'),
     applyMixer: byId('apply-mixer'), modHeadphonePanning: byId('mod-headphone-panning'),
     // Insert effects (M7-H7).
-    effectsTarget: byId('effects-target'), effectsSlots: byId('effects-slots'),
+    effectsTarget: byId('effects-target'), effectsSlots: byId('effects-slots'), effectsReset: byId('effects-reset'),
     // Live input (task E6).
     liveInputStatus: byId('live-input-status'), keyboardEnable: byId('keyboard-enable'), eventLead: byId('event-lead'),
     midiInput: byId('midi-input'), enableMidi: byId('enable-midi'), midiNote: byId('midi-note'),
@@ -1285,6 +1285,22 @@ function ensureEffectsSlots() {
         select.addEventListener('change', () => onEffectSelectChanged(slot, select));
         bypassInput.addEventListener('change', () => onBypassChanged(slot, bypassInput));
     }
+    elements.effectsReset.addEventListener('click', resetEffects);
+    renderEffectSlotRows();
+}
+
+/** Put the whole panel back to its page-load state: every installed effect on every target
+ *  (master and each channel) is removed, so its parameters and bypass go with it, and the
+ *  target select returns to Master. Removal is the allocating half, so each one is a
+ *  worklet message like a manual `None` selection would be. */
+function resetEffects() {
+    if (!state.effectsSlotsBuilt) return;
+    for (const key of [...state.insertLayout.keys()]) {
+        const [target, slot] = key.split(':').map(Number);
+        state.insertLayout.delete(key);
+        sendInsertMessage('remove', target, slot, 0);
+    }
+    elements.effectsTarget.value = String(Ring.INSERT_TARGET_MASTER);
     renderEffectSlotRows();
 }
 

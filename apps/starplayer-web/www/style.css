@@ -158,6 +158,8 @@ tbody tr:last-child td { border-bottom: 0; }
 /* Insert effects (M7-H7): four ordered slots per bus, each an effect select, a Bypass
    checkbox and — generated from the wasm host's own effect descriptors, never
    hand-written here — one range input per parameter. */
+.effects-panel .panel-heading { justify-content: flex-start; }
+.effects-panel .panel-heading button { margin-left: auto; padding: 4px 10px; font-size: 12px; }
 .effects-panel > label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; margin-top: 4px; }
 .effects-panel > label select { width: 100%; }
 .effects-slots { display: grid; gap: 12px; margin-top: 14px; }
