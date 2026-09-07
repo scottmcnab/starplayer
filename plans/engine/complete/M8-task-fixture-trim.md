@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Repository hygiene before going public |
-| Status | In progress 2026-09-07 |
+| Status | Landed 2026-09-07; ARMANI history purge is an owner step before going public |
 | Depends on | — |
 | Blocks | Making the repository public (`ARMANI.S3M` must also be purged from git history, a separate owner step) |
 | Recommended model | Claude Opus |
