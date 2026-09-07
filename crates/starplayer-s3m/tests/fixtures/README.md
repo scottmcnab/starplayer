@@ -5,9 +5,13 @@ Scream Tracker 3 between 1994 and 1996. They are included as loader and effect-p
 test fixtures: they are the same modules the original DOS StarPlayer was written to play,
 so they are the closest thing this project has to a reference recording.
 
-Licensing is **deferred** and will be settled with the project licence
-(`plans/product/00-vision.md` decision 7). Until then, treat them as the owner's own
-work, included in this repository for testing only.
+They are licensed under **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0
+International** ([CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/)),
+not under the repository's code licence. You may copy, share and play them unchanged,
+with credit to Scott McNab, for non-commercial purposes; running this repository's tests
+and demos is exactly that. You may not sell them, sample them, or distribute altered
+versions. Rendering them to audio for the golden and perceptual tests is playback, not a
+derivative work.
 
 | File | Bytes | Channels | Notes |
 |---|---|---|---|

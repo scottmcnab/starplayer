@@ -82,10 +82,10 @@ Made by the project owner; do not re-litigate in derived plans.
    bar most uses, and because it continues the owner's own 1996 terms:
    `STARPLAY-2.25s/SP-CODE.DOC` granted free use of the original code with a credit
    request, which MIT's attribution clause makes enforceable. The DOS sources in
-   `STARPLAY/` and `STARPLAY-2.25s/` remain under those original terms. The **music
-   licence** for the S3M fixtures is still deferred and is a separate decision from the
-   code licence; until it is made the fixtures stay "owner's own work, for testing only"
-   (see `crates/starplayer-s3m/tests/fixtures/README.md`).
+   `STARPLAY/` and `STARPLAY-2.25s/` remain under those original terms. The **music**
+   in `crates/starplayer-s3m/tests/fixtures/` is licensed separately under
+   **CC BY-NC-ND 4.0** (decided 2026-09-07): shareable and playable unchanged with credit,
+   not for sale or reuse in other works. The root `README.md` states all three.
 
 ## What StarPlayer is not
 
