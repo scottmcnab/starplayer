@@ -1495,24 +1495,18 @@ impl ItProcessor {
         state.key_off = true;
         let instrument = state.instrument;
         let sample = state.sample;
-        let has_volume_envelope = self.instrument_mode
-            && self
-                .module
-                .instrument(InstrumentId(instrument.wrapping_sub(1)))
-                .is_some_and(|definition| definition.volume_envelope.is_some());
-        let loops = self
-            .module
-            .instrument(InstrumentId(instrument.wrapping_sub(1)))
-            .and_then(|definition| definition.volume_envelope.as_ref())
-            .is_some_and(|envelope| envelope.loop_span.is_some());
-        let fadeout = self
-            .module
-            .instrument(InstrumentId(instrument.wrapping_sub(1)))
-            .map(|definition| definition.fadeout)
-            .unwrap_or(0);
-        if let Some(state) = self.voices.get_mut(voice.index() as usize)
-            && (!has_volume_envelope || (loops && fadeout != 0))
-        {
+        // Only an instrument can fade: a sample-mode note-off releases the sustain loop
+        // and nothing else (OpenMPT `KeyOff` tests `pModInstrument` before every
+        // `CHN_NOTEFADE` it sets).
+        let definition = match self.instrument_mode {
+            true => self.module.instrument(InstrumentId(instrument.wrapping_sub(1))),
+            false => None,
+        };
+        let starts_fade = definition.is_some_and(|definition| match definition.volume_envelope.as_ref() {
+            None => true,
+            Some(envelope) => envelope.loop_span.is_some() && definition.fadeout != 0,
+        });
+        if starts_fade && let Some(state) = self.voices.get_mut(voice.index() as usize) {
             state.note_fade = true;
         }
         // The sustain loop is released here: the sample's normal loop comes back, or the
@@ -1527,11 +1521,20 @@ impl ItProcessor {
             slot.set_region(region);
             let loop_end = sample_index.loop_end() as u64;
             let loop_start = sample_index.loop_start() as u64;
-            if sample_index.loop_mode().is_looping() && loop_end > loop_start && position > loop_end {
-                let wrapped = loop_start + (position - loop_start) % (loop_end - loop_start);
-                slot.set_position(wrapped << 32);
-            } else {
-                slot.set_position(position << 32);
+            // A bidirectional main loop keeps both the position and the direction: a voice
+            // the sustain loop left running backwards past the loop end plays on in
+            // reverse until it reaches the loop (libxmp `libxmp_mixer_release`,
+            // `it_sus_after_loop_bidi.it`).
+            if sample_index.loop_mode() != LoopMode::PingPong {
+                // Any other main loop cancels a reversed sustain loop, and a position past
+                // the loop end folds back into it.
+                slot.set_reversed(false);
+                if sample_index.loop_mode().is_looping() && loop_end > loop_start && position > loop_end {
+                    let wrapped = loop_start + (position - loop_start) % (loop_end - loop_start);
+                    slot.set_position(wrapped << 32);
+                } else {
+                    slot.set_position(position << 32);
+                }
             }
         }
     }

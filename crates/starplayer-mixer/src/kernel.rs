@@ -277,7 +277,10 @@ fn normalise_position(position: i128, reverse: &mut bool, sample: SampleData<'_>
             // Below `start` while going *forwards* is the run-in before the loop, which a
             // ping-pong sample plays exactly like any other; below it while going
             // backwards is the bottom turn. Folding the first would swallow the run-in.
-            if position > turn || (*reverse && position < start) {
+            // Above `turn` while going *backwards* is a released sustain loop that left
+            // the voice past the main loop: it plays on in reverse until it reaches the
+            // loop rather than folding (libxmp `it_sus_after_loop_bidi.it`).
+            if (position > turn && !*reverse) || (*reverse && position < start) {
                 let (folded, folded_reverse) = fold_ping_pong(position, *reverse, span);
                 *reverse = folded_reverse;
                 Some(folded)

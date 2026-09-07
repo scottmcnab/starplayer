@@ -213,10 +213,8 @@ cases into another group before it moves them into the pass column.
 
 ## G6-IT-001
 
-**The volume chain — 21 cases.** `libxmp-it-channel-filter`,
-`libxmp-it-duplicate-check-transpose`, `libxmp-it-fade-env-reset`,
-`libxmp-it-finevolrowdelaymultiple`, `libxmp-it-note-delay-nna`,
-`libxmp-it-portamento-after-cut-fade-cg`, `libxmp-it-portamento-after-keyoff-cg`,
+**The volume chain — 18 cases.** `libxmp-it-duplicate-check-transpose`,
+`libxmp-it-finevolrowdelaymultiple`, `libxmp-it-portamento-after-cut-fade-cg`, `libxmp-it-portamento-after-keyoff-cg`,
 `libxmp-it-portamento-envelope-reset-cg`, `libxmp-it-portamento-nna-sample`,
 `openmpt-it-cut-carry`, `openmpt-it-envelope-loops`, `openmpt-it-fade-portamento`,
 `openmpt-it-fine-volume-column-slide`, `openmpt-it-instrument-number-change`,
@@ -225,7 +223,10 @@ cases into another group before it moves them into the pass column.
 `openmpt-it-volume-column-memory`, `openmpt-it-volume-envelope-carry`.
 
 D80 settled the *arithmetic*: the one-step tolerance covers the two chains' different
-grouping, and the volume products themselves now agree. What is left is **state**, not
+grouping, and the volume products themselves now agree. Fading at IT's rate — `NFC`
+counts down from 1024 by the raw `FadeOut` every tick, not by a thirty-second of it —
+and routing `===` through the real key-off moved `libxmp-it-channel-filter`,
+`libxmp-it-fade-env-reset` and `libxmp-it-note-delay-nna` into the pass column. What is left is **state**, not
 rounding — every remaining first difference is more than one step, and most are far more
 (`openmpt-it-off-portamento-compatible-gxx` is 55 against 4). The cases cluster on
 envelope and fadeout *reset* rules around note-off, note-cut and tone portamento
