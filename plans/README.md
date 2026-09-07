@@ -67,6 +67,7 @@ plan set, and `AGENTS.md`.
 | Milestone | Status | Master plan | Notes |
 |---|---|---|---|
 | Web player | **Landed**, extended by every host-facing engine milestone since — most recently [M7-H7](engine/complete/M7-task-H7-host-wiring.md)'s Effects panel (insert effects: EQ, delay, chorus, reverb, compressor) | delivered by [M0-A4](engine/complete/M0-task-A4-audioworklet-spike.md) + [M1-B7](engine/complete/M1-task-B7-web-player.md) | The primary UI and the first deliverable |
+| Web player on GitHub Pages | **Landed** 2026-09-07 — owner: enable the Pages source and check the live site | [W3](apps/complete/W3-task-github-pages.md) | `cargo xtask wasm --pages` plus a CI-gated `Pages` workflow publish the player to https://scottmcnab.github.io/starplayer/ — no bundled fixtures, and the `coi-serviceworker` shim supplies the COOP/COEP headers Pages cannot |
 | A1 TUI STAR.EXE homage | **Pull-driven** | [A1](apps/A1-master-plan.md) | The nostalgic one. Second consumer of the telemetry API |
 | A2 Desktop shells | **Pull-driven** | [A2](apps/A2-master-plan.md) | Ask whether it is needed at all first |
 | A3 Mobile shells | **Pull-driven** | [A3](apps/A3-master-plan.md) | Lowest priority; the responsive web player covers most of it |

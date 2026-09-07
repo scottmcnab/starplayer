@@ -13,9 +13,46 @@ headers — `node apps/starplayer-web/dev-server.mjs --no-isolation` serves it t
 deliberately — and reports its batched `postMessage` fallback in the Engine panel.
 
 `ARMANI`, `MOVEMENT`, `NICETUNE`, `PETRI` and `REFLEX` are packaged into `dist/modules/`
-from the S3M crate's fixture corpus and appear in the **Bundled fixture** menu. Anything
-else arrives by file picker, drag-and-drop onto the drop zone, or a URL the remote server
-allows CORS on.
+from the S3M crate's fixture corpus, alongside a `dist/modules/index.json` listing them.
+The **Bundled fixture** menu is built from that manifest at start-up: no entry is written
+into `index.html`, and a build that ships no fixtures — `--pages`, below — serves no
+manifest, so the menu and its **Load fixture** button hide themselves rather than offering
+names that would 404. Anything else arrives by file picker, drag-and-drop onto the drop
+zone, or a URL the remote server allows CORS on.
+
+## Deploying
+
+```text
+cargo xtask wasm --pages
+```
+
+packages the same build for <https://scottmcnab.github.io/starplayer/>, differing from the
+development build in exactly two ways.
+
+* **No bundled fixtures.** `dist/modules/` is not created at all. The corpus in
+  `crates/starplayer-s3m/tests/fixtures/` is licensed for testing only, so it must not be
+  republished; the page copes with its absence as described above.
+* **The isolation shim runs.** GitHub Pages cannot send COOP/COEP, so `crossOriginIsolated`
+  would be false and the page would quietly fall back to batched `postMessage` for commands
+  and telemetry. `www/coi-serviceworker.js` (v0.1.7, MIT, vendored verbatim) registers a
+  service worker that adds the headers to every response and reloads the page once — a
+  single extra reload on a first visit, and nothing thereafter. It self-skips when the page
+  is already isolated, so it costs a properly isolated host nothing. `www/index.html` marks
+  its place with a `<!-- xtask:coi -->` line in `<head>`; `--pages` replaces that line with
+  the script tag, and a missing marker fails the build rather than silently producing a
+  non-isolated site. Without `--pages` the marker is copied through untouched, which is why
+  the dev server's `--no-isolation` mode still exercises the genuine non-isolated path.
+
+`.github/workflows/pages.yml` does this in CI. It is triggered by the **CI** workflow
+completing on `main` and builds only when that run's conclusion was `success`, so nothing
+reaches the public site on a red build; `workflow_dispatch` runs it by hand. It checks out
+the commit CI passed on, installs the `wasm-bindgen` CLI at the workspace's exact pin,
+runs `cargo xtask wasm --pages`, and uploads `apps/starplayer-web/dist` as the Pages
+artefact for a second job to deploy.
+
+The one-time repository setting it depends on is **Settings → Pages → Source: GitHub
+Actions**. Without it the deploy job fails; there is no branch to configure and no
+`gh-pages` branch involved.
 
 ## Controls
 
