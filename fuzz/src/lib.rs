@@ -32,10 +32,16 @@ use starplayer_model::Module;
 
 /// Budget floor: what an input of no size at all is still allowed to allocate.
 ///
-/// It has to clear the loaders' own production caps by a wide margin — the S3M loader's
-/// decoded-pattern budget alone has a 4 MiB floor (research point 3) — so that a
-/// *legitimately* bounded allocation is never mistaken for a runaway one.
-pub const MEMORY_CAP_FLOOR_BYTES: usize = 64 * 1024 * 1024;
+/// It has to clear the loaders' own production caps by a wide margin, so that a
+/// *legitimately* bounded allocation is never mistaken for a runaway one — and "clear"
+/// means the *peak*, not the cap. The IT loader's decoded-pattern floor is 32 MiB, and a
+/// blob that size is built by `Vec` growth, which can hold up to twice the final length,
+/// then copied once more by `into_boxed_slice` when the module is assembled: three times
+/// the cap live at once, before the 16 MiB PCM floor and everything else. A 64 MiB floor
+/// tripped on exactly that (`fuzz/regressions/it/pattern-blob-near-the-32mib-floor-*`);
+/// 256 MiB clears the worst case with room to spare and is still far below what any
+/// runaway allocation reaches.
+pub const MEMORY_CAP_FLOOR_BYTES: usize = 256 * 1024 * 1024;
 
 /// Budget per input byte, on top of the floor.
 ///
