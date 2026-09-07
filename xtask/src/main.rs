@@ -2183,7 +2183,7 @@ fn write_pages_index(source: &Path, destination: &Path) -> bool {
     true
 }
 
-/// Ship the five licensed test modules as one-click smoke fixtures. The source remains
+/// Ship the licensed test modules as one-click smoke fixtures. The source remains
 /// the format crate's corpus; packaging copies it rather than creating a second checked-in
 /// set that could drift.
 ///
@@ -2197,7 +2197,7 @@ fn copy_fixture_modules(root: &Path, output_directory: &Path) -> bool {
         eprintln!("xtask wasm: cannot create `{}`: {error}", destination.display());
         return false;
     }
-    let names = ["ARMANI.S3M", "MOVEMENT.S3M", "NICETUNE.S3M", "PETRI.S3M", "REFLEX.S3M"];
+    let names = ["PETRI.S3M", "REFLEX.S3M"];
     for name in names {
         if let Err(error) = std::fs::copy(source.join(name), destination.join(name)) {
             eprintln!("xtask wasm: cannot package fixture `{name}`: {error}");

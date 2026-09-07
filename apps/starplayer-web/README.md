@@ -12,7 +12,7 @@ default `SharedArrayBuffer` transports are available. The page still works witho
 headers — `node apps/starplayer-web/dev-server.mjs --no-isolation` serves it that way
 deliberately — and reports its batched `postMessage` fallback in the Engine panel.
 
-`ARMANI`, `MOVEMENT`, `NICETUNE`, `PETRI` and `REFLEX` are packaged into `dist/modules/`
+`PETRI` and `REFLEX` are packaged into `dist/modules/`
 from the S3M crate's fixture corpus, alongside a `dist/modules/index.json` listing them.
 The **Bundled fixture** menu is built from that manifest at start-up: no entry is written
 into `index.html`, and a build that ships no fixtures — `--pages`, below — serves no

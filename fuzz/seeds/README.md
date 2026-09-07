@@ -42,7 +42,7 @@ rejection path.
 | `amiga-limits.s3m` | general-flag bit 4, the Amiga period clamp |
 | `order-past-the-end.s3m` | an order naming a pattern the file does not have, plus the `0xFE` skip marker |
 
-The owner's five real Scream Tracker 3 modules are **not** duplicated here — they already
+The owner's real Scream Tracker 3 modules are **not** duplicated here — they already
 live in `crates/starplayer-s3m/tests/fixtures/` and the seeder copies them from there.
 
 ## `mtm/`

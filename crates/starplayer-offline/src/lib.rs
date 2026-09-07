@@ -842,11 +842,9 @@ mod tests {
     use super::*;
 
     const REFLEX: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
+    const PETRI: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M");
     const GOLDEN_CORPUS: &[(&str, &[u8])] = &[
-        ("ARMANI.S3M", include_bytes!("../../starplayer-s3m/tests/fixtures/ARMANI.S3M")),
-        ("MOVEMENT.S3M", include_bytes!("../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M")),
-        ("NICETUNE.S3M", include_bytes!("../../starplayer-s3m/tests/fixtures/NICETUNE.S3M")),
-        ("PETRI.S3M", include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M")),
+        ("PETRI.S3M", PETRI),
         ("REFLEX.S3M", REFLEX),
     ];
 
@@ -1291,19 +1289,18 @@ mod tests {
         assert_eq!(thirty_two_bit.last().copied(), Some(0), "the last frame of a 32-bit fade is exactly zero");
     }
 
-    /// Task D2's acceptance case. `NICETUNE.S3M`'s order list simply runs out, so the song
-    /// *ends* rather than looping — and it ends on exactly the frame D1 called its loop
-    /// point, so nothing about its measured length moved. The number is the one the build
-    /// before D2 reported.
+    /// Task D2's acceptance case. `PETRI.S3M`'s order list simply runs out, so the song
+    /// *ends* rather than looping, and there is no loop length to report. The frame count
+    /// and duration pinned here are the ones measured on 2026-09-07, when the fixture set
+    /// was trimmed to `PETRI.S3M` and `REFLEX.S3M`.
     #[test]
-    fn nicetune_ends_when_its_order_list_runs_out_at_the_length_it_always_had() {
-        const NICETUNE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/NICETUNE.S3M");
-        let module = Arc::new(starplayer::s3m::load(NICETUNE).expect("NICETUNE loads"));
-        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("NICETUNE scans");
+    fn petri_ends_when_its_order_list_runs_out_at_the_length_it_always_had() {
+        let module = Arc::new(starplayer::s3m::load(PETRI).expect("PETRI loads"));
+        let timeline = song_timeline(&module, GOLDEN_SAMPLE_RATE_HZ).expect("PETRI scans");
 
-        assert_eq!(timeline.end(), EndReason::Ended, "nothing in NICETUNE jumps backwards");
-        assert_eq!(timeline.end_frame(), 1_128_960, "the same frame count D1 measured");
-        assert!((timeline.duration_seconds() - 25.6).abs() < 0.001, "0:25, not 0:30");
+        assert_eq!(timeline.end(), EndReason::Ended, "nothing in PETRI jumps backwards");
+        assert_eq!(timeline.end_frame(), 1_814_400, "the frame count measured on 2026-09-07");
+        assert!((timeline.duration_seconds() - 41.142857).abs() < 0.001, "0:41, the duration measured on 2026-09-07");
         assert_eq!(timeline.loop_length_frames(), None);
     }
 

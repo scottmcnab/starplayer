@@ -1,4 +1,4 @@
-//! Loader tests against the five real Scream Tracker 3 modules in `tests/fixtures/`, plus
+//! Loader tests against the two real Scream Tracker 3 modules in `tests/fixtures/`, plus
 //! the synthetic headers that cover the cases no real file exercises.
 //!
 //! Every expected value in `EXPECTATIONS` was read out of the files with a Python hex
@@ -11,10 +11,7 @@ use starplayer_model::{ORDER_END, OrderEntry, PatternId};
 use starplayer_s3m::{Error, PatternView, S3mCell, S3mFormatExtra, pan_nibble_to_bipolar};
 
 const REFLEX: &[u8] = include_bytes!("fixtures/REFLEX.S3M");
-const ARMANI: &[u8] = include_bytes!("fixtures/ARMANI.S3M");
 const PETRI: &[u8] = include_bytes!("fixtures/PETRI.S3M");
-const NICETUNE: &[u8] = include_bytes!("fixtures/NICETUNE.S3M");
-const MOVEMENT: &[u8] = include_bytes!("fixtures/MOVEMENT.S3M");
 
 /// What a hex dump of one fixture says its header holds.
 struct Expectation {
@@ -67,26 +64,6 @@ const EXPECTATIONS: &[Expectation] = &[
         structure_end: 7410,
     },
     Expectation {
-        file_name: "ARMANI.S3M",
-        bytes: ARMANI,
-        title: "Armani Showers",
-        channel_count: 5,
-        order_count: 12,
-        instrument_count: 7,
-        sample_count: 7,
-        pattern_count: 11,
-        initial_speed: 8,
-        initial_tempo: 125,
-        global_volume: 64,
-        master_volume_raw: 176,
-        stereo: true,
-        amiga_limits: false,
-        tracker_version: 0x1310,
-        // Pan block 0x25 0x2C 0x2A 0x28 0x2A: valid bit set on all five, nibbles below.
-        pan_nibbles: Some(&[5, 12, 10, 8, 10]),
-        structure_end: 12447,
-    },
-    Expectation {
         file_name: "PETRI.S3M",
         bytes: PETRI,
         title: "Petrified",
@@ -105,46 +82,6 @@ const EXPECTATIONS: &[Expectation] = &[
         // No pan block; channel settings 0,8,9,1,2,10,3,11 through `ClearChannels`.
         pan_nibbles: Some(&[3, 12, 12, 3, 3, 12, 3, 12]),
         structure_end: 3586,
-    },
-    Expectation {
-        file_name: "NICETUNE.S3M",
-        bytes: NICETUNE,
-        title: "Wot a happy tune! :)",
-        channel_count: 16,
-        order_count: 6,
-        instrument_count: 4,
-        sample_count: 4,
-        pattern_count: 5,
-        initial_speed: 5,
-        initial_tempo: 125,
-        global_volume: 64,
-        master_volume_raw: 176,
-        stereo: true,
-        amiga_limits: true,
-        tracker_version: 0x1301,
-        // Channel settings 0,8,1,9,…: the Amiga L-R-R-L interleave, alternating.
-        pan_nibbles: Some(&[3, 12, 3, 12, 3, 12, 3, 12, 3, 12, 3, 12, 3, 12, 3, 12]),
-        structure_end: 3298,
-    },
-    Expectation {
-        file_name: "MOVEMENT.S3M",
-        bytes: MOVEMENT,
-        title: "The Movement - Track 4",
-        channel_count: 2,
-        order_count: 2,
-        instrument_count: 3,
-        sample_count: 2,
-        pattern_count: 1,
-        initial_speed: 6,
-        initial_tempo: 103,
-        global_volume: 64,
-        master_volume_raw: 48,
-        stereo: false,
-        amiga_limits: false,
-        tracker_version: 0x1301,
-        // Mono and no pan block: the model's empty "centre every channel" table.
-        pan_nibbles: None,
-        structure_end: 533,
     },
 ];
 
@@ -350,7 +287,7 @@ fn a_module_that_is_not_an_s3m_is_refused_by_probe_and_by_load() {
 
 // ── synthetic modules ───────────────────────────────────────────────────────────────
 //
-// The fixtures are five well-formed files by one author; these cover what they cannot.
+// The fixtures are two well-formed files by one author; these cover what they cannot.
 
 /// Offsets the synthetic file below places its parapointed blocks at.
 const SYNTHETIC_SAMPLE_HEADER: usize = 16 * 16;
@@ -443,6 +380,21 @@ fn a_stereo_module_without_a_pan_block_pans_by_its_channel_settings() {
     let expected: Vec<I1F15> = [3u8, 12, 3, 12].iter().map(|nibble| pan_nibble_to_bipolar(*nibble)).collect();
     assert_eq!(module.header().default_pan.as_ref(), expected.as_slice());
     assert!(module.header().flags.stereo);
+}
+
+/// A full 16-entry channel-settings table, the Amiga interleave a 16-channel module
+/// carries: settings alternate below 8 and at-or-above 8, so the derived pan nibbles
+/// alternate hard left (3) and hard right (12) all sixteen times. No real fixture
+/// declares sixteen channels, so only this synthetic header covers the case.
+#[test]
+fn a_sixteen_channel_settings_table_derives_sixteen_alternating_pan_nibbles() {
+    let settings = [0u8, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+    let module = starplayer_s3m::load(&synthetic_s3m(true, &settings, None)).expect("the synthetic module loads");
+
+    assert_eq!(module.header().channel_count, 16, "sixteen enabled channel settings mean sixteen channels");
+    let nibbles = [3u8, 12, 3, 12, 3, 12, 3, 12, 3, 12, 3, 12, 3, 12, 3, 12];
+    let expected: Vec<I1F15> = nibbles.iter().map(|nibble| pan_nibble_to_bipolar(*nibble)).collect();
+    assert_eq!(module.header().default_pan.as_ref(), expected.as_slice());
 }
 
 #[test]

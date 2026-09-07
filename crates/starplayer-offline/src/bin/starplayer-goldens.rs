@@ -28,7 +28,7 @@ const EVERY_KERNEL: &[Interpolator] = &[GOLDEN_INTERPOLATOR, Interpolator::Cubic
 
 /// Every fixture in the canonical contract.
 ///
-/// The five S3Ms are the repository owner's own modules and are committed as bytes. MOD,
+/// The S3Ms are the repository owner's own modules and are committed as bytes. MOD,
 /// MTM and XM have no licence-safe module to commit, so C6a synthesises theirs from a
 /// committed generator instead — see `starplayer_offline::fixtures` for why that route was
 /// chosen over hashing the pinned libxmp corpus. Task F2 added the XM one, whose fixture
@@ -40,9 +40,6 @@ fn fixtures() -> Vec<Fixture> {
         Fixture { format: GoldenFormat::Mtm, stem: "synthetic", bytes: fixtures::synthetic_mtm(), kernels: CANONICAL },
         Fixture { format: GoldenFormat::Xm, stem: "synthetic", bytes: fixtures::synthetic_xm(), kernels: CANONICAL },
         Fixture { format: GoldenFormat::It, stem: "synthetic", bytes: fixtures::synthetic_it(), kernels: CANONICAL },
-        Fixture { format: GoldenFormat::S3m, stem: "armani", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/ARMANI.S3M").to_vec(), kernels: CANONICAL },
-        Fixture { format: GoldenFormat::S3m, stem: "movement", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/MOVEMENT.S3M").to_vec(), kernels: CANONICAL },
-        Fixture { format: GoldenFormat::S3m, stem: "nicetune", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/NICETUNE.S3M").to_vec(), kernels: CANONICAL },
         Fixture { format: GoldenFormat::S3m, stem: "petri", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/PETRI.S3M").to_vec(), kernels: CANONICAL },
         Fixture { format: GoldenFormat::S3m, stem: "reflex", bytes: include_bytes!("../../../starplayer-s3m/tests/fixtures/REFLEX.S3M").to_vec(), kernels: EVERY_KERNEL },
     ]

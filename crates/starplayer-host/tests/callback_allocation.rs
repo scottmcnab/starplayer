@@ -19,7 +19,7 @@ use starplayer::core::{AtEnd, ChannelId, Interpolator, U0F16};
 use starplayer::engine::{MixPathKind, MixerMode, OutputDepth, RENDER_QUANTUM};
 use starplayer_host::{AudioSpec, ManualBackend, Player};
 
-const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/NICETUNE.S3M");
+const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M");
 const REFLEX: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
 
 // ── the allocator hook ──────────────────────────────────────────────────────────────
