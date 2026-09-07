@@ -18,7 +18,10 @@ The **Bundled fixture** menu is built from that manifest at start-up: no entry i
 into `index.html`, and a build that ships no fixtures — `--pages`, below — serves no
 manifest, so the menu and its **Load fixture** button hide themselves rather than offering
 names that would 404. Anything else arrives by file picker, drag-and-drop onto the drop
-zone, or a URL the remote server allows CORS on.
+zone, or a URL the remote server allows CORS on. The URL box starts out pointing at
+Purple Motion's *Unreal ][* on Modland, which sends `Access-Control-Allow-Origin: *`, so
+one click on **Load URL** fetches a real song even on the public site; scene.org's mirror
+of the same file only allows its own origin, which is why it is not the default.
 
 ## Deploying
 
