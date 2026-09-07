@@ -81,6 +81,8 @@ const MAX_NOTE: u8 = 119;
 const UNITS_PER_SEMITONE: i32 = LINEAR_FREQUENCY_TABLE_LEN as i32 / 12;
 /// IT's fadeout counter, full scale. ITTECH.TXT's `NFC` is this divided by 64.
 const FADEOUT_FULL: i32 = 65536;
+/// What one unit of an instrument's `FadeOut` takes off [`FADEOUT_FULL`] per tick.
+const FADEOUT_STEP_SCALE: i32 = FADEOUT_FULL / 1024;
 /// The widest note volume IT's mixer works in, four times the file's 0..64.
 const MAX_NOTE_VOLUME: i32 = 256;
 /// The widest pan position IT's mixer works in, four times the file's 0..64.
@@ -241,7 +243,8 @@ pub struct ItVoiceState {
     pub pitch_envelope: ItEnvelopeState,
     /// The instrument's pitch envelope drives the filter cutoff rather than the pitch.
     pub pitch_envelope_is_filter: bool,
-    /// `NFC · 64`: 65536 at note-on, decremented by `2 · fadeout` once note-fade is set.
+    /// `NFC · 64`: 65536 at note-on, decremented by `64 · fadeout` once note-fade is set —
+    /// IT counts `NFC` down from 1024 by the instrument's raw `FadeOut` every tick.
     pub fadeout: i32,
     /// The key has been released (`===`, `S71`, NNA note-off, DCA note-off).
     pub key_off: bool,
@@ -1053,7 +1056,9 @@ impl ItProcessor {
     fn note_change(&mut self, context: &mut TickContext<'_>, channel_index: usize, note: u8, instrument: u8, tone_portamento: bool) {
         match note {
             NOTE_OFF => {
-                self.key_off_foreground(channel_index);
+                if let Some(voice) = self.channels[channel_index].voice {
+                    self.key_off_voice(context, voice);
+                }
                 // IT compatibility (`noteoff3.it`): a note-off with an instrument number
                 // under Old Effects releases the sustain loop without releasing the
                 // envelopes or starting the fadeout.
@@ -1427,9 +1432,9 @@ impl ItProcessor {
         entry.foreground = false;
         match action {
             NewNoteAction::Continue => {}
-            NewNoteAction::NoteOff => {
-                entry.key_off = true;
-            }
+            // `KeyOff` on the moved channel: the sustain loop goes, and the fadeout starts
+            // unless a non-looping volume envelope is left to run out.
+            NewNoteAction::NoteOff => self.key_off_voice(context, detached),
             NewNoteAction::NoteFade => entry.note_fade = true,
             NewNoteAction::Cut => {
                 entry.fadeout = 0;
@@ -1473,7 +1478,7 @@ impl ItProcessor {
                     state.fadeout = 0;
                     state.note_fade = true;
                 }
-                DuplicateAction::NoteOff => state.key_off = true,
+                DuplicateAction::NoteOff => self.key_off_voice(context, voice),
                 DuplicateAction::NoteFade => state.note_fade = true,
             }
         }
@@ -1528,14 +1533,6 @@ impl ItProcessor {
             } else {
                 slot.set_position(position << 32);
             }
-        }
-    }
-
-    fn key_off_foreground(&mut self, channel_index: usize) {
-        // The sample-side half needs the pool, so the channel path records the release and
-        // `sync_foreground` performs it on the next voice pass.
-        if let Some(state) = self.foreground_state_mut(channel_index) {
-            state.key_off = true;
         }
     }
 
@@ -2760,11 +2757,14 @@ impl ItProcessor {
                         }
                     }
                 }
-                // The fadeout, once note-fade is set.
+                // The fadeout, once note-fade is set: ITTECH.TXT's `NFC` loses the raw
+                // `FadeOut` from a count of 1024 every tick, so a fadeout of 10 is silent
+                // after 103 ticks. OpenMPT stores `fadeout << 5` and subtracts twice that
+                // from the same 65536 scale.
                 if state.note_fade {
                     let fadeout = definition.fadeout as i32;
                     if fadeout != 0 {
-                        state.fadeout = (state.fadeout - fadeout * 2).max(0);
+                        state.fadeout = (state.fadeout - fadeout * FADEOUT_STEP_SCALE).max(0);
                     }
                     volume = (volume as i64 * state.fadeout as i64 / FADEOUT_FULL as i64) as i32;
                 }
@@ -3117,6 +3117,11 @@ mod tests {
     /// A two-channel instrument-mode IT with one sample and one instrument, and a pattern
     /// of `cells` — one `ItCell` per channel per row.
     fn module_with(cells: &[ItCell], new_note_action: NewNoteAction) -> Arc<Module> {
+        module_with_instrument(cells, new_note_action, |_| {})
+    }
+
+    /// [`module_with`], with `customise` applied to the instrument before it is added.
+    fn module_with_instrument(cells: &[ItCell], new_note_action: NewNoteAction, customise: impl FnOnce(&mut InstrumentDef)) -> Arc<Module> {
         let mut builder = ModuleBuilder::new();
         let sample = builder.add_sample(&[0i16; 64], SampleSpec::one_shot("pcm").with_forward_loop(0, 64)).unwrap();
         let mut instrument = InstrumentDef::from_sample("ins", sample, U0F16::MAX);
@@ -3126,6 +3131,7 @@ mod tests {
         }
         instrument.new_note_action = new_note_action;
         instrument.fadeout = 0;
+        customise(&mut instrument);
         builder.add_instrument(instrument).unwrap();
         let mut bytes = alloc::vec::Vec::new();
         for cell in cells {
@@ -3187,6 +3193,98 @@ mod tests {
         assert_eq!(detached.root_channel, 0, "it keeps the channel that triggered it, for S7x and the duplicate check");
         assert_eq!(detached.note, 60, "the detached voice keeps its own note");
         assert_eq!(processor.voice(foreground).unwrap().note, 64);
+    }
+
+    /// A flat volume envelope that loops over its whole length and never sustains, so a
+    /// key-off can only end the note through the fadeout.
+    fn looping_volume_envelope() -> Envelope {
+        Envelope {
+            points: alloc::vec![
+                starplayer_model::EnvelopePoint { tick: 0, value: 64 },
+                starplayer_model::EnvelopePoint { tick: 10, value: 64 },
+            ]
+            .into_boxed_slice(),
+            sustain: None,
+            loop_span: Some(starplayer_model::EnvelopeSpan { start: 0, end: 1 }),
+            carry: false,
+        }
+    }
+
+    /// The ticks a fadeout of `fadeout` takes to reach silence: ITTECH.TXT's `NFC` counts
+    /// down from 1024 by the raw value every tick.
+    fn fadeout_ticks(fadeout: u16) -> u16 { 1024u16.div_ceil(fadeout) }
+
+    /// The background voice a New Note Action of `Fade` detaches takes `1024 / FadeOut`
+    /// ticks to reach silence and be released — not thirty-two times that, which is what
+    /// left M4V-UNKN.IT's strings ringing across a dozen orders.
+    #[test]
+    fn a_fading_background_voice_is_released_after_1024_over_fadeout_ticks() {
+        const FADEOUT: u16 = 10;
+        const TICKS_PER_ROW: u8 = 60;
+        let cells = [note_cell(60, 1), ItCell::EMPTY, note_cell(64, 1), ItCell::EMPTY];
+        let module = module_with_instrument(&cells, NewNoteAction::NoteFade, |instrument| instrument.fadeout = FADEOUT);
+
+        // Sixty ticks into the fade the voice is still there, and its counter says exactly
+        // how far along it is.
+        let (processor, voices, _) = play(Arc::clone(&module), 2, TICKS_PER_ROW);
+        assert_eq!(voices.voices_active(), 2, "the faded note is still sounding sixty ticks in");
+        let fading = voices.iter().map(|(voice, _)| voice).find(|voice| !processor.voice(*voice).unwrap().foreground).unwrap();
+        assert_eq!(processor.voice(fading).unwrap().fadeout, FADEOUT_FULL - TICKS_PER_ROW as i32 * FADEOUT as i32 * FADEOUT_STEP_SCALE);
+
+        // One more row is past the 103 ticks the fade takes, and the slot has been freed.
+        assert!(fadeout_ticks(FADEOUT) < TICKS_PER_ROW as u16 * 2);
+        let (processor, voices, _) = play(module, 3, TICKS_PER_ROW);
+        assert_eq!(voices.voices_active(), 1, "the faded voice is released once its counter reaches zero");
+        assert_eq!(processor.active_voices(), 1);
+    }
+
+    /// `===` on an instrument whose volume envelope loops (or which has none) starts the
+    /// fadeout, exactly as `S71` does; the key-off flag alone would leave the note
+    /// sounding forever at its looped envelope level.
+    #[test]
+    fn a_note_off_starts_the_fadeout_when_the_volume_envelope_cannot_end_the_note() {
+        const FADEOUT: u16 = 10;
+        const TICKS_PER_ROW: u8 = 60;
+        let cells = [note_cell(60, 1), ItCell::EMPTY, note_cell(NOTE_OFF, 0), ItCell::EMPTY];
+        for (label, customise) in [
+            ("a looping volume envelope", (|instrument: &mut InstrumentDef| instrument.volume_envelope = Some(looping_volume_envelope())) as fn(&mut InstrumentDef)),
+            ("no volume envelope", |instrument: &mut InstrumentDef| instrument.volume_envelope = None),
+        ] {
+            let module = module_with_instrument(&cells, NewNoteAction::Cut, |instrument| {
+                instrument.fadeout = FADEOUT;
+                customise(instrument);
+            });
+            let (processor, voices, _) = play(Arc::clone(&module), 2, TICKS_PER_ROW);
+            assert_eq!(voices.voices_active(), 1, "{label}: the released note is still sounding sixty ticks in");
+            let foreground = voices.iter().map(|(voice, _)| voice).next().unwrap();
+            let state = processor.voice(foreground).unwrap();
+            assert!(state.key_off && state.note_fade, "{label}: the note-off released the key and started the fade");
+            // A silent foreground voice is stopped rather than released — the mixer frees
+            // the slot when it honours the stop — and the processor forgets it at once.
+            let (processor, voices, _) = play(module, 3, TICKS_PER_ROW);
+            assert!(voices.get(foreground).is_some_and(|slot| slot.wants_stop()), "{label}: the faded note has been told to stop");
+            assert_eq!(processor.active_voices(), 0, "{label}: the processor no longer tracks the faded voice");
+            assert!(processor.channel(0).unwrap().voice.is_none(), "{label}: the channel no longer owns a voice");
+        }
+    }
+
+    /// A New Note Action of `NoteOff` is a key-off on the detached voice, and so also
+    /// starts the fadeout on a looping volume envelope.
+    #[test]
+    fn a_note_off_new_note_action_fades_the_detached_voice() {
+        const FADEOUT: u16 = 10;
+        const TICKS_PER_ROW: u8 = 60;
+        let cells = [note_cell(60, 1), ItCell::EMPTY, note_cell(64, 1), ItCell::EMPTY];
+        let module = module_with_instrument(&cells, NewNoteAction::NoteOff, |instrument| {
+            instrument.fadeout = FADEOUT;
+            instrument.volume_envelope = Some(looping_volume_envelope());
+        });
+        let (processor, voices, _) = play(Arc::clone(&module), 2, TICKS_PER_ROW);
+        assert_eq!(voices.voices_active(), 2);
+        let detached = voices.iter().map(|(voice, _)| voice).find(|voice| !processor.voice(*voice).unwrap().foreground).unwrap();
+        assert!(processor.voice(detached).unwrap().note_fade, "the note-off action started the detached voice's fade");
+        let (_, voices, _) = play(module, 3, TICKS_PER_ROW);
+        assert_eq!(voices.voices_active(), 1, "only the new note is left once the detached voice has faded");
     }
 
     /// A New Note Action of `Cut` allocates nothing: `trigger_channel` replaces the old
