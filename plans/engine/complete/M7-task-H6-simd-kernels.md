@@ -372,7 +372,7 @@ prototype's numbers above are the case for it.
 
 ## Verification
 
-Run on x86-64 (WSL2), pinned toolchain 1.97.1, at `f98b3ee`:
+Run on x86-64 (WSL2), pinned toolchain 1.97.1, at `fe2caa9`:
 
 ```
 cargo test -p starplayer-dsp --features simd                                   ok (193 + 8 + …)

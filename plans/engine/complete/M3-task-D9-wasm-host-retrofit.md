@@ -199,7 +199,7 @@ before the reserve stopped covering it. Left at 16 MiB.
 
 ### 3. `headless.mjs` — **the harness, not the page; stale since task D2, and fixed here**
 
-Reproduced first, on a clean checkout of `d9` at 965fa89, before any change:
+Reproduced first, on a clean checkout of `d9` at 08de025, before any change:
 
 ```
 Error: timed out waiting for the slider to grow by the fade with Repeat off

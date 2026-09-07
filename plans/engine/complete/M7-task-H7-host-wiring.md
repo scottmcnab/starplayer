@@ -277,7 +277,7 @@ not separately measurable from that total.
 
 ## Verification results (2026-09-06)
 
-All commands pass on branch `h7`, at commit `5af9c30`:
+All commands pass on branch `h7`, at commit `939aa58`:
 
 ```
 cargo test --workspace                              ok (every crate, 0 failures)

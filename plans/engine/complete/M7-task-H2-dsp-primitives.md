@@ -262,7 +262,7 @@ response.
 ## Verification results (2026-09-05)
 
 All six commands in the Verification section above were run against this branch (commits
-`e1fcfd2`..`c29fe21`) and pass:
+`b5f1b30`..`ab132c4`) and pass:
 
 - `cargo test -p starplayer-dsp` — 85 passed, 0 failed.
 - `cargo test -p starplayer-dsp --features std` — 85 passed, 0 failed.
