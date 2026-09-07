@@ -2,6 +2,8 @@
 name = "xtask"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 # xtask deliberately has no dependencies: it must build with nothing but the pinned

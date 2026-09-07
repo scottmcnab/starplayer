@@ -2,6 +2,8 @@
 name = "starplayer-midi-native"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 description = "Native MIDI input: a midir port decoded into engine events and pushed at a Player's live-input queue."
 

@@ -75,11 +75,17 @@ Made by the project owner; do not re-litigate in derived plans.
    (`plans/engine/M2-task-C8-dos-reference-harness.md`).
 6. **`no_std` + `alloc` from day one**, CI-enforced on a bare-metal target. Retrofitting
    `no_std` later forces a rewrite of the IO and error layers.
-7. **Licence deferred.** (Context found 2026-08-31: the owner's own 1996 source release
-   `STARPLAY-2.25s/SP-CODE.DOC` already granted free use of the original code with a
-   credit request, and the owner holds the rights — so the decision is unconstrained by
-   third parties.) The repo stays private; no licence files or SPDX headers are
-   added yet. Revisit before going public.
+7. **Code licence: MIT OR Apache-2.0** (decided 2026-09-07). `LICENSE-MIT` and
+   `LICENSE-APACHE` sit at the repository root and every workspace member inherits
+   `license` from `[workspace.package]`. Permissive because the engine is built to be
+   embedded — WASM in other pages, `no_std` firmware, plugin hosts — where copyleft would
+   bar most uses, and because it continues the owner's own 1996 terms:
+   `STARPLAY-2.25s/SP-CODE.DOC` granted free use of the original code with a credit
+   request, which MIT's attribution clause makes enforceable. The DOS sources in
+   `STARPLAY/` and `STARPLAY-2.25s/` remain under those original terms. The **music
+   licence** for the S3M fixtures is still deferred and is a separate decision from the
+   code licence; until it is made the fixtures stay "owner's own work, for testing only"
+   (see `crates/starplayer-s3m/tests/fixtures/README.md`).
 
 ## What StarPlayer is not
 

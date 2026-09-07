@@ -2,6 +2,8 @@
 name = "starplayer-host"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 description = "Backend-neutral native host: the AudioBackend trait and the Player that drives the engine."
 

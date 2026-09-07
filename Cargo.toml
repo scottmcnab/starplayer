@@ -16,6 +16,8 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/scottmcnab/starplayer"
 
 # Every external version is pinned once here; members write `{ workspace = true }`.
 # Internal path dependencies are listed so the dependency graph is declared in one
