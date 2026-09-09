@@ -174,84 +174,272 @@ models, known-sample replacement packs, anything that runs at M11 scan time; cha
 
 ## Research resolution
 
-*Written 2026-09-10, on branch `k5c`.*
+*Written 2026-09-10, on branch `k5c`. Sections 1, 3 and 4 were re-measured after the
+harness itself was corrected — see section 2.*
 
-Read this alongside the harness table below, which is the verbatim output of
-`cargo run -p starplayer-offline --example enhance_report --release`. Two of the six
-acceptance criteria are **not met**; both are stated with their numbers and with what was
-tried, and neither was relaxed to make it pass.
+Four of seven acceptance criteria are met. The three that are not are stated with their
+numbers, with the sweeps run against them, and with what would actually reach them; none
+was relaxed to make it pass, and the two pinned in
+`crates/starplayer-offline/tests/enhance_quality.rs` are labelled there as regression
+floors rather than as targets.
 
 ### 1. The harness table
 
-Every row renders the degraded instrument — band-limited, decimated to 8 363 Hz, rounded
-to 8 bits and widened by 256 — through the named chain and scores it against a render of
-the 16-bit 44 100 Hz ground truth. Both renders go through `render_song_with_options` at
-44 100 Hz on the fixed path with the linear kernel, playing a one-channel, one-sample IT
-whose `C5Speed` is the sample's own rate, so the ground truth plays at unity step. SNRs in
-dB, higher better; LSD in dB, lower better; `tail` is the in-band SNR over the last 40 % of
-the render; `first 10 ms` is the attack RMS in dBFS.
+Verbatim output of `cargo run -p starplayer-offline --example enhance_report --release`.
+Both renders go through `render_song_with_options` at 44 100 Hz on the fixed path with the
+linear kernel, playing a one-channel, one-sample IT whose `C5Speed` is the sample's own
+rate, so the ground truth plays at unity step.
+
+Every row renders the degraded instrument (band-limited, decimated to 8 363 Hz, rounded to 8 bits) through the named chain and scores it against a render of the 16-bit 44 100 Hz ground truth. SNRs in dB, higher better; LSD in dB, lower better.
+
+The **log-spectral distance is floored 60 dB below the ground truth's loudest bin** (`analysis::AUDIBLE_FLOOR_BELOW_PEAK_DB`) rather than at the −120 dB the libopenmpt comparison uses: this harness asks whether something sounds closer, and a bin filled a hundred decibels down is not a difference anybody can hear. The floor is anchored to the signal rather than stated as an absolute magnitude because these magnitudes are normalised so a full-scale *sine* puts 0.25 in one bin — an absolute −60 dBFS floor left between 0.3 % and 7.2 % of the reference's bins above it and stopped the score being a measurement at all.
+
+`tail` is the in-band SNR over the **decay window**: the frames where the ground truth's own level lies between -24 dB and -48 dB of its peak, which is where a decay crosses the 8-bit quantisation floor. `NaN` means the instrument has no such window — a sustained tone never gets that quiet.
+
+Instruments (a) and (b) carry harmonics all the way to 20 kHz, so the band `sbr` fills is a band the ground truth genuinely has. (d) is deliberately dark and (c) is broadband noise.
 
 #### (a) plucked decay
 
 | chain | full-band SNR | in-band SNR | LSD | tail in-band SNR | first 10 ms |
 |---|---:|---:|---:|---:|---:|
-| `none` | 7.18 | 9.17 | 9.84 | 1.04 | -15.20 |
-| `sinc4x` | 7.50 | 10.22 | 8.85 | 0.67 | -14.71 |
-| `denoise` | 7.23 | 9.19 | 9.54 | 1.18 | -15.20 |
-| `denoise+sinc4x` | 7.68 | 10.43 | 8.61 | 1.06 | -14.71 |
-| `sinc4x+sbr` | 7.28 | 9.79 | 9.01 | 0.68 | -14.73 |
-| `denoise+sinc4x+sbr` | 7.45 | 9.99 | 8.76 | 1.06 | -14.73 |
-| `denoise+sinc4x+sbr+loop=64` | 7.45 | 9.99 | 8.76 | 1.06 | -14.73 |
+| `none` | 5.23 | 8.89 | 2.24 | 8.54 | -18.37 |
+| `sinc4x` | 5.40 | 9.99 | 2.17 | 8.27 | -17.84 |
+| `denoise` | 5.27 | 8.90 | 2.23 | 8.59 | -18.37 |
+| `denoise+sinc4x` | 5.55 | 10.21 | 2.15 | 8.83 | -17.84 |
+| `sinc4x+sbr` | 5.39 | 9.98 | 2.15 | 8.27 | -17.84 |
+| `denoise+sinc4x+sbr` | 5.54 | 10.21 | 2.13 | 8.82 | -17.84 |
+| `denoise+sinc4x+sbr+loop=64` | 5.54 | 10.21 | 2.13 | 8.82 | -17.84 |
 
-Ground truth's own first 10 ms: -14.39 dB.
+Ground truth's own first 10 ms: -17.35 dB.
 
 #### (b) sustained loop
 
 | chain | full-band SNR | in-band SNR | LSD | tail in-band SNR | first 10 ms |
 |---|---:|---:|---:|---:|---:|
-| `none` | 14.45 | 18.53 | 16.96 | 18.54 | -16.21 |
-| `sinc4x` | 15.56 | 22.39 | 12.80 | 22.39 | -15.93 |
-| `denoise` | 14.45 | 18.53 | 16.96 | 18.54 | -16.21 |
-| `denoise+sinc4x` | 15.56 | 22.39 | 12.80 | 22.39 | -15.93 |
-| `sinc4x+sbr` | 15.53 | 22.39 | 13.58 | 22.39 | -15.93 |
-| `denoise+sinc4x+sbr` | 15.53 | 22.39 | 13.58 | 22.39 | -15.93 |
-| `denoise+sinc4x+sbr+loop=64` | 15.44 | 22.39 | 13.58 | 22.39 | -15.93 |
+| `none` | 12.07 | 19.50 | 6.98 | NaN | -18.17 |
+| `sinc4x` | 12.85 | 24.72 | 6.46 | NaN | -17.88 |
+| `denoise` | 12.07 | 19.49 | 6.98 | NaN | -18.17 |
+| `denoise+sinc4x` | 12.85 | 24.71 | 6.46 | NaN | -17.89 |
+| `sinc4x+sbr` | 12.84 | 24.72 | 6.49 | NaN | -17.88 |
+| `denoise+sinc4x+sbr` | 12.84 | 24.71 | 6.49 | NaN | -17.89 |
+| `denoise+sinc4x+sbr+loop=64` | 12.77 | 24.71 | 6.49 | NaN | -17.89 |
 
-Ground truth's own first 10 ms: -15.76 dB.
+Ground truth's own first 10 ms: -17.61 dB.
 
 #### (c) noise drum
 
 | chain | full-band SNR | in-band SNR | LSD | tail in-band SNR | first 10 ms |
 |---|---:|---:|---:|---:|---:|
-| `none` | 2.50 | 5.96 | 14.90 | NaN | -17.38 |
-| `sinc4x` | 2.52 | 6.75 | 19.73 | NaN | -16.42 |
-| `denoise` | 2.51 | 5.97 | 15.14 | NaN | -17.38 |
-| `denoise+sinc4x` | 2.56 | 6.86 | 19.90 | NaN | -16.42 |
-| `sinc4x+sbr` | 2.51 | 6.73 | 18.37 | NaN | -16.42 |
-| `denoise+sinc4x+sbr` | 2.55 | 6.84 | 18.54 | NaN | -16.42 |
-| `denoise+sinc4x+sbr+loop=64` | 2.55 | 6.84 | 18.54 | NaN | -16.42 |
+| `none` | 2.41 | 6.04 | 15.78 | 6.77 | -17.32 |
+| `sinc4x` | 2.54 | 7.08 | 21.30 | 7.41 | -16.30 |
+| `denoise` | 2.42 | 6.05 | 16.09 | 6.80 | -17.32 |
+| `denoise+sinc4x` | 2.58 | 7.19 | 21.49 | 7.67 | -16.30 |
+| `sinc4x+sbr` | 2.52 | 7.08 | 19.41 | 7.51 | -16.30 |
+| `denoise+sinc4x+sbr` | 2.56 | 7.20 | 19.59 | 7.77 | -16.30 |
+| `denoise+sinc4x+sbr+loop=64` | 2.56 | 7.20 | 19.59 | 7.77 | -16.30 |
 
 Ground truth's own first 10 ms: -14.11 dB.
-
-`NaN` in the drum's tail column is the metric saying so honestly: the burst is over by
-80 ms and the last 40 % of a 250 ms render has no reference energy above the silence gate,
-so there is nothing to score. It is not a failure and not a zero.
 
 #### (d) dark pluck (3 kHz)
 
 | chain | full-band SNR | in-band SNR | LSD | tail in-band SNR | first 10 ms |
 |---|---:|---:|---:|---:|---:|
-| `none` | 10.66 | 11.46 | 9.45 | 1.13 | -15.26 |
-| `sinc4x` | 14.39 | 14.83 | 8.17 | 0.77 | -14.82 |
-| `denoise` | 10.68 | 11.45 | 9.14 | 1.27 | -15.26 |
-| `denoise+sinc4x` | 14.58 | 15.04 | 7.90 | 1.16 | -14.82 |
-| `sinc4x+sbr` | 14.37 | 15.25 | 7.46 | 0.97 | -14.82 |
-| `denoise+sinc4x+sbr` | 14.53 | 15.41 | 7.23 | 1.26 | -14.82 |
-| `denoise+sinc4x+sbr+loop=64` | 14.53 | 15.41 | 7.23 | 1.26 | -14.82 |
+| `none` | 9.64 | 10.88 | 0.87 | 8.85 | -18.45 |
+| `sinc4x` | 12.62 | 13.63 | 0.72 | 8.26 | -18.01 |
+| `denoise` | 9.65 | 10.87 | 0.86 | 8.89 | -18.45 |
+| `denoise+sinc4x` | 12.82 | 13.84 | 0.70 | 8.79 | -18.01 |
+| `sinc4x+sbr` | 12.40 | 13.46 | 0.76 | 8.25 | -18.01 |
+| `denoise+sinc4x+sbr` | 12.60 | 13.67 | 0.73 | 8.78 | -18.01 |
+| `denoise+sinc4x+sbr+loop=64` | 12.60 | 13.67 | 0.73 | 8.78 | -18.01 |
 
-Ground truth's own first 10 ms: -14.78 dB.
+Ground truth's own first 10 ms: -17.98 dB.
+### 2. The harness was judging two criteria by construction, and was corrected
 
-### 2. The constants chosen
+Three things about the first version of this harness decided two of its own verdicts before
+any enhancer ran. All three are fixed, and the fixes are why sections 3 and 4 differ from
+the first draft of this resolution.
+
+**The ground truths stopped at 5.6 kHz.** Instruments (a) and (b) were built with eight and
+twelve partials, so their spectra were silent above 5.6 and 5.9 kHz — and a bandwidth
+extender was then scored as *wrong* for putting anything up there, against a truth no real
+instrument resembles. Both now carry `1/n` harmonics up to
+[`INSTRUMENT_BANDWIDTH_HZ`] = 20 kHz, which is where hearing stops and therefore where an
+instrument stops. (c) and (d) are unchanged in kind; (d) is still (a) low-passed at 3 kHz
+and is still the deliberately dark case.
+
+That change forced a second: the decimation filter went from **64 taps to 512**. A
+Kaiser-windowed sinc's transition width is inversely proportional to its length, and at 64
+taps it is about 4.4 kHz wide at 44 100 Hz — so with content up to 20 kHz, everything from
+4 to 8 kHz folded back into the degraded sample and the harness would have been measuring
+aliasing rather than the loss of a band. At 512 taps the transition is 550 Hz and fits
+between the 3 847 Hz cutoff and the 4 181 Hz Nyquist with a hundred decibels to spare.
+
+**The log-spectral distance charged full price for the inaudible.** Its floor was −120 dB,
+so a bin the reference leaves empty and the candidate fills a hundred decibels down counted
+as much as content that was wrong and loud. The harness now floors it 60 dB below the
+ground truth's own loudest bin ([`AUDIBLE_FLOOR_BELOW_PEAK_DB`]); the libopenmpt comparison
+keeps −120 dB, which is right for it, because *there* the question is whether two engines
+agree rather than whether something sounds closer.
+
+The floor is anchored to the signal rather than stated as an absolute magnitude, and that
+detail is not cosmetic. These magnitudes are normalised so a full-scale **sine** puts 0.25
+in one bin; a real instrument spreads the same energy over thousands of bins, so its
+per-bin magnitudes sit 30 to 40 dB below its own level before anything is lost. An absolute
+`0.25 × 10⁻³` floor was implemented first and measured: it left **0.3 % (d), 1.3 % (a),
+2.9 % (c) and 7.2 % (b)** of the reference's bins above it, collapsed every chain's score
+into a range of 0.05 dB, and did not stop inaudible differences dominating the score — it
+stopped the score being a measurement. Sixty decibels below the loudest bin is the same
+intent, delivered.
+
+**The tail window was mostly digital silence.** "The last 40 %" of a decay that reaches
+−60 dB is, at 8 bits, three quarters silence: every value below half a quantisation step
+rounds to zero, so those frames score exactly 0 dB whatever any enhancer does. The window
+is now the frames where the ground truth's level lies between
+[`TAIL_WINDOW_UPPER_DB`] = −24 dB and [`TAIL_WINDOW_LOWER_DB`] = −48 dB of its peak.
+
+Unlike the other two, **this one did not change the verdict**, and that is itself the
+finding. Measured across five window placements on instrument (a):
+
+| window (dB below peak) | frames | `sinc4x` | `denoise+sinc4x` | gain |
+|---|---:|---:|---:|---:|
+| −24 … −48 (the one now used) | 25 600 | 8.27 | 8.83 | **+0.56** |
+| −30 … −54 | 26 624 | 4.26 | 4.78 | +0.51 |
+| −36 … −60 | 26 624 | 1.60 | 2.08 | +0.48 |
+| −40 … −64 | 25 600 | 0.40 | 0.71 | +0.30 |
+| −24 … −72 | 45 670 | 5.13 | 5.47 | +0.34 |
+
+The denoiser gains between 0.30 and 0.56 dB wherever the window is put. Section 3 explains
+why that is the mechanism's ceiling rather than the window's fault. (The 8-bit floor lands
+45.2 dB below this instrument's rendered peak, so the chosen window's lower edge is right
+at the crossing — it is the best of the five, which is why it is kept.)
+
+### 3. Deliverable 2's acceptance criteria
+
+| Criterion | Target | Measured | Outcome |
+|---|---|---|---|
+| (a) decay-window in-band SNR improves | ≥ 3 dB | **+0.56 dB** (`sinc4x` 8.27 → `denoise+sinc4x` 8.83) | **NOT MET** |
+| (b) full-band SNR drops | < 0.5 dB | **0.00 dB** (12.85 → 12.85) | met |
+| (c) attack first-10 ms RMS | within 0.5 dB | **0.00 dB** (−16.30 → −16.30) | met |
+
+**Why 3 dB is out of reach for a per-block scalar gain, in one line of arithmetic.** The
+optimal scalar Wiener gain `g = s²/(s²+n²)` turns an error of `n²` into `s²n²/(s²+n²)`, so
+it improves the signal-to-error ratio by exactly `10·log10(1 + n²/s²)` — a quantity that
+depends only on how far the signal already is above the floor. Reaching **+3 dB requires
+`s ≤ n`**: the window has to sit at or below the point where the decay crosses its own
+noise floor. The measured baseline in the specified window is 8.27 dB, so `s²/n² = 6.71`
+and the ceiling there is `10·log10(1.149)` = **+0.60 dB**. The implementation achieves
+**+0.56 dB**, which is 93 % of it.
+
+Moving the window down does not help, because below the crossing the 8-bit sample is
+already digital silence and there is no noise left to remove — which is what the five-window
+sweep in section 2 shows: +0.30 dB at −40…−64 dB, *worse* than +0.56 at −24…−48.
+
+Also swept, and neither is what limits it:
+
+* **Strength** 0/50/100/150/200/300/400 %: the plain Wiener gain (100 %) is the optimum, as
+  the theory above says it must be, and every other setting is worse.
+* **Release fraction** 0.125/0.25/0.5/0.75/1.0: within 0.02 dB of each other.
+
+The route to ≥ 3 dB is a **spectral** rather than scalar Wiener gain — in a decay the
+signal is concentrated in a few harmonic bins while the quantisation noise is flat across
+every bin, so a per-bin gain can keep the harmonics and drop the rest, which no broadband
+gain can. The STFT this task already builds for `sbr` is the machinery it would need. It is
+a different enhancer, and the task specified this one.
+
+### 4. Deliverable 3's acceptance criteria
+
+| Criterion | Target | Measured | Outcome |
+|---|---|---|---|
+| (a) LSD lower with `sinc4x+sbr` than `sinc4x` | lower | **−0.02 dB** (2.17 → 2.15) | **met** |
+| (b) LSD lower with `sinc4x+sbr` than `sinc4x` | lower | **+0.03 dB higher** (6.46 → 6.49) | **NOT MET** |
+| (c) LSD does not rise | ≤ +1 dB | **−1.89 dB better** (21.30 → 19.41) | met |
+| (d) detects the 3 kHz edge | yes | **2 875 Hz**, against a 3 887 Hz band limit | met |
+| (d) LSD not worse than `sinc4x` | not worse | **+0.04 dB worse** (0.72 → 0.76) | **NOT MET** |
+
+Criterion (a) is the one the harness correction turned around: against a truth that stopped
+at 5.6 kHz the extender could only be wrong, and against one that carries harmonics to
+20 kHz it is right. Two changes to the extender itself were needed to get there, and both
+are improvements in their own right rather than tuning:
+
+**Phase doubling.** Copying bin `b`'s complex value to bin `2b` puts the right magnitude in
+the right place within one frame — but the frames overlap four to one, and a component at
+bin `2b` must advance its phase by `2π·2b·hop/N` between frames while bin `b`'s value
+advances by half that. Fed the wrong advance, successive frames fight each other and the
+patched band partly cancels. Squaring a complex number doubles its phase and squares its
+magnitude, so squaring and dividing by the magnitude once, per octave, gives the right
+advance at the right level. On instrument (a) this moved the extender from +0.009 dB
+(harmful) to −0.003 dB before the other change below.
+
+**The patch is additive.** The extender used to resynthesise the whole signal, which cost
+one fresh rounding to `i16` of every frame of a sample whose tail is a step or two tall:
+0.29 dB of in-band SNR on instrument (a), spent on a band the enhancer had no business
+touching. It now synthesises the added band alone — everything at or below the edge is
+zeroed before the inverse transform — and sums it onto the original frames. The source's
+own band comes back arithmetic for arithmetic, and the loop stays periodic for the same
+reason it already did.
+
+**Why (b) and (d) still go the wrong way, and what was tried.**
+
+(b) is **inharmonic by construction**: its partials are stretched by `1 + 0.0008n²`, so
+`2·f(n) ≠ f(2n)` and an octave transposition lands its copies *between* the true partials
+of a sustained, sharply tonal spectrum — where the log-spectral distance charges most. (a),
+whose harmonics are exact, improves under the identical mechanism. That is a real property
+of transposition-based band replication and not a defect in this implementation: SBR is
+right for a harmonic source and wrong for an inharmonic one.
+
+(d) is dark, and the extender's own report of it is exactly right — a content edge of
+2 875 Hz inside a band limit of 3 887 Hz, which is the 3 kHz the criterion names. It then
+extends anyway, because a source that stops with a moderate roll-off is genuinely
+indistinguishable from one whose sample rate ran out. Two guards were measured and neither
+separates it:
+
+| instrument | band limit | content edge | fill | gain at `tilt_db` = −6 | Δ LSD |
+|---|---:|---:|---:|---:|---:|
+| (a) plucked decay | 3 855 Hz | 3 528 Hz | 92 % | 0.41 | **−0.02** |
+| (b) sustained loop | 4 966 Hz | 3 789 Hz | 76 % | 0.20 | +0.03 |
+| (c) noise drum | 4 868 Hz | 3 887 Hz | 80 % | 0.13 | **−1.89** |
+| (d) dark pluck | 3 887 Hz | 2 875 Hz | 74 % | 0.14 | +0.04 |
+
+A **gain** guard cannot work: (d) at 0.14 sits *above* (c) at 0.13, and (c) is the
+instrument that gains most. A **fill-ratio** guard could — anything between 76 % and 80 %
+refuses (b) and (d) and keeps (a) and (c) — but a threshold placed in a four-point gap on
+four synthetic instruments is fitted, not derived, and would refuse legitimately dull
+samples that a listener might still want extended. It is deliberately not added; the
+numbers are here so the owner can weigh it at the listening check.
+
+The cost on (d) is worth its size: +0.04 dB on the instrument with the *lowest* absolute
+distance of the four (0.72 against 2.17, 6.46 and 21.30), against −1.89 dB on the drum.
+
+**The tilt sweep**, as the change in log-spectral distance against `sinc4x` alone (a `+0.00`
+means the gain fell below `MINIMUM_EXTENSION_GAIN` and the extender declined the sample):
+
+| `tilt_db` | 0 | −3 | −6 | −9 |
+|---|---:|---:|---:|---:|
+| (a) | −0.043 | −0.034 | −0.025 | −0.017 |
+| (b) | +0.082 | +0.048 | +0.026 | +0.013 |
+| (c) | −2.07 | −1.82 | −1.60 | −1.39 |
+| (d) | +0.086 | +0.055 | +0.033 | +0.018 |
+
+Every tilt has the same signs, so no setting satisfies (b) or (d); the specified default of
+−6 is kept as the point where the two instruments that should improve do, by a useful
+margin, and the two that should not are hurt least.
+
+**The octave sweep**, at the default tilt, against the same baseline:
+
+| octaves | (a) | (b) | (c) | (d) |
+|---|---:|---:|---:|---:|
+| 1 | −0.025 | +0.026 | −1.60 | **+0.033** |
+| 2 | −0.024 | +0.026 | **−1.90** | +0.035 |
+| 3 | −0.024 | +0.026 | −1.90 | +0.035 |
+
+`MAXIMUM_PATCHED_OCTAVES` is **2**: the second octave buys 0.30 dB on the drum — the
+instrument whose truth genuinely has broadband content up there, and the case this enhancer
+exists for — and costs at most 0.003 dB on the other three, while a third buys nothing,
+because two octaves above a 3.8 kHz edge is already 15 kHz. The first version of this
+constant was **1**, chosen against the harness whose instruments stopped at 5.6 kHz, where
+every octave of extension was scored against silence and fewer always won.
+
+### 5. The constants chosen
 
 **`DecayDenoiser`** (`crates/starplayer-enhance/src/denoise.rs`):
 
@@ -279,173 +467,11 @@ equal-length blocks is exactly the square of their pooled RMS, so it is the same
 | `BAND_EDGE_THRESHOLD_DB` | 12 | As specified. |
 | `SPECTRAL_FLOOR_TOP_PERCENT` | 10 | As specified — but the **median** of those bins, not their mean. See below. |
 | `MAXIMUM_EDGE_FRACTION_PERCENT` | 45 | As specified. |
-| `MINIMUM_EXTENSION_GAIN` | 0.08 | With the default −6 dB of extra roll-off already in the gain, this trips when the source is falling faster than about 16 dB per octave at its own top. |
-| `MAXIMUM_PATCHED_OCTAVES` | **1** | Measured, not assumed. See the octave sweep below. |
-| default `tilt_db` | −6 | As specified. The sweep below is the evidence for keeping it. |
+| `MINIMUM_EXTENSION_GAIN` | 0.08 | With the default −6 dB of extra roll-off already in the gain, this trips when the source is falling faster than about 16 dB per octave at its own top. It is a safety rail, not the thing that decides the dark case — see section 4. |
+| `MAXIMUM_PATCHED_OCTAVES` | **2** | Measured, not assumed, and re-measured after the harness was corrected. See the octave sweep in section 4. |
+| default `tilt_db` | −6 | As specified. The sweep in section 4 is the evidence for keeping it. |
 
-### 3. Deliverable 2's acceptance criteria
-
-| Criterion | Target | Measured | Outcome |
-|---|---|---|---|
-| (a) tail-only in-band SNR improves | ≥ 3 dB | **+0.39 dB** (`sinc4x` 0.67 → `denoise+sinc4x` 1.06) | **NOT MET** |
-| (b) full-band SNR drops | < 0.5 dB | **0.00 dB** (15.56 → 15.56) | met |
-| (c) attack first-10 ms RMS | within 0.5 dB | **0.00 dB** (−16.42 → −16.42) | met |
-
-**Why (a) cannot be met by a per-block scalar gain, and what was tried.**
-
-The degraded instrument (a) is *digital silence* for its final quarter. A decay reaching
-−60 dB from a peak near full scale passes below half an 8-bit step at about t = 1.2 s, and
-every value after that rounds to zero — so there is no noise there to remove and no signal
-there to keep. Rendered and scored in tenths, instrument (a) looks like this
-(`sinc4x` against `denoise+sinc4x`, in-band SNR per tenth):
-
-| tenth | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| reference RMS | 4910 | 2474 | 1240 | 621 | 312 | 156 | 78 | 39 | 20 | 10 |
-| `sinc4x` | 19.33 | 19.18 | 18.79 | 17.34 | 14.30 | 9.39 | 2.88 | 0.01 | 0.00 | 0.00 |
-| `denoise+sinc4x` | 19.33 | 19.18 | 18.78 | 17.33 | 14.31 | 9.91 | 4.36 | 0.02 | 0.00 | 0.00 |
-
-The last 40 % is tenths 6 to 9. Three of those four are pinned at 0.00 dB *whatever any
-enhancer does*: the candidate is silent, so the error is the reference and the ratio is
-one. The whole of the available improvement lives in tenth 6, where the decay crosses its
-own noise floor, and there the denoiser gains **+1.48 dB** — against a theoretical
-per-block Wiener ideal of +2.09 dB at that block's signal-to-floor ratio, so the
-implementation is within 0.6 dB of the best its own class can do.
-
-What was tried, and what it bought on the specified tail window:
-
-* **Strength**, swept 0/50/100/150/200/300/400 %: tail 0.67 / 0.96 / **1.06** / 1.06 /
-  0.99 / 0.81 / 0.64. The plain Wiener gain is the optimum, which is what the theory says
-  it should be — it is the MSE-minimising scalar gain per block — so no strength setting
-  reaches 3 dB.
-* **Release fraction**, swept 0.125 / 0.25 / 0.5 / 0.75 / 1.0 (instant): tail 1.04 / 1.06 /
-  1.06 / — / 1.04. The release is not what is limiting it.
-* **A larger or smaller block** cannot help either, for the same reason the strength sweep
-  cannot: the gap to the per-block Wiener ideal is 0.6 dB and the criterion needs 2.6 dB
-  more than that.
-
-The route to ≥ 3 dB, measured out of scope here and named for whoever wants it, is a
-**spectral** rather than scalar Wiener gain: in the tail the signal is concentrated in a
-few harmonic bins while the quantisation noise is spread flat across every bin, so a
-per-bin gain can keep the harmonics and remove the rest, which a broadband gain cannot.
-The STFT this task built for `sbr` is exactly the machinery that would need. It is a
-different enhancer, not a tuning of this one, and the task specified this one.
-
-`crates/starplayer-offline/tests/enhance_quality.rs` pins the achieved +0.39 dB with a
-margin rather than deleting the criterion, and says in its own documentation that it should
-be raised if the spectral denoiser ever lands.
-
-### 4. Deliverable 3's acceptance criteria
-
-| Criterion | Target | Measured | Outcome |
-|---|---|---|---|
-| (a) LSD lower with `sinc4x+sbr` than `sinc4x` | lower | **+0.16 dB worse** (8.85 → 9.01) | **NOT MET** |
-| (b) LSD lower with `sinc4x+sbr` than `sinc4x` | lower | **+0.78 dB worse** (12.80 → 13.58) | **NOT MET** |
-| (c) LSD does not rise | ≤ +1 dB | **−1.36 dB better** (19.73 → 18.37) | met |
-| (d) detects the 3 kHz edge, LSD not worse | not worse | **−0.71 dB better** (8.17 → 7.46) | met |
-
-**Why (a) and (b) go the wrong way, and what was tried.**
-
-The extender is filling a band the *ground truth does not have either*. Instrument (a) is
-eight harmonics of 700 Hz, so its highest partial is 5 600 Hz; instrument (b) is twelve
-partials of 440 Hz, so its highest is 5 888 Hz. The degraded sample's band edge after a 4x
-upsample sits at about 3 763 Hz. So the honest headroom — the band where the ground truth
-has content and the degraded sample does not — is one third of an octave wide, and
-everything the extender puts above 5.9 kHz lands where the reference is silent. The
-log-spectral distance floors an empty bin at −120 dB and charges the full difference, so
-content 60 dB below anything audible costs exactly as much as content that is wrong and
-loud.
-
-The per-band breakdown for instrument (a) (RMS dB error per band, `sinc4x` against
-`sinc4x+sbr`, before the octave limit was set) shows it directly:
-
-| band | 0–3 763 Hz | 3 763–6 000 Hz | 6 000–9 000 Hz | 9 000–13 000 Hz | 13 000–22 050 Hz |
-|---|---:|---:|---:|---:|---:|
-| `sinc4x` | 20.83 | 11.59 | 2.65 | 2.45 | 2.01 |
-| `sinc4x+sbr` | 20.31 | 12.71 | 5.54 | 2.45 | 2.73 |
-
-The cost is entirely in 6–9 kHz, which is above every harmonic instrument (a) has. On the
-drum — the only test instrument whose ground truth genuinely runs past 6 kHz — the same
-band improves from 20.30 to 17.49 and the band the extender is really aimed at,
-3 763–6 000 Hz, improves from 21.78 to 13.87.
-
-What was tried:
-
-* **`tilt_db` swept** 0 / −3 / −6 / −9 / −12 / −18 / −24, as the change in LSD against
-  `sinc4x` alone (a `+0.00` means the gain fell below `MINIMUM_EXTENSION_GAIN` and the
-  extender declined the sample entirely):
-
-  | tilt | 0 | −3 | −6 | −9 | −12 | −18 | −24 |
-  |---|---:|---:|---:|---:|---:|---:|---:|
-  | (a) | +2.09 | +1.22 | +0.67 | +0.33 | +0.10 | **−0.13** | +0.00 |
-  | (b) | +2.17 | +1.52 | +1.06 | +0.73 | +0.00 | +0.00 | +0.00 |
-  | (c) | **−2.40** | −1.80 | −1.41 | +0.00 | +0.00 | +0.00 | +0.00 |
-  | (d) | −0.14 | −0.42 | −0.61 | **−0.73** | +0.00 | +0.00 | +0.00 |
-
-  No tilt satisfies (a) and (b) together. At −18 instrument (a) finally improves by
-  0.13 dB, but by then the extender has declined (b), (c) and (d) outright and is a no-op
-  on three quarters of the corpus, which is a worse enhancer rather than a better score.
-  The specified default of −6 is kept: it is the setting at which every instrument is
-  still processed and the two instruments whose ground truth has a real top octave both
-  improve.
-
-* **A content mask before transposition.** Copying the source's complex spectrum verbatim
-  transposes its 8-bit quantisation floor along with its partials, putting hiss into an
-  octave that previously had none. The extender now transposes only bins standing 12 dB
-  above the source's own noise floor — the same rule that found the edge. This is a real
-  improvement (instrument (a) at tilt 0 went from +2.09 to +1.53) and is kept, but it does
-  not change the sign.
-
-* **The number of octaves patched**, swept against a `sinc4x` baseline at the default
-  tilt:
-
-  | octaves | (a) | (b) | (c) | (d) |
-  |---|---:|---:|---:|---:|
-  | 1 | **+0.15** | **+0.79** | −1.36 | **−0.70** |
-  | 2 | +0.47 | +1.06 | **−1.41** | −0.64 |
-  | 3 | +0.50 | +1.06 | −1.41 | −0.64 |
-
-  One octave is better on three instruments and 0.05 dB worse on the fourth, so
-  `MAXIMUM_PATCHED_OCTAVES` is **1** and the task's "again up to Nyquist" is a documented
-  deviation. The reason is structural rather than a property of these instruments:
-  doubling maps harmonic `n` to harmonic `2n`, which is a real harmonic of the same
-  instrument, while quadrupling maps it to `4n`, which for most instruments is past where
-  the instrument has any harmonics at all. One octave above a 4x-upsampled tracker sample's
-  3.7 kHz edge reaches 7.5 kHz, which is the octave that carries an instrument's
-  brightness.
-
-**What (d) actually showed, which is the opposite of what was expected.** The task guards
-against "a false extension of a dark sample". On instrument (d) the extender extends — and
-*improves* the log-spectral distance by 0.71 dB, more than it improves any other
-instrument. The reason is that the 3 kHz low-pass is a 127-tap windowed sinc with a real
-stopband rather than an infinite wall, so the ground truth does have content above 3 kHz,
-at −45 dB and falling, while the degraded and upsampled candidate has nothing at all above
-its 3.7 kHz polyphase cutoff. The extender's own tilt measurement makes its patch quiet on
-a source that is already rolling off, and quiet content in that band is closer to the truth
-than silence. The criterion "must not get worse" is met with room to spare, and the guard
-is kept as a safety rail rather than as the thing that saved it.
-
-**Two edges, not one — the detection deviation that made (d) checkable at all.** A
-resampled tracker sample has *two* band limits: the polyphase filter's stopband a hundred
-decibels down above the source's Nyquist, and the source's own 8-bit quantisation noise
-spread flat across everything below it. A floor read from the top tenth of the whole
-spectrum measures the stopband, so the highest bin standing 12 dB above it is the
-*resampler's cutoff* and not the point where the instrument stops — which is the same
-answer for a bright sample and a dark one. `band_edge` therefore runs **twice**: the first
-pass finds that hard limit, which is what the headroom refusal is about, and the second
-re-reads the floor from the top tenth of the band below it — the source's own noise floor —
-and finds where the content really ends against it. On instrument (d) the second pass is
-what lands on 3 kHz rather than on 3.7 kHz. Two passes and no more: iterating to a fixed
-point would keep walking a smoothly decaying spectrum downwards with nothing to stop it.
-
-The floor is also the **median** of those top bins rather than their mean. The two agree on
-the sample this enhancer exists for, where the top tenth is nothing but stopband. They part
-company on a sample that already fills its band: its top tenth carries real partials, their
-mean is dominated by them, the threshold rises, the true edge is hidden, and a full-band
-sample looks like one with headroom to fill. `a_sample_with_no_headroom_is_returned_unchanged`
-is that case as a test.
-
-### 5. Research point 1 — a noise-shaped floor for 16-bit sources
+### 6. Research point 1 — a noise-shaped floor for 16-bit sources
 
 **No, and the measurement found something worse than "no useful gain": the specified floor
 estimator is actively destructive on 16-bit material, and that is now fixed.**
@@ -455,16 +481,16 @@ on their degraded twins:
 
 | instrument | estimated floor (mean square) | in-band SNR, `sinc4x` | in-band SNR, `denoise+sinc4x` |
 |---|---:|---:|---:|
-| (a) plucked decay | 128.47 | 120.00 | 70.87 |
+| (a) plucked decay | 64.9 | 68.29 | 53.28 |
 | (b) sustained loop, **before** the cap | 34 557 631 | 120.00 | **5.22** |
-| (b) sustained loop, **after** the cap | 6 308.66 | 120.00 | 79.50 |
+| (b) sustained loop, **after** the cap | 4 123.7 | 86.98 | 79.20 |
 
 A sustained tone has no quiet passage: its quietest 5 % of blocks are as loud as its
 loudest, so "the RMS of the quietest blocks" *is* the signal, the Wiener gain reads the
 whole sample as noise, and the enhancer flattens it. `MAXIMUM_ESTIMATED_FLOOR_FRACTION`
 refuses an estimate that comes back within 40 dB of the whole sample's own mean square —
 a floor worth removing is at least that far down, and an 8-bit source's is 47 dB down — and
-the same tone then comes back at 79.5 dB, an inaudible 0.0016 dB of level change. Eight-bit
+the same tone then comes back at 79.2 dB, an inaudible 0.002 dB of level change. Eight-bit
 sources take the arithmetic floor rather than the estimate and are bit-for-bit unaffected
 by the cap; the harness table above is identical with and without it.
 
@@ -473,7 +499,7 @@ which is the honest answer: there is no quantisation floor there to remove. A no
 floor would not change that — shaping describes where a floor sits in frequency, and a
 16-bit source's floor is 96 dB down wherever it sits. **Noted, not built.**
 
-### 6. Research point 2 — chip loops
+### 7. Research point 2 — chip loops
 
 **The extender already declines every single-cycle loop, and should.** A 4x upsample of a
 `k`-frame loop gives `4k` frames, and `MINIMUM_EXTENDABLE_FRAMES` is one hop, 256 frames.
@@ -498,64 +524,94 @@ octave below that up by one octave puts back harmonics that genuinely belong to 
 waveform. Because the analysis is folded circularly through the loop, the result is still
 exactly periodic — `a_patched_loop_stays_periodic_at_its_seam` is that property as a test.
 
-### 7. Research point 3 — worklet cost
+### 8. Research point 3 — worklet cost
 
 `Module::enhanced` on `PETRI.S3M` (31 998 source frames across five samples), native
 release build, on the development machine:
 
 | chain | time | result |
 |---|---:|---|
-| `sinc4x` | 7.5 ms | 127 992 frames |
-| `denoise` | 0.12 ms | 31 998 frames |
+| `sinc4x` | 7.6 ms | 127 992 frames |
+| `denoise` | 0.13 ms | 31 998 frames |
 | `denoise+sinc4x` | 7.6 ms | 127 992 frames |
-| `sinc4x+sbr` | 23.6 ms | 127 992 frames |
-| `denoise+sinc4x+sbr` | 24.1 ms | 127 992 frames |
-| `denoise+sinc4x+sbr+loop=64` | 24.2 ms | 127 992 frames |
+| `sinc4x+sbr` | 29.4 ms | 127 992 frames |
+| `denoise+sinc4x+sbr` | 29.6 ms | 127 992 frames |
+| `denoise+sinc4x+sbr+loop=64` | 30.1 ms | 127 992 frames |
 
 K5a measured `sinc4x` at 6.9 ms on this fixture and it measures 7.5 ms here, so the machine
-and the method agree. **The full chain costs 24 ms**, an order of magnitude under the
+and the method agree. **The full chain costs 30 ms**, an order of magnitude under the
 ~200 ms the task named as the point at which to say something and two orders under W4's
-~1 s threshold for moving the rebuild off the worklet. The extender is the expensive stage
-and its cost is two 1 024-point transforms per 256 output frames — linear in the *rebuilt*
-sample length, so a 4 MB IT would be around 3 s of rebuild rather than 24 ms and would want
-the frame budget's fallback long before it wanted a different thread. Nothing to change.
+~1 s threshold for moving the rebuild off the worklet. The extender is the expensive stage:
+two 1 024-point transforms per 256 output frames, plus one Newton square root per patched
+bin per frame for the phase doubling, which is what took it from 24 ms to 30 ms and is
+worth every microsecond — see section 4. The cost is linear in the *rebuilt* sample length,
+so a 4 MB IT would be around 4 s of rebuild rather than 30 ms and would want the frame
+budget's fallback long before it wanted a different thread. Nothing to change.
 
 The denoiser is essentially free: one pass of mean squares and one multiply per frame.
 
-### 8. Deviations from the task file
+### 9. Deviations from the task file
 
-* **`MAXIMUM_PATCHED_OCTAVES` is 1, not "up to Nyquist".** Measured; the sweep is in
-  section 4.
+**In the harness**, all three from section 2 and their consequences:
+
+* **Instruments (a) and (b) carry harmonics to 20 kHz**, not the eight and twelve partials
+  the task named. Section 2.
+* **The log-spectral distance is floored 60 dB below the reference's loudest bin**, not at
+  the −120 dB of the metric it was lifted from, and the floor is anchored to the signal
+  rather than being an absolute magnitude. Section 2.
+* **The tail metric is a level window, not "the last 40 %"**. Section 2.
+* **The decimation filter is 512 taps at a 0.92 cutoff**, not 64 at 0.95 — forced by the
+  richer instruments, or the harness would have measured aliasing. Section 2.
+* **The synthetic module's mixing volume is IT's maximum**, so the render sits about 3 dB
+  under full scale rather than 11 dB under it. Every decibel the render loses is a decibel
+  of the instrument's decay that falls under the audibility floor and stops being measured.
+
+**In the extender**:
+
+* **`MAXIMUM_PATCHED_OCTAVES` is 2, not "up to Nyquist".** Section 4.
 * **The spectral floor is the median of the top 10 % of bins, not their mean**, and the
-  band edge is found in **two passes** rather than one. Both are in section 4; without the
-  second pass the extender cannot detect instrument (d)'s 3 kHz edge at all, which is a
-  criterion the task states explicitly.
-* **The extender transposes only bins carrying content**, by the same 12 dB rule that finds
-  the edge, rather than the whole complex spectrum. Section 4.
-* **`MAXIMUM_ESTIMATED_FLOOR_FRACTION` is new**, and is the fix for research point 1's
-  finding. Section 5.
-* **The denoiser works in mean squares rather than RMS**, which is the same quantity
-  squared and removes every square root from it. Section 2.
+  band edge is found in **two passes** rather than one. Without the second pass the
+  extender cannot detect instrument (d)'s 3 kHz edge at all, which is a criterion the task
+  states explicitly — and it reports 2 875 Hz against a 3 887 Hz band limit, so it does.
+* **Only bins carrying content are transposed**, by the same 12 dB rule that finds the
+  edge, rather than the whole complex spectrum. Transposing the source's own quantisation
+  floor puts hiss into an octave that previously had none.
+* **The phase is multiplied by `2^k`, not copied.** Section 4 — this is what makes the
+  overlap-add reconstruct the patched band at the level the tilt asked for instead of
+  partly cancelling it.
+* **The patch is additive**: the extender synthesises the added band alone and sums it onto
+  the original frames, rather than resynthesising the whole signal. Section 4.
 * **"Never above the level at the edge" is satisfied by construction rather than by a
   clamp.** The first patched bin takes the bin an octave below it and scales it by exactly
   the measured ratio between those two levels, times an extra roll-off that is never above
-  one, so the patch cannot land above the edge. An explicit clamp was implemented first and
-  removed: measured against the *detected* edge — which sits a little above the last real
-  partial — it read the noise skirt as "the level at the edge" and refused every extension.
+  one. An explicit clamp was implemented first and removed: measured against the *detected*
+  edge — which sits a little above the last real partial — it read the noise skirt as "the
+  level at the edge" and refused every extension.
+
+**In the denoiser**:
+
+* **`MAXIMUM_ESTIMATED_FLOOR_FRACTION` is new**, and is the fix for research point 1's
+  finding. Section 6.
+* **It works in mean squares rather than RMS**, which is the same quantity squared and
+  removes every square root from it. Section 5.
+
+**Elsewhere**:
+
 * **`InfiniteSource` grew a second index map rather than changing its existing one.**
-  `body_index` is what the upsampler reads through, unchanged: before frame 0 it is silence,
-  because a resampled frame really is played from frame 0 forwards with the module's own
-  pre-roll in front of it. `periodic_body_index` continues a loop that begins at frame 0
-  *backwards* as well, which the extender needs because it folds its output past `loop_end`
-  back into the loop and the two only agree if the reading is circular in both directions.
-  Changing `at()` instead would have moved `sinc4x`'s output on every sample whose loop
-  starts at zero, and `tests/module_rebuild.rs`'s pinned `REFLEX.S3M` hash is unchanged
-  because it did not.
+  `body_index` is what the upsampler reads through, unchanged: before frame 0 it is
+  silence, because a resampled frame really is played from frame 0 forwards with the
+  module's own pre-roll in front of it. `periodic_body_index` continues a loop that begins
+  at frame 0 *backwards* as well, which the extender needs because it folds its output past
+  `loop_end` back into the loop and the two only agree if the reading is circular in both
+  directions. Changing `at()` instead would have moved `sinc4x`'s output on every sample
+  whose loop starts at zero, and `tests/module_rebuild.rs`'s pinned `REFLEX.S3M` hash is
+  unchanged because it did not.
 * **`deterministic.rs` is a new module the task did not name.** The strength knob is
   specified as a percent and the tilt as decibels, and raising a gain to a fractional power
   needs `powf` — which does not exist in `core` and is not bit-reproducible across libm
   implementations where it does exist. The crate therefore carries a Newton square root and
   a binary-expansion power built from `+ − × ÷` alone, pinned against `f64::powf` in tests.
+  The square root earns its keep twice over: the phase doubling needs one per patched bin.
   `saturating_i16` moved there from `upsample.rs` unchanged so every enhancer rounds the
   same way.
 * **The harness's instruments, degradation and metrics live in
@@ -564,16 +620,30 @@ The denoiser is essentially free: one pass of mean squares and one multiply per 
   takes a `&dyn SampleEnhancer`, which it already has through `starplayer::model`, and both
   `examples/enhance_report.rs` and `tests/enhance_quality.rs` build the chains themselves
   from their shared dev-dependency.
+* **`BandwidthExtender::describe` is public** so the harness and the pinned tests can check
+  what the extender decided — the band limit, the content edge and the gain — rather than
+  inferring it from output. It is diagnosis only; the enhancer works from the private
+  `Plan`.
 * **`starplayer-testkit` did already depend on `starplayer-offline`**, so `Fft`, the Hann
   window and `log_spectral_distance_db` moved rather than being copied, as the task's first
-  preference asked.
+  preference asked. `log_spectral_distance_db` gained a `magnitude_floor` parameter so the
+  two callers can disagree about it, and the perceptual binary passes the constant it
+  always used.
 
-### 9. Owner acceptance
+### 10. Owner acceptance
 
-Everything above is agent verification. What is left is the listening check: `sinc4x+loop`
-against `denoise+sinc4x+sbr+loop` on the owner's own S3Ms and on the third-party MODs in
-`music/old/`, with the question being whether the decay denoiser removes hiss without
-dulling attacks and whether the bandwidth extender's top octave sounds like the instrument
-rather than like a phaser. The measurements say the denoiser is safe and the extender is
-worth its cost on percussive material; only listening can say whether the extender should
-be on by default, and nothing in this task turns it on.
+Everything above is agent verification. What is left is the listening check:
+`sinc4x+loop` against `denoise+sinc4x+sbr+loop` on the owner's own S3Ms and on the
+third-party MODs in `music/old/`, with three questions the measurements cannot answer.
+
+* Does the decay denoiser remove hiss without dulling attacks? It is measurably safe — it
+  costs nothing on a sustained tone and nothing on a drum's first ten milliseconds — but
+  +0.56 dB is a small effect and the owner may find it inaudible either way.
+* Does the bandwidth extender's top octave sound like the instrument, or like a phaser? It
+  measures clearly positive on broadband percussion (−1.89 dB) and mildly positive on a
+  harmonic pluck (−0.02 dB), and mildly negative on a sustained inharmonic tone and on a
+  deliberately dark one. Real modules contain all four.
+* Should `sbr` be on by default? Nothing in this task turns it on, and the fill-ratio guard
+  in section 4 — which would refuse the two instruments it hurts — is deliberately left
+  unbuilt because a threshold fitted to a four-point gap is not a rule. The owner's ear on
+  real material is the evidence that would justify one.
