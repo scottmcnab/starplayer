@@ -77,6 +77,7 @@ use starplayer::core::ExactFixedPoint;
 use starplayer::mixer::StereoI16;
 use sha2::{Digest, Sha256};
 
+pub mod analysis;
 pub mod fixtures;
 pub mod wav;
 
