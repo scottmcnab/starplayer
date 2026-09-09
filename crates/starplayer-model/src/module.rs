@@ -170,7 +170,10 @@ impl Module {
     /// 5. every instrument's sample reference names a sample that exists, and every
     ///    non-zero entry of its `note_sample_map` names a sample that exists;
     /// 6. every order names a pattern that exists, or is [`ORDER_MARKER`] /
-    ///    [`ORDER_END`].
+    ///    [`ORDER_END`];
+    /// 7. every sample's
+    ///    [`rate_scale_log2`](crate::SampleSpec::rate_scale_log2) is at most
+    ///    [`MAX_RATE_SCALE_LOG2`](crate::sample::MAX_RATE_SCALE_LOG2).
     pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.header.channel_count == 0 {
             return Err(Error::Invalid("a module must have at least one channel"));
@@ -255,6 +258,9 @@ fn validate_sample(sample: &SampleIndex, pcm_length: usize) -> Result<(), Error>
     }
     if sample.length_frames() == 0 && sample.loop_mode().is_looping() {
         return Err(Error::Invalid("an empty sample cannot loop"));
+    }
+    if sample.rate_scale_log2() > crate::sample::MAX_RATE_SCALE_LOG2 {
+        return Err(Error::Invalid("a sample's rate scale may not exceed 2^3"));
     }
     Ok(())
 }

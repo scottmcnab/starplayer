@@ -89,6 +89,7 @@
 extern crate alloc;
 
 pub mod builder;
+pub mod enhance;
 pub mod header;
 pub mod instrument;
 pub mod module;
@@ -97,7 +98,8 @@ pub mod reader;
 pub mod sample;
 pub mod text;
 
-pub use builder::ModuleBuilder;
+pub use builder::{ModuleBuilder, ping_pong_reflect};
+pub use enhance::{EnhancedPcm, SampleEnhancer, SamplePcm};
 pub use header::{ModuleFlags, ModuleFormat, ModuleHeader};
 pub use instrument::{
     DuplicateAction, DuplicateCheck, Envelope, EnvelopePoint, EnvelopeSpan, InstrumentDef,
@@ -110,8 +112,8 @@ pub use pattern::{
 };
 pub use reader::ModuleReader;
 pub use sample::{
-    AutoVibrato, AutoVibratoWaveform, DEFAULT_REFERENCE_RATE_HZ, LoopMode, SampleIndex,
-    SampleSpec, SustainLoop,
+    AutoVibrato, AutoVibratoWaveform, DEFAULT_REFERENCE_RATE_HZ, LoopMode, MAX_RATE_SCALE_LOG2,
+    SampleIndex, SampleSpec, SustainLoop,
 };
 pub use text::{cp437_char, decode_cp437};
 

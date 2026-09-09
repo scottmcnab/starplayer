@@ -136,7 +136,27 @@ pub struct SampleSpec {
     /// See [`ModuleBuilder::add_sample`](crate::ModuleBuilder::add_sample) for what this
     /// does to the sample's stored-frame and guard-frame layout.
     pub sustain_loop: Option<SustainLoop>,
+    /// How many times the stored frames have been **doubled** relative to the rate
+    /// `reference_rate_hz` names: `0` for every sample as a loader reads it, `2` for a
+    /// sample a 4x enhancer has rebuilt (`crate::enhance`).
+    ///
+    /// The rate itself is deliberately *not* rescaled. MOD and MTM derive their step from
+    /// an Amiga period and read the rate only to recover a finetune index, XM uses the
+    /// constant 8363, and S3M's `S2x` overwrites the channel rate outright — so a rate
+    /// that lied about the sample's own data would move three formats' pitch and none of
+    /// them by the right amount. Playback instead shifts the step and the sample offset by
+    /// this exponent, at the two places a step enters a voice and the one place each
+    /// format reads its offset command. A shift by zero is a no-op, which is why every
+    /// committed golden is untouched by the retrofit.
+    ///
+    /// [`Module::validate`](crate::Module::validate) rejects anything above `3`: a 16x
+    /// rebuild is already 32 bytes per source frame, and the shift has to stay far inside
+    /// a `u32` frame count and a Q32.32 step.
+    pub rate_scale_log2: u8,
 }
+
+/// The largest [`SampleSpec::rate_scale_log2`] a module may carry: an 8x rebuild.
+pub const MAX_RATE_SCALE_LOG2: u8 = 3;
 
 impl SampleSpec {
     /// A one-shot sample at the default reference rate and full volume, with every
@@ -154,6 +174,7 @@ impl SampleSpec {
             default_pan: None,
             auto_vibrato: AutoVibrato::default(),
             sustain_loop: None,
+            rate_scale_log2: 0,
         }
     }
 
@@ -215,6 +236,7 @@ pub struct SampleIndex {
     default_pan: Option<I1F15>,
     auto_vibrato: AutoVibrato,
     sustain_loop: Option<SustainLoop>,
+    rate_scale_log2: u8,
     name: Box<str>,
 }
 
@@ -235,6 +257,7 @@ impl SampleIndex {
             default_pan,
             auto_vibrato,
             sustain_loop,
+            rate_scale_log2,
         } = specification;
         SampleIndex {
             pcm_offset,
@@ -249,6 +272,7 @@ impl SampleIndex {
             default_pan,
             auto_vibrato,
             sustain_loop,
+            rate_scale_log2,
             name: name.into_boxed_str(),
         }
     }
@@ -306,4 +330,32 @@ impl SampleIndex {
 
     /// The sample's name as the file spelled it.
     pub fn name(&self) -> &str { &self.name }
+
+    /// How many times these stored frames have been doubled relative to
+    /// [`SampleIndex::reference_rate_hz`]. `0` for every sample as a loader reads it; see
+    /// [`SampleSpec::rate_scale_log2`].
+    pub const fn rate_scale_log2(&self) -> u8 { self.rate_scale_log2 }
+
+    /// The [`SampleSpec`] this index was built from, field for field.
+    ///
+    /// `pcm_offset` and `length_frames` are deliberately absent: those are the builder's
+    /// to derive from the guard-frame layout it writes, so a rebuild
+    /// ([`Module::enhanced`](crate::Module::enhanced)) hands the frames back and lets
+    /// [`ModuleBuilder::add_sample`](crate::ModuleBuilder::add_sample) place them again.
+    pub fn to_spec(&self) -> SampleSpec {
+        SampleSpec {
+            name: String::from(self.name()),
+            loop_mode: self.loop_mode,
+            loop_start: self.loop_start,
+            loop_end: self.loop_end,
+            default_volume: self.default_volume,
+            reference_rate_hz: self.reference_rate_hz,
+            relative_note: self.relative_note,
+            finetune: self.finetune,
+            default_pan: self.default_pan,
+            auto_vibrato: self.auto_vibrato,
+            sustain_loop: self.sustain_loop,
+            rate_scale_log2: self.rate_scale_log2,
+        }
+    }
 }
