@@ -15,11 +15,16 @@ starplayer-model = { workspace = true }
 starplayer-dsp = { workspace = true }
 
 [dev-dependencies]
-# The real-world S3M the determinism hash and the identity rebuild are pinned against, and
-# the offline harness that traces a module and reports its timeline. Dev-only: nothing in
-# the shipped crate knows about a format or about `std`.
-starplayer-s3m = { workspace = true }
-starplayer-offline = { workspace = true, features = ["trace"] }
+# The facade, for its autodetecting loader — the rebuild has to be proved on all five
+# formats, not just the one this crate could name — and the offline harness that traces a
+# module and reports its timeline. Dev-only: nothing in the shipped crate knows about a
+# format or about `std`, which is why `xtask ci --job no-std-purity` walks `no-dev` edges.
+starplayer = { workspace = true, features = ["std"] }
+# **Not** with `trace`: resolver 2 unifies dependency features across the whole
+# workspace, so a `trace` here would compile the engine's per-tick recorder into
+# `render()` for every `cargo test --workspace` in the repository. The trace-position
+# proof therefore lives in `starplayer-offline`'s own `trace`-gated test suite.
+starplayer-offline = { workspace = true }
 sha2 = { workspace = true }
 
 [features]

@@ -34,6 +34,12 @@ telemetry = ["starplayer/telemetry"]
 # goldens must hash identically with it on and off.
 simd = ["starplayer/simd"]
 
+[dev-dependencies]
+# M10-K5a's load-time sample enhancers, for `tests/enhanced_trace_positions.rs`. A
+# dev-dependency in both directions — `starplayer-enhance` dev-depends on this crate for
+# `song_timeline` — which cargo allows precisely because neither edge is a build edge.
+starplayer-enhance = { workspace = true }
+
 [[bin]]
 name = "starplayer-trace"
 required-features = ["trace"]

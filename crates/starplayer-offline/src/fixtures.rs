@@ -72,6 +72,15 @@ fn looped_ramp() -> Vec<i8> {
     (0..128).map(|index: i32| (index * 2 - 127) as i8).collect()
 }
 
+/// The same ramp stretched over 512 frames, so a `9xx`/`Oxx` parameter of `01` — 256
+/// source frames — lands **inside** the sample rather than past its end.
+///
+/// Only the enhancer fixtures use it: every committed golden keeps the 128-frame ramp
+/// above, because changing a golden fixture's bytes changes its hash.
+fn long_looped_ramp() -> Vec<i8> {
+    (0..512).map(|index: i32| ((index / 4) * 2 - 127) as i8).collect()
+}
+
 /// A one-shot 64-frame two-level pulse. Its hard edges make an interpolation change
 /// visible in the hash rather than dissolving into a smooth waveform.
 fn one_shot_pulse() -> Vec<i8> {
@@ -482,7 +491,17 @@ fn delta_encode(samples: &[i8]) -> Vec<u8> {
 /// a channel-volume `Mxx`, an `Xxx` pan and a `Qxy` retrigger. No `Zxx`: the filter is
 /// task G2's, and a golden that changed the moment the filter landed would be useless as
 /// a regression alarm for the mixer.
-pub fn synthetic_it() -> Vec<u8> {
+pub fn synthetic_it() -> Vec<u8> { synthetic_it_with(looped_ramp(), false) }
+
+/// The same IT with a 512-frame looped sample and an `Oxx` that lands inside it.
+///
+/// A separate fixture rather than a change to [`synthetic_it`], because the committed IT
+/// golden hashes that generator's bytes. M10-K5a's trace-position proof needs a module
+/// whose sample-offset command is **in range**, and every other synthetic fixture's
+/// samples are shorter than the 256 frames the smallest non-zero parameter asks for.
+pub fn synthetic_it_with_offset() -> Vec<u8> { synthetic_it_with(long_looped_ramp(), true) }
+
+fn synthetic_it_with(ramp: Vec<i8>, offsets: bool) -> Vec<u8> {
     const IT_ROWS: usize = 32;
     const IT_CHANNELS: usize = 4;
     const HEADER_BYTES: usize = 0xC0;
@@ -490,10 +509,10 @@ pub fn synthetic_it() -> Vec<u8> {
     const SAMPLE_BYTES: usize = 80;
     const ORDERS: [u8; 2] = [0, 255];
 
-    let looped: Vec<u8> = looped_ramp().iter().map(|sample| (*sample as i16 + 128) as u8).collect();
+    let looped: Vec<u8> = ramp.iter().map(|sample| (*sample as i16 + 128) as u8).collect();
     let pulse: Vec<u8> = one_shot_pulse().iter().map(|sample| (*sample as i16 + 128) as u8).collect();
 
-    let pattern = it_pattern(IT_ROWS);
+    let pattern = it_pattern(IT_ROWS, offsets);
     let orders_offset = HEADER_BYTES;
     let instrument_offsets_offset = orders_offset + ORDERS.len();
     let sample_offsets_offset = instrument_offsets_offset + 2 * 4;
@@ -539,10 +558,15 @@ pub fn synthetic_it() -> Vec<u8> {
 
     write_it_instrument(&mut bytes[instruments_offset..instruments_offset + INSTRUMENT_BYTES], 1, 1, true);
     write_it_instrument(&mut bytes[instruments_offset + INSTRUMENT_BYTES..instruments_offset + 2 * INSTRUMENT_BYTES], 2, 0, false);
-    write_it_sample(&mut bytes[samples_offset..samples_offset + SAMPLE_BYTES], looped.len() as u32, true, first_pcm_offset as u32, 8_363);
+    // The offset fixture's looped sample has **no** sustain loop: releasing one truncates
+    // the voice's position to a whole frame (`SusAfterLoop.it`), and a whole frame of a
+    // quadrupled sample is a quarter of a whole frame of the original, so the exact
+    // position-scaling proof would have nothing to say about that one tick.
+    write_it_sample(&mut bytes[samples_offset..samples_offset + SAMPLE_BYTES], looped.len() as u32, true, !offsets, first_pcm_offset as u32, 8_363);
     write_it_sample(
         &mut bytes[samples_offset + SAMPLE_BYTES..samples_offset + 2 * SAMPLE_BYTES],
         pulse.len() as u32,
+        false,
         false,
         second_pcm_offset as u32,
         16_726,
@@ -598,20 +622,23 @@ fn write_it_envelope(destination: &mut [u8], flags: u8, loop_span: (u8, u8), sus
 }
 
 /// One 80-byte IT sample header.
-fn write_it_sample(destination: &mut [u8], length: u32, sustain: bool, pcm_offset: u32, c5_speed: u32) {
+fn write_it_sample(destination: &mut [u8], length: u32, loops: bool, sustains: bool, pcm_offset: u32, c5_speed: u32) {
     destination[..4].copy_from_slice(b"IMPS");
     destination[0x11] = 64;
-    // Has data, and — for the looped one — a forward loop plus a forward sustain loop.
-    destination[0x12] = 0x01 | if sustain { 0x10 | 0x20 } else { 0 };
+    // Has data, and — for the looped one — a forward loop, plus a forward sustain loop
+    // unless the caller asked for the loop alone.
+    destination[0x12] = 0x01 | if loops { 0x10 } else { 0 } | if sustains { 0x20 } else { 0 };
     destination[0x13] = 64;
     write_text(&mut destination[0x14..0x2E], "synth sample");
     // Unsigned PCM, as Impulse Tracker 1.x wrote it.
     destination[0x2E] = 0;
     destination[0x2F] = 0;
     destination[0x30..0x34].copy_from_slice(&length.to_le_bytes());
-    if sustain {
+    if loops {
         destination[0x34..0x38].copy_from_slice(&(length / 2).to_le_bytes());
         destination[0x38..0x3C].copy_from_slice(&length.to_le_bytes());
+    }
+    if sustains {
         destination[0x40..0x44].copy_from_slice(&(length / 4).to_le_bytes());
         destination[0x44..0x48].copy_from_slice(&(length / 2).to_le_bytes());
     }
@@ -625,11 +652,11 @@ fn write_it_sample(destination: &mut [u8], length: u32, sustain: bool, pcm_offse
 }
 
 /// The synthetic pattern, in IT's packed encoding.
-fn it_pattern(rows: usize) -> Vec<u8> {
+fn it_pattern(rows: usize, offsets: bool) -> Vec<u8> {
     let mut packed = Vec::new();
     for row in 0..rows {
         for channel in 0..4u8 {
-            let cell = it_cell(row, channel);
+            let cell = it_cell(row, channel, offsets);
             let Some((note, instrument, volume, command, parameter)) = cell else { continue };
             let mut mask = 0u8;
             if note.is_some() { mask |= 0x01; }
@@ -658,7 +685,7 @@ fn it_pattern(rows: usize) -> Vec<u8> {
 
 /// One cell of the synthetic pattern: `(note, instrument, volume, command, parameter)`.
 #[allow(clippy::type_complexity)]
-fn it_cell(row: usize, channel: u8) -> Option<(Option<u8>, Option<u8>, Option<u8>, Option<u8>, u8)> {
+fn it_cell(row: usize, channel: u8, offsets: bool) -> Option<(Option<u8>, Option<u8>, Option<u8>, Option<u8>, u8)> {
     let command = |letter: u8, parameter: u8| (Some(letter - b'A' + 1), parameter);
     match (channel, row) {
         // Channel zero: a `Continue` instrument retriggered every four rows, so background
@@ -666,7 +693,13 @@ fn it_cell(row: usize, channel: u8) -> Option<(Option<u8>, Option<u8>, Option<u8
         // are all exercised.
         (0, row) if row % 4 == 0 => Some((Some(48 + (row / 4) as u8), Some(1), None, None, 0)),
         (0, 3) => Some((None, None, Some(40), None, 0)),
-        // Channel one: a note, then a tone portamento up to it, then a volume slide.
+        // Channel one: a note, then a tone portamento up to it, then a volume slide. The
+        // `Oxx` at row eight exists only in the offset fixture, whose looped sample is
+        // long enough for the smallest non-zero parameter to land inside it.
+        (1, 8) if offsets => {
+            let (letter, parameter) = command(b'O', 0x01);
+            Some((Some(60), Some(1), None, letter, parameter))
+        }
         (1, 0) => Some((Some(60), Some(1), None, None, 0)),
         (1, 4) => {
             let (letter, parameter) = command(b'G', 0x08);
