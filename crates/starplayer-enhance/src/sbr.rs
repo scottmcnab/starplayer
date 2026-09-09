@@ -20,9 +20,22 @@
 //! # The band edge, and refusing to invent
 //!
 //! The long-term average power spectrum decides where the content stops: the **spectral
-//! floor** is the mean power of the top [`SPECTRAL_FLOOR_TOP_PERCENT`] of bins, and the
-//! **edge** is the highest bin standing [`BAND_EDGE_THRESHOLD_DB`] above it. Two things
-//! then refuse the whole transform, and both matter more than the transform itself:
+//! floor** is the median power of the top [`SPECTRAL_FLOOR_TOP_PERCENT`] of bins, and an
+//! **edge** is the highest bin standing [`BAND_EDGE_THRESHOLD_DB`] above it.
+//!
+//! That search runs **twice**, because a resampled tracker sample has two band edges. A 4x
+//! upsample leaves the polyphase filter's stopband — a hundred decibels down — above the
+//! source's Nyquist, with the source's own 8-bit quantisation noise spread flat across
+//! everything below it, so the first pass measures the *resampler's cutoff*: the same
+//! answer for a bright sample and a dark one. The second pass re-reads the floor from the
+//! top tenth of the band below that limit — the source's own noise floor — and finds where
+//! the instrument really stops against it. Only the second answer is worth transposing
+//! from, and finding it is what lets a 3 kHz-limited sample be told apart from one whose
+//! sample rate simply ran out. See [`plan`](BandwidthExtender::plan) for why two passes and
+//! not a fixed point.
+//!
+//! Two things then refuse the whole transform, and both matter more than the transform
+//! itself:
 //!
 //! * **No headroom.** An edge above [`MAXIMUM_EDGE_FRACTION_PERCENT`] of the arriving rate
 //!   means the sample already fills its band and there is nothing to fill. The sample comes
@@ -42,12 +55,14 @@
 //! Per analysis frame, output bin `j ≥ edge` takes the complex value of bin `j >> k`,
 //! where `k` is the number of octaves `j` sits above the edge, scaled by `gain^k` — for as
 //! many octaves as [`MAXIMUM_PATCHED_OCTAVES`] allows, and only from bins the source
-//! carries content in rather than noise. The
-//! gain is the source's own tilt over the octave below the edge — measured as the power
-//! ratio of that octave's upper half to its lower half, which *is* the per-octave
+//! carries content in rather than noise.
+//!
+//! The gain is the source's own tilt over the octave below the edge — measured as the
+//! power ratio of that octave's upper half to its lower half, which *is* the per-octave
 //! amplitude ratio for any spectrum falling as a power of frequency — times an extra
-//! [`BandwidthExtender::tilt_db`] per octave, and it never boosts and never lands above
-//! the level at the edge itself.
+//! [`BandwidthExtender::tilt_db`] per octave. It never boosts, and because it is exactly
+//! the ratio between the level an octave below the edge and the level at it, the patch
+//! cannot land above the edge either.
 //!
 //! # Loops
 //!
