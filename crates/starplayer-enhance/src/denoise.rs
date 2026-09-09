@@ -88,6 +88,24 @@ pub const MINIMUM_FLOOR_MEAN_SQUARE: f64 = f64::from_bits(MINIMUM_FLOOR_MEAN_SQU
 /// Percentage of the quietest blocks pooled into an estimated floor.
 pub const QUIET_BLOCK_PERCENT: usize = 5;
 
+/// Ceiling on an **estimated** floor, as a fraction of the whole sample's mean square:
+/// 10^-4, which is 40 dB down.
+///
+/// Without it the estimator is catastrophic on the one thing it is asked to estimate for.
+/// A sustained 16-bit tone has no quiet passage at all — its quietest 5 % of blocks are
+/// as loud as its loudest — so "the RMS of the quietest blocks" *is* the signal, the
+/// Wiener gain reads the whole sample as noise, and M10-K5c's harness measured the
+/// in-band SNR of a 16-bit sustained tone falling from a perfect 120 dB to 5.2 dB. With
+/// the ceiling the same sample's gain is 0.9999 and it is left alone.
+///
+/// Forty decibels is the argument in one number: a noise floor worth removing is at least
+/// that far below the material sitting on it — an 8-bit source's is 47 dB down — and an
+/// estimate that comes back louder has not found a floor, it has found the signal.
+pub const MAXIMUM_ESTIMATED_FLOOR_FRACTION_BITS: u64 = 0x3f1a_36e2_eb1c_432d;
+
+/// [`MAXIMUM_ESTIMATED_FLOOR_FRACTION_BITS`], decoded. The `f64` nearest 10^-4.
+pub const MAXIMUM_ESTIMATED_FLOOR_FRACTION: f64 = f64::from_bits(MAXIMUM_ESTIMATED_FLOOR_FRACTION_BITS);
+
 /// How far the gain moves towards a **lower** block gain, per block. A quarter of the way
 /// per 64 frames is a 26 ms time constant at 8 363 Hz: slower than a tracker's tick, so it
 /// cannot pump, and far faster than any decay it has to follow.
@@ -158,6 +176,12 @@ pub fn noise_floor_mean_square(frames: &[i16]) -> f64 {
         return EIGHT_BIT_FLOOR_MEAN_SQUARE;
     }
     let mut blocks = block_mean_squares(frames);
+    let mut whole = 0.0f64;
+    for value in blocks.iter() {
+        whole += *value;
+    }
+    let ceiling = whole / blocks.len() as f64 * MAXIMUM_ESTIMATED_FLOOR_FRACTION;
+
     blocks.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
     let quiet = (blocks.len() * QUIET_BLOCK_PERCENT / 100).max(1).min(blocks.len());
     let mut pooled = 0.0f64;
@@ -165,6 +189,7 @@ pub fn noise_floor_mean_square(frames: &[i16]) -> f64 {
         pooled += *value;
     }
     let estimate = pooled / quiet as f64;
+    let estimate = if estimate > ceiling { ceiling } else { estimate };
     if estimate < MINIMUM_FLOOR_MEAN_SQUARE { MINIMUM_FLOOR_MEAN_SQUARE } else { estimate }
 }
 
@@ -329,7 +354,32 @@ mod tests {
     fn the_committed_floor_constants_are_what_the_arithmetic_says() {
         assert_eq!(EIGHT_BIT_FLOOR_MEAN_SQUARE.to_bits(), (256.0f64 * 256.0 / 12.0).to_bits());
         assert_eq!(MINIMUM_FLOOR_MEAN_SQUARE.to_bits(), (1.0f64 / 12.0).to_bits());
+        assert_eq!(MAXIMUM_ESTIMATED_FLOOR_FRACTION.to_bits(), 1.0e-4f64.to_bits());
         assert_eq!(RELEASE_FRACTION, 0.25);
+    }
+
+    /// Research point 1's finding, as a test: a sustained 16-bit tone has no quiet passage
+    /// to estimate a floor from, and the ceiling is what stops the estimator reading the
+    /// whole signal as noise.
+    #[test]
+    fn a_sustained_sixteen_bit_tone_is_left_alone_because_the_estimate_is_capped() {
+        let frames: Vec<i16> = (0..4_096)
+            .map(|index| {
+                // Sixteen samples per cycle, so every 64-frame block holds exactly four
+                // cycles and every block's mean square is identical.
+                let step = index % 16;
+                let table = [0, 3_136, 5_792, 7_568, 8_192, 7_568, 5_792, 3_136, 0, -3_136, -5_792, -7_568, -8_192, -7_568, -5_792, -3_136];
+                table[step] as i16
+            })
+            .collect();
+        let mean_square: f64 = frames.iter().map(|frame| *frame as f64 * *frame as f64).sum::<f64>() / frames.len() as f64;
+        let floor = noise_floor_mean_square(&frames);
+        assert!(floor <= mean_square * MAXIMUM_ESTIMATED_FLOOR_FRACTION * 1.001, "the estimate {floor} is not capped against the sample's own {mean_square}");
+
+        let enhanced = DecayDenoiser::new().enhance(one_shot(&frames));
+        for (after, before) in enhanced.frames.iter().zip(frames.iter()) {
+            assert!((*after as i32 - *before as i32).abs() <= 2, "a sustained 16-bit tone must survive: {after} against {before}");
+        }
     }
 
     #[test]
