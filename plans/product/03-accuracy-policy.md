@@ -638,6 +638,15 @@ Ordered by value per unit of effort. Full detail in `02-roadmap.md`.
    two are **cross-target pins for the wide kernels** — the thing they catch is a cubic or
    sinc render that is not bit-identical on x86-64, aarch64 and wasm32 — not a second
    reference render. Accuracy statements in this document are about the linear hashes.
+   **A canonical golden never sees a sample enhancer.** M10-K5's load-time enhancers
+   (`starplayer-enhance`) rebuild a module before it is played, so an enhanced render is
+   a different render of a different module and could not be an accuracy statement about
+   anything. An enhanced configuration is hashed under its own filename —
+   `<stem>__i16_mono_44100_linear_enh-<name>.sha256`, where `<name>` is the enhancer
+   chain's own `name()` and therefore encodes every parameter that changes its output
+   (`sinc4x`, `loop=64`, `sinc4x+loop=64`, a rate ceiling and all) — so turning an
+   enhancer on is visibly a new golden rather than a silent break, exactly as a change of
+   interpolator is. The `enhance` feature is never in `default` for the same reason.
 6. **Cross-target hash equality** — x86-64, aarch64 and wasm32 must agree bit-for-bit
    on the fixed-point path.
 7. **Perceptual comparison vs libopenmpt** on the float path — spectral distance /

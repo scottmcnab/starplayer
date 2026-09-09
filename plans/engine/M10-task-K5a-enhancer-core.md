@@ -253,3 +253,205 @@ cargo xtask ci --job host-tests
 The CLI `--enhance` flag, `RenderOptions` and golden naming (K5b); the web checkboxes and
 wasm export (W4); spectral band replication or a learned model; running an enhancer at
 runtime; the library scan (M11).
+
+## Research resolution
+
+*Written 2026-09-09, on branch `k5a`.*
+
+### 1. Where the step shift lives
+
+**Kept in the engine, as specified**, and no reason was found to prefer `VoiceParam::apply`.
+Three things settled it:
+
+* `VoiceParam::apply` (`crates/starplayer-core/src/event.rs:360`) takes only
+  `&mut VoiceParams`. It has no region, so moving the shift there would mean either giving
+  `VoiceParams` a copy of the scale — a field the mixer would carry and never read — or
+  moving the whole `apply` into the mixer, where `Voice` would then know why its frames
+  exist. Both are worse than one `match` at each of the engine's own entry points.
+* The shift has to happen at a **trigger** too, not only at a parameter write, and a
+  trigger never goes through `apply`. So the mixer site would not have been one site; it
+  would have been `apply` *plus* `Voice::new`.
+* `render()` is untouched either way, but the engine sites keep the change entirely outside
+  `starplayer-mixer`, so `rt-safety` and the SIMD kernels never had to be re-reasoned about.
+
+Two adjustments to the letter of the deliverable, both narrowing rather than widening:
+
+* The trigger-side shift is applied in **`ChannelTable::trigger`** (`channel.rs`) rather
+  than in `TickContext::trigger_channel`. `trigger` is the single function every
+  `trigger_channel` reaches, and it is *also* what the engine's own instruments call
+  (`instrument.rs:398`, `:477`), so one site covers both instead of two sites covering one
+  each.
+* There is a **third** step entry point the task did not list, found by the audit below:
+  FastTracker 2 recomputes its period every tick and writes it straight into
+  `Voice::params` rather than through `write_voice_param`, at
+  `crates/starplayer-xm/src/processor.rs:1777`. Left unscaled it would have overwritten the
+  scaled trigger step on the very next tick and silently broken XM. `scaled_step` is
+  therefore `pub` and `starplayer-xm` calls it. The XM trace-position test is what would
+  have caught it.
+
+### 2. `kaiser` / `bessel_i0`
+
+**Duplicated in this crate's generator test**, not lifted into a `starplayer_dsp::design`
+module. The reason is that the lift as described is not possible: `kaiser` needs
+`f64::sqrt` and the prototype needs `f64::sin`, and neither exists in `core` — they are
+`std`-only inherent methods, and a `no_std` `starplayer-dsp` would need `libm` to get them.
+A `design` module would therefore have had to be `#[cfg(any(test, feature = "std"))]`, which
+is a feature-gated public module whose only two consumers are both `#[cfg(test)]` anyway.
+
+The duplication is forty lines of textbook mathematics in a `#[cfg(test)] mod tests`, and
+each copy is pinned by its own regeneration gate against its own committed table
+(`the_committed_table_is_what_the_generator_produces` in both `sinc_table.rs` and
+`polyphase.rs`), so the two cannot drift without a test failing. Sharing would have bought
+nothing a reader needs and cost a `std`-shaped seam in a crate that has none.
+
+### 3. 8-bit dither / 16-bit reconstruction
+
+**Measured, and there is nothing worth building.** Three measurements, on a scratch harness
+run against the committed S3M fixtures and a synthetic control:
+
+* **Every frame of REFLEX.S3M's and PETRI.S3M's PCM is a multiple of 256** — that is, both
+  modules are entirely widened 8-bit, which is the ST-01-style material the research point
+  asks about. After a `sinc4x` rebuild they are not, so the reconstruction is already
+  producing genuinely 16-bit-valued frames rather than shifted 8-bit ones.
+* **A clean sine quantised to 8 bits measures 47.0 dB SNR** (0.92 full scale; the textbook
+  full-scale figure is 49.9 dB). That is the floor the source carries, and no load-time
+  transform can lower it — the quantisation happened in someone else's sampler, decades ago.
+* **Only 1.4 % of the upsampled noise power lies above the source Nyquist.** This is the
+  number that settles it: the polyphase filter's stopband keeps the source's noise inside
+  the source's own band, so a low-pass at the source Nyquist could remove at most 1.4 % of
+  the noise power — about 0.06 dB — and would remove signal along with it, because signal
+  and noise occupy exactly the same band.
+
+Adding dither at the 16-bit rebuild is worse than useless for the same reason: TPDF dither
+would put a fresh floor roughly 48 dB *below* the one already there.
+
+The transform that would actually help is noise **shaping at the original quantisation**,
+which is not available to us, or a de-noiser / band-extender — and both of those are the
+spectral work this task lists as out of scope. **Noted, not built.**
+
+### 4. Memory
+
+Measured on the two committed S3M fixtures:
+
+| Module | Samples | PCM frames | `sinc4x` | Growth | With a 22 050 Hz ceiling |
+|---|---|---|---|---|---|
+| REFLEX.S3M | 4 | 2 240 (4 kB) | 8 768 (17 kB) | 3.91x | 4 416 frames, 1.97x |
+| PETRI.S3M | 5 | 32 078 (63 kB) | 128 072 (250 kB) | 3.99x | 64 076 frames, 2.00x |
+
+Growth is just under 4x rather than exactly 4x because each sample carries a fixed pre-roll
+and guard that do not scale, and because a ping-pong loop's stored length is
+`F·(end − 1) + 1` rather than `F·end`.
+
+Both fixtures' samples sit at 8 363-8 900 Hz, so a 22 050 Hz ceiling puts **every** sample
+at 2x — `8363 × 4 = 33 452` is over, `8363 × 2 = 16 726` is not — and the blob doubles
+instead of quadrupling. That is the ceiling working exactly as intended: it is a per-sample
+decision, and on this material every sample happens to make the same one.
+
+Extrapolating: a 4 MB IT becomes 16 MB. Fine on desktop, fine in a browser tab.
+
+What an **embedded** host would need, for M8's benefit:
+
+* The rebuild is a second allocation of the whole PCM blob. On a target where the module is
+  *borrowed* from memory-mapped flash (architecture §6's mmap case), enhancement gives that
+  up entirely — the rebuilt blob has to live in RAM. An ESP32-class host should treat
+  `sinc4x` as unavailable rather than as a slow path, and use the ceiling to opt in per
+  sample if it wants anything at all.
+* **`ModuleBuilder` has no `reserve`.** `add_sample` extends `self.pcm` frame by frame, so
+  the growing `Vec` doubles, and during the final reallocation the old and new buffers
+  coexist. The peak is therefore well above the `4 × source` the finished module costs. An
+  embedded host — or a wasm host with a hard heap ceiling — would want
+  `ModuleBuilder::reserve_pcm(frames)` and `Module::enhanced` to call it with the total the
+  enhancer is about to produce. That is a small, self-contained follow-up, deliberately not
+  taken here because it changes the builder's public surface and nothing on desktop needs
+  it.
+* The rebuild is not incremental and cannot be interrupted, so a host with a frame budget
+  has to run it off the audio thread and swap the module in when it is done — which is
+  exactly what the engine's existing `Arc<Module>` swap and garbage channel already do.
+  W4's wasm budget is that pattern; nothing new is needed for it.
+
+### 5. The offset-site audit
+
+`grep -n "length_frames()\|loop_end()\|loop_start()" crates/starplayer-*/src/processor.rs`
+turns up twenty-eight lines. Classified:
+
+| Site | What it compares | Verdict |
+|---|---|---|
+| `mod:304` | `sample.length_frames() > 0` | A zero test. Unit-free. |
+| `mod:573` `advance_sample_pointer` | channel `sample_offset` vs `length_frames()` | **Consistent**: the offset is scaled at `sample_offset()`, where the file's `9xx` parameter is read, so both sides are stored frames. |
+| `mod:799` | `sample_offset + 2` vs `length_frames()` | **Changed.** PT's retained one-word region is two *source* frames; scaled to `2 << rate_scale_log2()` so an enhanced sample's "one word" is the same duration. The region is tagged with the scale. |
+| `mod:1064` `sample_region` | loop points → `SampleRegion` | **Changed**: tagged with the scale. |
+| `mod:1169`, `:1173`, `:1831` | test helpers reading `region().length_frames()` | Test-only, and already in region frames. |
+| `mtm:250` | test helper | Test-only. MTM shares `ModProcessor`, so it inherits every MOD site above. |
+| `s3m:346` (`Oxx`) | writes `sample_offset` | **Changed**: scaled by the sample the channel is about to trigger. |
+| `s3m:905` `sample_region` | loop points | **Changed**: tagged. |
+| `xm:687` (`9xx`) | writes `sample_start_frame` | **Changed**: scaled, using the sample resolved four lines above. |
+| `xm:1726` | `length_frames() > 0` | A zero test. |
+| `xm:1744` | `offset >= length_frames()` (`kFT2ST3OffsetOutOfRange`) | **Consistent**: the offset is scaled at `:687`. Note this is the site that would break loudly if it were not — a `9xx` past the end of the plain sample lands *inside* the quadrupled one. |
+| `xm:1980` `sample_region` | loop points | **Changed**: tagged. |
+| `it:709` `sample_region` | loop points, sustain and main | **Changed**: tagged. |
+| `it:1522-1523` | `loop_start`/`loop_end` vs `position >> 32` | **Consistent** in units, but it *quantises*: the sustain-loop release truncates the Q32.32 cursor to a whole frame, so `4·floor(p)` and `floor(4p)` differ by up to three frames. This is IT's own semantics (`SusAfterLoop.it`), it is not made worse by the scale, and it is the one place the `<< 2` invariant is stated as a bound rather than an equality. `tests/enhanced_trace_positions.rs::an_it_sustain_loop_release_quantises_its_position_to_a_whole_frame` pins the bound. |
+| `it:2135` (`Oxx`) | `offset >= length_frames()` | **Consistent**: the offset — `SAx`'s high byte included — is scaled two lines above, at the read. |
+| `it:2424` | `region().length_frames()` | Already in region frames. |
+| `engine instrument.rs:205` | loop points | **Changed**: tagged. |
+
+Nothing else in the four processors compares a channel-state offset against a sample
+extent. The only remaining frame-count constant in a comparison is MOD's one word, handled
+above.
+
+### 6. Two design calls the task file left open
+
+**`reference_rate_hz` keeps the file's value.** Deliverable 1 says `to_spec()` takes "the
+returned rate", and finding 2 says "`reference_rate_hz` keeps the file's value". Those
+conflict, and finding 2 wins: the returned rate is used **only** to derive
+`rate_scale_log2`. Quadrupling `reference_rate_hz` would do nothing at all for MOD, MTM and
+XM (which never derive pitch from it) and would break MOD's `finetune_from_rate` table
+lookup outright, while for S3M and IT it would double-count against the engine's own shift.
+`SamplePcm::rate_hz` is documented as *the rate the frames in the slice represent* —
+`reference_rate_hz << rate_scale_log2` — so a chained or already-scaled sample's ceiling
+check stays honest and the scales add.
+
+**The trace-position invariant is stated against the `Linear` kernel.** A forward loop's
+wrap is deferred by the interpolator's `LEADING_FRAMES`
+(`starplayer_mixer::kernel::forward_wrap_bits`), which is a constant in *frames* and does
+not scale. `Linear` and `Nearest` have zero leading frames, so the wrap is exactly
+`loop_end` and scales exactly; `Cubic` and `Sinc` do not. The offline trace engine is
+`Engine<FixedPath, Linear, StereoI16>`, so the proof is exact where it is made, and the
+deferral is a rendering difference rather than a sequencing one. This is recorded in the
+test's own module documentation.
+
+### 7. Deviations from the task file
+
+* The identity-rebuild test over real fixtures lives in `crates/starplayer-enhance/tests/`
+  rather than in the model's own tests: `starplayer-model` cannot load a MOD or an IT
+  without dev-depending on all five format crates. The model keeps an `Identity` enhancer
+  and a hand-built module covering every sample shape (forward, ping-pong, one-shot, empty,
+  sustain), which is the part that does belong there.
+* The trace-position proof lives in `crates/starplayer-offline/tests/`, gated on that
+  crate's own `trace` feature, rather than in `starplayer-enhance/tests/`. Resolver 2
+  unifies dependency features across the workspace, so a `starplayer-offline/trace`
+  dev-dependency in the enhance crate compiles the engine's per-tick recorder into
+  `render()` for **every** `cargo test --workspace` in the repository — which is exactly
+  what `starplayer-offline/Cargo.toml` already warns about, and which showed up immediately
+  as three `starplayer-host` allocation tests failing.
+* `xtask`'s `assert_resolved_features_exclude_std` now walks `--edges features,no-dev`.
+  Without it, `starplayer-enhance`'s dev-dependency on the (necessarily `std`) offline
+  harness reads as a purity violation. Dev-dependencies are never compiled into the crate a
+  host links, and the `cargo check --target <bare metal>` half of the same job already
+  ignored them, so the two halves now agree on what they are looking at.
+* `synthetic_it_with_offset()` is a **new** fixture rather than an `Oxx` added to
+  `synthetic_it()`: the committed IT golden hashes that generator's bytes. Its looped sample
+  is 512 frames (so the smallest non-zero offset parameter, 256 frames, lands inside it) and
+  has a forward loop with no sustain loop (so the release quantisation above does not blunt
+  the exactness proof). `synthetic_it()`'s bytes are unchanged, which `cargo xtask goldens
+  --check` confirms.
+* The S3M offset case is **PETRI.S3M**, not REFLEX.S3M: REFLEX uses no `Oxx` at all
+  (its commands are A, C, D, G, H, J, K, Q, S), while PETRI uses 146 of them against real
+  samples. Both are traced; REFLEX remains the determinism hash's subject.
+* `catalogue::enhancer_for_id` and `catalogue::descriptor` were added beside `from_flags`.
+  Without a constructor, the `sinc2x` entry the task asks for — an enhancer with no flag bit
+  — would be a catalogue row nothing could build, and K5b's parser would have to hard-code
+  the mapping the catalogue exists to own.
+* `starplayer-enhance`'s dev-dependency is the **facade** rather than `starplayer-s3m`: the
+  identity rebuild has to be proved on all five formats, and the facade's autodetecting
+  loader is the one thing that reaches them all. It re-exports `starplayer-s3m`, so REFLEX
+  and PETRI still load.

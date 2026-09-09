@@ -731,6 +731,29 @@ each lie anywhere inside it; its guard is silence, and one frame of `Linear`
 interpolation reads real PCM past a loop end there instead of a wrapped or reflected
 copy — accepted for now, left for M7's kernels to reconsider.
 
+**Load-time sample enhancement** (M10-K5a) is a *rebuild*, not a hook: an enhancer is a
+transform on one sample's decoded PCM, and `Module::enhanced(&dyn SampleEnhancer)` runs a
+fresh `ModuleBuilder` over an existing module — header, orders, instruments and patterns
+copied through in id order, every sample's stored body handed to the enhancer and added
+back. That works only because of the properties above: ids are push order,
+`sample_pcm(id)[..length_frames()]` is exactly the stored body, and `Module` derives
+`PartialEq` over all seven fields. So an *identity* enhancer must rebuild an **equal**
+module, which is the test the whole scheme rests on. A rebuild is also why an enhancer
+needs no lifetime on the builder and no change to any of the five loaders.
+
+An enhancer may raise a sample's rate, but only by a power of two, and the module records
+the factor rather than the rate: `SampleSpec::rate_scale_log2` (0 = identity, 3 = the
+limit) alongside a `reference_rate_hz` that keeps the file's own value. The rate must not
+move because three of the four formats would mis-hear it — MOD and MTM read it only to
+recover a finetune index, XM uses the constant 8363, and S3M's `S2x` overwrites the
+channel rate outright. **Playback shifts instead**: the engine scales the step at the two
+places one enters a voice (`ChannelTable::trigger` and `write_voice_param`; FastTracker 2
+writes its per-tick period straight into `Voice::params`, so `starplayer-xm` is a third),
+and each format scales its sample-offset command where it reads the file's own parameter,
+so every later comparison against `length_frames()` stays in the region's own stored
+frames. A shift by zero is a no-op, which is what makes the retrofit provably free: the
+committed goldens are byte-identical across it, on every format.
+
 Format crates keep their **native** pattern bytes in `blob`. The shared model covers
 samples, envelopes, instrument definitions and a **display-only** `PatternCell` view for
 UIs — deliberately *not* a shared pattern-cell model, which is exactly the mistake that
@@ -1508,6 +1531,11 @@ crates/
                         the `smf` feature (parser + SmfSequencer) also → engine, for
                         EventFeed and the MIDI_CHANNEL_BASE mapping (task E5)
   starplayer-telemetry  snapshot types shared by every UI             → core, rt
+  starplayer-enhance    load-time sample enhancers: polyphase sinc upsampling
+                        (a committed f64 coefficient table, so no `sin` at run
+                        time and no `std`), loop-seam smoothing, and the
+                        catalogue a host builds its checkboxes from. Never in
+                        `default`; the RT path never sees it.  → model, dsp
   starplayer            facade: re-exports + format autodetect. THE public crate.
   # ── std ─────────────────────────────────────────────────────────────────────
   starplayer-host       AudioBackend trait, AudioSpec/DeviceInfo/Stream, the
@@ -1591,6 +1619,8 @@ float-mix = []                # both mix paths may be enabled at once
 fixed-mix = []
 telemetry = []
 trace = []                    # per-tick state trace; test/debug only
+enhance = []                  # load-time sample enhancers; never in default, because
+                              # the canonical goldens must never see an enhanced module
 quirks-starplayer = []        # see plans/product/03-accuracy-policy.md §2
 serde = []
 mod = []; s3m = []; mtm = []; xm = []; it = []
