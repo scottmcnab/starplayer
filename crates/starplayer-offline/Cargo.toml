@@ -35,7 +35,8 @@ telemetry = ["starplayer/telemetry"]
 simd = ["starplayer/simd"]
 
 [dev-dependencies]
-# M10-K5a's load-time sample enhancers, for `tests/enhanced_trace_positions.rs`. A
+# M10-K5a's load-time sample enhancers, for `tests/enhanced_trace_positions.rs`,
+# M10-K5c's `tests/enhance_quality.rs` and `examples/enhance_report.rs`. A
 # dev-dependency in both directions — `starplayer-enhance` dev-depends on this crate for
 # `song_timeline` — which cargo allows precisely because neither edge is a build edge.
 starplayer-enhance = { workspace = true }

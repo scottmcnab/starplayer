@@ -88,6 +88,12 @@ const ENHANCE_FRAME_BUDGET: usize = 16_000_000;
 const ENHANCE_FLAG_UPSAMPLE: u32 = 1 << 0;
 /// [`CATALOGUE`](starplayer::enhance::CATALOGUE)'s bit for the loop-seam smoother checkbox.
 const ENHANCE_FLAG_LOOP: u32 = 1 << 1;
+/// The catalogue id of the enhancer [`ENHANCE_FRAME_BUDGET`] applies to. It is the only
+/// entry [`build_enhancement`] treats specially, because it is the only one that changes
+/// how much memory the rebuild costs.
+const ENHANCE_UPSAMPLE_ID: &str = "sinc4x";
+/// The id the frame budget falls back to before falling back to nothing.
+const ENHANCE_HALF_UPSAMPLE_ID: &str = "sinc2x";
 
 /// Fraction of the held master peak that survives one quantum: about a 200 ms fall from
 /// full scale to silence at 48 kHz, which reads well on a bar.
@@ -220,16 +226,21 @@ fn decode(bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags:
 /// is passed straight through to the upsampler, exactly as `starplayer::enhance::from_flags`
 /// would.
 ///
+/// The walk is over `CATALOGUE` itself, in **catalogue order**, which since M10-K5c is the
+/// order the stages have to run in rather than the order their bits were assigned. So an
+/// enhancer added to that table appears here — and in the page's checkboxes, and in the
+/// CLI's `--enhance` — without this function changing. The upsampler is the one entry with
+/// a special case, and only because it is the one entry that decides how much memory the
+/// rebuild costs.
+///
 /// Returns the chain (`None` for the identity — no enhancer ran at all), the flags actually
 /// engaged (`sinc2x` reports through [`ENHANCE_FLAG_UPSAMPLE`], the same bit `sinc4x` would
 /// have used, since the checkbox catalogue gives it no bit of its own), and the upsample
 /// factor that actually ran, 1 meaning none.
 fn build_enhancement(enhancement_flags: u32, source_frames: usize, rate_ceiling_hz: u32) -> (Option<starplayer::enhance::Chain>, u32, u32) {
-    use starplayer::enhance::enhancer_for_id;
+    use starplayer::enhance::{CATALOGUE, NO_FLAG_BIT, enhancer_for_id};
 
     let wants_upsample = enhancement_flags & ENHANCE_FLAG_UPSAMPLE != 0;
-    let wants_loop = enhancement_flags & ENHANCE_FLAG_LOOP != 0;
-
     let mut factor: u32 = if wants_upsample { 4 } else { 1 };
     while factor > 1 && source_frames.saturating_mul(factor as usize) > ENHANCE_FRAME_BUDGET {
         factor = if factor == 4 { 2 } else { 1 };
@@ -237,15 +248,25 @@ fn build_enhancement(enhancement_flags: u32, source_frames: usize, rate_ceiling_
 
     let mut chain = starplayer::enhance::Chain::new();
     let mut applied_flags = 0u32;
-    if factor > 1
-        && let Some(enhancer) = enhancer_for_id(if factor == 4 { "sinc4x" } else { "sinc2x" }, Some(rate_ceiling_hz))
-    {
-        chain = chain.then(enhancer);
-        applied_flags |= ENHANCE_FLAG_UPSAMPLE;
-    }
-    if wants_loop && let Some(enhancer) = enhancer_for_id("loop", None) {
-        chain = chain.then(enhancer);
-        applied_flags |= ENHANCE_FLAG_LOOP;
+    for descriptor in CATALOGUE.iter() {
+        if descriptor.flag_bit == NO_FLAG_BIT || descriptor.flag_bit >= u32::BITS as u8 {
+            continue;
+        }
+        if enhancement_flags & (1 << descriptor.flag_bit) == 0 {
+            continue;
+        }
+        // The upsampler is the only entry the frame budget can narrow or drop, and the
+        // only one that wants the rate ceiling — nothing else changes a sample's rate.
+        let (id, ceiling_hz) = match descriptor.id {
+            ENHANCE_UPSAMPLE_ID if factor == 4 => (ENHANCE_UPSAMPLE_ID, Some(rate_ceiling_hz)),
+            ENHANCE_UPSAMPLE_ID if factor == 2 => (ENHANCE_HALF_UPSAMPLE_ID, Some(rate_ceiling_hz)),
+            ENHANCE_UPSAMPLE_ID => continue,
+            id => (id, None),
+        };
+        if let Some(enhancer) = enhancer_for_id(id, ceiling_hz) {
+            chain = chain.then(enhancer);
+            applied_flags |= 1 << descriptor.flag_bit;
+        }
     }
     let chain = if chain.is_empty() { None } else { Some(chain) };
     (chain, applied_flags, factor)
@@ -1241,10 +1262,67 @@ mod tests {
         assert_eq!(factor_identity, 1);
     }
 
+    /// M10-K5c's two new bits reach their enhancers through the catalogue walk, in
+    /// catalogue order rather than bit order.
+    #[test]
+    fn the_denoise_and_sbr_bits_build_their_stages_in_run_order() {
+        const DENOISE: u32 = 1 << 2;
+        const SBR: u32 = 1 << 3;
+
+        let (chain, applied_flags, factor) = build_enhancement(DENOISE, 1_000, 48_000);
+        assert_eq!(chain.map(|chain| chain.name()), Some(String::from("denoise")));
+        assert_eq!(applied_flags, DENOISE);
+        assert_eq!(factor, 1, "the denoiser changes no rate");
+
+        let (chain, applied_flags, _) = build_enhancement(SBR, 1_000, 48_000);
+        assert_eq!(chain.map(|chain| chain.name()), Some(String::from("sbr")));
+        assert_eq!(applied_flags, SBR);
+
+        // Bits set in any order build the chain in the order the stages must run in.
+        let (chain, applied_flags, factor) = build_enhancement(SBR | ENHANCE_FLAG_LOOP | ENHANCE_FLAG_UPSAMPLE | DENOISE, 1_000, 48_000);
+        assert_eq!(chain.map(|chain| chain.name()), Some(String::from("denoise+sinc4x-ceil48000+sbr+loop=64")));
+        assert_eq!(applied_flags, DENOISE | ENHANCE_FLAG_UPSAMPLE | SBR | ENHANCE_FLAG_LOOP);
+        assert_eq!(factor, 4);
+    }
+
+    /// The frame budget narrows the upsampler and leaves every other stage alone.
+    #[test]
+    fn the_frame_budget_narrows_only_the_upsampler() {
+        const DENOISE: u32 = 1 << 2;
+        const SBR: u32 = 1 << 3;
+
+        let (chain, applied_flags, factor) = build_enhancement(DENOISE | ENHANCE_FLAG_UPSAMPLE | SBR, ENHANCE_FRAME_BUDGET / 3, 48_000);
+        assert_eq!(chain.map(|chain| chain.name()), Some(String::from("denoise+sinc2x-ceil48000+sbr")));
+        assert_eq!(applied_flags, DENOISE | ENHANCE_FLAG_UPSAMPLE | SBR, "2x still reports through the upsample bit");
+        assert_eq!(factor, 2);
+
+        let (chain, applied_flags, factor) = build_enhancement(DENOISE | ENHANCE_FLAG_UPSAMPLE | SBR, ENHANCE_FRAME_BUDGET, 48_000);
+        assert_eq!(chain.map(|chain| chain.name()), Some(String::from("denoise+sbr")), "the upsampler drops out and the rest stays");
+        assert_eq!(applied_flags, DENOISE | SBR);
+        assert_eq!(factor, 1);
+    }
+
+    /// A load through the real host with every checkbox bit set reaches the engine.
+    #[test]
+    fn every_checkbox_bit_together_loads_and_plays() {
+        let all_bits: u32 = starplayer::enhance::CATALOGUE
+            .iter()
+            .filter(|descriptor| descriptor.flag_bit != starplayer::enhance::NO_FLAG_BIT)
+            .map(|descriptor| 1u32 << descriptor.flag_bit)
+            .fold(0, |flags, bit| flags | bit);
+        assert_eq!(all_bits, 0b1111, "four checkbox enhancers, bits 0 to 3");
+
+        let mut host = Host::new(48_000);
+        assert_eq!(host.load_module_with_options(FIXTURE, false, all_bits), Ok(1));
+        assert_eq!(host.last_applied_enhancement_flags, all_bits, "every bit engaged");
+        assert_eq!(host.last_enhancement_factor, 4);
+        assert!((0..40).any(|_| host.process(RENDER_QUANTUM) > 0.0), "the enhanced module still plays");
+    }
+
     #[test]
     fn an_unknown_enhancement_bit_is_ignored_like_from_flags() {
         let mut host = Host::new(48_000);
-        assert_eq!(host.load_module_with_options(FIXTURE, false, 0xFFFF_FFFC), Ok(1), "no known bit is set");
+        assert_eq!(host.load_module_with_options(FIXTURE, false, 0xFFFF_FFF0), Ok(1), "no known bit is set");
         assert_eq!(host.last_applied_enhancement_flags, 0);
         assert_eq!(host.last_enhancement_factor, 1);
     }
