@@ -2142,10 +2142,14 @@ impl ItProcessor {
         let sample = self.foreground_sample(channel_index);
         // `Oxx` (and `SAx`'s high byte) address **source** frames, so the sounding
         // sample's scale turns the pair into the stored-frame offset the length
-        // comparison below and the voice itself want.
-        let offset_scale = self.sample_index(sample).map(|index| index.rate_scale_log2()).unwrap_or(0);
+        // comparison below and the voice itself want. The *sounding* sample rather than
+        // the one a note on this row may be about to select, deliberately: that is which
+        // sample `end` is already read from, and the two have to be in the same units.
+        let (offset_scale, end) = match self.sample_index(sample) {
+            Some(index) => (index.rate_scale_log2(), index.length_frames()),
+            None => (0, 0),
+        };
         let offset = (((self.channels[channel_index].high_offset as u32) << 16) | ((value as u32) << 8)) << offset_scale;
-        let end = self.sample_index(sample).map(|index| index.length_frames()).unwrap_or(0);
         let _ = note;
         if offset >= end && end != 0 {
             // Past the end: ignored, unless Old Effects makes it play from the end.

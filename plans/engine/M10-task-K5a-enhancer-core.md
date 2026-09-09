@@ -390,7 +390,7 @@ turns up twenty-eight lines. Classified:
 | `xm:1980` `sample_region` | loop points | **Changed**: tagged. |
 | `it:709` `sample_region` | loop points, sustain and main | **Changed**: tagged. |
 | `it:1522-1523` | `loop_start`/`loop_end` vs `position >> 32` | **Consistent** in units, but it *quantises*: the sustain-loop release truncates the Q32.32 cursor to a whole frame, so `4·floor(p)` and `floor(4p)` differ by up to three frames. This is IT's own semantics (`SusAfterLoop.it`), it is not made worse by the scale, and it is the one place the `<< 2` invariant is stated as a bound rather than an equality. `tests/enhanced_trace_positions.rs::an_it_sustain_loop_release_quantises_its_position_to_a_whole_frame` pins the bound. |
-| `it:2135` (`Oxx`) | `offset >= length_frames()` | **Consistent**: the offset — `SAx`'s high byte included — is scaled two lines above, at the read. |
+| `it:2135` (`Oxx`) | `offset >= length_frames()` | **Consistent**: the offset — `SAx`'s high byte included — is scaled at the read, from the *sounding* sample rather than from one a note on the same row might be about to select. That is deliberate: `end` is already read from the sounding sample, and the two sides of the comparison have to be in one sample's units. It is also moot in practice, since `Module::enhanced` gives every sample the same enhancer and only a rate ceiling can make two samples differ. |
 | `it:2424` | `region().length_frames()` | Already in region frames. |
 | `engine instrument.rs:205` | loop points | **Changed**: tagged. |
 

@@ -758,6 +758,20 @@ impl S3mProcessor {
     /// and `T` reads it back, so `H82` on one row makes the next row's `D00` behave as
     /// `D02` (OpenMPT `ParamMemory.s3m`). `G` and the `H`/`R`/`U` family keep their own
     /// read memories and only write this one.
+    /// How many times the sample this channel is about to trigger has been doubled by a
+    /// load-time enhancer — the shift an `Oxx` parameter needs to become a stored-frame
+    /// offset.
+    fn offset_scale(&self, channel_index: usize) -> u8 {
+        let number = self.channels[channel_index].sample_number;
+        if number == NO_SAMPLE { return 0; }
+        self.module
+            .instrument(InstrumentId((number - 1) as u16))
+            .and_then(|instrument| instrument.sample)
+            .and_then(|sample_id| self.module.sample(sample_id))
+            .map(|sample| sample.rate_scale_log2())
+            .unwrap_or(0)
+    }
+
     fn recall_parameter(&mut self, channel_index: usize, parameter: u8) -> u8 {
         if parameter == 0 { return self.channels[channel_index].parameter_memory; }
         self.channels[channel_index].parameter_memory = parameter;
@@ -899,22 +913,6 @@ fn period_from_note(note: u8, reference_rate_hz: u32) -> u32 {
 
 fn step_from_period(period: u32, sample_rate_hz: u32) -> Step {
     Step::from_ratio((ST3_FREQUENCY_NUMERATOR / period.max(1)) as u64, sample_rate_hz as u64)
-}
-
-impl S3mProcessor {
-    /// How many times the sample this channel is about to trigger has been doubled by a
-    /// load-time enhancer — the shift an `Oxx` parameter needs to become a stored-frame
-    /// offset.
-    fn offset_scale(&self, channel_index: usize) -> u8 {
-        let number = self.channels[channel_index].sample_number;
-        if number == NO_SAMPLE { return 0; }
-        self.module
-            .instrument(InstrumentId((number - 1) as u16))
-            .and_then(|instrument| instrument.sample)
-            .and_then(|sample_id| self.module.sample(sample_id))
-            .map(|sample| sample.rate_scale_log2())
-            .unwrap_or(0)
-    }
 }
 
 fn scaled_volume(channel_volume: u8, global_volume: u8) -> U0F16 {
