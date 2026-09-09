@@ -43,14 +43,14 @@ const POWER_FRACTION_BITS: usize = 64;
 /// Returns `0.0` for zero, for a negative input and for anything not finite, so a caller
 /// working in the mean-square domain never has to guard its own arithmetic.
 pub fn square_root(value: f64) -> f64 {
-    if !(value > 0.0) || value == f64::INFINITY {
+    if !value.is_finite() || value <= 0.0 {
         return 0.0;
     }
     // Halve the exponent by halving the whole bit pattern and re-biasing. For a positive
     // normal `f64` this lands within a few percent of the root; for a subnormal it lands
     // somewhere sane, and the Newton steps do the rest.
     let mut estimate = f64::from_bits((value.to_bits() >> 1) + (1023u64 << 51));
-    if !(estimate > 0.0) {
+    if !estimate.is_finite() || estimate <= 0.0 {
         estimate = value;
     }
     for _ in 0..SQUARE_ROOT_STEPS {
@@ -74,7 +74,7 @@ pub fn power_hundredths(base: f64, exponent_hundredths: u32) -> f64 {
         return 1.0;
     }
     let base = if base > 1.0 { 1.0 } else { base };
-    if !(base > 0.0) {
+    if !base.is_finite() || base <= 0.0 {
         return 0.0;
     }
 

@@ -211,7 +211,7 @@ fn block_mean_squares(frames: &[i16]) -> Vec<f64> {
 
 /// The Wiener gain for one block's mean square, raised to `strength_percent` hundredths.
 fn wiener_gain(mean_square: f64, floor_mean_square: f64, strength_percent: u32) -> f64 {
-    if !(mean_square > floor_mean_square) {
+    if !mean_square.is_finite() || mean_square <= floor_mean_square {
         return 0.0;
     }
     let gain = 1.0 - floor_mean_square / mean_square;

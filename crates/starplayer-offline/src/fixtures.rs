@@ -771,78 +771,6 @@ fn mtm_sample_header(name: &str, length: usize, loop_span: Option<(usize, usize)
     header
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use starplayer::model::ModuleFormat;
-
-    #[test]
-    fn the_generators_are_deterministic_and_sized_exactly() {
-        assert_eq!(synthetic_mod(), synthetic_mod(), "the MOD generator is a pure function");
-        assert_eq!(synthetic_mtm(), synthetic_mtm(), "the MTM generator is a pure function");
-        assert_eq!(synthetic_mod().len(), MOD_HEADER_BYTES + PATTERNS * ROWS * CHANNELS * MOD_CELL_BYTES + 128 + 64);
-        assert_eq!(
-            synthetic_mtm().len(),
-            MTM_HEADER_BYTES + 2 * MTM_SAMPLE_HEADER_BYTES + MTM_ORDER_BYTES + 5 * MTM_TRACK_BYTES + PATTERNS * MTM_PATTERN_TABLE_BYTES + 128 + 64,
-        );
-        assert_eq!(MOD_SAMPLE_SLOTS * MOD_SAMPLE_HEADER_BYTES + 20, 950, "the fixed MOD header still ends where the loader expects");
-    }
-
-    #[test]
-    fn both_fixtures_load_through_their_native_format_crate() {
-        let module = starplayer::mod_file::load(&synthetic_mod()).expect("the synthetic MOD loads");
-        assert_eq!(module.header().format, ModuleFormat::Mod);
-        assert_eq!(module.header().channel_count, CHANNELS as u8);
-        assert_eq!(starplayer::probe(&synthetic_mod()), Some(ModuleFormat::Mod), "autodetection agrees");
-
-        let module = starplayer::mtm::load(&synthetic_mtm()).expect("the synthetic MTM loads");
-        assert_eq!(module.header().format, ModuleFormat::Mtm);
-        assert_eq!(module.header().channel_count, CHANNELS as u8);
-        assert_eq!(starplayer::probe(&synthetic_mtm()), Some(ModuleFormat::Mtm), "autodetection agrees");
-
-        let module = starplayer::xm::load(&synthetic_xm()).expect("the synthetic XM loads");
-        assert_eq!(module.header().format, ModuleFormat::Xm);
-        assert_eq!(module.header().channel_count, CHANNELS as u8);
-        assert_eq!(starplayer::probe(&synthetic_xm()), Some(ModuleFormat::Xm), "autodetection agrees");
-    }
-
-    #[test]
-    fn the_synthetic_xm_reaches_the_articulation_paths_no_other_fixture_can() {
-        let module = starplayer::xm::load(&synthetic_xm()).expect("the synthetic XM loads");
-        assert!(module.header().flags.linear_slides, "the fixture is a linear-frequency module");
-
-        let instrument = module.instrument(starplayer::model::InstrumentId(0)).expect("the one instrument");
-        assert!(instrument.volume_envelope.is_some(), "the volume envelope is on");
-        assert!(instrument.panning_envelope.is_some(), "the panning envelope is on");
-        assert_eq!(instrument.volume_envelope.as_ref().and_then(|envelope| envelope.sustain).map(|span| span.start), Some(1), "and it sustains");
-        assert_eq!(instrument.fadeout, 512, "a key-off has something to fade with");
-        assert_ne!(instrument.note_sample_map[0], instrument.note_sample_map[60], "the map switches sample at C-5");
-
-        let ping_pong = module.sample(starplayer::model::SampleId(0)).expect("sample zero");
-        assert_eq!(ping_pong.loop_mode(), starplayer::model::LoopMode::PingPong);
-        assert_eq!(ping_pong.relative_note(), -12);
-        let one_shot = module.sample(starplayer::model::SampleId(1)).expect("sample one");
-        assert_eq!(one_shot.loop_mode(), starplayer::model::LoopMode::None);
-        assert_ne!(one_shot.finetune(), ping_pong.finetune(), "the two samples carry opposite finetunes");
-    }
-
-    #[test]
-    fn the_fixtures_reach_the_paths_they_exist_to_cover() {
-        let module = starplayer::mod_file::load(&synthetic_mod()).expect("the synthetic MOD loads");
-        let looped = module.sample(starplayer::model::SampleId(0)).expect("slot one is present");
-        assert_eq!(looped.loop_mode(), starplayer::model::LoopMode::Forward, "slot one loops");
-        let one_shot = module.sample(starplayer::model::SampleId(1)).expect("slot two is present");
-        assert_eq!(one_shot.loop_mode(), starplayer::model::LoopMode::None, "slot two is one-shot");
-        assert_ne!(looped.reference_rate_hz(), one_shot.reference_rate_hz(), "the two slots carry opposite finetunes");
-
-        let module = starplayer::mtm::load(&synthetic_mtm()).expect("the synthetic MTM loads");
-        assert_eq!(starplayer::mtm::track_count(&module), Some(5), "all five tracks survive the load");
-        let pans = module.header().default_pan.clone();
-        assert_ne!(pans[0], pans[1], "the header pan positions are not all the same");
-    }
-}
-
 /// A one-channel, one-sample Impulse Tracker module carrying `frames` verbatim as a
 /// signed 16-bit sample whose `C5Speed` is `rate_hz`, played once at note C-5 (M10-K5c).
 ///
@@ -970,4 +898,76 @@ fn single_channel_it_pattern(rows: usize) -> Vec<u8> {
     bytes.extend_from_slice(&[0, 0, 0, 0]);
     bytes.extend_from_slice(&packed);
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use starplayer::model::ModuleFormat;
+
+    #[test]
+    fn the_generators_are_deterministic_and_sized_exactly() {
+        assert_eq!(synthetic_mod(), synthetic_mod(), "the MOD generator is a pure function");
+        assert_eq!(synthetic_mtm(), synthetic_mtm(), "the MTM generator is a pure function");
+        assert_eq!(synthetic_mod().len(), MOD_HEADER_BYTES + PATTERNS * ROWS * CHANNELS * MOD_CELL_BYTES + 128 + 64);
+        assert_eq!(
+            synthetic_mtm().len(),
+            MTM_HEADER_BYTES + 2 * MTM_SAMPLE_HEADER_BYTES + MTM_ORDER_BYTES + 5 * MTM_TRACK_BYTES + PATTERNS * MTM_PATTERN_TABLE_BYTES + 128 + 64,
+        );
+        assert_eq!(MOD_SAMPLE_SLOTS * MOD_SAMPLE_HEADER_BYTES + 20, 950, "the fixed MOD header still ends where the loader expects");
+    }
+
+    #[test]
+    fn both_fixtures_load_through_their_native_format_crate() {
+        let module = starplayer::mod_file::load(&synthetic_mod()).expect("the synthetic MOD loads");
+        assert_eq!(module.header().format, ModuleFormat::Mod);
+        assert_eq!(module.header().channel_count, CHANNELS as u8);
+        assert_eq!(starplayer::probe(&synthetic_mod()), Some(ModuleFormat::Mod), "autodetection agrees");
+
+        let module = starplayer::mtm::load(&synthetic_mtm()).expect("the synthetic MTM loads");
+        assert_eq!(module.header().format, ModuleFormat::Mtm);
+        assert_eq!(module.header().channel_count, CHANNELS as u8);
+        assert_eq!(starplayer::probe(&synthetic_mtm()), Some(ModuleFormat::Mtm), "autodetection agrees");
+
+        let module = starplayer::xm::load(&synthetic_xm()).expect("the synthetic XM loads");
+        assert_eq!(module.header().format, ModuleFormat::Xm);
+        assert_eq!(module.header().channel_count, CHANNELS as u8);
+        assert_eq!(starplayer::probe(&synthetic_xm()), Some(ModuleFormat::Xm), "autodetection agrees");
+    }
+
+    #[test]
+    fn the_synthetic_xm_reaches_the_articulation_paths_no_other_fixture_can() {
+        let module = starplayer::xm::load(&synthetic_xm()).expect("the synthetic XM loads");
+        assert!(module.header().flags.linear_slides, "the fixture is a linear-frequency module");
+
+        let instrument = module.instrument(starplayer::model::InstrumentId(0)).expect("the one instrument");
+        assert!(instrument.volume_envelope.is_some(), "the volume envelope is on");
+        assert!(instrument.panning_envelope.is_some(), "the panning envelope is on");
+        assert_eq!(instrument.volume_envelope.as_ref().and_then(|envelope| envelope.sustain).map(|span| span.start), Some(1), "and it sustains");
+        assert_eq!(instrument.fadeout, 512, "a key-off has something to fade with");
+        assert_ne!(instrument.note_sample_map[0], instrument.note_sample_map[60], "the map switches sample at C-5");
+
+        let ping_pong = module.sample(starplayer::model::SampleId(0)).expect("sample zero");
+        assert_eq!(ping_pong.loop_mode(), starplayer::model::LoopMode::PingPong);
+        assert_eq!(ping_pong.relative_note(), -12);
+        let one_shot = module.sample(starplayer::model::SampleId(1)).expect("sample one");
+        assert_eq!(one_shot.loop_mode(), starplayer::model::LoopMode::None);
+        assert_ne!(one_shot.finetune(), ping_pong.finetune(), "the two samples carry opposite finetunes");
+    }
+
+    #[test]
+    fn the_fixtures_reach_the_paths_they_exist_to_cover() {
+        let module = starplayer::mod_file::load(&synthetic_mod()).expect("the synthetic MOD loads");
+        let looped = module.sample(starplayer::model::SampleId(0)).expect("slot one is present");
+        assert_eq!(looped.loop_mode(), starplayer::model::LoopMode::Forward, "slot one loops");
+        let one_shot = module.sample(starplayer::model::SampleId(1)).expect("slot two is present");
+        assert_eq!(one_shot.loop_mode(), starplayer::model::LoopMode::None, "slot two is one-shot");
+        assert_ne!(looped.reference_rate_hz(), one_shot.reference_rate_hz(), "the two slots carry opposite finetunes");
+
+        let module = starplayer::mtm::load(&synthetic_mtm()).expect("the synthetic MTM loads");
+        assert_eq!(starplayer::mtm::track_count(&module), Some(5), "all five tracks survive the load");
+        let pans = module.header().default_pan.clone();
+        assert_ne!(pans[0], pans[1], "the header pan positions are not all the same");
+    }
 }

@@ -86,7 +86,11 @@ const ENHANCE_FRAME_BUDGET: usize = 16_000_000;
 /// `sinc2x` has no bit of its own, so a budget fallback still reports through this bit,
 /// and [`Host::last_enhancement_factor`] is what tells the two apart.
 const ENHANCE_FLAG_UPSAMPLE: u32 = 1 << 0;
-/// [`CATALOGUE`](starplayer::enhance::CATALOGUE)'s bit for the loop-seam smoother checkbox.
+/// [`CATALOGUE`](starplayer::enhance::CATALOGUE)'s bit for the loop-seam smoother
+/// checkbox. Named only in this crate's tests since M10-K5c made `build_enhancement` walk
+/// the catalogue instead of naming bits, which is the point: the loop smoother is no
+/// longer special to the host, only to the tests that check it arrives.
+#[cfg(test)]
 const ENHANCE_FLAG_LOOP: u32 = 1 << 1;
 /// The catalogue id of the enhancer [`ENHANCE_FRAME_BUDGET`] applies to. It is the only
 /// entry [`build_enhancement`] treats specially, because it is the only one that changes

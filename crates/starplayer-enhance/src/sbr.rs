@@ -199,10 +199,10 @@ impl SampleEnhancer for BandwidthExtender {
             forward(&mut real, &mut imaginary);
             patch(&mut real, &mut imaginary, &plan);
             inverse(&mut real, &mut imaginary);
-            for offset in 0..STFT_SIZE {
+            for (offset, value) in real.iter().enumerate() {
                 let Some(target) = source.periodic_body_index(start + offset as i64) else { continue };
                 let weighting = window(offset);
-                signal[target] += real[offset] * weighting;
+                signal[target] += *value * weighting;
                 weight[target] += weighting * weighting;
             }
         }
@@ -281,7 +281,7 @@ impl BandwidthExtender {
         // those two levels, times an extra roll-off that is never above one.
         let lower_mean = mean(power, edge_bin / 2, edge_bin * 3 / 4);
         let upper_mean = mean(power, edge_bin * 3 / 4, edge_bin);
-        if !(lower_mean > 0.0) {
+        if !lower_mean.is_finite() || lower_mean <= 0.0 {
             return None;
         }
         let tilt = upper_mean / lower_mean;
@@ -586,10 +586,10 @@ mod tests {
             load_frame(&source, start, &mut real, &mut imaginary);
             forward(&mut real, &mut imaginary);
             inverse(&mut real, &mut imaginary);
-            for offset in 0..STFT_SIZE {
+            for (offset, value) in real.iter().enumerate() {
                 let Some(target) = source.periodic_body_index(start + offset as i64) else { continue };
                 let weighting = window(offset);
-                signal[target] += real[offset] * weighting;
+                signal[target] += *value * weighting;
                 weight[target] += weighting * weighting;
             }
         }
