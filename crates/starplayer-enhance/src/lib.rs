@@ -49,7 +49,7 @@ pub mod loop_smooth;
 pub mod polyphase;
 pub mod upsample;
 
-pub use catalogue::{CATALOGUE, DEFAULT_CROSSFADE_FRAMES, EnhancerDescriptor, NO_FLAG_BIT, enhancer_for_id, from_flags};
+pub use catalogue::{CATALOGUE, DEFAULT_CROSSFADE_FRAMES, EnhancerDescriptor, NO_FLAG_BIT, descriptor, enhancer_for_id, from_flags};
 pub use chain::Chain;
 pub use loop_smooth::LoopSmoother;
 pub use polyphase::{UPSAMPLE_CUTOFF, UPSAMPLE_KAISER_BETA, UPSAMPLE_LEADING_TAPS, UPSAMPLE_PHASES, UPSAMPLE_TAPS, coefficient};
