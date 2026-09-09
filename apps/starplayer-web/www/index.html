@@ -56,10 +56,19 @@
                 <input id="url" type="url" inputmode="url" value="https://modland.com/pub/modules/Screamtracker%203/Purple%20Motion/unreal%20%5D%5B.s3m" placeholder="https://example.com/song.xm" aria-label="S3M, MOD, MTM, XM, IT, or ZIP URL">
                 <button type="submit">Load URL</button>
             </form>
-            <label class="mod-panning-option">
-                <input id="mod-headphone-panning" type="checkbox">
-                <span><strong>Headphone-friendly MOD panning</strong><small>Uses S3M-style 60% stereo spacing instead of hard left/right.</small></span>
-            </label>
+            <!-- M10-W4. Every input here is a load option: applied when a module is
+                 (re)loaded and disabled while a load is in flight. The panning checkbox is
+                 hand-written because it is MOD-specific; the enhancement checkboxes below
+                 it are built entirely from the wasm host's own `enhancements_json()`
+                 (`starplayer-enhance::CATALOGUE`), so nothing about a specific enhancer is
+                 transcribed here — the same rule the Effects panel follows. -->
+            <div id="load-options" class="load-options">
+                <label class="mod-panning-option">
+                    <input id="mod-headphone-panning" type="checkbox">
+                    <span><strong>Headphone-friendly MOD panning</strong><small>Uses S3M-style 60% stereo spacing instead of hard left/right.</small></span>
+                </label>
+                <div id="enhancement-options"></div>
+            </div>
         </div>
         <div id="drop-zone" class="drop-zone" tabindex="0">
             <strong>Drop .s3m, .mod, .mtm, .xm, .it, or .zip here</strong>

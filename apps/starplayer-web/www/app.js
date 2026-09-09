@@ -49,6 +49,9 @@ const elements = {
     outputChannels: byId('output-channels'), applyChannels: byId('apply-channels'), mixerPath: byId('mixer-path'),
     mixerInterpolator: byId('mixer-interpolator'), mixerDepth: byId('mixer-depth'), mixerDither: byId('mixer-dither'),
     applyMixer: byId('apply-mixer'), modHeadphonePanning: byId('mod-headphone-panning'),
+    // Load-time sample enhancement (M10-W4). The checkboxes themselves are built into this
+    // container from the wasm host's own `enhancements_json()`.
+    enhancementOptions: byId('enhancement-options'),
     // Insert effects (M7-H7).
     effectsTarget: byId('effects-target'), effectsSlots: byId('effects-slots'), effectsReset: byId('effects-reset'),
     // Live input (task E6).
@@ -96,9 +99,26 @@ const state = {
     archivePickerResolve: null,
     archivePreviousFocus: null,
     moduleRevision: 0,
-    activeModHeadphonePanning: false,
-    panningReloadInProgress: false,
-    panningReloadRequested: false,
+    // M10-W4: the load options actually active in the currently loaded module — not
+    // necessarily what the checkboxes show right now, since a change is only applied once
+    // its reload finishes. `enhancementFlags` is the applied word `enhancements_json()`'s
+    // bits describe; `sinc4x` may have been silently narrowed by the host's frame budget
+    // (`build_enhancement`), which is why `moduleLoaded`/`loadOptionsApplied` also carry
+    // the factor that actually ran.
+    activeLoadOptions: { headphoneFriendlyModPanning: false, enhancementFlags: 0 },
+    loadOptionsReloadInProgress: false,
+    loadOptionsReloadRequested: null,
+    /// Parsed from the worklet's first `ready` message: `enhancements_json()`, in
+    /// `CATALOGUE` order — `[{bit, id, label, description}]`. Never transcribed by hand,
+    /// so the load panel cannot drift from what `enhancementFlags` actually accepts.
+    enhancements: [],
+    /// Whether the enhancement checkboxes have been built yet (`state.enhancements`
+    /// arrives with the worklet's `ready` message, which can race the panel's own first
+    /// render — the same race `effectsSlotsBuilt` guards against).
+    enhancementCheckboxesBuilt: false,
+    /// `enhancementFlags` read from `localStorage` before the checkboxes existed to carry
+    /// it, applied to them the moment `ensureEnhancementCheckboxes` builds them.
+    pendingEnhancementFlags: 0,
     scrubbing: false,
     showRemaining: readShowRemaining(),
     pendingSeekFrame: null,
@@ -196,6 +216,11 @@ function restorePreferences() {
         selectStoredValue(elements.mixerDepth, saved.depth ?? 'f32');
         selectStoredValue(elements.mixerDither, saved.dither ?? 'off');
         elements.modHeadphonePanning.checked = saved.headphoneFriendlyModPanning === true;
+        // M10-W4: the enhancement checkboxes do not exist yet (they are built from the
+        // worklet's first `ready` message), so the value is held until
+        // `ensureEnhancementCheckboxes` can apply it.
+        state.pendingEnhancementFlags = Number(saved.enhancementFlags) >>> 0 || 0;
+        writeEnhancementFlagsToControls(state.pendingEnhancementFlags);
         if (typeof saved.sinkId === 'string') elements.outputDevice.dataset.savedSinkId = saved.sinkId;
     } catch (_) {
         // Storage may be disabled or contain data from a broken older development build.
@@ -212,11 +237,97 @@ function persistPreferences() {
             interpolator: elements.mixerInterpolator.value,
             depth: elements.mixerDepth.value,
             dither: elements.mixerDither.value,
+            // The v1 record keeps this exact key so an older saved object still restores
+            // (`headless.mjs`'s v1-record test asserts on it), even though the checkbox it
+            // names is now one of several inputs a `loadOptionsFromControls()` record
+            // carries.
             headphoneFriendlyModPanning: elements.modHeadphonePanning.checked,
+            enhancementFlags: enhancementFlagsFromControls(),
         }));
     } catch (_) {
         // A private or storage-blocked page still gets fully working in-memory controls.
     }
+}
+
+// ── load options (M10-W4) ────────────────────────────────────────────────────────────
+//
+// A load option is anything applied by decoding the module a particular way: the
+// MOD-only panning checkbox and the sample-enhancement checkboxes built from
+// `enhancements_json()`. `loadOptionsFromControls()` is the one record `activateModuleOnNode`
+// and `applyLoadOptions` both send; nothing about a specific enhancer's id, label or
+// description is written here — the checkboxes carry their bit in `dataset.bit`, read
+// straight off `starplayer-enhance::CATALOGUE` through the wasm host.
+
+function enhancementFlagsFromControls() {
+    let flags = 0;
+    for (const input of elements.enhancementOptions.querySelectorAll('input[type=checkbox]')) {
+        if (input.checked) flags |= (1 << Number(input.dataset.bit));
+    }
+    return flags >>> 0;
+}
+
+function writeEnhancementFlagsToControls(flags) {
+    for (const input of elements.enhancementOptions.querySelectorAll('input[type=checkbox]')) {
+        input.checked = (flags & (1 << Number(input.dataset.bit))) !== 0;
+    }
+}
+
+function loadOptionsFromControls() {
+    return {
+        headphoneFriendlyModPanning: elements.modHeadphonePanning.checked,
+        enhancementFlags: enhancementFlagsFromControls(),
+    };
+}
+
+function writeLoadOptionsToControls(options) {
+    elements.modHeadphonePanning.checked = options.headphoneFriendlyModPanning;
+    writeEnhancementFlagsToControls(options.enhancementFlags);
+}
+
+/** Build one checkbox per `enhancements_json()` entry, the first time `state.enhancements`
+ *  is available. Mirrors `ensureEffectsSlots`'s race guard against the worklet's `ready`
+ *  message. */
+function ensureEnhancementCheckboxes() {
+    if (state.enhancementCheckboxesBuilt || state.enhancements.length === 0) return;
+    state.enhancementCheckboxesBuilt = true;
+    elements.enhancementOptions.replaceChildren();
+    for (const enhancement of state.enhancements) {
+        const label = document.createElement('label');
+        label.className = 'mod-panning-option';
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.id = `enhancement-${enhancement.id}`;
+        input.dataset.bit = String(enhancement.bit);
+        const span = document.createElement('span');
+        const strong = document.createElement('strong');
+        strong.textContent = enhancement.label;
+        const small = document.createElement('small');
+        small.textContent = enhancement.description;
+        span.append(strong, small);
+        label.append(input, span);
+        elements.enhancementOptions.append(label);
+        input.addEventListener('change', () => applyLoadOptions('enhancementFlags').catch(showError));
+    }
+    writeEnhancementFlagsToControls(state.pendingEnhancementFlags);
+}
+
+/// The enhancer id `CATALOGUE` gives the sinc upsampler's checkbox, so a reduced
+/// `appliedEnhancementFactor` can be explained without transcribing anything about the
+/// other enhancers.
+function enhancementUpsampleBit() {
+    const entry = state.enhancements.find((enhancement) => enhancement.id === 'sinc4x');
+    return entry ? entry.bit : null;
+}
+
+/// `null` when nothing needs explaining; otherwise a sentence for the status line, because
+/// `build_enhancement`'s frame-budget fallback silently narrowed the requested factor.
+function describeEnhancementReduction(requestedFlags, appliedFactor) {
+    const upsampleBit = enhancementUpsampleBit();
+    if (upsampleBit === null || (requestedFlags & (1 << upsampleBit)) === 0) return null;
+    if (!Number.isFinite(appliedFactor) || appliedFactor >= 4) return null;
+    return appliedFactor <= 1
+        ? 'the sinc upsampler did not fit the frame budget, so the module loaded without it'
+        : `the sinc upsampler was reduced to ${appliedFactor}x to fit the frame budget`;
 }
 
 function formatRate(value) {
@@ -472,12 +583,15 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
     showMessage(`Activating ${moduleLabel}…`);
     const retainedBytes = moduleBuffer.slice(0);
     const revision = ++state.moduleRevision;
-    const headphoneFriendlyModPanning = elements.modHeadphonePanning.checked;
-    const result = await activateModuleOnNode(state.node, moduleBuffer, headphoneFriendlyModPanning);
+    const loadOptions = loadOptionsFromControls();
+    const result = await activateModuleOnNode(state.node, moduleBuffer, loadOptions);
     if (revision !== state.moduleRevision) return false;
     state.metadata = metadata;
     state.currentModuleBytes = retainedBytes;
-    state.activeModHeadphonePanning = metadata.isMod && headphoneFriendlyModPanning;
+    state.activeLoadOptions = {
+        headphoneFriendlyModPanning: metadata.isMod && loadOptions.headphoneFriendlyModPanning,
+        enhancementFlags: result.appliedEnhancementFlags ?? loadOptions.enhancementFlags,
+    };
     state.activationMemoryBytes = result.memoryBytes;
     state.loadCount += 1;
     renderMetadata();
@@ -492,7 +606,8 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
     queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(Number(elements.volume.value) * 65535 / 100), 0);
     queueRepeatCommand();
     queueCommand(Ring.OPCODE_PLAY, 0, 0);
-    showMessage(`Playing ${metadata.title || moduleLabel}.`);
+    const reduction = describeEnhancementReduction(loadOptions.enhancementFlags, result.appliedEnhancementFactor);
+    showMessage(`Playing ${metadata.title || moduleLabel}.${reduction ? ` (${reduction}.)` : ''}`);
 
     // The engine applies LoadModule at the next quantum. Collection happens in a
     // later worklet message task, never inside process(). Two attempts cover a busy
@@ -644,21 +759,31 @@ function readMetadata(label) {
     };
 }
 
-function activateModuleOnNode(node, buffer, headphoneFriendlyModPanning = elements.modHeadphonePanning.checked) {
+function activateModuleOnNode(node, buffer, loadOptions = loadOptionsFromControls()) {
     const requestId = state.nextRequestId++;
     return new Promise((resolve, reject) => {
         state.pendingLoads.set(requestId, { resolve, reject });
         updateModPanningAvailability();
-        node.port.postMessage({ type: 'loadModule', requestId, bytes: buffer, headphoneFriendlyModPanning }, [buffer]);
+        node.port.postMessage({
+            type: 'loadModule',
+            requestId,
+            bytes: buffer,
+            headphoneFriendlyModPanning: loadOptions.headphoneFriendlyModPanning,
+            enhancementFlags: loadOptions.enhancementFlags,
+        }, [buffer]);
     });
 }
 
-/// The panning toggle reloads the module the page is holding. Doing that while another
+/// A load-option checkbox reloads the module the page is holding. Doing that while another
 /// load is already in flight interleaves two `loadModule` messages on one FIFO port, so
-/// the option is unavailable until the port is quiet again — on the error path too, which
-/// is why this reads the map rather than being set and cleared by hand.
+/// every load option is unavailable until the port is quiet again — on the error path too,
+/// which is why this reads the map rather than being set and cleared by hand.
 function updateModPanningAvailability() {
-    elements.modHeadphonePanning.disabled = state.pendingLoads.size > 0 || state.panningReloadInProgress;
+    const disabled = state.pendingLoads.size > 0 || state.loadOptionsReloadInProgress;
+    elements.modHeadphonePanning.disabled = disabled;
+    for (const input of elements.enhancementOptions.querySelectorAll('input[type=checkbox]')) {
+        input.disabled = disabled;
+    }
 }
 
 function onWorkletMessage(message, node) {
@@ -680,6 +805,16 @@ function onWorkletMessage(message, node) {
                 showError(`Could not parse the effect list: ${error && error.message ? error.message : error}`);
             }
             ensureEffectsSlots();
+        }
+        // M10-W4: same build-time-fact reasoning as `effects` above — parsed once, from
+        // whichever node's `ready` message arrives first.
+        if (state.enhancements.length === 0 && message.enhancements) {
+            try {
+                state.enhancements = JSON.parse(message.enhancements);
+            } catch (error) {
+                showError(`Could not parse the enhancement list: ${error && error.message ? error.message : error}`);
+            }
+            ensureEnhancementCheckboxes();
         }
     } else if (message.type === 'quantum') {
         if (node !== state.node) return;
@@ -1064,24 +1199,31 @@ function sendCommandsToCurrentGraph(commands) {
     }
 }
 
-async function applyModPanningPreference() {
-    const requested = elements.modHeadphonePanning.checked;
-    if (state.panningReloadInProgress) {
+/// A load-option checkbox reloads the module the page is holding. `changedKey` is
+/// `'headphoneFriendlyModPanning'` for the panning checkbox or `'enhancementFlags'` for
+/// any enhancement checkbox; only the panning checkbox's early-out is format-restricted —
+/// an enhancement applies to every format, so it always reloads if a module is retained.
+async function applyLoadOptions(changedKey) {
+    const requested = loadOptionsFromControls();
+    if (state.loadOptionsReloadInProgress) {
         // A disabled checkbox cannot normally emit another user change, but keeping this
         // guard deterministic also covers scripted changes and a racing load interaction.
-        elements.modHeadphonePanning.checked = state.panningReloadRequested;
+        writeLoadOptionsToControls(state.loadOptionsReloadRequested);
         persistPreferences();
         return;
     }
     persistPreferences();
-    if (!state.metadata?.isMod || state.currentModuleBytes === null || state.node === null) {
-        showMessage(requested
-            ? 'Headphone-friendly MOD panning saved for the next MOD load.'
-            : 'Authentic MOD panning saved for the next MOD load.');
+    const modOnlyChange = changedKey === 'headphoneFriendlyModPanning';
+    if (state.currentModuleBytes === null || state.node === null || (modOnlyChange && !state.metadata?.isMod)) {
+        showMessage(modOnlyChange
+            ? (requested.headphoneFriendlyModPanning
+                ? 'Headphone-friendly MOD panning saved for the next MOD load.'
+                : 'Authentic MOD panning saved for the next MOD load.')
+            : 'Sample enhancement choice saved for the next load.');
         return;
     }
 
-    const previous = state.activeModHeadphonePanning;
+    const previous = state.activeLoadOptions;
     // Claim a revision exactly as the load path does. Reusing the current value let a
     // concurrent load and this reload both believe they were last: the port is a FIFO, so
     // the module posted second is the one that sounds, and whichever handler ran second
@@ -1089,35 +1231,44 @@ async function applyModPanningPreference() {
     const revision = ++state.moduleRevision;
     const node = state.node;
     const restoreCommands = playbackRestoreCommands();
-    state.panningReloadInProgress = true;
-    state.panningReloadRequested = requested;
+    state.loadOptionsReloadInProgress = true;
+    state.loadOptionsReloadRequested = requested;
     updateModPanningAvailability();
     clearError();
-    showMessage(`Reloading this MOD with ${requested ? 'S3M-style 60% spacing' : 'authentic hard panning'}…`);
+    showMessage(modOnlyChange
+        ? `Reloading this MOD with ${requested.headphoneFriendlyModPanning ? 'S3M-style 60% spacing' : 'authentic hard panning'}…`
+        : 'Reloading with the new sample enhancement choice…');
     try {
         const activation = await activateModuleOnNode(node, state.currentModuleBytes.slice(0), requested);
         if (revision !== state.moduleRevision || node !== state.node) return;
-        state.activeModHeadphonePanning = requested;
+        state.activeLoadOptions = {
+            headphoneFriendlyModPanning: requested.headphoneFriendlyModPanning,
+            enhancementFlags: activation.appliedEnhancementFlags ?? requested.enhancementFlags,
+        };
         state.activationMemoryBytes = activation.memoryBytes;
         state.loadCount += 1;
         sendCommandsToCurrentGraph(restoreCommands);
         persistPreferences();
-        showMessage(`${requested ? 'Headphone-friendly S3M-style 60% spacing' : 'Authentic hard MOD panning'} applied; playback restored at the sounding order.`);
+        const reduction = describeEnhancementReduction(requested.enhancementFlags, activation.appliedEnhancementFactor);
+        const applied = modOnlyChange
+            ? `${requested.headphoneFriendlyModPanning ? 'Headphone-friendly S3M-style 60% spacing' : 'Authentic hard MOD panning'} applied`
+            : 'Sample enhancement choice applied';
+        showMessage(`${applied}; playback restored at the sounding order.${reduction ? ` (${reduction}.)` : ''}`);
         setTimeout(requestGarbageCollection, 100);
         setTimeout(requestGarbageCollection, 500);
     } catch (error) {
         // The preference was persisted before the reload was attempted, so it has to be
         // put back whatever else has happened since — a revision check here would leave a
         // failed toggle stored as the user's choice for every future session.
-        elements.modHeadphonePanning.checked = previous;
+        writeLoadOptionsToControls(previous);
         persistPreferences();
         if (revision === state.moduleRevision && node === state.node) {
-            showError(`Could not change MOD panning: ${error && error.message ? error.message : error}`);
-            showMessage(`Still playing ${state.metadata.title} with ${previous ? 'headphone-friendly 60% spacing' : 'authentic hard panning'}.`);
+            showError(`Could not change load options: ${error && error.message ? error.message : error}`);
+            showMessage(`Still playing ${state.metadata.title}.`);
         }
     } finally {
-        state.panningReloadInProgress = false;
-        state.panningReloadRequested = false;
+        state.loadOptionsReloadInProgress = false;
+        state.loadOptionsReloadRequested = null;
         updateModPanningAvailability();
     }
 }
@@ -1145,9 +1296,10 @@ async function rebuildAudioContext() {
         const channels = Number(elements.outputChannels.value) === 1 ? 1 : 2;
         const graph = await prepareNode(candidateContext, channels, mixerModeFromControls(), true);
         candidateNode = graph.node;
+        const loadOptions = loadOptionsFromControls();
         const activation = state.currentModuleBytes === null
             ? null
-            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), elements.modHeadphonePanning.checked);
+            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions);
         if (oldSinkId && typeof candidateContext.setSinkId === 'function') {
             await candidateContext.setSinkId(oldSinkId).catch((error) => {
                 elements.outputDeviceNote.textContent = `The previous output device could not be restored (${error.name || error.message}).`;
@@ -1160,8 +1312,13 @@ async function rebuildAudioContext() {
         installGraph(graph);
         state.latest = null;
         state.activeModeWire = mixerModeFromControls();
-        if (activation) state.activationMemoryBytes = activation.memoryBytes;
-        if (activation && state.metadata?.isMod) state.activeModHeadphonePanning = elements.modHeadphonePanning.checked;
+        if (activation) {
+            state.activationMemoryBytes = activation.memoryBytes;
+            state.activeLoadOptions = {
+                headphoneFriendlyModPanning: state.metadata?.isMod ? loadOptions.headphoneFriendlyModPanning : state.activeLoadOptions.headphoneFriendlyModPanning,
+                enhancementFlags: activation.appliedEnhancementFlags ?? loadOptions.enhancementFlags,
+            };
+        }
         oldNode.disconnect();
         await oldContext.close().catch(() => {});
         state.requestedSampleRate = requested;
@@ -1196,16 +1353,22 @@ async function rebuildOutputChannels() {
     try {
         const graph = await prepareNode(state.context, channels, mixerModeFromControls(), false);
         candidateNode = graph.node;
+        const loadOptions = loadOptionsFromControls();
         const activation = state.currentModuleBytes === null
             ? null
-            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), elements.modHeadphonePanning.checked);
+            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions);
         graph.node.connect(state.context.destination);
         if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
         installGraph(graph);
         state.latest = null;
         state.activeModeWire = mixerModeFromControls();
-        if (activation) state.activationMemoryBytes = activation.memoryBytes;
-        if (activation && state.metadata?.isMod) state.activeModHeadphonePanning = elements.modHeadphonePanning.checked;
+        if (activation) {
+            state.activationMemoryBytes = activation.memoryBytes;
+            state.activeLoadOptions = {
+                headphoneFriendlyModPanning: state.metadata?.isMod ? loadOptions.headphoneFriendlyModPanning : state.activeLoadOptions.headphoneFriendlyModPanning,
+                enhancementFlags: activation.appliedEnhancementFlags ?? loadOptions.enhancementFlags,
+            };
+        }
         oldNode.disconnect();
         persistPreferences();
         updateOutputPanel();
@@ -1519,7 +1682,10 @@ function renderMetadata() {
         const name = document.createElement('span');
         const length = document.createElement('small');
         name.textContent = instrument.name || '(empty slot)';
-        length.textContent = instrument.length > 0 ? `${instrument.length.toLocaleString()} frames` : 'no PCM';
+        // M10-W4: this metadata instance never enhances (`apps/starplayer-web/src/lib.rs`
+        // stays unenhanced), so what it reports is always the stored length before any
+        // enhancement checkbox runs on the worklet's own copy.
+        length.textContent = instrument.length > 0 ? `${instrument.length.toLocaleString()} source frames` : 'no PCM';
         item.append(name, length);
         elements.instrumentList.append(item);
     }
@@ -1971,7 +2137,7 @@ elements.applyChannels.addEventListener('click', () => rebuildOutputChannels().c
 elements.applyOutputDevice.addEventListener('click', () => applyOutputDevice().catch(showError));
 elements.chooseOutputDevice.addEventListener('click', () => chooseOutputDevice().catch(showError));
 elements.applyMixer.addEventListener('click', applyMixerMode);
-elements.modHeadphonePanning.addEventListener('change', () => applyModPanningPreference().catch(showError));
+elements.modHeadphonePanning.addEventListener('change', () => applyLoadOptions('headphoneFriendlyModPanning').catch(showError));
 elements.effectsTarget.addEventListener('change', renderEffectSlotRows);
 // A choice is remembered as it is made, not only when it is applied: the owner's test
 // setup should survive a reload even if the page is reloaded mid-comparison.
