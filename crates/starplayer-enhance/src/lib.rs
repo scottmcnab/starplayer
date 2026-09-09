@@ -45,13 +45,19 @@ extern crate std;
 
 pub mod catalogue;
 pub mod chain;
+pub mod denoise;
+pub mod deterministic;
 pub mod loop_smooth;
 pub mod polyphase;
+pub mod sbr;
+pub mod stft;
 pub mod upsample;
 
 pub use catalogue::{CATALOGUE, DEFAULT_CROSSFADE_FRAMES, EnhancerDescriptor, NO_FLAG_BIT, descriptor, enhancer_for_id, from_flags};
 pub use chain::Chain;
+pub use denoise::{DEFAULT_DENOISE_STRENGTH_PERCENT, DecayDenoiser};
 pub use loop_smooth::LoopSmoother;
+pub use sbr::{BandwidthExtender, DEFAULT_SBR_TILT_DB};
 pub use polyphase::{UPSAMPLE_CUTOFF, UPSAMPLE_KAISER_BETA, UPSAMPLE_LEADING_TAPS, UPSAMPLE_PHASES, UPSAMPLE_TAPS, coefficient};
 pub use upsample::{SincUpsampler, UpsampleFactor};
 
