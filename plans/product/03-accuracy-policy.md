@@ -644,7 +644,8 @@ Ordered by value per unit of effort. Full detail in `02-roadmap.md`.
    anything. An enhanced configuration is hashed under its own filename —
    `<stem>__i16_mono_44100_linear_enh-<name>.sha256`, where `<name>` is the enhancer
    chain's own `name()` and therefore encodes every parameter that changes its output
-   (`sinc4x`, `loop=64`, `sinc4x+loop=64`, a rate ceiling and all) — so turning an
+   (`sinc4x`, `loop=64`, `sinc4x+loop=64`, `denoise+sinc4x+sbr+loop=64`, a rate ceiling
+   and all) — so turning an
    enhancer on is visibly a new golden rather than a silent break, exactly as a change of
    interpolator is. The `enhance` feature is never in `default` for the same reason.
    M10-K5b's `starplayer-cli render --enhance sinc4x+loop -o out.wav` names this same

@@ -2,7 +2,7 @@
 //! and `info` (M10-K5b), after the `--insert` model in `insert_arg.rs`.
 //!
 //! Grammar: entries joined with `+`, each an id from `starplayer_enhance::CATALOGUE` —
-//! `sinc2x`, `sinc4x`, `loop` or `loop=<frames>` (default
+//! `denoise`, `sinc4x`, `sinc2x`, `sbr`, `loop` or `loop=<frames>` (default
 //! `starplayer_enhance::DEFAULT_CROSSFADE_FRAMES`). Order is the order the stages run in,
 //! matching `Chain::name`'s own `+`-joined spelling — `--enhance sinc4x+loop` and a
 //! `Chain`'s printed name read the same way.
