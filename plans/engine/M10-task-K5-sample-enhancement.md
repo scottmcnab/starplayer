@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M10 ([master plan](M10-master-plan.md), "The task graph" section); composes with [M11](M11-master-plan.md) (enhance once at library-scan time) |
-| Status | Superseded 2026-09-09 by [K5a](M10-task-K5a-enhancer-core.md) + [K5b](M10-task-K5b-enhance-offline-and-cli.md) + [W4](../apps/W4-task-enhancement-checkboxes.md) — see "Plan amendment" |
+| Status | Superseded 2026-09-09 by [K5a](complete/M10-task-K5a-enhancer-core.md) + [K5b](M10-task-K5b-enhance-offline-and-cli.md) + [W4](../apps/W4-task-enhancement-checkboxes.md) — see "Plan amendment" |
 | Depends on | — (M7-H5's sinc kernel and pre-roll are useful precedent, not a dependency) |
 | Blocks | — |
 | Parallel with | K1, K2 |
@@ -153,5 +153,5 @@ is split into three task files and this one is kept as the record of the origina
 4. Ping-pong loop points scale as `F·start`, `F·(end − 1) + 1`; sustain-loop samples are
    resampled as one-shots.
 
-Engine half: [K5a](M10-task-K5a-enhancer-core.md). CLI/offline: [K5b](M10-task-K5b-enhance-offline-and-cli.md).
+Engine half: [K5a](complete/M10-task-K5a-enhancer-core.md). CLI/offline: [K5b](M10-task-K5b-enhance-offline-and-cli.md).
 Web: [W4](../apps/W4-task-enhancement-checkboxes.md).

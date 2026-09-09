@@ -4,7 +4,7 @@
 |---|---|
 | Milestone | Web player maintenance (follows W3); the web half of M10-[K5](../engine/M10-task-K5-sample-enhancement.md) |
 | Status | Planned 2026-09-09 |
-| Depends on | [K5a](../engine/M10-task-K5a-enhancer-core.md) landed (`starplayer::enhance`, `CATALOGUE`, `Module::enhanced`) |
+| Depends on | [K5a](../engine/complete/M10-task-K5a-enhancer-core.md) landed (`starplayer::enhance`, `CATALOGUE`, `Module::enhanced`) |
 | Blocks | — |
 | Parallel with | [K5b](../engine/M10-task-K5b-enhance-offline-and-cli.md) |
 | Recommended model | Claude Sonnet (one wasm export, one JSON descriptor, and generalising an existing checkbox's reload dance) |
@@ -12,7 +12,7 @@
 
 ## Context for a fresh agent
 
-Read `CLAUDE.md`, `apps/starplayer-web/README.md`, and [K5a](../engine/M10-task-K5a-enhancer-core.md).
+Read `CLAUDE.md`, `apps/starplayer-web/README.md`, and [K5a](../engine/complete/M10-task-K5a-enhancer-core.md).
 The owner wants the K5 sample enhancers **exposed as checkboxes in the web player so they
 take effect when a track is loaded**. Enhancement is a load-time module rebuild
 (`Module::enhanced`), so in the web player it belongs exactly where the module is decoded:

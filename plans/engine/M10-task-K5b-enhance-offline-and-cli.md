@@ -4,7 +4,7 @@
 |---|---|
 | Milestone | M10 ([master plan](M10-master-plan.md), decision 6); the host half of [K5](M10-task-K5-sample-enhancement.md) |
 | Status | Planned 2026-09-09 |
-| Depends on | [K5a](M10-task-K5a-enhancer-core.md) landed (`starplayer::enhance`, `Module::enhanced`, `CATALOGUE`) |
+| Depends on | [K5a](complete/M10-task-K5a-enhancer-core.md) landed (`starplayer::enhance`, `Module::enhanced`, `CATALOGUE`) |
 | Blocks | — |
 | Parallel with | [W4](../apps/W4-task-enhancement-checkboxes.md) |
 | Recommended model | Claude Sonnet (plumbing an existing API through two entry points and a clap flag, with the `--insert` parser as the model) |
@@ -12,7 +12,7 @@
 
 ## Context for a fresh agent
 
-Read `CLAUDE.md`, then [K5a](M10-task-K5a-enhancer-core.md) for the API this task consumes:
+Read `CLAUDE.md`, then [K5a](complete/M10-task-K5a-enhancer-core.md) for the API this task consumes:
 `starplayer::enhance::{SampleEnhancer, SincUpsampler, UpsampleFactor, LoopSmoother, Chain, CATALOGUE}`
 behind the facade feature `enhance`, and `Module::enhanced(&dyn SampleEnhancer)`. An
 enhanced render is a **different configuration** from the goldens and gets a different

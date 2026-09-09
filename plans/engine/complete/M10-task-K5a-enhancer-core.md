@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M10 ([master plan](M10-master-plan.md), decision 6); supersedes the engine half of [K5](M10-task-K5-sample-enhancement.md) — see its "Plan amendment" |
-| Status | Planned 2026-09-09 |
+| Milestone | M10 ([master plan](../M10-master-plan.md), decision 6); supersedes the engine half of [K5](../M10-task-K5-sample-enhancement.md) — see its "Plan amendment" |
+| Status | Landed 2026-09-09; owner listening via K5b outstanding |
 | Depends on | — (M7-H5's `sinc_table.rs` is the pattern to copy, not a dependency) |
-| Blocks | [K5b](M10-task-K5b-enhance-offline-and-cli.md) (CLI/offline), [W4](../apps/W4-task-enhancement-checkboxes.md) (web checkboxes) |
+| Blocks | [K5b](../M10-task-K5b-enhance-offline-and-cli.md) (CLI/offline), [W4](../../apps/W4-task-enhancement-checkboxes.md) (web checkboxes) |
 | Parallel with | K1, K2 |
 | Recommended model | Claude Opus (polyphase resampling with a periodic extension, an exact-power-of-two playback scale threaded through four format processors, and a cross-target determinism contract) |
 | Verified by | agent (goldens untouched, identity rebuild equal, trace positions scale exactly, pinned hash), then owner listening via K5b |
