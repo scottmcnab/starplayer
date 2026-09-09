@@ -14,7 +14,9 @@
 /// Analysis frame length for the log-spectral distance, in frames of one channel.
 pub const SPECTRAL_FRAME_FRAMES: usize = 4_096;
 
-/// 50 % overlap.
+/// 50 % overlap. The hop [`log_spectral_distance_db`] actually walks is half of whatever
+/// [`Fft`] it is handed, so this states the convention for a caller sizing a buffer rather
+/// than being read by the function itself.
 pub const SPECTRAL_HOP_FRAMES: usize = SPECTRAL_FRAME_FRAMES / 2;
 
 /// Magnitude floor for the log-spectral distance, relative to a full-scale sine's
@@ -76,7 +78,7 @@ pub fn audible_magnitude_floor(fft: &Fft, reference: &[f64]) -> f64 {
 /// The hop is half the transform, so the caller picks the resolution by picking the
 /// [`Fft`] it hands in, and `magnitude_floor` is how quiet a bin has to be before the
 /// caller stops caring what is in it — [`SPECTRAL_MAGNITUDE_FLOOR`] for an
-/// engine-against-engine comparison, [`AUDIBLE_MAGNITUDE_FLOOR`] for a
+/// engine-against-engine comparison, [`audible_magnitude_floor`] for a
 /// does-this-sound-closer one.
 pub fn log_spectral_distance_db(fft: &Fft, reference: &[f64], candidate: &[f64], magnitude_floor: f64) -> Option<f64> {
     let length = reference.len().min(candidate.len());
