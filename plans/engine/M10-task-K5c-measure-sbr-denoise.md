@@ -451,10 +451,10 @@ every octave of extension was scored against silence and fewer always won.
 | `DENOISE_BLOCK_FRAMES` | 64 | 7.6 ms at 8 363 Hz: a drum's 80 ms decay is a dozen blocks, and a block's mean square is an estimate rather than a sample of the waveform. |
 | `EIGHT_BIT_FLOOR_MEAN_SQUARE` | `256² / 12` = 5 461.33 | The exact variance of uniform quantisation with a step of 256. Taken whenever every frame is a multiple of 256, which is true of every sample in `REFLEX.S3M` and `PETRI.S3M`. |
 | `MINIMUM_FLOOR_MEAN_SQUARE` | `1 / 12` | One `i16` step. A sample cannot be quieter than its own grid. |
-| `MAXIMUM_ESTIMATED_FLOOR_FRACTION` | `10⁻⁴` (−40 dB) | Added after research point 1 measured the estimator destroying a 16-bit sustained tone. See below. |
+| `MAXIMUM_ESTIMATED_FLOOR_FRACTION` | `10⁻⁴` (−40 dB) | Added after research point 1 measured the estimator destroying a 16-bit sustained tone. See section 6. |
 | `QUIET_BLOCK_PERCENT` | 5 | As specified. |
 | `RELEASE_FRACTION` | 0.25 per block | A 26 ms time constant at 8 363 Hz: slower than a tracker tick, so it cannot pump, and 20 time constants inside the decay it has to follow. The attack is **instant** (the gain takes any higher block gain immediately), which is what leaves a drum's first block untouched. |
-| default `strength_percent` | 100 | The plain Wiener gain, and measurably the optimum — see the strength sweep below. |
+| default `strength_percent` | 100 | The plain Wiener gain, and measurably the optimum in both directions — see the strength sweep in section 3. |
 
 Everything runs in the **mean-square** domain rather than in RMS, which is the same
 quantity squared and removes every square root from the enhancer: the Wiener gain is a
@@ -462,13 +462,22 @@ ratio of mean squares and the strength is the only place a root appears at all. 
 deviation in letter from the task's "RMS of the quietest 5 %"; the pooled mean square of
 equal-length blocks is exactly the square of their pooled RMS, so it is the same number.
 
+**The harness** (`crates/starplayer-offline/src/{analysis,enhance_measure}.rs`):
+
+| Constant | Value | Why |
+|---|---|---|
+| `INSTRUMENT_BANDWIDTH_HZ` | 20 kHz | Where hearing stops, and therefore where a test instrument's harmonic series has to stop for an extension of the band above 4 kHz to be scorable at all. Section 2. |
+| `AUDIBLE_FLOOR_BELOW_PEAK_DB` | −60 dB, below the reference's loudest bin | Section 2. |
+| `TAIL_WINDOW_UPPER_DB` / `TAIL_WINDOW_LOWER_DB` | −24 / −48 dB below peak | The zone where an 8-bit decay crosses its own quantisation floor, which on instrument (a) lands 45.2 dB below the rendered peak. Section 2. |
+| `DECIMATION_TAPS` / `DECIMATION_CUTOFF_FRACTION` | 512 / 0.92 | A 550 Hz transition that fits between the 3 847 Hz cutoff and the 4 181 Hz Nyquist, so the degradation is a lost band rather than aliasing. Section 2. |
+
 **`BandwidthExtender`** (`crates/starplayer-enhance/src/sbr.rs`):
 
 | Constant | Value | Why |
 |---|---|---|
 | `STFT_SIZE` / `STFT_HOP` | 1 024 / 256 | 30.6 ms and 32.7 Hz at the 33 452 Hz an upsampled tracker sample arrives at: fine enough to resolve a bass note's partials, short enough that a drum's decay is three frames. A quarter hop is far past the overlap-add criterion, so the analysis **and** synthesis windows can both be applied and a patched frame cannot click against its neighbours. |
 | `BAND_EDGE_THRESHOLD_DB` | 12 | As specified. |
-| `SPECTRAL_FLOOR_TOP_PERCENT` | 10 | As specified — but the **median** of those bins, not their mean. See below. |
+| `SPECTRAL_FLOOR_TOP_PERCENT` | 10 | As specified — but the **median** of those bins, not their mean, and read twice: once over the whole spectrum and once over the band below what that finds. See section 9. |
 | `MAXIMUM_EDGE_FRACTION_PERCENT` | 45 | As specified. |
 | `MINIMUM_EXTENSION_GAIN` | 0.08 | With the default −6 dB of extra roll-off already in the gain, this trips when the source is falling faster than about 16 dB per octave at its own top. It is a safety rail, not the thing that decides the dark case — see section 4. |
 | `MAXIMUM_PATCHED_OCTAVES` | **2** | Measured, not assumed, and re-measured after the harness was corrected. See the octave sweep in section 4. |
