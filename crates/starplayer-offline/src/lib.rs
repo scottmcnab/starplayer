@@ -78,6 +78,7 @@ use starplayer::mixer::StereoI16;
 use sha2::{Digest, Sha256};
 
 pub mod analysis;
+pub mod enhance_measure;
 pub mod fixtures;
 pub mod wav;
 
