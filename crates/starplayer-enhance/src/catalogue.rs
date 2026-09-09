@@ -11,7 +11,9 @@ use alloc::boxed::Box;
 use starplayer_model::SampleEnhancer;
 
 use crate::chain::Chain;
+use crate::denoise::DecayDenoiser;
 use crate::loop_smooth::LoopSmoother;
+use crate::sbr::BandwidthExtender;
 use crate::upsample::{SincUpsampler, UpsampleFactor};
 
 /// [`EnhancerDescriptor::flag_bit`] for an enhancer that has no bit in the flag word — one
@@ -37,10 +39,24 @@ pub struct EnhancerDescriptor {
 
 /// Every enhancer a host may offer, in the order [`from_flags`] applies them.
 ///
-/// Order matters and is the bit order: upsampling first, so the smoother's crossfade is
-/// measured in the rebuilt sample's own frames and the seam it repairs is the seam
-/// playback will actually reach.
+/// **Catalogue order is run order, and it is no longer the bit order.** Bits 0 and 1 were
+/// shipped first and live in browsers' `localStorage`, so they cannot move; the order the
+/// stages have to run in is a signal-chain question, not a history question:
+///
+/// * `denoise` first, on the **source** frames — its noise floor is read from the fact
+///   that every frame is a multiple of 256, which is true of an 8-bit sample and false of
+///   anything an upsampler has already touched.
+/// * then the upsampler, which is what creates the headroom everything after it works in.
+/// * then `sbr`, which needs that headroom: with none it is the identity.
+/// * `loop` last, so the crossfade is measured in the rebuilt sample's own frames and the
+///   seam it repairs is the seam playback will actually reach.
 pub const CATALOGUE: &[EnhancerDescriptor] = &[
+    EnhancerDescriptor {
+        id: "denoise",
+        label: "Reduce decay noise",
+        description: "Attenuates each block of a sample by how much of it is signal rather than the constant hiss an 8-bit source carries, so notes fade into silence rather than into a wash of noise. Loud passages and loop regions are left at full level.",
+        flag_bit: 2,
+    },
     EnhancerDescriptor {
         id: "sinc4x",
         label: "Upsample samples (4x sinc)",
@@ -48,16 +64,22 @@ pub const CATALOGUE: &[EnhancerDescriptor] = &[
         flag_bit: 0,
     },
     EnhancerDescriptor {
-        id: "loop",
-        label: "Smooth loop seams",
-        description: "Crossfades the end of each forward loop into the frames that led into its start, removing the click a loop whose ends do not meet makes on every wrap. A loop that does not click is left untouched.",
-        flag_bit: 1,
-    },
-    EnhancerDescriptor {
         id: "sinc2x",
         label: "Upsample samples (2x sinc)",
         description: "The same filter at half the factor, for a module whose samples are already close to the output rate or a host with a tight memory budget.",
         flag_bit: NO_FLAG_BIT,
+    },
+    EnhancerDescriptor {
+        id: "sbr",
+        label: "Extend sample bandwidth",
+        description: "Transposes the octave below a sample's band edge upwards, at the level the sample's own roll-off predicts, so a bright instrument recorded at 8 kHz gets a top octave back. A sample that already fills its band, or one that is dark because it was recorded dark, is left alone.",
+        flag_bit: 3,
+    },
+    EnhancerDescriptor {
+        id: "loop",
+        label: "Smooth loop seams",
+        description: "Crossfades the end of each forward loop into the frames that led into its start, removing the click a loop whose ends do not meet makes on every wrap. A loop that does not click is left untouched.",
+        flag_bit: 1,
     },
 ];
 
@@ -82,6 +104,8 @@ pub fn enhancer_for_id(id: &str, ceiling_hz: Option<u32>) -> Option<Box<dyn Samp
         "sinc4x" => Some(Box::new(upsampler(UpsampleFactor::Four))),
         "sinc2x" => Some(Box::new(upsampler(UpsampleFactor::Two))),
         "loop" => Some(Box::new(LoopSmoother::new(DEFAULT_CROSSFADE_FRAMES))),
+        "denoise" => Some(Box::new(DecayDenoiser::new())),
+        "sbr" => Some(Box::new(BandwidthExtender::new())),
         _ => None,
     }
 }
@@ -110,6 +134,7 @@ pub fn from_flags(flags: u32, ceiling_hz: Option<u32>) -> Option<Chain> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     fn every_id_is_unique_and_constructible() {
@@ -125,11 +150,23 @@ mod tests {
         }
     }
 
+    /// Bits 0 and 1 shipped first and live in browsers' `localStorage`, so they are
+    /// frozen: a page that remembered "upsample and smooth loops" must still mean that
+    /// after this crate grows two more enhancers.
     #[test]
-    fn the_two_checkbox_enhancers_sit_on_bits_zero_and_one() {
+    fn the_checkbox_bits_are_the_ones_that_shipped_and_the_new_ones_sit_above_them() {
         assert_eq!(descriptor("sinc4x").map(|descriptor| descriptor.flag_bit), Some(0));
         assert_eq!(descriptor("loop").map(|descriptor| descriptor.flag_bit), Some(1));
+        assert_eq!(descriptor("denoise").map(|descriptor| descriptor.flag_bit), Some(2));
+        assert_eq!(descriptor("sbr").map(|descriptor| descriptor.flag_bit), Some(3));
         assert_eq!(descriptor("sinc2x").map(|descriptor| descriptor.flag_bit), Some(NO_FLAG_BIT), "2x is command-line only");
+    }
+
+    /// Catalogue order is **run** order, and it is deliberately not bit order.
+    #[test]
+    fn the_catalogue_runs_the_signal_chain_in_the_order_the_stages_belong_in() {
+        let ids: Vec<&str> = CATALOGUE.iter().map(|descriptor| descriptor.id).collect();
+        assert_eq!(ids, ["denoise", "sinc4x", "sinc2x", "sbr", "loop"]);
     }
 
     #[test]
@@ -138,7 +175,12 @@ mod tests {
         assert_eq!(from_flags(1, None).map(|chain| chain.name()).as_deref(), Some("sinc4x"));
         assert_eq!(from_flags(2, None).map(|chain| chain.name()).as_deref(), Some("loop=64"));
         assert_eq!(from_flags(3, None).map(|chain| chain.name()).as_deref(), Some("sinc4x+loop=64"));
-        assert_eq!(from_flags(0xffff_fffe, None).map(|chain| chain.name()).as_deref(), Some("loop=64"), "unknown bits are ignored");
+        assert_eq!(from_flags(4, None).map(|chain| chain.name()).as_deref(), Some("denoise"));
+        assert_eq!(from_flags(8, None).map(|chain| chain.name()).as_deref(), Some("sbr"));
+        assert_eq!(from_flags(0b1101, None).map(|chain| chain.name()).as_deref(), Some("denoise+sinc4x+sbr"), "run order, not bit order");
+        assert_eq!(from_flags(0b1111, None).map(|chain| chain.name()).as_deref(), Some("denoise+sinc4x+sbr+loop=64"));
+        assert!(from_flags(0xffff_fff0, None).is_none(), "every bit above the catalogue's is ignored");
+        assert_eq!(from_flags(0xffff_fff2, None).map(|chain| chain.name()).as_deref(), Some("loop=64"), "unknown bits are ignored");
     }
 
     #[test]

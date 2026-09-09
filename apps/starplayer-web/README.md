@@ -165,20 +165,35 @@ availability rule.
 same symmetric 60% positions used by ordinary stereo S3Ms. It does not affect S3M, MTM, or
 later MOD panning effects.
 
-**Upsample samples (4x sinc)** and **Smooth loop seams** rebuild every sample through
-`Module::enhanced` — a polyphase sinc upsample and a loop-seam crossfade, respectively —
-before the module reaches the engine. Unlike the panning option these apply to every
-format, not only MOD. Neither checkbox is transcribed by hand: the worklet's first `ready`
-message carries `enhancements_json()`, read straight from `starplayer-enhance::CATALOGUE`
-(the wasm host's `starplayer` dependency enables the facade's `enhance` feature for
-exactly this), and the load panel builds one checkbox per entry from its label,
-description and flag bit. Both are off by default.
+**Reduce decay noise**, **Upsample samples (4x sinc)**, **Extend sample bandwidth** and
+**Smooth loop seams** rebuild every sample through `Module::enhanced` before the module
+reaches the engine. Unlike the panning option these apply to every format, not only MOD.
+No checkbox is transcribed by hand: the worklet's first `ready` message carries
+`enhancements_json()`, read straight from `starplayer-enhance::CATALOGUE` (the wasm host's
+`starplayer` dependency enables the facade's `enhance` feature for exactly this), and the
+load panel builds one checkbox per entry from its label, description and flag bit. All four
+are off by default.
+
+**The order is the catalogue's, not the order you tick them in.** The stages always run
+`denoise → sinc4x → sbr → loop`, which is the order they belong in as a signal chain: the
+denoiser reads its noise floor from the fact that an 8-bit sample's frames are all
+multiples of 256, which is true only before anything else has touched them; the upsampler
+creates the headroom the bandwidth extender needs, and with no headroom the extender is
+the identity; and the loop smoother goes last so its crossfade is measured in the rebuilt
+sample's own frames. The recommended combination on 8-bit tracker material is all four —
+**Reduce decay noise**, **Upsample samples**, **Extend sample bandwidth** and **Smooth loop
+seams** — which is what the CLI spells `--enhance denoise+sinc4x+sbr+loop`.
+
+Note that the checkbox **bits** are not in that order: bits 0 and 1 belong to the
+upsampler and the loop smoother, which shipped first and are already in browsers'
+`localStorage`, and the two enhancers added in M10-K5c took bits 2 and 3. Nothing outside
+the catalogue needs to know that, which is the point.
 
 **Frame budget.** A rebuild bypasses the IT loader's own load-time PCM budget entirely, so
 the wasm host enforces its own 16-million-frame ceiling on the *rebuilt* module: a
 requested 4x upsample that would cross it is quietly retried at 2x, and a 2x rebuild that
-still would not fit is dropped to identity. The loop smoother is unaffected, since it never
-changes a sample's length. `moduleLoaded`'s `appliedEnhancementFlags` and
+still would not fit is dropped to identity. The other three stages are unaffected, since
+none of them changes a sample's length. `moduleLoaded`'s `appliedEnhancementFlags` and
 `appliedEnhancementFactor` report what actually ran, and the status line says so whenever
 it is narrower than what the checkbox asked for.
 

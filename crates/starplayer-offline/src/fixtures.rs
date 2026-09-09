@@ -771,6 +771,138 @@ fn mtm_sample_header(name: &str, length: usize, loop_span: Option<(usize, usize)
     header
 }
 
+/// A one-channel, one-sample Impulse Tracker module carrying `frames` verbatim as a
+/// signed 16-bit sample whose `C5Speed` is `rate_hz`, played once at note C-5 (M10-K5c).
+///
+/// # Why this exists
+///
+/// The enhancement harness has to compare a 44 100 Hz ground-truth instrument against the
+/// 8 363 Hz, 8-bit version of the same instrument **through the real pipeline** rather
+/// than by comparing two `Vec<i16>` in isolation, because an enhancer's output only means
+/// anything after the mixer has resampled it to the output rate. IT is the format that
+/// makes that possible: its `C5Speed` is an arbitrary rate, so a 44 100 Hz sample plays at
+/// unity step against a 44 100 Hz render and the ground truth reaches the comparison
+/// unresampled. Every other format's reference rate is either the Amiga clock or a fixed
+/// 8 363.
+///
+/// The module is in **sample mode** — the instrument column names a sample directly — with
+/// one channel, one 64-row pattern and a single order, so the render is one voice playing
+/// one sample with nothing else in it: no envelopes, no auto-vibrato, no second note. Any
+/// difference between two renders is the sample.
+///
+/// `loop_span` gives the sample a forward loop over `[start, end)`; `None` makes it a
+/// one-shot. As the model requires, a forward loop's stored body must end at `loop_end`,
+/// so the caller passes frames whose length is exactly the loop end.
+pub fn synthetic_it_single_sample(frames: &[i16], rate_hz: u32, loop_span: Option<(u32, u32)>) -> Vec<u8> {
+    const HEADER_BYTES: usize = 0xC0;
+    const INSTRUMENT_BYTES: usize = 554;
+    const SAMPLE_BYTES: usize = 80;
+    const ORDERS: [u8; 2] = [0, 255];
+    const IT_ROWS: usize = 64;
+
+    let pattern = single_channel_it_pattern(IT_ROWS);
+    let pcm: Vec<u8> = frames.iter().flat_map(|frame| frame.to_le_bytes()).collect();
+
+    let orders_offset = HEADER_BYTES;
+    let instrument_offsets_offset = orders_offset + ORDERS.len();
+    let sample_offsets_offset = instrument_offsets_offset + 4;
+    let pattern_offsets_offset = sample_offsets_offset + 4;
+    let instruments_offset = pattern_offsets_offset + 4;
+    let samples_offset = instruments_offset + INSTRUMENT_BYTES;
+    let patterns_offset = samples_offset + SAMPLE_BYTES;
+    let pcm_offset = patterns_offset + pattern.len();
+
+    let mut bytes = vec![0u8; pcm_offset + pcm.len()];
+    bytes[..4].copy_from_slice(b"IMPM");
+    write_text(&mut bytes[4..30], "starplayer enhance probe");
+    bytes[0x20..0x22].copy_from_slice(&(ORDERS.len() as u16).to_le_bytes());
+    bytes[0x22..0x24].copy_from_slice(&1u16.to_le_bytes());
+    bytes[0x24..0x26].copy_from_slice(&1u16.to_le_bytes());
+    bytes[0x26..0x28].copy_from_slice(&1u16.to_le_bytes());
+    bytes[0x28..0x2A].copy_from_slice(&0x0214u16.to_le_bytes());
+    bytes[0x2A..0x2C].copy_from_slice(&0x0214u16.to_le_bytes());
+    // Stereo and linear slides, **not** instrument mode: the instrument column names the
+    // sample, so there is no envelope anywhere to shape the voice.
+    bytes[0x2C..0x2E].copy_from_slice(&0x0009u16.to_le_bytes());
+    bytes[0x2E..0x30].copy_from_slice(&0u16.to_le_bytes());
+    bytes[0x30] = 128;
+    // Mixing volume at the format's maximum, which puts a 0.9-full-scale sample's render
+    // at about −3 dBFS. That matters because the harness's log-spectral distance is
+    // floored at −60 dB **relative to full scale**: every decibel the render sits below
+    // full scale is a decibel of the instrument's own decay that falls under the floor and
+    // stops being measured at all. The engine's limiter is `Clamp` and the render is
+    // checked for warnings, so the headroom is real rather than assumed.
+    bytes[0x31] = 128;
+    bytes[0x32] = 6;
+    bytes[0x33] = 125;
+    bytes[0x34] = 128;
+    bytes[0x35] = 0;
+    for channel in 0..64 {
+        // Dead centre, so a mono downmix loses nothing to panning.
+        bytes[0x40 + channel] = 32;
+        bytes[0x80 + channel] = 64;
+    }
+    bytes[orders_offset..orders_offset + ORDERS.len()].copy_from_slice(&ORDERS);
+    bytes[instrument_offsets_offset..instrument_offsets_offset + 4].copy_from_slice(&(instruments_offset as u32).to_le_bytes());
+    bytes[sample_offsets_offset..sample_offsets_offset + 4].copy_from_slice(&(samples_offset as u32).to_le_bytes());
+    bytes[pattern_offsets_offset..pattern_offsets_offset + 4].copy_from_slice(&(patterns_offset as u32).to_le_bytes());
+
+    // Sample mode ignores the instrument table, but the header claims one instrument, so a
+    // well-formed empty header keeps the file honest.
+    bytes[instruments_offset..instruments_offset + 4].copy_from_slice(b"IMPI");
+
+    write_it_sixteen_bit_sample(&mut bytes[samples_offset..samples_offset + SAMPLE_BYTES], frames.len() as u32, loop_span, pcm_offset as u32, rate_hz);
+    bytes[patterns_offset..patterns_offset + pattern.len()].copy_from_slice(&pattern);
+    bytes[pcm_offset..pcm_offset + pcm.len()].copy_from_slice(&pcm);
+    bytes
+}
+
+/// One 80-byte IT sample header for signed little-endian 16-bit PCM, with no sustain loop
+/// and no auto-vibrato.
+fn write_it_sixteen_bit_sample(destination: &mut [u8], length: u32, loop_span: Option<(u32, u32)>, pcm_offset: u32, c5_speed: u32) {
+    destination[..4].copy_from_slice(b"IMPS");
+    // Global volume and default volume both at their maxima: nothing here may scale the
+    // sample, because the harness compares levels.
+    destination[0x11] = 64;
+    destination[0x12] = 0x01 | 0x02 | if loop_span.is_some() { 0x10 } else { 0 };
+    destination[0x13] = 64;
+    write_text(&mut destination[0x14..0x2E], "probe");
+    // Signed, little-endian, not delta — how IT 2.02 and later wrote 16-bit data.
+    destination[0x2E] = 0x01;
+    destination[0x2F] = 0;
+    destination[0x30..0x34].copy_from_slice(&length.to_le_bytes());
+    if let Some((start, end)) = loop_span {
+        destination[0x34..0x38].copy_from_slice(&start.to_le_bytes());
+        destination[0x38..0x3C].copy_from_slice(&end.to_le_bytes());
+    }
+    destination[0x3C..0x40].copy_from_slice(&c5_speed.to_le_bytes());
+    destination[0x48..0x4C].copy_from_slice(&pcm_offset.to_le_bytes());
+}
+
+/// A one-channel pattern whose first row plays note C-5 of sample one at full volume and
+/// whose remaining rows are empty.
+fn single_channel_it_pattern(rows: usize) -> Vec<u8> {
+    let mut packed = Vec::new();
+    for row in 0..rows {
+        if row == 0 {
+            packed.push(1 | 0x80);
+            // Note, instrument and volume present; no effect.
+            packed.push(0x01 | 0x02 | 0x04);
+            // 60 is C-5, the note `C5Speed` names the rate of.
+            packed.push(60);
+            packed.push(1);
+            packed.push(64);
+        }
+        packed.push(0);
+    }
+    let mut bytes = Vec::with_capacity(8 + packed.len());
+    bytes.extend_from_slice(&(packed.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&(rows as u16).to_le_bytes());
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes.extend_from_slice(&packed);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

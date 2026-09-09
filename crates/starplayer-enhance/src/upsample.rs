@@ -7,6 +7,7 @@ use core::fmt::Write;
 
 use starplayer_model::{EnhancedPcm, LoopMode, SampleEnhancer, SamplePcm, SustainLoop, ping_pong_reflect};
 
+use crate::deterministic::saturating_i16;
 use crate::polyphase::{UPSAMPLE_LEADING_TAPS, UPSAMPLE_PHASES, UPSAMPLE_TAPS, coefficient};
 
 /// How far a sample is upsampled. Both factors are powers of two, because the module
@@ -162,7 +163,12 @@ fn effective_rate_hz(sample: SamplePcm<'_>) -> u32 {
 }
 
 /// The source, read as an infinite sequence. See [`SincUpsampler`] for the four cases.
-struct InfiniteSource<'pcm> {
+///
+/// Shared with [`crate::sbr`], which windows the same infinite sequence rather than
+/// filtering it: any process that reaches past a sample's ends has to agree with this one
+/// about what is out there, or two enhancers in one chain would disagree about the same
+/// loop.
+pub(crate) struct InfiniteSource<'pcm> {
     frames: &'pcm [i16],
     extension: Extension,
     loop_start: u32,
@@ -170,23 +176,44 @@ struct InfiniteSource<'pcm> {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Extension {
+pub(crate) enum Extension {
     Zero,
     Forward,
     PingPong,
 }
 
-impl InfiniteSource<'_> {
-    fn at(&self, index: i64) -> f64 {
+impl<'pcm> InfiniteSource<'pcm> {
+    /// The infinite reading of one sample: its loop's periodic or reflected continuation
+    /// where it has one that a resampler can honour, and silence where it does not.
+    pub(crate) fn for_sample(sample: &SamplePcm<'pcm>) -> InfiniteSource<'pcm> {
+        let periodic = sample.sustain_loop.is_none() && sample.loop_mode.is_looping();
+        let extension = match (periodic, sample.loop_mode) {
+            (true, LoopMode::Forward) => Extension::Forward,
+            (true, LoopMode::PingPong) => Extension::PingPong,
+            _ => Extension::Zero,
+        };
+        InfiniteSource { frames: sample.frames, extension, loop_start: sample.loop_start, loop_end: sample.loop_end }
+    }
+
+    /// Which extension this reading uses.
+    pub(crate) fn extension(&self) -> Extension { self.extension }
+
+    /// The stored frame index an infinite index reads, or `None` for silence.
+    ///
+    /// Negative indices are silence: playback starts at frame 0 and what precedes it is
+    /// the module's own pre-roll, which the builder fills with zeros.
+    pub(crate) fn body_index(&self, index: i64) -> Option<usize> {
         if index < 0 {
-            return 0.0;
+            return None;
         }
         let index = index as u64;
-        if let Some(frame) = usize::try_from(index).ok().and_then(|index| self.frames.get(index)) {
-            return *frame as f64;
+        if let Ok(direct) = usize::try_from(index)
+            && direct < self.frames.len()
+        {
+            return Some(direct);
         }
         let source = match self.extension {
-            Extension::Zero => return 0.0,
+            Extension::Zero => return None,
             Extension::Forward => {
                 let length = (self.loop_end - self.loop_start) as u64;
                 self.loop_start as u64 + (index - self.loop_start as u64) % length
@@ -206,7 +233,54 @@ impl InfiniteSource<'_> {
                 }
             }
         };
-        usize::try_from(source).ok().and_then(|source| self.frames.get(source)).map(|frame| *frame as f64).unwrap_or(0.0)
+        usize::try_from(source).ok().filter(|source| *source < self.frames.len())
+    }
+
+    /// [`InfiniteSource::body_index`], extended **backwards** through a loop that begins
+    /// at frame 0.
+    ///
+    /// A windowed process reaches behind frame 0 as well as past the end, and its output
+    /// at frame `n` has to be folded back into the loop for the loop to stay periodic.
+    /// Those two only agree if the reading is circular in both directions — so where the
+    /// whole body is one loop, this map continues it backwards instead of reading the
+    /// pre-roll's silence. Where a loop begins after frame 0, the frames before it are
+    /// genuinely aperiodic and negative indices are silence, exactly as
+    /// [`InfiniteSource::body_index`] says.
+    ///
+    /// The upsampler keeps the plain map: a resampled frame *is* played from frame 0
+    /// forwards, so silence in front of it is right there and folding would be wrong.
+    pub(crate) fn periodic_body_index(&self, index: i64) -> Option<usize> {
+        if index >= 0 || self.loop_start != 0 {
+            return self.body_index(index);
+        }
+        let length = i64::from(self.loop_end);
+        match self.extension {
+            Extension::Zero => None,
+            Extension::Forward if length > 0 => usize::try_from(index.rem_euclid(length)).ok().filter(|source| *source < self.frames.len()),
+            Extension::PingPong if length > 1 => {
+                let period = 2 * (length - 1);
+                let phase = u32::try_from(index.rem_euclid(period)).unwrap_or(0);
+                let reflected = ping_pong_reflect(0, self.loop_end, phase) as usize;
+                Some(reflected).filter(|source| *source < self.frames.len())
+            }
+            _ => Some(0).filter(|source| *source < self.frames.len()),
+        }
+    }
+
+    /// The frame value at an infinite index, as an `f64`.
+    pub(crate) fn at(&self, index: i64) -> f64 {
+        match self.body_index(index).and_then(|source| self.frames.get(source)) {
+            Some(frame) => *frame as f64,
+            None => 0.0,
+        }
+    }
+
+    /// [`InfiniteSource::at`] through [`InfiniteSource::periodic_body_index`].
+    pub(crate) fn at_periodic(&self, index: i64) -> f64 {
+        match self.periodic_body_index(index).and_then(|source| self.frames.get(source)) {
+            Some(frame) => *frame as f64,
+            None => 0.0,
+        }
     }
 }
 
@@ -217,13 +291,8 @@ fn resample(sample: SamplePcm<'_>, factor: UpsampleFactor) -> EnhancedPcm {
     let phase_stride = UPSAMPLE_PHASES / ratio as usize;
 
     let body_frames = sample.frames.len() as u64;
-    let periodic = sample.sustain_loop.is_none() && sample.loop_mode.is_looping();
-    let extension = match (periodic, sample.loop_mode) {
-        (true, LoopMode::Forward) => Extension::Forward,
-        (true, LoopMode::PingPong) => Extension::PingPong,
-        _ => Extension::Zero,
-    };
-    let source = InfiniteSource { frames: sample.frames, extension, loop_start: sample.loop_start, loop_end: sample.loop_end };
+    let source = InfiniteSource::for_sample(&sample);
+    let extension = source.extension();
 
     let (loop_start, loop_end) = scaled_span(sample.loop_mode, sample.loop_start, sample.loop_end, ratio);
     let output_frames = match extension {
@@ -271,16 +340,6 @@ fn scaled_span(mode: LoopMode, start: u32, end: u32, ratio: u32) -> (u32, u32) {
         _ => end.saturating_mul(ratio),
     };
     (scaled_start, scaled_end)
-}
-
-/// Round half away from zero, then saturate to `i16`.
-///
-/// `as i64` truncates towards zero and saturates on a non-finite input, so adding half a
-/// unit in the value's own direction first is exactly "round half away from zero" with no
-/// branch on the rounding mode of the target.
-fn saturating_i16(value: f64) -> i16 {
-    let rounded = if value >= 0.0 { (value + 0.5) as i64 } else { (value - 0.5) as i64 };
-    rounded.clamp(i16::MIN as i64, i16::MAX as i64) as i16
 }
 
 #[cfg(test)]

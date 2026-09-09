@@ -1531,11 +1531,14 @@ crates/
                         the `smf` feature (parser + SmfSequencer) also → engine, for
                         EventFeed and the MIDI_CHANNEL_BASE mapping (task E5)
   starplayer-telemetry  snapshot types shared by every UI             → core, rt
-  starplayer-enhance    load-time sample enhancers: polyphase sinc upsampling
-                        (a committed f64 coefficient table, so no `sin` at run
-                        time and no `std`), loop-seam smoothing, and the
-                        catalogue a host builds its checkboxes from. Never in
-                        `default`; the RT path never sees it.  → model, dsp
+  starplayer-enhance    load-time sample enhancers: polyphase sinc upsampling,
+                        decay denoising, STFT bandwidth extension and loop-seam
+                        smoothing, plus the catalogue a host builds its
+                        checkboxes from. Every window, twiddle and filter
+                        coefficient is a committed f64 bit-pattern table and the
+                        rest is `+ − × ÷`, so there is no `sin`, `sqrt` or
+                        `powf` at run time and no `std`. Never in `default`;
+                        the RT path never sees it.  → model, dsp
   starplayer            facade: re-exports + format autodetect. THE public crate.
   # ── std ─────────────────────────────────────────────────────────────────────
   starplayer-host       AudioBackend trait, AudioSpec/DeviceInfo/Stream, the
