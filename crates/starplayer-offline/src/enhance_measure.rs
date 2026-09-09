@@ -32,7 +32,15 @@
 //!   [`DEGRADED_NYQUIST_HZ`] — what survived inside the band the source *did* have. This
 //!   is where a denoiser has to show up, and where it must not do damage.
 //! * **Log-spectral distance** ([`crate::analysis::log_spectral_distance_db`]) — the
-//!   shape of the spectrum, which is where a bandwidth extender has to show up.
+//!   shape of the spectrum, which is where a bandwidth extender has to show up. Floored
+//!   [`AUDIBLE_FLOOR_BELOW_PEAK_DB`](crate::analysis::AUDIBLE_FLOOR_BELOW_PEAK_DB) below
+//!   the ground truth's own loudest bin, rather than at the −120 dB the libopenmpt
+//!   comparison uses: this harness is asking whether something sounds closer, and a bin
+//!   filled a hundred decibels down is not a difference anybody can hear.
+//!
+//! The first two are also reported over the **decay window** alone — see [`tail_window`] —
+//! because that is the only stretch of an 8-bit decay where a denoiser has anything to
+//! work with.
 //!
 //! Nothing in this module runs on the audio thread or ships to a host, so `sin`, `cos` and
 //! `powf` are all fine here. The enhancers being measured may use none of them.
@@ -42,7 +50,7 @@ use starplayer::dsp::Linear;
 use starplayer::mixer::{FixedPath, MonoI16};
 use starplayer::model::SampleEnhancer;
 
-use crate::analysis::{Fft, band_limited_snr_db, log_spectral_distance_db};
+use crate::analysis::{Fft, audible_magnitude_floor, band_limited_snr_db, log_spectral_distance_db};
 use crate::{GoldenFormat, RenderError, RenderLength, RenderOptions, SEGMENTAL_SNR_FRAMES, render_song_with_options, segmental_snr_db};
 
 /// The rate the ground-truth instruments are synthesised at, and the rate every render in
@@ -59,14 +67,27 @@ pub const DEGRADED_NYQUIST_HZ: f64 = DEGRADED_RATE_HZ as f64 / 2.0;
 
 /// Cutoff of the decimation filter, as a fraction of [`DEGRADED_NYQUIST_HZ`].
 ///
-/// 0.95 rather than the upsampler's 0.9: the point of the degradation is to model a real
-/// sampler's band limit, and leaving the top twentieth of the band clear of the filter's
-/// own transition keeps the octave below the edge — which is what a bandwidth extender
+/// 0.92 rather than the upsampler's 0.9: the point of the degradation is to model a real
+/// sampler's band limit, and leaving the top of the band clear of the filter's own
+/// transition keeps the octave below the edge — which is what a bandwidth extender
 /// measures its tilt over — representative of the material rather than of the filter.
-const DECIMATION_CUTOFF_FRACTION: f64 = 0.95;
+const DECIMATION_CUTOFF_FRACTION: f64 = 0.92;
 
-/// Taps in the decimation filter, and in the 3 kHz low-pass instrument (d) is made with.
-const DECIMATION_TAPS: usize = 64;
+/// Taps in the decimation filter.
+///
+/// Five hundred and twelve, not sixty-four. The instruments carry harmonics up to
+/// [`INSTRUMENT_BANDWIDTH_HZ`], and a Kaiser-windowed sinc's transition width is inversely
+/// proportional to its length: at 64 taps the transition is about 4.4 kHz wide at
+/// 44 100 Hz, so everything from 4 kHz to 8 kHz would fold back into the degraded sample
+/// and the harness would be measuring **aliasing** rather than the loss of a band. At 512
+/// taps it is 550 Hz wide, which fits between the 3 847 Hz cutoff and the 4 181 Hz Nyquist
+/// with a hundred decibels to spare.
+const DECIMATION_TAPS: usize = 512;
+
+/// Taps in the 3 kHz low-pass instrument (d) is made with — unchanged, and deliberately
+/// modest: (d) is the "tape-sourced, oversampled" case, whose roll-off is gentle rather
+/// than a wall.
+const DARK_LOW_PASS_TAPS: usize = 127;
 
 /// FFT size for the in-band SNR. 1 024 points at 44 100 Hz is 23 ms and 43 Hz — short
 /// enough that a decaying tail is scored over dozens of frames rather than a handful.
@@ -78,15 +99,22 @@ const SPECTRAL_FFT_SIZE: usize = 4_096;
 /// The four test instruments.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Instrument {
-    /// (a) A plucked harmonic decay: eight harmonics of 700 Hz at `1/n`, falling to −60 dB
-    /// over 1.5 s. Harmonics six to eight sit above [`DEGRADED_NYQUIST_HZ`], so the
-    /// degradation genuinely removes content, and the long quiet tail is where an 8-bit
-    /// sample's quantisation noise is most audible.
+    /// (a) A plucked harmonic decay: harmonics of 700 Hz at `1/n` **up to 20 kHz**,
+    /// falling to −60 dB over 1.5 s.
+    ///
+    /// The harmonic count matters more than it looks. An earlier version of this harness
+    /// stopped at eight harmonics, so the ground truth itself was silent above 5.6 kHz —
+    /// and a bandwidth extender was then scored as *wrong* for putting anything there,
+    /// against a truth no real instrument resembles. A plucked string has harmonics all
+    /// the way up; twenty kilohertz is where hearing stops, so that is where the
+    /// instrument stops.
     PluckedDecay,
-    /// (b) A sustained looped tone with slow vibrato and slight inharmonicity. Every
-    /// partial's frequency is a multiple of 0.5 Hz and the vibrato is 5 Hz, so the whole
-    /// two-second body is exactly one period and the loop is seamless before anything
-    /// touches it.
+    /// (b) A sustained looped tone with slow vibrato and slight inharmonicity, its
+    /// stretched partials running **up to 20 kHz** for the same reason (a)'s harmonics do.
+    ///
+    /// Every partial's frequency is a multiple of 0.5 Hz and the vibrato is 5 Hz, so the
+    /// whole two-second body is exactly one period and the loop is seamless before
+    /// anything touches it.
     SustainedTone,
     /// (c) A noise-burst drum: low-passed noise from a seeded xorshift, falling to −60 dB
     /// over 80 ms. The instrument a denoiser is most likely to damage, because its attack
@@ -197,15 +225,63 @@ pub struct Metrics {
     pub full_band_snr_db: f64,
     /// Average SNR below [`DEGRADED_NYQUIST_HZ`], in dB.
     pub in_band_snr_db: f64,
-    /// Average log-spectral distance, in dB. Lower is better.
+    /// Average log-spectral distance, in dB, floored
+    /// [`AUDIBLE_FLOOR_BELOW_PEAK_DB`](crate::analysis::AUDIBLE_FLOOR_BELOW_PEAK_DB) below
+    /// the ground truth's loudest bin. Lower is better.
     pub log_spectral_distance_db: f64,
-    /// In-band SNR over the last 40 % of the render, in dB — where an 8-bit sample's
-    /// quantisation noise is loudest relative to what is left of the signal.
+    /// In-band SNR over the **decay window** — see [`tail_window`] — in dB, which is where
+    /// an 8-bit sample's quantisation noise is loudest relative to what is left of the
+    /// signal. `NaN` when the instrument has no such window.
     pub tail_in_band_snr_db: f64,
 }
 
-/// Fraction of a render the tail score covers.
-pub const TAIL_FRACTION: f64 = 0.4;
+/// Upper edge of the decay window, relative to the ground truth's own peak.
+pub const TAIL_WINDOW_UPPER_DB: f64 = -24.0;
+
+/// Lower edge of the decay window, relative to the ground truth's own peak.
+pub const TAIL_WINDOW_LOWER_DB: f64 = -48.0;
+
+/// Block length the decay window is found with.
+const TAIL_BLOCK_FRAMES: usize = 1_024;
+
+/// The frames of a render over which its level lies between [`TAIL_WINDOW_UPPER_DB`] and
+/// [`TAIL_WINDOW_LOWER_DB`] of its own peak — the zone where a decay crosses the 8-bit
+/// quantisation floor, and the only zone where a denoiser has anything to do.
+///
+/// # Why not simply "the last 40 %"
+///
+/// Because on an 8-bit sample that window is mostly **digital silence** and cannot move.
+/// An exponential decay reaching −60 dB passes below half a quantisation step at about
+/// −48 dB, and every value after that rounds to zero: there is no noise left to remove and
+/// no signal left to keep, so those frames score exactly 0 dB whatever any enhancer does,
+/// and they drag the average of any window that contains them towards zero. Measured on
+/// instrument (a), three of the four tenths in the last 40 % were pinned at 0.00 dB.
+///
+/// −24 dB is where the decay first gets close enough to the floor for the floor to matter;
+/// −48 dB is where the sample stops existing. Between them is the whole of what a decay
+/// denoiser is for.
+pub fn tail_window(reference: &[i16]) -> Option<core::ops::Range<usize>> {
+    let peak = reference.iter().map(|frame| (*frame as i32).unsigned_abs()).max()? as f64;
+    if peak <= 0.0 {
+        return None;
+    }
+    let upper = peak * 10.0f64.powf(TAIL_WINDOW_UPPER_DB / 20.0);
+    let lower = peak * 10.0f64.powf(TAIL_WINDOW_LOWER_DB / 20.0);
+
+    let block_rms = |block: &[i16]| -> f64 {
+        let energy: f64 = block.iter().map(|frame| *frame as f64 * *frame as f64).sum();
+        (energy / block.len().max(1) as f64).sqrt()
+    };
+    let blocks: Vec<f64> = reference.chunks(TAIL_BLOCK_FRAMES).map(block_rms).collect();
+    let first = blocks.iter().position(|rms| *rms <= upper)?;
+    let last = blocks.iter().rposition(|rms| *rms >= lower)?;
+    if last < first {
+        return None;
+    }
+    let start = first * TAIL_BLOCK_FRAMES;
+    let end = ((last + 1) * TAIL_BLOCK_FRAMES).min(reference.len());
+    if end - start < IN_BAND_FFT_SIZE { None } else { Some(start..end) }
+}
 
 /// Score `candidate` against `reference`, both rendered at [`GROUND_TRUTH_RATE_HZ`].
 pub fn measure(reference: &[i16], candidate: &[i16]) -> Metrics {
@@ -223,11 +299,14 @@ pub fn measure(reference: &[i16], candidate: &[i16]) -> Metrics {
     let spectral_fft = Fft::new(SPECTRAL_FFT_SIZE);
     let rate = GROUND_TRUTH_RATE_HZ as f64;
     let in_band_snr_db = band_limited_snr_db(&in_band_fft, &reference_scaled, &candidate_scaled, rate, DEGRADED_NYQUIST_HZ).unwrap_or(f64::NAN);
-    let log_spectral_distance_db = log_spectral_distance_db(&spectral_fft, &reference_scaled, &candidate_scaled).unwrap_or(f64::NAN);
+    let magnitude_floor = audible_magnitude_floor(&spectral_fft, &reference_scaled);
+    let log_spectral_distance_db = log_spectral_distance_db(&spectral_fft, &reference_scaled, &candidate_scaled, magnitude_floor).unwrap_or(f64::NAN);
 
-    let tail_from = ((length as f64) * (1.0 - TAIL_FRACTION)) as usize;
-    let tail_in_band_snr_db = band_limited_snr_db(&in_band_fft, &reference_scaled[tail_from..], &candidate_scaled[tail_from..], rate, DEGRADED_NYQUIST_HZ)
-        .unwrap_or(f64::NAN);
+    let tail_in_band_snr_db = match tail_window(reference) {
+        Some(window) => band_limited_snr_db(&in_band_fft, &reference_scaled[window.clone()], &candidate_scaled[window], rate, DEGRADED_NYQUIST_HZ)
+            .unwrap_or(f64::NAN),
+        None => f64::NAN,
+    };
 
     Metrics { full_band_snr_db, in_band_snr_db, log_spectral_distance_db, tail_in_band_snr_db }
 }
@@ -245,11 +324,17 @@ pub fn attack_rms_db(render: &[i16], milliseconds: f64) -> f64 {
 // The instruments
 // ---------------------------------------------------------------------------
 
-/// Eight harmonics of 700 Hz at `1/n`, falling exponentially to −60 dB over 1.5 s.
+/// The highest frequency any test instrument carries: where hearing stops, and therefore
+/// where a harmonic series has to stop for the comparison to mean anything.
+pub const INSTRUMENT_BANDWIDTH_HZ: f64 = 20_000.0;
+
+/// Harmonics of 700 Hz at `1/n` up to [`INSTRUMENT_BANDWIDTH_HZ`], falling exponentially
+/// to −60 dB over 1.5 s.
 fn plucked_decay() -> Vec<i16> {
     let frames = Instrument::PluckedDecay.ground_truth_frames();
     let rate = GROUND_TRUTH_RATE_HZ as f64;
-    let harmonic_sum: f64 = (1..=8).map(|harmonic| 1.0 / harmonic as f64).sum();
+    let harmonics: Vec<usize> = (1..).take_while(|harmonic| 700.0 * *harmonic as f64 <= INSTRUMENT_BANDWIDTH_HZ).collect();
+    let harmonic_sum: f64 = harmonics.iter().map(|harmonic| 1.0 / *harmonic as f64).sum();
     let peak = 0.9 * 32_767.0 / harmonic_sum;
     (0..frames)
         .map(|index| {
@@ -257,9 +342,9 @@ fn plucked_decay() -> Vec<i16> {
             // −60 dB over the whole 1.5 s, which is a factor of 1 000 in amplitude.
             let envelope = 10.0f64.powf(-3.0 * seconds / 1.5);
             let mut value = 0.0f64;
-            for harmonic in 1..=8usize {
-                let frequency = 700.0 * harmonic as f64;
-                value += (1.0 / harmonic as f64) * (std::f64::consts::TAU * frequency * seconds).sin();
+            for harmonic in &harmonics {
+                let frequency = 700.0 * *harmonic as f64;
+                value += (1.0 / *harmonic as f64) * (std::f64::consts::TAU * frequency * seconds).sin();
             }
             round_to_i16(peak * envelope * value)
         })
@@ -276,12 +361,13 @@ fn plucked_decay() -> Vec<i16> {
 fn sustained_tone() -> Vec<i16> {
     let frames = Instrument::SustainedTone.ground_truth_frames();
     let rate = GROUND_TRUTH_RATE_HZ as f64;
-    let partials: Vec<(f64, f64)> = (1..=12usize)
-        .map(|partial| {
+    let partials: Vec<(f64, f64)> = (1..)
+        .map(|partial: usize| {
             let stretched = 440.0 * partial as f64 * (1.0 + 0.0008 * (partial * partial) as f64);
             // To the nearest half hertz: two seconds of it is then a whole number of turns.
             ((stretched * 2.0).round() / 2.0, 1.0 / partial as f64)
         })
+        .take_while(|(frequency, _)| *frequency <= INSTRUMENT_BANDWIDTH_HZ)
         .collect();
     let amplitude_sum: f64 = partials.iter().map(|(_, amplitude)| *amplitude).sum();
     let peak = 0.85 * 32_767.0 / amplitude_sum;
@@ -336,7 +422,7 @@ fn noise_drum() -> Vec<i16> {
 
 /// A linear-phase windowed-sinc low-pass, applied to a one-shot with zero extension.
 fn low_pass(frames: &[i16], cutoff_hz: f64, rate_hz: f64) -> Vec<i16> {
-    let taps = 127usize;
+    let taps = DARK_LOW_PASS_TAPS;
     let leading = (taps / 2) as i64;
     let normalised_cutoff = 2.0 * cutoff_hz / rate_hz;
     let mut kernel = vec![0.0f64; taps];
@@ -490,6 +576,47 @@ mod tests {
         assert!(metrics.log_spectral_distance_db < 1.0e-9, "{metrics:?}");
     }
 
+    /// Instruments (a) and (b) carry content all the way to the top of hearing, which is
+    /// what makes an extension of the missing band scorable at all.
+    #[test]
+    fn the_two_harmonic_instruments_reach_the_top_of_the_audible_band() {
+        use crate::analysis::{Fft, hann_window};
+
+        let fft = Fft::new(4_096);
+        let window = hann_window(4_096);
+        for instrument in [Instrument::PluckedDecay, Instrument::SustainedTone] {
+            let frames = ground_truth(instrument).frames;
+            let scaled: Vec<f64> = frames[..4_096].iter().map(|frame| *frame as f64 / 32_767.0).collect();
+            let magnitudes = fft.windowed_magnitudes(&scaled, &window, 4_096.0);
+            // Energy in the octave below 20 kHz, against the octave below the degraded
+            // sample's own Nyquist. A truth that stops at 6 kHz would have none.
+            let bin_of = |hz: f64| (hz / GROUND_TRUTH_RATE_HZ as f64 * 4_096.0) as usize;
+            let top: f64 = magnitudes[bin_of(10_000.0)..bin_of(20_000.0)].iter().map(|value| value * value).sum();
+            let source_band: f64 = magnitudes[bin_of(2_000.0)..bin_of(4_181.0)].iter().map(|value| value * value).sum();
+            assert!(top > source_band * 1.0e-6, "({}) has nothing above 10 kHz: {top:.3e} against {source_band:.3e}", instrument.letter());
+        }
+    }
+
+    /// The decay window is where the ground truth crosses the 8-bit floor, and it has to
+    /// contain real signal rather than the silence the last-40 % window mostly held.
+    #[test]
+    fn the_decay_window_lands_between_the_two_levels_it_names() {
+        let instrument = Instrument::PluckedDecay;
+        let reference = render(&ground_truth(instrument), None, instrument.render_frames()).expect("the ground truth renders");
+        let window = tail_window(&reference).expect("a decaying instrument has a decay window");
+        assert!(window.start > 0 && window.end <= reference.len());
+
+        let peak = reference.iter().map(|frame| (*frame as i32).unsigned_abs()).max().expect("a peak") as f64;
+        let rms = |slice: &[i16]| -> f64 {
+            let energy: f64 = slice.iter().map(|frame| *frame as f64 * *frame as f64).sum();
+            (energy / slice.len().max(1) as f64).sqrt()
+        };
+        let level_db = 20.0 * (rms(&reference[window.clone()]) / peak).log10();
+        assert!(level_db < TAIL_WINDOW_UPPER_DB && level_db > TAIL_WINDOW_LOWER_DB, "the decay window sits at {level_db:.1} dB below peak");
+        // And it is not the silent end of the sample: something is genuinely there.
+        assert!(rms(&reference[window]) > 1.0, "the decay window is silent, which is exactly the failure it exists to avoid");
+    }
+
     /// The degraded render is plainly worse than the ground truth, and worse above the
     /// source Nyquist than below it — the shape every later measurement is read against.
     #[test]
@@ -500,6 +627,10 @@ mod tests {
         let metrics = measure(&reference, &candidate);
         assert!(metrics.full_band_snr_db < 30.0, "{metrics:?}");
         assert!(metrics.in_band_snr_db > metrics.full_band_snr_db, "the loss should be worse out of band: {metrics:?}");
-        assert!(metrics.log_spectral_distance_db > 1.0, "{metrics:?}");
+        // Half a decibel of log-spectral distance is a large number under the audible
+        // floor — a perfect score is zero, and the whole spread between chains lives
+        // inside a couple of decibels once inaudible bins stop being charged for.
+        assert!(metrics.log_spectral_distance_db > 0.2, "{metrics:?}");
+        assert!(metrics.tail_in_band_snr_db.is_finite(), "a decaying instrument has a decay window: {metrics:?}");
     }
 }

@@ -826,10 +826,13 @@ pub fn synthetic_it_single_sample(frames: &[i16], rate_hz: u32, loop_span: Optio
     bytes[0x2C..0x2E].copy_from_slice(&0x0009u16.to_le_bytes());
     bytes[0x2E..0x30].copy_from_slice(&0u16.to_le_bytes());
     bytes[0x30] = 128;
-    // Mixing volume. Well below the 128 maximum so a full-scale sample cannot reach the
-    // limiter: a clipped render would put the harness's SNR floor somewhere other than
-    // where the arithmetic says it is.
-    bytes[0x31] = 48;
+    // Mixing volume at the format's maximum, which puts a 0.9-full-scale sample's render
+    // at about −3 dBFS. That matters because the harness's log-spectral distance is
+    // floored at −60 dB **relative to full scale**: every decibel the render sits below
+    // full scale is a decibel of the instrument's own decay that falls under the floor and
+    // stops being measured at all. The engine's limiter is `Clamp` and the render is
+    // checked for warnings, so the headroom is real rather than assumed.
+    bytes[0x31] = 128;
     bytes[0x32] = 6;
     bytes[0x33] = 125;
     bytes[0x34] = 128;

@@ -19,7 +19,9 @@ pub const SPECTRAL_HOP_FRAMES: usize = SPECTRAL_FRAME_FRAMES / 2;
 
 /// Magnitude floor for the log-spectral distance, relative to a full-scale sine's
 /// normalised bin magnitude of 0.25. −120 dB, so an empty bin cannot contribute an
-/// infinite distance.
+/// infinite distance. This is the floor the libopenmpt comparison uses, where the
+/// question is "do two engines agree" and a difference nobody can hear is still a
+/// difference in the arithmetic.
 pub const SPECTRAL_MAGNITUDE_FLOOR: f64 = 1.0e-6;
 
 /// Analysis frames quieter than this — in both signals — carry no spectrum worth
@@ -27,13 +29,56 @@ pub const SPECTRAL_MAGNITUDE_FLOOR: f64 = 1.0e-6;
 /// [`segmental_snr_db`](crate::segmental_snr_db) applies to a segment.
 pub const SPECTRAL_SILENCE_MEAN_SQUARE: f64 = 1.0e-8;
 
+/// How far below the reference's loudest bin a comparison stops caring what is in a bin:
+/// **−60 dB**, the audibility floor M10-K5c's enhancement harness scores against.
+///
+/// # Why it is measured from the signal rather than from the number `1.0`
+///
+/// "Sixty decibels below full scale" is the intent, and stating it as an absolute
+/// magnitude does not deliver it. These magnitudes are normalised so that a **full-scale
+/// sine** puts 0.25 in one bin; a real instrument spreads the same energy over thousands
+/// of bins, so its per-bin magnitudes sit 30 to 40 dB below its own level before anything
+/// has been lost. Measured on this harness's four instruments, an absolute floor of
+/// `0.25 × 10⁻³` left **0.3 % to 7.2 %** of the reference's bins above it — it did not
+/// stop inaudible differences dominating the score, it stopped the score being a
+/// measurement at all.
+///
+/// Anchoring the same −60 dB to the loudest bin of the reference gives the intended
+/// dynamic range, is what "full scale" means for a signal that is not at full scale, and
+/// is independent of the transform length. [`SPECTRAL_MAGNITUDE_FLOOR`] stays absolute
+/// because the libopenmpt comparison normalises both renders to a fixed peak first.
+pub const AUDIBLE_FLOOR_BELOW_PEAK_DB: f64 = -60.0;
+
+/// The magnitude floor [`AUDIBLE_FLOOR_BELOW_PEAK_DB`] asks for, against `reference`.
+///
+/// Returns zero for a silent reference, which floors nothing and lets the distance speak
+/// for itself.
+pub fn audible_magnitude_floor(fft: &Fft, reference: &[f64]) -> f64 {
+    let window = hann_window(fft.size());
+    let hop = fft.size() / 2;
+    let mut peak = 0.0f64;
+    let mut start = 0usize;
+    while start + fft.size() <= reference.len() {
+        for magnitude in fft.windowed_magnitudes(&reference[start..start + fft.size()], &window, fft.size() as f64) {
+            if magnitude > peak {
+                peak = magnitude;
+            }
+        }
+        start += hop;
+    }
+    peak * 10.0f64.powf(AUDIBLE_FLOOR_BELOW_PEAK_DB / 20.0)
+}
+
 /// Mean over analysis frames of the RMS difference of the two log-magnitude spectra, in
 /// dB. Returns `None` when both signals are silent everywhere or are shorter than one
 /// analysis frame.
 ///
 /// The hop is half the transform, so the caller picks the resolution by picking the
-/// [`Fft`] it hands in.
-pub fn log_spectral_distance_db(fft: &Fft, reference: &[f64], candidate: &[f64]) -> Option<f64> {
+/// [`Fft`] it hands in, and `magnitude_floor` is how quiet a bin has to be before the
+/// caller stops caring what is in it — [`SPECTRAL_MAGNITUDE_FLOOR`] for an
+/// engine-against-engine comparison, [`AUDIBLE_MAGNITUDE_FLOOR`] for a
+/// does-this-sound-closer one.
+pub fn log_spectral_distance_db(fft: &Fft, reference: &[f64], candidate: &[f64], magnitude_floor: f64) -> Option<f64> {
     let length = reference.len().min(candidate.len());
     if length < fft.size() {
         return None;
@@ -59,8 +104,8 @@ pub fn log_spectral_distance_db(fft: &Fft, reference: &[f64], candidate: &[f64])
         let candidate_magnitudes = fft.windowed_magnitudes(candidate_frame, &window, normalisation);
         let mut squared_difference = 0.0f64;
         for bin in 0..bin_count {
-            let reference_db = 20.0 * reference_magnitudes[bin].max(SPECTRAL_MAGNITUDE_FLOOR).log10();
-            let candidate_db = 20.0 * candidate_magnitudes[bin].max(SPECTRAL_MAGNITUDE_FLOOR).log10();
+            let reference_db = 20.0 * reference_magnitudes[bin].max(magnitude_floor).log10();
+            let candidate_db = 20.0 * candidate_magnitudes[bin].max(magnitude_floor).log10();
             let difference = reference_db - candidate_db;
             squared_difference += difference * difference;
         }
@@ -277,7 +322,7 @@ mod tests {
     fn a_signal_against_itself_scores_perfectly() {
         let fft = Fft::new(1_024);
         let samples: Vec<f64> = (0..8_192).map(|index| 0.4 * (index as f64 * 0.013).sin() + 0.2 * (index as f64 * 0.0031).cos()).collect();
-        assert!(log_spectral_distance_db(&fft, &samples, &samples).expect("a score") < 1.0e-9);
+        assert!(log_spectral_distance_db(&fft, &samples, &samples, SPECTRAL_MAGNITUDE_FLOOR).expect("a score") < 1.0e-9);
         assert_eq!(band_limited_snr_db(&fft, &samples, &samples, 44_100.0, 4_181.0), Some(120.0));
     }
 
@@ -300,13 +345,31 @@ mod tests {
         assert!(whole_band < 20.0, "over the whole band the added tone is plainly visible: {whole_band} dB");
     }
 
+    /// The audible floor stops a difference nobody can hear from dominating the score.
+    #[test]
+    fn a_difference_below_the_audible_floor_costs_nothing_under_it_and_plenty_under_the_other() {
+        let fft = Fft::new(1_024);
+        let rate = 44_100.0;
+        let reference: Vec<f64> = (0..8_192).map(|index| 0.5 * (2.0 * std::f64::consts::PI * 500.0 * index as f64 / rate).sin()).collect();
+        // The same signal plus a 10 kHz tone 80 dB below it: inaudible, 20 dB below the
+        // audible floor, and 40 dB above the arithmetic one.
+        let candidate: Vec<f64> = reference.iter().enumerate()
+            .map(|(index, &sample)| sample + 5.0e-5 * (2.0 * std::f64::consts::PI * 10_000.0 * index as f64 / rate).sin())
+            .collect();
+
+        let audible = log_spectral_distance_db(&fft, &reference, &candidate, audible_magnitude_floor(&fft, &reference)).expect("a score");
+        let arithmetic = log_spectral_distance_db(&fft, &reference, &candidate, SPECTRAL_MAGNITUDE_FLOOR).expect("a score");
+        assert!(audible < 0.5, "an inaudible addition scored {audible} dB under the audible floor");
+        assert!(arithmetic > audible * 4.0, "the arithmetic floor should charge far more for it: {arithmetic} against {audible}");
+    }
+
     /// Two unrelated signals score badly, and the scores are finite.
     #[test]
     fn unrelated_signals_score_badly() {
         let fft = Fft::new(1_024);
         let reference: Vec<f64> = (0..8_192).map(|index| 0.3 * (index as f64 * 0.011).sin()).collect();
         let candidate: Vec<f64> = (0..8_192).map(|index| 0.3 * (index as f64 * 0.37).sin()).collect();
-        assert!(log_spectral_distance_db(&fft, &reference, &candidate).expect("a score") > 10.0);
+        assert!(log_spectral_distance_db(&fft, &reference, &candidate, SPECTRAL_MAGNITUDE_FLOOR).expect("a score") > 10.0);
         assert!(band_limited_snr_db(&fft, &reference, &candidate, 44_100.0, 22_050.0).expect("a score") < 6.0);
     }
 }

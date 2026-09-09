@@ -7,7 +7,7 @@
 //! than being copied. What stays here is the part that is specific to comparing two
 //! *renders*: the RMS/peak normalisation and the [`Scores`] a fixture reports.
 
-use starplayer_offline::analysis::{Fft, log_spectral_distance_db};
+use starplayer_offline::analysis::{Fft, SPECTRAL_MAGNITUDE_FLOOR, log_spectral_distance_db};
 use starplayer_offline::segmental_snr_db;
 
 /// Segment length for the segmental SNR, in frames of one channel.
@@ -78,7 +78,7 @@ pub fn compare(candidate: &[f32], reference: &[f32], channel_count: usize) -> Op
         let quantised_reference: Vec<i16> = reference_channel.iter().map(|&sample| quantise(sample)).collect();
         let candidate_f32: Vec<f32> = candidate_channel.iter().map(|&sample| sample as f32).collect();
         let Some(snr_db) = segmental_snr_db(&quantised_reference, &candidate_f32, SEGMENT_FRAMES) else { continue };
-        let Some(lsd_db) = log_spectral_distance_db(&fft, &reference_channel, &candidate_channel) else { continue };
+        let Some(lsd_db) = log_spectral_distance_db(&fft, &reference_channel, &candidate_channel, SPECTRAL_MAGNITUDE_FLOOR) else { continue };
 
         total_snr_db += snr_db;
         total_lsd_db += lsd_db;
