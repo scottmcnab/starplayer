@@ -2,8 +2,8 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M10 ([master plan](M10-master-plan.md), decision 6); follows [K5a](complete/M10-task-K5a-enhancer-core.md), [K5b](complete/M10-task-K5b-enhance-offline-and-cli.md), [W4](../apps/complete/W4-task-enhancement-checkboxes.md) |
-| Status | Planned 2026-09-09 |
+| Milestone | M10 ([master plan](../M10-master-plan.md), decision 6); follows [K5a](M10-task-K5a-enhancer-core.md), [K5b](M10-task-K5b-enhance-offline-and-cli.md), [W4](../../apps/complete/W4-task-enhancement-checkboxes.md) |
+| Status | Landed 2026-09-10; owner listening outstanding (`/tmp/enhanced-full.wav`, the web checkboxes). Four of seven acceptance criteria met; the three misses are mechanism ceilings, recorded in the Research resolution and pinned as regression floors |
 | Depends on | K5a, K5b, W4 (all landed) |
 | Blocks | — |
 | Parallel with | K1, K2 |
