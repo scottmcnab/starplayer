@@ -1,0 +1,28 @@
+[package]
+name = "starplayer-enhance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Load-time sample enhancers for StarPlayer: polyphase sinc upsampling and loop-seam smoothing."
+
+[dependencies]
+starplayer-model = { workspace = true }
+# `pow2_q24`, for the XM effective-rate the sample-rate ceiling is measured against, and
+# `equal_power_q15`, for the loop-seam crossfade. Both are table-driven and `no_std`,
+# which is what keeps this crate bare-metal-clean.
+starplayer-dsp = { workspace = true }
+
+[dev-dependencies]
+# The real-world S3M the determinism hash and the identity rebuild are pinned against, and
+# the offline harness that traces a module and reports its timeline. Dev-only: nothing in
+# the shipped crate knows about a format or about `std`.
+starplayer-s3m = { workspace = true }
+starplayer-offline = { workspace = true, features = ["trace"] }
+sha2 = { workspace = true }
+
+[features]
+default = []
+std = ["starplayer-model/std", "starplayer-dsp/std"]
+alloc = ["starplayer-model/alloc", "starplayer-dsp/alloc"]

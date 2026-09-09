@@ -73,6 +73,7 @@ const NO_STD_CRATES: &[&str] = &[
     "starplayer-mixer",
     "starplayer-model",
     "starplayer-engine",
+    "starplayer-enhance",
     "starplayer-mod",
     "starplayer-s3m",
     "starplayer-mtm",
@@ -92,7 +93,11 @@ const NO_STD_CRATES: &[&str] = &[
 /// `starplayer-telemetry` edge (architecture §11, M1-B6). `starplayer-midi/smf` is the
 /// second (task E5): it turns on the optional `starplayer-engine` edge `smf` needs for
 /// `EventFeed` and `midi_channel` (see `starplayer-midi/src/lib.rs`'s module doc).
-const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry"), ("starplayer-midi", "smf")];
+/// `starplayer/enhance` is the third (M10-K5a): it turns on the optional
+/// `starplayer-enhance` edge, which is `no_std + alloc` and reads a committed `f64`
+/// coefficient table rather than calling `sin` at run time — the check is what keeps it
+/// that way.
+const FEATURE_ENABLED_NO_STD_CHECKS: &[(&str, &str)] = &[("starplayer-engine", "telemetry"), ("starplayer-midi", "smf"), ("starplayer", "enhance")];
 
 /// The `no_std` crates that have a `simd` feature, in dependency order (M7-H6).
 ///
@@ -1668,8 +1673,16 @@ fn job_no_std_purity() -> bool {
     all_succeeded
 }
 
+/// Check 2: the resolved feature set of `crate_name`, built for the bare-metal target,
+/// names `std` nowhere.
+///
+/// `no-dev` because a **dev**-dependency is never compiled into the crate a host links:
+/// `starplayer-enhance`'s tests trace a real module through `starplayer-offline`, which is
+/// `std` by construction, and that says nothing about whether the enhance crate itself is
+/// bare-metal clean. `cargo check --target <bare metal>` above builds no dev-dependency
+/// either, so the two halves of the check now agree on what they are looking at.
 fn assert_resolved_features_exclude_std(crate_name: &str) -> bool {
-    let arguments = ["tree", "--edges", "features", "--target", BARE_METAL_TARGET, "-p", crate_name];
+    let arguments = ["tree", "--edges", "features,no-dev", "--target", BARE_METAL_TARGET, "-p", crate_name];
     println!("     cargo {}", arguments.join(" "));
 
     let output = match Command::new(cargo_binary()).args(arguments).output() {

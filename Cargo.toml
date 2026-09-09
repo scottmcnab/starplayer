@@ -101,6 +101,7 @@ starplayer-dsp = { path = "crates/starplayer-dsp" }
 starplayer-mixer = { path = "crates/starplayer-mixer" }
 starplayer-model = { path = "crates/starplayer-model" }
 starplayer-engine = { path = "crates/starplayer-engine" }
+starplayer-enhance = { path = "crates/starplayer-enhance" }
 starplayer-mod = { path = "crates/starplayer-mod" }
 starplayer-s3m = { path = "crates/starplayer-s3m" }
 starplayer-mtm = { path = "crates/starplayer-mtm" }

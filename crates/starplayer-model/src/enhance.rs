@@ -195,7 +195,7 @@ fn rate_scale_log2_between(source_rate_hz: u32, enhanced_rate_hz: u32) -> Result
     if source_rate_hz == 0 || enhanced_rate_hz < source_rate_hz {
         return Err(NOT_A_POWER_OF_TWO);
     }
-    if enhanced_rate_hz % source_rate_hz != 0 {
+    if !enhanced_rate_hz.is_multiple_of(source_rate_hz) {
         return Err(NOT_A_POWER_OF_TWO);
     }
     let ratio = enhanced_rate_hz / source_rate_hz;
