@@ -370,8 +370,9 @@ bin `2b` must advance its phase by `2π·2b·hop/N` between frames while bin `b`
 advances by half that. Fed the wrong advance, successive frames fight each other and the
 patched band partly cancels. Squaring a complex number doubles its phase and squares its
 magnitude, so squaring and dividing by the magnitude once, per octave, gives the right
-advance at the right level. On instrument (a) this moved the extender from +0.009 dB
-(harmful) to −0.003 dB before the other change below.
+advance at the right level. Measured while it was the only change in flight, it roughly
+tripled the extension's coherent level on instrument (a) and turned the extender from
+harmful to neutral there; the additive patch below is what took it the rest of the way.
 
 **The patch is additive.** The extender used to resynthesise the whole signal, which cost
 one fresh rounding to `i16` of every frame of a sample whose tail is a step or two tall:
@@ -413,8 +414,10 @@ numbers are here so the owner can weigh it at the listening check.
 The cost on (d) is worth its size: +0.04 dB on the instrument with the *lowest* absolute
 distance of the four (0.72 against 2.17, 6.46 and 21.30), against −1.89 dB on the drum.
 
-**The tilt sweep**, as the change in log-spectral distance against `sinc4x` alone (a `+0.00`
-means the gain fell below `MINIMUM_EXTENSION_GAIN` and the extender declined the sample):
+**The tilt sweep**, as the change in log-spectral distance against `sinc4x` alone. Every
+instrument is processed at every tilt shown — none of them trips
+`MINIMUM_EXTENSION_GAIN`, which is why that constant is a safety rail rather than the thing
+deciding the dark case:
 
 | `tilt_db` | 0 | −3 | −6 | −9 |
 |---|---:|---:|---:|---:|
