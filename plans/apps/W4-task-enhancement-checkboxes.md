@@ -6,7 +6,7 @@
 | Status | Planned 2026-09-09 |
 | Depends on | [K5a](../engine/complete/M10-task-K5a-enhancer-core.md) landed (`starplayer::enhance`, `CATALOGUE`, `Module::enhanced`) |
 | Blocks | — |
-| Parallel with | [K5b](../engine/M10-task-K5b-enhance-offline-and-cli.md) |
+| Parallel with | [K5b](../engine/complete/M10-task-K5b-enhance-offline-and-cli.md) |
 | Recommended model | Claude Sonnet (one wasm export, one JSON descriptor, and generalising an existing checkbox's reload dance) |
 | Verified by | agent (headless harness + `cargo test -p starplayer-host-wasm -p starplayer-web`), then owner in a browser on an 8-bit MOD |
 

@@ -2,17 +2,17 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M10 ([master plan](M10-master-plan.md), decision 6); the host half of [K5](M10-task-K5-sample-enhancement.md) |
-| Status | Implemented 2026-09-09; owner listening outstanding |
-| Depends on | [K5a](complete/M10-task-K5a-enhancer-core.md) landed (`starplayer::enhance`, `Module::enhanced`, `CATALOGUE`) |
+| Milestone | M10 ([master plan](../M10-master-plan.md), decision 6); the host half of [K5](../M10-task-K5-sample-enhancement.md) |
+| Status | Landed 2026-09-09; owner listening outstanding (`/tmp/enhanced.wav` vs `/tmp/plain.wav`) |
+| Depends on | [K5a](M10-task-K5a-enhancer-core.md) landed (`starplayer::enhance`, `Module::enhanced`, `CATALOGUE`) |
 | Blocks | — |
-| Parallel with | [W4](../apps/W4-task-enhancement-checkboxes.md) |
+| Parallel with | [W4](../../apps/W4-task-enhancement-checkboxes.md) |
 | Recommended model | Claude Sonnet (plumbing an existing API through two entry points and a clap flag, with the `--insert` parser as the model) |
 | Verified by | agent (goldens untouched, naming test, CLI tests), then **owner listening**: `/tmp/enhanced.wav` against the plain render |
 
 ## Context for a fresh agent
 
-Read `CLAUDE.md`, then [K5a](complete/M10-task-K5a-enhancer-core.md) for the API this task consumes:
+Read `CLAUDE.md`, then [K5a](M10-task-K5a-enhancer-core.md) for the API this task consumes:
 `starplayer::enhance::{SampleEnhancer, SincUpsampler, UpsampleFactor, LoopSmoother, Chain, CATALOGUE}`
 behind the facade feature `enhance`, and `Module::enhanced(&dyn SampleEnhancer)`. An
 enhanced render is a **different configuration** from the goldens and gets a different
