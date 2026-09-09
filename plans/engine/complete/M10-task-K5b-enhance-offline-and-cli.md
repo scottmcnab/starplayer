@@ -6,7 +6,7 @@
 | Status | Landed 2026-09-09; owner listening outstanding (`/tmp/enhanced.wav` vs `/tmp/plain.wav`) |
 | Depends on | [K5a](M10-task-K5a-enhancer-core.md) landed (`starplayer::enhance`, `Module::enhanced`, `CATALOGUE`) |
 | Blocks | — |
-| Parallel with | [W4](../../apps/W4-task-enhancement-checkboxes.md) |
+| Parallel with | [W4](../../apps/complete/W4-task-enhancement-checkboxes.md) |
 | Recommended model | Claude Sonnet (plumbing an existing API through two entry points and a clap flag, with the `--insert` parser as the model) |
 | Verified by | agent (goldens untouched, naming test, CLI tests), then **owner listening**: `/tmp/enhanced.wav` against the plain render |
 
