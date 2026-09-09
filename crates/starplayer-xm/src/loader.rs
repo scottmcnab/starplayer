@@ -552,6 +552,7 @@ fn add_sample<R: ModuleReader + ?Sized>(source: &Source<'_, R>, pending: &Pendin
         // sample the instrument owns, so it is copied down onto each of them here.
         auto_vibrato: instrument_header.auto_vibrato,
         sustain_loop: None,
+        rate_scale_log2: 0,
     };
 
     Ok(builder.add_sample(&pcm, specification)?.0)

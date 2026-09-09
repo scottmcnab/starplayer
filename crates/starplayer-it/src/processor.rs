@@ -706,7 +706,16 @@ fn default_channel_volume(module: &Module, channel: u8) -> u8 {
 }
 
 /// The mixer region for one sample, choosing the sustain loop while the key is down.
+///
+/// The region carries the sample's `rate_scale_log2` so the engine can scale the step when
+/// a voice is triggered or repitched; both loops' points and the length are already in the
+/// region's own stored frames and need no conversion.
 fn sample_region(sample: &SampleIndex, sustain: bool) -> SampleRegion {
+    let region = sample_span(sample, sustain);
+    region.with_rate_scale(sample.rate_scale_log2())
+}
+
+fn sample_span(sample: &SampleIndex, sustain: bool) -> SampleRegion {
     if sustain && let Some(loop_span) = sample.sustain_loop() {
         let span = match loop_span.mode {
             LoopMode::PingPong => LoopSpan::ping_pong(loop_span.start, loop_span.end),
@@ -2130,8 +2139,12 @@ impl ItProcessor {
         // `kITOffsetWithInstrNumber`: an offset next to a lone instrument number applies to
         // the note the channel remembers.
         let note = if cell.note <= MAX_NOTE { cell.note } else if cell.instrument != INSTRUMENT_NONE { self.channels[channel_index].last_note } else { return };
-        let offset = ((self.channels[channel_index].high_offset as u32) << 16) | ((value as u32) << 8);
         let sample = self.foreground_sample(channel_index);
+        // `Oxx` (and `SAx`'s high byte) address **source** frames, so the sounding
+        // sample's scale turns the pair into the stored-frame offset the length
+        // comparison below and the voice itself want.
+        let offset_scale = self.sample_index(sample).map(|index| index.rate_scale_log2()).unwrap_or(0);
+        let offset = (((self.channels[channel_index].high_offset as u32) << 16) | ((value as u32) << 8)) << offset_scale;
         let end = self.sample_index(sample).map(|index| index.length_frames()).unwrap_or(0);
         let _ = note;
         if offset >= end && end != 0 {

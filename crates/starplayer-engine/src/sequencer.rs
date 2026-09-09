@@ -447,6 +447,10 @@ impl<'engine> TickContext<'engine> {
     }
 
     /// Apply one absolute parameter write and feed the trace hook.
+    ///
+    /// A [`VoiceParam::Step`] is scaled by the voice's region first — see
+    /// [`scaled_step`](crate::channel::scaled_step). This and
+    /// [`TickContext::trigger_channel`] are the only two places a step reaches a voice.
     #[inline]
     pub fn write_voice_param(&mut self, voice: VoiceId, param: VoiceParam) {
         #[cfg(feature = "trace")]
@@ -454,6 +458,10 @@ impl<'engine> TickContext<'engine> {
             trace.record_param_write(self.voices, self.channels, voice, param);
         }
         if let Some(state) = self.voices.get_mut(voice) {
+            let param = match param {
+                VoiceParam::Step(step) => VoiceParam::Step(crate::channel::scaled_step(step, state.region())),
+                other => other,
+            };
             param.apply(&mut state.params);
         }
     }

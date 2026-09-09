@@ -546,7 +546,11 @@ impl ModProcessor {
 
     fn sample_offset(&mut self, channel_index: usize, note_present: bool, parameter: u8) {
         if parameter != 0 { self.channels[channel_index].offset_memory = parameter; }
-        let offset = (self.channels[channel_index].offset_memory as u32) << 8;
+        // `9xx` addresses **source** frames. Scaling here, where the file's own parameter
+        // is read, is what lets every later comparison against `length_frames()` — the
+        // retained-pointer advance below, the one-word fallback in `flush_channel` — stay
+        // in the region's own stored frames with no further conversion.
+        let offset = ((self.channels[channel_index].offset_memory as u32) << 8) << self.offset_scale(channel_index);
         match self.semantics {
             EffectSemantics::ProTracker => {
                 // PT 1/2 starts this note at the requested offset, then advances the
@@ -567,6 +571,12 @@ impl ModProcessor {
             }
             EffectSemantics::MultiTracker { .. } => {}
         }
+    }
+
+    /// How many times the sounding sample's frames have been doubled by a load-time
+    /// enhancer — the shift a `9xx` parameter needs to become a stored-frame offset.
+    fn offset_scale(&self, channel_index: usize) -> u8 {
+        self.sample_index(channel_index).map(|sample| sample.rate_scale_log2()).unwrap_or(0)
     }
 
     fn advance_sample_pointer(&mut self, channel_index: usize, amount: u32) -> bool {
@@ -795,9 +805,12 @@ impl ModProcessor {
             let state = &self.channels[channel_index];
             let region = if state.offset_past_end {
                 // Keep PT's retained n_start while restricting playback after it to one
-                // word. The region ends two frames after the logical retained offset.
-                let end = state.sample_offset.saturating_add(2).min(sample.length_frames());
-                SampleRegion::one_shot(sample.pcm_offset(), end)
+                // word. The region ends two frames after the logical retained offset —
+                // two *source* frames, so an enhanced sample's one word is two frames of
+                // the rate the file was written at, not two of its rebuilt ones.
+                let word_frames = 2u32 << sample.rate_scale_log2();
+                let end = state.sample_offset.saturating_add(word_frames).min(sample.length_frames());
+                SampleRegion::one_shot(sample.pcm_offset(), end).with_rate_scale(sample.rate_scale_log2())
             } else {
                 sample_region(sample)
             };
@@ -1061,12 +1074,18 @@ fn step_from_period(period: u32, sample_rate_hz: u32, paula_floor: bool, clock: 
     Step::from_ratio(clock.hz(), hardware_period as u64 * sample_rate_hz.max(1) as u64)
 }
 
+/// The mixer region for one sample.
+///
+/// The region carries the sample's `rate_scale_log2` so the engine can scale the step
+/// when a voice is triggered or repitched; the loop points and the length are already in
+/// the region's own stored frames and need no conversion.
 fn sample_region(sample: &starplayer_model::SampleIndex) -> SampleRegion {
-    match sample.loop_mode() {
+    let region = match sample.loop_mode() {
         LoopMode::Forward => LoopSpan::new(sample.loop_start(), sample.loop_end()).map(|span| SampleRegion::looping(sample.pcm_offset(), span)).unwrap_or_else(|| SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames())),
         LoopMode::PingPong => LoopSpan::ping_pong(sample.loop_start(), sample.loop_end()).map(|span| SampleRegion::looping(sample.pcm_offset(), span)).unwrap_or_else(|| SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames())),
         LoopMode::None => SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames()),
-    }
+    };
+    region.with_rate_scale(sample.rate_scale_log2())
 }
 
 fn finetune_from_rate(rate: u32) -> u8 {

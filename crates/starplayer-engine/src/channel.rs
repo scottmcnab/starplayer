@@ -8,7 +8,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 
-use starplayer_core::{ChannelId, VoiceId, VoiceParams};
+use starplayer_core::{ChannelId, Step, VoiceId, VoiceParams};
 use starplayer_mixer::{SampleRegion, VoicePool, VoiceTag};
 
 /// One control lane.
@@ -121,6 +121,11 @@ impl ChannelTable {
     ///
     /// `tag.channel` is overwritten with `channel`, so a caller cannot accidentally
     /// mis-tag a voice and break IT's Duplicate Check later.
+    ///
+    /// `params.step` is scaled by the region's
+    /// [`rate_scale_log2`](SampleRegion::rate_scale_log2) — see [`scaled_step`]. This is
+    /// one of the engine's two step entry points; the other is
+    /// `write_voice_param(VoiceParam::Step)`.
     pub fn trigger(
         &mut self,
         channel: ChannelId,
@@ -136,6 +141,7 @@ impl ChannelTable {
         }
 
         let tag = VoiceTag { channel: channel.0 as u8, ..tag };
+        let params = VoiceParams { step: scaled_step(params.step, region), ..params };
         let voice = voices.allocate(tag, region, params, offset_frames)?;
         lane.foreground = Some(voice);
         Some(voice)
@@ -201,6 +207,35 @@ impl ChannelTable {
     }
 }
 
+/// A format processor's step, in the frames its region actually stores.
+///
+/// A processor computes a step from a period, a C2SPD or a linear-frequency table, all of
+/// which describe the sample **as the file spells it**. A sample a load-time enhancer has
+/// rebuilt stores `2^rate_scale_log2` times as many frames for the same second of sound,
+/// so the voice has to walk through them that much faster to sound the same note. Every
+/// other quantity a voice holds — the loop span, the length, the offset it starts at — is
+/// already in the region's own frames, so the step is the only thing that has to be
+/// converted, and the two places it enters a voice are the only places that convert it.
+///
+/// Shifting rather than multiplying is what makes the retrofit provably free: a scale of
+/// zero is `step << 0`, which is `step`, so every committed golden is byte-identical.
+///
+/// Saturating, because `render()` may not panic and an absurd module must not be able to
+/// produce an overflowing shift.
+///
+/// Public because FastTracker 2 recomputes its period every tick and writes the result
+/// straight into `Voice::params` rather than through
+/// [`TickContext::write_voice_param`](crate::sequencer::TickContext::write_voice_param),
+/// so `starplayer-xm` is a third site that has to convert.
+pub fn scaled_step(step: Step, region: SampleRegion) -> Step {
+    let scale = region.rate_scale_log2() as u32;
+    if scale == 0 {
+        return step;
+    }
+    let bits = step.to_bits();
+    if bits.leading_zeros() < scale { Step::MAX } else { Step::from_bits(bits << scale) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +250,36 @@ mod tests {
         let pcm: Vec<i16> = (0..32).map(|index| 100 + index as i16).collect();
         let region = append_guarded_sample(&mut blob, &pcm, LoopSpan::new(0, 32));
         (blob, region)
+    }
+
+    #[test]
+    fn a_rate_scale_of_zero_leaves_a_step_bit_identical() {
+        let (_blob, region) = looping_blob();
+        for bits in [0u64, 1, 1 << 32, u64::MAX, 0x1234_5678_9abc_def0] {
+            assert_eq!(scaled_step(Step::from_bits(bits), region), Step::from_bits(bits), "an unenhanced sample must not move a single bit");
+        }
+    }
+
+    #[test]
+    fn a_rate_scale_shifts_the_step_exactly_and_saturates_rather_than_wrapping() {
+        let (_blob, region) = looping_blob();
+        let quadrupled = region.with_rate_scale(2);
+        assert_eq!(scaled_step(Step::ONE, quadrupled), Step::from_bits(Step::ONE.to_bits() << 2));
+        assert_eq!(scaled_step(Step::from_ratio(7, 3), quadrupled), Step::from_bits(Step::from_ratio(7, 3).to_bits() << 2));
+        assert_eq!(scaled_step(Step::MAX, quadrupled), Step::MAX, "an absurd step saturates rather than wrapping into silence");
+        assert_eq!(scaled_step(Step::ZERO, quadrupled), Step::ZERO);
+    }
+
+    #[test]
+    fn a_trigger_scales_the_initial_step_by_its_regions_rate_scale() {
+        let (_blob, region) = looping_blob();
+        let mut channels = ChannelTable::new(1);
+        let mut voices = VoicePool::new(2);
+
+        let voice = channels
+            .trigger(ChannelId(0), &mut voices, VoiceTag::default(), region.with_rate_scale(2), sounding(), 0)
+            .expect("a fresh pool has room");
+        assert_eq!(voices.get(voice).map(|voice| voice.params.step), Some(Step::from_bits(Step::ONE.to_bits() << 2)));
     }
 
     #[test]

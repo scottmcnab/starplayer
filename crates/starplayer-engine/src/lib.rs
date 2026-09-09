@@ -99,7 +99,7 @@ pub mod timeline;
 #[cfg(feature = "trace")]
 pub mod trace;
 
-pub use channel::{Channel, ChannelTable, MAX_VOICE_CAPACITY};
+pub use channel::{Channel, ChannelTable, MAX_VOICE_CAPACITY, scaled_step};
 pub use flow::PatternFlowState;
 pub use command::{
     DEFAULT_COMMAND_CAPACITY, DEFAULT_GARBAGE_CAPACITY, EngineHandle, MAX_COMMANDS_PER_QUANTUM, PcmSource,

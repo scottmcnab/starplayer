@@ -649,6 +649,10 @@ impl XmProcessor {
         self.channels[channel_index].sample = sample_id;
 
         let sample = sample_id.and_then(|id| self.module.sample(id));
+        // `9xx` addresses **source** frames; this is the shift that turns it into the
+        // stored-frame offset `trigger_voice`'s length comparison and the voice itself
+        // want. Read here, where the sample is already resolved.
+        let offset_scale = sample.map_or(0, |sample| sample.rate_scale_log2());
         self.channels[channel_index].relative_note = sample.map_or(0, |sample| sample.relative_note());
 
         // FT2's `note += relativeNote` is `uint8_t` arithmetic, and the range test that
@@ -684,7 +688,7 @@ impl XmProcessor {
             if parameter > 0 {
                 self.channels[channel_index].offset_memory = self.channels[channel_index].effect_data;
             }
-            self.channels[channel_index].sample_start_frame = (self.channels[channel_index].offset_memory as u32) << 8;
+            self.channels[channel_index].sample_start_frame = ((self.channels[channel_index].offset_memory as u32) << 8) << offset_scale;
         } else {
             self.channels[channel_index].sample_start_frame = 0;
         }
@@ -1773,7 +1777,10 @@ impl XmProcessor {
         let Some(voice) = context.channels.foreground(channel_id) else { return };
         let Some(voice) = context.voices.get_mut(voice) else { return };
         let state = &self.channels[channel_index];
-        let step = self.step_for_period(state.final_period);
+        // FT2's per-tick period is written straight into `params`, so this is a third
+        // place a step reaches a voice and it has to convert to the region's own frames
+        // exactly as the engine's two entry points do.
+        let step = starplayer_engine::scaled_step(self.step_for_period(state.final_period), voice.region());
         if voice.params.step != step {
             voice.params.set_step(step);
         }
@@ -1977,8 +1984,13 @@ fn pan_from_byte(pan: u8) -> I1F15 { starplayer_core::fixed::bipolar_from_ratio(
 
 fn volume_from_bits(volume_bits: u32) -> U0F16 { U0F16::from_bits(volume_bits.min(65_535) as u16) }
 
+/// The mixer region for one sample.
+///
+/// The region carries the sample's `rate_scale_log2` so the engine can scale the step
+/// when a voice is triggered or repitched; the loop points and the length are already in
+/// the region's own stored frames and need no conversion.
 fn sample_region(sample: &starplayer_model::SampleIndex) -> SampleRegion {
-    match sample.loop_mode() {
+    let region = match sample.loop_mode() {
         LoopMode::Forward => LoopSpan::new(sample.loop_start(), sample.loop_end())
             .map(|span| SampleRegion::looping(sample.pcm_offset(), span))
             .unwrap_or_else(|| SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames())),
@@ -1986,7 +1998,8 @@ fn sample_region(sample: &starplayer_model::SampleIndex) -> SampleRegion {
             .map(|span| SampleRegion::looping(sample.pcm_offset(), span))
             .unwrap_or_else(|| SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames())),
         LoopMode::None => SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames()),
-    }
+    };
+    region.with_rate_scale(sample.rate_scale_log2())
 }
 
 impl TrackerProcessor for XmProcessor {
