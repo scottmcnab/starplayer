@@ -758,6 +758,17 @@ pub fn trace_xm(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError
     trace_loaded(Arc::new(starplayer::xm::load(bytes)?), options)
 }
 
+/// Capture the per-tick trace of a module that is **already loaded**.
+///
+/// The entry point for anything that transforms a module before playing it — M10-K5a's
+/// sample enhancers, whose proof is that an enhanced module's traced positions are the
+/// plain module's shifted by the enhancement's own factor, and nothing else in the trace
+/// moves at all.
+#[cfg(feature = "trace")]
+pub fn trace_loaded_module(module: Arc<Module>, options: TraceOptions) -> Result<Trace, TraceError> {
+    trace_loaded(module, options)
+}
+
 #[cfg(feature = "trace")]
 fn trace_loaded(module: Arc<Module>, options: TraceOptions) -> Result<Trace, TraceError> {
     let engine_settings = EngineSettings {

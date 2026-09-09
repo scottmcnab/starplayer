@@ -129,11 +129,19 @@ impl<'engine> EngineContext<'engine> {
 
     /// Apply one absolute parameter write and feed the trace hook in diagnostic builds.
     /// A stale voice remains a no-op.
+    ///
+    /// A [`VoiceParam::Step`] is scaled by the voice's region first — see
+    /// [`scaled_step`](crate::channel::scaled_step). This and `ChannelTable::trigger` are
+    /// the only two places a step reaches a voice.
     #[inline]
     pub fn write_voice_param(&mut self, voice: VoiceId, param: VoiceParam) {
         #[cfg(feature = "trace")]
         let channel = self.voices.get(voice).map(|state| state.tag.channel);
         let Some(state) = self.voices.get_mut(voice) else { return };
+        let param = match param {
+            VoiceParam::Step(step) => VoiceParam::Step(crate::channel::scaled_step(step, state.region())),
+            other => other,
+        };
         param.apply(&mut state.params);
         #[cfg(feature = "trace")]
         if let (Some(trace), Some(channel)) = (self.trace.as_deref_mut(), channel)

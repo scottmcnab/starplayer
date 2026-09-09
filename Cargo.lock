@@ -1251,6 +1251,7 @@ dependencies = [
  "starplayer-core",
  "starplayer-dsp",
  "starplayer-engine",
+ "starplayer-enhance",
  "starplayer-it",
  "starplayer-midi",
  "starplayer-mixer",
@@ -1313,6 +1314,17 @@ dependencies = [
  "starplayer-model",
  "starplayer-rt",
  "starplayer-telemetry",
+]
+
+[[package]]
+name = "starplayer-enhance"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "starplayer",
+ "starplayer-dsp",
+ "starplayer-model",
+ "starplayer-offline",
 ]
 
 [[package]]
@@ -1417,6 +1429,7 @@ version = "0.1.0"
 dependencies = [
  "sha2",
  "starplayer",
+ "starplayer-enhance",
 ]
 
 [[package]]

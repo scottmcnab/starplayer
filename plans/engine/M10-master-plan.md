@@ -88,9 +88,15 @@ Decisions taken while planning:
    `format_data`, no orders) plus a manifest, and the rack's `for_bank` beside
    `for_module`. K4 does not wait for M11.
 6. **Enhancement is a load-time transform with two real implementations** (goal 8): a
-   windowed-sinc upsampler and a loop-seam smoother, both deterministic, both in a
-   std-capable crate the builder calls before the PCM is committed. Goldens never see an
-   enhancer; an enhanced render is a different configuration and gets a different name.
+   windowed-sinc upsampler and a loop-seam smoother, both deterministic. Goldens never see
+   an enhancer; an enhanced render is a different configuration and gets a different name.
+   *Amended by K5a, 2026-09-09*: the hook is `Module::enhanced(&dyn SampleEnhancer)` — a
+   rebuild through the existing `ModuleBuilder`, not a builder field, because all five
+   loaders make their own builder and a `&dyn` field would put a lifetime on every
+   `&mut ModuleBuilder` helper. And `starplayer-enhance` is **`no_std + alloc`**, not
+   std-capable: the sinc coefficients are a committed `f64` table with a regeneration
+   gate, so the runtime needs only arithmetic and the crate is checked on the bare-metal
+   target like every other core crate.
 
 | ID | Task | Depends on | Parallel with | Model |
 |---|---|---|---|---|
@@ -98,7 +104,7 @@ Decisions taken while planning:
 | K2 | [Generator voices in the mixer, and the FM instrument](M10-task-K2-generator-voices-and-fm.md) | K1 | K5 | Opus |
 | K3 | [SID voice emulation as an instrument](M10-task-K3-sid-instrument.md) | K2 | K4, K6 | Opus |
 | K4 | [SoundFont 2 → `InstrumentBank`](M10-task-K4-soundfont.md) | K1 | K3, K6 | Opus |
-| K5 | The sample-enhancement API — pulled 2026-09-09 as [K5a](M10-task-K5a-enhancer-core.md) (trait, rebuild, playback scale, `starplayer-enhance`; Opus), [K5b](M10-task-K5b-enhance-offline-and-cli.md) (CLI/offline; Sonnet) and [W4](../apps/W4-task-enhancement-checkboxes.md) (web checkboxes; Sonnet); [original text](M10-task-K5-sample-enhancement.md) | — | K1, K2 | Opus / Sonnet |
+| K5 | The sample-enhancement API — pulled 2026-09-09 as [K5a](M10-task-K5a-enhancer-core.md) (trait, rebuild, playback scale, `starplayer-enhance`; Opus; **landed**), [K5b](M10-task-K5b-enhance-offline-and-cli.md) (CLI/offline; Sonnet) and [W4](../apps/W4-task-enhancement-checkboxes.md) (web checkboxes; Sonnet); [original text](M10-task-K5-sample-enhancement.md) | — | K1, K2 | Opus / Sonnet |
 | K6 | [Karplus-Strong plucked string](M10-task-K6-karplus-strong.md) | K2 | K3, K4 | Sonnet |
 
 ```

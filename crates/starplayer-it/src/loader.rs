@@ -449,6 +449,7 @@ fn load_sample<R: ModuleReader + ?Sized>(source: &Source<'_, R>, header_offset: 
             }),
             false => None,
         },
+        rate_scale_log2: 0,
     };
 
     builder.add_sample(&pcm, specification)?;

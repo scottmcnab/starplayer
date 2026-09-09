@@ -343,7 +343,10 @@ impl S3mProcessor {
                 self.set_minor(channel_index, 12, value);
             }
             // Analysis §4, S_FX_O (3001), gated on a note being present.
-            15 => { let value = if cell.info == 0 { self.channels[channel_index].offset_memory } else { cell.info }; self.channels[channel_index].offset_memory = value; self.channels[channel_index].sample_offset = (value as u32) << 8; if self.channels[channel_index].current_note != 0 { self.channels[channel_index].pending_dirty.insert(DirtyBits::SAMPLE); } self.clear_minor(channel_index); }
+            // `Oxx` addresses **source** frames, so the scale of the sample this channel
+            // is about to trigger turns it into the stored-frame offset every later
+            // comparison and the voice itself want.
+            15 => { let value = if cell.info == 0 { self.channels[channel_index].offset_memory } else { cell.info }; self.channels[channel_index].offset_memory = value; self.channels[channel_index].sample_offset = ((value as u32) << 8) << self.offset_scale(channel_index); if self.channels[channel_index].current_note != 0 { self.channels[channel_index].pending_dirty.insert(DirtyBits::SAMPLE); } self.clear_minor(channel_index); }
             // Analysis §4, S_FX_Q (3015).
             17 => self.static_retrigger(channel_index, cell.info),
             // Analysis §4, S_FX_S (3038).
@@ -755,6 +758,20 @@ impl S3mProcessor {
     /// and `T` reads it back, so `H82` on one row makes the next row's `D00` behave as
     /// `D02` (OpenMPT `ParamMemory.s3m`). `G` and the `H`/`R`/`U` family keep their own
     /// read memories and only write this one.
+    /// How many times the sample this channel is about to trigger has been doubled by a
+    /// load-time enhancer — the shift an `Oxx` parameter needs to become a stored-frame
+    /// offset.
+    fn offset_scale(&self, channel_index: usize) -> u8 {
+        let number = self.channels[channel_index].sample_number;
+        if number == NO_SAMPLE { return 0; }
+        self.module
+            .instrument(InstrumentId((number - 1) as u16))
+            .and_then(|instrument| instrument.sample)
+            .and_then(|sample_id| self.module.sample(sample_id))
+            .map(|sample| sample.rate_scale_log2())
+            .unwrap_or(0)
+    }
+
     fn recall_parameter(&mut self, channel_index: usize, parameter: u8) -> u8 {
         if parameter == 0 { return self.channels[channel_index].parameter_memory; }
         self.channels[channel_index].parameter_memory = parameter;
@@ -902,12 +919,18 @@ fn scaled_volume(channel_volume: u8, global_volume: u8) -> U0F16 {
     unit_from_ratio(channel_volume.min(64) as u32 * global_volume.min(64) as u32, 64 * 64)
 }
 
+/// The mixer region for one sample.
+///
+/// The region carries the sample's `rate_scale_log2` so the engine can scale the step
+/// when a voice is triggered or repitched; the loop points and the length are already in
+/// the region's own stored frames and need no conversion.
 fn sample_region(sample: &starplayer_model::SampleIndex) -> SampleRegion {
-    match sample.loop_mode() {
+    let region = match sample.loop_mode() {
         LoopMode::Forward => LoopSpan::new(sample.loop_start(), sample.loop_end()).map(|span| SampleRegion::looping(sample.pcm_offset(), span)).unwrap_or_else(|| SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames())),
         LoopMode::PingPong => LoopSpan::ping_pong(sample.loop_start(), sample.loop_end()).map(|span| SampleRegion::looping(sample.pcm_offset(), span)).unwrap_or_else(|| SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames())),
         LoopMode::None => SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames()),
-    }
+    };
+    region.with_rate_scale(sample.rate_scale_log2())
 }
 
 fn linear_note(note: u8) -> u8 { (note >> 4).saturating_mul(12).saturating_add(note & 15) }

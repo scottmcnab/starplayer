@@ -256,7 +256,12 @@ impl ModuleBuilder {
 /// Reproduced here, rather than called there, because `starplayer-model` does not depend
 /// on `starplayer-mixer`; `tests::a_ping_pong_guard_matches_the_mixers_own_arithmetic`
 /// below is the proof the two agree.
-const fn ping_pong_reflect(start: u32, end: u32, position: u32) -> u32 {
+///
+/// Public because a sample enhancer that resamples a ping-pong loop has to extend the
+/// source past `end` with exactly this reflection, so that the upsampled sample's own
+/// guard frames — which [`ModuleBuilder::add_sample`] fills with the same function — and
+/// the frames the resampler read are one definition rather than two.
+pub const fn ping_pong_reflect(start: u32, end: u32, position: u32) -> u32 {
     let length = end - start;
     if length <= 1 {
         return start;

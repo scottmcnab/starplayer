@@ -1,0 +1,33 @@
+[package]
+name = "starplayer-enhance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Load-time sample enhancers for StarPlayer: polyphase sinc upsampling and loop-seam smoothing."
+
+[dependencies]
+starplayer-model = { workspace = true }
+# `pow2_q24`, for the XM effective-rate the sample-rate ceiling is measured against, and
+# `equal_power_q15`, for the loop-seam crossfade. Both are table-driven and `no_std`,
+# which is what keeps this crate bare-metal-clean.
+starplayer-dsp = { workspace = true }
+
+[dev-dependencies]
+# The facade, for its autodetecting loader — the rebuild has to be proved on all five
+# formats, not just the one this crate could name — and the offline harness that traces a
+# module and reports its timeline. Dev-only: nothing in the shipped crate knows about a
+# format or about `std`, which is why `xtask ci --job no-std-purity` walks `no-dev` edges.
+starplayer = { workspace = true, features = ["std"] }
+# **Not** with `trace`: resolver 2 unifies dependency features across the whole
+# workspace, so a `trace` here would compile the engine's per-tick recorder into
+# `render()` for every `cargo test --workspace` in the repository. The trace-position
+# proof therefore lives in `starplayer-offline`'s own `trace`-gated test suite.
+starplayer-offline = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+default = []
+std = ["starplayer-model/std", "starplayer-dsp/std"]
+alloc = ["starplayer-model/alloc", "starplayer-dsp/alloc"]

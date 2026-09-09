@@ -14,6 +14,7 @@ starplayer-dsp = { workspace = true }
 starplayer-mixer = { workspace = true }
 starplayer-model = { workspace = true }
 starplayer-engine = { workspace = true }
+starplayer-enhance = { workspace = true, optional = true }
 starplayer-mod = { workspace = true, optional = true }
 starplayer-s3m = { workspace = true, optional = true }
 starplayer-mtm = { workspace = true, optional = true }
@@ -38,6 +39,7 @@ std = [
     "starplayer-mixer/std",
     "starplayer-model/std",
     "starplayer-engine/std",
+    "starplayer-enhance?/std",
     "starplayer-mod?/std",
     "starplayer-s3m?/std",
     "starplayer-mtm?/std",
@@ -53,6 +55,7 @@ alloc = [
     "starplayer-mixer/alloc",
     "starplayer-model/alloc",
     "starplayer-engine/alloc",
+    "starplayer-enhance?/alloc",
     "starplayer-mod?/alloc",
     "starplayer-s3m?/alloc",
     "starplayer-mtm?/alloc",
@@ -99,6 +102,10 @@ s3m = ["dep:starplayer-s3m"]
 mtm = ["dep:starplayer-mtm"]
 xm = ["dep:starplayer-xm"]
 it = ["dep:starplayer-it"]
+
+# M10-K5a's load-time sample enhancers. **Never in `default`**: an enhancer rebuilds a
+# module, and the goldens must never see one (accuracy policy section 5 item 5).
+enhance = ["dep:starplayer-enhance"]
 
 midi = ["dep:starplayer-midi"]
 smf = ["midi", "starplayer-midi/smf"]

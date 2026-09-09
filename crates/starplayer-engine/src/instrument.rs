@@ -204,7 +204,7 @@ pub trait Instrument: Send {
 /// semantics, which is format behaviour rather than a projection.
 pub fn sample_region(sample: &SampleIndex) -> SampleRegion {
     let one_shot = || SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames());
-    match sample.loop_mode() {
+    let region = match sample.loop_mode() {
         LoopMode::Forward => LoopSpan::new(sample.loop_start(), sample.loop_end())
             .map(|span| SampleRegion::looping(sample.pcm_offset(), span))
             .unwrap_or_else(one_shot),
@@ -212,7 +212,8 @@ pub fn sample_region(sample: &SampleIndex) -> SampleRegion {
             .map(|span| SampleRegion::looping(sample.pcm_offset(), span))
             .unwrap_or_else(one_shot),
         LoopMode::None => one_shot(),
-    }
+    };
+    region.with_rate_scale(sample.rate_scale_log2())
 }
 
 /// `left × right` for two unit scalars, rounded to nearest.

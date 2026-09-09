@@ -133,6 +133,7 @@ pub struct SampleRegion {
     pcm_offset: u32,
     length_frames: u32,
     loop_span: Option<LoopSpan>,
+    rate_scale_log2: u8,
 }
 
 impl Default for SampleRegion {
@@ -144,7 +145,7 @@ impl Default for SampleRegion {
 impl SampleRegion {
     /// A sample that plays once and then ends the voice.
     pub const fn one_shot(pcm_offset: u32, length_frames: u32) -> SampleRegion {
-        SampleRegion { pcm_offset, length_frames, loop_span: None }
+        SampleRegion { pcm_offset, length_frames, loop_span: None, rate_scale_log2: 0 }
     }
 
     /// A looping sample.
@@ -168,7 +169,20 @@ impl SampleRegion {
     ///
     /// A degenerate span collapses to [`SampleRegion::one_shot`].
     pub const fn looping(pcm_offset: u32, loop_span: LoopSpan) -> SampleRegion {
-        SampleRegion { pcm_offset, length_frames: loop_span.end, loop_span: Some(loop_span) }
+        SampleRegion { pcm_offset, length_frames: loop_span.end, loop_span: Some(loop_span), rate_scale_log2: 0 }
+    }
+
+    /// The same region, tagged with how many times its frames have been doubled relative
+    /// to the rate the sample's `reference_rate_hz` names — `starplayer_model`'s
+    /// `SampleSpec::rate_scale_log2`, `0` for every sample a loader produces.
+    ///
+    /// **Nothing in the mixer reads this.** The frames, the loop and the length are all
+    /// already in the region's own stored frames, so the resample step is the only thing
+    /// that has to know, and the engine shifts it at the two places it enters a voice. The
+    /// tag travels on the region purely so those two places can find it without a second
+    /// lookup through the model — a `Voice` stays ignorant of where its frames came from.
+    pub const fn with_rate_scale(self, rate_scale_log2: u8) -> SampleRegion {
+        SampleRegion { rate_scale_log2, ..self }
     }
 
     /// Offset of the sample's first frame within the module's PCM blob.
@@ -179,6 +193,10 @@ impl SampleRegion {
 
     /// The forward loop, if the sample has one.
     pub const fn loop_span(self) -> Option<LoopSpan> { self.loop_span }
+
+    /// How many times these frames have been doubled relative to the sample's own
+    /// reference rate. See [`SampleRegion::with_rate_scale`].
+    pub const fn rate_scale_log2(self) -> u8 { self.rate_scale_log2 }
 
     /// Frames this region occupies in the blob: its [`PRE_ROLL_FRAMES`], its addressable
     /// frames and its [`GUARD_FRAMES`]. The run starts `PRE_ROLL_FRAMES` *before*

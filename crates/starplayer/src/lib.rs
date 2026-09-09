@@ -147,6 +147,14 @@ pub use starplayer_engine::MAX_VOICE_CAPACITY;
 #[cfg(feature = "telemetry")]
 pub use starplayer_telemetry as telemetry;
 
+/// Load-time sample enhancers (`enhance` feature): polyphase sinc upsampling, loop-seam
+/// smoothing, and the catalogue a host builds its checkboxes from.
+///
+/// Off by default and never in `default`, because an enhanced module is a different module
+/// and the canonical goldens must never see one.
+#[cfg(feature = "enhance")]
+pub use starplayer_enhance as enhance;
+
 /// Scream Tracker 3 loading, native pattern access and sequencer construction.
 #[cfg(feature = "s3m")]
 pub use starplayer_s3m as s3m;
