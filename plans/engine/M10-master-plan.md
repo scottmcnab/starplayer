@@ -98,7 +98,7 @@ Decisions taken while planning:
 | K2 | [Generator voices in the mixer, and the FM instrument](M10-task-K2-generator-voices-and-fm.md) | K1 | K5 | Opus |
 | K3 | [SID voice emulation as an instrument](M10-task-K3-sid-instrument.md) | K2 | K4, K6 | Opus |
 | K4 | [SoundFont 2 → `InstrumentBank`](M10-task-K4-soundfont.md) | K1 | K3, K6 | Opus |
-| K5 | [The sample-enhancement API](M10-task-K5-sample-enhancement.md) | — | K1, K2 | Sonnet |
+| K5 | The sample-enhancement API — pulled 2026-09-09 as [K5a](M10-task-K5a-enhancer-core.md) (trait, rebuild, playback scale, `starplayer-enhance`; Opus), [K5b](M10-task-K5b-enhance-offline-and-cli.md) (CLI/offline; Sonnet) and [W4](../apps/W4-task-enhancement-checkboxes.md) (web checkboxes; Sonnet); [original text](M10-task-K5-sample-enhancement.md) | — | K1, K2 | Opus / Sonnet |
 | K6 | [Karplus-Strong plucked string](M10-task-K6-karplus-strong.md) | K2 | K3, K4 | Sonnet |
 
 ```

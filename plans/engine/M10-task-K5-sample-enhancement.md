@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M10 ([master plan](M10-master-plan.md), "The task graph" section); composes with [M11](M11-master-plan.md) (enhance once at library-scan time) |
-| Status | Planned; pull-driven (not scheduled) |
+| Status | Superseded 2026-09-09 by [K5a](M10-task-K5a-enhancer-core.md) + [K5b](M10-task-K5b-enhance-offline-and-cli.md) + [W4](../apps/W4-task-enhancement-checkboxes.md) — see "Plan amendment" |
 | Depends on | — (M7-H5's sinc kernel and pre-roll are useful precedent, not a dependency) |
 | Blocks | — |
 | Parallel with | K1, K2 |
@@ -136,3 +136,22 @@ cargo xtask ci --job clippy
 Spectral band replication or a learned model (they are further `SampleEnhancer`
 implementations in their own crates once the API exists); running an enhancer at runtime;
 the library scan (M11).
+
+## Plan amendment (2026-09-09)
+
+Pulled at the owner's request, with a new deliverable: checkboxes in the web player that
+apply the enhancers at load. Planning against the code changed four things, so the work
+is split into three task files and this one is kept as the record of the original shape:
+
+1. `ModuleBuilder::with_enhancer` cannot be the hook — every loader builds its own
+   `ModuleBuilder` internally. The hook is `Module::enhanced(&dyn SampleEnhancer)`, a
+   rebuild through `add_sample`, and loaders stay untouched.
+2. A new `reference_rate_hz` does not change pitch on MOD/MTM/XM, and sample-offset
+   commands address source frames, so the module carries `rate_scale_log2` and the engine
+   scales the step; processors scale offsets where they read them.
+3. The sinc kernel is a committed table, so `starplayer-enhance` is `no_std + alloc`.
+4. Ping-pong loop points scale as `F·start`, `F·(end − 1) + 1`; sustain-loop samples are
+   resampled as one-shots.
+
+Engine half: [K5a](M10-task-K5a-enhancer-core.md). CLI/offline: [K5b](M10-task-K5b-enhance-offline-and-cli.md).
+Web: [W4](../apps/W4-task-enhancement-checkboxes.md).
