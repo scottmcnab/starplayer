@@ -26,9 +26,8 @@
 //! rate ran out, and no guard threshold separates (d) from the noise drum, the instrument
 //! that gains most.
 
-use starplayer_enhance::{BandwidthExtender, Chain, SampleEnhancer, enhancer_for_id};
-use starplayer_enhance::SamplePcm;
 use starplayer::model::LoopMode;
+use starplayer_enhance::{BandwidthExtender, Chain, SampleEnhancer, SamplePcm, enhancer_for_id};
 use starplayer_offline::enhance_measure::{Instrument, Metrics, degraded, ground_truth, measure, render};
 
 /// Build a chain from catalogue ids.
