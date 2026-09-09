@@ -24,6 +24,12 @@ pub struct InfoArgs {
     /// holding more than one module lists its entries instead of loading one.
     #[arg(long)]
     pub entry: Option<usize>,
+    /// Rebuild every sample through a load-time enhancer (M10-K5b) and print a table
+    /// alongside the module's own information: id, name, reference rate, scale, and frames
+    /// and loop points before and after. Grammar as `render --enhance`. Off by default —
+    /// the owner has not asked for this table unconditionally.
+    #[arg(long)]
+    pub enhance: Option<String>,
 }
 
 pub fn run(args: InfoArgs) -> Result<(), String> {
@@ -39,9 +45,12 @@ pub fn run(args: InfoArgs) -> Result<(), String> {
 
     let module_bytes = archive::resolve_entry(&args.file, &bytes, args.entry)?;
     if starplayer::probe_smf(&module_bytes) {
+        if args.enhance.is_some() {
+            return Err(String::from("--enhance only applies to a tracker module, not a Standard MIDI File"));
+        }
         return print_smf_info(&module_bytes);
     }
-    print_module_info(&module_bytes)
+    print_module_info(&module_bytes, args.enhance.as_deref())
 }
 
 /// `starplayer info` on a `.mid`: format, tracks, division, tempo changes and length
@@ -89,7 +98,7 @@ fn list_archive_entries(path: &std::path::Path, modules: &[starplayer_archive::A
     println!("pick one with --entry N");
 }
 
-fn print_module_info(bytes: &[u8]) -> Result<(), String> {
+fn print_module_info(bytes: &[u8], enhance: Option<&str>) -> Result<(), String> {
     let module = Arc::new(starplayer::load(bytes).map_err(|error| error.to_string())?);
     let header = module.header();
     let title = if header.title.is_empty() { "(untitled)" } else { header.title.as_ref() };
@@ -117,7 +126,31 @@ fn print_module_info(bytes: &[u8]) -> Result<(), String> {
     println!("length:       {} ({} frames at {} Hz)", format_duration(timeline.duration_seconds()), timeline.end_frame(), INFO_SCAN_SAMPLE_RATE_HZ);
     println!("at end:       {}", format_end(timeline.end()));
 
+    if let Some(spec) = enhance {
+        // No rate ceiling: `info` names no output rate to cap an upsampler against, and
+        // this table is a diagnostic, not a render.
+        let chain = crate::enhance_arg::parse_enhance_arg(spec, None)?;
+        let enhanced = module.enhanced(&chain).map_err(|error| error.to_string())?;
+        print_enhance_table(&module, &enhanced, &chain);
+    }
+
     Ok(())
+}
+
+/// `info --enhance` (M10-K5b): one row per sample naming what the rebuild changed. The
+/// reference rate is unchanged by design (K5a's finding 2 — `reference_rate_hz` keeps the
+/// file's own value; only the stored frame count and `rate_scale_log2` move), so it is
+/// printed once per row rather than as a before/after pair.
+fn print_enhance_table(module: &starplayer::model::Module, enhanced: &starplayer::model::Module, chain: &dyn starplayer::model::SampleEnhancer) {
+    println!();
+    println!("enhanced (--enhance {}):", chain.name());
+    println!("{:<4} {:<22} {:>10} {:>6} {:>20} {:>20}", "id", "name", "ref rate", "scale", "frames", "loop");
+    for (id, (before, after)) in module.samples().iter().zip(enhanced.samples().iter()).enumerate() {
+        let scale = 1u32 << after.rate_scale_log2();
+        let frames = format!("{} -> {}", before.length_frames(), after.length_frames());
+        let loop_points = format!("{}..{} -> {}..{}", before.loop_start(), before.loop_end(), after.loop_start(), after.loop_end());
+        println!("{id:<4} {:<22} {:>7} Hz {:>5} {:>20} {:>20}", before.name(), before.reference_rate_hz(), format!("×{scale}"), frames, loop_points);
+    }
 }
 
 fn format_flags(flags: &ModuleFlags) -> String {

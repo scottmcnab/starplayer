@@ -23,7 +23,7 @@ use starplayer::engine::{
     InstrumentRack, MidiSource, ScanLimits, SongTimeline,
 };
 use starplayer::mixer::{FixedPath, FloatPath, I24, Limiter, MixPath, MonoF32, MonoI16, OutputFormat};
-use starplayer::model::{Module, ModuleFormat};
+use starplayer::model::{Module, ModuleFormat, SampleEnhancer};
 use starplayer::rt::Arc;
 use starplayer::{NativeSequencer, ScannedSong, recommended_voice_capacity, scan_song};
 
@@ -45,6 +45,23 @@ pub struct InsertSpec {
     pub kind: InsertKind,
     /// Parameters to set after installing, away from the effect's own defaults.
     pub params: Vec<(ParamId, i32)>,
+}
+
+/// Everything a [`render_song_with_options`] render can be asked for beyond the plain
+/// song: inserts installed before the first frame, and a load-time sample enhancer
+/// (M10-K5a's `starplayer::enhance`) applied to the module before it plays.
+///
+/// The enhancer runs on the loaded [`Module`] right after [`load_golden`], before it is
+/// wrapped in the `Arc` every render path shares — so the scan that produces
+/// [`song_timeline`]'s timing sees the enhanced module and nothing downstream of the load
+/// has to know an enhancer ran at all.
+#[derive(Clone, Copy, Default)]
+pub struct RenderOptions<'a> {
+    /// Inserts to install before the first frame. See [`InsertSpec`].
+    pub inserts: &'a [InsertSpec],
+    /// A sample enhancer to rebuild the module through before playback. `None` renders the
+    /// module exactly as loaded.
+    pub enhancer: Option<&'a dyn SampleEnhancer>,
 }
 
 // The per-tick trace is a diagnostic build only. Everything it needs sits behind the
@@ -407,7 +424,7 @@ where
     Out: OutputFormat<Accumulator = Path::Accumulator>,
     Out::Sample: FadeSample,
 {
-    render_song_with_inserts::<Path, Interp, Out>(format, bytes, sample_rate_hz, host_block_frames, length, &[])
+    render_song_with_options::<Path, Interp, Out>(format, bytes, sample_rate_hz, host_block_frames, length, &RenderOptions::default())
 }
 
 /// [`render_song`] with insert effects installed before the first frame renders (M7-H7):
@@ -427,7 +444,36 @@ where
     Out: OutputFormat<Accumulator = Path::Accumulator>,
     Out::Sample: FadeSample,
 {
-    let module = Arc::new(load_golden(format, bytes)?);
+    render_song_with_options::<Path, Interp, Out>(format, bytes, sample_rate_hz, host_block_frames, length, &RenderOptions { inserts, enhancer: None })
+}
+
+/// [`render_song`] with the full [`RenderOptions`]: inserts, and optionally a load-time
+/// sample enhancer (M10-K5b). `render_song` and `render_song_with_inserts` both delegate
+/// here.
+///
+/// The enhancer, if any, rebuilds the loaded module **before** it is wrapped in the `Arc`
+/// every render path shares, so [`song_timeline`]'s scan — and everything the fade and the
+/// playback sequencer derive from it — sees exactly the module that plays.
+pub fn render_song_with_options<Path, Interp, Out>(
+    format: GoldenFormat,
+    bytes: &[u8],
+    sample_rate_hz: u32,
+    host_block_frames: usize,
+    length: RenderLength,
+    options: &RenderOptions<'_>,
+) -> Result<Vec<Out::Sample>, RenderError>
+where
+    Path: MixPath,
+    Interp: Interpolate,
+    Out: OutputFormat<Accumulator = Path::Accumulator>,
+    Out::Sample: FadeSample,
+{
+    let loaded = load_golden(format, bytes)?;
+    let loaded = match options.enhancer {
+        Some(enhancer) => loaded.enhanced(enhancer)?,
+        None => loaded,
+    };
+    let module = Arc::new(loaded);
     let scanned = scanned_song(&module, sample_rate_hz)?;
     let (total_frames, fade_frames) = length.frames_for(&scanned.timeline);
 
@@ -443,9 +489,9 @@ where
     engine.set_source(playback_source(module, sample_rate_hz, scanned)?);
     engine.set_limiter(Limiter::Clamp);
 
-    if !inserts.is_empty() {
+    if !options.inserts.is_empty() {
         let mut insert_control = engine.take_insert_control().ok_or(RenderError::CommandQueue)?;
-        for spec in inserts {
+        for spec in options.inserts {
             let boxed = build_insert::<Path::Mono>(spec.kind, sample_rate_hz);
             insert_control.install(spec.target, spec.slot, boxed).map_err(|_| RenderError::CommandQueue)?;
             for &(param, value) in &spec.params {
@@ -602,7 +648,7 @@ pub fn sha256_hex(hash: [u8; 32]) -> String {
 
 /// Configuration-encoded filename for one module stem.
 pub fn golden_filename(module_stem: &str) -> String {
-    golden_filename_for_interpolator(module_stem, GOLDEN_INTERPOLATOR)
+    golden_filename_for_configuration(module_stem, GOLDEN_INTERPOLATOR, None)
 }
 
 /// The configuration filename an alternate interpolator uses.
@@ -612,13 +658,30 @@ pub fn golden_filename(module_stem: &str) -> String {
 /// apart: selecting another kernel names a different file rather than comparing its bytes
 /// against the linear hash.
 pub fn golden_filename_for_interpolator(module_stem: &str, interpolator: Interpolator) -> String {
+    golden_filename_for_configuration(module_stem, interpolator, None)
+}
+
+/// The filename one rendered configuration hashes under: the module stem, the fixed
+/// `i16_mono_44100` shape every golden shares, the interpolator, and — when a load-time
+/// sample enhancer (M10-K5a) ran — its name behind an `_enh-` marker.
+///
+/// An enhanced render is a **different configuration** from the plain goldens
+/// (`plans/product/03-accuracy-policy.md` §5 item 5), so it must never collide with one:
+/// `stem__i16_mono_44100_<kernel>.sha256` when `enhancer_name` is `None`, else
+/// `stem__i16_mono_44100_<kernel>_enh-<name>.sha256`. [`golden_filename`] and
+/// [`golden_filename_for_interpolator`] both delegate here with `None`. No enhanced golden
+/// is committed; this function only names what a future one would be called.
+pub fn golden_filename_for_configuration(module_stem: &str, interpolator: Interpolator, enhancer_name: Option<&str>) -> String {
     let label = match interpolator {
         Interpolator::None => "nearest",
         Interpolator::Linear => "linear",
         Interpolator::Cubic => "cubic",
         Interpolator::Sinc => "sinc",
     };
-    format!("{module_stem}__i16_mono_44100_{label}.sha256")
+    match enhancer_name {
+        None => format!("{module_stem}__i16_mono_44100_{label}.sha256"),
+        Some(name) => format!("{module_stem}__i16_mono_44100_{label}_enh-{name}.sha256"),
+    }
 }
 
 /// Average segmental SNR in dB, treating `fixed` as the reference signal.
@@ -958,6 +1021,22 @@ mod tests {
             assert_eq!(render_s3m_fixed_mono(REFLEX, host_block_frames).expect("REFLEX renders"), reference, "host block size {host_block_frames} changed the canonical PCM");
             assert_eq!(canonical_s3m_sha256(REFLEX, host_block_frames).expect("REFLEX hashes"), reference_hash, "host block size {host_block_frames} changed the canonical hash");
         }
+    }
+
+    /// M10-K5b: an enhanced configuration's filename pins visibly apart from a plain one's,
+    /// so a later pin of an enhanced golden cannot collide with an existing plain one.
+    #[test]
+    fn golden_filename_for_configuration_names_an_enhanced_configuration_separately() {
+        assert_eq!(golden_filename_for_configuration("reflex", Interpolator::Linear, None), "reflex__i16_mono_44100_linear.sha256");
+        assert_eq!(golden_filename_for_configuration("reflex", Interpolator::Linear, None), golden_filename("reflex"));
+        assert_eq!(
+            golden_filename_for_configuration("reflex", Interpolator::Linear, Some("sinc4x+loop=64")),
+            "reflex__i16_mono_44100_linear_enh-sinc4x+loop=64.sha256"
+        );
+        assert_eq!(
+            golden_filename_for_configuration("reflex", Interpolator::None, Some("sinc2x")),
+            "reflex__i16_mono_44100_nearest_enh-sinc2x.sha256"
+        );
     }
 
     /// The block-size determinism invariant, with **Impulse Tracker's New Note Actions
@@ -1480,5 +1559,53 @@ mod tests {
         let via_inserts =
             render_song_with_inserts::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, 128, length, &[]).expect("renders");
         assert_eq!(plain, via_inserts);
+    }
+
+    // ── M10-K5b: `render_song_with_options` and the load-time enhancer ──────────────
+
+    /// An enhancer that hands every sample back unchanged, so a rebuilt module still
+    /// renders exactly like the one it came from. `starplayer-model`'s own equivalent is
+    /// `#[cfg(test)]`-private, so this crate — which is the one place a real fixture can be
+    /// both loaded and enhanced — keeps its own.
+    struct IdentityEnhancer;
+
+    impl SampleEnhancer for IdentityEnhancer {
+        fn name(&self) -> String { String::from("identity") }
+        fn enhance(&self, sample: starplayer::model::SamplePcm<'_>) -> starplayer::model::EnhancedPcm {
+            starplayer::model::EnhancedPcm::unchanged(sample)
+        }
+    }
+
+    #[test]
+    fn render_song_with_options_and_an_identity_enhancer_matches_render_song() {
+        let length = RenderLength { max_frames: 2 * GOLDEN_SAMPLE_RATE_HZ as u64, fade_frames: 0, ..RenderLength::default_for(GOLDEN_SAMPLE_RATE_HZ) };
+        let plain = render_song::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, 128, length).expect("plain renders");
+
+        let identity = IdentityEnhancer;
+        let options = RenderOptions { inserts: &[], enhancer: Some(&identity as &dyn SampleEnhancer) };
+        let enhanced = render_song_with_options::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, 128, length, &options)
+            .expect("identity-enhanced renders");
+        assert_eq!(plain, enhanced, "an identity enhancer must not change a byte");
+    }
+
+    /// `sinc4x` changes the rendered bytes, and the change is block-size independent —
+    /// design goal 3 holds for an enhanced render exactly as it does for a plain one.
+    #[test]
+    fn render_song_with_options_and_a_sinc4x_enhancer_differs_and_is_block_size_independent() {
+        let length = RenderLength { max_frames: 2 * GOLDEN_SAMPLE_RATE_HZ as u64, fade_frames: 0, ..RenderLength::default_for(GOLDEN_SAMPLE_RATE_HZ) };
+        let plain = render_song::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, 128, length).expect("plain renders");
+
+        let enhancer = starplayer_enhance::SincUpsampler::new(starplayer_enhance::UpsampleFactor::Four);
+        let options = RenderOptions { inserts: &[], enhancer: Some(&enhancer as &dyn SampleEnhancer) };
+        let reference = render_song_with_options::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, 128, length, &options)
+            .expect("sinc4x-enhanced renders");
+        assert_ne!(reference, plain, "a sinc4x-enhanced render must differ from the plain one");
+
+        for host_block_frames in [1, 3, 64, 128, 4_096, 8_191] {
+            let rendered =
+                render_song_with_options::<FixedPath, Linear, MonoI16>(GoldenFormat::S3m, REFLEX, GOLDEN_SAMPLE_RATE_HZ, host_block_frames, length, &options)
+                    .expect("sinc4x-enhanced renders");
+            assert_eq!(rendered, reference, "host block size {host_block_frames} changed a sinc4x-enhanced render");
+        }
     }
 }

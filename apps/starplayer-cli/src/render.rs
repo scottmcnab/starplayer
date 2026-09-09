@@ -40,11 +40,12 @@ use sha2::{Digest, Sha256};
 use starplayer::core::AtEnd;
 use starplayer::dsp::{Cubic, Linear, Nearest, Sinc};
 use starplayer::mixer::{FixedOut, FixedPath, FloatOut, FloatPath, I24};
-use starplayer::model::ModuleFormat;
+use starplayer::model::{ModuleFormat, SampleEnhancer};
 use starplayer_offline::wav::{WavSample, write_wav};
-use starplayer_offline::{GoldenFormat, InsertSpec, RenderLength};
+use starplayer_offline::{GoldenFormat, InsertSpec, RenderLength, RenderOptions};
 
 use crate::archive;
+use crate::enhance_arg;
 use crate::insert_arg;
 
 /// Voice-accumulation path.
@@ -93,11 +94,12 @@ pub enum AtEndArg {
 
 #[derive(clap::Args, Debug)]
 pub struct RenderArgs {
-    /// Module file, or a ZIP archive containing one. Not needed with `--list-effects`.
-    #[arg(required_unless_present = "list_effects")]
+    /// Module file, or a ZIP archive containing one. Not needed with `--list-effects` or
+    /// `--list-enhancers`.
+    #[arg(required_unless_present_any = ["list_effects", "list_enhancers"])]
     pub file: Option<PathBuf>,
-    /// Output WAV file. Not needed with `--list-effects`.
-    #[arg(short = 'o', long = "output", required_unless_present = "list_effects")]
+    /// Output WAV file. Not needed with `--list-effects` or `--list-enhancers`.
+    #[arg(short = 'o', long = "output", required_unless_present_any = ["list_effects", "list_enhancers"])]
     pub output: Option<PathBuf>,
     /// Output sample rate in Hz.
     #[arg(long, default_value_t = 44_100, conflicts_with = "golden")]
@@ -153,12 +155,28 @@ pub struct RenderArgs {
     /// ranges and defaults, and exit.
     #[arg(long)]
     pub list_effects: bool,
+    /// Rebuild every sample through a load-time enhancer before rendering (M10-K5b):
+    /// entries joined with `+`, each an id from the catalogue — `sinc2x`, `sinc4x`, `loop`
+    /// or `loop=<frames>` (default 64) — e.g. `--enhance sinc4x+loop`. A `sincNx` stage is
+    /// capped at twice `--rate`. An enhanced render is a different configuration from the
+    /// goldens (`plans/product/03-accuracy-policy.md` §5 item 5), so this conflicts with
+    /// `--golden`.
+    #[arg(long, conflicts_with = "golden")]
+    pub enhance: Option<String>,
+    /// Print every load-time sample enhancer `--enhance` can name, and exit.
+    #[arg(long)]
+    pub list_enhancers: bool,
 }
 
 pub fn run(args: RenderArgs) -> Result<(), String> {
-    // `--list-effects` names no file and renders nothing (M7-H7).
+    // `--list-effects` and `--list-enhancers` name no file and render nothing (M7-H7,
+    // M10-K5b).
     if args.list_effects {
         print!("{}", insert_arg::list_effects());
+        return Ok(());
+    }
+    if args.list_enhancers {
+        print!("{}", enhance_arg::list_enhancers());
         return Ok(());
     }
     let file = args.file.clone().ok_or_else(|| String::from("no module given; see --help"))?;
@@ -180,6 +198,10 @@ pub fn run(args: RenderArgs) -> Result<(), String> {
     }
 
     let inserts = parse_inserts(&args.insert)?;
+    // The rate ceiling is twice the requested output rate: a sample upsampled past that
+    // could never be told apart from one that was not, at this render's own output rate.
+    let enhance_chain = args.enhance.as_deref().map(|spec| enhance_arg::parse_enhance_arg(spec, Some(args.rate.saturating_mul(2)))).transpose()?;
+    let enhancer: Option<&dyn SampleEnhancer> = enhance_chain.as_ref().map(|chain| chain as &dyn SampleEnhancer);
 
     let mut length = RenderLength::default_for(args.rate);
     length.repeat_count = args.repeat;
@@ -213,11 +235,12 @@ pub fn run(args: RenderArgs) -> Result<(), String> {
         length,
         output: &output,
         inserts: &inserts,
+        enhancer,
     })?;
 
     println!(
         "wrote {} · {frames_written} frames · {:.3} s at {} Hz to {}",
-        describe(args.mix_path, args.interp, args.depth, channels),
+        describe(args.mix_path, args.interp, args.depth, channels, enhancer),
         frames_written as f64 / args.rate.max(1) as f64,
         args.rate,
         output.display()
@@ -263,6 +286,9 @@ fn run_smf(args: &RenderArgs, file: &Path, output: &Path, smf_bytes: &[u8]) -> R
     if !args.insert.is_empty() {
         return Err(String::from("--insert only applies to a tracker module render, not a Standard MIDI File"));
     }
+    if args.enhance.is_some() {
+        return Err(String::from("--enhance only applies to a tracker module render, not a Standard MIDI File"));
+    }
     let Some(instruments_path) = args.instruments.as_ref() else {
         return Err(format!("{}: a Standard MIDI File needs --instruments <module> naming the module whose instruments play it", file.display()));
     };
@@ -285,7 +311,7 @@ fn run_smf(args: &RenderArgs, file: &Path, output: &Path, smf_bytes: &[u8]) -> R
 
     println!(
         "wrote {} · {frames_written} frames · {:.3} s at {} Hz to {}",
-        describe(args.mix_path, args.interp, args.depth, channels),
+        describe(args.mix_path, args.interp, args.depth, channels, None),
         frames_written as f64 / args.rate.max(1) as f64,
         args.rate,
         output.display()
@@ -306,12 +332,15 @@ fn golden_format(format: ModuleFormat) -> Option<GoldenFormat> {
 
 fn seconds_to_frames(seconds: f64, rate: u32) -> u64 { (seconds.max(0.0) * rate as f64).round() as u64 }
 
-fn describe(mix_path: MixPathArg, interp: InterpArg, depth: DepthArg, channels: u16) -> String {
+fn describe(mix_path: MixPathArg, interp: InterpArg, depth: DepthArg, channels: u16, enhancer: Option<&dyn SampleEnhancer>) -> String {
     let mix_path = match mix_path { MixPathArg::Float => "float", MixPathArg::Fixed => "fixed" };
     let interp = match interp { InterpArg::Nearest => "nearest", InterpArg::Linear => "linear", InterpArg::Cubic => "cubic", InterpArg::Sinc => "sinc" };
     let depth = match depth { DepthArg::I16 => "16-bit", DepthArg::I24 => "24-bit", DepthArg::I32 => "32-bit", DepthArg::F32 => "f32" };
     let channels = if channels == 1 { "mono" } else { "stereo" };
-    format!("{mix_path} · {interp} · {depth} · {channels}")
+    match enhancer {
+        Some(enhancer) => format!("{mix_path} · {interp} · {depth} · {channels} · enhanced: {}", enhancer.name()),
+        None => format!("{mix_path} · {interp} · {depth} · {channels}"),
+    }
 }
 
 /// SHA-256 over `samples` encoded as little-endian bytes, hex-formatted — the same
@@ -350,16 +379,22 @@ struct RenderTarget<'a> {
     length: RenderLength,
     output: &'a Path,
     inserts: &'a [InsertSpec],
+    enhancer: Option<&'a dyn SampleEnhancer>,
 }
 
 /// Render then write the WAV file, dispatching the compile-time mixer path,
 /// interpolator, sample type and channel count that the runtime arguments named. Returns
 /// the number of frames written and the hex SHA-256 of its PCM payload.
+///
+/// The enhancer (M10-K5b) rides as a runtime argument through `RenderOptions` rather than
+/// widening this match: it changes nothing about which types get monomorphised, only what
+/// `render_song_with_options` does to the module before it plays.
 fn render_dispatch(target: RenderTarget<'_>) -> Result<(usize, String), String> {
-    let RenderTarget { mix_path, interp, depth, channels, format, bytes, rate, host_block_frames, length, output, inserts } = target;
+    let RenderTarget { mix_path, interp, depth, channels, format, bytes, rate, host_block_frames, length, output, inserts, enhancer } = target;
+    let options = RenderOptions { inserts, enhancer };
     macro_rules! render_and_write {
         ($path:ty, $out:ty, $interp:ty, $channels:expr) => {{
-            let samples = starplayer_offline::render_song_with_inserts::<$path, $interp, $out>(format, bytes, rate, host_block_frames, length, inserts)
+            let samples = starplayer_offline::render_song_with_options::<$path, $interp, $out>(format, bytes, rate, host_block_frames, length, &options)
                 .map_err(|error| error.to_string())?;
             write_wav(output, rate, channels, &samples).map_err(|error| error.to_string())?;
             (samples.len() / ($channels as usize), pcm_sha256(&samples))

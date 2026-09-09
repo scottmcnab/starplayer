@@ -1282,6 +1282,7 @@ dependencies = [
  "sha2",
  "starplayer",
  "starplayer-archive",
+ "starplayer-enhance",
  "starplayer-host",
  "starplayer-host-cpal",
  "starplayer-midi-native",

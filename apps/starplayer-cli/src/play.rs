@@ -115,6 +115,17 @@ pub struct PlayArgs {
     /// ranges and defaults, and exit.
     #[arg(long)]
     pub list_effects: bool,
+
+    // ── load-time sample enhancement (M10-K5b) ───────────────────────────────────────
+    /// Rebuild every sample through a load-time enhancer before playing: entries joined
+    /// with `+`, each an id from the catalogue — `sinc2x`, `sinc4x`, `loop` or
+    /// `loop=<frames>` (default 64) — e.g. `--enhance sinc4x+loop`. Applies only to a
+    /// tracker module played directly, not to the instruments behind a Standard MIDI File.
+    #[arg(long)]
+    pub enhance: Option<String>,
+    /// Print every load-time sample enhancer `--enhance` can name, and exit.
+    #[arg(long)]
+    pub list_enhancers: bool,
 }
 
 pub fn run(args: PlayArgs) -> Result<(), String> {
@@ -130,6 +141,10 @@ pub fn run(args: PlayArgs) -> Result<(), String> {
         print!("{}", crate::insert_arg::list_effects());
         return Ok(());
     }
+    if args.list_enhancers {
+        print!("{}", crate::enhance_arg::list_enhancers());
+        return Ok(());
+    }
 
     let Some(file) = args.file.clone() else {
         return Err(String::from("no module given; see --help"));
@@ -142,6 +157,9 @@ pub fn run(args: PlayArgs) -> Result<(), String> {
     }
     if is_smf && args.midi.is_some() {
         return Err(String::from("--midi cannot be combined with Standard MIDI File playback; it is live input for a tracker module"));
+    }
+    if is_smf && args.enhance.is_some() {
+        return Err(String::from("--enhance only applies to a tracker module played directly, not the instruments behind a Standard MIDI File"));
     }
     // ── end task E5 ────────────────────────────────────────────────────────────────
 
@@ -183,6 +201,14 @@ fn play_on(backend: &mut dyn AudioBackend, backend_name: &str, file_display: &st
         let instrument_bytes = std::fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let instruments = starplayer::rt::Arc::new(starplayer::load(&instrument_bytes).map_err(|error| error.to_string())?);
         Some(player.load_smf(bytes, instruments).map_err(|error| error.to_string())?)
+    } else if let Some(spec) = args.enhance.as_deref() {
+        // No rate ceiling here: `play` negotiates its device rate after this loads, so
+        // there is no output rate yet to cap an upsampler against.
+        let chain = crate::enhance_arg::parse_enhance_arg(spec, None)?;
+        let module = starplayer::load(bytes).map_err(|error| error.to_string())?;
+        let module = module.enhanced(&chain).map_err(|error| error.to_string())?;
+        player.load_module(starplayer::rt::Arc::new(module)).map_err(|error| error.to_string())?;
+        None
     } else {
         player.load(bytes).map_err(|error| error.to_string())?;
         None
@@ -433,6 +459,8 @@ mod tests {
             list_midi_ports: false,
             insert: Vec::new(),
             list_effects: false,
+            enhance: None,
+            list_enhancers: false,
         }
     }
 
