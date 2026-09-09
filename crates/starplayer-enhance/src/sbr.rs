@@ -81,7 +81,7 @@ use core::fmt::Write;
 
 use starplayer_model::{EnhancedPcm, SampleEnhancer, SamplePcm};
 
-use crate::deterministic::{power_hundredths, saturating_i16};
+use crate::deterministic::{power_hundredths, saturating_i16, square_root};
 use crate::stft::{STFT_BINS, STFT_HOP, STFT_SIZE, forward, inverse, window};
 use crate::upsample::InfiniteSource;
 
@@ -133,19 +133,19 @@ const MINIMUM_EDGE_BIN: usize = 8;
 
 /// Octaves the patch reaches above the edge.
 ///
-/// **One**, measured rather than assumed. The obvious design fills everything up to
-/// Nyquist, and M10-K5c's harness says that is worse: against the four ground-truth
-/// instruments, extending two octaves instead of one costs 0.32 dB of log-spectral
-/// distance on the plucked decay and 0.27 dB on the sustained tone, and buys 0.05 dB on
-/// the drum and −0.06 dB on the dark pluck. The reason is that the second octave is where
-/// a transposed partial is least likely to land on a real one: doubling maps harmonic `n`
-/// to harmonic `2n`, which is a real harmonic, but quadrupling maps it to `4n`, which for
-/// most instruments is past where the instrument has any harmonics at all.
+/// **Two**, measured rather than assumed, and re-measured after M10-K5c's harness was
+/// corrected. Against ground truths that carry harmonics all the way to 20 kHz and a
+/// log-spectral distance floored at the edge of audibility, a second octave buys 0.30 dB
+/// on the noise drum — the instrument whose truth genuinely has broadband content up
+/// there, and the case this enhancer exists for — and costs at most 0.003 dB on the other
+/// three. A third buys nothing measurable beyond it, because two octaves above a
+/// 4x-upsampled tracker sample's 3.8 kHz edge is already 15 kHz.
 ///
-/// One octave above a 4x-upsampled tracker sample's 3.7 kHz edge reaches 7.5 kHz, which is
-/// the octave that carries an instrument's brightness. The full sweep is in the task's
-/// Research resolution.
-pub const MAXIMUM_PATCHED_OCTAVES: usize = 1;
+/// The first version of this constant was **one**, chosen against a harness whose
+/// instruments stopped at 5.6 kHz — so every octave of extension was scored against a
+/// truth that was silent, and fewer octaves always won. That is why the number is stated
+/// with its evidence: the sweep is in the task's Research resolution.
+pub const MAXIMUM_PATCHED_OCTAVES: usize = 2;
 
 /// Samples shorter than this are returned unchanged: a hop is the least a windowed
 /// analysis can say anything about, and a sample that short is a chip-tune single cycle
@@ -222,9 +222,11 @@ impl SampleEnhancer for BandwidthExtender {
             }
         }
 
+        // The patch synthesises the **added** band alone and it is added to the original
+        // frames, rather than the whole signal being resynthesised. See `patch`.
         let frames: Vec<i16> = (0..body_frames)
             .map(|index| match weight[index] > 0.0 {
-                true => saturating_i16(signal[index] / weight[index]),
+                true => saturating_i16(sample.frames[index] as f64 + signal[index] / weight[index]),
                 // Unreachable while the frame grid covers the body, and a plain copy
                 // rather than a panic if it ever is not.
                 false => sample.frames[index],
@@ -260,6 +262,21 @@ impl Plan {
 }
 
 impl BandwidthExtender {
+    /// What this extender would do to a sample, for diagnosis: the band limit it found,
+    /// the content edge inside it, and the per-octave gain — or `None` for a refusal.
+    ///
+    /// Only the harness calls this; the enhancer itself works from [`Plan`].
+    pub fn describe(&self, sample: SamplePcm<'_>) -> Option<(usize, usize, f64)> {
+        let source = InfiniteSource::for_sample(&sample);
+        if sample.frames.len() < MINIMUM_EXTENDABLE_FRAMES {
+            return None;
+        }
+        let power = average_power_spectrum(&source, sample.frames.len());
+        let (band_limit_bin, _) = band_edge(&power, STFT_BINS)?;
+        let plan = self.plan(&power)?;
+        Some((band_limit_bin, plan.edge_bin, plan.octave_gains.get(1).copied().unwrap_or(0.0)))
+    }
+
     /// The band edge and the per-octave gains, or `None` for one of the two refusals.
     fn plan(&self, power: &[f64; STFT_BINS]) -> Option<Plan> {
         // Two passes, because a resampled tracker sample has **two** band edges and only
@@ -315,6 +332,39 @@ impl BandwidthExtender {
         let content: Vec<bool> = (0..edge_bin).map(|bin| power[bin] > content_threshold).collect();
         Some(Plan { edge_bin, octave_gains, content })
     }
+}
+
+/// Move a bin's complex value up `octaves` octaves: the same magnitude, the phase
+/// multiplied by `2^octaves`.
+///
+/// # Why the phase has to move too
+///
+/// This is the difference between a bandwidth extender that works and one that measures as
+/// doing almost nothing, and it is not obvious. Copying bin `b`'s complex value to bin `2b`
+/// puts the right magnitude in the right place *within one frame* — but the frames overlap
+/// four to one, and a component at bin `2b` has to advance its phase by `2π·2b·hop/N` from
+/// one frame to the next while bin `b`'s value advances by half that. Feed the wrong
+/// advance into the overlap-add and successive frames fight each other: the patched band
+/// partially cancels, arriving both quieter than the tilt asked for and smeared.
+///
+/// Squaring a complex number doubles its phase and squares its magnitude, so dividing by
+/// the magnitude once puts the magnitude back and leaves the doubled phase — and doing that
+/// `k` times raises the phase by `2^k`, which is exactly what a `k`-octave transposition
+/// needs. `magnitude` comes from [`square_root`], which is Newton's method over `+ − × ÷`,
+/// so this stays inside the crate's determinism contract.
+fn raise_by_octaves(real: f64, imaginary: f64, octaves: usize) -> (f64, f64) {
+    let (mut real, mut imaginary) = (real, imaginary);
+    for _ in 0..octaves {
+        let magnitude = square_root(real * real + imaginary * imaginary);
+        if magnitude <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let squared_real = real * real - imaginary * imaginary;
+        let squared_imaginary = 2.0 * real * imaginary;
+        real = squared_real / magnitude;
+        imaginary = squared_imaginary / magnitude;
+    }
+    (real, imaginary)
 }
 
 /// The highest bin below `limit` standing [`BAND_EDGE_THRESHOLD_DB`] above the floor of
@@ -392,11 +442,30 @@ fn average_power_spectrum(source: &InfiniteSource<'_>, body_frames: usize) -> [f
     power
 }
 
-/// Copy the octave below the edge upwards, octave by octave, and restore the spectrum's
-/// Hermitian symmetry so the inverse transform gives a real signal back.
+/// Build the spectrum of the **added band alone**: the octave below the edge transposed
+/// upwards, with everything at or below the edge zeroed, and the Hermitian symmetry
+/// restored so the inverse transform gives a real signal back.
+///
+/// # Why the band below the edge is thrown away rather than passed through
+///
+/// Because the extender then never touches it. Resynthesising the whole signal costs one
+/// round trip through the transform, one overlap-add and — the expensive part — one fresh
+/// rounding to `i16` of every frame of a sample whose tail is already only a step or two
+/// tall. Measured on M10-K5c's harness that cost 0.29 dB of in-band SNR on the plucked
+/// decay: real damage to the band the enhancer had no business changing, in exchange for
+/// nothing.
+///
+/// Synthesising only what is added and summing it onto the original frames leaves the
+/// source's own band **exactly** as it arrived, makes the enhancer's effect strictly
+/// additive, and keeps a loop periodic for the same reason it already was — a periodic
+/// signal plus a periodic addition is periodic.
 fn patch(real: &mut [f64; STFT_SIZE], imaginary: &mut [f64; STFT_SIZE], plan: &Plan) {
     let last_octave = plan.octave_gains.len() - 1;
     let patched_to = plan.patched_to();
+
+    // The transposition first, while the source band is still intact: source bins all sit
+    // below the edge and target bins all sit at or above it, so nothing is read after it
+    // has been written.
     for bin in plan.edge_bin..patched_to {
         let mut source_bin = bin;
         let mut octave = 0usize;
@@ -404,21 +473,29 @@ fn patch(real: &mut [f64; STFT_SIZE], imaginary: &mut [f64; STFT_SIZE], plan: &P
             source_bin /= 2;
             octave += 1;
         }
-        // Source bins all sit below the edge and target bins all sit at or above it, so
-        // nothing is read after it has been written.
         let gain = match plan.content.get(source_bin) {
             Some(true) if octave <= last_octave => plan.octave_gains[octave],
             _ => 0.0,
         };
-        real[bin] = gain * real[source_bin];
-        imaginary[bin] = gain * imaginary[source_bin];
+        let (patched_real, patched_imaginary) = raise_by_octaves(real[source_bin], imaginary[source_bin], octave);
+        real[bin] = gain * patched_real;
+        imaginary[bin] = gain * patched_imaginary;
     }
-    // The Nyquist bin of a real signal has no imaginary part, and it is only this frame's
-    // business when the patch actually reached it.
-    if patched_to > STFT_SIZE / 2 {
-        imaginary[STFT_SIZE / 2] = 0.0;
+
+    // Then everything the source already had, dropped — DC included, which a transposed
+    // band has no business carrying.
+    for bin in 0..plan.edge_bin {
+        real[bin] = 0.0;
+        imaginary[bin] = 0.0;
     }
-    for bin in plan.edge_bin..patched_to.min(STFT_SIZE / 2) {
+    for bin in patched_to..=STFT_SIZE / 2 {
+        real[bin] = 0.0;
+        imaginary[bin] = 0.0;
+    }
+    // The Nyquist bin of a real signal has no imaginary part, and the negative frequencies
+    // are the conjugate of the positive ones, so the inverse transform gives a real signal.
+    imaginary[STFT_SIZE / 2] = 0.0;
+    for bin in 1..STFT_SIZE / 2 {
         real[STFT_SIZE - bin] = real[bin];
         imaginary[STFT_SIZE - bin] = -imaginary[bin];
     }
@@ -501,23 +578,28 @@ mod tests {
         assert_eq!(BandwidthExtender::with_tilt_db(-12).name(), "sbr=-12");
     }
 
-    /// The whole point: a sample with headroom above its content gets content there.
+    /// The whole point: a sample with headroom above its content gets content there, and
+    /// the band below the edge comes back **exactly** as it went in.
     #[test]
-    fn a_band_limited_harmonic_series_gains_energy_above_its_edge() {
+    fn a_band_limited_harmonic_series_gains_energy_above_its_edge_and_keeps_the_band_below_it() {
         let frames = band_limited_harmonics(16_384, 220.0, 4_000.0);
-        let edge_bin = (4_000.0 / RATE * STFT_SIZE as f64) as usize;
+        let sample = one_shot(&frames);
+        let (_, edge_bin, gain) = BandwidthExtender::new().describe(sample).expect("a band-limited sample is extended");
+        assert!(gain > 0.1, "the extension gain collapsed to {gain}");
+
         let before = spectrum(&frames, None);
-        let enhanced = BandwidthExtender::new().enhance(one_shot(&frames));
+        let enhanced = BandwidthExtender::new().enhance(sample);
         assert_eq!(enhanced.frames.len(), frames.len(), "the body length is untouched");
         assert_eq!(enhanced.rate_hz, DEFAULT_REFERENCE_RATE_HZ * 4, "and so is the rate");
         let after = spectrum(&enhanced.frames, None);
 
-        let gained = energy_above(&after, edge_bin + 4) / energy_above(&before, edge_bin + 4).max(1.0e-30);
-        assert!(gained > 10.0, "the band above the edge gained only a factor of {gained}");
-        // And the band below it is left where it was.
-        let below_before: f64 = before[..edge_bin - 4].iter().sum();
-        let below_after: f64 = after[..edge_bin - 4].iter().sum();
-        assert!((below_after / below_before - 1.0).abs() < 0.02, "the band below the edge moved by {}", below_after / below_before - 1.0);
+        let gained = energy_above(&after, edge_bin + 2) / energy_above(&before, edge_bin + 2).max(1.0e-30);
+        assert!(gained > 2.0, "the band above the edge gained only a factor of {gained}");
+        // The patch is additive and stops at the edge, so the band below it is arithmetic
+        // for arithmetic what the source had.
+        let below_before: f64 = before[..edge_bin].iter().sum();
+        let below_after: f64 = after[..edge_bin].iter().sum();
+        assert!((below_after / below_before - 1.0).abs() < 0.001, "the band below the edge moved by {}", below_after / below_before - 1.0);
     }
 
     /// A sample that already fills its band is returned bit-identical: the first refusal.
@@ -627,6 +709,27 @@ mod tests {
         let wrap_step = (body[0] as i32 - body[body.len() - 1] as i32).abs();
         let largest_inside = body.windows(2).map(|pair| (pair[1] as i32 - pair[0] as i32).abs()).max().unwrap_or(0);
         assert!(wrap_step <= largest_inside, "the seam steps by {wrap_step} against {largest_inside} inside the loop");
+    }
+
+    /// Squaring and renormalising keeps the magnitude and doubles the angle, once per
+    /// octave.
+    #[test]
+    fn raising_a_bin_keeps_its_magnitude_and_multiplies_its_phase() {
+        for (real, imaginary) in [(3.0f64, 4.0f64), (-1.0, 0.5), (0.25, -0.75), (1.0, 0.0)] {
+            let magnitude = std::primitive::f64::sqrt(real * real + imaginary * imaginary);
+            let angle = std::primitive::f64::atan2(imaginary, real);
+            for octaves in 0..=3usize {
+                let (raised_real, raised_imaginary) = raise_by_octaves(real, imaginary, octaves);
+                let raised_magnitude = std::primitive::f64::sqrt(raised_real * raised_real + raised_imaginary * raised_imaginary);
+                assert!((raised_magnitude - magnitude).abs() < 1.0e-9, "octave {octaves}: magnitude {raised_magnitude} against {magnitude}");
+                let wanted = angle * (1 << octaves) as f64;
+                let raised_angle = std::primitive::f64::atan2(raised_imaginary, raised_real);
+                let difference = (raised_angle - wanted).rem_euclid(2.0 * core::f64::consts::PI);
+                let wrapped = difference.min(2.0 * core::f64::consts::PI - difference);
+                assert!(wrapped < 1.0e-9, "octave {octaves}: angle {raised_angle} against {wanted}");
+            }
+        }
+        assert_eq!(raise_by_octaves(0.0, 0.0, 1), (0.0, 0.0));
     }
 
     #[test]
