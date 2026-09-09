@@ -355,6 +355,12 @@ const READ_STATE = `
         pans: [...document.querySelectorAll('#channel-body tr')].map((row) => row.children[4]?.textContent.trim()).filter(Boolean),
         headphonePanning: document.getElementById('mod-headphone-panning').checked,
         headphonePanningDisabled: document.getElementById('mod-headphone-panning').disabled,
+        // M10-W4: built from the wasm host's own \`enhancements_json()\`, so the count is
+        // whatever the current build offers rather than a number hard-coded here.
+        enhancementFlags: [...document.querySelectorAll('#enhancement-options input[type=checkbox]')]
+            .reduce((flags, input) => flags | (input.checked ? (1 << Number(input.dataset.bit)) : 0), 0),
+        enhancementCheckboxCount: document.querySelectorAll('#enhancement-options input[type=checkbox]').length,
+        enhancementCheckboxesDisabled: [...document.querySelectorAll('#enhancement-options input[type=checkbox]')].every((input) => input.disabled),
         mutes: [...document.querySelectorAll('#channel-body button')].map((button) => button.textContent.trim()),
         elapsed: text('elapsed'),
         duration: text('duration'),
@@ -431,12 +437,48 @@ async function run(executable, mode) {
         await page.send('Page.reload', { ignoreCache: true });
         await page.waitFor('the reloaded page module', "document.documentElement.dataset.playerReady === 'true'");
         assert.equal(await page.evaluate("return document.getElementById('mod-headphone-panning').checked;"), false, 'an older v1 preference object restores as unchecked');
+
+        // ── M10-W4: a persisted enhancement choice restores onto the checkboxes ─────
+        //
+        // The enhancement checkboxes do not exist until the worklet's first `ready`
+        // message arrives (`enhancements_json()`), so the restore is only observable once
+        // audio has started — unlike the panning checkbox above, which is static HTML.
+        await page.evaluate("localStorage.setItem('starplayer.output-and-mixer.v1', JSON.stringify({ headphoneFriendlyModPanning: false, enhancementFlags: 1 })); return true;");
+        // `restorePreferences()` runs once, at page load: the new record only takes effect
+        // after another reload, exactly as the v1-shape check above needed one. This is
+        // also where this run's real "Start audio" happens — a reload clears the
+        // `force-fallback` checkbox along with everything else, so `mode === 'fallback'`
+        // has to be reapplied here rather than after a second, separate reload.
+        await page.send('Page.reload', { ignoreCache: true });
+        await page.waitFor('the page reloaded for the enhancement restore check', "document.documentElement.dataset.playerReady === 'true'");
         if (mode === 'fallback') {
             await page.evaluate("document.getElementById('force-fallback').checked = true; return true;");
         }
-
         await page.evaluate("document.getElementById('start-audio').click(); return true;");
         await page.waitFor('the AudioWorklet', "document.getElementById('transport-chip').textContent === 'audio ready'");
+        await page.waitFor('the enhancement checkboxes to be built', "document.querySelectorAll('#enhancement-options input[type=checkbox]').length > 0");
+        const restoredEnhancementFlags = await page.evaluate(
+            "return [...document.querySelectorAll('#enhancement-options input[type=checkbox]')].reduce((flags, input) => flags | (input.checked ? (1 << Number(input.dataset.bit)) : 0), 0);"
+        );
+        assert.equal(restoredEnhancementFlags, 1, 'a persisted enhancement choice restores onto the checkboxes once they exist');
+        report.enhancementRestored = restoredEnhancementFlags;
+        // Reset for the rest of the run: no module is loaded yet, so unchecking here only
+        // persists the choice rather than reloading anything (`applyLoadOptions`'s
+        // `state.currentModuleBytes === null` early-out).
+        await page.evaluate(`
+            for (const checkbox of document.querySelectorAll('#enhancement-options input[type=checkbox]')) {
+                if (checkbox.checked) { checkbox.checked = false; checkbox.dispatchEvent(new Event('change')); }
+            }
+            return true;
+        `);
+        assert.equal(
+            await page.evaluate("return [...document.querySelectorAll('#enhancement-options input[type=checkbox]')].every((input) => !input.checked);"),
+            true,
+            'the enhancement checkboxes reset for the rest of the run'
+        );
+
+        // Audio is already started above (the enhancement-restore check needed it); the
+        // rest of the run continues from here.
 
         // ── headphone-friendly MOD panning ─────────────────────────────────────────
         await loadFile(page, modBytes, 'headphones.mod');
@@ -820,6 +862,90 @@ async function run(executable, mode) {
         report.multiZipLabel = swapped.moduleDetail.split(' · ')[0];
         report.retiredAfterSwap = swapped.retired;
         report.secondTitle = swapped.title;
+
+        // ── load-time sample enhancement checkboxes (M10-W4) ────────────────────────
+        //
+        // PETRI.S3M (swapped in above) is loaded and playing here — a non-MOD format,
+        // which proves the enhancement checkboxes are not MOD-specific like the panning
+        // option — and large enough (K5a's research measured it at 63 KB plain, 250 KB
+        // under sinc4x) that the wasm memory line reliably moves when the upsampler runs.
+        await page.waitFor('the enhancement checkboxes to be built', "document.querySelectorAll('#enhancement-options input[type=checkbox]').length > 0");
+        const beforeEnhance = await page.evaluate(READ_STATE);
+        assert.equal(beforeEnhance.enhancementFlags, 0, 'enhancements default to off');
+        assert.ok(beforeEnhance.enhancementCheckboxCount > 0, 'the load panel built at least one enhancement checkbox from enhancements_json()');
+
+        const toggleEnhancementCheckbox = async (index, checked) => page.evaluate(`
+            const checkboxes = [...document.querySelectorAll('#enhancement-options input[type=checkbox]')];
+            const target = checkboxes[${index}];
+            target.checked = ${checked};
+            target.dispatchEvent(new Event('change'));
+            return target.disabled;
+        `);
+
+        // Each checkbox toggles independently: on, wait for its own reload, then off again.
+        for (let index = 0; index < beforeEnhance.enhancementCheckboxCount; index += 1) {
+            const bit = await page.evaluate(`return Number(document.querySelectorAll('#enhancement-options input[type=checkbox]')[${index}].dataset.bit);`);
+
+            const disabledDuringOn = await toggleEnhancementCheckbox(index, true);
+            assert.equal(disabledDuringOn, true, `checkbox ${index} is disabled while its own reload is in flight`);
+            await page.waitFor(`every enhancement checkbox re-enabled after enabling checkbox ${index}`, "[...document.querySelectorAll('#enhancement-options input[type=checkbox]')].every((input) => !input.disabled)");
+            await page.waitFor('the enhanced module to resume playing', "document.getElementById('transport-chip').textContent === 'playing'");
+            const onState = await page.evaluate(READ_STATE);
+            assert.equal(onState.errorShown, false, `enabling checkbox ${index} raised an error: ${onState.errorText}`);
+            assert.equal(onState.enhancementFlags & (1 << bit), 1 << bit, `checkbox ${index}'s bit is set once its own reload lands`);
+
+            const disabledDuringOff = await toggleEnhancementCheckbox(index, false);
+            assert.equal(disabledDuringOff, true, `checkbox ${index} is disabled while turning it back off`);
+            await page.waitFor(`every enhancement checkbox re-enabled after disabling checkbox ${index}`, "[...document.querySelectorAll('#enhancement-options input[type=checkbox]')].every((input) => !input.disabled)");
+            await page.waitFor('the un-enhanced module to resume playing', "document.getElementById('transport-chip').textContent === 'playing'");
+            const offState = await page.evaluate(READ_STATE);
+            assert.equal(offState.enhancementFlags & (1 << bit), 0, `checkbox ${index}'s bit clears once its own reload lands`);
+        }
+
+        // Re-enable the sinc upsampler (bit 0) alone, and check the memory line: a reload
+        // is exactly where memory is *allowed* to move (the rebuild is a real allocation
+        // outside process(), like any other load), and it must then hold steady through
+        // ordinary playback, exactly like every other reload in this file. Whether it
+        // visibly moves depends on how much of `HEAP_RESERVE_BYTES`'s slack earlier loads
+        // in this run already used — PETRI's own +187 KB (K5a's research measurement) is
+        // small next to a 16 MiB reservation, so this reports the observation rather than
+        // asserting a specific direction; "GREW" appearing on the *load* itself would be
+        // wrong regardless, since only a page count freshly settled by `bindViews()` after
+        // activation should ever be reported at that instant.
+        const sincIndex = await page.evaluate(
+            "return [...document.querySelectorAll('#enhancement-options input[type=checkbox]')].findIndex((input) => input.dataset.bit === '0');"
+        );
+        assert.ok(sincIndex >= 0, 'the sinc upsampler checkbox exists at bit 0');
+        await toggleEnhancementCheckbox(sincIndex, true);
+        await page.waitFor('the sinc4x reload to settle', "[...document.querySelectorAll('#enhancement-options input[type=checkbox]')].every((input) => !input.disabled)");
+        await page.waitFor('the enhanced module to resume playing', "document.getElementById('transport-chip').textContent === 'playing'");
+        const afterSinc = await page.evaluate(READ_STATE);
+        report.enhancementMemory = afterSinc.memory === beforeEnhance.memory
+            ? `${beforeEnhance.memory} (unchanged: existing heap headroom absorbed the rebuild)`
+            : `${beforeEnhance.memory} -> ${afterSinc.memory}`;
+
+        await delay(2000);
+        const afterSincPlaying = await page.evaluate(READ_STATE);
+        assert.equal(afterSincPlaying.memory, afterSinc.memory, `wasm memory changed during playback after enabling sinc4x: ${afterSincPlaying.memory}`);
+        assert.ok(afterSincPlaying.memory.includes('stable'), `wasm memory grew during playback after enabling sinc4x: ${afterSincPlaying.memory}`);
+
+        const storedEnhance = await page.evaluate("return localStorage.getItem('starplayer.output-and-mixer.v1');");
+        assert.match(storedEnhance, /"enhancementFlags":1/, 'the enhancement choice is persisted alongside the existing v1 record');
+        assert.match(storedEnhance, /"headphoneFriendlyModPanning":/, 'the v1 record keeps its existing key');
+
+        // Turn it back off so the rest of the run — which assumes an un-enhanced module
+        // for its own memory and timing assertions — is unaffected.
+        await toggleEnhancementCheckbox(sincIndex, false);
+        await page.waitFor('the sinc4x-off reload to settle', "[...document.querySelectorAll('#enhancement-options input[type=checkbox]')].every((input) => !input.disabled)");
+        await page.waitFor('the module to resume playing without the enhancer', "document.getElementById('transport-chip').textContent === 'playing'");
+        const afterSincOff = await page.evaluate(READ_STATE);
+        assert.equal(afterSincOff.enhancementFlags, 0, 'the sinc4x checkbox reload turned it back off');
+
+        // ── the panning toggle's race guard generalised to `applyLoadOptions` ────────
+        //
+        // The concurrent-load race test above (`panningRace`) already exercises this same
+        // shared function through the panning checkbox; nothing about the race depends on
+        // which load option changed, so it is not duplicated per checkbox here.
 
         // ── the retained ZIP keeps its other tracks one click away ──────────────────
         const trackPicker = await page.evaluate(`
