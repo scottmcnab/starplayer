@@ -67,6 +67,10 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             // `install_insert` and `OPCODE_INSERT_PARAM` actually accept. Needs no loaded
             // module and no prior state, so it rides the very first message.
             effects: this.wasm.effects_json(),
+            // M10-W4: every load-time sample enhancer with a checkbox bit, read straight
+            // from `starplayer::enhance::CATALOGUE` so the load panel's checkboxes can
+            // never drift from what `loadModule`'s `enhancementFlags` actually accepts.
+            enhancements: this.wasm.enhancements_json(),
         });
     }
 
@@ -118,6 +122,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                 const generation = this.wasm.load_module_with_options(
                     new Uint8Array(message.bytes),
                     message.headphoneFriendlyModPanning === true,
+                    message.enhancementFlags >>> 0 || 0,
                 );
                 // Activation may consume more of the pre-reserved heap. Rebind once here,
                 // outside process; any growth after this point is a fatal RT-path defect.
@@ -127,6 +132,10 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                     requestId: message.requestId,
                     generation,
                     memoryBytes: this.stableMemoryBytes,
+                    // M10-W4: what the load actually did, which can be narrower than what
+                    // was asked for — see `build_enhancement`'s frame-budget fallback.
+                    appliedEnhancementFlags: this.wasm.applied_enhancement_flags(),
+                    appliedEnhancementFactor: this.wasm.applied_enhancement_factor(),
                 });
             } catch (error) {
                 this.port.postMessage({

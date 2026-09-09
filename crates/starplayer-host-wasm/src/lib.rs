@@ -74,6 +74,21 @@ pub const MAX_OUTPUT_CHANNELS: usize = 2;
 /// resolution.
 const HEAP_RESERVE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The largest total PCM frame count a load-time enhancer rebuild may produce. The IT
+/// loader's own `decoded_pcm_budget` is load-time only and a rebuild bypasses it entirely,
+/// so the host enforces its own ceiling here: a `sinc4x` request that would cross it is
+/// dropped to `sinc2x`, and a `sinc2x` request that would still cross it is dropped to
+/// identity (M10-W4 deliverable 1). See [`build_enhancement`].
+const ENHANCE_FRAME_BUDGET: usize = 16_000_000;
+
+/// [`CATALOGUE`](starplayer::enhance::CATALOGUE)'s bit for the sinc-upsampler checkbox.
+/// Reused in [`Host::last_applied_enhancement_flags`] for whichever factor actually ran —
+/// `sinc2x` has no bit of its own, so a budget fallback still reports through this bit,
+/// and [`Host::last_enhancement_factor`] is what tells the two apart.
+const ENHANCE_FLAG_UPSAMPLE: u32 = 1 << 0;
+/// [`CATALOGUE`](starplayer::enhance::CATALOGUE)'s bit for the loop-seam smoother checkbox.
+const ENHANCE_FLAG_LOOP: u32 = 1 << 1;
+
 /// Fraction of the held master peak that survives one quantum: about a 200 ms fall from
 /// full scale to silence at 48 kHz, which reads well on a bar.
 const MASTER_PEAK_DECAY_PER_QUANTUM: f32 = 0.94;
@@ -167,13 +182,17 @@ const SCOPE_VALUES: usize = SCOPE_CHANNELS * SCOPE_WINDOW_BUCKETS;
 /// would do inside `process()`.
 const SCOPE_REFRESH_QUANTA: u64 = 4;
 
-/// Decode `bytes` with the web player's own loading preference.
+/// Decode `bytes` with the web player's own loading preferences, then apply
+/// `enhancement_flags` as a load-time [`Module::enhanced`] rebuild (M10-W4). Returns the
+/// finished module alongside the flags actually applied and the upsample factor that ran
+/// (1 for none), which may be smaller than what `enhancement_flags` asked for — see
+/// [`build_enhancement`].
 ///
 /// [`Player::load`] would do the autodetection, but not the MOD stereo-separation option:
 /// that is a *player* preference the page exposes, so the decode happens here and the
 /// finished module goes to [`Player::load_module`].
-fn decode(bytes: &[u8], headphone_friendly_mod_panning: bool) -> Result<Module, starplayer::core::Error> {
-    match starplayer::probe(bytes) {
+fn decode(bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags: u32, rate_ceiling_hz: u32) -> Result<(Module, u32, u32), starplayer::core::Error> {
+    let module = match starplayer::probe(bytes) {
         Some(ModuleFormat::Mod) => starplayer::mod_file::load_with_options(bytes, starplayer::mod_file::LoadOptions {
             stereo_separation: starplayer::mod_file::StereoSeparation::percent(if headphone_friendly_mod_panning { 60 } else { 100 }),
         }),
@@ -182,7 +201,54 @@ fn decode(bytes: &[u8], headphone_friendly_mod_panning: bool) -> Result<Module, 
         Some(ModuleFormat::Xm) => starplayer::xm::load(bytes),
         Some(ModuleFormat::It) => starplayer::it::load(bytes),
         _ => Err(starplayer::core::Error::BadMagic),
+    }?;
+    if enhancement_flags == 0 {
+        return Ok((module, 0, 1));
     }
+    let (chain, applied_flags, factor) = build_enhancement(enhancement_flags, module.pcm().len(), rate_ceiling_hz);
+    let module = match chain {
+        Some(chain) => module.enhanced(&chain)?,
+        None => module,
+    };
+    Ok((module, applied_flags, factor))
+}
+
+/// Build the enhancer chain `enhancement_flags` (the same bits [`exports::enhancements_json`]
+/// describes) asks for, downgrading a requested 4x upsample to 2x and then to identity if
+/// `source_frames × factor` would cross [`ENHANCE_FRAME_BUDGET`] — a rebuild bypasses the
+/// IT loader's own load-time budget entirely, so nothing else limits it. `rate_ceiling_hz`
+/// is passed straight through to the upsampler, exactly as `starplayer::enhance::from_flags`
+/// would.
+///
+/// Returns the chain (`None` for the identity — no enhancer ran at all), the flags actually
+/// engaged (`sinc2x` reports through [`ENHANCE_FLAG_UPSAMPLE`], the same bit `sinc4x` would
+/// have used, since the checkbox catalogue gives it no bit of its own), and the upsample
+/// factor that actually ran, 1 meaning none.
+fn build_enhancement(enhancement_flags: u32, source_frames: usize, rate_ceiling_hz: u32) -> (Option<starplayer::enhance::Chain>, u32, u32) {
+    use starplayer::enhance::enhancer_for_id;
+
+    let wants_upsample = enhancement_flags & ENHANCE_FLAG_UPSAMPLE != 0;
+    let wants_loop = enhancement_flags & ENHANCE_FLAG_LOOP != 0;
+
+    let mut factor: u32 = if wants_upsample { 4 } else { 1 };
+    while factor > 1 && source_frames.saturating_mul(factor as usize) > ENHANCE_FRAME_BUDGET {
+        factor = if factor == 4 { 2 } else { 1 };
+    }
+
+    let mut chain = starplayer::enhance::Chain::new();
+    let mut applied_flags = 0u32;
+    if factor > 1
+        && let Some(enhancer) = enhancer_for_id(if factor == 4 { "sinc4x" } else { "sinc2x" }, Some(rate_ceiling_hz))
+    {
+        chain = chain.then(enhancer);
+        applied_flags |= ENHANCE_FLAG_UPSAMPLE;
+    }
+    if wants_loop && let Some(enhancer) = enhancer_for_id("loop", None) {
+        chain = chain.then(enhancer);
+        applied_flags |= ENHANCE_FLAG_LOOP;
+    }
+    let chain = if chain.is_empty() { None } else { Some(chain) };
+    (chain, applied_flags, factor)
 }
 
 /// The wire spelling of [`AtEnd`], or `None` for a value the page should never have sent.
@@ -232,6 +298,18 @@ struct Host {
     module_generation: u32,
     retired_modules_collected: u32,
     last_peak: f32,
+    /// The context's own negotiated rate (`player.spec().sample_rate_hz`), stored so
+    /// [`Host::load_module_with_options`] does not have to reach back into the player just
+    /// to compute the upsampler's rate ceiling.
+    sample_rate_hz: u32,
+    /// The enhancement flags actually engaged by the most recent load, reported to the page
+    /// through [`exports::applied_enhancement_flags`]. May be narrower than what was asked
+    /// for — see [`build_enhancement`].
+    last_applied_enhancement_flags: u32,
+    /// The upsample factor the most recent load actually ran at (1, 2 or 4), reported
+    /// through [`exports::applied_enhancement_factor`] so the page can tell a budget
+    /// fallback from the request it made.
+    last_enhancement_factor: u32,
 }
 
 impl Host {
@@ -250,6 +328,7 @@ impl Host {
             preferred_block_frames: Some(RENDER_QUANTUM as u32),
         };
         let mut player = Player::open(&mut backend, None, requested, active_mode).map_err(|error| error.to_string())?;
+        let negotiated_sample_rate_hz = player.spec().sample_rate_hz;
         let scopes = player.take_scope_readers().ok_or_else(|| String::from("a new engine owns its scope readers"))?;
         // A `Player` opens with its transport silent and its musical clock stopped; the page
         // expects a module to sound the moment it is activated, rather than after a separate
@@ -273,21 +352,33 @@ impl Host {
             module_generation: 0,
             retired_modules_collected: 0,
             last_peak: 0.0,
+            sample_rate_hz: negotiated_sample_rate_hz,
+            last_applied_enhancement_flags: 0,
+            last_enhancement_factor: 1,
         })
     }
 
     /// Decode, construct and queue a module. Called from the worklet's message handler,
     /// never from `process()`; a failed decode leaves the previous module and source live.
     #[cfg(test)]
-    fn load_module(&mut self, bytes: &[u8]) -> Result<u32, String> { self.load_module_with_options(bytes, false) }
+    fn load_module(&mut self, bytes: &[u8]) -> Result<u32, String> { self.load_module_with_options(bytes, false, 0) }
 
-    fn load_module_with_options(&mut self, bytes: &[u8], headphone_friendly_mod_panning: bool) -> Result<u32, String> {
-        let module = Arc::new(decode(bytes, headphone_friendly_mod_panning).map_err(|error| error.to_string())?);
+    /// `rate_ceiling_hz` for the upsampler is twice the context's own negotiated rate: the
+    /// mixer interpolates between real frames up to that rate, and doubling it (rather than
+    /// passing the rate itself) leaves room for a resampling interpolator to still find
+    /// something to do above the output rate. See [`build_enhancement`] for the frame-budget
+    /// fallback `enhancement_flags` may trigger.
+    fn load_module_with_options(&mut self, bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags: u32) -> Result<u32, String> {
+        let rate_ceiling_hz = self.sample_rate_hz.saturating_mul(2);
+        let (module, applied_flags, factor) =
+            decode(bytes, headphone_friendly_mod_panning, enhancement_flags, rate_ceiling_hz).map_err(|error| error.to_string())?;
         // Everything expensive — the scan, the sequencer, the per-channel state — happens
         // inside this call, on this thread. Only a `Box` and two `Arc`s cross to the render
         // callback, and whatever they replace comes back here to be dropped.
-        self.player.load_module(module).map_err(|error| error.to_string())?;
+        self.player.load_module(Arc::new(module)).map_err(|error| error.to_string())?;
         self.module_generation = self.module_generation.wrapping_add(1).max(1);
+        self.last_applied_enhancement_flags = applied_flags;
+        self.last_enhancement_factor = factor;
         Ok(self.module_generation)
     }
 
@@ -593,17 +684,66 @@ mod exports {
 
     /// Decode and activate one validated native module byte buffer outside `process()`.
     #[wasm_bindgen]
-    pub fn load_module(bytes: &[u8]) -> Result<u32, JsValue> { load_module_with_options(bytes, false) }
+    pub fn load_module(bytes: &[u8]) -> Result<u32, JsValue> { load_module_with_options(bytes, false, 0) }
 
-    /// Decode and activate a module with web-player loading preferences. The option is
-    /// deliberately MOD-specific; every other format continues through its native loader.
+    /// Decode and activate a module with web-player loading preferences. The panning
+    /// option is deliberately MOD-specific; every other format continues through its
+    /// native loader. `enhancement_flags` is the bit word [`enhancements_json`] describes
+    /// (M10-W4); [`applied_enhancement_flags`] and [`applied_enhancement_factor`] report
+    /// what this call actually did, since a frame-budget fallback can narrow the request.
     #[wasm_bindgen]
-    pub fn load_module_with_options(bytes: &[u8], headphone_friendly_mod_panning: bool) -> Result<u32, JsValue> {
+    pub fn load_module_with_options(bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags: u32) -> Result<u32, JsValue> {
         HOST.with(|cell| {
             let mut slot = cell.try_borrow_mut().map_err(|_| JsValue::from_str("the worklet host is busy"))?;
             let host = slot.as_mut().ok_or_else(|| JsValue::from_str("the worklet host is not initialized"))?;
-            host.load_module_with_options(bytes, headphone_friendly_mod_panning).map_err(|message| JsValue::from_str(&message))
+            host.load_module_with_options(bytes, headphone_friendly_mod_panning, enhancement_flags).map_err(|message| JsValue::from_str(&message))
         })
+    }
+
+    /// The enhancement flags actually engaged by the most recent [`load_module_with_options`]
+    /// call (M10-W4). Narrower than what was asked for when the frame budget forced a
+    /// fallback; see [`applied_enhancement_factor`] for which upsample size actually ran.
+    #[wasm_bindgen]
+    pub fn applied_enhancement_flags() -> u32 { with_host(0, |host| host.last_applied_enhancement_flags) }
+
+    /// The upsample factor the most recent load actually ran at: 4, 2, or 1 for none —
+    /// smaller than the checkbox asked for exactly when the frame budget forced a
+    /// fallback, which is what the page reports in its status line.
+    #[wasm_bindgen]
+    pub fn applied_enhancement_factor() -> u32 { with_host(1, |host| host.last_enhancement_factor) }
+
+    /// Every load-time sample enhancer with a checkbox bit, as a JSON array — read
+    /// straight from `starplayer::enhance::CATALOGUE` so the page's load panel can never
+    /// drift from what `load_module_with_options`'s `enhancement_flags` actually accepts
+    /// (M10-W4, mirroring [`effects_json`]'s contract for the Effects panel).
+    ///
+    /// One object per checkbox-eligible entry, in `CATALOGUE` order:
+    /// `{"bit", "id", "label", "description"}`. `starplayer-enhance`'s command-line-only
+    /// entries (`NO_FLAG_BIT`, currently `sinc2x`) are omitted — a command line spells
+    /// them by id, but a checkbox has no bit to set. Callable before [`init`] — it names
+    /// what this build can do, not what any particular host instance has loaded.
+    #[wasm_bindgen]
+    pub fn enhancements_json() -> String {
+        use std::fmt::Write;
+
+        let mut json = String::from("[");
+        let mut first = true;
+        for descriptor in starplayer::enhance::CATALOGUE.iter() {
+            if descriptor.flag_bit == starplayer::enhance::NO_FLAG_BIT {
+                continue;
+            }
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            let _ = write!(
+                json,
+                r#"{{"bit":{},"id":"{}","label":"{}","description":"{}"}}"#,
+                descriptor.flag_bit, descriptor.id, descriptor.label, descriptor.description
+            );
+        }
+        json.push(']');
+        json
     }
 
     /// Decode one SAB/fallback wire record into the wasm-side fixed command ring.
@@ -786,11 +926,15 @@ mod exports {
 mod tests {
     use super::*;
     use starplayer::core::Interpolator;
+    use starplayer::enhance::SampleEnhancer;
     use starplayer::engine::{EndReason, MixPathKind, OutputDepth};
     use starplayer_host::SeekKind;
     use std::collections::BTreeSet;
 
     const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
+    /// The largest module fixture committed to the repository (36 kB): W4 research point
+    /// 1's timing measurement runs against this one, not `FIXTURE`.
+    const LARGEST_FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M");
 
     fn minimal_mod() -> Vec<u8> {
         const SAMPLE_FRAMES: usize = 256;
@@ -1011,23 +1155,141 @@ mod tests {
     fn mod_headphone_option_changes_only_mod_initial_panning() {
         let mut host = Host::new(48_000);
         let mod_bytes = minimal_mod();
-        assert_eq!(host.load_module_with_options(&mod_bytes, false), Ok(1));
+        assert_eq!(host.load_module_with_options(&mod_bytes, false, 0), Ok(1));
         let hard: Vec<i16> = host.player.module().expect("MOD retained").header().default_pan.iter().map(|pan| pan.to_bits()).collect();
         assert_eq!(hard, [-32_767, 32_767, 32_767, -32_767]);
-        assert_eq!(host.load_module_with_options(&mod_bytes, true), Ok(2));
+        assert_eq!(host.load_module_with_options(&mod_bytes, true, 0), Ok(2));
         let headphone: Vec<i16> = host.player.module().expect("MOD retained").header().default_pan.iter().map(|pan| pan.to_bits()).collect();
         assert_eq!(headphone, [-19_660, 19_660, 19_660, -19_660]);
 
-        assert_eq!(host.load_module_with_options(FIXTURE, false), Ok(3));
+        assert_eq!(host.load_module_with_options(FIXTURE, false, 0), Ok(3));
         let s3m_authentic = host.player.module().expect("S3M retained").header().default_pan.to_vec();
-        assert_eq!(host.load_module_with_options(FIXTURE, true), Ok(4));
+        assert_eq!(host.load_module_with_options(FIXTURE, true, 0), Ok(4));
         assert_eq!(host.player.module().expect("S3M retained").header().default_pan.as_ref(), s3m_authentic.as_slice());
 
         let mtm_bytes = minimal_mtm();
-        assert_eq!(host.load_module_with_options(&mtm_bytes, false), Ok(5));
+        assert_eq!(host.load_module_with_options(&mtm_bytes, false, 0), Ok(5));
         let mtm_authentic = host.player.module().expect("MTM retained").header().default_pan.to_vec();
-        assert_eq!(host.load_module_with_options(&mtm_bytes, true), Ok(6));
+        assert_eq!(host.load_module_with_options(&mtm_bytes, true, 0), Ok(6));
         assert_eq!(host.player.module().expect("MTM retained").header().default_pan.as_ref(), mtm_authentic.as_slice());
+    }
+
+    // ── M10-W4: the enhancement checkboxes' wasm surface ────────────────────────────
+
+    #[test]
+    fn enhancement_flags_zero_is_the_plain_load() {
+        let mut plain = Host::new(48_000);
+        assert!(plain.load_module(FIXTURE).is_ok());
+        let plain_lengths: Vec<u32> = plain.player.module().expect("retained").samples().iter().map(|sample| sample.length_frames()).collect();
+
+        let mut unflagged = Host::new(48_000);
+        assert_eq!(unflagged.load_module_with_options(FIXTURE, false, 0), Ok(1));
+        let unflagged_lengths: Vec<u32> =
+            unflagged.player.module().expect("retained").samples().iter().map(|sample| sample.length_frames()).collect();
+        assert_eq!(unflagged_lengths, plain_lengths, "flags 0 is byte-identical to the no-options load");
+        assert_eq!(unflagged.last_applied_enhancement_flags, 0);
+        assert_eq!(unflagged.last_enhancement_factor, 1);
+    }
+
+    #[test]
+    fn the_sinc4x_flag_quadruples_every_samples_length_and_records_the_scale() {
+        let mut plain = Host::new(48_000);
+        assert!(plain.load_module(FIXTURE).is_ok());
+        let plain_lengths: Vec<u32> = plain.player.module().expect("retained").samples().iter().map(|sample| sample.length_frames()).collect();
+        assert!(plain_lengths.iter().all(|length| *length > 0), "the fixture actually carries samples to enhance");
+
+        let mut enhanced = Host::new(48_000);
+        assert_eq!(enhanced.load_module_with_options(FIXTURE, false, ENHANCE_FLAG_UPSAMPLE), Ok(1));
+        let enhanced_module = enhanced.player.module().expect("retained");
+        for (plain_length, sample) in plain_lengths.iter().zip(enhanced_module.samples().iter()) {
+            assert_eq!(sample.length_frames(), plain_length * 4, "sinc4x quadruples every sample's stored length");
+            assert_eq!(sample.rate_scale_log2(), 2, "a 4x rebuild is log2(4) = 2");
+        }
+        assert_eq!(enhanced.last_applied_enhancement_flags, ENHANCE_FLAG_UPSAMPLE, "the upsample bit reports as engaged");
+        assert_eq!(enhanced.last_enhancement_factor, 4, "and at the requested factor, since the fixture is well under budget");
+    }
+
+    #[test]
+    fn a_source_too_large_for_any_upsample_still_runs_the_loop_smoother() {
+        // Larger than `ENHANCE_FRAME_BUDGET` even at 2x: the upsample bit is asked for but
+        // nothing runs, while the loop bit — unaffected by the budget — still does.
+        let source_frames = ENHANCE_FRAME_BUDGET;
+        let (chain, applied_flags, factor) = build_enhancement(ENHANCE_FLAG_UPSAMPLE | ENHANCE_FLAG_LOOP, source_frames, 48_000);
+        assert!(chain.is_some(), "the loop smoother still runs");
+        assert_eq!(chain.map(|chain| chain.name()), Some(String::from("loop=64")));
+        assert_eq!(applied_flags, ENHANCE_FLAG_LOOP, "the upsample bit did not survive an impossible budget");
+        assert_eq!(factor, 1);
+    }
+
+    #[test]
+    fn build_enhancement_downgrades_a_tiny_budget_step_by_step() {
+        // Independent of any fixture's real size: a synthetic frame count exercises every
+        // rung of the fallback deterministically.
+        let (chain_4x_fits, flags_4x_fits, factor_4x_fits) = build_enhancement(ENHANCE_FLAG_UPSAMPLE, 1_000, 48_000);
+        assert!(chain_4x_fits.is_some());
+        assert_eq!(flags_4x_fits, ENHANCE_FLAG_UPSAMPLE);
+        assert_eq!(factor_4x_fits, 4, "1,000 x 4 is nowhere near the budget");
+
+        let (chain_2x, flags_2x, factor_2x) = build_enhancement(ENHANCE_FLAG_UPSAMPLE, ENHANCE_FRAME_BUDGET / 3, 48_000);
+        assert!(chain_2x.is_some());
+        assert_eq!(flags_2x, ENHANCE_FLAG_UPSAMPLE);
+        assert_eq!(factor_2x, 2, "x4 would cross the budget, x2 does not");
+
+        let (chain_identity, flags_identity, factor_identity) = build_enhancement(ENHANCE_FLAG_UPSAMPLE, ENHANCE_FRAME_BUDGET, 48_000);
+        assert!(chain_identity.is_none(), "even x2 crosses the budget at this size, so nothing runs");
+        assert_eq!(flags_identity, 0);
+        assert_eq!(factor_identity, 1);
+    }
+
+    #[test]
+    fn an_unknown_enhancement_bit_is_ignored_like_from_flags() {
+        let mut host = Host::new(48_000);
+        assert_eq!(host.load_module_with_options(FIXTURE, false, 0xFFFF_FFFC), Ok(1), "no known bit is set");
+        assert_eq!(host.last_applied_enhancement_flags, 0);
+        assert_eq!(host.last_enhancement_factor, 1);
+    }
+
+    #[test]
+    fn enhancements_json_names_every_checkbox_eligible_enhancer_and_its_bit() {
+        let json = exports::enhancements_json();
+        for descriptor in starplayer::enhance::CATALOGUE.iter() {
+            if descriptor.flag_bit == starplayer::enhance::NO_FLAG_BIT {
+                assert!(!json.contains(&format!(r#""id":"{}""#, descriptor.id)), "{} has no checkbox bit and must not appear", descriptor.id);
+                continue;
+            }
+            assert!(json.contains(&format!(r#""bit":{}"#, descriptor.flag_bit)), "{}: missing bit in enhancements_json", descriptor.id);
+            assert!(json.contains(&format!(r#""id":"{}""#, descriptor.id)), "{}: missing from enhancements_json", descriptor.id);
+            assert!(json.contains(&format!(r#""label":"{}""#, descriptor.label)), "{}: missing label", descriptor.id);
+        }
+    }
+
+    /// W4 research point 1: how long a `sinc4x` rebuild of the largest fixture in the
+    /// repository takes. This is `Module::enhanced` running natively (`cargo test` builds
+    /// this crate's `rlib` for the host target, not wasm) rather than a genuine
+    /// worklet-thread measurement — see the task's Research resolution for why that is the
+    /// honest number available here. Also asserts a generous upper bound so a real
+    /// regression in the polyphase filter shows up as a test failure, not just a slow page.
+    #[test]
+    fn a_sinc4x_rebuild_of_the_largest_fixture_completes_quickly() {
+        // Two loads on the same already-constructed `Host` (so `Host::new`'s own engine
+        // and ring allocation, unrelated to the enhancer, is excluded from both) isolate
+        // what the enhancer itself costs: the plain load is the baseline, and the
+        // difference is `Module::enhanced`'s own polyphase-filter work.
+        let mut host = Host::new(48_000);
+        let plain_started = std::time::Instant::now();
+        assert_eq!(host.load_module_with_options(LARGEST_FIXTURE, false, 0), Ok(1));
+        let plain_elapsed = plain_started.elapsed();
+
+        let enhanced_started = std::time::Instant::now();
+        assert_eq!(host.load_module_with_options(LARGEST_FIXTURE, false, ENHANCE_FLAG_UPSAMPLE), Ok(2));
+        let enhanced_elapsed = enhanced_started.elapsed();
+        assert_eq!(host.last_enhancement_factor, 4, "PETRI.S3M is nowhere near the frame budget, so the full 4x ran");
+
+        eprintln!(
+            "W4 research point 1: PETRI.S3M (36 kB) plain load {plain_elapsed:?}, sinc4x load {enhanced_elapsed:?} \
+             (native `cargo test`, unoptimized; not the worklet thread — see the task's Research resolution)"
+        );
+        assert!(enhanced_elapsed.as_millis() < 1_000, "a sinc4x rebuild of the largest fixture took {enhanced_elapsed:?}, which is surprisingly slow for 36 kB");
     }
 
     #[test]

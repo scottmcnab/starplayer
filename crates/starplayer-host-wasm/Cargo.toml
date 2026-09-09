@@ -13,7 +13,12 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-starplayer = { workspace = true, features = ["std", "telemetry"] }
+# M10-K5a/W4: `enhance` gives the worklet `starplayer::enhance::{CATALOGUE, from_flags}`
+# for the load-time sample-enhancer checkboxes. It is enabled unconditionally, not as an
+# optional feature of this crate, because the packaged web player is built with
+# `cargo xtask wasm`'s plain `cargo build -p starplayer-host-wasm` and the checkboxes must
+# work in that build, unlike `simd` below, which the shipped page deliberately excludes.
+starplayer = { workspace = true, features = ["std", "telemetry", "enhance"] }
 # The backend-neutral half of a host. This crate implements `AudioBackend` over the
 # browser's audio graph and drives `Player` through it, so the engine arms, the transport,
 # the song fade, the seek mailbox and the output-depth post-stage all live there (task D9).

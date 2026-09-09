@@ -154,17 +154,53 @@ At phone width the channel and pattern tables scroll horizontally. Collapsing a 
 row or paginating channels would hide the relationship between instrument, note, VU and
 the English effect name; a deliberate horizontal swipe preserves it.
 
-The load panel's **Headphone-friendly MOD panning** option narrows MOD's authentic hard
-L-R-R-L defaults to the same symmetric 60% positions used by ordinary stereo S3Ms. It
-does not affect S3M, MTM, or later MOD panning effects. Changing it while a MOD is active
-reloads the retained bytes at the sounding order and restores transport, volume, and
-channel mutes; the old module remains live if decoding fails, and the persisted preference
-is put back whether or not another load has started since.
+## Load options (M10-W4)
 
-The option is disabled while any module load is in flight. The worklet port is a FIFO, so
-two `loadModule` messages in the air at once are decided by posting order rather than by
-which promise settles first; the reload also claims a module revision of its own, exactly
-as the load path does, so whichever of the two claimed last is the one that paints the UI.
+The load panel's checkboxes are everything applied while a module is decoded, rather than
+afterwards: the MOD-only panning option, and the load-time sample enhancers from
+`starplayer-enhance`. All three share one persisted record, one reload dance, and one
+availability rule.
+
+**Headphone-friendly MOD panning** narrows MOD's authentic hard L-R-R-L defaults to the
+same symmetric 60% positions used by ordinary stereo S3Ms. It does not affect S3M, MTM, or
+later MOD panning effects.
+
+**Upsample samples (4x sinc)** and **Smooth loop seams** rebuild every sample through
+`Module::enhanced` — a polyphase sinc upsample and a loop-seam crossfade, respectively —
+before the module reaches the engine. Unlike the panning option these apply to every
+format, not only MOD. Neither checkbox is transcribed by hand: the worklet's first `ready`
+message carries `enhancements_json()`, read straight from `starplayer-enhance::CATALOGUE`
+(the wasm host's `starplayer` dependency enables the facade's `enhance` feature for
+exactly this), and the load panel builds one checkbox per entry from its label,
+description and flag bit. Both are off by default.
+
+**Frame budget.** A rebuild bypasses the IT loader's own load-time PCM budget entirely, so
+the wasm host enforces its own 16-million-frame ceiling on the *rebuilt* module: a
+requested 4x upsample that would cross it is quietly retried at 2x, and a 2x rebuild that
+still would not fit is dropped to identity. The loop smoother is unaffected, since it never
+changes a sample's length. `moduleLoaded`'s `appliedEnhancementFlags` and
+`appliedEnhancementFactor` report what actually ran, and the status line says so whenever
+it is narrower than what the checkbox asked for.
+
+**The instrument metadata panel shows source lengths.** The page-side metadata instance
+(`apps/starplayer-web/src/lib.rs`) validates and describes a module without ever enhancing
+it — only the worklet's own copy is rebuilt — so the Instruments panel's frame counts are
+always the stored length before any enhancer runs, labelled "source frames" for exactly
+that reason.
+
+Changing any of the three while a module is active reloads the retained bytes at the
+sounding order and restores transport, volume, and channel mutes; the old module remains
+live if decoding fails, and the persisted preference is put back whether or not another
+load has started since. The panning checkbox alone has a MOD-only early-out — asking for it
+on a non-MOD module just saves the preference for the next load without reloading, since
+authentic panning is exactly what a non-MOD format already used — while an enhancement
+choice always reloads a retained module, being format-independent.
+
+Every load-option input is disabled while any module load is in flight. The worklet port is
+a FIFO, so two `loadModule` messages in the air at once are decided by posting order rather
+than by which promise settles first; the reload also claims a module revision of its own,
+exactly as the load path does, so whichever of the two claimed last is the one that paints
+the UI.
 
 ## Output and mixer options
 

@@ -106,3 +106,53 @@ node apps/starplayer-web/test/worklet-harness.mjs
 
 CLI/offline (K5b); serialising a rebuilt module across threads; enhancing in the
 page-side metadata instance; a per-track (non-persistent) setting.
+
+## Research resolution
+
+*Written 2026-09-09, on branch `w4`.*
+
+### 1. Load time
+
+**Measured natively, not on the worklet thread, and it says so.** The worklet thread has no
+timing hook today — `worklet-processor.js`'s `loadModule` handler calls straight into the
+wasm export and posts the reply, with no `performance.now()`/`console.time` bracketing it —
+and adding one would be a small but real change to a message-handling hot path that nothing
+else in this task asked for, so it was not added. Instead,
+`starplayer-host-wasm::tests::a_sinc4x_rebuild_of_the_largest_fixture_completes_quickly`
+times `Host::load_module_with_options` directly, on an already-constructed `Host` (so the
+one-time engine/ring allocation `Host::new` does is excluded from both figures) against
+PETRI.S3M — at 36 kB, the largest module fixture committed to the repository (no ~2 MB IT
+fixture is at hand; none is committed anywhere in the tree).
+
+| Build | Plain load | `sinc4x` load | Difference |
+|---|---|---|---|
+| `cargo test` (debug, unoptimized) | 3.4 ms | 200.2 ms | ~197 ms |
+| `cargo test --release` | 0.36 ms | 6.9 ms | ~6.5 ms |
+
+This is native x86-64, not wasm, and not the worklet's own thread — a fair reading is
+"the release number is the honest floor, the debug number is what a first Rust change
+without `--release` will feel like if anyone profiles this by hand." Wasm is typically
+slower than native release code for scalar f64 work like the polyphase filter's inner loop
+(no autovectorization across the fixed tap order the determinism rules require, see
+`starplayer-enhance`'s crate doc), so the true worklet-thread number for this fixture likely
+sits somewhere above 6.9 ms and well under the 200 ms debug figure — in any case **far**
+under the "~1 s" threshold the research point sets, for the only real-world fixture
+available to measure. **The Worker-thread option is not needed at this size.**
+
+The task's own K5a memory-research table (`plans/engine/complete/M10-task-K5a-enhancer-core.md`)
+extrapolates a 4 MB IT to 16 MB of rebuilt PCM — over 400x PETRI's — so a module anywhere
+near that size would need its own measurement before shipping the checkbox against it
+without a spinner; nothing in the repository is that large today, and the wasm host's own
+`ENHANCE_FRAME_BUDGET` (16,000,000 frames, `crates/starplayer-host-wasm/src/lib.rs`) caps
+how far a single rebuild can go regardless, by falling back from 4x to 2x to identity.
+
+### 2. Per-track vs. global
+
+**Kept global, as specified.** The owner asked for checkboxes that take effect at load,
+which is exactly `state.activeLoadOptions` / `enhancementFlags`'s shape: one persisted
+choice applied to whatever loads next, generalising the panning checkbox's own precedent
+rather than introducing a second, per-track mechanism beside it. No reason was found during
+implementation to prefer a per-track setting — a per-track override would need its own
+storage keyed by module identity (title, hash, or URL, none of which is stable across a
+drag-and-drop or a re-encoded file) and a second UI surface to edit it, for a preference
+the owner did not ask to vary per file.
