@@ -19,6 +19,8 @@ starplayer = { workspace = true, features = ["std", "smf"] }
 # enables the `trace` command; without it the command explains how to get it.
 starplayer-offline = { workspace = true }
 starplayer-archive = { workspace = true }
+# `--enhance` (M10-K5b): the catalogue `render`, `play` and `info` all parse it against.
+starplayer-enhance = { workspace = true }
 # `play` (task D8): the backend-neutral controller and the cpal driver behind it.
 starplayer-host = { workspace = true }
 starplayer-host-cpal = { workspace = true }

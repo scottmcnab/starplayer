@@ -35,12 +35,22 @@
 //!     with --golden, which is DSP-bypassed by policy:
 //!         starplayer render <file> -o out.wav --insert 1:reverb:room=60,mix=50
 //!
+//!     --enhance <spec> rebuilds every sample through a load-time enhancer before
+//!     rendering (M10-K5b): entries joined with `+`, each an id from
+//!     `starplayer_enhance::CATALOGUE` — `sinc2x`, `sinc4x`, `loop` or `loop=<frames>`. A
+//!     `sincNx` stage is capped at twice `--rate`. --list-enhancers prints every enhancer
+//!     this build's catalogue offers and exits. See `src/enhance_arg.rs`'s module doc for
+//!     the grammar. An enhanced render is a different configuration from the goldens, so
+//!     this conflicts with --golden:
+//!         starplayer render <file> -o out.wav --enhance sinc4x+loop
+//!
 //! starplayer trace <file> [--ticks N]
 //!     Print a per-tick diagnostic trace of the sequencer's state to stdout.
 //!
 //! starplayer play <file> [--entry N] [--device NAME] [--rate HZ] [--buffer FRAMES]
 //!                         [--repeat] [--list-devices] [--midi PORT] [--list-midi-ports]
 //!                         [--insert TARGET:EFFECT[:PARAM=VALUE,...]] [--list-effects]
+//!                         [--enhance SPEC] [--list-enhancers]
 //!     Play a module on an audio output device through starplayer-host-cpal. Prints
 //!     the title and the negotiated stream spec once, then order/pattern/row/speed/
 //!     BPM/voices/peak on one updating line once a second. Stops at the song's natural
@@ -57,7 +67,10 @@
 //!     --instruments MODULE names the module whose instruments play a `.mid` (task E5).
 //!
 //!     --insert and --list-effects are the same flags `render` takes (M7-H7), installed
-//!     through `Player` before playback starts.
+//!     through `Player` before playback starts. --enhance and --list-enhancers are
+//!     `render`'s same flags too (M10-K5b), rebuilding the module through
+//!     `Module::enhanced` before `Player::load_module`; they apply only to a tracker
+//!     module played directly, not to the instruments behind a Standard MIDI File.
 //! ```
 //!
 //! A ZIP archive is accepted anywhere a module file is. With more than one recognised
@@ -71,6 +84,7 @@
 #![forbid(unsafe_code)]
 
 mod archive;
+mod enhance_arg;
 mod info;
 mod insert_arg;
 mod play;
@@ -95,6 +109,11 @@ struct Cli {
     /// and `play --list-effects` do the same for a caller already typing one of those.
     #[arg(long)]
     list_effects: bool,
+    /// Print every load-time sample enhancer `--enhance` can name (M10-K5b) and exit.
+    /// Needs no subcommand; `render --list-enhancers` and `play --list-enhancers` do the
+    /// same for a caller already typing one of those.
+    #[arg(long)]
+    list_enhancers: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -117,6 +136,10 @@ fn main() -> ExitCode {
     // flag, for a caller already typing one of those.
     if cli.list_effects {
         print!("{}", insert_arg::list_effects());
+        return ExitCode::SUCCESS;
+    }
+    if cli.list_enhancers {
+        print!("{}", enhance_arg::list_enhancers());
         return ExitCode::SUCCESS;
     }
     let Some(command) = cli.command else {
