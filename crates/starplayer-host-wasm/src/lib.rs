@@ -932,6 +932,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     const FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M");
+    /// The largest module fixture committed to the repository (36 kB): W4 research point
+    /// 1's timing measurement runs against this one, not `FIXTURE`.
+    const LARGEST_FIXTURE: &[u8] = include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M");
 
     fn minimal_mod() -> Vec<u8> {
         const SAMPLE_FRAMES: usize = 256;
@@ -1258,6 +1261,35 @@ mod tests {
             assert!(json.contains(&format!(r#""id":"{}""#, descriptor.id)), "{}: missing from enhancements_json", descriptor.id);
             assert!(json.contains(&format!(r#""label":"{}""#, descriptor.label)), "{}: missing label", descriptor.id);
         }
+    }
+
+    /// W4 research point 1: how long a `sinc4x` rebuild of the largest fixture in the
+    /// repository takes. This is `Module::enhanced` running natively (`cargo test` builds
+    /// this crate's `rlib` for the host target, not wasm) rather than a genuine
+    /// worklet-thread measurement — see the task's Research resolution for why that is the
+    /// honest number available here. Also asserts a generous upper bound so a real
+    /// regression in the polyphase filter shows up as a test failure, not just a slow page.
+    #[test]
+    fn a_sinc4x_rebuild_of_the_largest_fixture_completes_quickly() {
+        // Two loads on the same already-constructed `Host` (so `Host::new`'s own engine
+        // and ring allocation, unrelated to the enhancer, is excluded from both) isolate
+        // what the enhancer itself costs: the plain load is the baseline, and the
+        // difference is `Module::enhanced`'s own polyphase-filter work.
+        let mut host = Host::new(48_000);
+        let plain_started = std::time::Instant::now();
+        assert_eq!(host.load_module_with_options(LARGEST_FIXTURE, false, 0), Ok(1));
+        let plain_elapsed = plain_started.elapsed();
+
+        let enhanced_started = std::time::Instant::now();
+        assert_eq!(host.load_module_with_options(LARGEST_FIXTURE, false, ENHANCE_FLAG_UPSAMPLE), Ok(2));
+        let enhanced_elapsed = enhanced_started.elapsed();
+        assert_eq!(host.last_enhancement_factor, 4, "PETRI.S3M is nowhere near the frame budget, so the full 4x ran");
+
+        eprintln!(
+            "W4 research point 1: PETRI.S3M (36 kB) plain load {plain_elapsed:?}, sinc4x load {enhanced_elapsed:?} \
+             (native `cargo test`, unoptimized; not the worklet thread — see the task's Research resolution)"
+        );
+        assert!(enhanced_elapsed.as_millis() < 1_000, "a sinc4x rebuild of the largest fixture took {enhanced_elapsed:?}, which is surprisingly slow for 36 kB");
     }
 
     #[test]
