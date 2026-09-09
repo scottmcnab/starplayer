@@ -647,6 +647,10 @@ Ordered by value per unit of effort. Full detail in `02-roadmap.md`.
    (`sinc4x`, `loop=64`, `sinc4x+loop=64`, a rate ceiling and all) — so turning an
    enhancer on is visibly a new golden rather than a silent break, exactly as a change of
    interpolator is. The `enhance` feature is never in `default` for the same reason.
+   M10-K5b's `starplayer-cli render --enhance sinc4x+loop -o out.wav` names this same
+   configuration on the command line — `--golden` refuses `--enhance` for exactly this
+   reason — and `starplayer-offline::golden_filename_for_configuration` is the one place
+   that spells the `_enh-<name>` suffix; no enhanced golden is committed.
 6. **Cross-target hash equality** — x86-64, aarch64 and wasm32 must agree bit-for-bit
    on the fixed-point path.
 7. **Perceptual comparison vs libopenmpt** on the float path — spectral distance /
