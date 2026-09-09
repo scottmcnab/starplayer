@@ -334,11 +334,14 @@ Moving the window down does not help, because below the crossing the 8-bit sampl
 already digital silence and there is no noise left to remove — which is what the five-window
 sweep in section 2 shows: +0.30 dB at −40…−64 dB, *worse* than +0.56 at −24…−48.
 
-Also swept, and neither is what limits it:
+Also swept against the corrected harness, and neither is what limits it:
 
-* **Strength** 0/50/100/150/200/300/400 %: the plain Wiener gain (100 %) is the optimum, as
-  the theory above says it must be, and every other setting is worse.
-* **Release fraction** 0.125/0.25/0.5/0.75/1.0: within 0.02 dB of each other.
+* **Strength**, as the decay-window in-band SNR: 8.27 (off) / 8.68 (50 %) / **8.83
+  (100 %)** / 8.79 / 8.66 / 8.23 / 7.74 (400 %). The plain Wiener gain is the optimum, as
+  the theory above says it must be — it is the MSE-minimising scalar gain per block — and
+  every other setting is worse in both directions.
+* **Release fraction** 0.125 / **0.25** / 0.5 / 1.0 (instant): 8.81 / 8.83 / 8.81 / 8.78.
+  Within 0.05 dB of each other.
 
 The route to ≥ 3 dB is a **spectral** rather than scalar Wiener gain — in a decay the
 signal is concentrated in a few harmonic bins while the quantisation noise is flat across
