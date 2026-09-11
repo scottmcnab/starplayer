@@ -64,8 +64,11 @@ const LIBOPENMPT_MAKE_FLAGS: &[&str] = &[
     "NO_SDL2=1",
 ];
 
-/// Every crate that must stay `no_std`. The facade is last so a purity failure inside it
-/// is reported after the crate that actually caused it.
+/// Every crate that must stay `no_std`. In dependency order, so a purity failure is
+/// reported against the crate that actually caused it before it is reported against
+/// everything above it: the facade after the crates it re-exports, and
+/// `starplayer-host-embedded` — the `no_std` host (M8-I1) — after the facade it is built
+/// on.
 const NO_STD_CRATES: &[&str] = &[
     "starplayer-core",
     "starplayer-rt",
@@ -82,6 +85,7 @@ const NO_STD_CRATES: &[&str] = &[
     "starplayer-midi",
     "starplayer-telemetry",
     "starplayer",
+    "starplayer-host-embedded",
 ];
 
 /// Optional features that pull in a whole extra crate and therefore need their own
