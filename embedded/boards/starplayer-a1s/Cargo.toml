@@ -1,0 +1,74 @@
+[package]
+name = "starplayer-a1s"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "StarPlayer firmware for the AI-Thinker ESP32-Audio-Kit (ESP32-A1S, ES8388 codec)."
+
+[[bin]]
+name = "starplayer-a1s"
+path = "src/main.rs"
+# The built-in test harness needs `std`; without this, `cargo build` on the bare-metal
+# target tries to build a test harness for the binary and rust-analyzer reports phantom
+# errors. Same reason ampkeeper's firmware sets it.
+test = false
+harness = false
+
+[features]
+# Nothing by default: the plain build is the audio firmware, and every feature below adds
+# something to it. `cargo xtask build --board a1s` builds exactly this set.
+default = []
+
+# Render the six golden fixtures and print their hashes and cycle counts over UART; make
+# no sound and touch neither the codec nor I2S. The transcript this produces **is**
+# `plans/reference/embedded-budget.md`'s data. It instantiates all four interpolators,
+# where the audio build instantiates `Linear` alone — which is why the two builds' flash
+# figures are worth comparing.
+bench = []
+
+# M8-I5: the ST7789 now-playing screen on the SD-card pin group.
+lcd = []
+
+# M8-I6: the captive portal, the HTTP/WebSocket API and module upload.
+web = []
+
+# Every `esp-*` crate lives in a per-target table, never in a plain `[dependencies]`.
+# Putting them in the plain table would drag them into a host `cargo metadata` — they only
+# compile for their own triple — and break `cargo test -p starplayer-firmware-common` from
+# the workspace root. Cargo applies this table by build triple, so `--target
+# xtensa-esp32-none-elf` selects it and nothing else has to.
+#
+# Versions mirror `../ampkeeper/esp32/firmware/Cargo.toml`'s classic-ESP32 table, which is
+# the combination that ran daily on this chip family. `esp-radio` and `esp-storage` are
+# deliberately absent: no radio until M8-I6, and no flash writes at all in this milestone.
+[target.xtensa-esp32-none-elf.dependencies]
+esp-hal = { version = "1.1.1", features = ["esp32", "unstable"] }
+# `unstable` is what gates I2S, DMA and PSRAM in esp-hal 1.1; none of the three has a
+# stable API yet.
+esp-rtos = { version = "0.3.0", features = ["esp32", "embassy", "log-04"] }
+esp-println = { version = "0.17.0", features = ["esp32", "log-04"] }
+esp-backtrace = { version = "0.19.0", features = ["esp32", "panic-handler", "println"] }
+esp-alloc = "0.10.0"
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
+embedded-hal = "1"
+embedded-hal-async = "1"
+
+# Chip-independent crates. These build for any target, so they sit in the plain table.
+[dependencies]
+embassy-executor = { version = "0.10.0", features = ["nightly"] }
+embassy-time = "0.5.1"
+embassy-sync = "0.8.0"
+static_cell = "2.1.0"
+critical-section = "1"
+log = "0.4"
+
+starplayer = { workspace = true }
+starplayer-host-embedded = { workspace = true }
+starplayer-model = { workspace = true }
+firmware-common = { workspace = true }
+bytemuck = { workspace = true }
+
+[package.metadata.espflash]
+partition_table = "partitions.csv"

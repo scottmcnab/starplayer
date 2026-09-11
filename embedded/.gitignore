@@ -1,0 +1,4 @@
+# Build output for the firmware workspace. One target directory, shared by every board and
+# by the host builds of `firmware-common` and `xtask` — a second `build-std` tree for an
+# Xtensa target is well over a gigabyte, so there must never be another one.
+/target

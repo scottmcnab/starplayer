@@ -1,0 +1,42 @@
+# Directory-scoped build settings for the A1S firmware.
+#
+# **Cargo reads `.cargo/config.toml` from the directory it is invoked in**, not from the
+# workspace root, so this file only applies when cargo's current directory is this crate.
+# `embedded/xtask` therefore sets `current_dir` to this directory for every build; a bare
+# `cargo build` from `embedded/` would silently try to build the firmware for the host and
+# fail on the first `esp_hal` name. Get this wrong and the error is confusing rather than
+# absent, which is why it is spelled out here and in `embedded/README.md`.
+[build]
+target = "xtensa-esp32-none-elf"
+
+[target.xtensa-esp32-none-elf]
+# `espflash flash --monitor` as the runner, so `cargo run` does the obvious thing for the
+# **owner**. Agents never run it (see the flashing rule in `embedded/README.md`).
+runner = "espflash flash --monitor"
+rustflags = [
+  # esp-hal ships the chip's memory map and section placement in `linkall.x`.
+  "-C", "link-arg=-Tlinkall.x",
+  #
+  # `-C force-frame-pointers` is **deliberately absent**, and this is the one place that
+  # departs from ampkeeper's classic-ESP32 config. With it on, this firmware does not
+  # compile at all:
+  #
+  #     rustc-LLVM ERROR: Error while trying to spill A8 from class AR:
+  #     Cannot scavenge register without an emergency spill slot!
+  #
+  # — the Xtensa LLVM register-allocator bug ampkeeper hit from the other direction (its
+  # `esp32/firmware/.cargo/config.toml` drops the same flag on the S3 for the same
+  # message). The flag reserves a register; this crate's `main` inlines the whole boot
+  # sequence at `opt-level = 3` and the allocator then runs out. Reproduced on
+  # esp-1.97 (rustc 1.97.0-nightly, Xtensa LLVM) 2026-09-11.
+  #
+  # What it costs: `esp-backtrace`'s panic backtraces become less reliable to walk. What
+  # it would cost to keep: the firmware. `espflash monitor` still symbolises the frames it
+  # does find, because `[profile.release] debug = true` keeps the symbols in the ELF.
+]
+
+[unstable]
+# The Xtensa target has no precompiled `core`/`alloc`, so they are built from source with
+# this crate's profile. `panic_abort` is listed because `[profile.*] panic = "abort"` in
+# `embedded/Cargo.toml` needs a matching `panic_abort` crate to link against.
+build-std = ["alloc", "core", "panic_abort"]
