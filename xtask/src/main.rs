@@ -270,6 +270,7 @@ fn main() -> ExitCode {
     let subcommand = arguments.first().map(String::as_str);
 
     let succeeded = match subcommand {
+        Some("cast-probe") => run_cast_probe(&arguments[1..]),
         Some("ci") => run_ci(&arguments[1..]),
         Some("conformance") => run_conformance(&arguments[1..]),
         Some("fuzz") => run_fuzz(&arguments[1..]),
@@ -299,6 +300,8 @@ fn print_usage() {
     println!("usage: cargo xtask <subcommand>");
     println!();
     println!("subcommands:");
+    println!("  cast-probe   build the A4-N1 development Web Receiver + Chrome sender into");
+    println!("                     apps/starplayer-cast-probe/dist (independent of `wasm`'s own dist)");
     println!("  ci [--job <job>]   run the CI matrix locally, or a single job of it");
     println!("  conformance [--offline|--fetch-only] [--strict] [--archive PATH]   acquire and run the pinned tracker corpora");
     println!("  fuzz [--seed] [--target NAME] [--seconds N]   seed the loader corpora and run cargo-fuzz over them");
@@ -314,7 +317,8 @@ fn print_usage() {
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
     println!("  wasm [--serve] [--pages]   build and package the web player into apps/starplayer-web/dist");
     println!("                     --pages packages it for GitHub Pages: no bundled fixtures, and index.html");
-    println!("                     loads the coi-serviceworker shim that supplies the COOP/COEP headers Pages cannot");
+    println!("                     loads the coi-serviceworker shim that supplies the COOP/COEP headers Pages cannot;");
+    println!("                     it also stages the A4-N1 cast probe under dist/cast-probe/ (see `cast-probe` above)");
     println!("  serve [--port N] [--host ADDR]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
     println!("                     --host 0.0.0.0 exposes it to the LAN; add --tls [--tls-san ip,ip] there, since AudioWorklet");
     println!("                     and SharedArrayBuffer only exist in a secure context (https or localhost)");
@@ -1987,6 +1991,21 @@ const DEFAULT_SERVE_PORT: u16 = 8080;
 /// Loopback only, unless `serve --host` says otherwise.
 const DEFAULT_SERVE_HOST: &str = "127.0.0.1";
 
+// ── cast probe packaging (A4-N1) ────────────────────────────────────────────────────
+
+/// The development Web Receiver and its Chrome sender (A4-N1) — hand-written pages, no
+/// build step of their own beyond a flat copy, same as `WEB_SOURCE_DIRECTORY`.
+const CAST_PROBE_SOURCE_DIRECTORY: &str = "apps/starplayer-cast-probe/www";
+/// The probe's own output directory, independent of `WEB_OUTPUT_DIRECTORY`: `cargo xtask
+/// cast-probe` never touches the web player's `dist/`, and `cargo xtask wasm` never touches
+/// this one.
+const CAST_PROBE_OUTPUT_DIRECTORY: &str = "apps/starplayer-cast-probe/dist";
+/// Where `run_wasm --pages` stages a second copy of the probe, relative to the web
+/// player's own output directory. `.github/workflows/pages.yml` uploads all of
+/// `WEB_OUTPUT_DIRECTORY` and nothing else, so anything staged under this subdirectory
+/// publishes to Pages with no workflow change at all.
+const CAST_PROBE_STAGING_SUBDIRECTORY: &str = "cast-probe";
+
 /// `cargo build` → `wasm-bindgen` → worklet-scope massaging → a servable directory.
 ///
 /// `wasm-pack` would do the first two steps and is deliberately not used: it adds an
@@ -2092,6 +2111,16 @@ fn run_wasm(arguments: &[String]) -> bool {
     if !pages_build && !copy_fixture_modules(&root, &output_directory) {
         return false;
     }
+    if pages_build {
+        // A4-N1: `.github/workflows/pages.yml` uploads all of `output_directory` and
+        // nothing else, so staging the probe here publishes it with no workflow change —
+        // see `CAST_PROBE_STAGING_SUBDIRECTORY`'s own doc comment.
+        println!();
+        println!("     staging the A4-N1 cast probe under {CAST_PROBE_STAGING_SUBDIRECTORY}/ (no change to .github/workflows/pages.yml)");
+        if !build_cast_probe(&root, &output_directory.join(CAST_PROBE_STAGING_SUBDIRECTORY)) {
+            return false;
+        }
+    }
     if !report_output(&output_directory) {
         return false;
     }
@@ -2103,6 +2132,97 @@ fn run_wasm(arguments: &[String]) -> bool {
     }
     println!("     run `cargo xtask serve` and open http://localhost:{DEFAULT_SERVE_PORT}/");
     true
+}
+
+/// A4-N1: build the development Web Receiver and its Chrome sender into
+/// `apps/starplayer-cast-probe/dist`, independent of `cargo xtask wasm`'s own output.
+fn run_cast_probe(arguments: &[String]) -> bool {
+    if let Some(other) = arguments.first() {
+        eprintln!("xtask cast-probe: unexpected argument `{other}`");
+        return false;
+    }
+    let root = workspace_root();
+    let output_directory = root.join(CAST_PROBE_OUTPUT_DIRECTORY);
+    if !build_cast_probe(&root, &output_directory) {
+        return false;
+    }
+    println!();
+    println!("xtask cast-probe: packaged into {}", output_directory.display());
+    true
+}
+
+/// Build the probe into `output_directory` — shared by the standalone `cast-probe`
+/// subcommand and by `run_wasm --pages`'s staging step, so the two ways of getting the
+/// probe onto disk can never drift apart.
+///
+/// This reuses `WASM_CRATE` (`starplayer-host-wasm`) — the same crate the web player's
+/// worklet runs — but packages it completely differently. `run_wasm`'s
+/// `build_worklet_bundle` deletes the standalone wasm-bindgen glue after concatenating it
+/// into one worklet bundle, because the web player's worklet never instantiates wasm on
+/// its own; it is handed an already-compiled `WebAssembly.Module`. The probe's
+/// `receiver.js` is the opposite case — it loads `starplayer_host_wasm.js` with an
+/// ordinary `<script>` tag and calls `wasm_bindgen({ module_or_path:
+/// 'starplayer_host_wasm_bg.wasm' })` itself — so this function must **not** call
+/// `build_worklet_bundle`, and does not.
+fn build_cast_probe(root: &Path, output_directory: &Path) -> bool {
+    if !check_bindgen_version(root) {
+        return false;
+    }
+    if !cargo(&["build", "--release", "--target", WASM_TARGET, "-p", WASM_CRATE]) {
+        return false;
+    }
+
+    if output_directory.exists()
+        && let Err(error) = std::fs::remove_dir_all(output_directory) {
+        eprintln!("xtask cast-probe: cannot clear `{}`: {error}", output_directory.display());
+        return false;
+    }
+    if let Err(error) = std::fs::create_dir_all(output_directory) {
+        eprintln!("xtask cast-probe: cannot create `{}`: {error}", output_directory.display());
+        return false;
+    }
+
+    let wasm_artifact = root.join("target").join(WASM_TARGET).join("release").join(WASM_ARTIFACT);
+    println!("     wasm-bindgen --target no-modules {}", wasm_artifact.display());
+    let bindgen_succeeded = Command::new("wasm-bindgen")
+        .args(["--target", "no-modules", "--no-typescript", "--out-dir"])
+        .arg(output_directory)
+        .arg(&wasm_artifact)
+        .status();
+    match bindgen_succeeded {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("xtask cast-probe: wasm-bindgen exited with {status}");
+            return false;
+        }
+        Err(error) => {
+            eprintln!("xtask cast-probe: wasm-bindgen failed to start: {error}");
+            eprintln!("     install it with `cargo install wasm-bindgen-cli --version {}`", pinned_bindgen_version(root).unwrap_or_default());
+            return false;
+        }
+    }
+
+    let source_directory = root.join(CAST_PROBE_SOURCE_DIRECTORY);
+    let entries = match std::fs::read_dir(&source_directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("xtask cast-probe: cannot read `{}`: {error}", source_directory.display());
+            return false;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name() else { continue };
+        if let Err(error) = std::fs::copy(&path, output_directory.join(name)) {
+            eprintln!("xtask cast-probe: cannot copy `{}`: {error}", path.display());
+            return false;
+        }
+    }
+
+    report_output(output_directory)
 }
 
 /// Generate the independent main-thread loader instance. Keeping this separate from the
@@ -2343,25 +2463,43 @@ fn copy_fixture_modules(root: &Path, output_directory: &Path) -> bool {
 }
 
 fn report_output(output_directory: &Path) -> bool {
-    let entries = match std::fs::read_dir(output_directory) {
-        Ok(entries) => entries,
-        Err(error) => {
-            eprintln!("xtask wasm: cannot list `{}`: {error}", output_directory.display());
-            return false;
-        }
-    };
-    let mut listing: Vec<(String, u64)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            Some((entry.file_name().to_string_lossy().into_owned(), metadata.len()))
-        })
-        .collect();
+    let mut listing: Vec<(String, u64)> = Vec::new();
+    if !collect_output_listing(output_directory, "", &mut listing) {
+        return false;
+    }
     listing.sort();
 
     println!();
     for (name, size) in &listing {
         println!("     {size:>9}  {name}");
+    }
+    true
+}
+
+/// `read_dir` is not recursive, so a subdirectory — `cast-probe/`, once `run_wasm --pages`
+/// stages A4-N1's probe under it — would otherwise show up as one entry reporting the
+/// directory's own on-disk size rather than the files actually in it. Walking one level at
+/// a time and labelling each file with its path relative to `output_directory` keeps the
+/// listing meaningful regardless of how deep anything nests.
+fn collect_output_listing(directory: &Path, prefix: &str, listing: &mut Vec<(String, u64)>) -> bool {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("xtask wasm: cannot list `{}`: {error}", directory.display());
+            return false;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let label = format!("{prefix}{}", entry.file_name().to_string_lossy());
+        if path.is_dir() {
+            if !collect_output_listing(&path, &format!("{label}/"), listing) {
+                return false;
+            }
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        listing.push((label, metadata.len()));
     }
     true
 }

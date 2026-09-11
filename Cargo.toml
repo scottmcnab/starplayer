@@ -17,9 +17,14 @@ members = [
 # `esp-*` crates that only compile for their own triple. Neither is reached by the globs
 # above; `exclude` says so out loud, so that a future glob cannot quietly drag one in and
 # break `cargo xtask ci`.
+#
+# `apps/starplayer-cast-probe` (A4-N1) is not a Rust crate at all — hand-written HTML/JS
+# plus a Node test harness, like `apps/starplayer-web/www` but with no page-side wasm crate
+# of its own — so the `apps/*` glob above would otherwise fail to load it as a member.
 exclude = [
     "fuzz",
     "embedded",
+    "apps/starplayer-cast-probe",
 ]
 
 [workspace.package]

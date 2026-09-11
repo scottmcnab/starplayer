@@ -276,3 +276,339 @@ produces the evidence they are gated on, and no more. The registration itself, t
 account, the device serials and the publishing are the **owner's**, not the agent's.
 `starplayer-cast` and the CLI ([N2](A4-task-N2-cast-cli.md)). Any change to the engine, the
 worklet bundle, the web player's own pages, or `.github/workflows/pages.yml`.
+
+## Research resolution
+
+### 1. The speaker's platform (A4 point 1)
+
+**What the probe is built to find out.** `probe`'s `report` carries `userAgent` (to read
+off the Chromium version a speaker's own user-agent string reports), `wasm.instantiated`
+and `wasm.returnedValue` (does `WebAssembly.instantiate` exist and actually run — not just
+exist as a global), `audioContext.{supported,sampleRate,state,baseLatency}`,
+`audioWorklet.{supported,registered,toneHeard}` (registered from a `Blob` URL and proven by
+whether `process()` was ever called, not merely whether the constructor ran),
+`sharedArrayBuffer.supported`, and `crossOriginIsolated` — reported directly rather than
+left to be inferred, exactly as the task asks, because a receiver page is never served with
+COOP/COEP by the Cast Developer Console and the worklet's `postMessage` fallback path is
+the one that will matter for N3 if it is ever built. `bench`'s `realTimeRatio` (page-thread
+average ÷ `render_quantum() / sampleRate`) is the number that answers "does a module render
+in real time here" for whatever module is loaded — the synthetic default, or a real module
+the owner sends with **Send file** — including a 64-channel IT, once the owner has one to
+send; the probe cannot manufacture 64 real channels itself without a fixture, and fixtures
+must never reach a published page (see "Never publish or bundle the S3M fixtures" below).
+
+**What it found where it could run.**
+
+*Node (no browser at all)* — `apps/starplayer-cast-probe/test/probe-harness.mjs`, this run:
+`WebAssembly` present and the 1-function probe module returns 42; `AudioContext`,
+`AudioWorklet` and `ScriptProcessorNode` all absent and reported as `supported: false` with
+no throw; `SharedArrayBuffer` present (Node has it; a page does not get it without COOP/COEP
+regardless); `crossOriginIsolated` false (no `window`); `performance.memory` absent, reported
+`null`; `hardwareConcurrency` 32 (this host's core count — not a stand-in for a speaker's);
+a real 8-quantum bench against the real `starplayer-host-wasm` build: average **593.8 µs**
+against a **2902.5 µs** budget at 44.1 kHz (`realTimeRatio` ≈ 0.20) for the synthetic
+4-channel module — see the exact figures pasted under "Verification results" below (they
+vary a little run to run, as wall-clock timings do).
+
+*Desktop Chrome — not assumed, actually run.* This sandbox turned out to have a real
+Chromium build at hand (`Google Chrome for Testing 151.0.7922.34`, headless, the same
+version already documented in `apps/starplayer-web/README.md`'s output-panel table), so
+rather than stop at the Node numbers this task file expected, the agent drove the real
+`receiver.js` against it: served the packaged `dist/` over a plain local HTTP origin (no
+COOP/COEP, matching an unregistered Cast receiver's own hosting), stubbed
+`cast.framework.CastReceiverContext` the same way the Node harness does, and dispatched
+`probe` and `bench` by hand through the real listener. Full report:
+
+```json
+{
+  "wasm": { "supported": true, "instantiated": true, "error": null, "returnedValue": 42 },
+  "audioContext": { "supported": true, "sampleRate": 44100, "state": "running", "baseLatency": 0.01 },
+  "audioWorklet": { "supported": true, "registered": true, "toneHeard": true, "error": null },
+  "scriptProcessor": { "supported": true },
+  "sharedArrayBuffer": { "supported": false },
+  "crossOriginIsolated": false,
+  "memory": { "jsHeapSizeLimit": 4395630592, "totalJSHeapSize": 2157467, "usedJSHeapSize": 1015723 },
+  "hardwareConcurrency": 32,
+  "serviceWorker": { "supported": true, "controller": false }
+}
+```
+
+and a 256-quantum bench of the synthetic module: page-thread average **42.6 µs**
+(`realTimeRatio` ≈ 0.015), worklet-thread average **39.1 µs**, both against the same
+2902.5 µs budget, `underruns: 0`. Two things worth reading precisely:
+
+- **`sharedArrayBuffer.supported: false`, `crossOriginIsolated: false`.** Confirmed, not
+  assumed: an ordinary HTTP origin with no COOP/COEP genuinely takes away
+  `SharedArrayBuffer` in a real, current Chromium, even though the object exists as a
+  global in Node with no such restriction. This is exactly the "expect not [isolated]"
+  the task predicted, now backed by a real browser rather than an inference from Node.
+- **The worklet half of `bench` only works with the compiled `WebAssembly.Module` passed
+  through `processorOptions` at `AudioWorkletNode` construction, never through a later
+  `node.port.postMessage()`.** The first working draft of `runWorkletBench` built the node
+  bare and then `postMessage`d `{ hostModule, moduleBytes, … }` to it — the same shape
+  `worklet-processor.js`'s `ready`/`loadModule` protocol uses for ordinary messages — and
+  it hung forever against the real browser: no exception on either side, the worklet's
+  `onmessage` simply never fired. Isolated by hand with a minimal ping processor (see
+  "Deviations" below): a `WebAssembly.Module` structured-clones correctly as part of
+  `AudioWorkletNodeOptions` but silently fails to arrive over the same node's message port
+  afterwards, in this Chromium build. `receiver.js` now passes everything the bench needs
+  through `processorOptions` and runs the whole bench synchronously in the constructor, and
+  a large doc comment on `BENCH_PROCESSOR_SOURCE` records the finding so nobody "fixes" it
+  back the obvious way later. This is exactly the kind of platform surprise N1 exists to
+  catch before N3 is built on top of it.
+- **`AudioWorkletGlobalScope` has no `performance` at all** in this Chromium build — only
+  `Date` (millisecond-grained) and the audio clock `currentTime`/`currentFrame`, which only
+  advances once per real render quantum pulled into the graph and therefore cannot time a
+  synchronous loop inside a constructor. The worklet bench now times batches of 32 calls
+  with `Date.now()` and reports the batch average against every call in the batch — coarser
+  than the page-thread bench's per-call `performance.now()` figure, documented as such in
+  `runWorkletBench`'s own doc comment.
+
+*Owner-pending, and only the owner's step, per this task file:* which Chromium version
+Nest Audio, Nest Mini and Home Max actually report; whether any of the desktop findings
+above hold on that much more constrained runtime (memory pressure, CPU class, and the third-
+party "Cast for audio" profile's stated exclusion of WebAssembly/Web Audio — Nest speakers
+are expected to exceed that profile, per the master plan, but "expected" is exactly what
+this probe exists to confirm or deny); the real bench numbers for a module the owner
+actually cares about, including a 64-channel IT, via **Send file**.
+
+### 2. Custom message size and throughput (A4 point 2)
+
+**What the probe is built to find out.** `sender.js`'s **Send file** walks a real module up
+through `chunk` messages at a configurable size (default 65 536 bytes); its separate **Find
+message limit** control (an addition beyond the task's three named buttons, cheap to build
+from the same chunk-sending code and directly answering this research point) sends a series
+of disposable one-chunk transfers doubling from 4 KiB until the receiver stops
+acknowledging within a 5-second window or answers `error`, and reports the last size that
+worked. The receiver's own `report.maxMessageBytes` independently tracks the largest chunk
+any sender has successfully delivered, so the two numbers should agree.
+
+**What it found where it could run.** The custom-message channel only exists inside a real
+Cast session — a receiver page opened in an ordinary tab, or driven directly the way this
+run's desktop-Chrome check above did, never goes through the actual CASTv2 transport at
+all, so there is no real message-size ceiling to discover without a live Cast session. What
+*was* verified, against the real receiver logic (Node harness, and confirmed byte-for-byte
+by hand): a 4-chunk transfer of the synthetic module (2364 bytes total, 591-byte chunks)
+reassembles exactly, each `chunk-ack` reports a monotonically increasing `received` count
+and a non-negative `elapsedMs`, and the final chunk's `report.transfer` carries the correct
+`bytes`, `chunkSize` and a finite `bytesPerSecond`. A deliberately malformed `chunk` (invalid
+base64) answers `{ type: "error", stage: "chunk", message }` rather than hanging or
+throwing into the void — the one failure mode this task must not produce.
+
+**The mixed-content rule.** `receiver.html` is served only over HTTPS once registered (the
+Cast Developer Console requires it). A page served over HTTPS cannot `fetch()` a plain-HTTP
+origin — Chromium blocks the request as mixed content before it ever leaves the page — so
+fetch-by-URL for a module only works when the module's own host is itself HTTPS and sends
+CORS headers permitting the receiver's origin (an S3-style bucket, GitHub Pages, or the
+CLI's `starplayer cast` server placed behind TLS). A bare LAN dev server serving plain HTTP,
+which is the common case for "the file is on my laptop", is exactly what fetch-by-URL
+cannot reach from a registered receiver — which is why chunking over the custom message
+channel is the default and not merely a fallback: it is the one path that always works,
+regardless of what is or is not HTTPS on the sender's own network.
+
+**Owner-pending:** the actual largest accepted `chunk` size and measured bytes/s against a
+real Cast runtime, via **Find message limit** and **Send file** against a registered
+receiver and a real speaker.
+
+## Deviations from the task file
+
+- **`Cargo.toml`'s workspace `exclude` gained `apps/starplayer-cast-probe`.** Not in the
+  deliverable list, but necessary: `members = [..., "apps/*", ...]` requires every matched
+  directory to carry a `Cargo.toml`, and this app is deliberately not a Rust crate (reuses
+  `starplayer-host-wasm` directly, like the task describes). Without the exclusion,
+  `cargo build` anywhere in the workspace fails immediately with "failed to load manifest
+  for workspace member". Documented in place with the same reasoning `fuzz`/`embedded`
+  already carry.
+- **`report_output`'s subdirectory handling was a real bug, not a hypothetical one.**
+  Before the fix, a `cast-probe/` entry under `dist/` would have reported its own on-disk
+  directory size (a filesystem block count, not a byte total — typically 4096 on this
+  machine) labelled just `cast-probe`, with none of its eight real files listed at all.
+  `report_output` and its new `collect_output_listing` helper now recurse and label each
+  file with its path relative to the output directory; confirmed against the real
+  `--pages` build (see the listing under "Verification results" below, where
+  `cast-probe/receiver.html` etc. appear with their real sizes).
+- **A `Find message limit` button beyond the task's three named sender controls
+  (Probe/Bench/Send file).** Cheap to build from the same chunk-send/ack code `Send file`
+  already needs, and it is the concrete mechanism research point 2 asks the sender to
+  have ("walks the chunk size up until the speaker stops acknowledging"). Everything the
+  task named is present and unchanged; this is additive.
+- **The worklet half of `bench` does not use `performance.now()`, and does not pass the
+  compiled module or bytes through a post-construction `postMessage`.** Both were the
+  first working draft's design and both turned out to be wrong against a real
+  `AudioWorkletNode` — see "Research resolution" §1 above for what was actually observed
+  and why. The task's deliverable shape (`worklet: { quanta, underruns,
+  microsecondsPerQuantum }`) is unchanged; only the internal timing mechanism and the
+  parameter-passing path changed, both documented in place in `receiver.js`.
+- **`report.wasm` carries a fourth field, `returnedValue`,** alongside the three the task
+  names (`supported`, `instantiated`, `error`) — the task's own prose asks the probe to
+  "report the value it returned" but does not name a field for it, so one was added rather
+  than silently dropping that half of the instruction.
+- **Desktop-Chrome findings were gathered from a real browser, not inferred.** The task
+  says "on this machine you can only report desktop-Chrome and Node numbers", which reads
+  as expecting a real Chrome to be reachable; a Playwright-managed `Google Chrome for
+  Testing 151.0.7922.34` (the same build `apps/starplayer-web`'s own headless checks use)
+  was already cached on this machine, so it was used, over the DevTools protocol, the same
+  way `apps/starplayer-web/test/headless.mjs` drives Chromium. This is exploratory use for
+  this task's own research section — no new repo dependency, no new checked-in test, and
+  no change to `apps/starplayer-cast-probe/test/probe-harness.mjs`'s Node-only contract in
+  the Verification section.
+- **`www/worklet-prelude-source.mjs` duplicates `apps/starplayer-web/www/worklet-prelude.js`'s
+  polyfill body** rather than importing it, exactly as the task's own instruction for
+  `coi-serviceworker.js` establishes the pattern of: the two apps are independent Pages
+  outputs and this file is small, hand-written, and ours. Exported as a string constant
+  rather than run directly, since its only use is to be concatenated into a runtime-built
+  worklet bundle (see "Research resolution" §1) rather than loaded as a `<script>` on the
+  probe's own main thread, which already has a native `TextDecoder`.
+
+## Verification results (this run)
+
+All commands run from the workspace root, in order, after the worklet-bench fix described
+under "Deviations" above. Output trimmed to the parts that matter; nothing was skipped or
+reordered.
+
+```
+$ cargo xtask cast-probe
+     wasm-bindgen CLI 0.2.127 matches the pinned crate version
+     cargo build --release --target wasm32-unknown-unknown -p starplayer-host-wasm
+    Finished `release` profile [optimized] target(s) in 0.05s
+     wasm-bindgen --target no-modules .../target/wasm32-unknown-unknown/release/starplayer_host_wasm.wasm
+
+          1398  receiver.html
+         26099  receiver.js
+          3189  sender.html
+          9777  sender.js
+         19085  starplayer_host_wasm.js
+        745725  starplayer_host_wasm_bg.wasm
+          3300  synthetic-mod.mjs
+          4375  worklet-prelude-source.mjs
+
+xtask cast-probe: packaged into apps/starplayer-cast-probe/dist
+PASS
+```
+
+```
+$ ls apps/starplayer-cast-probe/dist
+receiver.html  receiver.js  sender.html  sender.js  starplayer_host_wasm.js
+starplayer_host_wasm_bg.wasm  synthetic-mod.mjs  worklet-prelude-source.mjs
+PASS — glue, .wasm, receiver.html, receiver.js, sender.html, sender.js all present
+```
+
+```
+$ node apps/starplayer-cast-probe/test/probe-harness.mjs
+ok: `probe` reports every field, fully degraded, on a runtime with no audio stack
+ok: a 4-chunk transfer of the synthetic module (2364 bytes) reassembles and reports
+ok: bench ran 8 real quanta — average 593.8us against a 2902.5us budget
+ok: a malformed `chunk` message answers `error` rather than throwing
+probe-harness: all checks passed
+PASS
+```
+
+```
+$ cargo xtask wasm --pages && ls apps/starplayer-web/dist/cast-probe
+     ... (full build log; unchanged web player steps, then:)
+     staging the A4-N1 cast probe under cast-probe/ (no change to .github/workflows/pages.yml)
+     wasm-bindgen CLI 0.2.127 matches the pinned crate version
+     cargo build --release --target wasm32-unknown-unknown -p starplayer-host-wasm
+     wasm-bindgen --target no-modules ...
+
+          1398  receiver.html
+         26099  receiver.js
+          3189  sender.html
+          9777  sender.js
+         19085  starplayer_host_wasm.js
+        745725  starplayer_host_wasm_bg.wasm
+          3300  synthetic-mod.mjs
+          4375  worklet-prelude-source.mjs
+
+        108265  app.js
+          1398  cast-probe/receiver.html
+         26099  cast-probe/receiver.js
+          3189  cast-probe/sender.html
+          9777  cast-probe/sender.js
+         19085  cast-probe/starplayer_host_wasm.js
+        745725  cast-probe/starplayer_host_wasm_bg.wasm
+          3300  cast-probe/synthetic-mod.mjs
+          4375  cast-probe/worklet-prelude-source.mjs
+          4678  coi-serviceworker.js
+         16078  index.html
+         16695  ring.js
+         56577  starplayer-worklet.js
+        745725  starplayer_host_wasm_bg.wasm
+         10612  starplayer_web.js
+        270090  starplayer_web_bg.wasm
+         13957  style.css
+
+xtask wasm: packaged into apps/starplayer-web/dist
+
+$ ls apps/starplayer-web/dist/cast-probe
+receiver.html  receiver.js  sender.html  sender.js  starplayer_host_wasm.js
+starplayer_host_wasm_bg.wasm  synthetic-mod.mjs  worklet-prelude-source.mjs
+PASS — the recursive `report_output` fix shows real per-file sizes under `cast-probe/`
+rather than one misleading directory-size line (see "Deviations")
+```
+
+```
+$ grep -c coi-serviceworker apps/starplayer-web/dist/cast-probe/receiver.html
+0
+PASS
+```
+
+```
+$ cargo xtask ci --job wasm-build
+     RUSTFLAGS="-C llvm-args=-fp-contract=off -C target-feature=+simd128" cargo build --target wasm32-unknown-unknown -p starplayer-host-wasm --features simd
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+xtask ci: 1 job(s) passed
+PASS
+```
+
+```
+$ cargo xtask ci --job clippy
+=== xtask ci: clippy ===
+     cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+xtask ci: 1 job(s) passed
+PASS — no new warnings from the xtask/Cargo.toml changes
+```
+
+```
+$ cargo test --workspace
+94 "test result: ok. ... 0 failed" lines, 0 lines containing FAILED, across the whole
+workspace (unit tests, integration tests and merged doctests for every crate). ALSA
+"snd_seq_hw_open" warnings appear from a couple of MIDI-adjacent crates' tests — pre-existing
+environment noise (no `/dev/snd` in this sandbox), not a new failure.
+PASS
+```
+
+```
+$ cargo xtask wasm
+     ... (full build log)
+        108265  app.js
+          4678  coi-serviceworker.js
+         16052  index.html
+         35966  modules/PETRI.S3M
+          9634  modules/REFLEX.S3M
+            28  modules/index.json
+         16695  ring.js
+         56577  starplayer-worklet.js
+        745725  starplayer_host_wasm_bg.wasm
+         10612  starplayer_web.js
+        270090  starplayer_web_bg.wasm
+         13957  style.css
+
+xtask wasm: packaged into apps/starplayer-web/dist
+PASS — dist/ left in its development shape: fixtures present, no cast-probe/ subdirectory
+```
+
+```
+$ node apps/starplayer-web/test/worklet-harness.mjs
+worklet harness: 10 s of real S3M render (peak 0.731), independent overlapping processors,
+MOD panning, transport, seek, memory, garbage, scope taps on both transports, live MIDI
+input on both transports and bad-file rejection passed
+PASS — the web player is unchanged
+```
+
+All nine verification steps pass. Additionally, and beyond what this section asked for: the
+real desktop-Chrome run described under "Research resolution" §1 exercised the packaged
+`dist/` end to end (`probe` and `bench`, including the worklet half) against a real
+`AudioWorkletNode`, which is what caught and fixed the `postMessage`/`WebAssembly.Module`
+bug recorded under "Deviations".

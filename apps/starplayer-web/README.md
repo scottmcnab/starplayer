@@ -46,6 +46,10 @@ development build in exactly two ways.
   non-isolated site. Without `--pages` the marker is copied through untouched, which is why
   the dev server's `--no-isolation` mode still exercises the genuine non-isolated path.
 
+`--pages` also stages a second, independent build of the A4-N1 cast probe under
+`dist/cast-probe/` — see `apps/starplayer-cast-probe/README.md` — which deliberately
+carries no isolation shim of its own.
+
 `.github/workflows/pages.yml` does this in CI. It is triggered by the **CI** workflow
 completing on `main` and builds only when that run's conclusion was `success`, so nothing
 reaches the public site on a red build; `workflow_dispatch` runs it by hand. It checks out

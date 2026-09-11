@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>StarPlayer cast probe — receiver</title>
+</head>
+<body>
+<!--
+    A4-N1 development Web Receiver. This is NOT the real StarPlayer receiver (N3); it
+    plays no music and exists only to report what this speaker's runtime can do.
+
+    One `<pre>` status line and nothing else — no images, no fonts, no CSS framework. The
+    Cast audio-device guidance is explicit about CPU and memory, and an audio speaker has
+    no screen to show any of this on anyway; the `<pre>` exists for the times this page is
+    opened in a desktop Chrome tab to debug the message protocol without a speaker at all.
+
+    Script order matters: `starplayer_host_wasm.js` is a classic (non-module) script that
+    declares `wasm_bindgen` with `let` at its own top level, and `receiver.js` — a module,
+    loaded after it — reads that as a free variable through the shared global environment.
+    Both must run before `receiver.js`'s own top-level code does, which classic scripts
+    (parser-blocking, unlike a deferred module script) guarantee by being listed first.
+-->
+<pre id="status">StarPlayer cast probe: loading…</pre>
+<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<script src="starplayer_host_wasm.js"></script>
+<script type="module" src="receiver.js"></script>
+</body>
+</html>

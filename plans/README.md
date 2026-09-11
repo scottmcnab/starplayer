@@ -72,7 +72,7 @@ the engine, the applications, the original DOS sources, and this plan set.
 | A1 TUI STAR.EXE homage | **Pull-driven** | [A1](apps/A1-master-plan.md) | The nostalgic one. Second consumer of the telemetry API |
 | A2 Desktop shells | **Pull-driven** | [A2](apps/A2-master-plan.md) | Ask whether it is needed at all first |
 | A3 Mobile shells | **Pull-driven** | [A3](apps/A3-master-plan.md) | Lowest priority; the responsive web player covers most of it |
-| A4 Cast to Google Home | **In progress** — [N2](apps/complete/A4-task-N2-cast-cli.md) built (`starplayer-cast` + `starplayer cast`), owner check on a real speaker pending; N1 pulled 2026-09-11; N3/N4 wait for the N1 findings | [A4](apps/A4-master-plan.md) | Play a module on a Nest speaker or group from the web player (custom Web Receiver running the wasm engine) or the CLI (rendered FLAC/WAV to the Default Media Receiver) |
+| A4 Cast to Google Home | **N1 and N2 landed 2026-09-12** — [N2](apps/complete/A4-task-N2-cast-cli.md) `starplayer-cast` + `starplayer cast` (owner check on a real speaker pending); [N1](apps/complete/A4-task-N1-cast-probe.md) the receiver capability probe (owner: register, host on Pages, paste the `## N1 findings` into the master plan); N3/N4 wait for those findings | [A4](apps/A4-master-plan.md) | Play a module on a Nest speaker or group from the web player (custom Web Receiver running the wasm engine) or the CLI (rendered FLAC/WAV to the Default Media Receiver) |
 
 **Critical path**: M0 → M1. Everything else is either proving what those two built (M2,
 M3) or extending it (M4 onward). From 2026-09-03 the rest of M3, M4-lite, M5 and M6 run
