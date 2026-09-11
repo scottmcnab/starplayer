@@ -1454,8 +1454,11 @@ frame rate, and reports which transport is live in the Engine panel.
 - Core crates are `#![no_std]` + `alloc`. CI checks `riscv32imc-unknown-none-elf` on
   every commit. **Hard rule: no default feature transitively enables `std`.**
 - `portable-atomic` + `critical-section` for targets lacking CAS — `alloc::sync::Arc`
-  hits this on thumbv6m, Xtensa and the CI target `riscv32imc-unknown-none-elf`, which
-  implements neither the `A` extension nor any of `core::sync::atomic`.
+  hits this on thumbv6m, the ESP32-S2 and the CI target `riscv32imc-unknown-none-elf`,
+  which implements neither the `A` extension nor any of `core::sync::atomic`. (The
+  classic ESP32 and the ESP32-S3 have `S32C1I` compare-and-swap, and the ESP32-C5 is
+  `riscv32imac`, so neither M8 board exercises this path; the `imc` CI check remains the
+  no-CAS canary — M8 decision 7.)
 
   **The arrangement, settled in M1-B3.** `starplayer-rt` re-exports
   `portable_atomic_util::Arc` as `starplayer_rt::Arc`, and every other crate names *that*
@@ -1531,6 +1534,10 @@ crates/
                         the `smf` feature (parser + SmfSequencer) also → engine, for
                         EventFeed and the MIDI_CHANNEL_BASE mapping (task E5)
   starplayer-telemetry  snapshot types shared by every UI             → core, rt
+  starplayer-host-embedded  the no_std host (M8-I1): EmbeddedPlayer over the fixed
+                        path with the std host's quantum-aligned control cadence,
+                        an i16 render entry point, a command mailbox and the golden
+                        bench digest.               → starplayer, rt, telemetry
   starplayer-enhance    load-time sample enhancers: polyphase sinc upsampling,
                         decay denoising, STFT bandwidth extension and loop-seam
                         smoothing, plus the catalogue a host builds its
@@ -1558,6 +1565,9 @@ apps/
   starplayer-web        wasm-bindgen + responsive web UI
   starplayer-cli        CLI player / renderer
   starplayer-tui        STAR.EXE homage (ratatui)
+embedded/               its own workspace on the `esp` toolchain (M8): firmware-common,
+                        boards/starplayer-a1s (Xtensa, ES8388), boards/starplayer-c5
+                        (RISC-V bench), xtask. Depends on the crates above by path.
 xtask/                  build orchestration, wasm packaging, golden regeneration
 ```
 
@@ -1647,7 +1657,7 @@ Recorded rather than guessed. Each has a milestone where it must be settled.
 | # | Question | Settle by |
 |---|---|---|
 | Q1 | Does `SharedArrayBuffer` + COOP/COEP work well enough for scope telemetry, or is `postMessage` the practical default? | **Settled in M0-A4 — see §9** |
-| Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | M8 |
+| Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | M8-I3 — measured on the ESP32-A1S against the I2S DMA ring depth |
 | Q3 | Which voice-stealing heuristic does libopenmpt actually use, exactly? | **Settled in M6-G3 — see §5.2** |
 | Q4 | Does the `Instrument` trait survive contact with a non-sample instrument (FM), or does it need a second tier? | M10 — **still open**; M4-E4 committed the trait with two *sample* implementations (§5.3), which is what design goal 8 asked for and is not yet the question Q4 asks |
 | Q5 | CLAP first with a VST3 wrapper, or nih-plug for both? | M9 |
