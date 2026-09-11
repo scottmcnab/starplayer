@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | A4 ([master plan](A4-master-plan.md)) |
-| Status | Ready 2026-09-11; owner: registration and hosting |
+| Status | Landed 2026-09-12; owner: registration, Pages hosting and the on-device findings outstanding |
 | Depends on | The web player and `cargo xtask wasm` as landed by [M1-B7](../engine/complete/M1-task-B7-web-player.md) and [W3](complete/W3-task-github-pages.md) |
 | Blocks | A4-N3 (the StarPlayer Web Receiver) and, through it, A4-N4 (the web player's Cast button) |
 | Parallel with | [N2](A4-task-N2-cast-cli.md) — no shared code; both touch `plans/README.md` |
