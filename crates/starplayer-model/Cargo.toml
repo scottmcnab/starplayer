@@ -8,6 +8,12 @@ rust-version.workspace = true
 
 [dependencies]
 starplayer-core = { workspace = true }
+# The one safe way to reinterpret a module image's PCM region as `&[i16]` without a
+# `transmute`: this crate is `#![forbid(unsafe_code)]`, and `try_cast_slice` does the
+# alignment and length checks the borrow needs anyway — a misaligned image has to be an
+# `Err` rather than a silent copy (`src/image.rs`). `no_std` with no default features, and
+# already in the graph underneath `fixed`.
+bytemuck = { workspace = true }
 
 [dev-dependencies]
 # Test-only, and deliberately not a normal dependency: `starplayer-model` does not depend

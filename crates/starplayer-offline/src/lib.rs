@@ -191,6 +191,46 @@ impl fmt::Display for GoldenFormat {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(self.directory()) }
 }
 
+/// One module of the golden contract: its format, the stem every artefact of it is named
+/// after, and its bytes.
+///
+/// The bytes are `Vec<u8>` rather than `&'static [u8]` because four of the six are
+/// *synthesised* by [`fixtures`] rather than committed: there is no licence-safe MOD, MTM,
+/// XM or IT to check in, so C6a generates them from a committed generator instead.
+#[derive(Clone, Debug)]
+pub struct GoldenFixture {
+    /// Which loader owns it, and which `goldens/<format>/` directory its hashes live in.
+    pub format: GoldenFormat,
+    /// The stem its golden filenames — and its `<stem>-<format>.spmi` module image — carry.
+    pub stem: &'static str,
+    /// The module file itself.
+    pub bytes: Vec<u8>,
+}
+
+/// The six modules the golden contract covers.
+///
+/// One list, used by `starplayer-goldens` to write the hashes and by
+/// `starplayer-module-image` to write the flash-resident images M8's firmware plays, so the
+/// two cannot drift apart. The S3Ms are the repository owner's own modules and are
+/// committed as bytes; the other four are synthesised (see [`GoldenFixture`]).
+pub fn golden_fixtures() -> Vec<GoldenFixture> {
+    vec![
+        GoldenFixture { format: GoldenFormat::Mod, stem: "synthetic", bytes: fixtures::synthetic_mod() },
+        GoldenFixture { format: GoldenFormat::Mtm, stem: "synthetic", bytes: fixtures::synthetic_mtm() },
+        GoldenFixture { format: GoldenFormat::Xm, stem: "synthetic", bytes: fixtures::synthetic_xm() },
+        GoldenFixture { format: GoldenFormat::It, stem: "synthetic", bytes: fixtures::synthetic_it() },
+        GoldenFixture { format: GoldenFormat::S3m, stem: "petri", bytes: include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M").to_vec() },
+        GoldenFixture { format: GoldenFormat::S3m, stem: "reflex", bytes: include_bytes!("../../starplayer-s3m/tests/fixtures/REFLEX.S3M").to_vec() },
+    ]
+}
+
+/// The filename `cargo xtask module-images` writes one fixture's module image under —
+/// `<stem>-<format>.spmi`, so `petri-s3m.spmi` and `synthetic-mod.spmi` sit unambiguously
+/// in one directory.
+pub fn module_image_filename(fixture: &GoldenFixture) -> String {
+    format!("{}-{}.spmi", fixture.stem, fixture.format.directory())
+}
+
 /// Failure to produce a canonical audio render.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RenderError {
@@ -265,13 +305,23 @@ pub fn render_fixed_mono(format: GoldenFormat, bytes: &[u8], host_block_frames: 
 /// mono fold-down, limiter — is identical, which is what makes the extra hashes worth
 /// having: the only variable between them is the kernel.
 pub fn render_fixed_mono_with(format: GoldenFormat, bytes: &[u8], host_block_frames: usize, interpolator: Interpolator) -> Result<Vec<i16>, RenderError> {
-    render_golden::<FixedPath, MonoI16>(format, bytes, GOLDEN_RENDER_FRAMES, host_block_frames, interpolator)
+    render_golden::<FixedPath, MonoI16>(load_golden(format, bytes)?, GOLDEN_RENDER_FRAMES, host_block_frames, interpolator)
+}
+
+/// [`render_fixed_mono_with`] over a module that is **already loaded** — the entry point
+/// for anything that obtains its module by some route other than a format loader.
+///
+/// M8-I2's proof that a flash-resident module image is the same module uses it: a
+/// `Module` borrowed out of an image renders through exactly this call, and its digest is
+/// compared against the committed golden the file's own bytes produce.
+pub fn render_loaded_fixed_mono(module: Module, host_block_frames: usize, interpolator: Interpolator) -> Result<Vec<i16>, RenderError> {
+    render_golden::<FixedPath, MonoI16>(module, GOLDEN_RENDER_FRAMES, host_block_frames, interpolator)
 }
 
 /// Render the float path with the same rate, duration, interpolation, mono fold-down and
 /// DSP bypass as [`render_fixed_mono`].
 pub fn render_float_mono(format: GoldenFormat, bytes: &[u8], host_block_frames: usize) -> Result<Vec<f32>, RenderError> {
-    render_golden::<FloatPath, MonoF32>(format, bytes, GOLDEN_RENDER_FRAMES, host_block_frames, GOLDEN_INTERPOLATOR)
+    render_golden::<FloatPath, MonoF32>(load_golden(format, bytes)?, GOLDEN_RENDER_FRAMES, host_block_frames, GOLDEN_INTERPOLATOR)
 }
 
 /// SHA-256 over the canonical samples encoded as little-endian signed PCM words.
@@ -286,7 +336,17 @@ pub fn canonical_sha256(format: GoldenFormat, bytes: &[u8], host_block_frames: u
 /// goldens. The kernel is part of the golden's filename, so a hash and the kernel that
 /// produced it cannot come apart.
 pub fn canonical_sha256_with(format: GoldenFormat, bytes: &[u8], host_block_frames: usize, interpolator: Interpolator) -> Result<[u8; 32], RenderError> {
-    let samples = render_fixed_mono_with(format, bytes, host_block_frames, interpolator)?;
+    Ok(sha256_of_samples(&render_fixed_mono_with(format, bytes, host_block_frames, interpolator)?))
+}
+
+/// [`canonical_sha256_with`] over a module that is already loaded. See
+/// [`render_loaded_fixed_mono`].
+pub fn canonical_sha256_of_loaded(module: Module, host_block_frames: usize, interpolator: Interpolator) -> Result<[u8; 32], RenderError> {
+    Ok(sha256_of_samples(&render_loaded_fixed_mono(module, host_block_frames, interpolator)?))
+}
+
+/// The canonical digest of a rendered segment: every sample as little-endian bytes.
+fn sha256_of_samples(samples: &[i16]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for sample in samples {
         hasher.update(sample.to_le_bytes());
@@ -294,7 +354,7 @@ pub fn canonical_sha256_with(format: GoldenFormat, bytes: &[u8], host_block_fram
     let digest = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&digest);
-    Ok(hash)
+    hash
 }
 
 /// Scan a loaded module and report the shape of its song: every row it plays, when, how
@@ -730,26 +790,26 @@ pub fn segmental_snr_db(fixed: &[i16], float: &[f32], segment_frames: usize) -> 
 /// that picks the file picks the code that produces its bytes, so the two cannot
 /// disagree. Adding a kernel to `starplayer-dsp` means adding one arm here, and nothing
 /// else in this crate may name an interpolator type.
-fn render_golden<Path, Out>(format: GoldenFormat, bytes: &[u8], frames: usize, host_block_frames: usize, interpolator: Interpolator) -> Result<Vec<Out::Sample>, RenderError>
+fn render_golden<Path, Out>(module: Module, frames: usize, host_block_frames: usize, interpolator: Interpolator) -> Result<Vec<Out::Sample>, RenderError>
 where
     Path: MixPath,
     Out: OutputFormat<Accumulator = Path::Accumulator>,
 {
     match interpolator {
-        Interpolator::None => render_with_kernel::<Path, Nearest, Out>(format, bytes, frames, host_block_frames),
-        Interpolator::Linear => render_with_kernel::<Path, Linear, Out>(format, bytes, frames, host_block_frames),
-        Interpolator::Cubic => render_with_kernel::<Path, Cubic, Out>(format, bytes, frames, host_block_frames),
-        Interpolator::Sinc => render_with_kernel::<Path, Sinc, Out>(format, bytes, frames, host_block_frames),
+        Interpolator::None => render_with_kernel::<Path, Nearest, Out>(module, frames, host_block_frames),
+        Interpolator::Linear => render_with_kernel::<Path, Linear, Out>(module, frames, host_block_frames),
+        Interpolator::Cubic => render_with_kernel::<Path, Cubic, Out>(module, frames, host_block_frames),
+        Interpolator::Sinc => render_with_kernel::<Path, Sinc, Out>(module, frames, host_block_frames),
     }
 }
 
-fn render_with_kernel<Path, Interp, Out>(format: GoldenFormat, bytes: &[u8], frames: usize, host_block_frames: usize) -> Result<Vec<Out::Sample>, RenderError>
+fn render_with_kernel<Path, Interp, Out>(module: Module, frames: usize, host_block_frames: usize) -> Result<Vec<Out::Sample>, RenderError>
 where
     Path: MixPath,
     Interp: Interpolate,
     Out: OutputFormat<Accumulator = Path::Accumulator>,
 {
-    let module = Arc::new(load_golden(format, bytes)?);
+    let module = Arc::new(module);
     let settings = EngineSettings {
         sample_rate_hz: GOLDEN_SAMPLE_RATE_HZ,
         channel_count: module.header().channel_count as usize,

@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StarPlayer</title>
+<style>
+:root {
+    color-scheme: dark;
+    --ink: #e7edf5;
+    --muted: #8997aa;
+    --panel: #171e29;
+    --panel-2: #111821;
+    --line: #2a3646;
+    --accent: #6fd3c5;
+    --accent-2: #f5c36b;
+    --danger: #ff7b7b;
+    --radius: 10px;
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    background: linear-gradient(180deg, #0e141c, #0a0f15 70%);
+    color: var(--ink);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+main { width: min(760px, calc(100% - 24px)); margin: 0 auto; padding: 16px 0 48px; }
+h1, h2, p { margin: 0; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
+a { color: var(--accent); }
+
+header.topbar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 12px; border-bottom: 1px solid var(--line);
+}
+header.topbar h1 { font-size: 18px; letter-spacing: -.02em; white-space: nowrap; }
+header.topbar h1 span { color: var(--accent); }
+#module-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+#module-format { color: var(--muted); font: 11px/1 ui-monospace, monospace; text-transform: uppercase; }
+.conn-badge {
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px;
+    font-size: 11px; color: var(--muted); white-space: nowrap;
+}
+.conn-badge.live { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.conn-badge.reconnecting { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); }
+
+.panel {
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: color-mix(in srgb, var(--panel) 94%, transparent);
+    padding: 14px; margin-top: 14px;
+}
+
+.transport { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.transport button {
+    min-width: 44px; min-height: 40px; border: 1px solid #39485b; border-radius: 7px;
+    background: #202a37; color: var(--ink); font-size: 16px; cursor: pointer;
+}
+.transport button:hover { border-color: #61758c; background: #283647; }
+.volume-label { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 180px; color: var(--muted); font-size: 12px; }
+.volume-label input { flex: 1; accent-color: var(--accent); }
+.volume-label output { width: 3em; text-align: right; color: var(--ink); font: 12px ui-monospace, monospace; }
+
+.position-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; }
+.position-grid div { padding: 8px 10px; background: var(--panel-2); }
+.position-grid span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.position-grid strong { font: 700 15px/1.5 ui-monospace, monospace; }
+
+.table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
+table { width: 100%; border-collapse: collapse; font: 12px/1.2 ui-monospace, monospace; min-width: 480px; }
+th { color: var(--muted); font-weight: 600; text-align: left; text-transform: uppercase; letter-spacing: .06em; font-size: 10px; }
+th, td { padding: 6px 8px; border-bottom: 1px solid #222d3a; white-space: nowrap; }
+tbody tr:last-child td { border-bottom: 0; }
+tr.inactive { color: #647184; }
+tr.muted .ch-cell { color: var(--danger); }
+.ch-cell { cursor: pointer; user-select: none; }
+.ch-cell:hover { color: var(--accent); }
+td.effect { color: var(--accent-2); overflow: hidden; text-overflow: ellipsis; max-width: 18ch; }
+.vu-track { display: block; width: 88px; height: 8px; border-radius: 2px; overflow: hidden; background: #252f3b; }
+.vu-fill { display: block; width: 0; height: 100%; background: linear-gradient(90deg, #67c587 0 50%, #e6c25f 50% 87.5%, #eb746e 87.5%); transition: width .1s linear; }
+.empty { color: var(--muted); text-align: center; padding: 14px; }
+
+ul.module-list { list-style: none; margin: 0; padding: 0; }
+ul.module-list li {
+    display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px;
+    padding: 8px 4px; border-bottom: 1px solid #222d3a;
+}
+ul.module-list li:last-child { border-bottom: 0; }
+ul.module-list li.current .module-name { color: var(--accent); }
+.module-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.module-meta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+button, select, input { font: inherit; }
+button, select, input[type=file] {
+    min-height: 36px; border: 1px solid #39485b; border-radius: 7px;
+    background: #202a37; color: var(--ink); padding: 6px 10px;
+}
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: #61758c; background: #283647; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+.upload-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.upload-row input[type=file] { flex: 1; min-width: 0; }
+.progress { height: 7px; border-radius: 4px; background: #202a37; overflow: hidden; margin-top: 10px; }
+.progress-fill { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s linear; }
+#upload-status { margin-top: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+.store-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.warn { margin-top: 8px; color: var(--accent-2); font-size: 12px; }
+#store-status { margin-top: 6px; color: var(--muted); font-size: 12px; }
+
+@media (max-width: 460px) {
+    .position-grid { grid-template-columns: repeat(2, 1fr); }
+    ul.module-list li { grid-template-columns: 1fr; }
+    ul.module-list button { justify-self: start; }
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+    <h1>Star<span>Player</span></h1>
+    <div id="module-title">&mdash;</div>
+    <div id="module-format"></div>
+    <div id="conn-badge" class="conn-badge">connecting&hellip;</div>
+</header>
+
+<main>
+    <section class="panel transport">
+        <button id="btn-prev" title="Previous">&#9198;</button>
+        <button id="btn-play" title="Play / pause">&#9654;</button>
+        <button id="btn-stop" title="Stop">&#9632;</button>
+        <button id="btn-next" title="Next">&#9197;</button>
+        <label class="volume-label">
+            <span>Vol</span>
+            <input type="range" id="volume" min="0" max="65535" value="32768">
+            <output id="volume-readout">50%</output>
+        </label>
+    </section>
+
+    <section class="panel">
+        <h2>Position</h2>
+        <div class="position-grid">
+            <div><span>Order</span><strong id="pos-order">&mdash;</strong></div>
+            <div><span>Pattern</span><strong id="pos-pattern">&mdash;</strong></div>
+            <div><span>Row</span><strong id="pos-row">&mdash;</strong></div>
+            <div><span>Speed</span><strong id="pos-speed">&mdash;</strong></div>
+            <div><span>BPM</span><strong id="pos-bpm">&mdash;</strong></div>
+            <div><span>Elapsed</span><strong id="pos-elapsed">&mdash;</strong></div>
+            <div><span>Total</span><strong id="pos-total">&mdash;</strong></div>
+            <div><span>Voices</span><strong id="pos-voices">&mdash;</strong></div>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h2>Channels</h2>
+        <div class="table-scroll">
+            <table>
+                <thead><tr><th>Ch</th><th>Inst</th><th>Note</th><th>VU</th><th>Effect</th></tr></thead>
+                <tbody id="channel-body"></tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel">
+        <h2>Modules</h2>
+        <ul class="module-list" id="module-list"><li class="empty">Loading&hellip;</li></ul>
+    </section>
+
+    <section class="panel">
+        <h2>Upload a module</h2>
+        <div class="upload-row">
+            <input type="file" id="upload-file" accept=".mod,.s3m,.mtm,.xm,.it,.spmi">
+            <button id="btn-upload">Upload</button>
+        </div>
+        <div class="progress"><span class="progress-fill" id="upload-progress"></span></div>
+        <p id="upload-status"></p>
+    </section>
+
+    <section class="panel">
+        <h2>Store to flash</h2>
+        <div class="store-row">
+            <label>Slot
+                <select id="store-slot">
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                    <option value="5">5</option>
+                </select>
+            </label>
+            <button id="btn-store">Store playing module</button>
+        </div>
+        <p class="warn">Writes the playing module into flash. Playback pauses for a few seconds while it writes.</p>
+        <p id="store-status"></p>
+    </section>
+</main>
+
+<script>
+(function () {
+    'use strict';
+
+    var SAMPLE_RATE = 44100;
+    var NOTE_NAMES = ['C-', 'C#', 'D-', 'D#', 'E-', 'F-', 'F#', 'G-', 'G#', 'A-', 'A#', 'B-'];
+    var HEADER_WORDS = 22;
+    var CHANNEL_WORDS = 8;
+
+    var moduleTitleEl = document.getElementById('module-title');
+    var moduleFormatEl = document.getElementById('module-format');
+    var connBadgeEl = document.getElementById('conn-badge');
+    var prevButton = document.getElementById('btn-prev');
+    var playButton = document.getElementById('btn-play');
+    var stopButton = document.getElementById('btn-stop');
+    var nextButton = document.getElementById('btn-next');
+    var volumeSlider = document.getElementById('volume');
+    var volumeReadout = document.getElementById('volume-readout');
+    var posOrderEl = document.getElementById('pos-order');
+    var posPatternEl = document.getElementById('pos-pattern');
+    var posRowEl = document.getElementById('pos-row');
+    var posSpeedEl = document.getElementById('pos-speed');
+    var posBpmEl = document.getElementById('pos-bpm');
+    var posElapsedEl = document.getElementById('pos-elapsed');
+    var posTotalEl = document.getElementById('pos-total');
+    var posVoicesEl = document.getElementById('pos-voices');
+    var channelBodyEl = document.getElementById('channel-body');
+    var moduleListEl = document.getElementById('module-list');
+    var uploadFileEl = document.getElementById('upload-file');
+    var uploadButton = document.getElementById('btn-upload');
+    var uploadProgressEl = document.getElementById('upload-progress');
+    var uploadStatusEl = document.getElementById('upload-status');
+    var storeSlotEl = document.getElementById('store-slot');
+    var storeButton = document.getElementById('btn-store');
+    var storeStatusEl = document.getElementById('store-status');
+
+    var socket = null;
+    var reconnectDelay = 500;
+    var isPlaying = false;
+    var channelRows = [];
+    var effectNames = [];
+    var volumeDragging = false;
+
+    // ---- small helpers, every one of them safe to call with nothing wired up yet ----
+
+    function formatSeconds(seconds) {
+        if (seconds === null || seconds === undefined || !isFinite(seconds)) return '—:—';
+        seconds = Math.max(0, Math.round(seconds));
+        var hours = Math.floor(seconds / 3600);
+        var minutes = Math.floor((seconds % 3600) / 60);
+        var secs = seconds % 60;
+        var pad = function (value) { return value < 10 ? '0' + value : '' + value; };
+        return hours > 0 ? hours + ':' + pad(minutes) + ':' + pad(secs) : minutes + ':' + pad(secs);
+    }
+
+    function formatBytes(bytes) {
+        if (bytes === null || bytes === undefined) return '';
+        if (bytes < 1024) return bytes + ' B';
+        return (bytes / 1024).toFixed(1) + ' KB';
+    }
+
+    function noteName(semitone) {
+        if (semitone < 0) return '---';
+        var octave = Math.floor(semitone / 12);
+        return NOTE_NAMES[semitone % 12] + octave;
+    }
+
+    function post(path, data) {
+        var options = { method: 'POST' };
+        if (data !== undefined) {
+            options.headers = { 'Content-Type': 'application/json' };
+            options.body = JSON.stringify(data);
+        }
+        return fetch(path, options).catch(function (error) {
+            console.error('POST', path, 'failed:', error);
+        });
+    }
+
+    // ---- WebSocket telemetry: 22 header words, then channel_count blocks of 8 ----
+
+    function wsUrl() {
+        var scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        return scheme + location.host + '/ws';
+    }
+
+    function setConnBadge(state) {
+        connBadgeEl.className = 'conn-badge ' + state;
+        connBadgeEl.textContent = state === 'live' ? 'live' : state === 'connecting' ? 'connecting…' : 'reconnecting…';
+    }
+
+    function connectSocket() {
+        setConnBadge('connecting');
+        var newSocket;
+        try {
+            newSocket = new WebSocket(wsUrl());
+            newSocket.binaryType = 'arraybuffer';
+        } catch (error) {
+            scheduleReconnect();
+            return;
+        }
+        socket = newSocket;
+        socket.onopen = function () { reconnectDelay = 500; setConnBadge('live'); };
+        socket.onclose = function () { setConnBadge('reconnecting'); scheduleReconnect(); };
+        socket.onerror = function () { try { newSocket.close(); } catch (error) { /* already closing */ } };
+        socket.onmessage = function (event) {
+            try { handleFrame(event.data); } catch (error) { /* one malformed frame must not kill the page */ }
+        };
+    }
+
+    function scheduleReconnect() {
+        setTimeout(connectSocket, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 8000);
+    }
+
+    function sendCommand(opcode, argument, extra) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        var buffer = new ArrayBuffer(9);
+        var view = new DataView(buffer);
+        view.setUint8(0, opcode);
+        view.setUint32(1, argument >>> 0, true);
+        view.setUint32(5, extra >>> 0, true);
+        try { socket.send(buffer); } catch (error) { /* socket dropped mid-send; the next frame will reconnect */ }
+    }
+
+    function handleFrame(rawFrame) {
+        var words = new Int32Array(rawFrame);
+        if (words.length < HEADER_WORDS) return;
+
+        var channelCount = Math.min(words[2], 64);
+        var voices = words[3];
+        var order = words[4];
+        var pattern = words[5];
+        var row = words[6];
+        var speed = words[8];
+        var bpm = words[9];
+        var playing = words[15] !== 0;
+        var elapsedFrames = words[19];
+        var totalFrames = words[20];
+        var songFlags = words[21];
+        var lengthKnown = (songFlags & 1) !== 0;
+
+        posOrderEl.textContent = order;
+        posPatternEl.textContent = pattern;
+        posRowEl.textContent = row;
+        posSpeedEl.textContent = speed;
+        posBpmEl.textContent = bpm;
+        posVoicesEl.textContent = voices;
+        posElapsedEl.textContent = formatSeconds(elapsedFrames / SAMPLE_RATE);
+        posTotalEl.textContent = lengthKnown ? formatSeconds(totalFrames / SAMPLE_RATE) : '—:—';
+
+        isPlaying = playing;
+        playButton.textContent = playing ? '⏸' : '▶';
+
+        if (!volumeDragging) {
+            var moduleVolume = words[10];
+            volumeSlider.value = moduleVolume;
+            volumeReadout.textContent = Math.round(moduleVolume / 65535 * 100) + '%';
+        }
+
+        ensureChannelRows(channelCount);
+        for (var channel = 0; channel < channelCount; channel++) {
+            var offset = HEADER_WORDS + channel * CHANNEL_WORDS;
+            var note = words[offset];
+            var instrument = words[offset + 1];
+            var vu = words[offset + 6];
+            var flags = words[offset + 7];
+            updateChannelRow(channel, note, instrument, vu, (flags & 1) !== 0, (flags & 2) !== 0);
+        }
+    }
+
+    // ---- channel table: rows are built once per channel count and updated in place ----
+
+    function ensureChannelRows(count) {
+        if (channelRows.length === count) return;
+        channelBodyEl.innerHTML = '';
+        channelRows = [];
+        for (var index = 0; index < count; index++) {
+            var row = document.createElement('tr');
+
+            var chCell = document.createElement('td');
+            chCell.className = 'ch-cell';
+            chCell.textContent = index + 1;
+            chCell.title = 'Click to mute or unmute this channel';
+            chCell.addEventListener('click', makeMuteHandler(index));
+
+            var instCell = document.createElement('td');
+            var noteCell = document.createElement('td');
+
+            var vuCell = document.createElement('td');
+            var vuTrack = document.createElement('span');
+            vuTrack.className = 'vu-track';
+            var vuFill = document.createElement('span');
+            vuFill.className = 'vu-fill';
+            vuTrack.appendChild(vuFill);
+            vuCell.appendChild(vuTrack);
+
+            var effectCell = document.createElement('td');
+            effectCell.className = 'effect';
+
+            row.appendChild(chCell);
+            row.appendChild(instCell);
+            row.appendChild(noteCell);
+            row.appendChild(vuCell);
+            row.appendChild(effectCell);
+            channelBodyEl.appendChild(row);
+
+            channelRows.push({ row: row, inst: instCell, note: noteCell, vu: vuFill, effect: effectCell, muted: false });
+        }
+    }
+
+    function makeMuteHandler(index) {
+        return function () {
+            var entry = channelRows[index];
+            if (!entry) return;
+            sendCommand(6, index, entry.muted ? 0 : 1);
+        };
+    }
+
+    function updateChannelRow(index, note, instrument, vu, active, muted) {
+        var entry = channelRows[index];
+        if (!entry) return;
+        entry.inst.textContent = instrument > 0 ? instrument : '—';
+        entry.note.textContent = noteName(note);
+        entry.vu.style.width = Math.min(100, Math.round(vu / 65535 * 100)) + '%';
+        entry.effect.textContent = effectNames[index] || '';
+        entry.muted = muted;
+        entry.row.classList.toggle('inactive', !active);
+        entry.row.classList.toggle('muted', muted);
+    }
+
+    // ---- /api/status: polled about once a second for the names the WebSocket does not carry ----
+
+    function pollStatus() {
+        fetch('/api/status').then(function (response) {
+            if (!response.ok) throw new Error('status ' + response.status);
+            return response.json();
+        }).then(function (status) {
+            moduleTitleEl.textContent = status.title || '(untitled)';
+            moduleFormatEl.textContent = status.format || '';
+            effectNames = (status.channels || []).map(function (channel) { return channel.effect || ''; });
+        }).catch(function () { /* device unreachable this tick; keep showing the last known state */ });
+    }
+
+    // ---- /api/modules: the module list and its "play" buttons ----
+
+    function refreshModules() {
+        fetch('/api/modules').then(function (response) {
+            if (!response.ok) throw new Error('modules ' + response.status);
+            return response.json();
+        }).then(renderModules).catch(function () {
+            moduleListEl.innerHTML = '<li class="empty">Could not load the module list.</li>';
+        });
+    }
+
+    function renderModules(modules) {
+        moduleListEl.innerHTML = '';
+        if (!modules || !modules.length) {
+            moduleListEl.innerHTML = '<li class="empty">No modules found.</li>';
+            return;
+        }
+        modules.forEach(function (entry) {
+            var item = document.createElement('li');
+            if (entry.current) item.classList.add('current');
+
+            var name = document.createElement('span');
+            name.className = 'module-name';
+            name.textContent = entry.name;
+
+            var meta = document.createElement('span');
+            meta.className = 'module-meta';
+            meta.textContent = entry.source + ' · ' + formatBytes(entry.bytes);
+
+            var button = document.createElement('button');
+            button.textContent = entry.current ? 'Playing' : 'Play';
+            button.disabled = !!entry.current;
+            button.addEventListener('click', function () {
+                post('/api/modules/select', { id: entry.id }).then(refreshModules);
+            });
+
+            item.appendChild(name);
+            item.appendChild(meta);
+            item.appendChild(button);
+            moduleListEl.appendChild(item);
+        });
+    }
+
+    // ---- upload: XHR for upload.onprogress, which fetch does not expose ----
+
+    function uploadModule() {
+        var file = uploadFileEl.files[0];
+        if (!file) {
+            uploadStatusEl.textContent = 'Choose a file first.';
+            return;
+        }
+        uploadProgressEl.style.width = '0%';
+        uploadStatusEl.textContent = 'Uploading…';
+        uploadButton.disabled = true;
+
+        var request = new XMLHttpRequest();
+        request.open('POST', '/api/modules');
+        request.setRequestHeader('Content-Type', 'application/octet-stream');
+        request.upload.onprogress = function (event) {
+            if (event.lengthComputable) {
+                uploadProgressEl.style.width = Math.round(event.loaded / event.total * 100) + '%';
+            }
+        };
+        request.onload = function () {
+            uploadButton.disabled = false;
+            if (request.status === 201) {
+                uploadProgressEl.style.width = '100%';
+                uploadStatusEl.textContent = 'Uploaded.';
+                refreshModules();
+            } else if (request.status === 413) {
+                uploadStatusEl.textContent = 'That file is too large.';
+            } else {
+                // Every refusal this firmware sends carries a sentence written for a
+                // person, so show it rather than a status code.
+                var reason = (request.responseText || '').trim();
+                uploadStatusEl.textContent = reason ? 'Upload refused: ' + reason
+                    : 'Upload failed (status ' + request.status + ').';
+            }
+        };
+        request.onerror = function () {
+            uploadButton.disabled = false;
+            uploadStatusEl.textContent = 'Upload failed — connection error.';
+        };
+        try {
+            request.send(file);
+        } catch (error) {
+            uploadButton.disabled = false;
+            uploadStatusEl.textContent = 'Upload failed to start.';
+        }
+    }
+
+    // ---- store to flash ----
+
+    function storeToFlash() {
+        var slot = parseInt(storeSlotEl.value, 10);
+        storeButton.disabled = true;
+        storeStatusEl.textContent = 'Writing slot ' + slot + '… playback will pause briefly.';
+        post('/api/modules/store', { id: slot }).then(function () {
+            storeStatusEl.textContent = 'Stored to slot ' + slot + '.';
+            storeButton.disabled = false;
+            refreshModules();
+        });
+    }
+
+    // ---- wiring ----
+
+    prevButton.addEventListener('click', function () { post('/api/previous'); });
+    nextButton.addEventListener('click', function () { post('/api/next'); });
+    stopButton.addEventListener('click', function () { post('/api/stop'); });
+    playButton.addEventListener('click', function () { post(isPlaying ? '/api/stop' : '/api/play'); });
+
+    volumeSlider.addEventListener('pointerdown', function () { volumeDragging = true; });
+    volumeSlider.addEventListener('pointerup', function () { volumeDragging = false; });
+    volumeSlider.addEventListener('input', function () {
+        var level = parseInt(volumeSlider.value, 10);
+        volumeReadout.textContent = Math.round(level / 65535 * 100) + '%';
+        sendCommand(5, level, 0);
+    });
+
+    uploadButton.addEventListener('click', uploadModule);
+    storeButton.addEventListener('click', storeToFlash);
+
+    setConnBadge('connecting');
+    connectSocket();
+    pollStatus();
+    setInterval(pollStatus, 1000);
+    refreshModules();
+})();
+</script>
+</body>
+</html>

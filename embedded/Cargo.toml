@@ -1,0 +1,144 @@
+# The firmware workspace — deliberately **not** a member of the main one (M8 master-plan
+# decision 1).
+#
+# Three things make it separate rather than a directory of crates:
+#
+# * the A1S board is built with the Xtensa fork of rustc (`rust-toolchain.toml` here pins
+#   the named espup toolchain `esp-1.97`), while the main workspace is on stable 1.97;
+# * the A1S needs `-Z build-std`, which is a nightly cargo feature the main workspace must
+#   not see. The C5 board (M8-I4) does *not* — `riscv32imac-unknown-none-elf` is a plain
+#   LLVM target with a prebuilt `core`/`alloc` component, so `embedded/xtask` builds it
+#   under the plain stable toolchain (`+1.97`) instead of `+esp-1.97`; it is still a member
+#   of this workspace rather than the main one for the third reason below;
+# * its board crates carry `[target.<triple>.dependencies]` tables full of `esp-*` crates
+#   that only compile for their own target — a single `cargo metadata` at the repo root
+#   that had to resolve them would break `cargo xtask ci`.
+#
+# The main workspace's `members` globs (`crates/*`, `apps/*`, `xtask`) do not reach in
+# here, and the root manifest's `exclude` says so out loud.
+[workspace]
+resolver = "2"
+members = [
+    "firmware-common",
+    "boards/starplayer-a1s",
+    "boards/starplayer-c5",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/scottmcnab/starplayer"
+
+[workspace.dependencies]
+# The engine, by path into the main workspace. Those crates are members of *that*
+# workspace and inherit their own `[workspace.package]`/`[workspace.dependencies]` from
+# its root manifest; a path dependency across a workspace boundary is exactly how `fuzz/`
+# already reaches them.
+#
+# The facade takes its **default** feature set (the five format processors) plus
+# `telemetry`, which is what `starplayer-host-embedded` itself requires and what the six
+# golden fixtures need. `std` is absent and must stay absent.
+starplayer = { path = "../crates/starplayer", features = ["telemetry"] }
+starplayer-host-embedded = { path = "../crates/starplayer-host-embedded" }
+starplayer-model = { path = "../crates/starplayer-model" }
+starplayer-telemetry = { path = "../crates/starplayer-telemetry" }
+# Checked, `unsafe`-free slice casting. The audio path uses it to view a rendered
+# `&[i16]` as the `&[u8]` the DMA ring wants — the one conversion that would otherwise
+# have been a pointer cast. Pinned at the same version as the main workspace.
+bytemuck = { version = "1.25", default-features = false }
+
+firmware-common = { package = "starplayer-firmware-common", path = "firmware-common" }
+
+# ---------------------------------------------------------------------------
+# M8-I5: the ST7789 now-playing screen. `embedded-graphics` is chip-agnostic and pure
+# Rust, so `firmware-common` depends on it unconditionally (it is what `screen.rs` draws
+# through, and what its host tests exercise against `MockDisplay`). `mipidsi` and
+# `embedded-hal-bus` are only pulled in by the board crate's `lcd` feature — see
+# `boards/starplayer-a1s/Cargo.toml`.
+# ---------------------------------------------------------------------------
+# Default features only (`batch`, which buffers pixel writes — wanted either way). No
+# `defmt` feature: this workspace logs through `esp-println`/`log`, not `defmt`.
+#
+# **Pinned to `=0.8.1`, not the newer `0.8.2`, and `mipidsi` below to `0.9.0`, not
+# `0.10.0`.** `embedded-graphics 0.8.2` tightened its own `fixed`/`az` requirements to
+# `~1.27.0`/`~1.2.0` (from `0.8.1`'s `^1.14.0`/`^1.2.0`), and `mipidsi 0.10.0` moved to
+# `embedded-graphics-core ^0.4.1`, whose own `Cargo.toml` also tightened `az` to
+# `~1.2.0`. `starplayer-core` depends on `fixed = "1.31"`, which needs `az ^1.3` — and
+# `~1.2.0` and `^1.3` do not overlap, so `cargo` cannot resolve a single `az` version at
+# all: "failed to select a version for `az`" against `embedded-graphics 0.8.2` alone, and
+# again against `mipidsi 0.10.0` alone, reproduced in isolation from this workspace's own
+# dependency table (M8-I5 research point 2). `embedded-graphics 0.8.1` (`az ^1.2.0`,
+# `fixed ^1.14.0`) and `mipidsi 0.9.0` (`embedded-graphics-core ^0.4.0`, satisfied by
+# `0.4.0`'s looser `az ^1.1`) both resolve cleanly against `fixed 1.31`/`az 1.3.0` — one
+# shared `az` version for the whole graph. Neither crate's API changed between these
+# patch/minor steps in a way this board's code below uses.
+embedded-graphics = "=0.8.1"
+# mipidsi carries its **own** SPI interface from 0.9 on (`mipidsi::interface::SpiInterface`,
+# built on `embedded-hal` 1.0's `SpiDevice` + `OutputPin`) rather than depending on the
+# separate `display-interface-spi` crate the way older mipidsi releases did — so that
+# crate is not a dependency here at all (M8-I5 research point 2). `0.9.0`, not the newer
+# `0.10.0`: see the `embedded-graphics` comment above for why.
+mipidsi = "0.9.0"
+# `esp_hal::spi::master::Spi` implements `embedded-hal`'s `SpiBus`, not `SpiDevice`
+# directly (its own module docs point here); `ExclusiveDevice::new_no_delay` wraps the
+# bus and a plain `Output` CS pin into the `SpiDevice` `mipidsi::interface::SpiInterface`
+# wants, with software-driven (not hardware) chip select.
+embedded-hal-bus = "0.3.0"
+
+# ---------------------------------------------------------------------------
+# M8-I6: the status JSON encoder in `firmware-common::api` and, from the board crate, the
+# `picoserve 0.18` HTTP/WebSocket server it sits behind.
+# ---------------------------------------------------------------------------
+# `serde` with only its `derive` feature — no `std`, no `alloc` feature either, since none
+# of `api`'s wire types owns a `String` or a heap `Vec`.
+serde = { version = "1", default-features = false, features = ["derive"] }
+# Pinned to `0.6` specifically, not a newer release: `picoserve 0.18` depends on
+# `serde-json-core 0.6.0` and `heapless 0.8`, and the board crate will share one copy of
+# each with it rather than resolving two. `firmware-common::api` is pinned to match so its
+# host-tested JSON encoding is the same code path the device runs.
+serde-json-core = "0.6"
+# `Status::channels` is a `heapless::Vec` rather than an `alloc::Vec` for the same reason
+# `now_playing::NowPlaying` avoids `alloc::String` (see that module's doc comment): the
+# `0.8` pin reuses the copy `mipidsi` above already resolves, rather than the `0.9` series
+# `embassy-sync` pulls in for its own, unrelated queues.
+heapless = { version = "0.8", default-features = false, features = ["serde"] }
+
+# ---------------------------------------------------------------------------
+# Profiles. Cargo honours `[profile.*]` only at a workspace root, so every profile for
+# every crate under `embedded/` is here.
+# ---------------------------------------------------------------------------
+
+# `opt-level = 3`, not ampkeeper's `"s"`. This firmware's whole reason to exist is a
+# cycles-per-frame measurement of a DSP inner loop (`plans/reference/embedded-budget.md`),
+# and a figure taken at `"s"` would measure the size/speed tradeoff rather than the mixer.
+# Flash is not the constraint here — the `factory` partition is 2.5 MB and the audio build
+# uses a small fraction of it — so the milestone spends flash and keeps the number honest.
+#
+# `codegen-units = 1` and thin LTO for the same reason: the voice kernels are generic and
+# only inline across crate boundaries with LTO on, which is how the std host is built and
+# measured too.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+# Symbols cost nothing in flash (they live in the ELF, not the image) and are what
+# `espflash monitor`'s backtrace decoding needs.
+debug = true
+# A panic on a device is a reset; `esp-backtrace` prints the frames first.
+panic = "abort"
+overflow-checks = false
+
+# The bench profile: release codegen with the debug assertions left on, so an engine
+# invariant that fires during bring-up says so instead of producing quiet nonsense. Not
+# the profile any published figure is taken at — `cargo xtask build --dev` says `--dev` in
+# the transcript so a number taken here can never be mistaken for a release one.
+[profile.dev]
+opt-level = 3
+codegen-units = 1
+debug = true
+panic = "abort"
+debug-assertions = true
+overflow-checks = true

@@ -15,6 +15,7 @@ use crate::instrument::InstrumentDef;
 use crate::module::Module;
 use crate::pattern::{PatternId, PatternIndex};
 use crate::sample::{LoopMode, SampleIndex, SampleSpec};
+use crate::storage::{BlobStorage, PcmStorage};
 
 /// Accumulates the parts of a [`Module`] and validates them on [`ModuleBuilder::build`].
 #[derive(Clone, Debug, Default)]
@@ -158,6 +159,21 @@ impl ModuleBuilder {
         Ok(SampleId(id))
     }
 
+    /// Reserve room for `frames` more PCM frames before the samples that need them are
+    /// added.
+    ///
+    /// [`ModuleBuilder::add_sample`] extends the PCM frame by frame, so without this the
+    /// growing `Vec` doubles, and during the final reallocation the old and the new buffer
+    /// coexist — a peak well above what the finished module costs. That is invisible on a
+    /// desktop and is exactly the wrong shape on an embedded target or a wasm host with a
+    /// hard heap ceiling (M10-K5a's research resolution asked for this; M8-I2 added it).
+    ///
+    /// The reservation is **exact**: a caller that knows the total says so once, before the
+    /// first `add_sample`, and the blob is allocated once. A caller that does not know the
+    /// total should not call this at all rather than call it repeatedly, since each call
+    /// can move the whole blob.
+    pub fn reserve_pcm(&mut self, frames: usize) { self.pcm.reserve_exact(frames); }
+
     /// Append one pattern's **native** bytes to the module's blob and return the id the
     /// module will know it by.
     ///
@@ -224,8 +240,8 @@ impl ModuleBuilder {
     pub fn build(self) -> Result<Module, Error> {
         let header = self.header.ok_or(Error::Invalid("no module header was set"))?;
         let module = Module::from_parts(
-            self.blob.into_boxed_slice(),
-            self.pcm.into_boxed_slice(),
+            BlobStorage::Owned(self.blob.into_boxed_slice()),
+            PcmStorage::Owned(self.pcm.into_boxed_slice()),
             self.samples.into_boxed_slice(),
             self.patterns.into_boxed_slice(),
             self.orders.into_boxed_slice(),
@@ -591,6 +607,29 @@ mod tests {
         header.default_pan = ModuleHeader::centred_pan(2);
         builder.set_header(header);
         assert_eq!(builder.build().map(|_| ()), Err(Error::Invalid("default_pan must be empty or one entry per channel")));
+    }
+
+    #[test]
+    fn reserving_the_pcm_up_front_changes_nothing_about_the_module_that_comes_out() {
+        let frames: &[i16] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let specification = SampleSpec::one_shot("loop").with_forward_loop(4, 8);
+
+        let mut reserved = ModuleBuilder::new();
+        reserved.reserve_pcm(4096);
+        let sample = reserved.add_sample(frames, specification.clone()).expect("a valid looping sample");
+        reserved.add_instrument(InstrumentDef::from_sample("loop", sample, U0F16::MAX)).expect("an instrument");
+        reserved.add_pattern(&[1, 2, 3, 4], 64, 4).expect("a valid pattern");
+        reserved.set_orders(&[0, ORDER_END]);
+        reserved.set_header(ModuleHeader::new(ModuleFormat::S3m, 4));
+
+        let mut plain = ModuleBuilder::new();
+        plain.add_sample(frames, specification).expect("a valid looping sample");
+        plain.add_instrument(InstrumentDef::from_sample("loop", sample, U0F16::MAX)).expect("an instrument");
+        plain.add_pattern(&[1, 2, 3, 4], 64, 4).expect("a valid pattern");
+        plain.set_orders(&[0, ORDER_END]);
+        plain.set_header(ModuleHeader::new(ModuleFormat::S3m, 4));
+
+        assert_eq!(reserved.build(), plain.build(), "a reservation is a memory hint, never a change to the module");
     }
 
     #[test]

@@ -56,8 +56,9 @@ crates/     starplayer-{core,rt,dsp,mixer,model,engine}   no_std + alloc
 apps/       starplayer-{web,cli,tui}
 xtask/      build orchestration, wasm packaging, golden regeneration
 fuzz/       cargo-fuzz loader targets and their seed corpus — its own workspace, nightly only
-embedded/   ESP32 firmware (M8) — its own workspace on the `esp` toolchain: firmware-common,
-            boards/starplayer-{a1s,c5}, xtask; never built by the main workspace
+embedded/   ESP32 firmware (M8) — its own workspace on the Xtensa `esp-1.97` toolchain:
+            firmware-common (no_std, host-tested), boards/starplayer-{a1s,c5}, xtask;
+            excluded from the root workspace and never built by `cargo xtask ci`
 plans/      design and implementation plans — see plans/README.md
 STARPLAY/   original DOS sources — unfinished PMODE/W rewrite (read-only)
 STARPLAY-2.25s/  released 2.25s sources, complete and buildable (read-only)

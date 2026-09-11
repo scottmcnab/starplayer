@@ -1,0 +1,24 @@
+# Directory-scoped build settings for the C5 bench firmware — see the A1S crate's copy of
+# this file for why this has to live here rather than at the workspace root.
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[target.riscv32imac-unknown-none-elf]
+# `espflash flash --monitor` as the runner, exactly as the A1S does. Owner only.
+runner = "espflash flash --monitor"
+rustflags = [
+  # esp-hal ships the chip's memory map and section placement in `linkall.x`, same as the
+  # A1S. `-C force-frame-pointers` is absent here too, but for a different reason than the
+  # A1S: that flag works around an Xtensa LLVM register-allocator bug this board's LLVM
+  # RISC-V backend does not have, so there was never a reason to add it.
+  "-C", "link-arg=-Tlinkall.x",
+]
+
+# Deliberately **no** `[unstable] build-std` section. `riscv32imac-unknown-none-elf` is a
+# plain LLVM target with a prebuilt `core`/`alloc` distributed by `rustup target add` (I4
+# research point 2) — unlike `xtensa-esp32-none-elf`, which is an out-of-tree target that
+# only exists inside the Xtensa rustc fork and has no prebuilt component at all. The
+# workspace's `esp-1.97` toolchain does not carry a prebuilt `riscv32imac-unknown-none-elf`
+# either (`ls ~/.rustup/toolchains/esp-1.97/lib/rustlib` has no such directory), so
+# `embedded/xtask` builds this crate under the plain stable toolchain `+1.97` rather than
+# `+esp-1.97` — see its `Board` table's `toolchain` field.

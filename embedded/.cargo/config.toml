@@ -1,0 +1,11 @@
+# Workspace-wide cargo settings for `embedded/`: **an alias and nothing else**.
+#
+# Every real build setting — the target triple, `-Tlinkall.x`, `-C force-frame-pointers`
+# and `-Z build-std` — lives in the *board crate's* own `.cargo/config.toml`, because
+# cargo resolves `.cargo/config.toml` from the **invocation directory**, not from the
+# workspace root. A board is therefore only ever built with cargo's current directory set
+# to that board's crate, which is what `embedded/xtask` does for every build. Putting a
+# `target` or `[unstable]` here instead would apply it to `xtask` (a host binary) and to
+# `firmware-common`'s host tests, both of which must build for the host.
+[alias]
+xtask = "run --package starplayer-embedded-xtask --"

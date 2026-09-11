@@ -699,8 +699,9 @@ Decide this now, not later:
 
 ```rust
 pub struct Module {
-    blob: Box<[u8]>,               // decoded pattern data and everything non-sample
-    pcm: Box<[i16]>,               // all samples decoded + delta-decoded, concatenated,
+    blob: BlobStorage,             // decoded pattern data and everything non-sample,
+                                   //   owned on the heap or borrowed from flash
+    pcm: PcmStorage,               // all samples decoded + delta-decoded, concatenated,
                                    //   each with N guard frames appended (loop-wrapped,
                                    //   reflected, or zeroed) so interpolators need no
                                    //   branches
@@ -719,8 +720,32 @@ pub struct Module {
 - trivially `Send + Sync`, so `Arc<Module>` hands to the audio thread with no ceremony;
 - trivially hashable, so golden tests can fingerprint a loaded module;
 - trivially fuzzable — a loader either produces a valid index set or an `Err`;
-- mmap- and flash-friendly on ESP32, where sample data may be borrowed rather than owned;
+- mmap- and flash-friendly on ESP32, where the sample data *is* borrowed rather than
+  owned (below);
 - no pointer chasing in the mixer inner loop.
+
+**Borrowed sample data, and the module image** (M8-I2) is what the fourth point above
+cashes in. `blob` and `pcm` are `BlobStorage` / `PcmStorage`, each either a heap allocation
+or a `&'static` borrow; equality, hashing and every accessor are defined over the slice
+contents, so nothing downstream can tell the two apart and `Module` keeps deriving
+`Clone, Debug, PartialEq, Eq, Hash`. The borrow is `'static` rather than a lifetime
+parameter deliberately: a `Module<'image>` would put a lifetime on `Arc<Module>`, on
+`Engine` and on every host type, to describe a borrow that is always from flash, which
+never goes away.
+
+What it borrows from is a **module image**: the finished `Module` serialised flat and
+little-endian, with its `i16` PCM 4-byte aligned, written on the development machine by
+`cargo xtask module-image` and linked into the firmware. The loaders are untouched and the
+index tables are unchanged — the image is the same offsets, written down. On the device
+`Module::from_image` validates it to exactly the standard `ModuleBuilder::build` applies,
+then borrows both blobs in place, so a load is a validation pass and four small index
+allocations rather than a copy of every sample. `from_image_or_copy` copies only the PCM
+when the mapping is not 4-byte aligned, and `from_image_copied` copies both for bytes that
+are not `'static` — the run-time upload path, which otherwise still goes through the
+ordinary loader into the heap. Any change to the layout bumps `IMAGE_VERSION` and the
+reader rejects a version it does not know; the format is a build product, not an
+interchange format, and big-endian hosts are deliberately unsupported on the borrowing
+path because the whole point is that no conversion pass runs.
 
 **Guard frames** are the other half: appending N frames to each sample's PCM (loop-
 wrapped for a forward loop, reflected for a ping-pong loop, or zeroed for a one-shot or a
@@ -1617,6 +1642,28 @@ enumeration and its `i16` conversion; the wasm host keeps the wire command decod
 buffer and the heap pre-reservation. Neither keeps a transport, an engine-arm enum, a seek
 mailbox or an output-depth post-stage.
 
+`starplayer-host-embedded` is the **second** host, and it is deliberately not behind
+`AudioBackend` (M8-I1). A device wants neither `std` nor a float output stage: an I2S DMA
+refill calls `Engine::<FixedPath, Linear, FixedOut<i16, 2>, Arc<Module>>::render(&mut
+[i16])` directly, and there is no device to negotiate with, no output-depth post-stage to
+run and no callback to own. So the crate is `no_std` + `alloc`, sits in the bare-metal CI
+matrix beside the engine crates, and offers an `EmbeddedPlayer` that splits into a
+`RenderHalf` the firmware calls from its refill and a `ControlHalf` it keeps in a task.
+
+What it *does* share with `Player` is the thing that makes a host a host: the
+**quantum-aligned control cadence**. Commands are drained and the end of the song is armed
+only at multiples of `RENDER_QUANTUM` frames emitted, never at device-block boundaries, so
+design goal 3 holds through the host and not merely through the engine. That logic exists
+twice, in `starplayer-host` and in `starplayer-host-embedded`, and I1 chose the duplication
+knowingly: `starplayer-host` is `std` by construction (`Box<dyn FnMut + Send>`, `Mutex`,
+`String` errors, device enumeration), its seek mailbox names `core::sync::atomic` types
+that `riscv32imc-unknown-none-elf` does not have at all, and sharing would take a `std`
+feature split of that crate. Three things would move into a shared `no_std` core if that is
+ever done — the transport, the seek mailbox and the twenty lines of `render` that walk a
+block quantum by quantum — and the mailbox would have to take the embedded crate's seqlock
+with it, because a 64-bit atomic on those targets is a critical section and design goal 5
+forbids a lock in `render()`.
+
 Dependency edges are strictly one-directional. Apps depend only on the facade.
 Extracting `starplayer` for crates.io later is a manifest change, not a refactor.
 
@@ -1657,7 +1704,35 @@ Recorded rather than guessed. Each has a milestone where it must be settled.
 | # | Question | Settle by |
 |---|---|---|
 | Q1 | Does `SharedArrayBuffer` + COOP/COEP work well enough for scope telemetry, or is `postMessage` the practical default? | **Settled in M0-A4 — see §9** |
-| Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | M8-I3 — measured on the ESP32-A1S against the I2S DMA ring depth |
+| Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | **Settled in M8-I3 — 128 stays, and there is no override; see below and `plans/reference/embedded-budget.md` §5** |
 | Q3 | Which voice-stealing heuristic does libopenmpt actually use, exactly? | **Settled in M6-G3 — see §5.2** |
 | Q4 | Does the `Instrument` trait survive contact with a non-sample instrument (FM), or does it need a second tier? | M10 — **still open**; M4-E4 committed the trait with two *sample* implementations (§5.3), which is what design goal 8 asked for and is not yet the question Q4 asks |
 | Q5 | CLAP first with a VST3 wrapper, or nih-plug for both? | M9 |
+
+### Q2, settled on the ESP32-A1S (M8-I3)
+
+**128 frames stays, and the embedded path does not want a compile-time override.** The
+question assumed the quantum was the knob an embedded host would reach for. It is not: the
+knob is the **I2S DMA ring depth**, which the host owns outright and which the firmware
+expresses as one constant (`DMA_RING_QUANTA`, 8 quanta = 23.2 ms as shipped).
+
+Three findings from the bring-up, recorded in full in the budget document:
+
+1. **512 bytes is a natural DMA chunk on this chip.** 128 frames × 4 bytes is well inside
+   the classic ESP32's 4 095-byte descriptor limit, and it lets each DMA descriptor be
+   exactly one quantum — so the peripheral's available-space figure is a whole number of
+   quanta and the host's control cadence and the DMA boundary coincide. A smaller quantum
+   would multiply descriptors; a larger one would coarsen the frame a seek or a stop can
+   land on.
+2. **Latency is the ring's, not the quantum's.** One quantum is 2.9 ms against a ring
+   eight times that. Nothing a host wants to tune about responsiveness is reachable by
+   changing the quantum before it is reachable by changing the ring.
+3. **The RAM a smaller quantum would save is not where the RAM goes.** The quantum-sized
+   buffers are `channels × 128 × 8` bytes — 8 kB on an eight-channel module — against
+   27.8 kB of fixed telemetry and pool overhead and an 88 kB flash-resident module image.
+   Halving the quantum would save 4 kB and double the per-block control overhead.
+
+An override would therefore be a knob with no question behind it, and a second block size
+for every buffer-size-independence test to keep honest. The one result that would reopen
+this is a cycles-per-frame figure showing the per-quantum fixed cost dominating the
+per-sample cost; the measurement that would show it is the budget document's §3 table.

@@ -11,8 +11,10 @@ always returns either `Err` or a clamped-but-valid `Module`.**
 |---|---|
 | `fuzz_targets/{mod,s3m,mtm,it}_loader.rs` | byte-level: arbitrary bytes into one loader |
 | `fuzz_targets/{mod,s3m,mtm,it}_structured.rs` | structured: a valid module with its fields disturbed |
+| `fuzz_targets/image.rs` | byte-level: arbitrary bytes into the module-image reader (M8-I2) |
 | `src/lib.rs` | the memory cap, the mutation program, the post-load walk |
 | `seeds/<format>/` | committed seeds — ours or the owner's, never third-party bytes |
+| `embedded/assets/*.spmi` | the `image` target's seeds: a **build product**, written by `cargo xtask module-images` and copied in at seed time |
 | `regressions/<format>/` | inputs that once crashed a loader; replayed by the stable test suite |
 | `dictionaries/tracker.dict` | the format magic values, so mutation finds a loader body at all |
 
@@ -20,7 +22,7 @@ always returns either `Err` or a clamped-but-valid `Module`.**
 
 ```sh
 cargo xtask fuzz --seed                 # fill fuzz/corpus/* from seeds, fixtures and the pinned corpus
-cargo xtask ci --job fuzz-smoke         # the bounded per-commit run, all eight targets
+cargo xtask ci --job fuzz-smoke         # the bounded per-commit run, every target
 cargo xtask fuzz --target s3m_loader --seconds 900   # a long run on one target
 ```
 
@@ -39,3 +41,9 @@ synthesised ITs) and the repository owner's own S3Ms, which already live in
 The pinned libxmp corpus is **not** committed — `cargo xtask fuzz --seed` copies it into
 the working corpus out of the conformance cache at run time, and the working corpus is
 git-ignored.
+
+The `image` target's seeds are handled the same way for a different reason: the six module
+images are a *build product* of the six golden fixtures, so `cargo xtask fuzz --seed` runs
+`cargo xtask module-images` and copies the result in, rather than committing binaries that
+would go stale the moment `IMAGE_VERSION` moves. `crates/starplayer-offline/tests/module_image.rs`
+is the pinned-stable half, replaying all six images on every commit.

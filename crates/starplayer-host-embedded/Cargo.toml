@@ -1,0 +1,37 @@
+[package]
+name = "starplayer-host-embedded"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The no_std host: an EmbeddedPlayer over the fixed path, with the std host's quantum-aligned control cadence and an i16 render entry point."
+
+[dependencies]
+# The facade at its **default** feature set — the five format processors, which is what the
+# six golden fixtures need — plus `telemetry`. `std` is absent, and stays absent: no default
+# feature anywhere below the facade enables it (design goal 4), which is what makes this
+# crate bare-metal buildable at all. `telemetry` is not optional here: the control cadence
+# reads `Snapshot::transport.end_reached` to arm the end of a song, exactly as the std host
+# does. It is spelled `workspace = true` rather than with `default-features = false` because
+# cargo refuses to let a member turn off a workspace dependency's defaults, and turning them
+# off here would buy nothing: `float-mix` and `linear-interp` gate no code today (I1
+# research point 4).
+starplayer = { workspace = true, features = ["telemetry"] }
+starplayer-rt = { workspace = true }
+starplayer-telemetry = { workspace = true }
+# The bench digest only. `no_std` at this feature set — `default-features = false` is set
+# once in the workspace manifest — and never reachable from `RenderHalf::render`.
+sha2 = { workspace = true }
+
+# Nothing here is optional: a feature that turned the bench or the telemetry off would be
+# a second configuration to keep bit-identical with the first, for a few kilobytes.
+[features]
+default = []
+
+[dev-dependencies]
+# Host-only, and therefore invisible to `cargo xtask ci --job no-std-check` and to
+# `--job no-std-purity`, which passes `--edges features,no-dev` for exactly this reason.
+# The proof that this host renders what the std one does needs both of the others.
+starplayer-offline = { workspace = true }
+starplayer-host = { workspace = true }

@@ -1,0 +1,4 @@
+# Module images are build products: `cargo xtask module-images` writes them here and
+# M8-I3 links them into the firmware with `include_bytes!`. Nothing here is committed.
+*
+!.gitignore

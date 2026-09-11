@@ -13,9 +13,28 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// Bare-metal target used for both the `no_std` check and the no-std purity guard.
-/// `std` is unavailable here, so any crate that reaches for it fails to compile.
-const BARE_METAL_TARGET: &str = "riscv32imc-unknown-none-elf";
+/// Bare-metal targets used for both the `no_std` check and the no-std purity guard.
+/// `std` is unavailable on either, so any crate that reaches for it fails to compile.
+///
+/// Two targets, deliberately, and neither replaces the other:
+///
+/// * `riscv32imc-unknown-none-elf` has **no atomics at all** and is the no-CAS canary
+///   architecture §10 and `starplayer-rt`'s target-conditional `portable-atomic` dependency
+///   are built around — it is what proves the fallback path compiles when the target
+///   genuinely cannot do a compare-and-swap.
+/// * `riscv32imac-unknown-none-elf` (M8-I4) is a **real chip's** target — the ESP32-C5 —
+///   with native compare-and-swap (`a` in the ISA string). It exercises the *other* arm of
+///   that same conditional dependency: the one every target with atomics actually takes.
+///
+/// The `simd` job's bare-metal pass (`SIMD_NO_STD_CRATES`) stays on `imc` alone: it is
+/// checking that `wide`'s plain-array fallback compiles on a target with no vector unit,
+/// which `imc` already demonstrates, and doubling that check on `imac` would test the same
+/// fallback a second time rather than a new claim.
+const BARE_METAL_TARGETS: &[&str] = &["riscv32imc-unknown-none-elf", "riscv32imac-unknown-none-elf"];
+
+/// The single bare-metal target the `simd` job's bare-metal pass uses — see
+/// [`BARE_METAL_TARGETS`]'s doc comment for why it does not loop over both.
+const SIMD_BARE_METAL_TARGET: &str = "riscv32imc-unknown-none-elf";
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
@@ -64,8 +83,11 @@ const LIBOPENMPT_MAKE_FLAGS: &[&str] = &[
     "NO_SDL2=1",
 ];
 
-/// Every crate that must stay `no_std`. The facade is last so a purity failure inside it
-/// is reported after the crate that actually caused it.
+/// Every crate that must stay `no_std`. In dependency order, so a purity failure is
+/// reported against the crate that actually caused it before it is reported against
+/// everything above it: the facade after the crates it re-exports, and
+/// `starplayer-host-embedded` — the `no_std` host (M8-I1) — after the facade it is built
+/// on.
 const NO_STD_CRATES: &[&str] = &[
     "starplayer-core",
     "starplayer-rt",
@@ -82,6 +104,7 @@ const NO_STD_CRATES: &[&str] = &[
     "starplayer-midi",
     "starplayer-telemetry",
     "starplayer",
+    "starplayer-host-embedded",
 ];
 
 /// Optional features that pull in a whole extra crate and therefore need their own
@@ -143,9 +166,15 @@ const FUZZ_TARGETS: &[(&str, Option<&str>)] = &[
     ("mtm_structured", None),
     ("xm_structured", None),
     ("it_structured", None),
+    ("image", Some(MODULE_IMAGE_FORMAT)),
 ];
 
-/// Seconds each target runs in the per-commit smoke job. Eight targets, so the job is a
+/// [`classify_module`]'s name for a module image, and therefore the `image` target's seed
+/// "format". The images themselves are a build product in [`MODULE_IMAGE_DIRECTORY`]
+/// rather than committed bytes; see [`seed_fuzz_corpora`].
+const MODULE_IMAGE_FORMAT: &str = "spmi";
+
+/// Seconds each target runs in the per-commit smoke job. Eleven targets, so the job is a
 /// few minutes including the build — "minutes, not hours", as the task asks.
 const FUZZ_SMOKE_SECONDS: u32 = 30;
 
@@ -245,6 +274,8 @@ fn main() -> ExitCode {
         Some("conformance") => run_conformance(&arguments[1..]),
         Some("fuzz") => run_fuzz(&arguments[1..]),
         Some("goldens") => run_goldens(&arguments[1..]),
+        Some("module-image") => run_module_image(&arguments[1..]),
+        Some("module-images") => run_module_images(&arguments[1..]),
         Some("openmpt") => run_openmpt(&arguments[1..]),
         Some("perceptual") => run_perceptual(&arguments[1..]),
         Some("trace") => run_trace(&arguments[1..]),
@@ -274,6 +305,9 @@ fn print_usage() {
     println!("                     needs a nightly toolchain and `cargo install cargo-fuzz`; see fuzz/README.md");
     println!("  goldens [--check] [--simd]   regenerate canonical SHA-256 renders, or verify them;");
     println!("                     --simd verifies them with the vector kernels compiled in (M7-H6)");
+    println!("  module-image <module> <out.spmi>   write one flash-resident module image (M8-I2)");
+    println!("  module-images      write the six golden fixtures' images into embedded/assets/ (a git-ignored");
+    println!("                     build product; M8-I3's firmware links them with include_bytes!)");
     println!("  openmpt [--offline|--fetch-only]   build the pinned libopenmpt's openmpt123 into target/openmpt");
     println!("  perceptual [--corpus PATH]... [--threshold-snr DB] [--offline]");
     println!("                     score the float render against libopenmpt's; nightly report, never a gate");
@@ -358,6 +392,57 @@ fn run_goldens(arguments: &[String]) -> bool {
         }
         Err(error) => {
             eprintln!("xtask goldens: offline driver failed to start: {error}");
+            false
+        }
+    }
+}
+
+/// Where `cargo xtask module-images` writes the golden fixtures' module images.
+///
+/// A **build product**, git-ignored: M8-I3's firmware links the files here with
+/// `include_bytes!`, and regenerating them is one command, so committing binaries that
+/// would go stale the moment the image layout version moves buys nothing.
+const MODULE_IMAGE_DIRECTORY: &str = "embedded/assets";
+
+/// Write one module image. See `crates/starplayer-model/src/image.rs` for the format.
+///
+/// Like every other driver here this shells out to a helper binary in the workspace:
+/// xtask is dependency-free by design and cannot link a module loader.
+fn run_module_image(arguments: &[String]) -> bool {
+    if arguments.len() != 2 {
+        eprintln!("xtask module-image: usage: cargo xtask module-image <module> <out.spmi>");
+        return false;
+    }
+    run_module_image_driver(arguments)
+}
+
+/// Write the six golden fixtures' module images into [`MODULE_IMAGE_DIRECTORY`].
+fn run_module_images(arguments: &[String]) -> bool {
+    if !arguments.is_empty() {
+        eprintln!("xtask module-images: usage: cargo xtask module-images");
+        return false;
+    }
+    run_module_image_driver(&["--fixtures".to_string(), MODULE_IMAGE_DIRECTORY.to_string()])
+}
+
+fn run_module_image_driver(driver_arguments: &[String]) -> bool {
+    let mut command = Command::new(cargo_binary());
+    command
+        .current_dir(workspace_root())
+        // The **golden driver's** target directory, not one of its own: this is the same
+        // package with the same features, so sharing means no second build and no second
+        // several-hundred-megabyte tree. A dedicated directory is needed only because the
+        // parent `cargo xtask` process holds the workspace target-directory lock.
+        .args(["run", "--quiet", "--target-dir", "target/xtask-goldens", "-p", "starplayer-offline", "--bin", "starplayer-module-image", "--"])
+        .args(driver_arguments);
+    match command.status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("xtask module-image: image driver exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("xtask module-image: image driver failed to start: {error}");
             false
         }
     }
@@ -946,6 +1031,15 @@ fn seed_fuzz_corpora() -> bool {
         println!("            run `cargo xtask conformance --fetch-only` to widen the corpus");
     }
 
+    // The `image` target's seeds are the six golden fixtures' module images, which are a
+    // build product rather than committed bytes — an image goes stale the moment
+    // `IMAGE_VERSION` moves, so it is regenerated here instead of checked in. Best effort:
+    // a workspace that will not build is a failure the other jobs report far better than
+    // this one would.
+    if !run_module_images(&[]) {
+        println!("xtask fuzz: could not write the module images; the image corpus keeps whatever it already had");
+    }
+
     for (target, format) in FUZZ_TARGETS {
         let Some(format) = format else { continue };
         let destination = fuzz.join("corpus").join(target);
@@ -958,6 +1052,7 @@ fn seed_fuzz_corpora() -> bool {
         copied += copy_seeds_into_corpus(&fuzz.join("seeds").join(format), "seed", format, &destination);
         copied += copy_seeds_into_corpus(&fuzz.join("regressions").join(format), "regression", format, &destination);
         copied += copy_seeds_into_corpus(&root.join(FIXTURE_SOURCE_DIRECTORY), "owner", format, &destination);
+        copied += copy_seeds_into_corpus(&root.join(MODULE_IMAGE_DIRECTORY), "image", format, &destination);
         copied += copy_seeds_into_corpus(&pinned_corpus, "libxmp", format, &destination);
         println!("xtask fuzz: {target} corpus seeded with {copied} module(s)");
     }
@@ -993,6 +1088,10 @@ fn copy_seeds_into_corpus(source: &Path, origin: &str, format: &str, destination
 /// restated here. They are short byte comparisons; the risk of drift is real but small,
 /// and a seed that stops being recognised only means a slightly narrower corpus.
 fn classify_module(bytes: &[u8]) -> Option<&'static str> {
+    // Not a tracker format: `starplayer-model`'s flash-resident module image (M8-I2).
+    if bytes.get(..4) == Some(b"SPMI") {
+        return Some(MODULE_IMAGE_FORMAT);
+    }
     if bytes.get(..17) == Some(b"Extended Module: ") && bytes.get(37) == Some(&0x1A) {
         return Some("xm");
     }
@@ -1601,7 +1700,7 @@ fn job_simd() -> bool {
     all_succeeded &= cargo(&["test", "-p", "starplayer-engine", "--features", "simd", "--test", "block_size_determinism"]);
     all_succeeded &= run_goldens(&["--check".to_string(), "--simd".to_string()]);
     for crate_name in SIMD_NO_STD_CRATES {
-        all_succeeded &= cargo(&["check", "--target", BARE_METAL_TARGET, "-p", crate_name, "--features", "simd"]);
+        all_succeeded &= cargo(&["check", "--target", SIMD_BARE_METAL_TARGET, "-p", crate_name, "--features", "simd"]);
     }
     all_succeeded
 }
@@ -1609,32 +1708,39 @@ fn job_simd() -> bool {
 /// Each `no_std` crate must compile for a bare-metal target with its features stripped
 /// back to nothing. This is the minimal-configuration half of the portability check.
 ///
-/// There is deliberately no *clippy* run on the bare-metal target. Clippy's findings are
-/// target-independent apart from code behind `#[cfg(target_arch = ...)]` and friends, and
-/// there is none of that yet, so the host clippy job already lints every line the
+/// There is deliberately no *clippy* run on either bare-metal target. Clippy's findings
+/// are target-independent apart from code behind `#[cfg(target_arch = ...)]` and friends,
+/// and there is none of that yet, so the host clippy job already lints every line the
 /// bare-metal build compiles. Revisit when `starplayer-dsp` grows its cfg-gated SIMD
 /// backends: at that point the scalar and simd128 arms stop being covered by host clippy,
-/// and a `cargo clippy --target riscv32imc-unknown-none-elf --workspace` run belongs here
-/// (measured at well under a second on top of the checks this job already does).
+/// and a `cargo clippy --target <target> --workspace` run belongs here for each entry in
+/// [`BARE_METAL_TARGETS`] (measured at well under a second on top of the checks this job
+/// already does).
+///
+/// Runs over both [`BARE_METAL_TARGETS`] (M8-I4): the no-CAS canary and the ESP32-C5's own
+/// target, so a crate that only compiles because one of the two happens to provide an
+/// atomic it should not be assuming is caught regardless of which one that is.
 fn job_no_std_check() -> bool {
     let mut all_succeeded = true;
-    for crate_name in NO_STD_CRATES {
-        let succeeded = cargo(&[
-            "check",
-            "--target", BARE_METAL_TARGET,
-            "--no-default-features",
-            "-p", crate_name,
-        ]);
-        all_succeeded &= succeeded;
-    }
-    for (crate_name, feature) in FEATURE_ENABLED_NO_STD_CHECKS {
-        all_succeeded &= cargo(&[
-            "check",
-            "--target", BARE_METAL_TARGET,
-            "--no-default-features",
-            "--features", feature,
-            "-p", crate_name,
-        ]);
+    for target in BARE_METAL_TARGETS {
+        for crate_name in NO_STD_CRATES {
+            let succeeded = cargo(&[
+                "check",
+                "--target", target,
+                "--no-default-features",
+                "-p", crate_name,
+            ]);
+            all_succeeded &= succeeded;
+        }
+        for (crate_name, feature) in FEATURE_ENABLED_NO_STD_CHECKS {
+            all_succeeded &= cargo(&[
+                "check",
+                "--target", target,
+                "--no-default-features",
+                "--features", feature,
+                "-p", crate_name,
+            ]);
+        }
     }
     all_succeeded
 }
@@ -1659,30 +1765,37 @@ fn job_clippy() -> bool {
 /// 3. Read every manifest's own `default = [...]` list and reject `"std"` and any
 ///    `".../std"` entry. Check 2 never sees the root crate's own feature list, so this
 ///    is what closes the loop on the crate being checked.
+///
+/// Checks 1 and 2 run over both [`BARE_METAL_TARGETS`] (M8-I4): a `std` leak could in
+/// principle be gated on which bare-metal target is doing the asking (for instance a
+/// dependency that only turns on `std` in the absence of an atomic feature), so purity is
+/// only proven once both are clean. Check 3 reads manifests, not a target, and runs once.
 fn job_no_std_purity() -> bool {
     let mut all_succeeded = true;
 
-    for crate_name in NO_STD_CRATES {
-        all_succeeded &= cargo(&["check", "--target", BARE_METAL_TARGET, "-p", crate_name]);
-    }
-    for crate_name in NO_STD_CRATES {
-        all_succeeded &= assert_resolved_features_exclude_std(crate_name);
+    for target in BARE_METAL_TARGETS {
+        for crate_name in NO_STD_CRATES {
+            all_succeeded &= cargo(&["check", "--target", target, "-p", crate_name]);
+        }
+        for crate_name in NO_STD_CRATES {
+            all_succeeded &= assert_resolved_features_exclude_std(crate_name, target);
+        }
     }
     all_succeeded &= assert_manifest_defaults_exclude_std();
 
     all_succeeded
 }
 
-/// Check 2: the resolved feature set of `crate_name`, built for the bare-metal target,
-/// names `std` nowhere.
+/// Check 2: the resolved feature set of `crate_name`, built for `target`, names `std`
+/// nowhere.
 ///
 /// `no-dev` because a **dev**-dependency is never compiled into the crate a host links:
 /// `starplayer-enhance`'s tests trace a real module through `starplayer-offline`, which is
 /// `std` by construction, and that says nothing about whether the enhance crate itself is
-/// bare-metal clean. `cargo check --target <bare metal>` above builds no dev-dependency
+/// bare-metal clean. `cargo check --target <target>` above builds no dev-dependency
 /// either, so the two halves of the check now agree on what they are looking at.
-fn assert_resolved_features_exclude_std(crate_name: &str) -> bool {
-    let arguments = ["tree", "--edges", "features,no-dev", "--target", BARE_METAL_TARGET, "-p", crate_name];
+fn assert_resolved_features_exclude_std(crate_name: &str, target: &str) -> bool {
+    let arguments = ["tree", "--edges", "features,no-dev", "--target", target, "-p", crate_name];
     println!("     cargo {}", arguments.join(" "));
 
     let output = match Command::new(cargo_binary()).args(arguments).output() {

@@ -2,8 +2,8 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md), decision 3; deliverable 2) |
-| Status | Planned 2026-09-11; pulled |
+| Milestone | M8 ([master plan](../M8-master-plan.md), decision 3; deliverable 2) |
+| Status | Implemented 2026-09-11; awaiting review |
 | Depends on | M1-B1 (landed): the `Module` blob-and-offsets layout; M10-K5a (landed): `Module::enhanced` rebuild, which must keep working |
 | Blocks | I3 |
 | Parallel with | I1 |
@@ -162,3 +162,133 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Running any loader on the device (I6 does that through the ordinary `starplayer::load`,
 into the heap). An `i8` storage. Compression of the image. Changing the loaders.
+
+---
+
+## Research resolution
+
+### 1. Alignment of `include_bytes!`, and how many constructors
+
+`include_bytes!` yields a `&'static [u8]` of alignment 1, so a firmware must place the
+image behind a `#[repr(C, align(4))]` wrapper or in an aligned flash partition. The
+recommendation in the task — "provide both, name them honestly" — landed as **three**
+constructors, because fuzzing and I6's upload path both need a fourth behaviour the other
+two cannot express (a non-`'static` slice):
+
+| Constructor | Blob | PCM | Wants | Who calls it |
+|---|---|---|---|---|
+| `Module::from_image` | borrowed | borrowed, or `Err` | a 4-byte-aligned `&'static [u8]` | I3's firmware; it is the constructor that *proves* the alignment wrapper is there |
+| `Module::from_image_or_copy` | borrowed | borrowed when it can be, else copied | any `&'static [u8]` | a flash partition whose alignment the caller does not control (I6) |
+| `Module::from_image_copied` | copied | copied | any `&[u8]`, any alignment, any endianness | the `image` fuzz target, host tests, an uploaded image |
+
+Alignment is checked twice over: the writer pads so the PCM's *offset within the image* is
+a multiple of 4, and `from_image` checks the mapped *address* is too (`bytemuck`'s
+`try_cast_slice` then re-checks `align_of::<i16>()` and the length). A misaligned image is
+`Err(Invalid("a module image must be 4-byte aligned in memory to borrow its PCM"))` — never
+a silent copy, which is the whole point of having the strict constructor at all.
+
+Big-endian hosts are refused on the two borrowing constructors and supported on
+`from_image_copied`, which decodes each frame from explicit little-endian bytes. Both ESP32
+targets are little-endian, so nothing on the milestone's path takes that arm.
+
+`starplayer-model` is `#![forbid(unsafe_code)]`, so the `&[u8]` → `&[i16]` borrow goes
+through **bytemuck** (`try_cast_slice`), added as a workspace dependency. It is `no_std`
+with no default features, is already in the lock file below `fixed`, and its checked cast
+*is* the alignment test rather than an extra one.
+
+### 2. 8-bit storage — what the PCM actually costs
+
+Measured from `cargo xtask module-images` (the number each line reports):
+
+| Fixture | Source module | Image | PCM in the image | PCM share | An `i8` storage would save |
+|---|---|---|---|---|---|
+| `synthetic-mod` (31 samples, 2 patterns) | 3 324 B | 6 072 B | 1 376 B | 22.7 % | 688 B (11 % of the image) |
+| `synthetic-mtm` (2, 2) | 1 548 B | 2 312 B | 448 B | 19.4 % | 224 B (10 %) |
+| `synthetic-xm` (2, 2) | 3 449 B | 3 564 B | 448 B | 12.6 % | 224 B (6 %) |
+| `synthetic-it` (2, 1) | 1 797 B | 2 072 B | 448 B | 21.6 % | 224 B (11 %) |
+| `petri-s3m` (5, 9) | 35 966 B | 88 036 B | 64 156 B | **72.9 %** | 32 078 B (36 %) |
+| `reflex-s3m` (4, 10) | 9 634 B | 14 984 B | 4 480 B | 29.9 % | 2 240 B (15 %) |
+
+The conclusion is that the share is a function of how much *music* a module has relative to
+its *samples*, and that only a sample-heavy module makes an `i8` storage worth a second
+mixer inner-loop instantiation. `PETRI.S3M` — the exit criterion's module — is the
+sample-heavy case: 5 samples, 32 078 stored frames, and an image where nearly three
+quarters is PCM. There an `i8` storage is a real 32 KB, or 0.8 % of a 4 MB flash. On the
+synthetic fixtures it is noise. Not implemented, as the task says; the number is recorded
+so I3's budget document can cite it.
+
+Two measurements that came out of the same exercise and were *not* anticipated:
+
+* **The pre-roll and the guard are free.** 16 frames per sample, so `PETRI`'s five samples
+  cost 160 bytes of the 64 156.
+* **The 120-entry note maps were not.** As first written, the image stored
+  `note_sample_map` (240 B) and `note_transpose_map` (120 B) verbatim for every instrument,
+  which made `synthetic-mod` — 31 instruments, 1 376 bytes of PCM — a **17 168-byte** image,
+  65 % of it zeroes and an identity map. The format now writes one presence byte for each
+  map and the array only when it differs from the default every MOD/S3M/MTM instrument
+  carries. `synthetic-mod` fell to 6 072 bytes and `petri-s3m` to 88 036. That is a layout
+  decision taken during implementation rather than in the task file, and it is the reason
+  the deliverable's format table mentions the note maps at all.
+
+### 3. `ModuleBuilder::reserve_pcm`
+
+Added, since the builder was already being touched. `reserve_pcm(frames)` is an **exact**
+reservation (`Vec::reserve_exact`) for a caller that knows the total before the first
+`add_sample`, which is what keeps the peak of a load near the finished blob rather than
+near twice it during the last doubling — K5a's point, and a real one on a heap-constrained
+target.
+
+`Module::enhanced` now calls it with the source module's PCM length. That is exact for an
+identity rebuild and a **floor** for any other, because an enhancer may only raise a
+sample's rate. The total-up-front version K5a imagined is still not possible: `enhanced`
+cannot know what the enhancer will produce without running it, and running it twice is
+worse than one reallocation.
+
+### 4. Where `Hash` / `PartialEq` on `Module` are used
+
+Confirmed, and all four sites stayed green with no change:
+
+* `starplayer-model/src/module.rs` — the hash and equality tests, including
+  `a_module_compares_equal_to_its_clone`;
+* `starplayer-model/src/enhance.rs` — `an_identity_enhancer_rebuilds_an_equal_module`,
+  K5a's load-bearing test;
+* `starplayer-enhance/tests/module_rebuild.rs` — the same claim across all five formats,
+  field by field (`pcm()`, `blob()`, `samples()`, then the whole module);
+* `starplayer-s3m/tests/fixtures.rs` — fixture equality.
+
+Nothing in the workspace puts a `Module` in a `HashMap` or a `HashSet`; `Hash` exists for
+fingerprinting. The manual impls on the two storage enums are defined over the **slice
+contents**, so an owned module and the borrowed module read back from its image compare
+equal and hash alike — `crates/starplayer-offline/tests/module_image.rs` asserts exactly
+that for all six fixtures, and asserts the identity rebuild of a *borrowed* module is an
+equal *owned* one.
+
+### Done differently from the task file, and why
+
+1. **Three constructors rather than two** — research point 1 above.
+2. **`to_image` is not feature-gated.** The task offered `image-write` "or unconditional if
+   it costs nothing". It costs nothing: it is a plain `alloc` function with no new
+   dependency, and a firmware that never calls it never links it. A feature would have cost
+   every test and every tool a flag, and would have made `cargo test -p starplayer-model`
+   skip the round-trip tests by default — which is the one thing the reader must not be
+   allowed to do.
+3. **The note maps are written compactly** — research point 2 above.
+4. **The six images are the fuzz seeds, but generated rather than committed.**
+   `embedded/assets/*.spmi` is a git-ignored build product, so `cargo xtask fuzz --seed`
+   runs `cargo xtask module-images` and copies the result into the working corpus, exactly
+   the way the pinned libxmp corpus is handled. Committing 130 KB of binaries that go stale
+   the moment `IMAGE_VERSION` moves buys nothing; the pinned-stable half of the coverage is
+   `crates/starplayer-offline/tests/module_image.rs`, which replays all six images on every
+   commit.
+5. **`golden_fixtures()` moved into `starplayer-offline`.** The six fixtures were a private
+   list inside `starplayer-goldens`; the image writer needs the same six, and two copies of
+   that list would drift. The goldens binary keeps its own per-fixture *kernel* mapping,
+   which is its business alone.
+6. **`render_loaded_fixed_mono` / `canonical_sha256_of_loaded`.** The golden render path
+   took `(format, bytes)` and loaded internally, so there was no way to hash a module that
+   arrived by another route. Both now delegate to one `render_golden` that takes a
+   `Module`; nothing about the render changed, and the committed goldens are byte-identical
+   across the refactor.
+7. **`cargo xtask module-image` shares the golden driver's target directory.** Same package,
+   same features, so a dedicated one would have meant a second several-hundred-megabyte
+   build tree for no isolation that matters.

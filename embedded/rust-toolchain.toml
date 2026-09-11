@@ -1,0 +1,17 @@
+# The Xtensa toolchain, by **name** rather than through the floating `esp` channel, so
+# that a local build, `embedded/xtask` and a future CI job all pin the same compiler. It
+# was installed with
+#
+#     espup install --name esp-1.97 --toolchain-version 1.97.0.0
+#
+# and carries both targets this milestone needs: `xtensa-esp32-none-elf` for the A1S (I3)
+# and `riscv32imac-unknown-none-elf` for the C5 (I4). 1.97 matches the main workspace's
+# `rust-version = "1.97"`, which cargo refuses to build with an older compiler.
+#
+# Every build also needs the Xtensa GCC linker and `LIBCLANG_PATH` on the environment:
+#
+#     . ~/export-esp-1.97.sh
+#
+# `embedded/xtask` checks for the linker and says so by name if it is missing.
+[toolchain]
+channel = "esp-1.97"

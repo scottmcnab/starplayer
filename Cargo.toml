@@ -11,6 +11,16 @@ members = [
     "apps/*",
     "xtask",
 ]
+# Two directories under this one hold their **own** workspaces and must never be resolved
+# by this one: `fuzz/` needs a nightly toolchain and a sanitizer, and `embedded/` (M8-I3)
+# needs the Xtensa fork of rustc, `-Z build-std` and per-target dependency tables full of
+# `esp-*` crates that only compile for their own triple. Neither is reached by the globs
+# above; `exclude` says so out loud, so that a future glob cannot quietly drag one in and
+# break `cargo xtask ci`.
+exclude = [
+    "fuzz",
+    "embedded",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,6 +43,10 @@ bitflags = { version = "2.13", default-features = false }
 # every other target. Its own `std` and `serde` features stay off, so it cannot threaten
 # design goal 4.
 wide = { version = "1.7", default-features = false }
+# Checked, `unsafe`-free slice casting, used by `starplayer-model` to borrow a module
+# image's PCM region as `&'static [i16]` (M8-I2). `no_std`, no default features, and
+# already in the graph below `fixed`.
+bytemuck = { version = "1.25", default-features = false }
 
 # Archive decoding stays on the pure-Rust miniz_oxide path for native and wasm builds.
 # Do not use zip's broad `deflate` feature: it also enables compressor and zlib-rs code
@@ -111,6 +125,7 @@ starplayer-midi = { path = "crates/starplayer-midi" }
 starplayer-midi-native = { path = "crates/starplayer-midi-native" }
 starplayer-telemetry = { path = "crates/starplayer-telemetry" }
 starplayer-host = { path = "crates/starplayer-host" }
+starplayer-host-embedded = { path = "crates/starplayer-host-embedded" }
 starplayer-host-cpal = { path = "crates/starplayer-host-cpal" }
 starplayer-host-wasm = { path = "crates/starplayer-host-wasm" }
 starplayer-archive = { path = "crates/starplayer-archive" }

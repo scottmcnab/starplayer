@@ -1,0 +1,14 @@
+# StarPlayer C5 partition table — 4 MB flash, no OTA, bench only.
+#
+# The C5 devkit's flash size is unconfirmed from here (I4 research resolution) — 4 MB is
+# the common ESP32-C5-DevKitC-1 figure and is what `flash_size` in `embedded/xtask` assumes
+# for this board; the owner corrects it before flashing if the board in hand differs
+# (`espflash board-info` reports the real size).
+#
+# No `modules` or `config` rows: those are M8-I6's, and I6 is an A1S-only deliverable — the
+# C5 has no WiFi in scope and stores nothing. `factory` is the only app row.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x180000,

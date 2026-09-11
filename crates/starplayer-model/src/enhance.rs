@@ -146,6 +146,11 @@ impl Module {
     ///   legitimately outgrow the `u32` PCM offsets.
     pub fn enhanced(&self, enhancer: &dyn SampleEnhancer) -> Result<Module, Error> {
         let mut builder = ModuleBuilder::new();
+        // The rebuilt PCM is at least as long as this one — an enhancer may only raise a
+        // sample's rate — so this is an exact reservation for an identity rebuild and a
+        // floor for any other, which is what keeps the peak of a rebuild near its result
+        // rather than near twice it (K5a's research resolution, M8-I2).
+        builder.reserve_pcm(self.pcm().len());
         builder.set_header(self.header().clone());
         builder.set_orders(self.orders());
 
