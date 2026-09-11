@@ -1,0 +1,62 @@
+[package]
+name = "starplayer-c5"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "StarPlayer RISC-V bench firmware for the ESP32-C5: renders every golden fixture and reports SHA-256 and cycles per frame over UART. The chip has no audio hardware; this board proves the second architecture, not sound."
+
+[[bin]]
+name = "starplayer-c5"
+path = "src/main.rs"
+# See starplayer-a1s/Cargo.toml's comment: the built-in test harness needs `std`, which
+# does not exist for this target.
+test = false
+harness = false
+
+[features]
+# Nothing by default: a minimal boot-and-idle build, so `cargo xtask build --board c5`
+# (no features) is a fast smoke build that links no module image at all. Every golden
+# fixture is only pulled in by `bench`.
+default = []
+
+# Render the six golden fixtures and print their hashes and cycles over UART, the same
+# transcript shape `firmware-common::bench` produces on the A1S — see I4 research point 1
+# for why the two boards can share the exact line format.
+bench = []
+
+# `riscv32imac-unknown-none-elf` is a plain LLVM target with a prebuilt `core`/`alloc`
+# component (I4 research point 2): this table resolves under the WORKSPACE's pinned
+# `esp-1.97` toolchain (`embedded/rust-toolchain.toml`) exactly as it would under a plain
+# stable `rustup` — `embedded/xtask` builds this crate with `+1.97` rather than
+# `+esp-1.97` for that reason (see its `Board` table), and no `-Z build-std` is needed.
+# Versions are pinned to the exact figures `embedded/Cargo.lock` already resolved for the
+# A1S's `esp-hal 1.1.1`/etc. requests (1.1.2, 0.17.0, 0.19.0, 0.10.0, 0.5.0): one lock
+# file, one set of versions, for both boards.
+[target.riscv32imac-unknown-none-elf.dependencies]
+esp-hal = { version = "1.1.1", features = ["esp32c5", "unstable"] }
+esp-println = { version = "0.17.0", features = ["esp32c5", "log-04"] }
+esp-backtrace = { version = "0.19.0", features = ["esp32c5", "panic-handler", "println"] }
+esp-alloc = { version = "0.10.0", features = ["esp32c5"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c5"] }
+# `CycleCounter`'s `mcycle` read (I4 deliverable 1) — a plain CSR accessor crate, not an
+# esp-rs one, so it carries no chip feature to select.
+riscv = "0.15"
+
+# Chip-independent. No `esp-rtos`, no `embassy-*`, no `static_cell`: this board has no
+# multitasking to do (`#[esp_hal::main]`'s blocking entry point is the whole runtime), and
+# not depending on `embassy-executor`'s `nightly` feature is what makes I4 research point
+# 2's plain-`rustup` build possible at all — the A1S's `#![feature(impl_trait_in_assoc_type)]`
+# is a consequence of `esp_rtos::main`'s task storage, and this crate never spawns a task.
+[dependencies]
+log = "0.4"
+
+starplayer = { workspace = true }
+starplayer-host-embedded = { workspace = true }
+starplayer-model = { workspace = true }
+firmware-common = { workspace = true }
+bytemuck = { workspace = true }
+
+[package.metadata.espflash]
+partition_table = "partitions.csv"

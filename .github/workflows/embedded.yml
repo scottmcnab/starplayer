@@ -1,0 +1,153 @@
+# CI for the `embedded/` firmware workspace (M8). Deliberately its own workflow file,
+# not a job in `ci.yml`: `embedded/` is its own cargo workspace on its own toolchain story
+# (M8 master-plan decision 1), and `.github/workflows/ci.yml`'s own comment says as much —
+# `cargo xtask ci` never reaches in here.
+#
+# Two board jobs, not a matrix: the A1S needs the Xtensa toolchain action and the C5 does
+# not (M8-I4 research point 2 — `riscv32imac-unknown-none-elf` builds under plain `rustup`,
+# the same toolchain the main workspace already pins), so the two jobs' steps genuinely
+# differ rather than only their inputs.
+#
+# Both jobs build the module images with the **main workspace's** stable toolchain before
+# touching a board's own toolchain, because the images are build products
+# (`embedded/assets/*.spmi`, `include_bytes!`-linked) and `embedded/xtask` builds them with
+# whatever `cargo` a bare `cd .. && cargo xtask module-images` resolves to at the repository
+# root — which must be the pinned stable toolchain, not a board's.
+
+name: embedded
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "embedded/**"
+      - "crates/**"
+      - "goldens/**"
+      - "xtask/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/embedded.yml"
+  pull_request:
+    paths:
+      - "embedded/**"
+      - "crates/**"
+      - "goldens/**"
+      - "xtask/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/embedded.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The board-independent half of `embedded/`: `firmware-common`'s bench runner and
+  # `embedded/xtask`'s own unit tests, both of which build for the host. Neither needs any
+  # embedded toolchain at all.
+  firmware-host-tests:
+    name: firmware host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: embedded -> target
+      - run: cargo test -p starplayer-firmware-common
+        working-directory: embedded
+      - run: cargo test -p starplayer-embedded-xtask
+        working-directory: embedded
+
+  a1s:
+    name: a1s (Xtensa)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The main workspace's own pinned toolchain, for `cargo xtask module-images` below —
+      # see the header comment. `rustup show` is the same idiom `ci.yml` uses; it installs
+      # whatever `rust-toolchain.toml` at the repository root names, targets included.
+      - name: Install the main workspace's pinned toolchain
+        run: rustup show
+
+      # The Xtensa toolchain, by the same name and version a local build uses
+      # (`embedded/README.md` §1, `embedded/rust-toolchain.toml`). `default: true` makes it
+      # the fallback toolchain for this job; it never overrides a directory's own
+      # `rust-toolchain.toml`, and `embedded/xtask` also names it explicitly (`+esp-1.97`)
+      # belt-and-braces.
+      - uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: false
+          version: "1.97.0.0"
+          name: esp-1.97
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            embedded -> target
+
+      # Build products, ahead of both board builds below — see the header comment.
+      - name: cargo xtask module-images (main workspace, stable toolchain)
+        run: cargo xtask module-images
+
+      - name: cargo xtask build --board a1s
+        working-directory: embedded
+        run: cargo xtask build --board a1s
+
+      - name: cargo xtask build --board a1s --features bench
+        working-directory: embedded
+        run: cargo xtask build --board a1s --features bench
+
+      # `cargo xtask size` itself is the 90 %-warn / 100 %-fail gate against
+      # `partitions.csv` (`embedded/xtask/src/main.rs`'s `command_size`) — its own exit
+      # code fails this step, no extra shell arithmetic needed.
+      - name: cargo xtask size --board a1s
+        working-directory: embedded
+        run: cargo xtask size --board a1s
+
+      - name: cargo xtask size --board a1s --features bench
+        working-directory: embedded
+        run: cargo xtask size --board a1s --features bench
+
+  c5:
+    name: c5 (RISC-V)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # This single step is the whole toolchain story for the C5 (M8-I4 research point 2):
+      # `riscv32imac-unknown-none-elf` is in the main workspace's own
+      # `rust-toolchain.toml` targets list, so installing the pinned stable toolchain here
+      # is *also* installing everything `cargo xtask build --board c5` needs — no Xtensa
+      # action, no `-Z build-std`, no second toolchain at all. `embedded/xtask` still names
+      # it explicitly (`+1.97`) so a build failure says which compiler was asked for.
+      - name: Install the main workspace's pinned toolchain (also the C5's)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            embedded -> target
+
+      - name: cargo xtask module-images (main workspace, stable toolchain)
+        run: cargo xtask module-images
+
+      - name: cargo xtask build --board c5
+        working-directory: embedded
+        run: cargo xtask build --board c5
+
+      - name: cargo xtask build --board c5 --features bench
+        working-directory: embedded
+        run: cargo xtask build --board c5 --features bench
+
+      - name: cargo xtask size --board c5
+        working-directory: embedded
+        run: cargo xtask size --board c5
+
+      - name: cargo xtask size --board c5 --features bench
+        working-directory: embedded
+        run: cargo xtask size --board c5 --features bench

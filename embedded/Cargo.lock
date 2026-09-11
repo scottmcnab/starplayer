@@ -658,6 +658,7 @@ dependencies = [
  "esp32 0.40.2",
  "esp32c2",
  "esp32c3",
+ "esp32c5 0.2.2",
  "esp32c6",
  "esp32h2",
  "esp32s2",
@@ -687,6 +688,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6aebfabb2c21bec45e575e4f6cb6bb7aa8e1b33e7ac45b5dffa0f9d33ff59105"
 dependencies = [
  "document-features",
+ "object",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -739,6 +741,7 @@ dependencies = [
  "document-features",
  "esp-metadata-generated 0.5.1",
  "esp32 0.41.0",
+ "esp32c5 0.3.0",
 ]
 
 [[package]]
@@ -813,6 +816,24 @@ name = "esp32c3"
 version = "0.32.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21e89ed62cf6c043a6d29c520b02a13b359ec8a75d67b65d4330ed717d15fe97"
+dependencies = [
+ "vcell",
+]
+
+[[package]]
+name = "esp32c5"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6f8ba56195df10224263c60ceb93b4578450019ee838b7338039a281117cb02"
+dependencies = [
+ "vcell",
+]
+
+[[package]]
+name = "esp32c5"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97afa80d8110c7234f840252baa8ee8de28f78e8dc233d2d430c0ccfbe59a2b5"
 dependencies = [
  "vcell",
 ]
@@ -1170,6 +1191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1521,6 +1551,24 @@ dependencies = [
  "starplayer-host-embedded",
  "starplayer-model",
  "static_cell",
+]
+
+[[package]]
+name = "starplayer-c5"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "esp-alloc",
+ "esp-backtrace",
+ "esp-bootloader-esp-idf",
+ "esp-hal",
+ "esp-println",
+ "log",
+ "riscv",
+ "starplayer",
+ "starplayer-firmware-common",
+ "starplayer-host-embedded",
+ "starplayer-model",
 ]
 
 [[package]]

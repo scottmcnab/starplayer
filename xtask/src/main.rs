@@ -13,9 +13,28 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// Bare-metal target used for both the `no_std` check and the no-std purity guard.
-/// `std` is unavailable here, so any crate that reaches for it fails to compile.
-const BARE_METAL_TARGET: &str = "riscv32imc-unknown-none-elf";
+/// Bare-metal targets used for both the `no_std` check and the no-std purity guard.
+/// `std` is unavailable on either, so any crate that reaches for it fails to compile.
+///
+/// Two targets, deliberately, and neither replaces the other:
+///
+/// * `riscv32imc-unknown-none-elf` has **no atomics at all** and is the no-CAS canary
+///   architecture §10 and `starplayer-rt`'s target-conditional `portable-atomic` dependency
+///   are built around — it is what proves the fallback path compiles when the target
+///   genuinely cannot do a compare-and-swap.
+/// * `riscv32imac-unknown-none-elf` (M8-I4) is a **real chip's** target — the ESP32-C5 —
+///   with native compare-and-swap (`a` in the ISA string). It exercises the *other* arm of
+///   that same conditional dependency: the one every target with atomics actually takes.
+///
+/// The `simd` job's bare-metal pass (`SIMD_NO_STD_CRATES`) stays on `imc` alone: it is
+/// checking that `wide`'s plain-array fallback compiles on a target with no vector unit,
+/// which `imc` already demonstrates, and doubling that check on `imac` would test the same
+/// fallback a second time rather than a new claim.
+const BARE_METAL_TARGETS: &[&str] = &["riscv32imc-unknown-none-elf", "riscv32imac-unknown-none-elf"];
+
+/// The single bare-metal target the `simd` job's bare-metal pass uses — see
+/// [`BARE_METAL_TARGETS`]'s doc comment for why it does not loop over both.
+const SIMD_BARE_METAL_TARGET: &str = "riscv32imc-unknown-none-elf";
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
@@ -1681,7 +1700,7 @@ fn job_simd() -> bool {
     all_succeeded &= cargo(&["test", "-p", "starplayer-engine", "--features", "simd", "--test", "block_size_determinism"]);
     all_succeeded &= run_goldens(&["--check".to_string(), "--simd".to_string()]);
     for crate_name in SIMD_NO_STD_CRATES {
-        all_succeeded &= cargo(&["check", "--target", BARE_METAL_TARGET, "-p", crate_name, "--features", "simd"]);
+        all_succeeded &= cargo(&["check", "--target", SIMD_BARE_METAL_TARGET, "-p", crate_name, "--features", "simd"]);
     }
     all_succeeded
 }
@@ -1689,32 +1708,39 @@ fn job_simd() -> bool {
 /// Each `no_std` crate must compile for a bare-metal target with its features stripped
 /// back to nothing. This is the minimal-configuration half of the portability check.
 ///
-/// There is deliberately no *clippy* run on the bare-metal target. Clippy's findings are
-/// target-independent apart from code behind `#[cfg(target_arch = ...)]` and friends, and
-/// there is none of that yet, so the host clippy job already lints every line the
+/// There is deliberately no *clippy* run on either bare-metal target. Clippy's findings
+/// are target-independent apart from code behind `#[cfg(target_arch = ...)]` and friends,
+/// and there is none of that yet, so the host clippy job already lints every line the
 /// bare-metal build compiles. Revisit when `starplayer-dsp` grows its cfg-gated SIMD
 /// backends: at that point the scalar and simd128 arms stop being covered by host clippy,
-/// and a `cargo clippy --target riscv32imc-unknown-none-elf --workspace` run belongs here
-/// (measured at well under a second on top of the checks this job already does).
+/// and a `cargo clippy --target <target> --workspace` run belongs here for each entry in
+/// [`BARE_METAL_TARGETS`] (measured at well under a second on top of the checks this job
+/// already does).
+///
+/// Runs over both [`BARE_METAL_TARGETS`] (M8-I4): the no-CAS canary and the ESP32-C5's own
+/// target, so a crate that only compiles because one of the two happens to provide an
+/// atomic it should not be assuming is caught regardless of which one that is.
 fn job_no_std_check() -> bool {
     let mut all_succeeded = true;
-    for crate_name in NO_STD_CRATES {
-        let succeeded = cargo(&[
-            "check",
-            "--target", BARE_METAL_TARGET,
-            "--no-default-features",
-            "-p", crate_name,
-        ]);
-        all_succeeded &= succeeded;
-    }
-    for (crate_name, feature) in FEATURE_ENABLED_NO_STD_CHECKS {
-        all_succeeded &= cargo(&[
-            "check",
-            "--target", BARE_METAL_TARGET,
-            "--no-default-features",
-            "--features", feature,
-            "-p", crate_name,
-        ]);
+    for target in BARE_METAL_TARGETS {
+        for crate_name in NO_STD_CRATES {
+            let succeeded = cargo(&[
+                "check",
+                "--target", target,
+                "--no-default-features",
+                "-p", crate_name,
+            ]);
+            all_succeeded &= succeeded;
+        }
+        for (crate_name, feature) in FEATURE_ENABLED_NO_STD_CHECKS {
+            all_succeeded &= cargo(&[
+                "check",
+                "--target", target,
+                "--no-default-features",
+                "--features", feature,
+                "-p", crate_name,
+            ]);
+        }
     }
     all_succeeded
 }
@@ -1739,30 +1765,37 @@ fn job_clippy() -> bool {
 /// 3. Read every manifest's own `default = [...]` list and reject `"std"` and any
 ///    `".../std"` entry. Check 2 never sees the root crate's own feature list, so this
 ///    is what closes the loop on the crate being checked.
+///
+/// Checks 1 and 2 run over both [`BARE_METAL_TARGETS`] (M8-I4): a `std` leak could in
+/// principle be gated on which bare-metal target is doing the asking (for instance a
+/// dependency that only turns on `std` in the absence of an atomic feature), so purity is
+/// only proven once both are clean. Check 3 reads manifests, not a target, and runs once.
 fn job_no_std_purity() -> bool {
     let mut all_succeeded = true;
 
-    for crate_name in NO_STD_CRATES {
-        all_succeeded &= cargo(&["check", "--target", BARE_METAL_TARGET, "-p", crate_name]);
-    }
-    for crate_name in NO_STD_CRATES {
-        all_succeeded &= assert_resolved_features_exclude_std(crate_name);
+    for target in BARE_METAL_TARGETS {
+        for crate_name in NO_STD_CRATES {
+            all_succeeded &= cargo(&["check", "--target", target, "-p", crate_name]);
+        }
+        for crate_name in NO_STD_CRATES {
+            all_succeeded &= assert_resolved_features_exclude_std(crate_name, target);
+        }
     }
     all_succeeded &= assert_manifest_defaults_exclude_std();
 
     all_succeeded
 }
 
-/// Check 2: the resolved feature set of `crate_name`, built for the bare-metal target,
-/// names `std` nowhere.
+/// Check 2: the resolved feature set of `crate_name`, built for `target`, names `std`
+/// nowhere.
 ///
 /// `no-dev` because a **dev**-dependency is never compiled into the crate a host links:
 /// `starplayer-enhance`'s tests trace a real module through `starplayer-offline`, which is
 /// `std` by construction, and that says nothing about whether the enhance crate itself is
-/// bare-metal clean. `cargo check --target <bare metal>` above builds no dev-dependency
+/// bare-metal clean. `cargo check --target <target>` above builds no dev-dependency
 /// either, so the two halves of the check now agree on what they are looking at.
-fn assert_resolved_features_exclude_std(crate_name: &str) -> bool {
-    let arguments = ["tree", "--edges", "features,no-dev", "--target", BARE_METAL_TARGET, "-p", crate_name];
+fn assert_resolved_features_exclude_std(crate_name: &str, target: &str) -> bool {
+    let arguments = ["tree", "--edges", "features,no-dev", "--target", target, "-p", crate_name];
     println!("     cargo {}", arguments.join(" "));
 
     let output = match Command::new(cargo_binary()).args(arguments).output() {

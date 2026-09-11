@@ -5,4 +5,9 @@ targets = [
     "wasm32-unknown-unknown",
     "wasm32-wasip1",
     "riscv32imc-unknown-none-elf",
+    # M8-I4: the ESP32-C5's target. `imc` above has no atomics at all and stays the
+    # no-CAS canary the `no-std-check`/`no-std-purity` jobs were built around; `imac` is a
+    # second, different bare-metal target — a real chip's target, with native CAS — added
+    # alongside it rather than in its place. See xtask's `BARE_METAL_TARGETS`.
+    "riscv32imac-unknown-none-elf",
 ]
