@@ -171,8 +171,15 @@ impl WavHeader {
     /// Write the `RIFF`/`WAVE`, `fmt ` and `data` chunk headers for `sample_count`
     /// interleaved samples, leaving the writer positioned to receive exactly that many
     /// bytes of sample data (plus, when `sample_count`'s bytes are odd, one pad byte the
-    /// caller must also write — [`write_wav`] does both).
-    fn write<W: Write>(&self, writer: &mut W, sample_count: usize) -> Result<u32, WavError> {
+    /// caller must also write — [`write_wav`] does both). Returns the `data` chunk's
+    /// declared size in bytes.
+    ///
+    /// Public because a WAV *stream* has no file to seek back into. `starplayer-cast`'s
+    /// `--live` path writes this header once, ahead of audio whose length it will not know
+    /// until the session ends, and declares the largest size a RIFF header can hold; see
+    /// the "4 GiB" section of this module's doc for why [`write_wav`] refuses to do
+    /// anything of the kind for a file. Nothing else calls it directly.
+    pub fn write_to<W: Write>(&self, writer: &mut W, sample_count: usize) -> Result<u32, WavError> {
         let (riff_size, data_bytes) = self.chunk_sizes(sample_count)?;
         writer.write_all(b"RIFF")?;
         writer.write_all(&riff_size.to_le_bytes())?;
@@ -198,7 +205,7 @@ impl WavHeader {
 pub fn write_wav<S: WavSample>(path: impl AsRef<Path>, sample_rate_hz: u32, channels: u16, samples: &[S]) -> Result<(), WavError> {
     let header = WavHeader::for_format::<S>(sample_rate_hz, channels);
     let mut writer = BufWriter::new(File::create(path)?);
-    let data_bytes = header.write(&mut writer, samples.len())?;
+    let data_bytes = header.write_to(&mut writer, samples.len())?;
 
     let mut payload = Vec::with_capacity(data_bytes as usize);
     for &sample in samples {

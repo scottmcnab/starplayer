@@ -26,7 +26,8 @@ MOD/S3M/MTM effect semantics this engine reproduces.
 ## Layout
 
 ```
-crates/     the engine, one crate per format loader, hosts, telemetry, test kit
+crates/     the engine, one crate per format loader, hosts, the Google Cast sender,
+            telemetry, test kit
 apps/       starplayer-web (browser player), starplayer-cli, starplayer-tui
 xtask/      build orchestration: CI jobs, wasm packaging, golden regeneration
 fuzz/       cargo-fuzz loader targets (nightly)
@@ -42,9 +43,19 @@ The toolchain is pinned by `rust-toolchain.toml`. Native tests need the ALSA hea
 cargo test --workspace          # unit, golden and conformance tests
 cargo xtask ci                  # every CI job, as GitHub Actions runs them
 cargo xtask wasm && cargo xtask serve   # the web player at http://localhost:8080/
+cargo run -p starplayer-cli -- cast --list                     # Cast devices and speaker groups
+cargo run -p starplayer-cli -- cast --device "Kitchen" song.s3m  # play it on that speaker
 ```
 
 See `apps/starplayer-web/README.md` for the browser player and its GitHub Pages deploy.
+
+`starplayer cast` renders the module here, serves it over HTTP on the LAN and hands the URL
+to the speaker's Google-hosted Default Media Receiver — no developer account, no
+registration. It needs real multicast to find anything, so it does not work from inside
+WSL2's default NAT. Worth knowing about the alternative: Chrome's own **"Cast this tab"**
+will send the web player's audio to a Chromecast today with no code at all, at
+tab-mirroring quality and latency, and it stops the moment the tab closes. That is the
+honest no-work option; it is not what `starplayer cast` is.
 
 ## Licence
 

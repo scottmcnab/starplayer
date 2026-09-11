@@ -79,6 +79,41 @@ cpal = { version = "0.18.2", default-features = false, features = ["pulseaudio"]
 # polling loop checks — never a call into the player from the handler's own thread.
 ctrlc = { version = "3.5.2" }
 
+# ── Google Cast (A4-N2) ──────────────────────────────────────────────────────────────
+#
+# Five crates and no async runtime: `rust_cast` is a blocking, `rustls`-based CASTv2
+# client, and one session, one HTTP server and one encoder each get a thread of their own
+# rather than an executor. All of them are reachable only from `starplayer-cast` and the
+# CLI, so like cpal and midir they cannot threaten design goal 4.
+#
+# `thread_safe` swaps `rust_cast`'s internal `Rc`/`RefCell` for `Arc`/`Mutex`, which is
+# what lets the heartbeat thread and the control thread share one connection. Its other
+# feature, `cast`, only re-exports the generated protobuf module and is off.
+rust_cast = { version = "0.21", features = ["thread_safe"] }
+# mDNS service discovery for `_googlecast._tcp.local.`. Pure Rust with its own daemon
+# thread, so no `avahi` or `mDNSResponder` system dependency comes with it.
+mdns-sd = "0.21"
+# The LAN media server the speaker fetches the rendered audio from. Blocking, a thread per
+# connection, and small enough to read end to end — which matters, because it serves bytes
+# to anything on the LAN that asks for them.
+tiny_http = "0.12"
+# The pure-Rust FLAC encoder that halves what WAV/LPCM would put on the wire. Its default
+# `par` and `serde` features are off: `par` pulls in crossbeam-channel to encode frames on
+# a thread pool, which is the wrong trade for a driver thread already pacing against the
+# wall clock, and `serde` exists only to serialise FLAC components for analysis.
+flacenc = { version = "0.5", default-features = false }
+# `starplayer-cast` builds its own TLS client stack rather than calling
+# `rust_cast::CastDevice::connect_without_host_verification`, because the CASTv2 session
+# needs a read timeout on the `TcpStream` underneath it — see `session.rs`'s module doc for
+# why. This is `rust_cast`'s own rustls version, so exactly one rustls and one crypto
+# provider are linked into the binary.
+rustls = "0.23"
+# The fake Cast receiver's self-signed certificate (`tests/fake_receiver.rs`), and nothing
+# else — a dev-dependency of one crate. `default-features = false` drops rcgen's `ring`
+# default in favour of the `aws-lc-rs` backend rustls already links, so the test adds no
+# second crypto library to the tree.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+
 # Native MIDI *input* for `starplayer-midi-native` (task E6). A `std` crate reachable only
 # from that host crate, so like cpal it cannot threaten design goal 4. On Linux it binds
 # the ALSA **sequencer** (`libasound`'s `snd_seq_*`), which is the same `alsa-lib` cpal's
@@ -129,6 +164,7 @@ starplayer-host-embedded = { path = "crates/starplayer-host-embedded" }
 starplayer-host-cpal = { path = "crates/starplayer-host-cpal" }
 starplayer-host-wasm = { path = "crates/starplayer-host-wasm" }
 starplayer-archive = { path = "crates/starplayer-archive" }
+starplayer-cast = { path = "crates/starplayer-cast" }
 starplayer-offline = { path = "crates/starplayer-offline" }
 starplayer-testkit = { path = "crates/starplayer-testkit" }
 

@@ -24,6 +24,9 @@ starplayer-enhance = { workspace = true }
 # `play` (task D8): the backend-neutral controller and the cpal driver behind it.
 starplayer-host = { workspace = true }
 starplayer-host-cpal = { workspace = true }
+# `cast` (A4-N2): mDNS discovery, the CASTv2 session, the LAN media server and the
+# FLAC/WAV encoders. A `std` crate like the host crates, reachable only from this binary.
+starplayer-cast = { workspace = true }
 # `play --midi` (task E6): a `midir` input port feeding the player's live-input queue.
 starplayer-midi-native = { workspace = true }
 clap = { workspace = true }

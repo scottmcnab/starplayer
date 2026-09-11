@@ -1578,6 +1578,13 @@ crates/
                         mailbox + output depth + insert control (M7-H7,
                         HostInsertControl + InsertLayout).         → starplayer
   starplayer-host-cpal  native audio output          → starplayer, starplayer-host, cpal
+  starplayer-cast       Google Cast sender: mDNS discovery, a CASTv2 session, an HTTP
+                        media server and a FLAC/WAV encoder (A4-N2). Synchronous —
+                        threads, no executor; no async runtime enters this workspace.
+                        Its CastStreamBackend is the third AudioBackend, a push backend
+                        whose driver thread encodes after the callback returns.
+                          → starplayer, starplayer-host, starplayer-offline, rust_cast,
+                            mdns-sd, tiny_http, flacenc, rustls
   starplayer-midi-native  native MIDI *input*: a midir port decoded onto a Player's
                         live-input queue (M4-E6). Not part of the cpal crate: it is not
                         an audio backend, and a host on any other one still wants a

@@ -436,3 +436,449 @@ N3 (the StarPlayer Web Receiver), N4 (the web player's Cast button), N5 (`--rece
 starplayer`). Raw-mode transport keys and any terminal-input crate — those are A1's. Jam
 mode over Cast. Creating or editing speaker groups. Any change to the engine, the mixer,
 the goldens or the `no_std` crates. Adding an async runtime.
+
+---
+
+## Research resolution
+
+### 1. The Default Media Receiver and live streams (A4 point 3)
+
+**Verdict: the code emits a chunked stream with no `Content-Length` under `streamType:
+LIVE` and the offline suite proves the wire format is well-formed, but whether *Nest
+hardware* accepts it is an owner step that cannot be settled from here.**
+
+What the code does now:
+
+- `MediaServer::serve_stream` answers a live path with `200`, `Transfer-Encoding: chunked`,
+  `Content-Type: audio/flac` (or `audio/wav`), no `Content-Length`, and
+  `Accept-Ranges: none`. A `Range` request against a live path is ignored and answered from
+  the current position — a live stream has no addressable past.
+- `FlacEncoder`'s streaming path writes a STREAMINFO whose `total_samples` is **0**, the
+  format's "unknown", and whose frame-size minimum/maximum are also zeroed. (`flacenc`'s
+  `StreamInfo::new` defaults the minimum to `u32::MAX` and the maximum to `0` so the first
+  frame narrows them; written into a header no frame will ever update, that produces a
+  STREAMINFO saying the smallest frame is larger than the largest, which its own parser
+  rejects. Zeroing both is the fix and is what the format intends.)
+- `WavEncoder`'s streaming path writes one 44-byte header declaring `data` = 4 294 967 258
+  bytes — the largest size that still leaves the outer `RIFF` size inside a 32-bit field —
+  and then raw little-endian `i16`. This is the single deliberate exception to `wav.rs`'s
+  "4 GiB" rule, and it is commented as such in `encode.rs`: the length is unknown when the
+  header goes out, the response is chunked so no reader ever reaches the end, and a
+  receiver that trusts the declared length simply never gets there.
+- The LOAD payload for `--live` carries `streamType: LIVE` and **no** `duration` field at
+  all (`rust_cast` skips a `None`).
+
+What the offline suite proves, with no device and no network beyond loopback:
+
+- `tests/range.rs::a_live_path_is_answered_chunked_and_ends_when_the_channel_closes`
+  decodes the chunked body by hand and asserts `Transfer-Encoding: chunked`, the absence of
+  `Content-Length`, that a `Range` header is ignored, and that every byte fed into the
+  channel comes out of the response in order.
+- `tests/fake_receiver.rs::a_live_load_payload_says_live_and_carries_no_duration` asserts
+  the LOAD payload's `streamType` is `LIVE` and that `duration` is absent, against a LOAD
+  whose protobuf and JSON the fake receiver decoded itself.
+- `live.rs::the_chunks_of_a_live_flac_stream_decode_to_the_frame_count_that_went_in` runs
+  the real `CastStreamBackend` driver and decodes the chunks back through `flacenc`'s own
+  parser: the frame count and the sample count equal what the render callback filled.
+- `encode.rs::a_live_flac_stream_declares_an_unknown_length_and_still_round_trips` pushes
+  ragged blocks through `FlacEncoder` and decodes the result losslessly.
+
+**What the owner should try, on the real hardware:**
+
+1. `starplayer cast --device "<speaker>" song.s3m --live` with the default `--format flac`.
+   Expect audio within a few seconds. If the speaker goes `IDLE` with `idleReason` `ERROR`
+   in the status line, the receiver refused the stream.
+2. If FLAC fails, repeat with `--live --format wav`. Reports of WAV-on-the-fly working are
+   specifically about Chromecast Audio; Nest hardware is the open question, and WAV is the
+   likelier of the two to be accepted because it needs no container-level length at all.
+3. Note whether the Google Home app shows a running clock or a stalled one, and whether the
+   speaker's own next/previous controls do anything — a `LIVE` stream should present as a
+   live tap with no seek bar.
+4. Report which of the two worked. If neither does, the fallback is not a code change but a
+   scope one: `--live` is only for an endless session, and the pre-render path (which is the
+   default and does not depend on this answer) covers playing a song.
+
+### 2. `rust_cast` maintenance (A4 point 4)
+
+**Verdict: `rust_cast` 0.21.0 resolved; `thread_safe` swaps its internal `Rc`/`RefCell` for
+`Arc`/`Mutex`; **no** `rust_cast` type appears anywhere in this crate's public API; and
+replacing it with `cast-sender` would be a rewrite of `session.rs` and nothing else.**
+
+Evidence:
+
+- **Version resolved:** `rust_cast 0.21.0` (the manifest pins `"0.21"`). Its own pins are
+  `protobuf =3.7.2` (exact, with `protobuf-codegen` as a build dependency generating
+  `cast_channel.rs` from the Chromium Open Screen `.proto`), `rustls 0.23`,
+  `rustls-native-certs 0.8`, `serde`/`serde_json 1`, `thiserror 2`, `byteorder 1.5`,
+  `log 0.4`. It is `edition 2024` and MIT.
+- **What `thread_safe` turns on:** two things, both in the crate's own source.
+  `src/lib.rs` defines `type Lrc<T> = std::sync::Arc<T>` with the feature and
+  `std::rc::Rc<T>` without it; `src/message_manager.rs` defines its internal `Lock<T>` as
+  `std::sync::Mutex<T>` with the feature and `std::cell::RefCell<T>` without. That is the
+  whole difference, and it is exactly what lets this crate's heartbeat thread and control
+  thread share one `MessageManager`. The crate's own `test_thread_safe` asserts
+  `CastDevice: Send + Sync` under the feature. Its only other feature, `cast`, merely
+  re-exports the generated protobuf module and stays off.
+- **Types that leak into our API: none.** `grep rust_cast crates/starplayer-cast/src`
+  finds uses only inside `session.rs`'s private body and in prose. The public surface is
+  `CastSession`, `MediaRequest`, `MediaStatus`, `StreamKind`, `CastError`, `CastDevice`,
+  `MediaServer`, `CastEncoder`/`FlacEncoder`/`WavEncoder` and `CastStreamBackend` — all
+  ours, made of `String`, `f32`, `i32` and `IpAddr`. `StreamKind::to_rust_cast` is private.
+  Player state and idle reason cross the boundary as the protocol's own strings
+  (`"PLAYING"`, `"CANCELLED"`) rather than as `rust_cast::channels::media::PlayerState`.
+- **Cost of replacing it with `cast-sender`:** one module. `session.rs` is 470 lines, of
+  which the `rust_cast`-specific parts are the four channel constructors, the nine
+  request calls and the `NoCertificateVerification` reference. Nothing above it —
+  `serve.rs`, `encode.rs`, `live.rs`, `apps/starplayer-cli/src/cast.rs`, both integration
+  tests — names `rust_cast` at all, and `tests/fake_receiver.rs` asserts on the *wire*
+  (protobuf frames and JSON payloads), not on library types, so it would keep working
+  unchanged against a different client. The one real obstacle is that `cast-sender` 0.3 is
+  built on `smol`, which would mean an async runtime in this workspace; that is a reason to
+  stay on `rust_cast` rather than a reason the wrapper does not work.
+- **One thing `rust_cast` could not give us**, worth recording for whoever revisits this:
+  `CastDevice::connect_without_host_verification` builds and hides its own `TcpStream`, so
+  there is no way to set a read timeout on it, and a speaker that stops answering would
+  hang the CLI for ever. `session.rs` therefore assembles the same stack itself —
+  `rustls` client → `MessageManager::new` → the four public channel constructors — over a
+  socket it holds a `try_clone` of. This is all public API of `rust_cast` (its own test
+  module documents exactly this construction), not a fork.
+
+### 3. Latency (A4 point 5)
+
+**Verdict: the CASTv2 control round trip is ~0.2 ms in-process and about a millisecond on
+a LAN; everything else a listener perceives is the receiver's own 2–5 s playout buffer,
+which a sender cannot see or shorten. `--help` states 2–5 s, and that is what rules out jam
+mode over Cast.**
+
+Measured here, against the fake receiver over loopback TLS
+(`cargo test -p starplayer-cast --test fake_receiver -- --ignored --nocapture
+measure_round_trip_latency`, which is kept in the suite as `#[ignore]`d evidence):
+
+```
+connect  1.207206ms      TCP + TLS handshake + CONNECT
+launch   440.805µs       GET_STATUS + LAUNCH + CONNECT(transport)
+load     207.951µs       LOAD, request to matching MEDIA_STATUS
+pause    188.054µs       mean of 50 PAUSE round trips
+```
+
+A note on how that number was obtained, because the first attempt was wrong: the same
+measurement read 44 ms per round trip until the fake receiver's accepted socket got
+`set_nodelay(true)`. Forty milliseconds is the delayed-ACK timer, not the protocol —
+`rustls` writes a record's header and payload separately and Nagle held the second. The
+session's own client socket has had `set_nodelay(true)` from the start for the same reason.
+
+On a real LAN, add the network RTT: a wired or 5 GHz link to a speaker is 1–3 ms, so a
+transport command reaches the receiver in single-digit milliseconds.
+
+**None of that is what a listener hears.** Between LOAD returning and sound leaving the
+speaker, and between a `p` and the speaker reacting, sits the receiver's own buffer, which
+Google documents as several seconds and which senders have no control over: the Cast
+audio-device guidance caps a stream buffer at 2 MB and the receiver decides its own
+pre-roll. Two to five seconds is the figure every Cast sender reports, and the `--live`
+path adds this crate's own `STREAM_LEAD` (2 s) on top, because the driver thread
+deliberately renders ahead of the wall clock so a network hiccup does not starve the
+receiver.
+
+**Why that rules out jam mode over Cast:** playing along with what you hear requires the
+round trip from your hands to your ears to stay under roughly 10–20 ms. Cast is two to
+three orders of magnitude away from that, the latency is in a component we do not control,
+and no amount of reducing `STREAM_LEAD` touches it — at lead zero the speaker's own buffer
+still stands between the render and the room. `--live` exists so an endless session can be
+*listened to* on the kitchen speaker, not so it can be played into. `--help` says exactly
+this, in the "Latency" paragraph.
+
+**Owner measurement, when a speaker is reachable:** with a watch, time (a) `starplayer cast
+--device … song.s3m` from the `loaded` line to the first sound, and (b) typing `p` + Enter
+to the speaker going quiet. Both should land in the 2–5 s band; anything much larger points
+at the network rather than at the receiver.
+
+### 4. The LAN bind address, and WSL2
+
+**Verdict: the UDP-connect trick returns the kernel's own routing answer, returns nothing
+at all when there is no route, and finds no Cast device on this machine — which is the
+correct and expected result under WSL2's NAT, reported as a clear message rather than a
+hang or a stack trace.**
+
+**The trick picks the interface that reaches the device.** `serve::local_address_reaching`
+binds a `UdpSocket` to `0.0.0.0:0`, calls `connect(device_address:9)` — which sends no
+packet; UDP `connect` only fixes the peer — and reads `local_addr().ip()`. Demonstrated on
+this machine, whose only routable interface is WSL2's `eth0` at `172.31.34.119/20` with a
+default route via `172.31.32.1`:
+
+```
+192.168.1.40     -> 172.31.34.119     a LAN address off-subnet: the default route's interface
+127.0.0.1        -> 127.0.0.1         loopback picks loopback
+8.8.8.8          -> 172.31.34.119     the internet: same default route
+172.31.34.200    -> 172.31.34.119     on-subnet: the link's own source address
+2001:db8::1      -> no route (Network is unreachable)
+```
+
+`crates/starplayer-cast/src/serve.rs::the_route_to_loopback_is_loopback` pins the loopback
+case in the suite.
+
+**What it returns when there is no route:** the `connect` fails with `ENETUNREACH` (the
+IPv6 line above), so `local_address_reaching` returns `None`. `MediaServer::bind_for` then
+falls back to binding `0.0.0.0`, the URL names whatever the listener reports, and
+`apps/starplayer-cli/src/cast.rs::warn_about_an_unroutable_url` prints a warning naming
+WSL2 and mirrored networking. The URL can never contain `127.0.0.1` by accident: the
+unspecified-address check in `local_address_reaching` rejects the kernel's "I have not
+picked an interface" answer, and loopback is only ever returned when the device address is
+itself loopback, which only the tests do.
+
+**`starplayer cast --list` on this machine**, verbatim:
+
+```
+$ cargo run -p starplayer-cli -- cast --list
+no cast device answered on this network.
+That is a normal result, not necessarily a fault: mDNS is multicast, and multicast does not
+cross a NAT. Inside WSL2's default networking, inside most containers, and across a VLAN
+boundary, nothing will ever answer — and a speaker could not reach a media server bound in
+there either. Try a longer --timeout, or run this from a native Linux or Windows build on
+the same subnet as the speaker (WSL2 needs mirrored networking).
+$ echo $?
+0
+```
+
+That is the expected result and the honest one. Exit status is 0, because mDNS finding
+nothing is a normal outcome and a non-zero exit would make it look like a fault. The message
+names `--timeout` and says what actually fixes it. There is no hang: the browse runs for
+exactly `--timeout` seconds and stops, and `cast --device …` on the same machine fails
+immediately afterwards with the same text rather than proceeding to bind a server the
+speaker could never reach.
+
+### 5. Not asked, but the reviewer will: `Int16Writer`
+
+The task said to reproduce `starplayer-host-cpal`'s allocation-free `f32` → `i16`
+conversion in the cast crate rather than copying the type, and to *ask* rather than move it
+into `starplayer-host`. **It turned out that neither was needed.** `Int16Writer` is a thin
+wrapper around `starplayer::mixer::HostSample`, which is already a shared, public,
+`no_std` trait: `live.rs`'s driver calls `<i16 as HostSample>::from_unit_f32(sample, &mut
+dither)` with `Dither::OFF` directly, into a scratch sized when the stream opened, exactly
+as `Int16Writer::write` does. So there is one conversion rule in the tree, not two, and no
+widening of scope to propose. **The question for the reviewer is therefore only whether
+that is the right call** — the alternative would be hoisting `Int16Writer` itself into
+`starplayer-host`, which buys a shared *buffer-walking loop* on top of a shared conversion,
+and the cast driver does not need one because it renders a fixed block size it chose.
+
+---
+
+## Deviations from the task file
+
+1. **`discover::find` returns `Result<&CastDevice, CastError>`, not
+   `Option<&CastDevice>`.** The task file's signature block says `Option`, and the sentence
+   immediately after it says "an ambiguous prefix is an error naming every match, not a
+   silent first-wins". `Option` cannot carry that error. `Result` was the only way to obey
+   the requirement, and the error text names every match.
+
+2. **`rustls` 0.23 is a normal dependency of `starplayer-cast`, not only a
+   dev-dependency.** The task listed four crates to pin plus `rustls`/`rcgen` "for the fake
+   receiver". `session.rs` needs rustls on the *client* side too, because
+   `rust_cast::CastDevice::connect_without_host_verification` builds and hides its own
+   `TcpStream` and there is no way to set a read timeout on a socket you cannot reach — so
+   a speaker that stopped answering would hang the CLI indefinitely, which research point 4
+   explicitly rules out ("not a hang and not a stack trace"). The same stack is therefore
+   assembled here from `rust_cast`'s own public pieces (`MessageManager::new` plus the four
+   channel constructors — the construction its own test module documents) over a socket
+   this crate holds a `try_clone` of. It is `rust_cast`'s own rustls version, so exactly
+   one rustls and one crypto provider (`aws-lc-rs`) are linked. `rust_cast`'s public
+   `NoCertificateVerification` is reused rather than re-implemented.
+
+3. **`rcgen` is pinned with `default-features = false, features = ["aws_lc_rs"]`.** Its
+   default feature set pulls `ring`, which would put a second C crypto library into the
+   dev-dependency tree beside the `aws-lc-rs` rustls already links. The task said to "pick
+   the current release and say which": **0.14.10**.
+
+4. **Transport keys are newline-terminated letters on stdin.** This is the deviation the
+   task file itself asked for and asked to have recorded: raw single-keypress input needs a
+   terminal crate this workspace does not have, and choosing one here would pre-empt A1's
+   own choice. `starplayer cast --help` says so in its own words.
+
+5. **`--repeat` takes a count, not a bare flag.** The task file's usage line shows
+   `[--repeat]`. `render`'s `--repeat` is a `u32` count of extra passes and `play`'s is a
+   bare flag; `cast`'s pre-render path goes through `RenderLength::repeat_count`, so it
+   follows `render`. `--live` ignores it and says so in the flag's own help: a live stream
+   loops forever by construction (`AtEnd::Continue`) and has no fade to describe.
+
+6. **`CastSession` grew three methods the task file's block did not list**, all of them
+   forced by requirements elsewhere in the same task: `launched_here()` (so the exit path
+   can stop the application "if and only if this process launched it"), `pump()` (so
+   incoming `PING`s get a `PONG` — the control thread is the only reader, see below), and
+   a `Debug` impl. `MediaServer` likewise grew `address()`, which the `Range` tests and the
+   unroutable-URL warning both need.
+
+7. **Reads happen only on the control thread; the heartbeat thread only writes.** The task
+   file says the heartbeat thread "pings every 5 s and answers `PING` with `PONG`". Doing
+   both on that thread deadlocks: `rust_cast`'s `MessageManager` holds one lock around the
+   stream for the whole of a blocking read, so a heartbeat thread parked in `read` would
+   block the control thread's next `send` indefinitely. The split implemented instead is
+   heartbeat-thread-sends-`PING`, control-thread-answers-`PING`-in-`pump()`, which the CLI
+   calls once a second. The thread still exits on an `Arc<AtomicBool>` and is joined in
+   `Drop`, as the task requires. `tests/fake_receiver.rs` sends a `PING` from the receiver
+   and asserts the `PONG` comes back.
+
+8. **The `--live` driver's blocking send is a retry loop rather than `SyncSender::send`.**
+   The task says "if the HTTP side stalls, the driver blocks rather than growing without
+   limit", and it does — but a plain blocking `send` deadlocks against `Drop` when the
+   consumer has already stopped reading, which is exactly what happens when the `Stream` is
+   dropped. `send_chunk` retries on a tick and checks the stop flag between attempts, and
+   still records one non-fatal `StreamHealth` error the first time a chunk has to wait.
+
+9. **`WavHeader::write` was renamed to `write_to` rather than kept as a private caller.**
+   The task offered either; renaming leaves one function instead of two and `write_wav`'s
+   single call site was updated.
+
+10. **`flacenc`'s `decode` feature is used as a dev-dependency feature.** The task asked
+    which check the encode tests ended up with: the real one. `flacenc = { workspace =
+    true, features = ["decode"] }` under `[dev-dependencies]` turns on its own
+    `component::parser` and `Decode`, so the FLAC tests parse the STREAMINFO, walk every
+    frame with CRC checking, and assert the decoded samples equal the input — rather than
+    asserting on byte patterns. Nothing the crate ships ever decodes FLAC.
+
+11. **`tests/fake_receiver.rs` carries one `#[ignore]`d test**,
+    `measure_round_trip_latency`. It is the evidence behind research point 3 and is
+    reproducible; being `#[ignore]`d it costs CI nothing.
+
+---
+
+## Verification results (this run)
+
+Run in `/home/scott/projects/starplayer-a4-n2-cast-cli` on the pinned toolchain
+(`1.97-x86_64-unknown-linux-gnu`), WSL2.
+
+| Command | Result |
+|---|---|
+| `cargo test -p starplayer-cast` | **pass** |
+| `cargo test -p starplayer-cli` | **pass** |
+| `cargo test --workspace` | **pass** |
+| `cargo xtask ci --job clippy` | **pass** |
+| `cargo xtask ci --job host-tests` | **pass** |
+| `cargo xtask ci --job no-std-purity` | **pass** |
+| `cargo xtask ci --job goldens` | **pass — every fingerprint unchanged** |
+| `cargo run -p starplayer-cli -- cast --list` | **pass** — found nothing, exit 0, as expected on WSL2 |
+| `cargo run -p starplayer-cli -- cast --help` | **pass** |
+| `cargo build --release -p starplayer-cli` | **pass** — 4 606 656 → 10 438 472 bytes |
+
+### `cargo test -p starplayer-cast`
+
+```
+running 30 tests   test result: ok. 30 passed; 0 failed; 0 ignored     (lib)
+running 7 tests    test result: ok. 6 passed; 0 failed; 1 ignored      (tests/fake_receiver.rs)
+running 10 tests   test result: ok. 10 passed; 0 failed; 0 ignored     (tests/range.rs)
+running 0 tests    test result: ok. 0 passed; 0 failed; 0 ignored      (doc-tests)
+```
+
+The one ignored test is `measure_round_trip_latency`, the research-point-3 measurement.
+
+### `cargo test -p starplayer-cli`
+
+```
+running 34 tests   test result: ok. 34 passed; 0 failed; 0 ignored     (unit, incl. 5 new cast tests)
+running 7 tests    test result: ok. 7 passed; 0 failed; 0 ignored      (tests/enhance_flags.rs)
+running 2 tests    test result: ok. 2 passed; 0 failed; 0 ignored      (tests/golden_reproduction.rs)
+running 5 tests    test result: ok. 5 passed; 0 failed; 0 ignored      (tests/insert_flags.rs)
+running 2 tests    test result: ok. 2 passed; 0 failed; 0 ignored      (tests/robustness.rs)
+```
+
+### `cargo test --workspace`
+
+```
+exit status 0
+98 test binaries reported `test result: ok`
+1565 tests passed, 0 failed
+```
+
+### `cargo xtask ci --job clippy`
+
+```
+=== xtask ci: clippy ===
+     cargo clippy --workspace --all-targets -- -D warnings
+    Checking starplayer-cli v0.1.0 (…/apps/starplayer-cli)
+    Checking starplayer-cast v0.1.0 (…/crates/starplayer-cast)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.94s
+
+xtask ci: 1 job(s) passed
+```
+
+### `cargo xtask ci --job host-tests`
+
+```
+=== xtask ci: host-tests ===
+     cargo tree --edges features --workspace
+     cargo test --workspace
+…
+xtask ci: 1 job(s) passed
+```
+
+### `cargo xtask ci --job no-std-purity`
+
+```
+     cargo tree --edges features,no-dev --target riscv32imac-unknown-none-elf -p starplayer-telemetry
+     cargo tree --edges features,no-dev --target riscv32imac-unknown-none-elf -p starplayer
+     cargo tree --edges features,no-dev --target riscv32imac-unknown-none-elf -p starplayer-host-embedded
+     scanning manifests for `std` in a default feature set
+
+xtask ci: 1 job(s) passed
+```
+
+`starplayer-cast` is a `std` crate and is deliberately **not** in `NO_STD_CRATES`; none of
+its five external dependencies is reachable from any `no_std` crate.
+
+### `cargo xtask ci --job goldens`
+
+```
+=== xtask ci: goldens ===
+ok    c5adc0cc55f95e9147a24530e9c4d0803f9c9930a59ad8107ac386ff7c3eb82a  goldens/mod/synthetic__i16_mono_44100_linear.sha256
+ok    2ca02ee1d5ec67fb6b603ba28950cccc0a6044d44ce9f4836b3e83a5345dcabb  goldens/mtm/synthetic__i16_mono_44100_linear.sha256
+ok    20beedc6f28ef53716dd63563789d70325ec50cf2350da907e236dd22fd48039  goldens/xm/synthetic__i16_mono_44100_linear.sha256
+ok    a5da3e4b0ac210a910d98e2eb44b28e584a999f408eea542b5070431d13bb218  goldens/it/synthetic__i16_mono_44100_linear.sha256
+ok    eaa4842ed00bfc48bcc35948dcfe635ec0d7f472cb59eae05cd3632d1f73412b  goldens/s3m/petri__i16_mono_44100_linear.sha256
+ok    bab4413c73d6d4da3681e088af0e761ec50ce7e2ec6fbd9885d28681f4a5e625  goldens/s3m/reflex__i16_mono_44100_linear.sha256
+ok    742675f6173bfd64dd486b841f4d7f4603fee6682c77d91d31d6719d914d54a5  goldens/s3m/reflex__i16_mono_44100_cubic.sha256
+ok    a1258c1e4e0acfdb440b79d748ed145c11e797d35b469723e6209d90bc109fa8  goldens/s3m/reflex__i16_mono_44100_sinc.sha256
+
+xtask ci: 1 job(s) passed
+```
+
+**Not one golden moved.** Nothing in this task touches a rendered byte: `render_pcm_i16_stereo`
+is `render_dispatch`'s own match with the sample type and channel count pinned, calling the
+same `render_song_with_options`.
+
+### `cargo run -p starplayer-cli -- cast --list`
+
+```
+no cast device answered on this network.
+That is a normal result, not necessarily a fault: mDNS is multicast, and multicast does not
+cross a NAT. Inside WSL2's default networking, inside most containers, and across a VLAN
+boundary, nothing will ever answer — and a speaker could not reach a media server bound in
+there either. Try a longer --timeout, or run this from a native Linux or Windows build on
+the same subnet as the speaker (WSL2 needs mirrored networking).
+```
+
+Exit status **0**. This is the expected WSL2 result (research point 4).
+
+### `cargo run -p starplayer-cli -- cast --help`
+
+Prints the long description — what the command does with the audio, the two paths, the
+stdin transport letters, the 2–5 s latency figure and why it rules out jam mode, and the
+note that `--list` finding nothing is normal — followed by the flag list. Exit status 0.
+
+### `cargo build --release -p starplayer-cli`
+
+| | bytes |
+|---|---|
+| before this task | 4 606 656 |
+| after this task | 10 438 472 |
+
++5.8 MB, and the shape of it is worth stating: it is `aws-lc-rs`/`aws-lc-sys` (the C crypto
+library rustls links, which `rust_cast` would have pulled in whichever way the TLS stack
+was assembled), `protobuf` 3.7's generated `cast_channel` module and runtime, `serde_json`,
+`mdns-sd` with `mio`/`socket2`/`if-addrs`, `tiny_http`, and `flacenc`. It is the cost of
+the CLI speaking a network protocol for the first time; the engine crates are unchanged and
+the `no_std` graph is untouched.
+
+### Also verified, not on the list
+
+- `cargo test -p starplayer-cast --test fake_receiver` run eight times in a row after
+  fixing one genuine race: the trailing CLOSE a dropped session sends has no reply to wait
+  for, so the test now waits for the receiver to record it before snapshotting. Eight
+  consecutive green runs, plus the workspace run above.
