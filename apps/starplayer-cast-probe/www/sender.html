@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StarPlayer cast probe — sender</title>
+<style>
+    body { font: 14px/1.4 system-ui, sans-serif; margin: 1rem; max-width: 60rem; }
+    fieldset { margin-bottom: 1rem; }
+    label { display: inline-block; min-width: 8rem; }
+    input[type="text"], input[type="number"] { font: inherit; }
+    button { font: inherit; margin-right: 0.5rem; }
+    #transcript { background: #111; color: #dfd; padding: 0.75rem; height: 24rem; overflow: auto; white-space: pre-wrap; }
+    #connection-status { font-weight: bold; }
+</style>
+</head>
+<body>
+<!--
+    A4-N1's Chrome sender: the counterpart to receiver.html. Chrome only — the Cast Web
+    Sender SDK exists nowhere else. Drives the development receiver over the custom
+    namespace and prints every reply, so the owner can Copy the transcript straight into
+    `plans/apps/A4-master-plan.md`'s `## N1 findings` section.
+
+    Can also be opened as an ordinary tab with no speaker at all: without a cast session
+    the Probe/Bench/Send controls stay disabled, but the page loads and the Cast SDK
+    connects fine — useful for checking this file's own logic before spending an owner's
+    time on real hardware.
+-->
+<h1>StarPlayer cast probe — sender</h1>
+<p>This is the A4-N1 capability probe, not the real StarPlayer Cast receiver (N3). It sends
+no audio the receiver would actually play; it only asks the speaker what it can do.</p>
+
+<fieldset>
+    <legend>Receiver application</legend>
+    <label for="app-id">Application id</label>
+    <input type="text" id="app-id" placeholder="paste the Developer Console application id" size="24">
+    <google-cast-launcher id="cast-launcher"></google-cast-launcher>
+    <div id="connection-status">not connected</div>
+</fieldset>
+
+<fieldset>
+    <legend>Probe</legend>
+    <button id="probe-button" disabled>Probe</button>
+</fieldset>
+
+<fieldset>
+    <legend>Bench</legend>
+    <label for="quanta">Quanta</label>
+    <input type="number" id="quanta" value="512" min="1" step="1">
+    <button id="bench-button" disabled>Bench</button>
+</fieldset>
+
+<fieldset>
+    <legend>Send file</legend>
+    <label for="file-input">Module</label>
+    <input type="file" id="file-input">
+    <br>
+    <label for="chunk-size">Chunk size (bytes)</label>
+    <input type="number" id="chunk-size" value="65536" min="256" step="256">
+    <button id="send-file-button" disabled>Send file</button>
+    <button id="find-limit-button" disabled>Find message limit</button>
+    <p><small>"Find message limit" sends a series of larger and larger throwaway one-chunk
+    transfers (doubling from 4 KiB) and reports the last size the receiver acknowledged —
+    the practical answer to A4-N1's research point 2, run against whatever runtime this
+    sender is actually connected to.</small></p>
+</fieldset>
+
+<fieldset>
+    <legend>Transcript</legend>
+    <button id="copy-button">Copy</button>
+    <pre id="transcript"></pre>
+</fieldset>
+
+<script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
+<script src="sender.js"></script>
+</body>
+</html>
