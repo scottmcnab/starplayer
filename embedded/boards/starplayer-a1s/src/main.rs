@@ -2,7 +2,7 @@
 //!
 //! Two builds out of one crate:
 //!
-//! * the **audio** build (no features) plays `PETRI.S3M` from flash through the ES8388
+//! * the **audio** build (no features) plays `REFLEX.S3M` from flash through the ES8388
 //!   into the headphone jack and the speaker outputs, takes transport and volume
 //!   commands from six push-buttons (M8-I5), optionally shows the sounding row on an
 //!   ST7789 screen behind the `lcd` feature (M8-I5), and logs the transport once a
@@ -412,7 +412,7 @@ async fn play(
     println!("LCD  ST7789 {}", if display.is_present() { "found" } else { "not found — continuing headless" });
 
     // The module: borrowed straight out of memory-mapped flash, PCM and all.
-    let image = images::petri_s3m();
+    let image = images::boot_module();
     let module = Arc::new(Module::from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?);
     println!(
         "MODULE image={} bytes ({}) channels={} samples={}",

@@ -349,7 +349,7 @@ impl Bridge {
     /// Re-read every slot header into [`MODULES`].
     fn refresh_modules(&mut self) {
         let mut entries: heapless::Vec<SlotEntry, MODULE_LIST_CAPACITY> = heapless::Vec::new();
-        let _ = entries.push(SlotEntry { id: 0, name: FixedStr::new("PETRI"), bytes: crate::images::petri_s3m().len() as u32 });
+        let _ = entries.push(SlotEntry { id: 0, name: FixedStr::new(crate::images::BOOT_MODULE_NAME), bytes: crate::images::boot_module().len() as u32 });
         let last = self.store.slot_count().min(MODULE_LIST_CAPACITY as u8 - 1);
         for id in 1..=last {
             if let Ok(Some(header)) = self.store.slot_header(id) {
@@ -506,7 +506,7 @@ impl Bridge {
     /// `POST /api/modules/select`: the compiled-in image, or one read out of a slot.
     async fn select(&mut self, control: &mut ControlHalf, id: u8) -> JobOutcome {
         if id == 0 {
-            let module = match Module::from_image(crate::images::petri_s3m()) {
+            let module = match Module::from_image(crate::images::boot_module()) {
                 Ok(module) => module,
                 Err(_) => return JobOutcome::Failed("the compiled-in image would not borrow"),
             };

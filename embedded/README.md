@@ -128,7 +128,7 @@ cd embedded
 cargo xtask flash --board a1s --features bench
 cargo xtask monitor --board a1s
 
-# the audio firmware: plays PETRI.S3M out of the headphone jack
+# the audio firmware: plays REFLEX.S3M out of the headphone jack
 cargo xtask flash --board a1s
 cargo xtask monitor --board a1s
 
@@ -442,7 +442,7 @@ written for a person, not a code.
 ```sh
 curl http://starplayer.local/api/status
 curl -X POST http://starplayer.local/api/play
-curl -X POST --data-binary @REFLEX.S3M http://starplayer.local/api/modules
+curl -X POST --data-binary @PETRI.S3M http://starplayer.local/api/modules
 curl -X POST -H 'content-type: application/json' -d '{"id":1}' http://starplayer.local/api/modules/store
 ```
 

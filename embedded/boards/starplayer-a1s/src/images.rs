@@ -12,9 +12,9 @@
 //!
 //! # What each build links
 //!
-//! The audio firmware links `PETRI.S3M` alone — it is the exit criterion's module, and at
-//! 88 036 bytes it is also the largest, 73 % of it PCM. The `bench` build links all six
-//! golden fixtures, 117 040 bytes together. Nothing is ever copied out of flash to play
+//! The audio firmware links `REFLEX.S3M` alone — the module it plays at boot, 14 984 bytes
+//! of image. The `bench` build links all six golden fixtures, 117 040 bytes together
+//! (`PETRI.S3M`, at 88 036 bytes and 73 % PCM, is the largest of them). Nothing is ever copied out of flash to play
 //! it: the mixer reads the PCM in place through the instruction cache, which is the whole
 //! point of M8-I2 and the `flash` row of the budget document's CPU table.
 
@@ -35,23 +35,28 @@ macro_rules! flash_image {
 }
 
 flash_image!(
-    /// `PETRI.S3M` — eight channels, five samples, 64 156 bytes of PCM. The module the
-    /// milestone's exit criterion is stated in terms of.
-    PetriImage, PETRI_S3M, "../../../assets/petri-s3m.spmi"
+    /// `REFLEX.S3M` — four channels, ten patterns, 4 480 bytes of PCM. The module the
+    /// audio firmware plays at boot.
+    ReflexImage, REFLEX_S3M, "../../../assets/reflex-s3m.spmi"
 );
 
-/// `PETRI.S3M`'s image, 4-byte aligned and `'static`.
+/// The boot module's image — `REFLEX.S3M`, 4-byte aligned and `'static`.
 ///
 /// The `bench` build reaches it through [`GOLDEN_FIXTURES`] instead, so this accessor has
 /// no caller there.
 #[cfg_attr(feature = "bench", allow(dead_code))]
-pub fn petri_s3m() -> &'static [u8] { &PETRI_S3M.0 }
+pub fn boot_module() -> &'static [u8] { &REFLEX_S3M.0 }
+
+/// The boot module's name, as the web module list shows it.
+#[cfg(feature = "web")]
+pub const BOOT_MODULE_NAME: &str = "REFLEX";
 
 #[cfg(feature = "bench")]
 mod fixtures {
     flash_image!(
-        /// `REFLEX.S3M` — four channels, ten patterns.
-        ReflexImage, REFLEX_S3M, "../../../assets/reflex-s3m.spmi"
+        /// `PETRI.S3M` — eight channels, five samples, 64 156 bytes of PCM; the largest
+        /// fixture, and the one the budget document's PSRAM/DRAM rows are about.
+        PetriImage, PETRI_S3M, "../../../assets/petri-s3m.spmi"
     );
     flash_image!(
         /// The synthetic MOD fixture: 31 instruments, two patterns.
@@ -79,8 +84,8 @@ mod fixtures {
         ("synthetic-mtm", &SYNTHETIC_MTM.0),
         ("synthetic-xm", &SYNTHETIC_XM.0),
         ("synthetic-it", &SYNTHETIC_IT.0),
-        ("petri-s3m", &super::PETRI_S3M.0),
-        ("reflex-s3m", &REFLEX_S3M.0),
+        ("petri-s3m", &PETRI_S3M.0),
+        ("reflex-s3m", &super::REFLEX_S3M.0),
     ];
 }
 
