@@ -1846,7 +1846,15 @@ fn assert_manifest_defaults_exclude_std() -> bool {
             }
         };
         for entry in entries.flatten() {
-            manifests.push(entry.path().join("Cargo.toml"));
+            // Not every directory here is a crate: `apps/starplayer-cast-probe` (A4-N1) is
+            // hand-written HTML/JS with no manifest and is excluded from the workspace for
+            // exactly that reason. A directory without a manifest has no default feature
+            // set to scan, and the workspace globs already fail the build if a real crate
+            // ever loses its `Cargo.toml`, so skipping it here cannot hide a violation.
+            let manifest = entry.path().join("Cargo.toml");
+            if manifest.is_file() {
+                manifests.push(manifest);
+            }
         }
     }
     manifests.sort();
