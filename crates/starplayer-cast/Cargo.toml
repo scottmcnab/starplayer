@@ -1,0 +1,34 @@
+[package]
+name = "starplayer-cast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The engine's own `f32` → `i16` conversion (`starplayer::mixer::HostSample`), so the
+# driver thread quantises exactly the way `starplayer-host-cpal` does rather than carrying
+# a second, subtly different rounding rule.
+starplayer = { workspace = true, features = ["std"] }
+# `AudioBackend`/`Stream`/`StreamHealth`: `CastStreamBackend` is the third implementation
+# of the backend contract, after cpal and `ManualBackend`.
+starplayer-host = { workspace = true }
+# `WavHeader::write_to`, for the streaming WAV header the `--live` path needs.
+starplayer-offline = { workspace = true }
+
+rust_cast = { workspace = true }
+mdns-sd = { workspace = true }
+tiny_http = { workspace = true }
+flacenc = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+# `tests/fake_receiver.rs` terminates a TLS connection of its own, so it needs rustls's
+# server half — the same rustls the session's client half is built on.
+rustls = { workspace = true }
+rcgen = { workspace = true }
+# `decode` turns on flacenc's own bitstream parser (`component::parser`) and `Decode`, so
+# the encoder tests can read back what they wrote rather than asserting on byte patterns.
+# A dev-dependency feature: nothing the crate ships ever decodes FLAC.
+flacenc = { workspace = true, features = ["decode"] }

@@ -71,6 +71,38 @@
 //!     `render`'s same flags too (M10-K5b), rebuilding the module through
 //!     `Module::enhanced` before `Player::load_module`; they apply only to a tracker
 //!     module played directly, not to the instruments behind a Standard MIDI File.
+//!
+//! starplayer cast --list [--timeout SECS]
+//! starplayer cast --device NAME <file> [--entry N] [--format flac|wav] [--rate HZ]
+//!                 [--insert TARGET:EFFECT[:PARAM=VALUE,...]] [--enhance SPEC]
+//!                 [--repeat N] [--fade S] [--live] [--volume 0..1] [--timeout SECS]
+//!     Play a module on a Google Home or Nest speaker, or a speaker group (A4-N2). The
+//!     speaker runs Google's own Default Media Receiver, which plays a media URL and
+//!     nothing else, so this command renders the module here, serves the audio over HTTP
+//!     from whichever local interface reaches the speaker, and hands the receiver that
+//!     URL. No Google developer account and no registration are involved.
+//!
+//!     Two paths. By default the whole song is rendered first and served with HTTP Range
+//!     support, which is what gives the speaker a duration, a seek bar and a clean end.
+//!     --live streams it as it renders instead — no duration, no seeking, and the
+//!     encoder's own lead on top of the speaker's buffer — which is for an endless
+//!     session rather than for playing a song.
+//!
+//!     Transport commands are single letters on stdin, each followed by Enter: `p`
+//!     play/pause, `s` stop, `q` quit, `+`/`-` volume by 0.05, `<`/`>` seek ∓10 s, and a
+//!     bare Enter prints the status line straight away. Single keypresses would need raw
+//!     terminal mode and a terminal crate this workspace does not have; that choice
+//!     belongs to the TUI (A1), so this reads lines.
+//!
+//!     Expect roughly 2–5 s between a command and the speaker acting on it: the CASTv2
+//!     round trip is about a millisecond on a LAN and the rest is the receiver's own
+//!     playout buffer, which a sender cannot see or shorten. That is why there is no jam
+//!     mode over Cast.
+//!
+//!     --list finding nothing is a normal result, not necessarily a fault: mDNS is
+//!     multicast and multicast does not cross a NAT, so nothing will ever answer from
+//!     inside WSL2's default networking or most containers — and a speaker could not
+//!     reach a media server bound in there either.
 //! ```
 //!
 //! A ZIP archive is accepted anywhere a module file is. With more than one recognised
@@ -79,11 +111,13 @@
 //!
 //! Apps depend only on the facade, plus the `std` helper crates this binary needs:
 //! `starplayer-offline` for rendering and tracing, `starplayer-archive` for ZIP entries,
-//! and `starplayer-host` / `starplayer-host-cpal` for `play`.
+//! `starplayer-host` / `starplayer-host-cpal` for `play`, and `starplayer-cast` for
+//! `cast`.
 
 #![forbid(unsafe_code)]
 
 mod archive;
+mod cast;
 mod enhance_arg;
 mod info;
 mod insert_arg;
@@ -126,6 +160,9 @@ enum Command {
     Trace(trace::TraceArgs),
     /// Play a module through an audio output device.
     Play(play::PlayArgs),
+    /// Play a module on a Google Home or Nest speaker.
+    #[command(long_about = cast::CAST_LONG_ABOUT)]
+    Cast(cast::CastArgs),
 }
 
 fn main() -> ExitCode {
@@ -152,6 +189,7 @@ fn main() -> ExitCode {
         Command::Render(args) => render::run(args),
         Command::Trace(args) => trace::run(args),
         Command::Play(args) => play::run(args),
+        Command::Cast(args) => cast::run(args),
     };
 
     match result {

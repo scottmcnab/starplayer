@@ -251,7 +251,7 @@ pub fn run(args: RenderArgs) -> Result<(), String> {
 
 /// Parse every `--insert` flag into the shape `starplayer_offline::render_song_with_inserts`
 /// takes, naming the flag's own text in any error so it is obvious which repeat was wrong.
-fn parse_inserts(specs: &[String]) -> Result<Vec<InsertSpec>, String> {
+pub(crate) fn parse_inserts(specs: &[String]) -> Result<Vec<InsertSpec>, String> {
     insert_arg::parse_insert_args(specs).map(|parsed| {
         parsed.into_iter().map(|arg| InsertSpec { target: arg.target, slot: arg.slot, kind: arg.kind, params: arg.params }).collect()
     })
@@ -320,7 +320,7 @@ fn run_smf(args: &RenderArgs, file: &Path, output: &Path, smf_bytes: &[u8]) -> R
     Ok(())
 }
 
-fn golden_format(format: ModuleFormat) -> Option<GoldenFormat> {
+pub(crate) fn golden_format(format: ModuleFormat) -> Option<GoldenFormat> {
     match format {
         ModuleFormat::Mod => Some(GoldenFormat::Mod),
         ModuleFormat::S3m => Some(GoldenFormat::S3m),
@@ -330,7 +330,7 @@ fn golden_format(format: ModuleFormat) -> Option<GoldenFormat> {
     }
 }
 
-fn seconds_to_frames(seconds: f64, rate: u32) -> u64 { (seconds.max(0.0) * rate as f64).round() as u64 }
+pub(crate) fn seconds_to_frames(seconds: f64, rate: u32) -> u64 { (seconds.max(0.0) * rate as f64).round() as u64 }
 
 fn describe(mix_path: MixPathArg, interp: InterpArg, depth: DepthArg, channels: u16, enhancer: Option<&dyn SampleEnhancer>) -> String {
     let mix_path = match mix_path { MixPathArg::Float => "float", MixPathArg::Fixed => "fixed" };
@@ -363,6 +363,56 @@ fn pcm_sha256<S: WavSample>(samples: &[S]) -> String {
         let _ = write!(hexadecimal, "{byte:02x}");
     }
     hexadecimal
+}
+
+// ── `starplayer cast`'s pre-render (A4-N2) ──────────────────────────────────────────
+
+/// [`render_pcm_i16_stereo`]'s parameters, the in-memory counterpart to [`RenderTarget`].
+///
+/// No `depth` and no `channels`: a Cast receiver is fed interleaved 16-bit stereo and
+/// nothing else, so those two are pinned rather than dispatched.
+pub(crate) struct PcmTarget<'a> {
+    pub mix_path: MixPathArg,
+    pub interp: InterpArg,
+    pub format: GoldenFormat,
+    pub bytes: &'a [u8],
+    pub rate: u32,
+    pub host_block_frames: usize,
+    pub length: RenderLength,
+    pub inserts: &'a [InsertSpec],
+    pub enhancer: Option<&'a dyn SampleEnhancer>,
+}
+
+/// Render a module to interleaved 16-bit stereo **in memory**, for `starplayer cast` to
+/// encode and serve.
+///
+/// This is [`render_dispatch`]'s match with the sample type and the channel count pinned,
+/// so eight arms rather than sixty-four, and no file: the cast command hands the samples
+/// straight to a FLAC or WAV encoder. Doing it here rather than in `cast.rs` is what keeps
+/// the runtime-to-compile-time mixer dispatch in one place — the alternative was either a
+/// second copy of the `render_song_with_options` call or making `render_dispatch` write a
+/// temporary file the cast command would immediately read back.
+pub(crate) fn render_pcm_i16_stereo(target: PcmTarget<'_>) -> Result<Vec<i16>, String> {
+    let PcmTarget { mix_path, interp, format, bytes, rate, host_block_frames, length, inserts, enhancer } = target;
+    let options = RenderOptions { inserts, enhancer };
+    macro_rules! render_pcm {
+        ($path:ty, $out:ty, $interp:ty) => {
+            starplayer_offline::render_song_with_options::<$path, $interp, $out>(format, bytes, rate, host_block_frames, length, &options)
+                .map_err(|error| error.to_string())
+        };
+    }
+
+    match (mix_path, interp) {
+        (MixPathArg::Float, InterpArg::Nearest) => render_pcm!(FloatPath, FloatOut<i16, 2>, Nearest),
+        (MixPathArg::Float, InterpArg::Linear) => render_pcm!(FloatPath, FloatOut<i16, 2>, Linear),
+        (MixPathArg::Float, InterpArg::Cubic) => render_pcm!(FloatPath, FloatOut<i16, 2>, Cubic),
+        (MixPathArg::Float, InterpArg::Sinc) => render_pcm!(FloatPath, FloatOut<i16, 2>, Sinc),
+
+        (MixPathArg::Fixed, InterpArg::Nearest) => render_pcm!(FixedPath, FixedOut<i16, 2>, Nearest),
+        (MixPathArg::Fixed, InterpArg::Linear) => render_pcm!(FixedPath, FixedOut<i16, 2>, Linear),
+        (MixPathArg::Fixed, InterpArg::Cubic) => render_pcm!(FixedPath, FixedOut<i16, 2>, Cubic),
+        (MixPathArg::Fixed, InterpArg::Sinc) => render_pcm!(FixedPath, FixedOut<i16, 2>, Sinc),
+    }
 }
 
 /// [`render_dispatch`]'s parameters, bundled so the runtime-to-compile-time dispatch
