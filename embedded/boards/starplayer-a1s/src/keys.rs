@@ -92,6 +92,36 @@ impl Keys {
     /// where the silicon cannot honour it, the same reasoning `board.rs`'s
     /// `headphone_detect` already relies on).
     fn sample(&self) -> [bool; KEY_COUNT] { core::array::from_fn(|index| self.inputs[index].as_ref().is_some_and(Input::is_low)) }
+
+    /// Whether one key reads pressed right now.
+    ///
+    /// For the boot-time gestures that run before [`keys_task`] exists — M8-I6's
+    /// re-provision hold is the only one. A key that this build does not claim (KEY2
+    /// under `lcd`, whose GPIO is the display's MOSI) always reads released.
+    #[cfg(feature = "web")]
+    pub fn is_pressed(&self, key: firmware_common::Key) -> bool {
+        self.inputs[key as usize].as_ref().is_some_and(Input::is_low)
+    }
+}
+
+/// Wait up to `hold` for `key` to be held down continuously, starting now.
+///
+/// Returns `false` immediately when the key is not already down, so a boot that nobody is
+/// touching costs one GPIO read rather than five seconds. Used for M8-I6's re-provision
+/// gesture, which is checked once, before the keys task starts.
+#[cfg(feature = "web")]
+pub async fn held_at_boot(keys: &Keys, key: firmware_common::Key, hold: Duration) -> bool {
+    if !keys.is_pressed(key) {
+        return false;
+    }
+    let deadline = Instant::now() + hold;
+    while Instant::now() < deadline {
+        Timer::after(POLL_INTERVAL).await;
+        if !keys.is_pressed(key) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Poll the six keys every [`POLL_INTERVAL`] and publish [`KeyEvent`]s onto `sender`.

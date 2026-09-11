@@ -12,7 +12,11 @@ publish = false
 name = "starplayer-embedded-xtask"
 path = "src/main.rs"
 
-# No dependencies, deliberately. Argument parsing here is thirty lines of `match`; a `clap`
-# would put a dozen crates into a lock file whose only other entries are the firmware's, and
-# `cargo xtask` has to be the one command that always builds.
+# Argument parsing stays dependency-free — thirty lines of `match` beats a `clap` lock file
+# entry. `flate2` is the one exception: `assets` gzips `www/index.html` into
+# `assets/index.html.gz` for the firmware to link, and shelling out to a system `gzip`
+# would make that step non-reproducible across the machines this runs on. Default features
+# pull in `miniz_oxide`, a pure-Rust deflate implementation, rather than linking the
+# system's zlib — one less thing the build depends on finding on `PATH`.
 [dependencies]
+flate2 = "1"

@@ -101,6 +101,15 @@ jobs:
         working-directory: embedded
         run: cargo xtask build --board a1s --features bench
 
+      # The one build that carries every optional feature at once (M8-I5's display and
+      # M8-I6's radio, HTTP server and flash storage), and the one most worth having in
+      # CI: it is also the build whose link fails first when a static grows, because
+      # `ld/stack-floor.x` asserts that the main stack stays above 24 KiB and on this chip
+      # the stack is whatever `.bss` leaves behind.
+      - name: cargo xtask build --board a1s --features web,lcd
+        working-directory: embedded
+        run: cargo xtask build --board a1s --features web,lcd
+
       # `cargo xtask size` itself is the 90 %-warn / 100 %-fail gate against
       # `partitions.csv` (`embedded/xtask/src/main.rs`'s `command_size`) — its own exit
       # code fails this step, no extra shell arithmetic needed.
@@ -111,6 +120,10 @@ jobs:
       - name: cargo xtask size --board a1s --features bench
         working-directory: embedded
         run: cargo xtask size --board a1s --features bench
+
+      - name: cargo xtask size --board a1s --features web,lcd
+        working-directory: embedded
+        run: cargo xtask size --board a1s --features web,lcd
 
   c5:
     name: c5 (RISC-V)

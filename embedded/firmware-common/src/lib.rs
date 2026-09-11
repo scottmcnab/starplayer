@@ -36,12 +36,14 @@
 
 extern crate alloc;
 
+pub mod api;
 pub mod bench;
 pub mod format;
 pub mod keys;
 pub mod now_playing;
 pub mod screen;
 
+pub use api::{HostState, Status, Upload, decode_wire_command, pack_telemetry};
 pub use bench::{BenchRow, CycleCounter, Kernel, PcmLocation, digest_row};
 pub use keys::{HOLD_REPEAT_INTERVAL_MS, HOLD_THRESHOLD_MS, Key, KeyDebounce, KeyEvent, KeyEvents};
 pub use now_playing::{ChannelRow, FixedStr, MAX_DISPLAY_CHANNELS, NowPlaying};

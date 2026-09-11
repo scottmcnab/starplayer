@@ -34,8 +34,30 @@ bench = []
 # naming their `dep:` form here.
 lcd = ["dep:mipidsi", "dep:embedded-graphics", "dep:embedded-hal-bus"]
 
-# M8-I6: the captive portal, the HTTP/WebSocket API and module upload.
-web = []
+# M8-I6: the captive portal, the HTTP/WebSocket API and module upload. Off by default,
+# and every crate it needs is `optional = true` below, so the default, `lcd` and `bench`
+# builds link exactly what they linked before this feature existed — the radio, the TCP/IP
+# stack and the HTTP server are more flash and more DRAM than the audio build should ever
+# pay for when nobody asked for a network.
+web = [
+    "dep:esp-radio",
+    "dep:esp-storage",
+    "dep:embassy-net",
+    "dep:embassy-futures",
+    "dep:picoserve",
+    "dep:edge-mdns",
+    "dep:edge-nal",
+    "dep:edge-nal-embassy",
+    "dep:sequential-storage",
+    "dep:embassy-embedded-hal",
+    "dep:embedded-storage",
+    "dep:embedded-storage-async",
+    "dep:embedded-io-async",
+    "dep:serde",
+    "dep:serde-json-core",
+    "dep:heapless",
+    "esp-rtos/esp-radio",
+]
 
 # Every `esp-*` crate lives in a per-target table, never in a plain `[dependencies]`.
 # Putting them in the plain table would drag them into a host `cargo metadata` — they only
@@ -57,6 +79,20 @@ esp-alloc = "0.10.0"
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32"] }
 embedded-hal = "1"
 embedded-hal-async = "1"
+
+# M8-I6's `web` feature. Versions are `../ampkeeper/esp32/firmware`'s classic-ESP32 table
+# (its tree before `aeb9039`, "Collapse the chip feature axis"), which is the combination
+# that ran daily on this chip with this radio.
+#
+# `esp-radio` carries no `init` of its own in 0.18: `esp_rtos::start` must run first, then
+# `esp_radio::wifi::new` brings the controller up — which is why `esp-rtos` gains its
+# `esp-radio` feature from the `web` feature above rather than carrying it unconditionally.
+# `unstable` is what gates `WifiController::is_connected`, the scan configuration and
+# the controller queue depths in 0.18, the same way `esp-hal`'s gates I2S and PSRAM.
+esp-radio = { version = "0.18.0", features = ["esp32", "wifi", "log-04", "unstable"], optional = true }
+# Flash reads and writes for the `config` and `modules` partitions. See `store.rs` for the
+# cache hazard this brings with it.
+esp-storage = { version = "0.9.0", features = ["esp32"], optional = true }
 
 # Chip-independent crates. These build for any target, so they sit in the plain table.
 [dependencies]
@@ -80,6 +116,24 @@ bytemuck = { workspace = true }
 mipidsi = { workspace = true, optional = true }
 embedded-graphics = { workspace = true, optional = true }
 embedded-hal-bus = { workspace = true, optional = true }
+
+# M8-I6's `web` feature — chip-agnostic, so the plain table, same reasoning as the `lcd`
+# crates above. `embassy-net`'s `medium-ethernet` is what the WiFi interface presents (and
+# what `picoserve` requires); `multicast` is what mDNS needs to join 224.0.0.251.
+embassy-net = { version = "0.9.1", features = ["tcp", "udp", "dhcpv4", "dns", "proto-ipv4", "medium-ethernet", "multicast"], optional = true }
+embassy-futures = { version = "0.1.2", optional = true }
+picoserve = { version = "0.18.0", features = ["alloc", "embassy", "json", "ws"], optional = true }
+edge-mdns = { version = "0.8.0", default-features = false, features = ["io"], optional = true }
+edge-nal = { version = "0.7.0", optional = true }
+edge-nal-embassy = { version = "0.9.0", default-features = false, features = ["udp", "multicast", "proto-ipv4"], optional = true }
+sequential-storage = { version = "8.0.0", default-features = false, optional = true }
+embassy-embedded-hal = { version = "0.6.0", optional = true }
+embedded-storage = { version = "0.3.1", optional = true }
+embedded-storage-async = { version = "0.4.1", optional = true }
+embedded-io-async = { version = "0.7.0", optional = true }
+serde = { workspace = true, optional = true }
+serde-json-core = { workspace = true, optional = true }
+heapless = { workspace = true, optional = true }
 
 [package.metadata.espflash]
 partition_table = "partitions.csv"

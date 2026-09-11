@@ -21,6 +21,12 @@ starplayer-telemetry = { workspace = true }
 # crate's own host tests exercise it against `MockDisplay` below. Pure Rust with no target
 # constraint, so it sits in the plain table like every other chip-agnostic dependency here.
 embedded-graphics = { workspace = true }
+# M8-I6's `api` module: the status JSON encoder and the small request bodies the web API
+# decodes. See `embedded/Cargo.toml`'s `[workspace.dependencies]` entries for why
+# `serde-json-core` is pinned to `0.6` and `heapless` to `0.8`.
+serde = { workspace = true }
+serde-json-core = { workspace = true }
+heapless = { workspace = true }
 
 # The tests build a real module at test time from the committed S3M fixture rather than
 # reading `embedded/assets/` — those images are git-ignored build products, and a test

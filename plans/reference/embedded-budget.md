@@ -60,12 +60,18 @@ espflash writes.
 
 | Build | `.text` | `.rodata` | `.data` | `.rwtext` | App image | Of its partition |
 |---|---|---|---|---|---|---|
-| A1S, audio, `Linear` only | 278 593 | 147 980 | 9 288 | 15 820 | **475 312** | 18.1 % |
+| A1S, audio, `Linear` only | 278 593 | 147 980 | 9 288 | 15 820 | **475 280** | 18.1 % |
 | A1S, `bench`, all four kernels | 355 841 | 169 708 | 4 400 | 15 732 | **552 560** | 21.0 % |
-| A1S, `lcd` (M8-I5) | 302 437 | 150 860 | 9 724 | 15 924 | **499 152** | 19.0 % |
-| A1S, `web` (M8-I6) | TBD | TBD | TBD | TBD | TBD | |
+| A1S, `lcd` (M8-I5) | 302 437 | 150 860 | 9 724 | 15 924 | **499 136** | 19.0 % |
+| A1S, `web` (M8-I6) | 993 513 | 222 884 | 18 216 | 20 460 | **1 340 288** | 51.1 % |
+| A1S, `web,lcd` (M8-I6) | 1 017 681 | 225 660 | 18 648 | 20 564 | **1 367 776** | 52.1 % |
 | C5, default (no module linked) | 25 486 | 9 492 | 788 | 1 784 | **39 904** | 2.5 % of 1.5 MB |
 | C5, `bench`, all four kernels, all six fixtures | 300 150 | 163 336 | 1 356 | 1 784 | **468 976** | 29.8 % of 1.5 MB |
+
+The audio and `lcd` images moved by 32 and 16 bytes respectively when M8-I6 landed, which
+is the cost of one `#[cfg]` on a control-task branch and of the stack-floor linker
+fragment; the section figures beside them are M8-I5's and are unchanged. Nothing else in a
+build without `--features web` is different.
 
 The C5's `factory` partition (1.5 MB, `boards/starplayer-c5/partitions.csv`) is smaller
 than the A1S's (2.5 MB) because there is no OTA and no reason to match the other board's
@@ -193,19 +199,20 @@ is where the real number belongs once it exists.
 
 From `xtensa-esp32-elf-size -A` and `xtensa-esp32-elf-nm`.
 
-| Item | Audio build | `lcd` build | Bench build |
-|---|---|---|---|
-| `.bss` total | 148 600 B | 149 568 B | 123 000 B |
-| — of which the heap array | 122 880 B | 122 880 B | 122 880 B |
-| — everything else (`RenderHalf`, the DMA ring and descriptors, task storage, core 1's 8 KiB stack, the key/display channels — M8-I5) | 25 720 B | 26 688 B | 120 B |
-| `.data` | 9 288 B | 9 724 B | 4 400 B |
-| **Core 0's main stack** (`0x3ffe_0000 − _bss_end`) | **38 712 B** | **37 312 B** | **69 208 B** |
+| Item | Audio build | `lcd` build | Bench build | `web` build (M8-I6) | `web,lcd` build |
+|---|---|---|---|---|---|
+| `.bss` total | 148 600 B | 149 568 B | 123 000 B | 146 652 B | 147 652 B |
+| — of which the heap array | 122 880 B | 122 880 B | 122 880 B | **0** (in `dram2_seg`) | **0** |
+| — everything else (`RenderHalf`, the DMA ring and descriptors, task storage, core 1's 8 KiB stack, the key/display channels — M8-I5) | 25 720 B | 26 688 B | 120 B | 146 652 B | 147 652 B |
+| `.data` | 9 288 B | 9 724 B | 4 400 B | 18 216 B | 18 648 B |
+| `.dram2_uninit` (the `web` build's heap) | — | — | — | 98 304 B | 98 304 B |
+| **Core 0's main stack** (`0x3ffe_0000 − _bss_end`) | **38 712 B** | **37 312 B** | **69 208 B** | **31 188 B** | **29 756 B** |
 
 The stack is the real constraint, and it is not obvious: on the classic ESP32 core 0's main
 stack is simply whatever internal DRAM is left over, so **every heap byte, and now every
 byte of core 1's own 8 KiB stack, is a byte core 0's stack does not get**. A 160 KiB heap
 still links and leaves 6 472 bytes of stack, which will not survive a boot. 120 KiB is the
-balance this firmware ships; `embedded/README.md` §6 has the one-line check to run after
+balance this firmware ships; `embedded/README.md` §7 has the one-line check to run after
 any change that moves a large static. **M8-I5 moved the audio refill task to core 1**
 (`esp_rtos::start_second_core`); core 1's own stack is a fixed, separate 8 KiB
 (`CORE1_STACK_SIZE` in `main.rs`) that this table's "Main stack" row does not measure —
@@ -219,7 +226,35 @@ The I2S DMA ring is `DMA_RING_QUANTA × 128 × 4` bytes = **4 096 B** at the shi
 |---|---|
 | Peak stack of the audio refill task, on core 1's dedicated 8 KiB (`CORE1_STACK_SIZE`, M8-I5) | TBD (owner: run the audio build — esp-hal's stack-guard watchpoint fires on an overflow, and a clean run through a whole song is the evidence that 8 KiB is enough) |
 | Peak stack of core 0's control/keys/(`lcd`) display tasks, against the **38 712 B** (audio) / **37 312 B** (`lcd`) budget above | TBD (owner: run each build) |
-| Heap high-water with the web stack up | TBD (M8-I6) |
+| Heap high-water with the web stack up, against the `web` build's 98 304 B `dram2_seg` heap | TBD (owner: `HEAP.stats()` is printed at boot and after each module swap) |
+| Audio gap during a 90 KB `POST /api/modules/store` flash write (M8-I6 research point 2) | TBD (owner: time the silence; the firmware fades out first, so the figure to record is how long the music is *stopped*, not how long it glitches) |
+| Underruns during an upload with the radio busy | TBD (owner: the once-a-second transport line's `underruns=` field, before and after) |
+
+#### What the `web` build's DRAM actually goes on (M8-I6)
+
+Two figures that are easy to assume wrongly, both measured with
+`xtensa-esp32-elf-nm -S --size-sort` on the `web,lcd` image:
+
+* **The WiFi driver's *static* DRAM reservation is small: 11 658 B.** Summing every `.bss`
+  symbol that does not belong to the firmware crate — `g_cnxMgr` (3 880 B), `s_wifi_nvs`
+  (1 308 B), `gWpaSm`, `g_ic`, `gChmCxt`, `s_dp`, `g_pm` and the rest of the blobs' state —
+  comes to under 12 KiB. The driver's real appetite is the **heap**: its receive and
+  transmit buffers are allocated at initialisation and per frame, which is why the `web`
+  build's heap had to move somewhere it could be large.
+* **The web workers are the expensive part, and their cost is picoserve's futures rather
+  than their buffers.** The two-worker task pool is **68 560 B** of `.bss` — 34 KiB per
+  worker against 3 KiB of TCP and HTTP buffers inside it. The first draft of `web.rs`
+  measured **97 456 B** for the same two workers; the difference is one refactoring,
+  described in M8-I6's research resolution: `IntoResponse::write_to` is monomorphised per
+  response type, and calling it from fourteen match arms put fourteen instantiations in
+  every worker's state machine. Funnelling every JSON and text answer through one body
+  type, and decoding request bodies synchronously instead of through a per-type extractor,
+  took 28 888 B out of `.bss` — which is 28 888 B of stack, on a chip where the stack is
+  whatever `.bss` leaves behind.
+
+A **linker assertion now guards the stack**: `boards/starplayer-a1s/ld/stack-floor.x` fails
+the build if `_stack_start − _stack_end` drops under 24 KiB, so the next large static is a
+build error rather than a boot that overwrites the WiFi driver's state.
 
 ### Static RAM, the C5's `bench` (M8-I4)
 

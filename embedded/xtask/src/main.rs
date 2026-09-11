@@ -24,6 +24,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::SystemTime;
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 /// Everything that differs between one board and the next.
 ///
@@ -205,23 +209,99 @@ fn require_linker(board: &Board) -> Result<(), String> {
     ))
 }
 
-/// Make sure `embedded/assets/*.spmi` exists, by running the main workspace's
-/// `cargo xtask module-images` when it does not.
+/// Make sure `embedded/assets/*.spmi` and `embedded/assets/index.html.gz` exist and are
+/// current, by running the main workspace's `cargo xtask module-images` and gzipping
+/// `www/index.html` respectively when they are missing or stale.
 ///
-/// The images are git-ignored build products that the firmware links with
-/// `include_bytes!`, so a fresh clone has none and a build would fail on a missing file.
-/// Running the generator is cheap and idempotent. `--force` regenerates unconditionally,
-/// which is what to do after `IMAGE_VERSION` moves.
+/// Both are git-ignored build products that the firmware links with `include_bytes!`, so a
+/// fresh clone has none and a build would fail on a missing file. Running the generators is
+/// cheap and idempotent. `--force` regenerates both unconditionally, which is what to do
+/// after `IMAGE_VERSION` moves or after hand-editing `www/index.html` and wanting to be
+/// sure the `.gz` really did pick up the change.
 fn ensure_assets(force: bool) -> Result<(), String> {
     let assets = embedded_root().join("assets");
     let petri = assets.join("petri-s3m.spmi");
-    if petri.is_file() && !force {
+    if force || !petri.is_file() {
+        eprintln!("xtask: generating module images (cargo xtask module-images in the main workspace)");
+        let mut command = Command::new("cargo");
+        command.arg("xtask").arg("module-images").current_dir(repository_root());
+        run(command)?;
+    }
+    ensure_web_asset(force)
+}
+
+/// The gzipped page the firmware serves at `/` must fit comfortably in flash. This is the
+/// budget the M8-I6 task file sets for it; [`ensure_web_asset`] fails the build rather than
+/// silently linking something over it.
+const WEB_ASSET_GZIP_BUDGET: u64 = 12_288;
+
+/// Whether `assets/index.html.gz` needs to be (re)built from `www/index.html`.
+///
+/// A pure function, so the decision is unit-testable without touching the filesystem:
+/// given the source page's modification time, the existing `.gz`'s (`None` if it has never
+/// been built), and whether the caller asked for an unconditional rebuild, decide whether
+/// to regenerate. This is the same "does the output already reflect the input" question
+/// [`ensure_assets`] asks about `petri-s3m.spmi`, just expressed as a timestamp comparison
+/// instead of a single existence check — `www/index.html` is hand-edited and changes far
+/// more often than the module images do, so "exists" alone is not enough here.
+fn web_asset_is_stale(source_modified: SystemTime, gz_modified: Option<SystemTime>, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    match gz_modified {
+        None => true,
+        Some(gz_modified) => source_modified > gz_modified,
+    }
+}
+
+/// Gzip `www/index.html` into `assets/index.html.gz`, the page the firmware links with
+/// `include_bytes!` and serves at `/` — see `boards/*/src/images.rs` for the
+/// `include_bytes!` pattern this asset follows.
+///
+/// `Compression::best()` because this runs once per build, not once per request: shipping
+/// the page pre-compressed only pays off if the device never has to compress it itself, so
+/// there is no reason not to spend a little more of the build's time on the smallest
+/// output. `flate2`'s default features pull in `miniz_oxide`, a pure-Rust deflate
+/// implementation, rather than reaching for the system's zlib — one less thing this build
+/// depends on finding on the machine it runs on.
+fn ensure_web_asset(force: bool) -> Result<(), String> {
+    let source = embedded_root().join("www").join("index.html");
+    let destination = embedded_root().join("assets").join("index.html.gz");
+
+    let source_modified =
+        std::fs::metadata(&source).and_then(|metadata| metadata.modified()).map_err(|error| format!("cannot stat {}: {error}", source.display()))?;
+    let gz_modified = std::fs::metadata(&destination).and_then(|metadata| metadata.modified()).ok();
+    if !web_asset_is_stale(source_modified, gz_modified, force) {
         return Ok(());
     }
-    eprintln!("xtask: generating module images (cargo xtask module-images in the main workspace)");
-    let mut command = Command::new("cargo");
-    command.arg("xtask").arg("module-images").current_dir(repository_root());
-    run(command)
+
+    let page = std::fs::read(&source).map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    std::io::Write::write_all(&mut encoder, &page).map_err(|error| format!("cannot gzip {}: {error}", source.display()))?;
+    let gzipped = encoder.finish().map_err(|error| format!("cannot finish gzipping {}: {error}", source.display()))?;
+
+    if gzipped.len() as u64 > WEB_ASSET_GZIP_BUDGET {
+        return Err(format!(
+            "{} gzips to {} bytes, over the {WEB_ASSET_GZIP_BUDGET}-byte budget for the served page — shrink www/index.html",
+            source.display(),
+            gzipped.len()
+        ));
+    }
+
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    std::fs::write(&destination, &gzipped).map_err(|error| format!("cannot write {}: {error}", destination.display()))?;
+
+    let saved_percent = 100 - gzipped.len() * 100 / page.len().max(1);
+    eprintln!(
+        "xtask: gzipped {} ({} bytes) to {} ({} bytes, {saved_percent}% smaller)",
+        source.display(),
+        page.len(),
+        destination.display(),
+        gzipped.len()
+    );
+    Ok(())
 }
 
 /// `cargo xtask build` — compile the firmware.
@@ -407,7 +487,7 @@ fn usage() {
     eprintln!("  build                compile the firmware");
     eprintln!("  image [--merge]      save an espflash image (--merge = bootloader + table + app)");
     eprintln!("  size                 the app image against its partition's budget");
-    eprintln!("  assets [--force]     regenerate embedded/assets/*.spmi from the main workspace");
+    eprintln!("  assets [--force]     regenerate embedded/assets/*.spmi and index.html.gz");
     eprintln!("  flash                OWNER ONLY — write the merged image and monitor");
     eprintln!("  monitor              OWNER ONLY — attach to the serial console");
     eprintln!();
@@ -498,5 +578,30 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), BOARDS.len());
+    }
+
+    #[test]
+    fn the_web_asset_gz_is_stale_when_it_has_never_been_built() {
+        assert!(web_asset_is_stale(SystemTime::now(), None, false));
+    }
+
+    #[test]
+    fn the_web_asset_gz_is_stale_when_the_page_is_newer_than_it() {
+        let built = SystemTime::UNIX_EPOCH;
+        let edited = built + std::time::Duration::from_secs(1);
+        assert!(web_asset_is_stale(edited, Some(built), false));
+    }
+
+    #[test]
+    fn the_web_asset_gz_is_fresh_when_it_is_newer_than_the_page() {
+        let edited = SystemTime::UNIX_EPOCH;
+        let built = edited + std::time::Duration::from_secs(1);
+        assert!(!web_asset_is_stale(edited, Some(built), false));
+    }
+
+    #[test]
+    fn force_rebuilds_the_web_asset_gz_even_when_it_is_already_fresh() {
+        let now = SystemTime::now();
+        assert!(web_asset_is_stale(now, Some(now), true));
     }
 }

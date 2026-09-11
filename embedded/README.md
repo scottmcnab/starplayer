@@ -74,9 +74,11 @@ cd embedded
 cargo xtask build  --board a1s                     # the audio firmware, six keys, no display
 cargo xtask build  --board a1s --features lcd      # the audio firmware, five keys, the ST7789 screen
 cargo xtask build  --board a1s --features bench    # the bench firmware (no audio)
+cargo xtask build  --board a1s --features web      # the audio firmware plus WiFi, a page and uploads
+cargo xtask build  --board a1s --features web,lcd  # both
 cargo xtask image  --board a1s [--merge]           # an espflash image under target/
 cargo xtask size   --board a1s                     # the image against its partition
-cargo xtask assets [--force]                       # regenerate the module images
+cargo xtask assets [--force]                       # regenerate the module images and gzip the page
 cargo xtask build  --board a1s --dev               # release codegen, debug assertions on
 
 cargo xtask build  --board c5                      # boot-and-idle smoke build, no module
@@ -89,8 +91,11 @@ A1S — `--board c5` always has to be spelled out.
 
 `cargo xtask assets` runs the **main** workspace's `cargo xtask module-images`, which
 writes `embedded/assets/*.spmi` — the module images the firmware links with
-`include_bytes!`. They are git-ignored build products, and `build`, `image` and `size` all
-generate them automatically when they are missing, so a fresh clone builds.
+`include_bytes!` — and gzips `www/index.html` into `embedded/assets/index.html.gz`, which
+the `web` build links the same way. All of them are git-ignored build products, and
+`build`, `image` and `size` generate them automatically when they are missing or stale, so
+a fresh clone builds. The gzipped page has a hard 12 KiB budget and the asset step fails
+the build if it is exceeded (it is 6.6 KiB today).
 
 Host-testable logic lives in `firmware-common`, which builds for the host too:
 
@@ -361,18 +366,146 @@ embedded/
     src/lcd.rs             the ST7789 SPI driver, #[cfg(feature = "lcd")] only
     src/images.rs         the aligned include_bytes! wrappers
     src/bench.rs          the `bench` build's runner
+    src/psram.rs          the PSRAM arena, #[cfg(feature = "web")] only (M8-I6)
+    src/store.rs          the config and modules partitions, `web` only
+    src/net.rs            station mode, embassy-net and mDNS, `web` only
+    src/provisioning.rs   the captive portal personality, `web` only
+    src/web.rs            picoserve, the JSON/WebSocket API and module upload, `web` only
     src/main.rs           boot, core pinning, the control/keys/display tasks
+    ld/stack-floor.x      a linker ASSERT that fails the build if the main stack drops
+                          under 24 KiB (see §6)
+    build.rs              adds that fragment to the link
+  www/index.html          the page the `web` build serves, gzipped into assets/ by xtask
   boards/starplayer-c5/   the RISC-V bench firmware (M8-I4) — no audio hardware
     .cargo/config.toml    target, runner, -Tlinkall.x — no build-std (research point 2)
     partitions.csv
     src/images.rs         the aligned include_bytes! wrappers (bench-only)
     src/bench.rs          the `mcycle`-backed board glue over firmware-common's runner
     src/main.rs           boot — synchronous `#[esp_hal::main]`, no embassy/esp-rtos
-  assets/                 git-ignored *.spmi module images
+  assets/                 git-ignored build products: *.spmi module images, index.html.gz
   xtask/                  build / image / size / assets / flash / monitor
 ```
 
-## 6. Notes for the next person
+## 6. Web control (M8-I6, `--features web`)
+
+Off by default. A build without it links no radio, no TCP/IP stack and no HTTP server, and
+is byte-for-byte the firmware M8-I5 shipped.
+
+### Getting the player onto a network
+
+There are no build-time credentials (M8 master-plan decision 5). The first boot with no
+stored network — and any boot where the re-provision key is held — comes up as a **captive
+portal** instead:
+
+1. Flash `--features web` (or `web,lcd`) and power the board. It plays the compiled-in
+   module in both personalities, so the music is how you know it is alive.
+2. Join the open network **`StarPlayer-XXXX`** from a phone or laptop (the suffix is the
+   last two bytes of the board's SoftAP MAC, so two boards on one desk are
+   distinguishable). The phone's own captive-portal detection should open the page; if it
+   does not, browse to **http://192.168.4.1/**.
+3. Pick the network from the list the board scanned before it became an access point, type
+   the passphrase, and press **Save and restart**. The board writes the credentials to the
+   `config` partition and soft-resets two seconds later — the delay is what lets the
+   confirmation page reach the phone before the radio goes.
+4. It comes back in station mode and answers at **http://starplayer.local/** (mDNS). The
+   UART log prints the DHCP address too, for a network where mDNS does not work.
+
+**To provision it again**, either hold the re-provision key at boot for five seconds, or
+`curl -X POST http://starplayer.local/api/reprovision` — both end with the portal. The key
+is **KEY2** in the six-key build and **KEY1** in the `lcd` build, where KEY2's GPIO is the
+display's MOSI and there is no KEY2 at all. A boot that nobody is touching costs one GPIO
+read; the key must be held from power-on, and the music plays while you hold it.
+
+There is no password on the portal and none on the API. The threat model is a music player
+on a desk; anyone already on the network can change the song, which is the point.
+
+### The API
+
+Port 80. Everything is JSON in and JSON or plain text out; every refusal carries a sentence
+written for a person, not a code.
+
+| Method, path | Body | Answer |
+|---|---|---|
+| `GET /` | — | the page, gzipped, `Content-Encoding: gzip` |
+| `GET /api/status` | — | the transport, the module and up to 16 channel rows |
+| `GET /api/modules` | — | the compiled-in module plus every stored slot |
+| `POST /api/play`, `/api/stop`, `/api/next`, `/api/previous` | — | 204 |
+| `POST /api/seek` | `{"order":12}` | 204 |
+| `POST /api/volume` | `{"level":32768}` | 204 (0–65535) |
+| `POST /api/mute` | `{"channel":3,"muted":true}` | 204 |
+| `POST /api/modules` | raw module bytes, or a `.spmi` image | 201, or 409/413/507 with the reason |
+| `POST /api/modules/select` | `{"id":2}` | 204 — `0` is the compiled-in module, `1..5` a flash slot |
+| `POST /api/modules/store` | `{"id":3}` | 204 — **pauses playback**, see below |
+| `POST /api/reprovision` | — | 204, then a reset into the portal |
+| `GET /ws` | WebSocket | binary telemetry at 10 Hz; accepts 9-byte command frames |
+
+```sh
+curl http://starplayer.local/api/status
+curl -X POST http://starplayer.local/api/play
+curl -X POST --data-binary @REFLEX.S3M http://starplayer.local/api/modules
+curl -X POST -H 'content-type: application/json' -d '{"id":1}' http://starplayer.local/api/modules/store
+```
+
+The WebSocket's wire format is the **same flat word layout the browser player uses**
+(`crates/starplayer-host-wasm/src/lib.rs`): 22 header words then eight words per channel,
+little-endian `i32`. `firmware-common/src/api.rs` owns this end of it and its host tests
+are what keep the two in step.
+
+### Uploading a module, and what actually fits
+
+Two kinds of file are accepted at `POST /api/modules`:
+
+* **A module image** (`.spmi`, what `cargo xtask module-image` writes in the main
+  workspace). It is streamed into PSRAM and played **borrowed in place** — no decoding, no
+  heap, and the only limit is the 512 KiB PSRAM buffer. This is the way to put
+  `PETRI.S3M`-sized music on the device.
+* **A raw module file** (`.mod`, `.s3m`, `.mtm`, `.xm`, `.it`). The device decodes it with
+  the ordinary loader, which allocates the decoded PCM **in DRAM**, serialises the result
+  back out to PSRAM, and frees the DRAM. The peak is the decoded module plus its image at
+  once, against a 96 KiB heap that already holds the engine — so this path is for small
+  modules, and it refuses with a sentence saying so rather than running out of memory. The
+  `web` build's heap lives in `dram2_seg`; `HEAP.stats()` is printed at boot.
+
+The `Arc` that owns an uploaded module, and everything else with an atomic in it, stays in
+**DRAM**: on the classic ESP32 the atomic instructions do not work on PSRAM, so this
+firmware never registers PSRAM with the allocator at all (`src/psram.rs` has the full
+argument).
+
+### The flash-write pause — the one thing that is audible
+
+On the classic ESP32 an erase or a write **turns the instruction and data caches off** for
+its duration. Everything mapped through that cache becomes unreadable: code executing from
+flash, the compiled-in module image, and PSRAM, which shares the cache. esp-storage refuses
+a write outright while the second core is running, and this firmware runs the audio refill
+on core 1 — so a write parks it.
+
+`POST /api/modules/store` therefore **stops the transport first**, waits for the 64-frame
+ramp and the 23 ms DMA ring to drain to silence, writes, and plays again. Storing a 90 KB
+module is a few seconds of silence, and that is the designed behaviour, not a fault; the
+page warns about it beside the button. `POST /api/modules/select` for a flash slot does the
+same for a long read, which is safe but contends for the flash bus badly enough to cost
+underruns. Saving WiFi credentials pauses playback the same way, and is followed by a reset
+anyway.
+
+### The DRAM budget
+
+The `web` build is close to the chip's limit and the limit is **not** flash (52 % of the
+partition) — it is the 192 KiB of internal DRAM, out of which core 0's main stack is
+whatever `.bss` leaves behind. Two things keep it in bounds, and both are easy to undo by
+accident:
+
+* **The heap is in `dram2_seg`, not `.bss`** (`main.rs`'s `HEAP_BYTES`). With a `.bss` heap
+  the `web` build does not link at all.
+* **Routing is one flat `match`, and every JSON answer is one body type** (`web.rs`).
+  picoserve monomorphises `write_to` per response type, and a `.route()` chain costs a
+  stack frame per route. The first draft's two web workers were 97 KiB of `.bss`; they are
+  68 KiB now.
+
+`ld/stack-floor.x` fails the build if the main stack drops under 24 KiB. It is 29 756 B in
+the `web,lcd` build. If it fires, shrink a static or move it to `dram2_seg` — do not lower
+the floor.
+
+## 7. Notes for the next person
 
 * **`-C force-frame-pointers` is deliberately absent** from the board's rustflags. With it
   on, this firmware does not compile: the Xtensa LLVM register allocator fails with
