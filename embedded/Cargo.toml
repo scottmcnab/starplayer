@@ -3,10 +3,13 @@
 #
 # Three things make it separate rather than a directory of crates:
 #
-# * it is built with the Xtensa fork of rustc (`rust-toolchain.toml` here pins the named
-#   espup toolchain `esp-1.97`), while the main workspace is on stable 1.97;
-# * it needs `-Z build-std`, which is a nightly cargo feature the main workspace must not
-#   see;
+# * the A1S board is built with the Xtensa fork of rustc (`rust-toolchain.toml` here pins
+#   the named espup toolchain `esp-1.97`), while the main workspace is on stable 1.97;
+# * the A1S needs `-Z build-std`, which is a nightly cargo feature the main workspace must
+#   not see. The C5 board (M8-I4) does *not* — `riscv32imac-unknown-none-elf` is a plain
+#   LLVM target with a prebuilt `core`/`alloc` component, so `embedded/xtask` builds it
+#   under the plain stable toolchain (`+1.97`) instead of `+esp-1.97`; it is still a member
+#   of this workspace rather than the main one for the third reason below;
 # * its board crates carry `[target.<triple>.dependencies]` tables full of `esp-*` crates
 #   that only compile for their own target — a single `cargo metadata` at the repo root
 #   that had to resolve them would break `cargo xtask ci`.
@@ -18,6 +21,7 @@ resolver = "2"
 members = [
     "firmware-common",
     "boards/starplayer-a1s",
+    "boards/starplayer-c5",
     "xtask",
 ]
 

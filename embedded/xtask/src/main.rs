@@ -50,9 +50,23 @@ struct Board {
     /// The compile-time `ESP_LOG` filter. esp-println reads it at build time, so it is
     /// part of what makes a build reproducible.
     esp_log: &'static str,
-    /// The toolchain-provided linker that must be on `PATH`, so a missing
-    /// `. ~/export-esp-1.97.sh` is diagnosed by name rather than by a link error.
-    linker: &'static str,
+    /// The toolchain-provided linker that must be on `PATH`, checked before a build so a
+    /// missing `. ~/export-esp-1.97.sh` is diagnosed by name rather than by a link error.
+    /// `None` when the board needs no toolchain-provided linker at all — see
+    /// [`Board::toolchain`].
+    linker: Option<&'static str>,
+    /// The named rustup toolchain this board is built with (`cargo +<toolchain>`),
+    /// overriding whatever `embedded/rust-toolchain.toml` would otherwise resolve to.
+    ///
+    /// The A1S is Xtensa, an out-of-tree target that only exists inside the named
+    /// `esp-1.97` toolchain and needs `-Z build-std`. The C5 (M8-I4) is
+    /// `riscv32imac-unknown-none-elf`, a plain LLVM target with a prebuilt `core`/`alloc`
+    /// component — `esp-1.97` does not carry one (`ls
+    /// ~/.rustup/toolchains/esp-1.97/lib/rustlib` has only its own host triple), but plain
+    /// stable `rustup` does once the target is added (`rustup target add
+    /// riscv32imac-unknown-none-elf`), so the C5 is built under `+1.97` instead. See the
+    /// C5 task file's "Research resolution" §2 for the finding this field encodes.
+    toolchain: &'static str,
 }
 
 /// The AI-Thinker ESP32-Audio-Kit (M8-I3).
@@ -66,11 +80,32 @@ const A1S: Board = Board {
     app_partition: "factory",
     flash_size: "4mb",
     esp_log: "info",
-    linker: "xtensa-esp32-elf-gcc",
+    linker: Some("xtensa-esp32-elf-gcc"),
+    toolchain: "esp-1.97",
 };
 
-/// Every board this workspace knows how to build. M8-I4 appends the C5 here.
-const BOARDS: &[Board] = &[A1S];
+/// The ESP32-C5 devkit (M8-I4) — the RISC-V bench. No audio hardware; see
+/// `plans/engine/M8-task-I4-esp32-c5-riscv-bench.md`.
+const C5: Board = Board {
+    name: "c5",
+    chip: "esp32c5",
+    target: "riscv32imac-unknown-none-elf",
+    directory: "boards/starplayer-c5",
+    package: "starplayer-c5",
+    partition_table: "partitions.csv",
+    app_partition: "factory",
+    flash_size: "4mb",
+    esp_log: "info",
+    // `riscv32imac-unknown-none-elf` links with rustc's self-contained `rust-lld` — no
+    // external GCC cross-linker is needed on this board's `PATH` at all (confirmed by
+    // building this crate's dependency graph standalone under `+1.97` with nothing but the
+    // target component installed; see the task file's research resolution).
+    linker: None,
+    toolchain: "1.97",
+};
+
+/// Every board this workspace knows how to build.
+const BOARDS: &[Board] = &[A1S, C5];
 
 /// What the command line asked for.
 struct Selectors {
@@ -135,32 +170,38 @@ fn repository_root() -> PathBuf {
 /// A cargo invocation with its current directory set to the board crate — see the
 /// working-directory rule in the module docs.
 ///
-/// The toolchain is named explicitly (`+esp-1.97`) as well as pinned by
-/// `embedded/rust-toolchain.toml`. Belt and braces: the file is what CI and a bare `cargo`
-/// obey, and the argument is what makes an error message say which compiler was asked for.
+/// The toolchain is named explicitly (`+<board.toolchain>`) rather than left to whatever
+/// `embedded/rust-toolchain.toml` would resolve to, because the two boards need different
+/// toolchains (see [`Board::toolchain`]) and a `+toolchain` argument is the one thing that
+/// is guaranteed to override a toolchain file. It also makes an error message say which
+/// compiler was asked for, which the file alone would not.
 fn board_command(board: &Board) -> Command {
     let mut command = Command::new("cargo");
-    command.arg("+esp-1.97");
+    command.arg(format!("+{}", board.toolchain));
     command.current_dir(embedded_root().join(board.directory));
     command.env("ESP_LOG", board.esp_log);
     command
 }
 
-/// Refuse early, with the fix, if the Xtensa GCC linker is not on `PATH`.
+/// Refuse early, with the fix, if the board's toolchain-provided linker is not on `PATH`.
 ///
-/// Without `. ~/export-esp-1.97.sh` the build gets a long way and then fails with
+/// Without `. ~/export-esp-1.97.sh` the A1S build gets a long way and then fails with
 /// `linker 'xtensa-esp32-elf-gcc' not found`, which is a perfectly good message buried
-/// under a screen of cargo output. This one is the first thing printed.
+/// under a screen of cargo output. This one is the first thing printed. A board whose
+/// [`Board::linker`] is `None` (the C5 — `rust-lld` needs nothing extra on `PATH`) skips
+/// the check entirely.
 fn require_linker(board: &Board) -> Result<(), String> {
+    let Some(linker) = board.linker else {
+        return Ok(());
+    };
     let found = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|directory| directory.join(board.linker).is_file()))
+        .map(|path| std::env::split_paths(&path).any(|directory| directory.join(linker).is_file()))
         .unwrap_or(false);
     if found {
         return Ok(());
     }
     Err(format!(
-        "{} is not on PATH.\n  The Xtensa toolchain's environment has not been sourced. Run:\n\n      . ~/export-esp-1.97.sh\n\n  in this shell and try again (it sets PATH for the linker and LIBCLANG_PATH for bindgen).",
-        board.linker
+        "{linker} is not on PATH.\n  The Xtensa toolchain's environment has not been sourced. Run:\n\n      . ~/export-esp-1.97.sh\n\n  in this shell and try again (it sets PATH for the linker and LIBCLANG_PATH for bindgen)."
     ))
 }
 
@@ -342,7 +383,7 @@ fn parse_selectors(arguments: &mut Vec<String>) -> Result<Selectors, String> {
     let mut iterator = taken.into_iter();
     while let Some(argument) = iterator.next() {
         match argument.as_str() {
-            "--board" => board_name = Some(iterator.next().ok_or("--board needs a value (a1s)")?),
+            "--board" => board_name = Some(iterator.next().ok_or("--board needs a value (a1s or c5)")?),
             "--features" => features = iterator.next().ok_or("--features needs a value")?,
             "--dev" => dev = true,
             "--release" => dev = false,
@@ -361,7 +402,7 @@ fn parse_selectors(arguments: &mut Vec<String>) -> Result<Selectors, String> {
 }
 
 fn usage() {
-    eprintln!("cargo xtask <command> [--board a1s] [--features f,g] [--dev]");
+    eprintln!("cargo xtask <command> [--board a1s|c5] [--features f,g] [--dev]");
     eprintln!();
     eprintln!("  build                compile the firmware");
     eprintln!("  image [--merge]      save an espflash image (--merge = bootloader + table + app)");
@@ -370,7 +411,8 @@ fn usage() {
     eprintln!("  flash                OWNER ONLY — write the merged image and monitor");
     eprintln!("  monitor              OWNER ONLY — attach to the serial console");
     eprintln!();
-    eprintln!("Every build needs the Xtensa toolchain's environment:  . ~/export-esp-1.97.sh");
+    eprintln!("The a1s build needs the Xtensa toolchain's environment:  . ~/export-esp-1.97.sh");
+    eprintln!("The c5 build needs only plain rustup and its riscv32imac-unknown-none-elf target.");
 }
 
 fn main() -> ExitCode {
@@ -427,6 +469,19 @@ mod tests {
     fn the_a1s_app_partition_is_two_and_a_half_megabytes() {
         let selectors = Selectors { board: A1S, features: String::new(), dev: false };
         assert_eq!(partition_size(&selectors).expect("the a1s table parses"), 0x280000);
+    }
+
+    #[test]
+    fn the_c5_app_partition_is_one_and_a_half_megabytes() {
+        let selectors = Selectors { board: C5, features: String::new(), dev: false };
+        assert_eq!(partition_size(&selectors).expect("the c5 table parses"), 0x180000);
+    }
+
+    #[test]
+    fn the_c5_needs_no_toolchain_provided_linker() {
+        assert_eq!(C5.linker, None);
+        assert_eq!(C5.toolchain, "1.97");
+        assert_eq!(A1S.toolchain, "esp-1.97");
     }
 
     #[test]

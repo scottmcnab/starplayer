@@ -1,11 +1,15 @@
 # StarPlayer firmware
 
-The `embedded/` workspace: StarPlayer running on real hardware. Today that is one board,
-the AI-Thinker **ESP32-Audio-Kit** (ESP32-A1S module, classic ESP32, ES8388 codec);
-M8-I4 adds the ESP32-C5.
+The `embedded/` workspace: StarPlayer running on real hardware. Two boards:
 
-This is **its own cargo workspace**, deliberately (M8 master-plan decision 1). It is built
-with the Xtensa fork of rustc, it needs `-Z build-std`, and its board crates carry
+* the AI-Thinker **ESP32-Audio-Kit** (ESP32-A1S module, classic ESP32, ES8388 codec) —
+  the one that makes sound (M8-I3);
+* the **ESP32-C5 devkit** (RISC-V, no audio hardware) — proves the second architecture by
+  rendering the same golden fixtures and comparing their SHA-256 and cycle counts against
+  the A1S's (M8-I4).
+
+This is **its own cargo workspace**, deliberately (M8 master-plan decision 1). The A1S is
+built with the Xtensa fork of rustc and needs `-Z build-std`; both board crates carry
 per-target dependency tables full of `esp-*` crates that only compile for their own
 triple. None of that may be visible to the main workspace's `cargo xtask ci`.
 
@@ -13,25 +17,51 @@ triple. None of that may be visible to the main workspace's `cargo xtask ci`.
 
 ## 1. Toolchain
 
-The compiler is the named espup toolchain **`esp-1.97`** (rustc 1.97.0-nightly, Xtensa),
-pinned in `rust-toolchain.toml`. It carries both targets the milestone needs —
-`xtensa-esp32-none-elf` (A1S) and `riscv32imac-unknown-none-elf` (C5, M8-I4).
+**Two toolchains, one per board — `embedded/xtask` picks the right one for you.**
 
-It is already installed. If it ever has to be installed again:
+* The **A1S** is Xtensa, an out-of-tree LLVM target that only exists inside the named
+  espup toolchain **`esp-1.97`** (rustc 1.97.0-nightly), pinned in `rust-toolchain.toml`
+  and built with `-Z build-std` (no target has a prebuilt `core`/`alloc` for it — there is
+  nothing to add with `rustup target add`).
+* The **C5** (`riscv32imac-unknown-none-elf`, M8-I4) is a plain LLVM target with a prebuilt
+  `core`/`alloc` component, so it is built under the **main workspace's own pinned stable
+  toolchain** (`1.97`) instead — the same one that already builds
+  `riscv32imc-unknown-none-elf` for `cargo xtask ci --job no-std-check`. No `-Z build-std`,
+  no espup, no Xtensa fork anywhere in the C5's build. This is M8-I4 research point 2:
+  plain `rustup` was tried first and it just worked, so the "simpler" `esp-1.97` fallback
+  the task allowed was never needed. See `plans/reference/embedded-budget.md` §8 for the
+  finding in full.
+
+`embedded/xtask` names the toolchain explicitly per board (`cargo +esp-1.97 …` for the
+A1S, `cargo +1.97 …` for the C5) — you never choose it yourself.
+
+The A1S's `esp-1.97` toolchain is already installed. If it ever has to be installed again:
 
 ```sh
 espup install --name esp-1.97 --toolchain-version 1.97.0.0
 ```
 
-**Every shell that builds firmware must first source the toolchain's environment**, which
-puts the Xtensa GCC linker on `PATH` and sets `LIBCLANG_PATH`:
+The C5's plain `1.97` toolchain needs only its target added once, if it is not already:
+
+```sh
+rustup target add riscv32imac-unknown-none-elf --toolchain 1.97
+```
+
+(`rust-toolchain.toml` at the repository root lists it under `targets`, so a bare `rustup
+show` from the repository root installs it automatically on a fresh clone.)
+
+**Every shell that builds the A1S must first source the Xtensa toolchain's environment**,
+which puts the Xtensa GCC linker on `PATH` and sets `LIBCLANG_PATH`:
 
 ```sh
 . ~/export-esp-1.97.sh
 ```
 
-Forget it and `cargo xtask` stops before compiling anything and tells you to run exactly
-that. Flashing needs `espflash` (3.3.0) and `cargo-espflash`, both already installed.
+Forget it and `cargo xtask build --board a1s` stops before compiling anything and tells you
+to run exactly that. **The C5 needs none of this** — `riscv32imac-unknown-none-elf` links
+with rustc's self-contained `rust-lld`, so `cargo xtask build --board c5` never checks for
+an external linker at all. Flashing needs `espflash` (3.3.0) and `cargo-espflash`, both
+already installed.
 
 ## 2. Build
 
@@ -39,7 +69,7 @@ Everything goes through `cargo xtask`, from **this** directory:
 
 ```sh
 cd embedded
-. ~/export-esp-1.97.sh
+. ~/export-esp-1.97.sh    # needed for --board a1s; harmless (and unnecessary) for c5
 
 cargo xtask build  --board a1s                     # the audio firmware
 cargo xtask build  --board a1s --features bench    # the bench firmware (no audio)
@@ -47,7 +77,14 @@ cargo xtask image  --board a1s [--merge]           # an espflash image under tar
 cargo xtask size   --board a1s                     # the image against its partition
 cargo xtask assets [--force]                       # regenerate the module images
 cargo xtask build  --board a1s --dev               # release codegen, debug assertions on
+
+cargo xtask build  --board c5                      # boot-and-idle smoke build, no module
+cargo xtask build  --board c5 --features bench     # the RISC-V bench (M8-I4)
+cargo xtask size   --board c5 --features bench     # the bench image against its partition
 ```
+
+`--board a1s` is also the default, so a bare `cargo xtask build` (no `--board`) builds the
+A1S — `--board c5` always has to be spelled out.
 
 `cargo xtask assets` runs the **main** workspace's `cargo xtask module-images`, which
 writes `embedded/assets/*.spmi` — the module images the firmware links with
@@ -88,6 +125,10 @@ cargo xtask monitor --board a1s
 # the audio firmware: plays PETRI.S3M out of the headphone jack
 cargo xtask flash --board a1s
 cargo xtask monitor --board a1s
+
+# the C5 (M8-I4): one flash, no audio, no listening check — see the "C5" note below
+cargo xtask flash --board c5 --features bench
+cargo xtask monitor --board c5
 ```
 
 `flash` builds a merged image (bootloader + partition table + app) with `--skip-padding`,
@@ -97,6 +138,16 @@ when it is done.
 The Audio Kit's USB port is a CP2102; on Linux it appears as `/dev/ttyUSB0` and needs the
 user to be in the `dialout` group. If espflash cannot get the board into the bootloader,
 hold **BOOT** (KEY1 area, the button marked `IO0`) while tapping **EN/RST**.
+
+### The C5
+
+There is no "audio" build to flash — the chip has no codec and no DAC, so `--features
+bench` is the only build worth flashing at all. `espflash` autodetects the chip
+(`esp32c5`) over USB the same way it does for the A1S; hold the board's **BOOT** button
+while tapping **RESET** if it does not enter the bootloader on its own. The transcript's
+`BENCH … linear flash sha256=…` lines are the exit criterion (they must equal the same
+`goldens/` hashes the A1S's do), and the full log is what fills
+`plans/reference/embedded-budget.md`'s C5 rows — its §6 has the line-by-line mapping.
 
 ### What a good boot looks like
 
@@ -118,6 +169,30 @@ BENCH synthetic-mod nearest flash sha256=… frames=441000 … cycles_per_frame=
 Every `BENCH … linear flash` line's `sha256=` must equal the committed hash in
 `goldens/<format>/<stem>__i16_mono_44100_linear.sha256`. That equality **is** M8's exit
 criterion. `grep BENCH` over a captured log is the whole extraction tool.
+
+The **C5** bench prints the same line shape from the same shared code
+(`firmware_common::bench`), so the two boards' transcripts can be compared line for line:
+
+```text
+=== StarPlayer C5 bench (RISC-V, no audio hardware) ===
+BUILD profile=release kernels=nearest,linear,cubic,sinc
+CPU  240 MHz  (240000000 cycles/s)
+SIZE voice=176 bytes  render_half=8344 bytes
+HEAP [boot] …
+STAGING dram=ok psram=unavailable (this devkit has no PSRAM)
+IMAGE synthetic-mod bytes=6072 (5.9 KiB)
+BENCH synthetic-mod nearest flash sha256=… frames=441000 … cycles_per_frame=… core_load=…%
+…
+BENCH petri-s3m nearest dram skipped=no staging buffer large enough
+…
+idle
+```
+
+Its `sha256=` lines must equal the **same** `goldens/` hashes the A1S's do — that equality
+on *both* boards is M8's exit criterion, not just the A1S's half of it. `petri-s3m`'s
+`dram` rows are always `skipped=`, on this board as on the A1S: its 88 036-byte image does
+not fit the 32 KiB `DRAM_STAGING_BYTES` buffer, and there is no `psram` row at all — this
+devkit has none fitted.
 
 The **audio** build prints its boot sequence and then one transport line a second:
 
@@ -150,6 +225,10 @@ Other addresses may appear and are harmless; the scan probes `0x08`–`0x77` wit
 zero-length write, which changes no register on any device.
 
 ## 4. The board
+
+This section is the **A1S**'s pin map. The C5 touches no peripheral beyond the CPU clock,
+the heap and, in the `bench` build, the `mcycle` CSR — there is no pin map for it because
+there is nothing wired to describe.
 
 | Function | GPIO | Note |
 |---|---|---|
@@ -202,7 +281,7 @@ after it and invalidates whatever a device had stored.
 ```text
 embedded/
   Cargo.toml              the workspace and every [profile.*]
-  rust-toolchain.toml     channel = "esp-1.97"
+  rust-toolchain.toml     channel = "esp-1.97"  (the A1S's; the C5 is built under +1.97 instead)
   .cargo/config.toml      the `xtask` alias and nothing else
   firmware-common/        board-independent: the bench runner, the now-playing view model,
                           the formatting helpers — builds and tests on the host
@@ -215,6 +294,12 @@ embedded/
     src/images.rs         the aligned include_bytes! wrappers
     src/bench.rs          the `bench` build's runner
     src/main.rs           boot
+  boards/starplayer-c5/   the RISC-V bench firmware (M8-I4) — no audio hardware
+    .cargo/config.toml    target, runner, -Tlinkall.x — no build-std (research point 2)
+    partitions.csv
+    src/images.rs         the aligned include_bytes! wrappers (bench-only)
+    src/bench.rs          the `mcycle`-backed board glue over firmware-common's runner
+    src/main.rs           boot — synchronous `#[esp_hal::main]`, no embassy/esp-rtos
   assets/                 git-ignored *.spmi module images
   xtask/                  build / image / size / assets / flash / monitor
 ```
@@ -245,3 +330,13 @@ embedded/
   of `src/main.rs` and the M8-I3 task file's research resolution.
 * The measured sizes live in `plans/reference/embedded-budget.md`, which is where any new
   number belongs.
+* **The C5 needs no `-Z build-std` and no Xtensa toolchain at all** — it is built under
+  the main workspace's own pinned stable `1.97`, not `esp-1.97` (M8-I4 research point 2,
+  `plans/reference/embedded-budget.md` §8). This is a **per-board** choice
+  (`embedded/xtask`'s `Board::toolchain`), not a workspace-wide one: `esp-1.97` still pins
+  `embedded/rust-toolchain.toml` at the root for the A1S, and `cargo +1.97` on the C5's
+  invocation overrides that per build.
+* **The C5's `bench` heap is 176 KiB, not the A1S's 120 KiB**, because this board has no
+  PSRAM to take `DRAM_STAGING_BYTES` off the internal heap the way the A1S's `External`
+  region does. `boards/starplayer-c5/src/main.rs`'s `HEAP_BYTES` doc comment has the
+  arithmetic; `plans/reference/embedded-budget.md` §2 has the budget it is sized against.
