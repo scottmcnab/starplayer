@@ -1,0 +1,86 @@
+# The firmware workspace — deliberately **not** a member of the main one (M8 master-plan
+# decision 1).
+#
+# Three things make it separate rather than a directory of crates:
+#
+# * it is built with the Xtensa fork of rustc (`rust-toolchain.toml` here pins the named
+#   espup toolchain `esp-1.97`), while the main workspace is on stable 1.97;
+# * it needs `-Z build-std`, which is a nightly cargo feature the main workspace must not
+#   see;
+# * its board crates carry `[target.<triple>.dependencies]` tables full of `esp-*` crates
+#   that only compile for their own target — a single `cargo metadata` at the repo root
+#   that had to resolve them would break `cargo xtask ci`.
+#
+# The main workspace's `members` globs (`crates/*`, `apps/*`, `xtask`) do not reach in
+# here, and the root manifest's `exclude` says so out loud.
+[workspace]
+resolver = "2"
+members = [
+    "firmware-common",
+    "boards/starplayer-a1s",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/scottmcnab/starplayer"
+
+[workspace.dependencies]
+# The engine, by path into the main workspace. Those crates are members of *that*
+# workspace and inherit their own `[workspace.package]`/`[workspace.dependencies]` from
+# its root manifest; a path dependency across a workspace boundary is exactly how `fuzz/`
+# already reaches them.
+#
+# The facade takes its **default** feature set (the five format processors) plus
+# `telemetry`, which is what `starplayer-host-embedded` itself requires and what the six
+# golden fixtures need. `std` is absent and must stay absent.
+starplayer = { path = "../crates/starplayer", features = ["telemetry"] }
+starplayer-host-embedded = { path = "../crates/starplayer-host-embedded" }
+starplayer-model = { path = "../crates/starplayer-model" }
+starplayer-telemetry = { path = "../crates/starplayer-telemetry" }
+# Checked, `unsafe`-free slice casting. The audio path uses it to view a rendered
+# `&[i16]` as the `&[u8]` the DMA ring wants — the one conversion that would otherwise
+# have been a pointer cast. Pinned at the same version as the main workspace.
+bytemuck = { version = "1.25", default-features = false }
+
+firmware-common = { package = "starplayer-firmware-common", path = "firmware-common" }
+
+# ---------------------------------------------------------------------------
+# Profiles. Cargo honours `[profile.*]` only at a workspace root, so every profile for
+# every crate under `embedded/` is here.
+# ---------------------------------------------------------------------------
+
+# `opt-level = 3`, not ampkeeper's `"s"`. This firmware's whole reason to exist is a
+# cycles-per-frame measurement of a DSP inner loop (`plans/reference/embedded-budget.md`),
+# and a figure taken at `"s"` would measure the size/speed tradeoff rather than the mixer.
+# Flash is not the constraint here — the `factory` partition is 2.5 MB and the audio build
+# uses a small fraction of it — so the milestone spends flash and keeps the number honest.
+#
+# `codegen-units = 1` and thin LTO for the same reason: the voice kernels are generic and
+# only inline across crate boundaries with LTO on, which is how the std host is built and
+# measured too.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+# Symbols cost nothing in flash (they live in the ELF, not the image) and are what
+# `espflash monitor`'s backtrace decoding needs.
+debug = true
+# A panic on a device is a reset; `esp-backtrace` prints the frames first.
+panic = "abort"
+overflow-checks = false
+
+# The bench profile: release codegen with the debug assertions left on, so an engine
+# invariant that fires during bring-up says so instead of producing quiet nonsense. Not
+# the profile any published figure is taken at — `cargo xtask build --dev` says `--dev` in
+# the transcript so a number taken here can never be mistaken for a release one.
+[profile.dev]
+opt-level = 3
+codegen-units = 1
+debug = true
+panic = "abort"
+debug-assertions = true
+overflow-checks = true

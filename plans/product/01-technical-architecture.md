@@ -1704,7 +1704,35 @@ Recorded rather than guessed. Each has a milestone where it must be settled.
 | # | Question | Settle by |
 |---|---|---|
 | Q1 | Does `SharedArrayBuffer` + COOP/COEP work well enough for scope telemetry, or is `postMessage` the practical default? | **Settled in M0-A4 — see §9** |
-| Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | M8-I3 — measured on the ESP32-A1S against the I2S DMA ring depth |
+| Q2 | Is 128 frames the right `RENDER_QUANTUM` for embedded, or does the ESP32 path want a compile-time override? | **Settled in M8-I3 — 128 stays, and there is no override; see below and `plans/reference/embedded-budget.md` §5** |
 | Q3 | Which voice-stealing heuristic does libopenmpt actually use, exactly? | **Settled in M6-G3 — see §5.2** |
 | Q4 | Does the `Instrument` trait survive contact with a non-sample instrument (FM), or does it need a second tier? | M10 — **still open**; M4-E4 committed the trait with two *sample* implementations (§5.3), which is what design goal 8 asked for and is not yet the question Q4 asks |
 | Q5 | CLAP first with a VST3 wrapper, or nih-plug for both? | M9 |
+
+### Q2, settled on the ESP32-A1S (M8-I3)
+
+**128 frames stays, and the embedded path does not want a compile-time override.** The
+question assumed the quantum was the knob an embedded host would reach for. It is not: the
+knob is the **I2S DMA ring depth**, which the host owns outright and which the firmware
+expresses as one constant (`DMA_RING_QUANTA`, 8 quanta = 23.2 ms as shipped).
+
+Three findings from the bring-up, recorded in full in the budget document:
+
+1. **512 bytes is a natural DMA chunk on this chip.** 128 frames × 4 bytes is well inside
+   the classic ESP32's 4 095-byte descriptor limit, and it lets each DMA descriptor be
+   exactly one quantum — so the peripheral's available-space figure is a whole number of
+   quanta and the host's control cadence and the DMA boundary coincide. A smaller quantum
+   would multiply descriptors; a larger one would coarsen the frame a seek or a stop can
+   land on.
+2. **Latency is the ring's, not the quantum's.** One quantum is 2.9 ms against a ring
+   eight times that. Nothing a host wants to tune about responsiveness is reachable by
+   changing the quantum before it is reachable by changing the ring.
+3. **The RAM a smaller quantum would save is not where the RAM goes.** The quantum-sized
+   buffers are `channels × 128 × 8` bytes — 8 kB on an eight-channel module — against
+   27.8 kB of fixed telemetry and pool overhead and an 88 kB flash-resident module image.
+   Halving the quantum would save 4 kB and double the per-block control overhead.
+
+An override would therefore be a knob with no question behind it, and a second block size
+for every buffer-size-independence test to keep honest. The one result that would reopen
+this is a cycles-per-frame figure showing the per-quantum fixed cost dominating the
+per-sample cost; the measurement that would show it is the budget document's §3 table.

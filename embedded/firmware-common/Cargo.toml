@@ -1,0 +1,26 @@
+[package]
+name = "starplayer-firmware-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Board-independent firmware logic: the bench runner, the now-playing view model and the formatting helpers every StarPlayer board shares."
+
+# Nothing here names a chip, a HAL or an executor. That is the point: this crate builds
+# for the **host** as well as for either board, so `cargo test -p
+# starplayer-firmware-common` runs the bench runner and the view model under a real test
+# harness rather than only on a device nobody can attach to CI.
+[dependencies]
+starplayer = { workspace = true }
+starplayer-host-embedded = { workspace = true }
+starplayer-model = { workspace = true }
+starplayer-telemetry = { workspace = true }
+
+# The tests build a real module at test time from the committed S3M fixture rather than
+# reading `embedded/assets/` — those images are git-ignored build products, and a test
+# that only passes after `cargo xtask module-images` has run is a test that fails on a
+# fresh clone. `starplayer` above is all they need to do it.
+
+[features]
+default = []

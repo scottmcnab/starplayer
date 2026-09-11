@@ -11,6 +11,16 @@ members = [
     "apps/*",
     "xtask",
 ]
+# Two directories under this one hold their **own** workspaces and must never be resolved
+# by this one: `fuzz/` needs a nightly toolchain and a sanitizer, and `embedded/` (M8-I3)
+# needs the Xtensa fork of rustc, `-Z build-std` and per-target dependency tables full of
+# `esp-*` crates that only compile for their own triple. Neither is reached by the globs
+# above; `exclude` says so out loud, so that a future glob cannot quietly drag one in and
+# break `cargo xtask ci`.
+exclude = [
+    "fuzz",
+    "embedded",
+]
 
 [workspace.package]
 version = "0.1.0"

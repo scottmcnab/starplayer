@@ -1,0 +1,19 @@
+# StarPlayer A1S partition table — 4 MB flash, no OTA.
+#
+# No OTA slots: this is a bring-up firmware flashed over USB by its owner, and an ota_0 /
+# ota_1 pair would halve the app budget for a feature the milestone does not need
+# (M8 master plan, out of scope). `factory` is therefore the only app row and espflash
+# writes it at 0x10000.
+#
+# `modules` and `config` exist for M8-I6 and are unused here: a module uploaded over WiFi
+# is written to `modules` so it survives a reboot, and the WiFi credentials the captive
+# portal collects go in `config`. They are declared now because a partition table is a
+# flash-layout commitment — adding a row later moves every row after it and invalidates
+# whatever a device had stored.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x280000,
+modules,    data, spiffs,  0x290000, 0x160000,
+config,     data, nvs,     0x3f0000, 0x10000,
