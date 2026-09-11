@@ -35,6 +35,13 @@ telemetry = ["starplayer/telemetry"]
 simd = ["starplayer/simd"]
 
 [dev-dependencies]
+# `tests/module_image.rs` leaks a `Vec<u32>` and casts it to bytes to obtain a
+# 4-byte-aligned `&'static [u8]`, which is what `Module::from_image` requires and what a
+# firmware's `#[repr(C, align(4))]` wrapper around `include_bytes!` provides. A leaked
+# `Vec<u8>` promises alignment 1, so the cast — not the allocator — is what makes the test
+# deterministic.
+bytemuck = { workspace = true }
+
 # M10-K5a's load-time sample enhancers, for `tests/enhanced_trace_positions.rs`,
 # M10-K5c's `tests/enhance_quality.rs` and `examples/enhance_report.rs`. A
 # dev-dependency in both directions — `starplayer-enhance` dev-depends on this crate for

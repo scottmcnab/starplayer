@@ -1,6 +1,6 @@
-//! Shared support for the eight loader fuzz targets: the memory cap, the structured
-//! mutation program, and the post-load walk that proves a produced [`Module`] is
-//! self-consistent.
+//! Shared support for the loader fuzz targets — and, since M8-I2, the module-image
+//! reader's: the memory cap, the structured mutation program, and the post-load walk that
+//! proves a produced [`Module`] is self-consistent, whichever of them produced it.
 //!
 //! # The memory cap (M2-C7 deliverable 2)
 //!

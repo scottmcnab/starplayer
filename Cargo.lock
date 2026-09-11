@@ -1419,6 +1419,7 @@ dependencies = [
 name = "starplayer-model"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "starplayer-core",
  "starplayer-mixer",
 ]
@@ -1440,6 +1441,7 @@ dependencies = [
 name = "starplayer-offline"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "sha2",
  "starplayer",
  "starplayer-enhance",

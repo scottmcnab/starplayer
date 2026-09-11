@@ -1,4 +1,4 @@
-//! [`Module`] itself: two owned blobs, four index tables and a header, and nothing else.
+//! [`Module`] itself: two blobs, four index tables and a header, and nothing else.
 
 use alloc::boxed::Box;
 use starplayer_core::{Error, InstrumentId, PRE_ROLL_FRAMES, SampleId};
@@ -7,6 +7,7 @@ use crate::header::ModuleHeader;
 use crate::instrument::InstrumentDef;
 use crate::pattern::{PatternId, PatternIndex};
 use crate::sample::{LoopMode, SampleIndex};
+use crate::storage::{BlobStorage, PcmStorage};
 
 /// Order-list value meaning "skip this position" — Scream Tracker 3's `+++` marker.
 pub const ORDER_MARKER: u16 = 254;
@@ -29,7 +30,7 @@ pub enum OrderEntry {
 ///
 /// # Offsets, not references
 ///
-/// Two owned blobs — [`blob`](Module::blob) for the patterns' **native** bytes and
+/// Two blobs — [`blob`](Module::blob) for the patterns' **native** bytes and
 /// [`pcm`](Module::pcm) for every sample's decoded frames — plus index tables of `u32`
 /// offsets into them. Architecture §6 pins this shape, and it buys four things at once:
 ///
@@ -37,8 +38,18 @@ pub enum OrderEntry {
 /// * hashable, so a golden test can fingerprint a loaded module (M2);
 /// * fuzzable — a loader either produces a valid index set or an `Err`, and
 ///   [`ModuleBuilder`](crate::ModuleBuilder) is the one place that decides which;
-/// * mmap- and flash-friendly, since an embedded target can eventually borrow the sample
-///   data rather than own it, and no pointer inside the module has to be rewritten.
+/// * mmap- and flash-friendly, since an embedded target borrows the sample data rather
+///   than owning it, and no pointer inside the module has to be rewritten.
+///
+/// # Owned or borrowed
+///
+/// The two blobs are [`BlobStorage`] and [`PcmStorage`], each of which is either a heap
+/// allocation or a `'static` borrow of a memory-mapped **module image**
+/// ([`Module::from_image`], M8-I2). Every loader and [`ModuleBuilder`](crate::ModuleBuilder)
+/// produce the owned form; a firmware plays the borrowed one straight out of flash, so a
+/// module costs four small index allocations rather than a copy of every sample.
+/// Equality, hashing and the accessors below cannot tell the two apart — only
+/// [`PcmStorage::is_borrowed`] can.
 ///
 /// # Nothing here panics
 ///
@@ -48,8 +59,8 @@ pub enum OrderEntry {
 /// and none in its API.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Module {
-    blob: Box<[u8]>,
-    pcm: Box<[i16]>,
+    blob: BlobStorage,
+    pcm: PcmStorage,
     samples: Box<[SampleIndex]>,
     patterns: Box<[PatternIndex]>,
     orders: Box<[u16]>,
@@ -67,8 +78,8 @@ impl Module {
     /// [`ModuleBuilder::build`](crate::ModuleBuilder::build) calls it, and it validates
     /// immediately afterwards.
     pub(crate) fn from_parts(
-        blob: Box<[u8]>,
-        pcm: Box<[i16]>,
+        blob: BlobStorage,
+        pcm: PcmStorage,
         samples: Box<[SampleIndex]>,
         patterns: Box<[PatternIndex]>,
         orders: Box<[u16]>,
@@ -83,14 +94,21 @@ impl Module {
 
     /// Every pattern's native bytes, concatenated. Only a format crate may interpret
     /// these; see [`PatternIndex`].
-    pub const fn blob(&self) -> &[u8] { &self.blob }
+    pub const fn blob(&self) -> &[u8] { self.blob.as_slice() }
 
     /// Every sample's frames, concatenated, each preceded by its
     /// [`PRE_ROLL_FRAMES`](starplayer_core::PRE_ROLL_FRAMES) and followed by its
     /// [`GUARD_FRAMES`](starplayer_core::GUARD_FRAMES).
     ///
     /// This is the slice the mixer resolves a `SampleRegion` against.
-    pub const fn pcm(&self) -> &[i16] { &self.pcm }
+    pub const fn pcm(&self) -> &[i16] { self.pcm.as_slice() }
+
+    /// How this module's sample frames are held — owned on the heap, or borrowed from a
+    /// module image in flash. The only thing that can tell the two apart.
+    pub const fn pcm_storage(&self) -> &PcmStorage { &self.pcm }
+
+    /// How this module's pattern blob is held. See [`Module::pcm_storage`].
+    pub const fn blob_storage(&self) -> &BlobStorage { &self.blob }
 
     /// The sample table.
     pub const fn samples(&self) -> &[SampleIndex] { &self.samples }

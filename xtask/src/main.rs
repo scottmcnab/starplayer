@@ -147,9 +147,15 @@ const FUZZ_TARGETS: &[(&str, Option<&str>)] = &[
     ("mtm_structured", None),
     ("xm_structured", None),
     ("it_structured", None),
+    ("image", Some(MODULE_IMAGE_FORMAT)),
 ];
 
-/// Seconds each target runs in the per-commit smoke job. Eight targets, so the job is a
+/// [`classify_module`]'s name for a module image, and therefore the `image` target's seed
+/// "format". The images themselves are a build product in [`MODULE_IMAGE_DIRECTORY`]
+/// rather than committed bytes; see [`seed_fuzz_corpora`].
+const MODULE_IMAGE_FORMAT: &str = "spmi";
+
+/// Seconds each target runs in the per-commit smoke job. Eleven targets, so the job is a
 /// few minutes including the build — "minutes, not hours", as the task asks.
 const FUZZ_SMOKE_SECONDS: u32 = 30;
 
@@ -249,6 +255,8 @@ fn main() -> ExitCode {
         Some("conformance") => run_conformance(&arguments[1..]),
         Some("fuzz") => run_fuzz(&arguments[1..]),
         Some("goldens") => run_goldens(&arguments[1..]),
+        Some("module-image") => run_module_image(&arguments[1..]),
+        Some("module-images") => run_module_images(&arguments[1..]),
         Some("openmpt") => run_openmpt(&arguments[1..]),
         Some("perceptual") => run_perceptual(&arguments[1..]),
         Some("trace") => run_trace(&arguments[1..]),
@@ -278,6 +286,9 @@ fn print_usage() {
     println!("                     needs a nightly toolchain and `cargo install cargo-fuzz`; see fuzz/README.md");
     println!("  goldens [--check] [--simd]   regenerate canonical SHA-256 renders, or verify them;");
     println!("                     --simd verifies them with the vector kernels compiled in (M7-H6)");
+    println!("  module-image <module> <out.spmi>   write one flash-resident module image (M8-I2)");
+    println!("  module-images      write the six golden fixtures' images into embedded/assets/ (a git-ignored");
+    println!("                     build product; M8-I3's firmware links them with include_bytes!)");
     println!("  openmpt [--offline|--fetch-only]   build the pinned libopenmpt's openmpt123 into target/openmpt");
     println!("  perceptual [--corpus PATH]... [--threshold-snr DB] [--offline]");
     println!("                     score the float render against libopenmpt's; nightly report, never a gate");
@@ -362,6 +373,57 @@ fn run_goldens(arguments: &[String]) -> bool {
         }
         Err(error) => {
             eprintln!("xtask goldens: offline driver failed to start: {error}");
+            false
+        }
+    }
+}
+
+/// Where `cargo xtask module-images` writes the golden fixtures' module images.
+///
+/// A **build product**, git-ignored: M8-I3's firmware links the files here with
+/// `include_bytes!`, and regenerating them is one command, so committing binaries that
+/// would go stale the moment the image layout version moves buys nothing.
+const MODULE_IMAGE_DIRECTORY: &str = "embedded/assets";
+
+/// Write one module image. See `crates/starplayer-model/src/image.rs` for the format.
+///
+/// Like every other driver here this shells out to a helper binary in the workspace:
+/// xtask is dependency-free by design and cannot link a module loader.
+fn run_module_image(arguments: &[String]) -> bool {
+    if arguments.len() != 2 {
+        eprintln!("xtask module-image: usage: cargo xtask module-image <module> <out.spmi>");
+        return false;
+    }
+    run_module_image_driver(arguments)
+}
+
+/// Write the six golden fixtures' module images into [`MODULE_IMAGE_DIRECTORY`].
+fn run_module_images(arguments: &[String]) -> bool {
+    if !arguments.is_empty() {
+        eprintln!("xtask module-images: usage: cargo xtask module-images");
+        return false;
+    }
+    run_module_image_driver(&["--fixtures".to_string(), MODULE_IMAGE_DIRECTORY.to_string()])
+}
+
+fn run_module_image_driver(driver_arguments: &[String]) -> bool {
+    let mut command = Command::new(cargo_binary());
+    command
+        .current_dir(workspace_root())
+        // The **golden driver's** target directory, not one of its own: this is the same
+        // package with the same features, so sharing means no second build and no second
+        // several-hundred-megabyte tree. A dedicated directory is needed only because the
+        // parent `cargo xtask` process holds the workspace target-directory lock.
+        .args(["run", "--quiet", "--target-dir", "target/xtask-goldens", "-p", "starplayer-offline", "--bin", "starplayer-module-image", "--"])
+        .args(driver_arguments);
+    match command.status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("xtask module-image: image driver exited with {status}");
+            false
+        }
+        Err(error) => {
+            eprintln!("xtask module-image: image driver failed to start: {error}");
             false
         }
     }
@@ -950,6 +1012,15 @@ fn seed_fuzz_corpora() -> bool {
         println!("            run `cargo xtask conformance --fetch-only` to widen the corpus");
     }
 
+    // The `image` target's seeds are the six golden fixtures' module images, which are a
+    // build product rather than committed bytes — an image goes stale the moment
+    // `IMAGE_VERSION` moves, so it is regenerated here instead of checked in. Best effort:
+    // a workspace that will not build is a failure the other jobs report far better than
+    // this one would.
+    if !run_module_images(&[]) {
+        println!("xtask fuzz: could not write the module images; the image corpus keeps whatever it already had");
+    }
+
     for (target, format) in FUZZ_TARGETS {
         let Some(format) = format else { continue };
         let destination = fuzz.join("corpus").join(target);
@@ -962,6 +1033,7 @@ fn seed_fuzz_corpora() -> bool {
         copied += copy_seeds_into_corpus(&fuzz.join("seeds").join(format), "seed", format, &destination);
         copied += copy_seeds_into_corpus(&fuzz.join("regressions").join(format), "regression", format, &destination);
         copied += copy_seeds_into_corpus(&root.join(FIXTURE_SOURCE_DIRECTORY), "owner", format, &destination);
+        copied += copy_seeds_into_corpus(&root.join(MODULE_IMAGE_DIRECTORY), "image", format, &destination);
         copied += copy_seeds_into_corpus(&pinned_corpus, "libxmp", format, &destination);
         println!("xtask fuzz: {target} corpus seeded with {copied} module(s)");
     }
@@ -997,6 +1069,10 @@ fn copy_seeds_into_corpus(source: &Path, origin: &str, format: &str, destination
 /// restated here. They are short byte comparisons; the risk of drift is real but small,
 /// and a seed that stops being recognised only means a slightly narrower corpus.
 fn classify_module(bytes: &[u8]) -> Option<&'static str> {
+    // Not a tracker format: `starplayer-model`'s flash-resident module image (M8-I2).
+    if bytes.get(..4) == Some(b"SPMI") {
+        return Some(MODULE_IMAGE_FORMAT);
+    }
     if bytes.get(..17) == Some(b"Extended Module: ") && bytes.get(37) == Some(&0x1A) {
         return Some("xm");
     }

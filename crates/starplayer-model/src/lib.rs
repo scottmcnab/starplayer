@@ -3,8 +3,9 @@
 //! display-only [`PatternCell`].
 //!
 //! Offsets rather than references are what let sample data be *borrowed* from
-//! memory-mapped flash on an embedded target, and what make `Arc<Module>` trivially
-//! `Send + Sync` and the whole module hashable for golden tests (architecture §6).
+//! memory-mapped flash on an embedded target — see [`image`] for the format that is
+//! borrowed from — and what make `Arc<Module>` trivially `Send + Sync` and the whole
+//! module hashable for golden tests (architecture §6).
 //!
 //! Allowed dependency edges: `starplayer-core`.
 //!
@@ -15,6 +16,7 @@
 //! | Samples, their loops and their guard-frame layout | Any format parsing (that is each format's own crate) |
 //! | Instruments, envelopes, NNA settings as **data** | Envelope or NNA *behaviour* |
 //! | Patterns' **native** bytes, unparsed, plus their extents | A shared executable pattern-cell type |
+//! | The flash-resident [module image](crate::image) a built `Module` serialises to | Any file format a *tracker* writes (that is each format's own crate) |
 //! | A display-only [`PatternCell`] and the English [`EffectNames`] | Sample decompression (IT, M6) |
 //!
 //! The second row of that table is design goal 7. Each format keeps its native pattern
@@ -56,12 +58,14 @@
 //! guess; nothing in the public API here changes if it does, because a loader already
 //! hands the builder decoded frames.
 //!
-//! **The blob and the PCM are two allocations, not one** (research point 2). One
-//! allocation would let a future mmap path map a single region, but it forces `pcm` to be
-//! byte-aligned rather than `i16`-aligned and makes every sample access go through a
-//! cast. Two allocations keep `pcm: Box<[i16]>` exactly as the mixer wants it, and the
-//! mmap case is better served later by making each blob independently *borrowable* —
-//! which the offsets-not-references layout already allows — than by fusing them now.
+//! **The blob and the PCM are two blobs, not one** (research point 2). One region would
+//! let a future mmap path map a single allocation, but it forces `pcm` to be byte-aligned
+//! rather than `i16`-aligned and makes every sample access go through a cast. Two keep
+//! `pcm` exactly as the mixer wants it, and the mmap case is better served by making each
+//! blob independently *borrowable* — which the offsets-not-references layout already
+//! allows — than by fusing them. M8-I2 cashed that in: [`PcmStorage`] and [`BlobStorage`]
+//! are each either owned or a `'static` borrow out of a memory-mapped [module
+//! image](crate::image), and nothing downstream can tell the two apart.
 //!
 //! **`Error` lives in `starplayer-core`** rather than here. Architecture §11 lists it
 //! under `core`, and it has three users with no crate in common: the format crates, this
@@ -91,16 +95,19 @@ extern crate alloc;
 pub mod builder;
 pub mod enhance;
 pub mod header;
+pub mod image;
 pub mod instrument;
 pub mod module;
 pub mod pattern;
 pub mod reader;
 pub mod sample;
+pub mod storage;
 pub mod text;
 
 pub use builder::{ModuleBuilder, ping_pong_reflect};
 pub use enhance::{EnhancedPcm, SampleEnhancer, SamplePcm};
 pub use header::{ModuleFlags, ModuleFormat, ModuleHeader};
+pub use image::{IMAGE_MAGIC, IMAGE_VERSION};
 pub use instrument::{
     DuplicateAction, DuplicateCheck, Envelope, EnvelopePoint, EnvelopeSpan, InstrumentDef,
     NOTE_MAP_LENGTH, NewNoteAction,
@@ -115,6 +122,7 @@ pub use sample::{
     AutoVibrato, AutoVibratoWaveform, DEFAULT_REFERENCE_RATE_HZ, LoopMode, MAX_RATE_SCALE_LOG2,
     SampleIndex, SampleSpec, SustainLoop,
 };
+pub use storage::{BlobStorage, PcmStorage};
 pub use text::{cp437_char, decode_cp437};
 
 // Re-exported so a format crate can name every type it needs from this one crate.
