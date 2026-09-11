@@ -28,7 +28,7 @@ before there is anything to test is how a project spends a month and produces si
 | M5 | XM support | Envelopes, key-off/fadeout, linear frequency, multi-sample instruments | 1.5u |
 | M6 | IT support | NNA/DCT/DCA, voice stealing policy, resonant filter, compressed samples | 2u |
 | M7 | DSP graph | Per-channel inserts, master bus, reverb/chorus/compressor, SIMD, higher-order interpolation | 1.5u |
-| M8 | Embedded proof | esp32 RISC-V playing a module from flash via I2S under embassy | 1u |
+| M8 | Embedded proof | ESP32-A1S (Xtensa) playing a module from flash through its ES8388 under Embassy, with keys, an optional ST7789 screen and web control; ESP32-C5 proves the RISC-V build | 2.5u |
 | M9 | Plugin surfaces | CLAP instrument, then effect hosting; VST3 if warranted | 2u |
 | M10 | Alternative synths | FM, wavetable, SID, SoundFont; sample-enhancement plugin API | pull-driven |
 | M11 | Instrument library | Tracker-module instruments as a MIDI-playable bank; content-hash dedup | pull-driven |
@@ -139,12 +139,16 @@ accuracy are worth two weeks on their own.
 Per-channel insert chains, master bus, reverb, chorus, delay, compressor, EQ; SIMD
 kernels with a scalar-equivalence gate; cubic and windowed-sinc interpolation.
 
-## M8 — Embedded proof (1u) — pull-driven
+## M8 — Embedded proof (2.5u) — pulled 2026-09-11
 
-The `no_std` CI check proves it compiles; this proves it *plays*. An esp32 RISC-V target
-rendering a module from flash through I2S under embassy, using the fixed-point mixer and
-borrowed sample data. Validates the portability claims before they calcify. Settles
-architecture open question Q2.
+The `no_std` CI check proves it compiles; this proves it *plays*. Re-planned for the
+owner's hardware: an **ESP32-A1S Audio Kit** (classic Xtensa ESP32, ES8388 codec) renders
+a module borrowed from memory-mapped flash through I2S under Embassy on the fixed-point
+mixer, with its six keys as controls, an ST7789 now-playing screen behind an `lcd`
+feature, and captive-portal web control; an **ESP32-C5** renders the goldens on RISC-V.
+The firmware is its own workspace at `embedded/`; the board-independent host is a
+`no_std` crate in the main workspace. Validates the portability claims before they
+calcify. Settles architecture open question Q2.
 
 ## M9 — Plugin surfaces (2u) — pull-driven
 
