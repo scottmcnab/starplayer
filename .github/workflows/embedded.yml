@@ -53,10 +53,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: embedded -> target
+      # `embedded/rust-toolchain.toml` names the Xtensa toolchain (`esp-1.97`) so that a
+      # local A1S build resolves it by default, but nothing in this job needs it and it is
+      # not installed here. `RUSTUP_TOOLCHAIN` outranks a directory's toolchain file, so
+      # these host builds use the same pinned stable toolchain `rustup show` just installed.
       - run: cargo test -p starplayer-firmware-common
         working-directory: embedded
+        env:
+          RUSTUP_TOOLCHAIN: "1.97"
       - run: cargo test -p starplayer-embedded-xtask
         working-directory: embedded
+        env:
+          RUSTUP_TOOLCHAIN: "1.97"
 
   a1s:
     name: a1s (Xtensa)
@@ -113,6 +121,15 @@ jobs:
       # `cargo xtask size` itself is the 90 %-warn / 100 %-fail gate against
       # `partitions.csv` (`embedded/xtask/src/main.rs`'s `command_size`) — its own exit
       # code fails this step, no extra shell arithmetic needed.
+      # `cargo xtask size` builds its app-only image through `cargo espflash save-image`,
+      # which is the separate `cargo-espflash` crate: the standalone `espflash` binary does
+      # not provide the cargo subcommand, and without it cargo says "no such command:
+      # espflash". Pinned to the release a local `cargo espflash --version` reports, so CI
+      # measures images with the same tool an owner does.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-espflash@4.5.0
+
       - name: cargo xtask size --board a1s
         working-directory: embedded
         run: cargo xtask size --board a1s
@@ -149,18 +166,40 @@ jobs:
       - name: cargo xtask module-images (main workspace, stable toolchain)
         run: cargo xtask module-images
 
+      # `embedded/rust-toolchain.toml` names `esp-1.97`, which this job deliberately never
+      # installs; `RUSTUP_TOOLCHAIN` outranks the file, so `embedded/xtask` itself builds
+      # on the pinned stable toolchain (the board build it then spawns names `+1.97`
+      # explicitly regardless). Set per step, not per job, so `rustup show` above still
+      # reads the root toolchain file and installs its targets.
       - name: cargo xtask build --board c5
         working-directory: embedded
         run: cargo xtask build --board c5
+        env:
+          RUSTUP_TOOLCHAIN: "1.97"
 
       - name: cargo xtask build --board c5 --features bench
         working-directory: embedded
         run: cargo xtask build --board c5 --features bench
+        env:
+          RUSTUP_TOOLCHAIN: "1.97"
+
+      # `cargo xtask size` builds its app-only image through `cargo espflash save-image`,
+      # which is the separate `cargo-espflash` crate: the standalone `espflash` binary does
+      # not provide the cargo subcommand, and without it cargo says "no such command:
+      # espflash". Pinned to the release a local `cargo espflash --version` reports, so CI
+      # measures images with the same tool an owner does.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-espflash@4.5.0
 
       - name: cargo xtask size --board c5
         working-directory: embedded
         run: cargo xtask size --board c5
+        env:
+          RUSTUP_TOOLCHAIN: "1.97"
 
       - name: cargo xtask size --board c5 --features bench
         working-directory: embedded
         run: cargo xtask size --board c5 --features bench
+        env:
+          RUSTUP_TOOLCHAIN: "1.97"
