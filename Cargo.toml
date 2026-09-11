@@ -33,6 +33,10 @@ bitflags = { version = "2.13", default-features = false }
 # every other target. Its own `std` and `serde` features stay off, so it cannot threaten
 # design goal 4.
 wide = { version = "1.7", default-features = false }
+# Checked, `unsafe`-free slice casting, used by `starplayer-model` to borrow a module
+# image's PCM region as `&'static [i16]` (M8-I2). `no_std`, no default features, and
+# already in the graph below `fixed`.
+bytemuck = { version = "1.25", default-features = false }
 
 # Archive decoding stays on the pure-Rust miniz_oxide path for native and wasm builds.
 # Do not use zip's broad `deflate` feature: it also enables compressor and zlib-rs code

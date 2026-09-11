@@ -699,8 +699,9 @@ Decide this now, not later:
 
 ```rust
 pub struct Module {
-    blob: Box<[u8]>,               // decoded pattern data and everything non-sample
-    pcm: Box<[i16]>,               // all samples decoded + delta-decoded, concatenated,
+    blob: BlobStorage,             // decoded pattern data and everything non-sample,
+                                   //   owned on the heap or borrowed from flash
+    pcm: PcmStorage,               // all samples decoded + delta-decoded, concatenated,
                                    //   each with N guard frames appended (loop-wrapped,
                                    //   reflected, or zeroed) so interpolators need no
                                    //   branches
@@ -719,8 +720,32 @@ pub struct Module {
 - trivially `Send + Sync`, so `Arc<Module>` hands to the audio thread with no ceremony;
 - trivially hashable, so golden tests can fingerprint a loaded module;
 - trivially fuzzable — a loader either produces a valid index set or an `Err`;
-- mmap- and flash-friendly on ESP32, where sample data may be borrowed rather than owned;
+- mmap- and flash-friendly on ESP32, where the sample data *is* borrowed rather than
+  owned (below);
 - no pointer chasing in the mixer inner loop.
+
+**Borrowed sample data, and the module image** (M8-I2) is what the fourth point above
+cashes in. `blob` and `pcm` are `BlobStorage` / `PcmStorage`, each either a heap allocation
+or a `&'static` borrow; equality, hashing and every accessor are defined over the slice
+contents, so nothing downstream can tell the two apart and `Module` keeps deriving
+`Clone, Debug, PartialEq, Eq, Hash`. The borrow is `'static` rather than a lifetime
+parameter deliberately: a `Module<'image>` would put a lifetime on `Arc<Module>`, on
+`Engine` and on every host type, to describe a borrow that is always from flash, which
+never goes away.
+
+What it borrows from is a **module image**: the finished `Module` serialised flat and
+little-endian, with its `i16` PCM 4-byte aligned, written on the development machine by
+`cargo xtask module-image` and linked into the firmware. The loaders are untouched and the
+index tables are unchanged — the image is the same offsets, written down. On the device
+`Module::from_image` validates it to exactly the standard `ModuleBuilder::build` applies,
+then borrows both blobs in place, so a load is a validation pass and four small index
+allocations rather than a copy of every sample. `from_image_or_copy` copies only the PCM
+when the mapping is not 4-byte aligned, and `from_image_copied` copies both for bytes that
+are not `'static` — the run-time upload path, which otherwise still goes through the
+ordinary loader into the heap. Any change to the layout bumps `IMAGE_VERSION` and the
+reader rejects a version it does not know; the format is a build product, not an
+interchange format, and big-endian hosts are deliberately unsupported on the borrowing
+path because the whole point is that no conversion pass runs.
 
 **Guard frames** are the other half: appending N frames to each sample's PCM (loop-
 wrapped for a forward loop, reflected for a ping-pong loop, or zeroed for a one-shot or a

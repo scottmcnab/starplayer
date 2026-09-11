@@ -285,6 +285,7 @@ dependencies = [
 name = "starplayer-model"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "starplayer-core",
 ]
 

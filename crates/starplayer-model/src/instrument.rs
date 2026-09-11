@@ -170,7 +170,11 @@ pub struct InstrumentDef {
 
 /// The identity note-transpose map: note `n` plays note `n`, for every format that never
 /// transposes.
-fn identity_transpose_map() -> [u8; NOTE_MAP_LENGTH] { core::array::from_fn(|note| note as u8) }
+///
+/// Crate-visible because the module image encodes it as a single byte rather than 120
+/// (`crate::image`): every MOD, S3M and MTM instrument carries exactly this map, and on a
+/// flash-resident module those bytes are real.
+pub(crate) fn identity_transpose_map() -> [u8; NOTE_MAP_LENGTH] { core::array::from_fn(|note| note as u8) }
 
 impl Default for InstrumentDef {
     fn default() -> InstrumentDef {

@@ -88,6 +88,12 @@ it_openmpt_reserved="OMPT"
 it_chunk_stpm="STPM"
 it_chunk_xtpm="XTPM"
 
+# ── the module image (M8-I2) ────────────────────────────────────────────────────────
+# Not a tracker format: the flash-resident form `cargo xtask module-image` writes. The
+# magic and the layout version are the first six bytes, and the reader stops at either.
+spmi_magic="SPMI"
+spmi_version_1="\x01\x00"
+
 # ── order-list markers shared by the formats ────────────────────────────────────────
 order_end="\xff"
 order_skip="\xfe"
