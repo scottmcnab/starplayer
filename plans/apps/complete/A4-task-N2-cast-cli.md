@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | A4 ([master plan](A4-master-plan.md)) |
-| Status | Ready 2026-09-11 |
+| Status | Landed 2026-09-11 (merge d46e59a); owner check on a real speaker outstanding |
 | Depends on | M3 (`starplayer-host::Player`, the CLI) and M7-H7 (inserts through `Player`) — both landed |
 | Blocks | A4-N5 (`--receiver starplayer`); nothing else |
 | Parallel with | [N1](A4-task-N1-cast-probe.md) — no shared code; both touch `plans/README.md`, and N1 also touches `xtask/src/main.rs` and `apps/starplayer-web/README.md`, which this task does not |
