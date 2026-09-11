@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md), decision 4; deliverable 7) |
+| Milestone | M8 ([master plan](../M8-master-plan.md), decision 4; deliverable 7) |
 | Status | Implemented 2026-09-11; builds link; awaiting owner hardware run |
 | Depends on | I3 (board crate, `EmbeddedPlayer` on the device, `firmware-common`) |
 | Blocks | — |

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md), deliverable 6) |
+| Milestone | M8 ([master plan](../M8-master-plan.md), deliverable 6) |
 | Status | Implemented 2026-09-11; builds link; awaiting owner hardware run |
 | Depends on | I3 (the `embedded/` workspace, `firmware-common`'s bench runner, the budget document) |
 | Blocks | — |
@@ -117,7 +117,7 @@ follow-up). WiFi on the C5. Replacing the `imc` canary.
 
 Implemented 2026-09-11 on branch `m8-i4`. Both feature sets of the C5 board link; nothing
 has been flashed. Every figure that can be taken without the board is in
-[`plans/reference/embedded-budget.md`](../reference/embedded-budget.md) (§ configuration
+[`plans/reference/embedded-budget.md`](../../reference/embedded-budget.md) (§ configuration
 note, §1 flash, §2 RAM, §3 CPU table shapes, §8 toolchain); every figure that needs the
 board says `TBD (owner: run the bench build)` there, with the exact command.
 

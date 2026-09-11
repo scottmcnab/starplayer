@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md), decisions 1–3 and 6–7; deliverables 3–5). **The milestone's exit criterion** |
+| Milestone | M8 ([master plan](../M8-master-plan.md), decisions 1–3 and 6–7; deliverables 3–5). **The milestone's exit criterion** |
 | Status | **Implemented 2026-09-11; builds link; awaiting owner hardware run** — see [Research resolution](#research-resolution) and the owner steps at the end |
 | Depends on | I1 (`starplayer-host-embedded`), I2 (module images) |
 | Blocks | I4, I5, I6 |
@@ -215,7 +215,7 @@ crates: if bring-up needs one, stop and write it up.
 
 Implemented 2026-09-11 on branch `m8-i3`. Both firmware variants link; nothing has been
 flashed. Every figure that can be taken without the board is in
-[`plans/reference/embedded-budget.md`](../reference/embedded-budget.md); every figure that
+[`plans/reference/embedded-budget.md`](../../reference/embedded-budget.md); every figure that
 cannot says `TBD (owner: …)` and names the command that produces it.
 
 ### 0. Toolchain

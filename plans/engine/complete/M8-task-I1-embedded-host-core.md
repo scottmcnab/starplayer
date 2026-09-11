@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md), decisions 1, 2 and 6) |
+| Milestone | M8 ([master plan](../M8-master-plan.md), decisions 1, 2 and 6) |
 | Status | Implemented 2026-09-11; awaiting review |
 | Depends on | M3 (landed): `starplayer-host`'s `RenderState` cadence, `starplayer-telemetry`; M7 (landed): interpolators |
 | Blocks | I3, I4 |

@@ -105,12 +105,12 @@ separate worktrees — I3 is the first consumer of both.
 
 | Task | Deliverable | Depends on | Parallel with | Model |
 |---|---|---|---|---|
-| [I1](M8-task-I1-embedded-host-core.md) | `starplayer-host-embedded`: `EmbeddedPlayer`, cadence, mailbox, bench | — | I2 | Opus |
-| [I2](M8-task-I2-flash-resident-modules.md) | `PcmStorage::Borrowed`, the module image, `xtask module-image` | — | I1 | Opus |
-| [I3](M8-task-I3-esp32-a1s-bringup.md) | `embedded/` workspace, ES8388/I2S, plays from flash, budget doc, Q2 | I1, I2 | — | Opus |
-| [I4](M8-task-I4-esp32-c5-riscv-bench.md) | C5 bench firmware, second CI target, `embedded.yml` | I3 | I5, I6 | Sonnet |
-| [I5](M8-task-I5-buttons-and-display.md) | Six keys, ST7789 now-playing screen (`lcd` feature) | I3 | I4, I6 | Sonnet |
-| [I6](M8-task-I6-web-control.md) | Captive portal, HTTP/WebSocket API, page, module upload | I3 | I4, I5 | Opus |
+| [I1](complete/M8-task-I1-embedded-host-core.md) | `starplayer-host-embedded`: `EmbeddedPlayer`, cadence, mailbox, bench | — | I2 | Opus |
+| [I2](complete/M8-task-I2-flash-resident-modules.md) | `PcmStorage::Borrowed`, the module image, `xtask module-image` | — | I1 | Opus |
+| [I3](complete/M8-task-I3-esp32-a1s-bringup.md) | `embedded/` workspace, ES8388/I2S, plays from flash, budget doc, Q2 | I1, I2 | — | Opus |
+| [I4](complete/M8-task-I4-esp32-c5-riscv-bench.md) | C5 bench firmware, second CI target, `embedded.yml` | I3 | I5, I6 | Sonnet |
+| [I5](complete/M8-task-I5-buttons-and-display.md) | Six keys, ST7789 now-playing screen (`lcd` feature) | I3 | I4, I6 | Sonnet |
+| [I6](complete/M8-task-I6-web-control.md) | Captive portal, HTTP/WebSocket API, page, module upload | I3 | I4, I5 | Opus |
 
 ## Exit criteria
 

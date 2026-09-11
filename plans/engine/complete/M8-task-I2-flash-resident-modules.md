@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md), decision 3; deliverable 2) |
+| Milestone | M8 ([master plan](../M8-master-plan.md), decision 3; deliverable 2) |
 | Status | Implemented 2026-09-11; awaiting review |
 | Depends on | M1-B1 (landed): the `Module` blob-and-offsets layout; M10-K5a (landed): `Module::enhanced` rebuild, which must keep working |
 | Blocks | I3 |
