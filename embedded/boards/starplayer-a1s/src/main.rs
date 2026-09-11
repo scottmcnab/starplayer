@@ -3,7 +3,9 @@
 //! Two builds out of one crate:
 //!
 //! * the **audio** build (no features) plays `PETRI.S3M` from flash through the ES8388
-//!   into the headphone jack and the speaker outputs, and logs the transport once a
+//!   into the headphone jack and the speaker outputs, takes transport and volume
+//!   commands from six push-buttons (M8-I5), optionally shows the sounding row on an
+//!   ST7789 screen behind the `lcd` feature (M8-I5), and logs the transport once a
 //!   second;
 //! * the **`bench`** build ([`bench`]) makes no sound and instead renders every golden
 //!   fixture, printing its SHA-256 and its cost.
@@ -15,11 +17,14 @@
 //! 2. The internal-DRAM heap. Everything the engine allocates, it allocates here.
 //! 3. PSRAM is *mapped* and its size reported. It is deliberately **not** added to the
 //!    general heap in the audio build — see "PSRAM and atomics" below.
-//! 4. `esp_rtos::start`, then the board's own pins.
+//! 4. `esp_rtos::start`, then the board's own pins — including the keys and, under
+//!    `lcd`, the display.
 //! 5. An I2C scan, logged (research point 1), then the codec — configured but **muted**.
 //! 6. The module image → [`Module::from_image`] → [`EmbeddedPlayer`], and only then I2S,
 //!    because the DMA ring is primed with real audio before the transfer starts.
-//! 7. Unmute, enable the speaker amplifier, spawn the refill and the control task.
+//! 7. Unmute, enable the speaker amplifier, start the second core with the audio refill
+//!    on it, and spawn the keys task, the control task and (under `lcd`) the display
+//!    task on core 0.
 //!
 //! # PSRAM and atomics
 //!
@@ -40,19 +45,21 @@
 //! M8-I6, which wants to hold an uploaded module in PSRAM, inherits this constraint: the
 //! *sample data* may live there, the `Arc` that owns it may not.
 //!
-//! # Core pinning — research point 6
+//! # Core pinning — corrected by M8-I5
 //!
-//! The audio task runs on **core 0**, with the control task, and not on a second-core
-//! executor as the task file's deliverable sketches. The blocker is a type, not the
-//! chip: `Engine` holds `Box<dyn EventSource>` — no `+ Send` — so `RenderHalf` is not
-//! `Send` and cannot be handed to `esp_rtos`'s second-core `SendSpawner`. The two ways out
-//! are (a) `Box<dyn EventSource + Send>` in `starplayer-engine`, which the task file puts
-//! out of scope ("any change to the engine crates: stop and write it up"), or (b) building
-//! the whole player *inside* the second core's entry closure so nothing crosses, which
-//! moves the control half to core 1 as well and wants the command channel M8-I5 and M8-I6
-//! will need anyway. Neither is needed for this milestone's exit criterion: there is no
-//! WiFi and no display yet, so core 0 has nothing to be starved by. The underrun counter
-//! is printed every second so the owner's run measures what single-core costs.
+//! **The audio refill now runs on core 1**, with core 0 running the keys task, the
+//! control task and (under `lcd`) the display task. M8-I3's write-up blamed `RenderHalf`
+//! not being `Send` on `Engine`'s `Box<dyn EventSource>` and kept everything on core 0 as
+//! a result. That diagnosis does not hold: `EventSource: Send` and `Insert: Send` are
+//! already supertrait bounds in `starplayer-engine`/`starplayer-dsp`, so `RenderHalf` is
+//! already `Send` — see the compile-time assertion and its doc comment beside
+//! `RenderHalf` in `crates/starplayer-host-embedded/src/player.rs`, verified against this
+//! exact `xtensa-esp32-none-elf` build, not only the host one. No engine change was
+//! needed to move the refill to `esp_rtos::start_second_core`, mirroring
+//! `../ampkeeper/esp32/firmware/src/esp32_main.rs`'s `CORE1_SPAWNER` pattern (simplified:
+//! this board only ever runs one task on core 1, so the refill is spawned directly inside
+//! the second core's entry closure rather than round-tripping a `SendSpawner` back to
+//! core 0 through a `Signal`).
 
 #![no_std]
 #![no_main]
@@ -72,6 +79,10 @@ mod board;
 #[cfg(not(feature = "bench"))]
 mod es8388;
 mod images;
+#[cfg(not(feature = "bench"))]
+mod keys;
+#[cfg(all(not(feature = "bench"), feature = "lcd"))]
+mod lcd;
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
@@ -80,7 +91,9 @@ use esp_bootloader_esp_idf::esp_app_desc;
 use esp_println::println;
 use firmware_common::format::Kib;
 #[cfg(not(feature = "bench"))]
-use firmware_common::NowPlaying;
+use firmware_common::{Key, KeyEvent, NowPlaying};
+#[cfg(not(feature = "bench"))]
+use starplayer::core::U0F16;
 #[cfg(not(feature = "bench"))]
 use starplayer::dsp::Linear;
 #[cfg(not(feature = "bench"))]
@@ -120,6 +133,55 @@ const HEAP_BYTES: usize = 120 * 1024;
 /// would put two copies of it on the stack.
 #[cfg(not(feature = "bench"))]
 static RENDER: StaticCell<RenderHalf<Linear>> = StaticCell::new();
+
+/// Core 1's stack. Only the audio refill task runs there — no allocation, no logging, one
+/// small local scratch buffer (`audio::fill`'s `[i16; QUANTUM_FRAMES * 2]`, 512 bytes) —
+/// so this is deliberately far smaller than core 0's, which carries the whole engine's
+/// call depth.
+#[cfg(not(feature = "bench"))]
+const CORE1_STACK_SIZE: usize = 8 * 1024;
+
+// Const-initialized rather than built with `StaticCell::init`, the same reasoning
+// ampkeeper's own `CORE1_STACK` comment gives: constructing an 8 KiB value through
+// `StaticCell::init` could materialise it on core 0's caller stack before the copy into
+// `.bss`. `ConstStaticCell::take` hands the static allocation directly to esp-rtos.
+#[cfg(not(feature = "bench"))]
+static CORE1_STACK: static_cell::ConstStaticCell<esp_hal::system::Stack<CORE1_STACK_SIZE>> =
+    static_cell::ConstStaticCell::new(esp_hal::system::Stack::new());
+#[cfg(not(feature = "bench"))]
+static CORE1_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+
+/// Carries [`audio::AudioTransfer`] across the one-time ownership handoff into core 1's
+/// entry closure.
+///
+/// `AudioTransfer` is not `Send`: esp-hal's DMA transfer type addresses its descriptor
+/// ring through raw pointers (`*mut DmaDescriptor`, `*const u8`, and `Async`'s own marker
+/// `PhantomData<*const ()>`), none of which carry `unsafe impl Send`. This crate is the
+/// one place `unsafe` is tolerated in the whole workspace (M8 master-plan decision 6), and
+/// this is exactly the shape `esp_rtos::start_second_core`'s own internal
+/// `SecondCoreStack` wrapper exists to cross (`esp-rtos` 0.3.0's `lib.rs`): a value moved
+/// **once**, into the closure that becomes core 1's entire program, with core 0 never
+/// touching it again afterwards. `Send`'s actual safety property — no two threads ever
+/// read or write the same memory concurrently — holds because there is only ever one
+/// owner at a time, never two.
+#[cfg(not(feature = "bench"))]
+struct SendTransfer(audio::AudioTransfer);
+
+// SAFETY: see the doc comment on `SendTransfer` above.
+#[cfg(not(feature = "bench"))]
+unsafe impl Send for SendTransfer {}
+
+/// Key events flow from [`keys::keys_task`] (core 0, polling GPIO every 10 ms) to
+/// [`control_task`] (core 0, the sole owner of [`ControlHalf`]) over this channel.
+#[cfg(not(feature = "bench"))]
+static KEY_EVENTS: keys::KeyEventChannel = keys::KeyEventChannel::new();
+
+/// The latest [`NowPlaying`] the control task has computed, signalled to the display task
+/// at up to 20 Hz. A `Signal` rather than a `Channel`: the display only ever wants the
+/// newest frame, and a display task that fell behind must never queue up stale ones.
+#[cfg(all(not(feature = "bench"), feature = "lcd"))]
+static NOW_PLAYING: embassy_sync::signal::Signal<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, NowPlaying> =
+    embassy_sync::signal::Signal::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
@@ -174,12 +236,32 @@ async fn main(spawner: Spawner) {
 
     #[cfg(not(feature = "bench"))]
     let started = {
+        #[cfg(not(feature = "lcd"))]
         let board = board::Board::take(
             peripherals.I2C0,
             peripherals.GPIO33,
             peripherals.GPIO32,
             peripherals.GPIO21,
             peripherals.GPIO39,
+            peripherals.GPIO36,
+            peripherals.GPIO13,
+            peripherals.GPIO19,
+            peripherals.GPIO23,
+            peripherals.GPIO18,
+            peripherals.GPIO5,
+        );
+        #[cfg(feature = "lcd")]
+        let board = board::Board::take(
+            peripherals.I2C0,
+            peripherals.GPIO33,
+            peripherals.GPIO32,
+            peripherals.GPIO21,
+            peripherals.GPIO39,
+            peripherals.GPIO36,
+            peripherals.GPIO19,
+            peripherals.GPIO23,
+            peripherals.GPIO18,
+            peripherals.GPIO5,
         );
         let audio_parts = audio::Parts {
             i2s0: peripherals.I2S0,
@@ -189,8 +271,22 @@ async fn main(spawner: Spawner) {
             lrck: peripherals.GPIO25,
             dout: peripherals.GPIO26,
         };
+        #[cfg(feature = "lcd")]
+        let lcd_parts =
+            lcd::Parts { spi2: peripherals.SPI2, sck: peripherals.GPIO14, mosi: peripherals.GPIO13, cs: peripherals.GPIO15, dc: peripherals.GPIO2, rst: peripherals.GPIO4 };
         match board {
-            Ok(board) => play(spawner, board, audio_parts).await,
+            Ok(board) => {
+                play(
+                    spawner,
+                    board,
+                    audio_parts,
+                    peripherals.CPU_CTRL,
+                    software_interrupts.software_interrupt1,
+                    #[cfg(feature = "lcd")]
+                    lcd_parts,
+                )
+                .await
+            }
             Err(_) => Err("the I2C controller rejected its configuration"),
         }
     };
@@ -206,9 +302,14 @@ async fn main(spawner: Spawner) {
     }
 }
 
-/// Bring the codec and I2S up and start playing. Only the audio build compiles it.
+/// Bring the codec and I2S up, start playing, and start the second core with the audio
+/// refill on it. Only the audio build compiles it.
 #[cfg(not(feature = "bench"))]
-async fn play(spawner: Spawner, mut board: board::Board<'static>, audio_parts: audio::Parts) -> Result<(), &'static str> {
+async fn play(
+    spawner: Spawner, mut board: board::Board<'static>, audio_parts: audio::Parts, cpu_control: esp_hal::peripherals::CPU_CTRL<'static>,
+    software_interrupt1: esp_hal::interrupt::software::SoftwareInterrupt<'static, 1>,
+    #[cfg(feature = "lcd")] lcd_parts: lcd::Parts,
+) -> Result<(), &'static str> {
     // Research point 1: what is actually on the control bus. Printed before anything is
     // configured, so a board that answers nowhere is diagnosable from the first boot.
     report_i2c_scan(&mut board);
@@ -217,6 +318,11 @@ async fn play(spawner: Spawner, mut board: board::Board<'static>, audio_parts: a
     let mut codec = es8388::Es8388::new(board.i2c, board::ES8388_I2C_ADDRESS);
     codec.init_dac_only(es8388::outputs::ALL).map_err(|_| "the ES8388 did not answer — is this the AC101 revision?")?;
     println!("CODEC ES8388 at 0x{:02x}: DAC up, 16-bit Philips slave, MCLK/LRCK 256, muted", board::ES8388_I2C_ADDRESS);
+
+    #[cfg(feature = "lcd")]
+    let display = lcd::LcdDisplay::take(lcd_parts);
+    #[cfg(feature = "lcd")]
+    println!("LCD  ST7789 {}", if display.is_present() { "found" } else { "not found — continuing headless" });
 
     // The module: borrowed straight out of memory-mapped flash, PCM and all.
     let image = images::petri_s3m();
@@ -256,8 +362,39 @@ async fn play(spawner: Spawner, mut board: board::Board<'static>, audio_parts: a
     board.power_amplifier.set_high();
     println!("PLAY");
 
-    spawner.spawn(audio::refill_task(transfer, render).map_err(|_| "the refill task would not spawn")?);
+    // The refill runs on core 1 — see the module docs, "Core pinning — corrected by
+    // M8-I5". Nothing crosses back: the whole task is built inside the second core's own
+    // entry closure and spawned on its own executor, so core 0 never holds a `SendSpawner`
+    // for it and this board never spawns a second task there.
+    //
+    // `transfer` (`audio::AudioTransfer`) has to cross into that closure and is not
+    // `Send`: esp-hal's DMA transfer type addresses its descriptor ring through raw
+    // pointers with no `unsafe impl Send`, the exact shape `esp_rtos::start_second_core`'s
+    // own internal `SecondCoreStack` wrapper exists to cross (`esp-rtos` 0.3.0's own
+    // `lib.rs`). `render` needs no such wrapper — `RenderHalf<Linear>` is `Send` (see the
+    // module docs and the assertion beside its definition), so `&'static mut RenderHalf`
+    // is `Send` too.
+    let core1_stack = CORE1_STACK.take();
+    let transfer = SendTransfer(transfer);
+    esp_rtos::start_second_core(cpu_control, software_interrupt1, core1_stack, move || {
+        // `let transfer = transfer;` before touching `.0` forces the closure to capture
+        // the *whole* `SendTransfer` by move rather than edition-2021 disjoint capture
+        // reaching in and capturing the `AudioTransfer` field directly — which would
+        // recreate exactly the `Send` error `SendTransfer` exists to route around, since
+        // the field itself carries no `unsafe impl Send`.
+        let transfer = transfer;
+        let transfer = transfer.0;
+        CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new()).run(|core1_spawner| {
+            let token = audio::refill_task(transfer, render).expect("the refill task is the only thing core 1's executor ever spawns");
+            core1_spawner.spawn(token);
+        });
+    });
+    println!("CORE1 audio refill running");
+
+    spawner.spawn(keys::keys_task(board.keys, KEY_EVENTS.sender()).map_err(|_| "the keys task would not spawn")?);
     spawner.spawn(control_task(control).map_err(|_| "the control task would not spawn")?);
+    #[cfg(feature = "lcd")]
+    spawner.spawn(display_task(display).map_err(|_| "the display task would not spawn")?);
     Ok(())
 }
 
@@ -282,25 +419,131 @@ fn report_i2c_scan(board: &mut board::Board<'static>) {
     }
 }
 
-/// Once a second: retire what the render loop handed back, and say where the song is.
+/// One master-volume step: `1/16` of full scale, the task file's own figure for KEY5/KEY6.
+#[cfg(not(feature = "bench"))]
+const VOLUME_STEP: U0F16 = U0F16::from_bits(u16::MAX / 16);
+
+/// How long the control task waits between polls of the key-event channel and the
+/// once-per-tick bookkeeping (garbage collection, the display refresh). 10 ms: fine
+/// enough that a key's `Hold` repeat cadence (200 ms,
+/// `firmware_common::keys::HOLD_REPEAT_INTERVAL_MS`) is never held up behind this loop.
+#[cfg(not(feature = "bench"))]
+const CONTROL_TICK: Duration = Duration::from_millis(10);
+
+/// The display refreshes at 20 Hz — every 5th control tick — never faster, and never from
+/// the audio task (the task file's own rule; [`display_task`] only ever reads what this
+/// task signals it).
+#[cfg(all(not(feature = "bench"), feature = "lcd"))]
+const DISPLAY_REFRESH_TICKS: u32 = 5;
+
+/// The UART transport line prints once a second — every 100th control tick.
+#[cfg(not(feature = "bench"))]
+const LOG_TICKS: u32 = 100;
+
+/// Apply one [`KeyEvent`] to the transport or the volume.
 ///
-/// Everything the refill may not do. `collect_garbage` is the reason it exists at all — a
-/// retired module or sequencer is dropped **here**, on a task that can afford a
-/// deallocation, never in the DMA refill (design goal 5).
+/// `key1_hold_actioned` is the five-key `lcd` build's "KEY1 long-press = stop" latch: a
+/// `Hold` fires repeatedly every 200 ms once past the threshold (the same mechanism
+/// KEY3–KEY6 want for their own repeat), so this remembers whether *this* hold has already
+/// stopped the transport, and clears on `Release` — the same shape
+/// `RenderHalf::awaiting_engine_stop` uses to keep a level-triggered signal from firing on
+/// every poll.
+#[cfg(not(feature = "bench"))]
+fn apply_key_event(control: &mut ControlHalf, event: KeyEvent, key1_hold_actioned: &mut bool) {
+    let current_order = control.telemetry().transport.order;
+    match event {
+        KeyEvent::Press(Key::Key1) => {
+            let _ = if control.is_playing() { control.stop() } else { control.play() };
+        }
+        #[cfg(feature = "lcd")]
+        KeyEvent::Hold(Key::Key1, _) => {
+            if !*key1_hold_actioned {
+                *key1_hold_actioned = true;
+                let _ = control.stop();
+                let _ = control.seek_order(0);
+            }
+        }
+        KeyEvent::Release(Key::Key1) => *key1_hold_actioned = false,
+
+        #[cfg(not(feature = "lcd"))]
+        KeyEvent::Press(Key::Key2) => {
+            let _ = control.stop();
+            let _ = control.seek_order(0);
+        }
+
+        KeyEvent::Press(Key::Key3) | KeyEvent::Hold(Key::Key3, _) => {
+            let _ = control.seek_order(current_order.saturating_sub(1));
+        }
+        KeyEvent::Press(Key::Key4) | KeyEvent::Hold(Key::Key4, _) => {
+            let _ = control.seek_order(current_order.saturating_add(1));
+        }
+        KeyEvent::Press(Key::Key5) | KeyEvent::Hold(Key::Key5, _) => {
+            let volume = U0F16::from_bits(control.master_volume().to_bits().saturating_sub(VOLUME_STEP.to_bits()));
+            let _ = control.set_master_volume(volume);
+        }
+        KeyEvent::Press(Key::Key6) | KeyEvent::Hold(Key::Key6, _) => {
+            let volume = U0F16::from_bits(control.master_volume().to_bits().saturating_add(VOLUME_STEP.to_bits()));
+            let _ = control.set_master_volume(volume);
+        }
+        _ => {}
+    }
+}
+
+/// The control task: the sole owner of [`ControlHalf`]. Drains key events and turns them
+/// into transport/volume commands, collects the render half's garbage, signals the
+/// display task its next frame (`lcd` only, at [`DISPLAY_REFRESH_TICKS`]), and prints the
+/// transport line once a second — everything the audio refill (now on core 1) may not do.
 #[cfg(not(feature = "bench"))]
 #[embassy_executor::task]
 async fn control_task(mut control: ControlHalf) {
+    let receiver: keys::KeyEventReceiver = KEY_EVENTS.receiver();
+    let mut key1_hold_actioned = false;
+    let mut tick: u32 = 0;
     loop {
-        Timer::after(Duration::from_secs(1)).await;
-        let retired = control.collect_garbage();
-        let view = NowPlaying::from_snapshot(control.telemetry(), firmware_common::SAMPLE_RATE_HZ);
-        println!(
-            "{view}  peak={} underruns={} dma_errors={} retired={} rejected={}",
-            control.peak(),
-            audio::underruns(),
-            audio::dma_errors(),
-            retired,
-            control.commands_rejected(),
-        );
+        Timer::after(CONTROL_TICK).await;
+        tick = tick.wrapping_add(1);
+
+        while let Ok(event) = receiver.try_receive() {
+            apply_key_event(&mut control, event, &mut key1_hold_actioned);
+        }
+
+        #[cfg(feature = "lcd")]
+        if tick % DISPLAY_REFRESH_TICKS == 0 {
+            let snapshot = *control.telemetry();
+            let title = control.module().map(|module| module.header().title.as_ref()).unwrap_or("");
+            let view = NowPlaying::from_snapshot(&snapshot, firmware_common::SAMPLE_RATE_HZ, title, control.master_volume());
+            NOW_PLAYING.signal(view);
+        }
+
+        if tick % LOG_TICKS == 0 {
+            let retired = control.collect_garbage();
+            let snapshot = *control.telemetry();
+            let title = control.module().map(|module| module.header().title.as_ref()).unwrap_or("");
+            let view = NowPlaying::from_snapshot(&snapshot, firmware_common::SAMPLE_RATE_HZ, title, control.master_volume());
+            println!(
+                "{view}  peak={} underruns={} dma_errors={} retired={} rejected={}",
+                control.peak(),
+                audio::underruns(),
+                audio::dma_errors(),
+                retired,
+                control.commands_rejected(),
+            );
+        }
+    }
+}
+
+/// Redraw the screen whenever the control task signals a new [`NowPlaying`]. `lcd` only.
+///
+/// This task never touches [`ControlHalf`] — the control task is its sole owner — and
+/// never reads faster than the control task signals (at most [`DISPLAY_REFRESH_TICKS`]
+/// per second, i.e. 20 Hz), which is what keeps the display's SPI traffic off the audio
+/// path (now on core 1 regardless) and bounded on core 0.
+#[cfg(all(not(feature = "bench"), feature = "lcd"))]
+#[embassy_executor::task]
+async fn display_task(mut display: lcd::LcdDisplay) {
+    let mut screen = firmware_common::Screen::new();
+    loop {
+        let view = NOW_PLAYING.wait().await;
+        let _ = screen.render(&mut display, &view);
     }
 }

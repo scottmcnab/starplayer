@@ -49,6 +49,42 @@ bytemuck = { version = "1.25", default-features = false }
 firmware-common = { package = "starplayer-firmware-common", path = "firmware-common" }
 
 # ---------------------------------------------------------------------------
+# M8-I5: the ST7789 now-playing screen. `embedded-graphics` is chip-agnostic and pure
+# Rust, so `firmware-common` depends on it unconditionally (it is what `screen.rs` draws
+# through, and what its host tests exercise against `MockDisplay`). `mipidsi` and
+# `embedded-hal-bus` are only pulled in by the board crate's `lcd` feature — see
+# `boards/starplayer-a1s/Cargo.toml`.
+# ---------------------------------------------------------------------------
+# Default features only (`batch`, which buffers pixel writes — wanted either way). No
+# `defmt` feature: this workspace logs through `esp-println`/`log`, not `defmt`.
+#
+# **Pinned to `=0.8.1`, not the newer `0.8.2`, and `mipidsi` below to `0.9.0`, not
+# `0.10.0`.** `embedded-graphics 0.8.2` tightened its own `fixed`/`az` requirements to
+# `~1.27.0`/`~1.2.0` (from `0.8.1`'s `^1.14.0`/`^1.2.0`), and `mipidsi 0.10.0` moved to
+# `embedded-graphics-core ^0.4.1`, whose own `Cargo.toml` also tightened `az` to
+# `~1.2.0`. `starplayer-core` depends on `fixed = "1.31"`, which needs `az ^1.3` — and
+# `~1.2.0` and `^1.3` do not overlap, so `cargo` cannot resolve a single `az` version at
+# all: "failed to select a version for `az`" against `embedded-graphics 0.8.2` alone, and
+# again against `mipidsi 0.10.0` alone, reproduced in isolation from this workspace's own
+# dependency table (M8-I5 research point 2). `embedded-graphics 0.8.1` (`az ^1.2.0`,
+# `fixed ^1.14.0`) and `mipidsi 0.9.0` (`embedded-graphics-core ^0.4.0`, satisfied by
+# `0.4.0`'s looser `az ^1.1`) both resolve cleanly against `fixed 1.31`/`az 1.3.0` — one
+# shared `az` version for the whole graph. Neither crate's API changed between these
+# patch/minor steps in a way this board's code below uses.
+embedded-graphics = "=0.8.1"
+# mipidsi carries its **own** SPI interface from 0.9 on (`mipidsi::interface::SpiInterface`,
+# built on `embedded-hal` 1.0's `SpiDevice` + `OutputPin`) rather than depending on the
+# separate `display-interface-spi` crate the way older mipidsi releases did — so that
+# crate is not a dependency here at all (M8-I5 research point 2). `0.9.0`, not the newer
+# `0.10.0`: see the `embedded-graphics` comment above for why.
+mipidsi = "0.9.0"
+# `esp_hal::spi::master::Spi` implements `embedded-hal`'s `SpiBus`, not `SpiDevice`
+# directly (its own module docs point here); `ExclusiveDevice::new_no_delay` wraps the
+# bus and a plain `Output` CS pin into the `SpiDevice` `mipidsi::interface::SpiInterface`
+# wants, with software-driven (not hardware) chip select.
+embedded-hal-bus = "0.3.0"
+
+# ---------------------------------------------------------------------------
 # Profiles. Cargo honours `[profile.*]` only at a workspace root, so every profile for
 # every crate under `embedded/` is here.
 # ---------------------------------------------------------------------------

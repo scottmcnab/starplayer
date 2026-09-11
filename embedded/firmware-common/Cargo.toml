@@ -16,6 +16,11 @@ starplayer = { workspace = true }
 starplayer-host-embedded = { workspace = true }
 starplayer-model = { workspace = true }
 starplayer-telemetry = { workspace = true }
+# M8-I5's `screen` module renders a `NowPlaying` onto a `DrawTarget<Color = Rgb565>`: the
+# board crate's `mipidsi`-driven ST7789 implements it under the `lcd` feature, and this
+# crate's own host tests exercise it against `MockDisplay` below. Pure Rust with no target
+# constraint, so it sits in the plain table like every other chip-agnostic dependency here.
+embedded-graphics = { workspace = true }
 
 # The tests build a real module at test time from the committed S3M fixture rather than
 # reading `embedded/assets/` — those images are git-ignored build products, and a test
