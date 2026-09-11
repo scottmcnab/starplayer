@@ -1617,6 +1617,28 @@ enumeration and its `i16` conversion; the wasm host keeps the wire command decod
 buffer and the heap pre-reservation. Neither keeps a transport, an engine-arm enum, a seek
 mailbox or an output-depth post-stage.
 
+`starplayer-host-embedded` is the **second** host, and it is deliberately not behind
+`AudioBackend` (M8-I1). A device wants neither `std` nor a float output stage: an I2S DMA
+refill calls `Engine::<FixedPath, Linear, FixedOut<i16, 2>, Arc<Module>>::render(&mut
+[i16])` directly, and there is no device to negotiate with, no output-depth post-stage to
+run and no callback to own. So the crate is `no_std` + `alloc`, sits in the bare-metal CI
+matrix beside the engine crates, and offers an `EmbeddedPlayer` that splits into a
+`RenderHalf` the firmware calls from its refill and a `ControlHalf` it keeps in a task.
+
+What it *does* share with `Player` is the thing that makes a host a host: the
+**quantum-aligned control cadence**. Commands are drained and the end of the song is armed
+only at multiples of `RENDER_QUANTUM` frames emitted, never at device-block boundaries, so
+design goal 3 holds through the host and not merely through the engine. That logic exists
+twice, in `starplayer-host` and in `starplayer-host-embedded`, and I1 chose the duplication
+knowingly: `starplayer-host` is `std` by construction (`Box<dyn FnMut + Send>`, `Mutex`,
+`String` errors, device enumeration), its seek mailbox names `core::sync::atomic` types
+that `riscv32imc-unknown-none-elf` does not have at all, and sharing would take a `std`
+feature split of that crate. Three things would move into a shared `no_std` core if that is
+ever done — the transport, the seek mailbox and the twenty lines of `render` that walk a
+block quantum by quantum — and the mailbox would have to take the embedded crate's seqlock
+with it, because a 64-bit atomic on those targets is a critical section and design goal 5
+forbids a lock in `render()`.
+
 Dependency edges are strictly one-directional. Apps depend only on the facade.
 Extracting `starplayer` for crates.io later is a manifest change, not a refactor.
 

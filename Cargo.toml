@@ -111,6 +111,7 @@ starplayer-midi = { path = "crates/starplayer-midi" }
 starplayer-midi-native = { path = "crates/starplayer-midi-native" }
 starplayer-telemetry = { path = "crates/starplayer-telemetry" }
 starplayer-host = { path = "crates/starplayer-host" }
+starplayer-host-embedded = { path = "crates/starplayer-host-embedded" }
 starplayer-host-cpal = { path = "crates/starplayer-host-cpal" }
 starplayer-host-wasm = { path = "crates/starplayer-host-wasm" }
 starplayer-archive = { path = "crates/starplayer-archive" }

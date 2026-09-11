@@ -1346,6 +1346,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "starplayer-host-embedded"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "starplayer",
+ "starplayer-host",
+ "starplayer-offline",
+ "starplayer-rt",
+ "starplayer-telemetry",
+]
+
+[[package]]
 name = "starplayer-host-wasm"
 version = "0.1.0"
 dependencies = [
