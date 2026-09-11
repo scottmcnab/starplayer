@@ -28,8 +28,11 @@ default = []
 # figures are worth comparing.
 bench = []
 
-# M8-I5: the ST7789 now-playing screen on the SD-card pin group.
-lcd = []
+# M8-I5: the ST7789 now-playing screen on the SD-card pin group. Off by default — the
+# audio build must not link `mipidsi`/`embedded-graphics`/`embedded-hal-bus` at all (M8
+# master-plan decision 4), so the three are `optional = true` below and pulled in only by
+# naming their `dep:` form here.
+lcd = ["dep:mipidsi", "dep:embedded-graphics", "dep:embedded-hal-bus"]
 
 # M8-I6: the captive portal, the HTTP/WebSocket API and module upload.
 web = []
@@ -69,6 +72,14 @@ starplayer-host-embedded = { workspace = true }
 starplayer-model = { workspace = true }
 firmware-common = { workspace = true }
 bytemuck = { workspace = true }
+
+# M8-I5's `lcd` feature only — see the `lcd` feature entry above for why these are
+# `optional`. Chip-agnostic (none is an `esp-*` crate), so the plain table is still the
+# right place for them; `cfg(feature = "lcd")` in `src/lcd.rs` is what actually keeps
+# them out of the default build's dependency graph at compile time, not this table.
+mipidsi = { workspace = true, optional = true }
+embedded-graphics = { workspace = true, optional = true }
+embedded-hal-bus = { workspace = true, optional = true }
 
 [package.metadata.espflash]
 partition_table = "partitions.csv"

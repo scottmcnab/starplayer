@@ -60,9 +60,9 @@ espflash writes.
 
 | Build | `.text` | `.rodata` | `.data` | `.rwtext` | App image | Of its partition |
 |---|---|---|---|---|---|---|
-| A1S, audio, `Linear` only | 268 233 | 146 924 | 9 296 | 15 820 | **464 944** | 17.7 % of 2.5 MB |
-| A1S, `bench`, all four kernels | 355 841 | 169 708 | 4 400 | 15 732 | **552 560** | 21.0 % of 2.5 MB |
-| A1S, `lcd` (M8-I5) | TBD | TBD | TBD | TBD | TBD | |
+| A1S, audio, `Linear` only | 278 593 | 147 980 | 9 288 | 15 820 | **475 312** | 18.1 % |
+| A1S, `bench`, all four kernels | 355 841 | 169 708 | 4 400 | 15 732 | **552 560** | 21.0 % |
+| A1S, `lcd` (M8-I5) | 302 437 | 150 860 | 9 724 | 15 924 | **499 152** | 19.0 % |
 | A1S, `web` (M8-I6) | TBD | TBD | TBD | TBD | TBD | |
 | C5, default (no module linked) | 25 486 | 9 492 | 788 | 1 784 | **39 904** | 2.5 % of 1.5 MB |
 | C5, `bench`, all four kernels, all six fixtures | 300 150 | 163 336 | 1 356 | 1 784 | **468 976** | 29.8 % of 1.5 MB |
@@ -74,6 +74,14 @@ reason, only each board's own two rows are. The C5's `bench` image (468 976 B) i
 smaller than the A1S's `bench` image (552 560 B) despite linking the **same six module
 images** and the **same four kernels**, because it links no codec driver, no I2S, no DMA
 and no board pin map — there is nothing on this chip for any of those to drive.
+
+The audio row moved from M8-I3's **464 944 B (17.7 %)** to **475 312 B (18.1 %)** in
+M8-I5: +10 368 bytes for the six-key debounce/edge/hold-repeat state machine, the keys
+task, the second-core plumbing (`esp_rtos::start_second_core`, its executor and stack) and
+the key-to-command mapping in `main.rs`. The `lcd` row is **+23 840 bytes** over the
+default audio build for `mipidsi`, `embedded-graphics` and the ST7789 driver glue —
+0.9 percentage points of the 2.5 MB partition. Both measured by `cargo xtask size --board
+a1s [--features lcd]`, an agent command; nothing here needed the board.
 
 `.rodata` includes the linked module images, which are the bulk of it: 88 036 bytes in the
 audio build (`PETRI.S3M` alone) and 117 040 in the bench build (all six fixtures). Net of
@@ -185,26 +193,32 @@ is where the real number belongs once it exists.
 
 From `xtensa-esp32-elf-size -A` and `xtensa-esp32-elf-nm`.
 
-| Item | Audio build | Bench build |
-|---|---|---|
-| `.bss` total | 139 888 B | 123 000 B |
-| — of which the heap array | 122 880 B | 122 880 B |
-| — everything else (`RenderHalf`, the DMA ring and descriptors, task storage) | 17 008 B | 120 B |
-| `.data` | 9 296 B | 4 400 B |
-| **Main stack** (`0x3ffe_0000 − _bss_end`) | **47 424 B** | **69 208 B** |
+| Item | Audio build | `lcd` build | Bench build |
+|---|---|---|---|
+| `.bss` total | 148 600 B | 149 568 B | 123 000 B |
+| — of which the heap array | 122 880 B | 122 880 B | 122 880 B |
+| — everything else (`RenderHalf`, the DMA ring and descriptors, task storage, core 1's 8 KiB stack, the key/display channels — M8-I5) | 25 720 B | 26 688 B | 120 B |
+| `.data` | 9 288 B | 9 724 B | 4 400 B |
+| **Core 0's main stack** (`0x3ffe_0000 − _bss_end`) | **38 712 B** | **37 312 B** | **69 208 B** |
 
-The stack is the real constraint, and it is not obvious: on the classic ESP32 the main
-stack is simply whatever internal DRAM is left over, so **every heap byte is a stack byte**.
-A 160 KiB heap still links and leaves 6 472 bytes of stack, which will not survive a boot.
-120 KiB is the balance this firmware ships; `embedded/README.md` §6 has the one-line check
-to run after any change that moves a large static.
+The stack is the real constraint, and it is not obvious: on the classic ESP32 core 0's main
+stack is simply whatever internal DRAM is left over, so **every heap byte, and now every
+byte of core 1's own 8 KiB stack, is a byte core 0's stack does not get**. A 160 KiB heap
+still links and leaves 6 472 bytes of stack, which will not survive a boot. 120 KiB is the
+balance this firmware ships; `embedded/README.md` §6 has the one-line check to run after
+any change that moves a large static. **M8-I5 moved the audio refill task to core 1**
+(`esp_rtos::start_second_core`); core 1's own stack is a fixed, separate 8 KiB
+(`CORE1_STACK_SIZE` in `main.rs`) that this table's "Main stack" row does not measure —
+only core 0's is `0x3ffe_0000 − _bss_end`, since core 1's is a `static` array with its own
+fixed size chosen at build time rather than "whatever is left".
 
 The I2S DMA ring is `DMA_RING_QUANTA × 128 × 4` bytes = **4 096 B** at the shipped depth of
 8 quanta, plus one descriptor per 512-byte chunk.
 
 | Measurement | Value |
 |---|---|
-| Peak stack of the audio task | TBD (owner: run the audio build — esp-hal's stack-guard watchpoint fires on an overflow, and a clean run through a whole song is the evidence that 47 424 B is enough) |
+| Peak stack of the audio refill task, on core 1's dedicated 8 KiB (`CORE1_STACK_SIZE`, M8-I5) | TBD (owner: run the audio build — esp-hal's stack-guard watchpoint fires on an overflow, and a clean run through a whole song is the evidence that 8 KiB is enough) |
+| Peak stack of core 0's control/keys/(`lcd`) display tasks, against the **38 712 B** (audio) / **37 312 B** (`lcd`) budget above | TBD (owner: run each build) |
 | Heap high-water with the web stack up | TBD (M8-I6) |
 
 ### Static RAM, the C5's `bench` (M8-I4)
@@ -451,11 +465,17 @@ x86/ARM/WASM) already commits to, and this milestone is where RISC-V joins that 
   bench build does register it, because it has no real-time path and asks for external
   memory explicitly by capability. **M8-I6 inherits this**: an uploaded module's *sample
   data* may live in PSRAM; the `Arc` that owns it may not.
-* **The audio task runs on core 0.** `RenderHalf` is not `Send`, because `Engine` holds a
-  `Box<dyn EventSource>` with no `+ Send` bound, so it cannot be handed to esp-rtos's
-  second-core `SendSpawner`. Nothing in this milestone competes for core 0, so every figure
-  above is a single-core figure with an idle second core. See the M8-I3 research
-  resolution.
+* **The audio refill task moved to core 1 in M8-I5.** M8-I3's write-up said `RenderHalf`
+  was not `Send` because `Engine` holds a `Box<dyn EventSource>` with no `+ Send` bound,
+  and kept it on core 0 with the CPU figures above measured as a single-core figure with an
+  idle second core. That diagnosis turned out not to hold: `EventSource` and `Insert` both
+  already carry a `Send` supertrait bound in `starplayer-engine`/`starplayer-dsp`, so
+  `RenderHalf` was already `Send` (a trait object erased from a `: Send` trait is `Send`
+  without needing `Box<dyn EventSource + Send>` spelled out — verified with a compile-time
+  assertion against this exact target, see `crates/starplayer-host-embedded/src/player.rs`
+  and M8-I5's research resolution). The CPU figures above still describe core 1 running the
+  mixer alone — core 0 is now busy with the keys, control and (`lcd`) display tasks instead
+  of being idle, but none of that work is on the timed path the bench measures.
 * **The C5's `bench` heap is 176 KiB, not the A1S's 120 KiB, and the reason is the board,
   not the engine.** The C5 has no PSRAM staging region to take the pressure off internal
   RAM the way the A1S's `External`-capability region does for its own `bench` build — every

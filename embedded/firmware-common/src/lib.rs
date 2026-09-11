@@ -11,7 +11,13 @@
 //!   rather than discovered by reading a UART.
 //! * [`now_playing`] — the view model M8-I5's display and M8-I6's web page both render.
 //!   A [`Snapshot`](starplayer_telemetry::Snapshot) is 2 616 bytes and carries 64
-//!   channels whatever the module has; a screen wants six fields.
+//!   channels whatever the module has; a screen wants a handful of header fields plus up
+//!   to [`now_playing::MAX_DISPLAY_CHANNELS`] channel rows.
+//! * [`keys`] — the six-button debounce, edge and hold-repeat state machine (M8-I5), fed
+//!   `(now_ms, samples)` by the board's GPIO polling task and independent of it.
+//! * [`screen`] — renders a [`now_playing::NowPlaying`] onto any `embedded-graphics`
+//!   `DrawTarget` (M8-I5), so the ST7789 layout is tested on the host against
+//!   `MockDisplay` rather than only by flashing a board.
 //! * [`format`] — `core::fmt` helpers (a SHA-256 as hex, a byte count as KiB, a ratio as
 //!   a fixed-point percentage) that exist so no board has to reach for `alloc::format!`
 //!   on a logging path.
@@ -32,10 +38,14 @@ extern crate alloc;
 
 pub mod bench;
 pub mod format;
+pub mod keys;
 pub mod now_playing;
+pub mod screen;
 
 pub use bench::{BenchRow, CycleCounter, Kernel, PcmLocation, digest_row};
-pub use now_playing::NowPlaying;
+pub use keys::{HOLD_REPEAT_INTERVAL_MS, HOLD_THRESHOLD_MS, Key, KeyDebounce, KeyEvent, KeyEvents};
+pub use now_playing::{ChannelRow, FixedStr, MAX_DISPLAY_CHANNELS, NowPlaying};
+pub use screen::Screen;
 
 /// The sample rate every StarPlayer firmware runs at.
 ///

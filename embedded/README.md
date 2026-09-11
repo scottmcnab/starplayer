@@ -71,7 +71,8 @@ Everything goes through `cargo xtask`, from **this** directory:
 cd embedded
 . ~/export-esp-1.97.sh    # needed for --board a1s; harmless (and unnecessary) for c5
 
-cargo xtask build  --board a1s                     # the audio firmware
+cargo xtask build  --board a1s                     # the audio firmware, six keys, no display
+cargo xtask build  --board a1s --features lcd      # the audio firmware, five keys, the ST7789 screen
 cargo xtask build  --board a1s --features bench    # the bench firmware (no audio)
 cargo xtask image  --board a1s [--merge]           # an espflash image under target/
 cargo xtask size   --board a1s                     # the image against its partition
@@ -207,8 +208,14 @@ MODULE image=88036 bytes (85.9 KiB) channels=8 samples=5
 HEAP after open: …
 I2S  44100 Hz stereo 16-bit, MCLK on GPIO0, DMA ring 8 quanta (1024 frames, 23 ms)
 PLAY
+CORE1 audio refill running
 ord 000 pat 000 row 00/06 125 bpm   3/ 8 voices  0:01/2:47  peak=… underruns=0 …
 ```
+
+An `lcd` build's boot log has one more line between `PLAY` and `CORE1` — `LCD  ST7789
+found` or `LCD  ST7789 not found — continuing headless`, from `LcdDisplay::take`'s probe.
+"Not found" is not fatal: the audio still plays and the six-vs-five-key map is unaffected
+either way (`lcd` always drops KEY2, whether or not a panel actually answered).
 
 ### The I2C scan expectation
 
@@ -239,11 +246,64 @@ there is nothing wired to describe.
 | I2S DIN (codec ASDOUT → ESP) | 35 | unused; input-only pin |
 | PA enable (speaker amplifier) | 21 | driven high once audio is flowing |
 | Headphone detect | 39 | input-only |
-| KEY1–KEY6 | 36, 13, 19, 23, 18, 5 | M8-I5; KEY1 is on an input-only pin |
+| KEY1–KEY6 | 36, 13, 19, 23, 18, 5 | KEY1 is on an input-only pin; six keys by default, five (no KEY2) when `--features lcd` is built |
 | LED4 / LED5 | 22 / 19 | LED5 shares KEY3 |
-| SD-card group (the display, M8-I5) | 14 SCK, 13 MOSI, 15 CS, 2, 4, 12 | 12 and 15 are strapping pins; **13 is also KEY2** |
+| Display (`--features lcd`, HSPI on the SD-card pin group) | 14 SCK, 13 MOSI, 15 CS, 2 DC, 4 RST | 12 and 15 are strapping pins; **13 is also KEY2**; GPIO12 is never wired to the panel and carries no pull |
 
 The map lives in exactly one place in code: `boards/starplayer-a1s/src/board.rs`.
+
+### Keys (M8-I5)
+
+Six push-buttons, KEY1–KEY6, debounced (two agreeing 10 ms samples) and polled by
+`boards/starplayer-a1s/src/keys.rs`; the debounce/edge/hold-repeat state machine itself is
+`firmware-common`'s `keys` module — host-tested, fed `(now_ms, [bool; 6])`.
+
+Six-key map (default build):
+
+| Key | GPIO | Press | Hold ≥ 1 s |
+|---|---|---|---|
+| KEY1 | 36 | play / pause | — |
+| KEY2 | 13 | stop (rewind to order 0) | — (I6: re-provision) |
+| KEY3 | 19 | previous order | seek back one order every 200 ms |
+| KEY4 | 23 | next order | seek forward one order every 200 ms |
+| KEY5 | 18 | volume − (1/16 step) | repeat every 200 ms |
+| KEY6 | 5 | volume + (1/16 step) | repeat every 200 ms |
+
+Five-key map (`--features lcd`, GPIO13 is the display's MOSI so KEY2 is unavailable):
+
+| Key | GPIO | Press | Hold ≥ 1 s |
+|---|---|---|---|
+| KEY1 | 36 | play / pause | stop (rewind to order 0) |
+| KEY3 | 19 | previous order | seek back one order every 200 ms |
+| KEY4 | 23 | next order | seek forward one order every 200 ms |
+| KEY5 | 18 | volume − (1/16 step) | repeat every 200 ms |
+| KEY6 | 5 | volume + (1/16 step) | repeat every 200 ms |
+
+Volume is applied through `ControlHalf::set_master_volume` and lives in RAM only — it does
+not persist across a reset.
+
+### The display (M8-I5, `--features lcd`)
+
+An ST7789 SPI IPS panel, 1.69" 240×280 (a 240×320 ST7789 RAM windowed with a 20-row
+y-offset), on HSPI: SCK 14, MOSI 13, CS 15, DC 2, RST 4, 20 MHz to start (research point 3
+— raise towards the panel's 40 MHz ceiling once the owner has measured a clean redraw on
+the board in hand). Off by **default**; `cargo xtask build --board a1s --features lcd`
+builds it in. `boards/starplayer-a1s/src/lcd.rs` is the only file that names `mipidsi` or
+`embedded-graphics`'s driver types; what is actually drawn is
+`firmware-common::screen::Screen`, host-tested against `embedded_graphics::mock_display`.
+
+The screen never panics if the panel is loose or absent: `LcdDisplay::take` goes headless
+on the first SPI/init error (the same fail-soft shape ampkeeper's `display.rs` uses for its
+I2C LCD backpack) and every draw call after that is a no-op.
+
+`mipidsi = "0.9.0"` and `embedded-graphics = "=0.8.1"` — **not** the newer `mipidsi 0.10.0`
+/ `embedded-graphics 0.8.2` (M8-I5 research point 2). The newer pair tightens its
+`fixed`/`az` version requirements to a range that cannot be satisfied alongside
+`starplayer-core`'s `fixed = "1.31"` at all — `cargo` refuses to resolve a single `az`
+version for the whole graph. See the long comment beside `embedded-graphics` in
+`embedded/Cargo.toml`'s `[workspace.dependencies]` for the exact ranges. Neither mipidsi
+release needs `display-interface-spi`: both carry their own
+`mipidsi::interface::SpiInterface`.
 
 ### DIP switches
 
@@ -251,13 +311,18 @@ The Audio Kit carries a five-way DIP switch block beside the SD slot. It multipl
 SD-card pin group between the slot, the JTAG header and the key matrix, and the silkscreen
 labelling differs between board revisions. For **this** firmware:
 
-* nothing here uses the SD card, JTAG or the keys, so **any** switch position boots and
-  plays;
-* M8-I5 takes the SD-card pin group for the ST7789 display, which means the SD slot must
-  be switched **off** then — a display and an SD card cannot both have GPIO14/13/15.
+* nothing here uses the SD card or JTAG, so any switch position that does not route the
+  group to the SD slot boots and plays;
+* the six-key default build reads KEY1–KEY6 as plain GPIO inputs — no SD card, no display,
+  the SD-card pin group's DIP position does not matter to it;
+* the `--features lcd` build takes the SD-card pin group (GPIO14/13/15/2/4) for the ST7789
+  display, which means the SD slot must be switched **off** — a display and an SD card
+  cannot both have those pins, and GPIO13 being both KEY2 and the display's MOSI is exactly
+  why the `lcd` build drops to five keys.
 
-Leave them as the board shipped until M8-I5 says otherwise, and record what the board in
-hand is actually set to when you do.
+Leave them as the board shipped for the six-key default build; switch the SD-card group off
+before flashing an `lcd` build, and record what the board in hand is actually set to when
+you do.
 
 ### Partition table — 4 MB, no OTA
 
@@ -284,16 +349,19 @@ embedded/
   rust-toolchain.toml     channel = "esp-1.97"  (the A1S's; the C5 is built under +1.97 instead)
   .cargo/config.toml      the `xtask` alias and nothing else
   firmware-common/        board-independent: the bench runner, the now-playing view model,
-                          the formatting helpers — builds and tests on the host
+                          the key debounce state machine, the screen renderer, the
+                          formatting helpers — builds and tests on the host
   boards/starplayer-a1s/  the Xtensa firmware
     .cargo/config.toml    target, runner, -Tlinkall.x, build-std  (directory-scoped!)
     partitions.csv
     src/board.rs          the pin map, once
     src/es8388.rs         the codec driver
-    src/audio.rs          I2S + circular DMA + the refill task
+    src/audio.rs          I2S + circular DMA + the refill task (runs on core 1)
+    src/keys.rs           the six push-buttons as GPIO inputs, always built
+    src/lcd.rs             the ST7789 SPI driver, #[cfg(feature = "lcd")] only
     src/images.rs         the aligned include_bytes! wrappers
     src/bench.rs          the `bench` build's runner
-    src/main.rs           boot
+    src/main.rs           boot, core pinning, the control/keys/display tasks
   boards/starplayer-c5/   the RISC-V bench firmware (M8-I4) — no audio hardware
     .cargo/config.toml    target, runner, -Tlinkall.x — no build-std (research point 2)
     partitions.csv
@@ -311,10 +379,13 @@ embedded/
   `Cannot scavenge register without an emergency spill slot`. Ampkeeper hit the same bug
   from the other direction on the S3. The comment in `.cargo/config.toml` has the detail.
 * **The heap is 120 KiB and the number is a balance against the stack.** On the classic
-  ESP32 the main stack is whatever DRAM is left between `_bss_end` and `0x3ffe_0000`, so
-  every heap byte is a stack byte. At 160 KiB the firmware links and leaves 6 472 bytes of
-  stack, which will not survive a boot; at 120 KiB the stack is 47 424 bytes. After any
-  change that moves a large static, check it:
+  ESP32 core 0's main stack is whatever DRAM is left between `_bss_end` and `0x3ffe_0000`,
+  so every heap byte (and every other `.bss`/`.data` byte — core 1's 8 KiB stack included,
+  since M8-I5) is a byte core 0's stack does not get. At 160 KiB the firmware links and
+  leaves 6 472 bytes of stack, which will not survive a boot; at 120 KiB the default
+  (six-key, no `lcd`) build's stack is 38 712 bytes and the `lcd` build's is 37 312 bytes —
+  both comfortably clear of the 6 472-byte failure point, but check after any change that
+  moves a large static:
 
   ```sh
   xtensa-esp32-elf-nm target/xtensa-esp32-none-elf/release/starplayer-a1s \
@@ -325,9 +396,18 @@ embedded/
   atomic instructions do not work correctly on PSRAM, and this engine puts atomics on the
   heap (`Arc` refcounts, the host's seqlocks, the telemetry ring). `src/main.rs` has the
   full reasoning; M8-I6 inherits the constraint.
-* **The audio task runs on core 0**, not on a second-core executor, because `RenderHalf`
-  is not `Send` (the engine holds a `Box<dyn EventSource>`). See the "Core pinning" section
-  of `src/main.rs` and the M8-I3 task file's research resolution.
+* **The audio refill task runs on core 1** — moved there by M8-I5. M8-I3's write-up blamed
+  `RenderHalf` not being `Send` on the engine's `Box<dyn EventSource>` and kept everything
+  on core 0 as a result; that diagnosis did not hold once actually checked (`EventSource`
+  and `Insert` both already carry a `Send` supertrait bound, so `RenderHalf` was already
+  `Send` — see the compile-time assertion beside its definition in
+  `crates/starplayer-host-embedded/src/player.rs`). The real, and genuinely unavoidable,
+  `Send` obstacle was `esp_hal`'s own DMA transfer type (`audio::AudioTransfer`), which
+  main.rs crosses with a small `unsafe impl Send` wrapper (`SendTransfer`) whose safety
+  argument is a one-time ownership handoff into core 1's entry closure, the same shape
+  `esp-rtos`'s own internal `SecondCoreStack` wrapper uses. Core 0 now runs the keys task,
+  the control task and (under `lcd`) the display task; see the "Core pinning" section of
+  `src/main.rs`.
 * The measured sizes live in `plans/reference/embedded-budget.md`, which is where any new
   number belongs.
 * **The C5 needs no `-Z build-std` and no Xtensa toolchain at all** — it is built under

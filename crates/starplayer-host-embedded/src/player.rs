@@ -233,6 +233,24 @@ pub struct RenderHalf<Interp: Interpolate = Linear> {
     frame_gain: i32,
 }
 
+/// `RenderHalf` **is** `Send` (M8-I5 research point, correcting the M8-I3 research
+/// resolution's diagnosis).
+///
+/// I3 blamed `Engine`'s `Box<dyn EventSource>` for `RenderHalf` not being `Send`, and kept
+/// the audio task on core 0 rather than moving it to a second-core `SendSpawner`. That
+/// diagnosis does not hold: `EventSource: Send` and `Insert: Send` are both already
+/// supertrait bounds (`crates/starplayer-engine/src/source.rs`,
+/// `crates/starplayer-dsp/src/insert.rs`), and a trait object erased from a trait whose
+/// definition carries `Send` as a supertrait is itself `Send` without needing to spell
+/// `Box<dyn EventSource + Send>` — `rustc` derives it from the trait's own bound. This
+/// assertion is the check I3's write-up says to run: it compiles (and is exercised by every
+/// build of this crate, host and target alike; verified directly against
+/// `xtensa-esp32-none-elf` under `embedded/`'s toolchain, not only the host one here) with
+/// no engine change at all, so the audio task can move to `esp_rtos::start_second_core`
+/// (`boards/starplayer-a1s/src/main.rs`) without touching `crates/starplayer-engine`.
+const fn assert_render_half_is_send<T: Send>() {}
+const _: () = assert_render_half_is_send::<RenderHalf<Linear>>();
+
 impl<Interp: Interpolate> RenderHalf<Interp> {
     /// Fill `output` with interleaved stereo `i16`, and report the block's peak magnitude.
     ///
