@@ -83,6 +83,16 @@ mod images;
 mod keys;
 #[cfg(all(not(feature = "bench"), feature = "lcd"))]
 mod lcd;
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+mod net;
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+mod provisioning;
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+mod psram;
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+mod store;
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+mod web;
 
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
@@ -125,7 +135,34 @@ esp_app_desc!();
 /// xtensa-esp32-elf-nm target/xtensa-esp32-none-elf/release/starplayer-a1s \
 ///   | grep -E " (_bss_end|_stack_start)$"
 /// ```
+///
+/// **The `web` build does not put its heap here at all.** It adds a great deal of `.bss`
+/// — the WiFi driver's statics, embassy-net's socket storage, the web workers'
+/// task-pool futures with their TCP buffers inside them — and every byte of that comes
+/// out of the same main stack this array would. Measured: with the heap in `.bss` the
+/// firmware does not link, because `.bss` alone reaches past `0x3ffe_0000` and the stack
+/// has nowhere to start. So the `web` build's heap goes to [`RECLAIMED_HEAP_BYTES`] in
+/// `dram2_seg` instead, and `dram_seg` carries `.bss` and the stack and nothing else.
+#[cfg(not(feature = "web"))]
 const HEAP_BYTES: usize = 120 * 1024;
+#[cfg(feature = "web")]
+const HEAP_BYTES: usize = RECLAIMED_HEAP_BYTES;
+
+/// The `web` build's entire heap, in `dram2_seg`.
+///
+/// `dram2_seg` is the 98 768 bytes of DRAM above the ROM's own data and stacks
+/// (`esp-hal`'s `ld/esp32/memory.x`), which the ESP-IDF heap reclaims and which esp-hal
+/// leaves as an uninitialised section with no other user. It is ordinary internal DRAM —
+/// atomics work there, unlike PSRAM — and, crucially, it is **not** `.bss` in `dram_seg`,
+/// so it does not shorten the main stack. ampkeeper's classic-ESP32 build put 96 KiB of
+/// its heap here for exactly this reason after a provisioning-mode allocation failure.
+///
+/// 96 KiB of the region's 98 768 bytes: all of it but a rounding margin. It is less than
+/// the default build's 120 KiB, which is the real cost of the radio — the engine's own
+/// requirement for `PETRI.S3M` is 71 576 bytes, so what is left over for the WiFi driver,
+/// the TCP stack and an uploaded module's index vectors is about 25 KiB.
+#[cfg(feature = "web")]
+const RECLAIMED_HEAP_BYTES: usize = 96 * 1024;
 
 /// The render half lives in a `static`: `size_of::<RenderHalf<Linear>>()` is 11 744 bytes
 /// (I1 research point 3a), because the engine's telemetry publisher holds a working
@@ -188,7 +225,11 @@ async fn main(spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));
 
     esp_println::logger::init_logger_from_env();
+    // The `web` build's heap is in `dram2_seg`, not in `.bss` — see `HEAP_BYTES`.
+    #[cfg(not(feature = "web"))]
     esp_alloc::heap_allocator!(size: HEAP_BYTES);
+    #[cfg(feature = "web")]
+    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: HEAP_BYTES);
 
     let timer = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG1);
     let software_interrupts = esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -204,8 +245,13 @@ async fn main(spawner: Spawner) {
     let (psram_start, psram_size) = psram.raw_parts();
     println!("PSRAM {psram_size} bytes ({}) mapped at {psram_start:p}", Kib(psram_size));
 
-    #[cfg(feature = "bench")]
+    #[cfg(not(any(feature = "bench", feature = "web")))]
     let _ = psram_start;
+
+    // The `web` build takes the PSRAM region as an arena of its own instead of handing it
+    // to the allocator — see `psram.rs` for the atomics erratum that forbids the latter.
+    #[cfg(all(not(feature = "bench"), feature = "web"))]
+    let mut psram_arena = psram::Arena::new(psram_start, psram_size);
 
     #[cfg(feature = "bench")]
     if psram_size > 0 {
@@ -233,6 +279,44 @@ async fn main(spawner: Spawner) {
             Timer::after(Duration::from_secs(60)).await;
         }
     }
+
+    // The web build opens the flash **before** the second core starts: reading the
+    // partition table and the stored credentials are flash reads with a ~3 KiB stack
+    // frame each, and doing them while the audio refill is running would cost underruns
+    // for no reason.
+    #[cfg(all(not(feature = "bench"), feature = "web"))]
+    let web_boot = {
+        let mut store = match store::Store::take(peripherals.FLASH) {
+            Ok(store) => store,
+            Err(error) => {
+                println!("FATAL: the flash partitions are not what this firmware expects: {error:?}");
+                loop {
+                    Timer::after(Duration::from_secs(5)).await;
+                }
+            }
+        };
+        let credentials = store.load_wifi().await.ok().flatten();
+        println!(
+            "STORE config partition {}, modules partition {} slots",
+            match &credentials {
+                Some(credentials) => credentials.ssid.as_str(),
+                None => "no network stored",
+            },
+            store.slot_count(),
+        );
+        let random = esp_hal::rng::Rng::new();
+        let seed = u64::from(random.random()) | (u64::from(random.random()) << 32);
+        // The format is corrected from the module's own header the moment `play` has one;
+        // the compiled-in image is S3M, and saying so here keeps `Bridge::new` from
+        // needing a module it does not yet have.
+        let bridge = web::Bridge::new(store, &mut psram_arena, "S3M");
+        println!(
+            "PSRAM upload staging {}, {} left unclaimed",
+            if bridge.has_psram() { "claimed" } else { "unavailable — uploads will be refused" },
+            Kib(psram_arena.remaining()),
+        );
+        web::Boot { bridge, credentials, wifi: peripherals.WIFI, seed }
+    };
 
     #[cfg(not(feature = "bench"))]
     let started = {
@@ -284,6 +368,8 @@ async fn main(spawner: Spawner) {
                     software_interrupts.software_interrupt1,
                     #[cfg(feature = "lcd")]
                     lcd_parts,
+                    #[cfg(feature = "web")]
+                    web_boot,
                 )
                 .await
             }
@@ -309,6 +395,7 @@ async fn play(
     spawner: Spawner, mut board: board::Board<'static>, audio_parts: audio::Parts, cpu_control: esp_hal::peripherals::CPU_CTRL<'static>,
     software_interrupt1: esp_hal::interrupt::software::SoftwareInterrupt<'static, 1>,
     #[cfg(feature = "lcd")] lcd_parts: lcd::Parts,
+    #[cfg(feature = "web")] web_boot: web::Boot,
 ) -> Result<(), &'static str> {
     // Research point 1: what is actually on the control bus. Printed before anything is
     // configured, so a board that answers nowhere is diagnosable from the first boot.
@@ -391,11 +478,74 @@ async fn play(
     });
     println!("CORE1 audio refill running");
 
+    // The re-provision gesture, checked once, before the keys task exists. A boot nobody
+    // is touching costs one GPIO read; a held key costs the five seconds it is held, with
+    // the music playing throughout.
+    #[cfg(feature = "web")]
+    let reprovision = {
+        let held = keys::held_at_boot(&board.keys, REPROVISION_KEY, Duration::from_secs(REPROVISION_HOLD_SECONDS)).await;
+        if held {
+            println!("KEYS {REPROVISION_KEY:?} held at boot — starting the captive portal");
+        }
+        held
+    };
+
+    #[cfg(feature = "web")]
+    let web::Boot { bridge, credentials, wifi, seed } = web_boot;
+
     spawner.spawn(keys::keys_task(board.keys, KEY_EVENTS.sender()).map_err(|_| "the keys task would not spawn")?);
-    spawner.spawn(control_task(control).map_err(|_| "the control task would not spawn")?);
+    #[cfg(not(feature = "web"))]
+    spawner.spawn(control_task(control, ()).map_err(|_| "the control task would not spawn")?);
+    #[cfg(feature = "web")]
+    spawner.spawn(control_task(control, bridge).map_err(|_| "the control task would not spawn")?);
     #[cfg(feature = "lcd")]
     spawner.spawn(display_task(display).map_err(|_| "the display task would not spawn")?);
+
+    // The network personality comes last: the codec, the DMA ring and core 1 are all up,
+    // so the radio's own bring-up cannot delay the first sample.
+    #[cfg(feature = "web")]
+    {
+        match credentials.filter(|_| !reprovision) {
+            Some(credentials) => {
+                println!("WIFI joining {}", credentials.ssid.as_str());
+                let station = net::start(spawner, wifi, credentials, seed)?;
+                web::start(spawner, station.stack)?;
+            }
+            None => provisioning::run(spawner, wifi, seed).await?,
+        }
+        spawner.spawn(reboot_task().map_err(|_| "the reboot watcher would not spawn")?);
+    }
     Ok(())
+}
+
+/// The key held at boot to start the captive portal instead of joining the stored
+/// network.
+///
+/// KEY2 in the six-key build. **KEY1 in the `lcd` build**, where KEY2 does not exist at
+/// all — GPIO13 is the display's MOSI there (M8-I5) — so the gesture moves rather than
+/// disappearing. KEY1 already carries a long-press meaning in that build (stop and
+/// rewind), but only through the keys task, which does not exist yet when this is
+/// checked, so the two cannot collide.
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+const REPROVISION_KEY: Key = if cfg!(feature = "lcd") { Key::Key1 } else { Key::Key2 };
+
+/// How long that key must be held.
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+const REPROVISION_HOLD_SECONDS: u64 = 5;
+
+/// Reset the board when something asks for it — `POST /api/reprovision`, or the portal's
+/// `POST /save`.
+///
+/// The delay is what lets the answer reach the browser first: a reset inside the handler
+/// would drop the connection before the response was flushed, and the owner would see a
+/// failed request for an operation that in fact succeeded.
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+#[embassy_executor::task]
+async fn reboot_task() {
+    web::wait_for_reboot().await;
+    println!("RESET requested — restarting in two seconds");
+    Timer::after(Duration::from_secs(2)).await;
+    esp_hal::system::software_reset();
 }
 
 /// Probe the control bus and print what answered.
@@ -433,7 +583,7 @@ const CONTROL_TICK: Duration = Duration::from_millis(10);
 /// The display refreshes at 20 Hz — every 5th control tick — never faster, and never from
 /// the audio task (the task file's own rule; [`display_task`] only ever reads what this
 /// task signals it).
-#[cfg(all(not(feature = "bench"), feature = "lcd"))]
+#[cfg(all(not(feature = "bench"), any(feature = "lcd", feature = "web")))]
 const DISPLAY_REFRESH_TICKS: u32 = 5;
 
 /// The UART transport line prints once a second — every 100th control tick.
@@ -489,13 +639,30 @@ fn apply_key_event(control: &mut ControlHalf, event: KeyEvent, key1_hold_actione
     }
 }
 
+/// What the control task carries for the web, which in a build without it is nothing.
+///
+/// A type alias rather than a `#[cfg]` parameter: `#[embassy_executor::task]` rewrites
+/// the function signature into a `TaskStorage`, and a parameter that exists in one build
+/// and not another is a shape the macro should not have to reason about.
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+type WebBridge = web::Bridge;
+#[cfg(all(not(feature = "bench"), not(feature = "web")))]
+type WebBridge = ();
+
 /// The control task: the sole owner of [`ControlHalf`]. Drains key events and turns them
 /// into transport/volume commands, collects the render half's garbage, signals the
 /// display task its next frame (`lcd` only, at [`DISPLAY_REFRESH_TICKS`]), and prints the
 /// transport line once a second — everything the audio refill (now on core 1) may not do.
 #[cfg(not(feature = "bench"))]
 #[embassy_executor::task]
-async fn control_task(mut control: ControlHalf) {
+async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
+    // One binding, two builds: in a build without `web` the parameter is `()` and exists
+    // only so that `#[embassy_executor::task]` sees one signature rather than two.
+    #[cfg(feature = "web")]
+    let mut bridge = bridge;
+    #[cfg(not(feature = "web"))]
+    let () = bridge;
+
     let receiver: keys::KeyEventReceiver = KEY_EVENTS.receiver();
     let mut key1_hold_actioned = false;
     let mut tick: u32 = 0;
@@ -507,12 +674,21 @@ async fn control_task(mut control: ControlHalf) {
             apply_key_event(&mut control, event, &mut key1_hold_actioned);
         }
 
-        #[cfg(feature = "lcd")]
+        // The web's own commands and jobs, on the same task and therefore under the same
+        // single owner of `ControlHalf`.
+        #[cfg(feature = "web")]
+        bridge.poll(&mut control).await;
+
+        #[cfg(any(feature = "lcd", feature = "web"))]
         if tick % DISPLAY_REFRESH_TICKS == 0 {
             let snapshot = *control.telemetry();
             let title = control.module().map(|module| module.header().title.as_ref()).unwrap_or("");
             let view = NowPlaying::from_snapshot(&snapshot, firmware_common::SAMPLE_RATE_HZ, title, control.master_volume());
+            #[cfg(feature = "lcd")]
             NOW_PLAYING.signal(view);
+            #[cfg(feature = "web")]
+            bridge.publish(&mut control, &view);
+            let _ = view;
         }
 
         if tick % LOG_TICKS == 0 {

@@ -89,6 +89,24 @@ mipidsi = "0.9.0"
 embedded-hal-bus = "0.3.0"
 
 # ---------------------------------------------------------------------------
+# M8-I6: the status JSON encoder in `firmware-common::api` and, from the board crate, the
+# `picoserve 0.18` HTTP/WebSocket server it sits behind.
+# ---------------------------------------------------------------------------
+# `serde` with only its `derive` feature — no `std`, no `alloc` feature either, since none
+# of `api`'s wire types owns a `String` or a heap `Vec`.
+serde = { version = "1", default-features = false, features = ["derive"] }
+# Pinned to `0.6` specifically, not a newer release: `picoserve 0.18` depends on
+# `serde-json-core 0.6.0` and `heapless 0.8`, and the board crate will share one copy of
+# each with it rather than resolving two. `firmware-common::api` is pinned to match so its
+# host-tested JSON encoding is the same code path the device runs.
+serde-json-core = "0.6"
+# `Status::channels` is a `heapless::Vec` rather than an `alloc::Vec` for the same reason
+# `now_playing::NowPlaying` avoids `alloc::String` (see that module's doc comment): the
+# `0.8` pin reuses the copy `mipidsi` above already resolves, rather than the `0.9` series
+# `embassy-sync` pulls in for its own, unrelated queues.
+heapless = { version = "0.8", default-features = false, features = ["serde"] }
+
+# ---------------------------------------------------------------------------
 # Profiles. Cargo honours `[profile.*]` only at a workspace root, so every profile for
 # every crate under `embedded/` is here.
 # ---------------------------------------------------------------------------
