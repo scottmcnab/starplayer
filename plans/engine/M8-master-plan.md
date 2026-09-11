@@ -114,7 +114,7 @@ separate worktrees — I3 is the first consumer of both.
 
 ## Exit criteria
 
-- The ESP32-A1S plays `PETRI.S3M` from flash cleanly through the headphone jack.
+- The ESP32-A1S plays `REFLEX.S3M` (the compiled-in boot module) from flash cleanly through the headphone jack; `PETRI.S3M` reaches it through the bench build or a web upload.
 - The bench build's on-device SHA-256 of the 10-second fixed/mono/linear render of every
   golden fixture equals the committed hash under `goldens/`, on the A1S and on the C5.
 - `plans/reference/embedded-budget.md` holds measured numbers, and Q2 is settled.
