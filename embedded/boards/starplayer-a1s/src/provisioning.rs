@@ -56,7 +56,7 @@ use embassy_time::{Duration, Timer};
 use esp_println::println;
 use esp_radio::wifi::ap::AccessPointConfig;
 use esp_radio::wifi::scan::ScanConfig;
-use esp_radio::wifi::{Config as RadioConfig, ControllerConfig, Interface};
+use esp_radio::wifi::{Config as RadioConfig, ControllerConfig, Interface, WifiController};
 use picoserve::request::{Path, Request};
 use picoserve::ResponseSent;
 use picoserve::response::{IntoResponse, Redirect, ResponseWriter, StatusCode};
@@ -109,8 +109,9 @@ pub fn access_point_ssid() -> heapless::String<SSID_MAX_BYTES> {
     ssid
 }
 
-/// Run the portal personality. Never returns: the only way out is the soft reset
-/// `POST /save` arms.
+/// Start the portal personality and return once its tasks are running. The network task
+/// owns the Wi-Fi controller for the whole portal session because dropping it tears the
+/// radio down; `POST /save` separately arms the reboot watcher spawned by the caller.
 pub async fn run(
     spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>, seed: u64, arena: &mut crate::psram::Arena,
 ) -> Result<(), &'static str> {
@@ -152,7 +153,7 @@ pub async fn run(
     static RESOURCES: StaticCell<StackResources<PORTAL_SOCKETS>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(interfaces.access_point, config, RESOURCES.init(StackResources::new()), seed);
 
-    spawner.spawn(access_point_net_task(runner).map_err(|_| "the portal network task would not spawn")?);
+    spawner.spawn(access_point_net_task(controller, runner).map_err(|_| "the portal network task would not spawn")?);
     spawner.spawn(dhcp_server_task(stack).map_err(|_| "the DHCP server would not spawn")?);
     spawner.spawn(dns_catchall_task(stack).map_err(|_| "the DNS catch-all would not spawn")?);
 
@@ -178,7 +179,11 @@ pub async fn run(
 
 /// embassy-net's runner for the SoftAP interface.
 #[embassy_executor::task]
-async fn access_point_net_task(mut runner: Runner<'static, Interface<'static>>) -> ! { runner.run().await }
+async fn access_point_net_task(
+    _controller: WifiController<'static>, mut runner: Runner<'static, Interface<'static>>,
+) -> ! {
+    runner.run().await
+}
 
 // ---------------------------------------------------------------------------
 // DHCP
