@@ -167,6 +167,24 @@ cargo xtask flash --board c5 --features bench
 cargo xtask monitor --board c5
 ```
 
+When the A1S is connected through the Mac RFC2217 bridge, the owner can build and flash the fixed
+`web` personality from the repository root with one command:
+
+```sh
+embedded/flash_image.sh
+```
+
+The wrapper resolves `embedded/` from its own path, so invoking it by any valid relative or
+absolute path does not depend on the caller's working directory. It sources
+`~/export-esp-1.97.sh`, builds the merged image through `embedded/xtask`, and uses `esptool.py` to
+write `target/starplayer-a1s-web-merged.bin` at address zero. It defaults to the proven
+`rfc2217://192.168.0.151:8086?ign_set_control` endpoint at 460800 baud. Override either for another
+bridge without changing the fixed firmware personality:
+
+```sh
+STARPLAYER_RFC2217_ENDPOINT='rfc2217://192.168.0.152:8086?ign_set_control' STARPLAYER_FLASH_BAUD=115200 embedded/flash_image.sh
+```
+
 `flash` builds a merged image (bootloader + partition table + app) with `--skip-padding`,
 so a reflash leaves the `modules` and `config` partitions alone, and attaches the monitor
 when it is done.
