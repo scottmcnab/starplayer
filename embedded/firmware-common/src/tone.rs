@@ -36,6 +36,12 @@ pub const MATCHED_TONE_LEFT_PEAK: i16 = 4_796;
 /// Signed peak written to the right channel by [`MatchedTone`].
 pub const MATCHED_TONE_RIGHT_PEAK: i16 = 5_327;
 
+/// Signed peak written to the left channel by the swapped comparison.
+pub const SWAPPED_TONE_LEFT_PEAK: i16 = MATCHED_TONE_RIGHT_PEAK;
+
+/// Signed peak written to the right channel by the swapped comparison.
+pub const SWAPPED_TONE_RIGHT_PEAK: i16 = MATCHED_TONE_LEFT_PEAK;
+
 /// Rounded full-turn phase increment for 125 Hz at 44 100 Hz.
 pub const MATCHED_TONE_PHASE_INCREMENT: u32 =
     ((MATCHED_TONE_FREQUENCY_HZ as u64 * (1u64 << 32) + crate::SAMPLE_RATE_HZ as u64 / 2) / crate::SAMPLE_RATE_HZ as u64) as u32;
@@ -117,20 +123,29 @@ pub fn engine_tone_module() -> Result<Module, starplayer::core::Error> {
     builder.build()
 }
 
-/// Continuous post-render 125 Hz comparison matched to the host engine-tone channel peaks.
+/// Continuous post-render 125 Hz comparison with independently configured channel peaks.
 ///
 /// A wrapping `u32` represents one full turn. Every output frame reads the shared integer Q15
 /// sine table, scales the channels independently, then advances by the exact rounded phase
 /// increment. The state is allocation-free and remains owned by the audio refill from prefill
 /// onward.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MatchedTone {
     phase: u32,
+    left_peak: i16,
+    right_peak: i16,
 }
 
 impl MatchedTone {
-    /// Start at the rising zero crossing.
-    pub const fn new() -> MatchedTone { MatchedTone { phase: 0 } }
+    /// Start the reproducible matched comparison at the rising zero crossing.
+    pub const fn new() -> MatchedTone {
+        MatchedTone::with_peaks(MATCHED_TONE_LEFT_PEAK, MATCHED_TONE_RIGHT_PEAK)
+    }
+
+    /// Start the shared generator with explicit independent channel peaks.
+    pub const fn with_peaks(left_peak: i16, right_peak: i16) -> MatchedTone {
+        MatchedTone { phase: 0, left_peak, right_peak }
+    }
 
     /// Replace interleaved stereo with the continuous matched tone.
     ///
@@ -140,12 +155,16 @@ impl MatchedTone {
         let mut frames = destination.chunks_exact_mut(2);
         for frame in &mut frames {
             let sine = starplayer::dsp::sin_q15(self.phase);
-            frame[0] = scale_q15_to_peak(sine, MATCHED_TONE_LEFT_PEAK);
-            frame[1] = scale_q15_to_peak(sine, MATCHED_TONE_RIGHT_PEAK);
+            frame[0] = scale_q15_to_peak(sine, self.left_peak);
+            frame[1] = scale_q15_to_peak(sine, self.right_peak);
             self.phase = self.phase.wrapping_add(MATCHED_TONE_PHASE_INCREMENT);
         }
         frames.into_remainder().fill(0);
     }
+}
+
+impl Default for MatchedTone {
+    fn default() -> MatchedTone { MatchedTone::new() }
 }
 
 #[inline(always)]
@@ -275,14 +294,56 @@ mod tests {
 
     #[test]
     fn matched_tone_hits_independent_signed_channel_peaks() {
-        let mut positive = MatchedTone { phase: 1 << 30 };
+        assert_eq!(MatchedTone::new(), MatchedTone::with_peaks(MATCHED_TONE_LEFT_PEAK, MATCHED_TONE_RIGHT_PEAK));
+        assert_eq!(MatchedTone::default(), MatchedTone::new());
+        let mut positive = MatchedTone::new();
+        positive.phase = 1 << 30;
         let mut frame = [0i16; 2];
         positive.overwrite(&mut frame);
         assert_eq!(frame, [MATCHED_TONE_LEFT_PEAK, MATCHED_TONE_RIGHT_PEAK]);
 
-        let mut negative = MatchedTone { phase: 3 << 30 };
+        let mut negative = MatchedTone::new();
+        negative.phase = 3 << 30;
         negative.overwrite(&mut frame);
         assert_eq!(frame, [-MATCHED_TONE_LEFT_PEAK, -MATCHED_TONE_RIGHT_PEAK]);
+    }
+
+    #[test]
+    fn swapped_tone_reverses_peaks_and_retains_polarity_phase_and_continuity() {
+        let mut positive = MatchedTone::with_peaks(SWAPPED_TONE_LEFT_PEAK, SWAPPED_TONE_RIGHT_PEAK);
+        positive.phase = 1 << 30;
+        let mut frame = [0i16; 2];
+        positive.overwrite(&mut frame);
+        assert_eq!(frame, [MATCHED_TONE_RIGHT_PEAK, MATCHED_TONE_LEFT_PEAK]);
+
+        let mut negative = MatchedTone::with_peaks(SWAPPED_TONE_LEFT_PEAK, SWAPPED_TONE_RIGHT_PEAK);
+        negative.phase = 3 << 30;
+        negative.overwrite(&mut frame);
+        assert_eq!(frame, [-MATCHED_TONE_RIGHT_PEAK, -MATCHED_TONE_LEFT_PEAK]);
+
+        let mut whole_tone = MatchedTone::with_peaks(SWAPPED_TONE_LEFT_PEAK, SWAPPED_TONE_RIGHT_PEAK);
+        let mut whole = [i16::MAX; 514];
+        whole_tone.overwrite(&mut whole);
+
+        let mut split_tone = MatchedTone::with_peaks(SWAPPED_TONE_LEFT_PEAK, SWAPPED_TONE_RIGHT_PEAK);
+        let mut split = [i16::MAX; 514];
+        split_tone.overwrite(&mut split[..10]);
+        split_tone.overwrite(&mut split[10..260]);
+        split_tone.overwrite(&mut split[260..]);
+        assert_eq!(split, whole);
+        assert_eq!(split_tone, whole_tone);
+
+        let mut previous: Option<[i16; 2]> = None;
+        for swapped_frame in whole.chunks_exact(2) {
+            assert!(swapped_frame[0].abs() <= SWAPPED_TONE_LEFT_PEAK);
+            assert!(swapped_frame[1].abs() <= SWAPPED_TONE_RIGHT_PEAK);
+            assert!(i32::from(swapped_frame[0]) * i32::from(swapped_frame[1]) >= 0);
+            if let Some(previous_frame) = previous {
+                assert!(swapped_frame[0].abs_diff(previous_frame[0]) <= 128);
+                assert!(swapped_frame[1].abs_diff(previous_frame[1]) <= 128);
+            }
+            previous = Some([swapped_frame[0], swapped_frame[1]]);
+        }
     }
 
     #[test]

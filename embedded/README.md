@@ -79,6 +79,7 @@ cargo xtask build  --board a1s --features web,lcd  # both
 cargo xtask build  --board a1s --features tone     # gated direct-tone listening diagnostic
 cargo xtask build  --board a1s --features engine-tone # standalone native-S3M engine-path diagnostic
 cargo xtask build  --board a1s --features matched-tone # strict post-render A/B against engine-tone
+cargo xtask build  --board a1s --features swapped-tone # matched A/B with only L/R peaks exchanged
 cargo xtask image  --board a1s [--merge]           # an espflash image under target/
 cargo xtask size   --board a1s                     # the image against its partition
 cargo xtask assets [--force]                       # regenerate the module images and gzip the page
@@ -145,6 +146,10 @@ cargo xtask monitor --board a1s
 
 # the owner-only matched A/B: same engine work, 125 Hz and measured stereo peaks
 cargo xtask flash --board a1s --features matched-tone
+cargo xtask monitor --board a1s
+
+# the owner-only channel discriminator: matched A/B with only its L/R peaks exchanged
+cargo xtask flash --board a1s --features swapped-tone
 cargo xtask monitor --board a1s
 
 # the C5 (M8-I4): one flash, no audio, no listening check — see the "C5" note below
@@ -234,7 +239,8 @@ to amplitude 28 672, has a full forward loop and a 32 kHz reference rate. `B00` 
 order list to order zero, producing an uninterrupted 125 Hz tone through the real
 `EmbeddedPlayer<Linear>` path at 44.1 kHz under its default `AtEnd::Continue` policy. Board
 master remains 1/4 and no post-render override is installed. `engine-tone` is incompatible with
-`bench`, `tone` and `web`; it may be combined with `lcd`. A clean result would place the music
+`bench`, `tone`, `matched-tone`, `swapped-tone` and `web`; it may be combined with `lcd`. A clean
+result would place the music
 grain in REFLEX's source material, while a grainy result would keep the sequencer, mixer,
 interpolator or master path under study.
 
@@ -255,13 +261,24 @@ before packing with a continuous 125 Hz integer-Q15 sine. A wrapping full-turn p
 advances by the exact rounded 12 173 944 units per 44.1 kHz frame and scales the channels to the
 host engine capture's signed peaks, 4 796 left and 5 327 right. Phase state continues from the
 initial ring prefill through muted handoffs and steady descriptor refill; there is no silence
-gate. `matched-tone` is incompatible with `bench`, `tone`, `engine-tone` and `web`, but may be
-combined with `lcd`.
+gate. `matched-tone` is incompatible with `bench`, `tone`, `engine-tone`, `swapped-tone` and
+`web`, but may be combined with `lcd`.
 
 The matched 125 Hz image also buzzed. In the owner's trimmed phone recording, unwanted lines
 begin at 297.363 Hz and repeat about every 86.13 Hz, exactly the cadence of 512 output frames or
 two DMA descriptors. The earlier clean direct tone hid this splice because its waveform repeats
 every 256 frames, exactly one descriptor, and its gates are descriptor aligned.
+
+After the heap-backed constrained handoff passed its objective transport checks, its matched tone
+still buzzed irregularly. KEY1 left the override tone in both channels while stopping the engine
+underlay, and the buzz moved from the centre to the right; resuming returned it to the centre. The
+default-off `--features swapped-tone` discriminator keeps that exact module, 1/4 master, 125 Hz
+Q15 phase and post-render placement, but exchanges only the generator peaks to 5 327 left and
+4 796 right. `MatchedTone::with_peaks` is the shared generator configuration, so phase still
+continues from prefill through startup and steady handoffs. `swapped-tone` is incompatible with
+`bench`, `tone`, `engine-tone`, `matched-tone` and `web`, may be combined with `lcd`, and leaves
+KEY1's ordinary play/stop mapping intact. If stopped buzz moves left it follows numeric level; if
+it remains right it follows the physical right output path.
 
 The same run confirmed the DMA remediation from
 `plans/engine/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
@@ -428,6 +445,12 @@ A `matched-tone` image renders the same controlled module underneath and reports
 
 ```text
 MATCHED-TONE output=125 Hz peaks=4796/5327 generator=integer-Q15 continuous underlay=engine-tone interpolation=linear master=1/4
+```
+
+A `swapped-tone` image changes only those generator peaks and reports:
+
+```text
+SWAPPED-TONE output=125 Hz peaks=5327/4796 generator=integer-Q15 continuous underlay=engine-tone interpolation=linear master=1/4
 ```
 
 An `lcd` build's boot log has one more line before `MODULE` — `LCD  ST7789

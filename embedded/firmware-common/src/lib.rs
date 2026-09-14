@@ -62,7 +62,8 @@ pub use tone::{
     DIAGNOSTIC_TONE_SILENT_FRAMES, DiagnosticTone, ENGINE_TONE_LOOP_FRAMES,
     ENGINE_TONE_OUTPUT_FREQUENCY_HZ, ENGINE_TONE_REFERENCE_RATE_HZ, ENGINE_TONE_SOURCE_AMPLITUDE,
     MATCHED_TONE_FREQUENCY_HZ, MATCHED_TONE_LEFT_PEAK, MATCHED_TONE_PHASE_INCREMENT,
-    MATCHED_TONE_RIGHT_PEAK, MatchedTone, engine_tone_module,
+    MATCHED_TONE_RIGHT_PEAK, MatchedTone, SWAPPED_TONE_LEFT_PEAK, SWAPPED_TONE_RIGHT_PEAK,
+    engine_tone_module,
 };
 pub use volume::{cap_master_volume, lower_master_volume, raise_master_volume};
 

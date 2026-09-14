@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M8 ([master plan](M8-master-plan.md)), remediating [I3](complete/M8-task-I3-esp32-a1s-bringup.md)'s `audio.rs` |
-| Status | **Open, written 2026-09-14.** The descriptor-coherent 172 Hz direct tone is accepted clean, while both continuous 125 Hz comparisons buzz. The heap-backed constrained one-descriptor handoff now passes objective hardware checks; owner clean/buzz listening and normal-music acceptance remain pending |
+| Status | **Open, written 2026-09-14.** The descriptor-coherent 172 Hz direct tone is accepted clean, while both continuous 125 Hz comparisons buzz. The heap-backed constrained one-descriptor handoff and swapped-channel discriminator pass objective hardware checks; the owner's playing/stopped result and normal-music acceptance remain pending |
 | Depends on | — (the diagnosis is done; see `plans/reference/embedded-budget.md` §4a) |
 | Blocks | Reliable A1S playback. M8's exit criterion is "sound from the headphone jack", transport progress and codec output routing must both be verified |
 | Parallel with | Work outside the A1S audio, codec and boot files |
@@ -796,3 +796,78 @@ post-open allocation, audio startup, complete one-descriptor handoffs, sustained
 the native song loop all ran without a stack failure or growing transport counter. The owner's
 clean/buzz result for the continuous matched 125 Hz output remains pending, as does clean normal
 music. Keep this plan open and unarchived.
+
+### Irregular buzz and swapped-channel discriminator (2026-09-14)
+
+The owner reports that the heap-backed constrained-handoff tone still buzzes, now irregularly.
+Pressing KEY1 once leaves the 125 Hz tone present in both channels but moves the buzz to the right
+channel; pressing KEY1 again returns the buzz to the centre. In the six-key build KEY1 only
+toggles `ControlHalf` between play and stop. `MatchedTone` runs after render with independent
+state and fixed samples, so KEY1 changes neither tone phase nor left/right samples, packer, DMA,
+codec or gain. The observation therefore proves that the central component depends on whether
+the underlying engine is actively rendering. The stopped right-only component could either be a
+physical right-path defect or follow the right channel's deliberately higher 5 327-count peak
+versus 4 796 on the left.
+
+Add one final controlled channel discriminator without changing the accepted handoff:
+
+- add a default-off A1S `swapped-tone` feature which selects the same controlled engine module,
+  1/4 master, 125 Hz Q15 generator, phase increment and continuous post-render placement as
+  `matched-tone`, but swaps only the generator peaks to 5 327 left and 4 796 right;
+- preserve `matched-tone` unchanged for reproducibility. Share generator implementation and add
+  an explicit constructor/configuration for swapped peaks; phase must still continue from prefill
+  through every handoff. Print `SWAPPED-TONE` with both channel peaks and the engine underlay;
+- make the feature incompatible with `bench`, `tone`, `engine-tone`, `matched-tone` and `web`,
+  while allowing `lcd`. KEY1 must retain its ordinary play/stop mapping so the owner can compare
+  engine-active and engine-stopped states;
+- add host assertions that the swapped generator reverses the exact signed peaks while retaining
+  polarity, phase and continuity. Keep refill allocation-free and leave the heap-backed packed
+  descriptor, constrained one-descriptor `push_with`, counters, geometry, PCM packing, clocks and
+  codec registers unchanged;
+- verify firmware-common tests and A1S normal, `matched-tone`, `swapped-tone`, and
+  `swapped-tone,lcd` release builds. Build and flash only `swapped-tone`, capture objective boot
+  and cadence evidence through `B00`, then have the owner listen once while playing, press KEY1
+  once and listen while stopped, and report where the buzz is in each state.
+
+Interpretation: if stopped buzz moves to the left, it follows the higher numeric level; if it
+stays on the right, it follows the physical right codec/headphone path. If the centred irregular
+component disappears whenever stopped in both images, it follows engine workload or timing. Use
+that result to choose the next fix; do not alter normal playback yet.
+
+Implementation result: the default-off A1S `swapped-tone` feature selects the same heap-built
+native S3M, 1/4 master, post-render position, integer-Q15 lookup and 12 173 944-unit phase step as
+`matched-tone`. The shared `MatchedTone::with_peaks` constructor stores independent channel peaks;
+the existing `new` constructor still selects 4 796 left and 5 327 right byte-for-byte, while the
+swapped build selects 5 327 left and 4 796 right. One generator state remains in `OutputOverride`
+from synchronous prefill through muted startup and steady refill, so neither phase nor placement
+changes at a handoff. Boot identifies `SWAPPED-TONE` and both peaks. The feature rejects `bench`,
+`tone`, `engine-tone`, `matched-tone` and `web`, permits `lcd`, and does not touch KEY1 handling.
+
+Host assertions pin both positive and negative swapped extrema, same-polarity channels, bounded
+adjacent samples and byte-identical phase continuity across unequal calls. All 71 firmware-common
+tests and A1S normal, `matched-tone`, `swapped-tone`, and `swapped-tone,lcd` release builds pass. The
+heap-backed buffer, constrained one-descriptor `push_with`, counters, descriptor geometry, PCM
+packing, clocks, codec and original `matched-tone` configuration are unchanged. Objective hardware
+evidence follows. The owner's playing/stopped channel result remains pending; keep this plan open.
+
+### Swapped-tone objective hardware run (2026-09-14)
+
+The flashed discriminator image passes its objective identity, allocation, codec, transport,
+cadence and native-loop checks:
+
+- Exact image: `embedded/target/starplayer-a1s-swapped-tone-merged.bin`, 431 424 bytes,
+  SHA-256 `6ce03f768fde170c8a11e039d8ef29a9197039e9608a16f75c61b4682d7575b6`.
+  `esptool` flash-hash verification passed on the ESP32 at MAC `b4:bf:e9:dd:d3:e4`.
+- A fresh reset identified `SWAPPED-TONE` at 125 Hz with peaks 5 327 left and 4 796 right.
+  Heap use was 27 932 bytes with 94 948 free after player open, then 29 980 used with
+  92 900 free after audio start: the expected exact 2 048-byte increase.
+- The codec remained ES8388 32-bit Philips slave with headphone analog at -12 dB. I2S remained
+  44 100 Hz stereo 32-bit with the six-quantum ring.
+- The native S3M crossed `B00` from row 59 to row 03. Final transport counters were
+  `offered=5330944 written=5330944 pushes=2603`; peak stayed at or below 5 327,
+  `underruns=0`, and the recovered startup `dma_errors=1` remained fixed.
+
+This accepts the swapped-tone image objectively: the exact exchanged channel peaks, post-open
+allocation, controlled codec/I2S configuration, sustained one-descriptor cadence and native song
+loop all behaved as specified. The owner's playing/stopped listening result remains pending, as
+does clean normal music. Keep this plan open and unarchived.

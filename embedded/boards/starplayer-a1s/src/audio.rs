@@ -26,13 +26,14 @@
 //! to 352 800 B/s. See
 //! `plans/reference/embedded-budget.md` §4a for the underlying esp-hal and Star FX analysis.
 //!
-//! With the board-only `tone` or `matched-tone` feature, the renderer still advances normally
-//! and an integer diagnostic sine replaces each complete output quantum immediately before the
-//! shared 32-bit packer. The override state travels from ring prefill through the muted handoffs
-//! into steady refill, so phase never restarts at a handoff. `tone` uses the compile-time table
-//! and its one-second silence gate; `matched-tone` is a continuous full-turn Q15 accumulator
-//! matched to the engine-tone's measured channel peaks. The default and `engine-tone` builds'
-//! override is a zero-sized no-op.
+//! With the board-only `tone`, `matched-tone` or `swapped-tone` feature, the renderer still
+//! advances normally and an integer diagnostic sine replaces each complete output quantum
+//! immediately before the shared 32-bit packer. The override state travels from ring prefill
+//! through the muted handoffs into steady refill, so phase never restarts at a handoff. `tone`
+//! uses the compile-time table
+//! and its one-second silence gate; the matched comparisons use one continuous full-turn Q15
+//! accumulator configured with the engine-tone's measured peaks in normal or swapped channel
+//! order. The default and `engine-tone` builds' override is a zero-sized no-op.
 //!
 //! # Why construction and refill share core 1
 //!
@@ -144,7 +145,7 @@ static DESCRIPTOR_SCRATCH: ConstStaticCell<[i16; DESCRIPTOR_SAMPLES]> = ConstSta
 struct OutputOverride {
     #[cfg(feature = "tone")]
     tone: firmware_common::DiagnosticTone,
-    #[cfg(feature = "matched-tone")]
+    #[cfg(any(feature = "matched-tone", feature = "swapped-tone"))]
     matched_tone: firmware_common::MatchedTone,
 }
 
@@ -153,8 +154,8 @@ impl OutputOverride {
         OutputOverride {
             #[cfg(feature = "tone")]
             tone: firmware_common::DiagnosticTone::new(),
-            #[cfg(feature = "matched-tone")]
-            matched_tone: firmware_common::MatchedTone::new(),
+            #[cfg(any(feature = "matched-tone", feature = "swapped-tone"))]
+            matched_tone: comparison_tone(),
         }
     }
 
@@ -162,11 +163,24 @@ impl OutputOverride {
     fn apply(&mut self, destination: &mut [i16]) {
         #[cfg(feature = "tone")]
         self.tone.overwrite(destination);
-        #[cfg(feature = "matched-tone")]
+        #[cfg(any(feature = "matched-tone", feature = "swapped-tone"))]
         self.matched_tone.overwrite(destination);
-        #[cfg(not(any(feature = "tone", feature = "matched-tone")))]
+        #[cfg(not(any(feature = "tone", feature = "matched-tone", feature = "swapped-tone")))]
         let _ = destination;
     }
+}
+
+#[cfg(any(feature = "matched-tone", feature = "swapped-tone"))]
+const fn comparison_tone() -> firmware_common::MatchedTone {
+    #[cfg(feature = "swapped-tone")]
+    {
+        return firmware_common::MatchedTone::with_peaks(
+            firmware_common::SWAPPED_TONE_LEFT_PEAK,
+            firmware_common::SWAPPED_TONE_RIGHT_PEAK,
+        );
+    }
+    #[cfg(not(feature = "swapped-tone"))]
+    firmware_common::MatchedTone::new()
 }
 
 /// Swap left and right on the way to the codec.
