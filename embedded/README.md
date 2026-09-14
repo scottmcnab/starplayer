@@ -176,8 +176,12 @@ embedded/flash_image.sh
 
 The wrapper resolves `embedded/` from its own path, so invoking it by any valid relative or
 absolute path does not depend on the caller's working directory. It sources
-`~/export-esp-1.97.sh`, builds the merged image through `embedded/xtask`, and uses `esptool.py` to
-write `target/starplayer-a1s-web-merged.bin` at address zero. It defaults to the proven
+`~/export-esp-1.97.sh`, deletes its checkout's old merged image, package-cleans and rebuilds
+`embedded/xtask` for that checkout, and uses `esptool.py` to write
+`target/starplayer-a1s-web-merged.bin` at address zero. The wrapper refuses to run esptool unless
+that rebuild creates a non-empty image at the expected checkout-local path. This prevents Cargo
+from reusing an xtask compiled with another worktree's embedded manifest path and silently
+flashing a stale artifact. It defaults to the proven
 `rfc2217://192.168.0.151:8086?ign_set_control` endpoint at 460800 baud. Override either for another
 bridge without changing the fixed firmware personality:
 

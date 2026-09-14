@@ -23,9 +23,12 @@ command -v cargo >/dev/null 2>&1 || die "cargo is not available after sourcing $
 command -v esptool.py >/dev/null 2>&1 || die "esptool.py is not available on PATH"
 
 cd "${STARPLAYER_EMBEDDED_DIR}"
+rm -f -- "${STARPLAYER_WEB_IMAGE}"
+cargo clean -p starplayer-embedded-xtask
 cargo xtask image --board a1s --features web --merge
 
-[[ -f "${STARPLAYER_WEB_IMAGE}" ]] || die "merged web image was not generated: ${STARPLAYER_WEB_IMAGE}"
+[[ -f "${STARPLAYER_WEB_IMAGE}" && -s "${STARPLAYER_WEB_IMAGE}" ]] ||
+    die "non-empty merged web image was not generated in this checkout: ${STARPLAYER_WEB_IMAGE}"
 
 esptool.py --chip esp32 --baud "${STARPLAYER_FLASH_BAUD}" \
     -p "${STARPLAYER_RFC2217_ENDPOINT}" write_flash 0x0 "${STARPLAYER_WEB_IMAGE}"
