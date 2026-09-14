@@ -276,7 +276,7 @@ Two figures that are easy to assume wrongly, both measured with
   `MemoryCapability::Internal`.
 * **PSRAM remains claim-only.** The three 512 KiB upload/image buffers are claimed first,
   leaving 2 621 440 bytes on the installed 4 MiB board before network selection. Station
-  mode consumes 68 480 bytes for its two futures and leaves 2 552 960; portal mode consumes
+  mode consumes 25 584 bytes for its two futures after I8c and leaves 2 595 856; portal mode consumes
   10 048 and leaves 2 611 392. The arena is never registered with `esp_alloc`, so engine
   `Arc`s, seqlocks and task-header atomics cannot spill into external memory. The future
   bodies directly own no cross-core atomics; private picoserve `Cell`/waker state is polled
@@ -286,6 +286,14 @@ The first draft of `web.rs` measured **97 456 B** for the same two station worke
 reduced that to 68 560 B by funnelling JSON/text answers through one body type and decoding
 request bodies synchronously. That remains useful: it bounds the PSRAM claim and the
 request-path call depth even though the future body no longer consumes `.bss`.
+
+I8c (2026-09-15) then replaced by-value response arrays with one borrowed 1 408-byte
+buffer per worker. The request select/handler frame fell from 38 912 to 8 496 bytes,
+FlatRoutes from 27 824 to 2 992, and the response writer from 3 168 to 144. The two
+worker futures now occupy 25 584 bytes total (12 792 each). The exact scripted web
+image reports 57 548 bytes of linked stack; web,lcd retains 56 116. These measurements
+distinguish persistent future storage from temporary execution-stack usage: the prior
+PSRAM migration alone still overflowed core 0 when serving API requests.
 
 A **linker assertion now guards the stack**: `boards/starplayer-a1s/ld/stack-floor.x` fails
 the build if `_stack_start − _stack_end` drops under 32 KiB, so the next large static is a

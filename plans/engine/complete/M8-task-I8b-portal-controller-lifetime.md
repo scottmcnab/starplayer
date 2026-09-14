@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M8 |
-| Status | **Implemented 2026-09-15.** Hardware acceptance remains with the owner |
+| Status | **Complete 2026-09-15.** Owner confirmed SoftAP join, credentials save and reboot |
 | Recommended model | GPT-5.6-sol, low effort |
 | Depends on | I8a web internal-heap remediation |
 
@@ -76,3 +76,7 @@ dma_errors=1 counter stayed constant. Capture: /tmp/starplayer-portal-lifetime.l
 Only owner acceptance remains: confirm SSID visibility for a minute, join and obtain an
 address, load http://192.168.4.1/, and save credentials to verify reboot/station connection.
 The UART announcement is not evidence of over-the-air visibility or successful provisioning.
+
+Owner acceptance on 2026-09-15 confirmed the phone joined the SoftAP, saved network
+credentials and rebooted successfully. The subsequent station-mode page crash is a
+separate request-stack issue tracked by I8c.

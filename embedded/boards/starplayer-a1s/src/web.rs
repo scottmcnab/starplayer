@@ -61,9 +61,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_net::Stack;
 use embassy_net::tcp::TcpSocket;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel;
-use embassy_sync::mutex::Mutex;
+use embassy_sync::mutex::{Mutex, MutexGuard};
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer, with_timeout};
 use esp_println::println;
@@ -100,10 +100,9 @@ const TCP_BUFFER_BYTES: usize = 1024;
 const HTTP_BUFFER_BYTES: usize = 1024;
 /// The largest JSON body this API answers with — the status, with sixteen channel rows.
 ///
-/// Every byte here is counted twice in a worker's PSRAM-resident future (the scratch the
-/// encoder writes into and the [`Body`] it is copied to), so this is sized to the largest
-/// real answer rather than rounded up: sixteen channel rows of roughly seventy bytes plus
-/// a header of about two hundred.
+/// This is sized to the largest real answer rather than rounded up: sixteen channel rows
+/// of roughly seventy bytes plus a header of about two hundred. Each worker owns one of
+/// these buffers in its PSRAM-resident future and lends it to [`Body`] while writing.
 const BODY_BYTES: usize = 1408;
 
 /// The largest request body the upload endpoint accepts, which is the size of the PSRAM
@@ -688,77 +687,81 @@ fn apply_command(control: &mut ControlHalf, command: Command) {
 // Responses
 // ---------------------------------------------------------------------------
 
-/// A response body built in a fixed buffer.
+/// One worker's response bytes, stored with that worker's future in PSRAM.
+type ResponseBuffer = Mutex<NoopRawMutex, [u8; BODY_BYTES]>;
+
+/// A response body borrowed from one worker's fixed buffer.
 ///
 /// Pre-serialised into bytes rather than handed to picoserve as a `serde::Serialize`, for
 /// the reason ampkeeper found the hard way: the response machinery monomorphises per body
 /// type and each instantiation is kilobytes of stack frame. One concrete body type is one
-/// instantiation whatever the endpoint.
-struct Body {
-    bytes: heapless::Vec<u8, BODY_BYTES>,
+/// instantiation whatever the endpoint. The large byte array itself stays in the worker's
+/// PSRAM-resident future: passing a `heapless::Vec` by value made generated picoserve poll
+/// functions reserve tens of kilobytes of core-0 stack while moving async state.
+struct Body<'a> {
+    buffer: MutexGuard<'a, NoopRawMutex, [u8; BODY_BYTES]>,
+    length: usize,
     content_type: &'static str,
 }
 
-impl Body {
-    /// An empty JSON body, filled to capacity so that [`Body::scratch`] can be written
-    /// into directly.
-    ///
-    /// Serialising into the body's own buffer rather than into a local array and copying
-    /// is not tidiness: the local array would be a second [`BODY_BYTES`] in the worker's
-    /// PSRAM claim for every endpoint that answers with JSON.
-    fn json() -> Body {
-        let mut bytes = heapless::Vec::new();
-        let _ = bytes.resize_default(BODY_BYTES);
-        Body { bytes, content_type: "application/json" }
+impl<'a> Body<'a> {
+    /// Lock one worker's response buffer for the response's lifetime.
+    async fn new(response_buffer: &'a ResponseBuffer, content_type: &'static str) -> Body<'a> {
+        Body { buffer: response_buffer.lock().await, length: 0, content_type }
     }
 
     /// The buffer an encoder writes into.
-    fn scratch(&mut self) -> &mut [u8] { &mut self.bytes }
+    fn scratch(&mut self) -> &mut [u8] { &mut *self.buffer }
 
     /// Keep the first `length` bytes — what the encoder actually wrote.
-    fn truncate(&mut self, length: usize) { self.bytes.truncate(length); }
+    fn truncate(&mut self, length: usize) { self.length = length; }
 }
 
-impl Content for Body {
+impl Content for Body<'_> {
     fn content_type(&self) -> &'static str { self.content_type }
-    fn content_length(&self) -> usize { self.bytes.len() }
-    async fn write_content<W: Write>(self, mut writer: W) -> Result<(), W::Error> { writer.write_all(&self.bytes).await }
+    fn content_length(&self) -> usize { self.length }
+    async fn write_content<W: Write>(self, mut writer: W) -> Result<(), W::Error> { writer.write_all(&self.buffer[..self.length]).await }
 }
 
 /// A plain-text answer — every failure this API reports is a sentence, not a code.
-fn text(status: StatusCode, message: &str) -> (StatusCode, Body) {
-    let mut body = Body { bytes: heapless::Vec::new(), content_type: "text/plain; charset=utf-8" };
-    let _ = body.bytes.extend_from_slice(message.as_bytes());
+async fn text<'a>(response_buffer: &'a ResponseBuffer, status: StatusCode, message: &str) -> (StatusCode, Body<'a>) {
+    let mut body = Body::new(response_buffer, "text/plain; charset=utf-8").await;
+    let length = message.len().min(BODY_BYTES);
+    body.buffer[..length].copy_from_slice(&message.as_bytes()[..length]);
+    body.length = length;
     (status, body)
 }
 
 /// Turn a job's answer into a response: 204 on success, 409 with the reason on failure.
-fn job_response(outcome: JobOutcome) -> (StatusCode, Body) {
+async fn job_response(response_buffer: &ResponseBuffer, outcome: JobOutcome) -> (StatusCode, Body<'_>) {
     match outcome {
-        JobOutcome::Done => text(StatusCode::NO_CONTENT, ""),
-        JobOutcome::Failed(message) => text(StatusCode::CONFLICT, message),
+        JobOutcome::Done => text(response_buffer, StatusCode::NO_CONTENT, "").await,
+        JobOutcome::Failed(message) => text(response_buffer, StatusCode::CONFLICT, message).await,
     }
 }
 
 /// `GET /api/status`.
-async fn status_response() -> (StatusCode, Body) {
+async fn status_response(response_buffer: &ResponseBuffer) -> (StatusCode, Body<'_>) {
     let guard = STATUS.lock().await;
     let Some(published) = guard.as_ref() else {
-        return text(StatusCode::SERVICE_UNAVAILABLE, "the player has not published a snapshot yet");
+        return text(response_buffer, StatusCode::SERVICE_UNAVAILABLE, "the player has not published a snapshot yet").await;
     };
     let status = api::Status::new(&published.view, &published.host, published.format, published.source.as_str());
-    let mut body = Body::json();
+    let mut body = Body::new(response_buffer, "application/json").await;
     match api::write_status_json(body.scratch(), &status) {
         Some(length) => {
             body.truncate(length);
             (StatusCode::OK, body)
         }
-        None => text(StatusCode::INTERNAL_SERVER_ERROR, "the status did not fit its buffer"),
+        None => {
+            drop(body);
+            text(response_buffer, StatusCode::INTERNAL_SERVER_ERROR, "the status did not fit its buffer").await
+        }
     }
 }
 
 /// `GET /api/modules`.
-async fn modules_response() -> (StatusCode, Body) {
+async fn modules_response(response_buffer: &ResponseBuffer) -> (StatusCode, Body<'_>) {
     let current = STATUS.lock().await.as_ref().map(|published| published.module_id).unwrap_or(0);
     let entries = MODULES.lock().await;
     let mut list: heapless::Vec<api::ModuleEntry, MODULE_LIST_CAPACITY> = heapless::Vec::new();
@@ -771,13 +774,16 @@ async fn modules_response() -> (StatusCode, Body) {
             current: entry.id == current,
         });
     }
-    let mut body = Body::json();
+    let mut body = Body::new(response_buffer, "application/json").await;
     match api::write_modules_json(body.scratch(), &list) {
         Some(length) => {
             body.truncate(length);
             (StatusCode::OK, body)
         }
-        None => text(StatusCode::INTERNAL_SERVER_ERROR, "the module list did not fit its buffer"),
+        None => {
+            drop(body);
+            text(response_buffer, StatusCode::INTERNAL_SERVER_ERROR, "the module list did not fit its buffer").await
+        }
     }
 }
 
@@ -785,12 +791,12 @@ async fn modules_response() -> (StatusCode, Body) {
 ///
 /// The staging lock is held for the whole call — that, and nothing else, is what makes a
 /// second concurrent upload a 409.
-async fn upload_response<R: Read>(request: &mut Request<'_, R>) -> (StatusCode, Body) {
+async fn upload_response<'a, R: Read>(request: &mut Request<'_, R>, response_buffer: &'a ResponseBuffer) -> (StatusCode, Body<'a>) {
     let Ok(mut guard) = STAGING.try_lock() else {
-        return text(StatusCode::CONFLICT, "another upload is already in flight");
+        return text(response_buffer, StatusCode::CONFLICT, "another upload is already in flight").await;
     };
     let Some(staging) = guard.as_mut() else {
-        return text(StatusCode::INSUFFICIENT_STORAGE, "this board has no PSRAM to stage an upload in");
+        return text(response_buffer, StatusCode::INSUFFICIENT_STORAGE, "this board has no PSRAM to stage an upload in").await;
     };
 
     let capacity = staging.buffer.capacity();
@@ -799,9 +805,9 @@ async fn upload_response<R: Read>(request: &mut Request<'_, R>) -> (StatusCode, 
     if let Err(error) = staging.upload.reserve(expected, capacity) {
         staging.upload.abort();
         return match error {
-            api::UploadError::TooLarge => text(StatusCode::PAYLOAD_TOO_LARGE, "that module is larger than the upload buffer"),
-            api::UploadError::Empty => text(StatusCode::BAD_REQUEST, "the request body was empty"),
-            _ => text(StatusCode::CONFLICT, "another upload is already in flight"),
+            api::UploadError::TooLarge => text(response_buffer, StatusCode::PAYLOAD_TOO_LARGE, "that module is larger than the upload buffer").await,
+            api::UploadError::Empty => text(response_buffer, StatusCode::BAD_REQUEST, "the request body was empty").await,
+            _ => text(response_buffer, StatusCode::CONFLICT, "another upload is already in flight").await,
         };
     }
 
@@ -817,30 +823,30 @@ async fn upload_response<R: Read>(request: &mut Request<'_, R>) -> (StatusCode, 
             Ok(read) => {
                 if staging.upload.append(read).is_err() {
                     staging.upload.abort();
-                    return text(StatusCode::BAD_REQUEST, "the body was longer than its Content-Length");
+                    return text(response_buffer, StatusCode::BAD_REQUEST, "the body was longer than its Content-Length").await;
                 }
                 written += read;
             }
             Err(_) => {
                 staging.upload.abort();
-                return text(StatusCode::BAD_REQUEST, "the upload was cut short");
+                return text(response_buffer, StatusCode::BAD_REQUEST, "the upload was cut short").await;
             }
         }
     }
     let Ok(length) = staging.upload.complete() else {
         staging.upload.abort();
-        return text(StatusCode::BAD_REQUEST, "the upload was cut short");
+        return text(response_buffer, StatusCode::BAD_REQUEST, "the upload was cut short").await;
     };
 
     // SAFETY: `length` bytes were just written through the `as_mut` borrow above, which
     // has ended. The view stays valid while this function holds `STAGING`, which it does
     // until after the control task has answered.
     let Some(view) = (unsafe { staging.buffer.view(length) }) else {
-        return text(StatusCode::INTERNAL_SERVER_ERROR, "the staged upload could not be read back");
+        return text(response_buffer, StatusCode::INTERNAL_SERVER_ERROR, "the staged upload could not be read back").await;
     };
     match run_job(Job::LoadUpload(view)).await {
-        JobOutcome::Done => text(StatusCode::CREATED, "playing"),
-        JobOutcome::Failed(message) => text(StatusCode::CONFLICT, message),
+        JobOutcome::Done => text(response_buffer, StatusCode::CREATED, "playing").await,
+        JobOutcome::Failed(message) => text(response_buffer, StatusCode::CONFLICT, message).await,
     }
 }
 
@@ -862,9 +868,9 @@ async fn upload_response<R: Read>(request: &mut Request<'_, R>) -> (StatusCode, 
 /// decoded synchronously, and `write_to` appears exactly three times below.
 struct FlatRoutes;
 
-impl PathRouterService<()> for FlatRoutes {
+impl PathRouterService<ResponseBuffer> for FlatRoutes {
     async fn call_path_router_service<R: Read, W: ResponseWriter<Error = R::Error>>(
-        &self, state: &(), _path_parameters: (), path: Path<'_>, mut request: Request<'_, R>, response_writer: W,
+        &self, response_buffer: &ResponseBuffer, _path_parameters: (), path: Path<'_>, mut request: Request<'_, R>, response_writer: W,
     ) -> Result<ResponseSent, W::Error> {
         let method = request.parts.method();
         let path = path.encoded();
@@ -873,22 +879,22 @@ impl PathRouterService<()> for FlatRoutes {
         // `write_to` instantiation and no others.
         if (method, path) == ("GET", "/") {
             return picoserve::response::File::with_content_type_and_headers(picoserve::response::File::MIME_HTML, INDEX_HTML_GZ, GZIP_HEADERS)
-                .call_request_handler_service(state, (), request, response_writer)
+                .call_request_handler_service(&(), (), request, response_writer)
                 .await;
         }
         if (method, path) == ("GET", "/ws") {
-            let upgrade = picoserve::from_request!(state, request, response_writer, WebSocketUpgrade);
+            let upgrade = picoserve::from_request!(response_buffer, request, response_writer, WebSocketUpgrade);
             let response = upgrade.on_upgrade(TelemetrySocket);
             return response.write_to(request.body_connection.finalize().await?, response_writer).await;
         }
         if (method, path) == ("POST", "/api/modules") {
-            let response = upload_response(&mut request).await;
+            let response = upload_response(&mut request, response_buffer).await;
             return response.write_to(request.body_connection.finalize().await?, response_writer).await;
         }
 
         // Everything else: one body extraction, one decode, one response type.
-        let body = picoserve::from_request!(state, request, response_writer, &[u8]);
-        let response = dispatch(method, path, body).await;
+        let body = picoserve::from_request!(response_buffer, request, response_writer, &[u8]);
+        let response = dispatch(response_buffer, method, path, body).await;
         response.write_to(request.body_connection.finalize().await?, response_writer).await
     }
 }
@@ -899,36 +905,36 @@ impl PathRouterService<()> for FlatRoutes {
 /// these is a few dozen bytes of JSON, so decoding it here with `serde_json_core` rather
 /// than through picoserve's `Json` extractor costs nothing and saves one monomorphised
 /// extractor future per request type.
-async fn dispatch(method: &str, path: &str, body: &[u8]) -> (StatusCode, Body) {
+async fn dispatch<'a>(response_buffer: &'a ResponseBuffer, method: &str, path: &str, body: &[u8]) -> (StatusCode, Body<'a>) {
     match (method, path) {
-        ("GET", "/api/status") => status_response().await,
-        ("GET", "/api/modules") => modules_response().await,
-        ("POST", "/api/play") => accepted(send_command(Command::Play)),
-        ("POST", "/api/stop") => accepted(send_command(Command::Stop)),
-        ("POST", "/api/next") => accepted(send_command(Command::Skip(1))),
-        ("POST", "/api/previous") => accepted(send_command(Command::Skip(-1))),
+        ("GET", "/api/status") => status_response(response_buffer).await,
+        ("GET", "/api/modules") => modules_response(response_buffer).await,
+        ("POST", "/api/play") => accepted(response_buffer, send_command(Command::Play)).await,
+        ("POST", "/api/stop") => accepted(response_buffer, send_command(Command::Stop)).await,
+        ("POST", "/api/next") => accepted(response_buffer, send_command(Command::Skip(1))).await,
+        ("POST", "/api/previous") => accepted(response_buffer, send_command(Command::Skip(-1))).await,
         ("POST", "/api/seek") => match decode::<api::SeekRequest>(body) {
-            Some(request) => accepted(send_command(Command::SeekOrder(request.order))),
-            None => malformed(),
+            Some(request) => accepted(response_buffer, send_command(Command::SeekOrder(request.order))).await,
+            None => malformed(response_buffer).await,
         },
         ("POST", "/api/volume") => match decode::<api::VolumeRequest>(body) {
-            Some(request) => accepted(send_command(Command::Volume(U0F16::from_bits(request.level)))),
-            None => malformed(),
+            Some(request) => accepted(response_buffer, send_command(Command::Volume(U0F16::from_bits(request.level)))).await,
+            None => malformed(response_buffer).await,
         },
         ("POST", "/api/mute") => match decode::<api::MuteRequest>(body) {
-            Some(request) => accepted(send_command(Command::Mute { channel: request.channel, muted: request.muted })),
-            None => malformed(),
+            Some(request) => accepted(response_buffer, send_command(Command::Mute { channel: request.channel, muted: request.muted })).await,
+            None => malformed(response_buffer).await,
         },
         ("POST", "/api/modules/select") => match decode::<api::SlotRequest>(body) {
-            Some(request) => job_response(run_job(Job::Select(request.id)).await),
-            None => malformed(),
+            Some(request) => job_response(response_buffer, run_job(Job::Select(request.id)).await).await,
+            None => malformed(response_buffer).await,
         },
         ("POST", "/api/modules/store") => match decode::<api::SlotRequest>(body) {
-            Some(request) => job_response(run_job(Job::Store(request.id)).await),
-            None => malformed(),
+            Some(request) => job_response(response_buffer, run_job(Job::Store(request.id)).await).await,
+            None => malformed(response_buffer).await,
         },
-        ("POST", "/api/reprovision") => job_response(run_job(Job::ForgetWifi).await),
-        _ => text(StatusCode::NOT_FOUND, "no such endpoint"),
+        ("POST", "/api/reprovision") => job_response(response_buffer, run_job(Job::ForgetWifi).await).await,
+        _ => text(response_buffer, StatusCode::NOT_FOUND, "no such endpoint").await,
     }
 }
 
@@ -938,20 +944,17 @@ fn decode<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Option<T> {
 }
 
 /// The answer to a body that would not decode.
-fn malformed() -> (StatusCode, Body) { text(StatusCode::BAD_REQUEST, "that request body is not the JSON this endpoint expects") }
-
-/// 204 when the command was queued, 503 when the channel was full.
-fn accepted(queued: bool) -> (StatusCode, Body) {
-    if queued { text(StatusCode::NO_CONTENT, "") } else { text(StatusCode::SERVICE_UNAVAILABLE, "the player is busy; try again") }
+async fn malformed(response_buffer: &ResponseBuffer) -> (StatusCode, Body<'_>) {
+    text(response_buffer, StatusCode::BAD_REQUEST, "that request body is not the JSON this endpoint expects").await
 }
 
-/// The router, for `picoserve::Server::new`.
-struct Application;
-
-impl picoserve::AppBuilder for Application {
-    type PathRouter = impl picoserve::routing::PathRouter;
-
-    fn build_app(self) -> picoserve::Router<Self::PathRouter> { picoserve::Router::new().nest_service("", FlatRoutes) }
+/// 204 when the command was queued, 503 when the channel was full.
+async fn accepted(response_buffer: &ResponseBuffer, queued: bool) -> (StatusCode, Body<'_>) {
+    if queued {
+        text(response_buffer, StatusCode::NO_CONTENT, "").await
+    } else {
+        text(response_buffer, StatusCode::SERVICE_UNAVAILABLE, "the player is busy; try again").await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,7 +1063,8 @@ async fn web_task(id: usize, stack: Stack<'static>, config: &'static picoserve::
     let mut receive_buffer = [0u8; TCP_BUFFER_BYTES];
     let mut transmit_buffer = [0u8; TCP_BUFFER_BYTES];
     let mut http_buffer = [0u8; HTTP_BUFFER_BYTES];
-    let application = picoserve::AppBuilder::build_app(Application);
+    let response_buffer = ResponseBuffer::new([0u8; BODY_BYTES]);
+    let application = picoserve::Router::<_, ResponseBuffer>::new().nest_service("", FlatRoutes).with_state(&response_buffer);
 
     loop {
         if !stack.is_link_up() {

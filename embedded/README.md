@@ -798,15 +798,18 @@ bounds, and all are easy to undo by accident:
   68 560 bytes for the two station workers and 10 088 bytes for the one portal worker.
   I8 keeps each 48-byte Embassy header/pointer proxy in the internal heap and constructs
   only the selected personality's large future bodies directly in the claim-only PSRAM
-  arena: 68 480 bytes for station or 10 048 bytes for the portal. The arena is still not
+  arena: 25 584 bytes for station after I8c, or 10 048 bytes for the portal. The arena is still not
   registered with the global allocator.
 * **Routing is one flat `match`, and every JSON answer is one body type** (`web.rs`).
   picoserve monomorphises `write_to` per response type, and a `.route()` chain costs a
   stack frame per route. The first draft's two web workers were 97 KiB; the compact pair
-  is 68 480 bytes in PSRAM now.
+  is 25 584 bytes in PSRAM after I8c. Each worker retains one 1 408-byte response
+  buffer and passes a borrowed handle through the response code. This reduces the two
+  largest nested request frames from 38 912 / 27 824 bytes to 8 496 / 2 992 bytes;
+  putting future state in PSRAM alone did not bound execution-stack usage.
 
 `ld/stack-floor.x` fails the build if the main stack drops under 32 KiB. The exact linked
-core-0 stack is logged once at boot. The I8a links leave 57 564 bytes in `web` and 56 132
+core-0 stack is logged once at boot. The I8c links leave 57 548 bytes in `web` and 56 116
 bytes in `web,lcd`; default leaves 35 608 bytes and `lcd` leaves 34 200 bytes. If the
 assertion fires, shrink or move the new static — do not lower the floor.
 
@@ -839,7 +842,7 @@ assertion fires, shrink or move the new static — do not lower the floor.
   heap (`Arc` refcounts, the host's seqlocks, the telemetry ring). `src/main.rs` has the
   full reasoning; M8-I6 inherits the constraint. I8's picoserve workers use direct,
   aligned monotonic arena claims instead: their task headers and every shared atomic stay
-  in internal DRAM, while one portal future (10 048 bytes) or two station futures (68 480
+  in internal DRAM, while one portal future (10 048 bytes) or two station futures (25 584
   bytes total) occupy the otherwise unused PSRAM after the three 512 KiB module buffers.
 * **The whole async audio driver and refill task run on core 1** — the refill moved there in
   M8-I5, and the driver construction followed after the hardware result above. M8-I3's write-up
@@ -867,3 +870,8 @@ assertion fires, shrink or move the new static — do not lower the floor.
   PSRAM to take `DRAM_STAGING_BYTES` off the internal heap the way the A1S's `External`
   region does. `boards/starplayer-c5/src/main.rs`'s `HEAP_BYTES` doc comment has the
   arithmetic; `plans/reference/embedded-budget.md` §2 has the budget it is sized against.
+
+The web request hardware regression test is `python3 embedded/tests/web_smoke.py <board-ip>`.
+Close other StarPlayer tabs first so both workers are available. It validates HTTP responses
+and sixty seconds of WebSocket telemetry alongside HTTP, and reports bounded connection-refused
+retries while listeners cycle. Capture UART separately to check audio and panic diagnostics.
