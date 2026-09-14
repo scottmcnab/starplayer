@@ -26,6 +26,19 @@ pub const ENGINE_TONE_SOURCE_AMPLITUDE: i16 = 28_672;
 /// Frames in the engine-tone's whole-sample forward loop.
 pub const ENGINE_TONE_LOOP_FRAMES: u32 = 256;
 
+/// Frequency of the strict post-render comparison against the engine tone.
+pub const MATCHED_TONE_FREQUENCY_HZ: u32 = 125;
+
+/// Signed peak written to the left channel by [`MatchedTone`].
+pub const MATCHED_TONE_LEFT_PEAK: i16 = 4_796;
+
+/// Signed peak written to the right channel by [`MatchedTone`].
+pub const MATCHED_TONE_RIGHT_PEAK: i16 = 5_327;
+
+/// Rounded full-turn phase increment for 125 Hz at 44 100 Hz.
+pub const MATCHED_TONE_PHASE_INCREMENT: u32 =
+    ((MATCHED_TONE_FREQUENCY_HZ as u64 * (1u64 << 32) + crate::SAMPLE_RATE_HZ as u64 / 2) / crate::SAMPLE_RATE_HZ as u64) as u32;
+
 const TABLE_LENGTH: usize = 256;
 const PHASE_STEP: usize = 1;
 const TABLE_CYCLE_FRAMES: u32 = 256;
@@ -41,6 +54,7 @@ const _: () = assert!(DIAGNOSTIC_TONE_SILENT_FRAMES == 172 * TABLE_CYCLE_FRAMES)
 const _: () = assert!(ENGINE_TONE_LOOP_FRAMES as usize == TABLE_LENGTH);
 const _: () = assert!(DIAGNOSTIC_TONE_AMPLITUDE as i32 * ENGINE_TONE_SAMPLE_SCALE as i32 == ENGINE_TONE_SOURCE_AMPLITUDE as i32);
 const _: () = assert!(ENGINE_TONE_REFERENCE_RATE_HZ / ENGINE_TONE_LOOP_FRAMES == ENGINE_TONE_OUTPUT_FREQUENCY_HZ);
+const _: () = assert!(MATCHED_TONE_PHASE_INCREMENT == 12_173_944);
 
 /// One full, rounded 256-entry sine cycle at [`DIAGNOSTIC_TONE_AMPLITUDE`].
 const SINE: [i16; TABLE_LENGTH] = [
@@ -100,6 +114,43 @@ pub fn engine_tone_module() -> Result<Module, starplayer::core::Error> {
     header.title = "ENGINE-TONE".into();
     builder.set_header(header);
     builder.build()
+}
+
+/// Continuous post-render 125 Hz comparison matched to the host engine-tone channel peaks.
+///
+/// A wrapping `u32` represents one full turn. Every output frame reads the shared integer Q15
+/// sine table, scales the channels independently, then advances by the exact rounded phase
+/// increment. The state is allocation-free and remains owned by the audio refill from prefill
+/// onward.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MatchedTone {
+    phase: u32,
+}
+
+impl MatchedTone {
+    /// Start at the rising zero crossing.
+    pub const fn new() -> MatchedTone { MatchedTone { phase: 0 } }
+
+    /// Replace interleaved stereo with the continuous matched tone.
+    ///
+    /// An unexpected unpaired trailing sample is zeroed without advancing phase. This keeps an
+    /// invalid caller slice harmless without logging, allocating, locking or panicking.
+    pub fn overwrite(&mut self, destination: &mut [i16]) {
+        let mut frames = destination.chunks_exact_mut(2);
+        for frame in &mut frames {
+            let sine = starplayer::dsp::sin_q15(self.phase);
+            frame[0] = scale_q15_to_peak(sine, MATCHED_TONE_LEFT_PEAK);
+            frame[1] = scale_q15_to_peak(sine, MATCHED_TONE_RIGHT_PEAK);
+            self.phase = self.phase.wrapping_add(MATCHED_TONE_PHASE_INCREMENT);
+        }
+        frames.into_remainder().fill(0);
+    }
+}
+
+#[inline(always)]
+fn scale_q15_to_peak(sine: i32, peak: i16) -> i16 {
+    let magnitude = (i64::from(sine.abs()) * i64::from(peak) + i64::from(i16::MAX) / 2) / i64::from(i16::MAX);
+    if sine < 0 { (-magnitude) as i16 } else { magnitude as i16 }
 }
 
 /// Stateful dual-mono tone/zero generator. Phase and gate position continue across calls.
@@ -208,6 +259,73 @@ mod tests {
         let mut restarted = [i16::MAX; 4];
         tone.overwrite(&mut restarted);
         assert_eq!(restarted, [0, 0, SINE[PHASE_STEP], SINE[PHASE_STEP]]);
+    }
+
+    #[test]
+    fn matched_tone_phase_increment_is_the_exact_nearest_full_turn_step() {
+        let numerator = u64::from(MATCHED_TONE_FREQUENCY_HZ) * (1u64 << 32);
+        let sample_rate = u64::from(crate::SAMPLE_RATE_HZ);
+        assert_eq!(MATCHED_TONE_PHASE_INCREMENT, 12_173_944);
+        let chosen_error = (u64::from(MATCHED_TONE_PHASE_INCREMENT) * sample_rate).abs_diff(numerator);
+        let lower_error = (u64::from(MATCHED_TONE_PHASE_INCREMENT - 1) * sample_rate).abs_diff(numerator);
+        let upper_error = (u64::from(MATCHED_TONE_PHASE_INCREMENT + 1) * sample_rate).abs_diff(numerator);
+        assert!(chosen_error < lower_error && chosen_error < upper_error);
+    }
+
+    #[test]
+    fn matched_tone_hits_independent_signed_channel_peaks() {
+        let mut positive = MatchedTone { phase: 1 << 30 };
+        let mut frame = [0i16; 2];
+        positive.overwrite(&mut frame);
+        assert_eq!(frame, [MATCHED_TONE_LEFT_PEAK, MATCHED_TONE_RIGHT_PEAK]);
+
+        let mut negative = MatchedTone { phase: 3 << 30 };
+        negative.overwrite(&mut frame);
+        assert_eq!(frame, [-MATCHED_TONE_LEFT_PEAK, -MATCHED_TONE_RIGHT_PEAK]);
+    }
+
+    #[test]
+    fn matched_tone_is_continuous_bounded_and_keeps_channel_polarity() {
+        let mut tone = MatchedTone::new();
+        let mut previous: Option<[i16; 2]> = None;
+        for _ in 0..crate::SAMPLE_RATE_HZ as usize * 2 / 128 {
+            let mut block = [i16::MAX; 128 * 2];
+            tone.overwrite(&mut block);
+            assert!(block.iter().any(|sample| *sample != 0), "the continuous comparison has no silence gate");
+            for frame in block.chunks_exact(2) {
+                assert!(frame[0].abs() <= MATCHED_TONE_LEFT_PEAK);
+                assert!(frame[1].abs() <= MATCHED_TONE_RIGHT_PEAK);
+                assert!(i32::from(frame[0]) * i32::from(frame[1]) >= 0);
+                if let Some(previous_frame) = previous {
+                    assert!(frame[0].abs_diff(previous_frame[0]) <= 128);
+                    assert!(frame[1].abs_diff(previous_frame[1]) <= 128);
+                }
+                previous = Some([frame[0], frame[1]]);
+            }
+        }
+    }
+
+    #[test]
+    fn matched_tone_phase_continues_across_unequal_calls_and_ignores_an_unpaired_sample() {
+        let mut whole_tone = MatchedTone::new();
+        let mut whole = [i16::MAX; 514];
+        whole_tone.overwrite(&mut whole);
+
+        let mut split_tone = MatchedTone::new();
+        let mut split = [i16::MAX; 514];
+        split_tone.overwrite(&mut split[..6]);
+        split_tone.overwrite(&mut split[6..204]);
+        split_tone.overwrite(&mut split[204..]);
+        assert_eq!(split, whole);
+        assert_eq!(split_tone, whole_tone);
+
+        let mut odd_tone = MatchedTone::new();
+        let mut odd = [i16::MAX; 3];
+        odd_tone.overwrite(&mut odd);
+        assert_eq!(odd, [0, 0, 0]);
+        let mut following = [i16::MAX; 2];
+        odd_tone.overwrite(&mut following);
+        assert_eq!(following, &whole[2..4]);
     }
 
     #[test]

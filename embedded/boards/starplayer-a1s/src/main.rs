@@ -11,6 +11,8 @@
 //!   quantum with a gated dual-mono diagnostic sine immediately before 32-bit I2S packing;
 //! * the standalone **`engine-tone`** build replaces the boot module before playback with a
 //!   one-channel native S3M whose 16-bit looping sine traverses the actual engine path;
+//! * the standalone **`matched-tone`** build renders that same S3M, then replaces each outgoing
+//!   quantum with a continuous 125 Hz Q15 sine matched to its measured left/right peaks;
 //! * the **`bench`** build ([`bench`]) makes no sound and instead renders every golden
 //!   fixture, printing its SHA-256 and its cost.
 //!
@@ -86,6 +88,8 @@
 compile_error!("the A1S `tone` diagnostic needs the audio build and cannot be combined with `bench`");
 #[cfg(all(feature = "engine-tone", any(feature = "bench", feature = "tone", feature = "web")))]
 compile_error!("the standalone A1S `engine-tone` diagnostic cannot be combined with `bench`, `tone` or `web`");
+#[cfg(all(feature = "matched-tone", any(feature = "bench", feature = "tone", feature = "engine-tone", feature = "web")))]
+compile_error!("the standalone A1S `matched-tone` diagnostic cannot be combined with `bench`, `tone`, `engine-tone` or `web`");
 
 extern crate alloc;
 
@@ -97,7 +101,7 @@ mod bench;
 mod board;
 #[cfg(not(feature = "bench"))]
 mod es8388;
-#[cfg(not(feature = "engine-tone"))]
+#[cfg(not(any(feature = "engine-tone", feature = "matched-tone")))]
 mod images;
 #[cfg(not(feature = "bench"))]
 mod keys;
@@ -126,7 +130,7 @@ use firmware_common::{Key, KeyEvent, NowPlaying};
 use starplayer::core::U0F16;
 #[cfg(not(feature = "bench"))]
 use starplayer::dsp::Linear;
-#[cfg(all(not(feature = "bench"), not(feature = "engine-tone")))]
+#[cfg(all(not(feature = "bench"), not(feature = "engine-tone"), not(feature = "matched-tone")))]
 use starplayer::model::Module;
 #[cfg(not(feature = "bench"))]
 use starplayer::rt::Arc;
@@ -435,11 +439,11 @@ async fn play(
     // Normal firmware borrows REFLEX straight from memory-mapped flash, PCM and all. The
     // standalone engine diagnostic instead allocates its controlled native S3M once here,
     // before either the player or audio task exists.
-    #[cfg(not(feature = "engine-tone"))]
+    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone")))]
     let image = images::boot_module();
-    #[cfg(not(feature = "engine-tone"))]
+    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone")))]
     let module = Arc::new(Module::from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?);
-    #[cfg(not(feature = "engine-tone"))]
+    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone")))]
     println!(
         "MODULE image={} bytes ({}) channels={} samples={}",
         image.len(),
@@ -447,7 +451,7 @@ async fn play(
         module.header().channel_count,
         module.samples().len(),
     );
-    #[cfg(feature = "engine-tone")]
+    #[cfg(any(feature = "engine-tone", feature = "matched-tone"))]
     let module = Arc::new(firmware_common::engine_tone_module().map_err(|_| "the engine-tone module would not build")?);
     #[cfg(feature = "engine-tone")]
     println!(
@@ -456,6 +460,13 @@ async fn play(
         firmware_common::ENGINE_TONE_REFERENCE_RATE_HZ,
         firmware_common::ENGINE_TONE_SOURCE_AMPLITUDE,
         firmware_common::ENGINE_TONE_LOOP_FRAMES,
+    );
+    #[cfg(feature = "matched-tone")]
+    println!(
+        "MATCHED-TONE output={} Hz peaks={}/{} generator=integer-Q15 continuous underlay=engine-tone interpolation=linear master=1/4",
+        firmware_common::MATCHED_TONE_FREQUENCY_HZ,
+        firmware_common::MATCHED_TONE_LEFT_PEAK,
+        firmware_common::MATCHED_TONE_RIGHT_PEAK,
     );
 
     let (render, mut control) = EmbeddedPlayer::<Linear>::open(Arc::clone(&module), firmware_common::SAMPLE_RATE_HZ)

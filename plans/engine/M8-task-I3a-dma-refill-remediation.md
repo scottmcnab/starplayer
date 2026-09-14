@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M8 ([master plan](M8-master-plan.md)), remediating [I3](complete/M8-task-I3-esp32-a1s-bringup.md)'s `audio.rs` |
-| Status | **Open, written 2026-09-14.** The lower-frequency direct tone and gated silence are accepted clean; the allocation-safe engine-tone image, configuration, cadence and native `B00` loop are objectively accepted. Owner clean/grainy 125 Hz listening and normal-music acceptance remain pending |
+| Status | **Open, written 2026-09-14.** The 172 Hz direct tone is accepted clean; the allocation-safe engine-tone and matched-tone images are objectively accepted, but the owner hears buzz from the engine-rendered 125 Hz output. Matched-tone clean/buzz listening and normal-music acceptance remain pending |
 | Depends on | — (the diagnosis is done; see `plans/reference/embedded-budget.md` §4a) |
 | Blocks | Reliable A1S playback. M8's exit criterion is "sound from the headphone jack", transport progress and codec output routing must both be verified |
 | Parallel with | Work outside the A1S audio, codec and boot files |
@@ -502,3 +502,88 @@ The final native-`B00` image passed its objective identity, boot, cadence and lo
 This accepts the engine-path image, configuration, refill cadence and allocation-safe `B00`
 loop. The owner's clean/grainy listening result for the 125 Hz engine-rendered tone remains
 pending, as does clean normal-music acceptance. Keep this plan open and unarchived.
+
+### Matched post-render A/B after engine-tone buzz (2026-09-14)
+
+The owner reports that the engine-rendered 125 Hz tone is buzzing. A host capture of the exact
+same `engine_tone_module()` path is smooth: after its startup second, its left and right peaks
+are 4 796 and 5 327, the largest adjacent-sample change is 87, the 125 Hz fundamental measures
+about 4 697 counts on the left, and its second harmonic is about −63 dB relative to full peak
+with higher harmonics below −69 dB. There is no sample-loop discontinuity in the host output.
+The earlier 172.265625 Hz, amplitude-4 096 dual-mono post-render tone was clean on this board,
+so the next experiment must hold frequency, level, stereo balance, engine work, DMA and codec
+configuration constant while changing only whether the audible samples came from the engine.
+
+Implement a second A1S-only post-render diagnostic for this strict comparison:
+
+- add a default-off `matched-tone` feature. It must construct and render the same controlled
+  `engine_tone_module()` as `engine-tone`, at the same 1/4 master setting, while replacing every
+  completed output quantum immediately before the shared PCM packer;
+- generate a continuous 125 Hz signed integer sine at 44 100 Hz with a wrapping full-turn phase
+  accumulator and the existing table-driven `starplayer::dsp::sin_q15`; do not use floating
+  point or transcendental functions in the audio path;
+- scale left and right to signed peaks 4 796 and 5 327 respectively, matching the measured
+  steady host engine output and its native S3M centre-pan imbalance. Preserve phase across ring
+  prefill, muted handoffs and every descriptor refill. This comparison is continuous and has no
+  silence gate;
+- make `matched-tone` compile-time incompatible with `bench`, `tone`, `engine-tone` and `web`.
+  Normal, `tone` and `engine-tone` behavior must remain unchanged. Share the controlled-module
+  selection cleanly between `engine-tone` and `matched-tone`, without enabling the normal flash
+  image module in either diagnostic;
+- print an unambiguous `MATCHED-TONE` boot line with 125 Hz, both peaks, integer Q15 generation,
+  continuous operation, `engine-tone` render underneath, linear interpolation and master 1/4;
+- add host tests that cover the exact rounded phase increment, independent left/right peaks,
+  signed polarity, phase continuity across unequal calls, continuous output, safe handling of an
+  unpaired trailing sample and a conservative adjacent-sample bound. The generator must allocate
+  nothing, log nothing, lock nothing and panic nowhere in the refill path;
+- verify `cargo test -p starplayer-firmware-common` and A1S release builds for normal, `tone`,
+  `engine-tone`, `matched-tone`, and `matched-tone,lcd`. Build and flash only the standalone
+  `matched-tone` image, record its exact size and SHA-256, reset the board, and capture enough
+  serial output to prove its feature identity, codec/I2S configuration, render progress, refill
+  cadence, bounded peak, zero underruns and stable DMA-error count.
+
+Listening interpretation is binary. If this matched post-render tone is clean, the target-side
+engine-rendered sample buffer differs from the clean host render and the next investigation must
+compare target render data or hashes before packing. If it buzzes, the problem is downstream and
+depends on the 125 Hz signal's exact level or stereo shape despite the earlier clean 172 Hz test.
+Do not change normal playback, mixer arithmetic, panning law, packer, codec gain or DMA geometry
+until this result is recorded.
+
+Implementation result: `matched-tone` selects the same allocation-safe `engine_tone_module()`
+as `engine-tone`, opens the same `EmbeddedPlayer<Linear>`, and applies the same 1/4 master. Its
+audio override replaces each completed quantum immediately before the unchanged 32-bit packer.
+The allocation-free generator calls the existing integer `sin_q15` with a wrapping `u32` phase,
+uses the exact rounded increment 12 173 944 for 125 Hz at 44 100 Hz, and independently scales
+left/right to signed peaks 4 796/5 327. Its state is carried from whole-ring prefill through the
+muted handoffs into steady refill, with continuous output and no gate.
+
+Feature selection excludes the normal flash module from both controlled-module diagnostics.
+`matched-tone` is compile-time incompatible with `bench`, `tone`, `engine-tone` and `web`, while
+`matched-tone,lcd` remains supported. Four host tests pin nearest-integer phase rounding, signed
+independent peaks, same-polarity continuous output, unequal-call phase continuity, harmless
+unpaired samples and a 128-count adjacent-sample bound. All 70 firmware-common tests pass. A1S
+normal, `tone`, `engine-tone`, `matched-tone`, and `matched-tone,lcd` release builds pass on
+`esp-1.97`. Hardware image identity and transport evidence are recorded below; owner listening
+remains pending.
+
+### Matched-tone objective hardware run (2026-09-14)
+
+The strict post-render A/B image passed its objective identity, boot, allocation, cadence and
+underlying-engine loop checks:
+
+- Exact image: `embedded/target/starplayer-a1s-matched-tone-merged.bin`, 429 456 bytes,
+  SHA-256 `9654d74c7df8121878345eaa1e956069b8f7eb700c6cd82d7cdcfdf6bb10e269`.
+  Flash hash verification passed on the A1S at MAC `b4:bf:e9:dd:d3:e4`.
+- A fresh reset identified `MATCHED-TONE output=125 Hz peaks=4796/5327
+  generator=integer-Q15 continuous underlay=engine-tone interpolation=linear master=1/4`.
+  `EmbeddedPlayer` open reported 27 932 heap bytes used and 94 948 free.
+- Codec and transport remained the controlled settings: ES8388 32-bit Philips slave,
+  headphone −12 dB, 44 100 Hz stereo 32-bit I2S and the six-quantum DMA ring.
+- The rendered engine underneath the override crossed its native `B00` loop from row 59 to
+  row 03. The first telemetry line reported `written=356352`, `pushes=117`; the final line
+  reported `written=5347328`, `pushes=1743`. Peak reached the matched right-channel bound of
+  5 327, `underruns=0`, and the recovered startup `dma_errors=1` remained fixed.
+
+This accepts the matched-tone image, configuration, engine work, refill cadence, bounded peak
+and native song loop objectively. The owner's clean/buzz listening result remains pending, as
+does clean normal-music acceptance. Keep this plan open and unarchived.

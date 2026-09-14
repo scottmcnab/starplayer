@@ -78,6 +78,7 @@ cargo xtask build  --board a1s --features web      # the audio firmware plus WiF
 cargo xtask build  --board a1s --features web,lcd  # both
 cargo xtask build  --board a1s --features tone     # gated direct-tone listening diagnostic
 cargo xtask build  --board a1s --features engine-tone # standalone native-S3M engine-path diagnostic
+cargo xtask build  --board a1s --features matched-tone # strict post-render A/B against engine-tone
 cargo xtask image  --board a1s [--merge]           # an espflash image under target/
 cargo xtask size   --board a1s                     # the image against its partition
 cargo xtask assets [--force]                       # regenerate the module images and gzip the page
@@ -140,6 +141,10 @@ cargo xtask monitor --board a1s
 
 # the owner-only engine-path comparison: native-S3M 125 Hz sine looped by B00
 cargo xtask flash --board a1s --features engine-tone
+cargo xtask monitor --board a1s
+
+# the owner-only matched A/B: same engine work, 125 Hz and measured stereo peaks
+cargo xtask flash --board a1s --features matched-tone
 cargo xtask monitor --board a1s
 
 # the C5 (M8-I4): one flash, no audio, no listening check — see the "C5" note below
@@ -241,9 +246,19 @@ sample loop, native `B00`, linear interpolation and 1/4 master. `EmbeddedPlayer`
 and continued through row 29 at `0:03`, proving the bounded scan and native song loop on the
 board. Across the capture, `written` advanced from 356 352 to 4 286 464 and `pushes` from 118 to
 1 402; peak held around 5 326–5 327, `underruns=0`, and the recovered startup `dma_errors=1`
-stayed fixed. Image identity, configuration, cadence and looping are accepted. The owner still
-needs to report whether the 125 Hz tone is clean or grainy; clean normal music also remains
-pending.
+stayed fixed. Image identity, configuration, cadence and looping are accepted. The owner reports
+that this engine-rendered 125 Hz tone buzzes; clean normal music also remains pending.
+
+The strict follow-up is the default-off `--features matched-tone` image. It constructs and renders
+that same native engine-tone S3M at 1/4 master, then replaces each completed quantum immediately
+before packing with a continuous 125 Hz integer-Q15 sine. A wrapping full-turn phase accumulator
+advances by the exact rounded 12 173 944 units per 44.1 kHz frame and scales the channels to the
+host engine capture's signed peaks, 4 796 left and 5 327 right. Phase state continues from the
+initial ring prefill through muted handoffs and steady descriptor refill; there is no silence
+gate. `matched-tone` is incompatible with `bench`, `tone`, `engine-tone` and `web`, but may be
+combined with `lcd`. If it is clean, compare target engine render data before packing next. If it
+buzzes, the remaining cause is downstream and depends on this 125 Hz signal's level or stereo
+shape.
 
 The same run confirmed the DMA remediation from
 `plans/engine/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
@@ -382,6 +397,12 @@ the module and omit it. An `engine-tone` image replaces the `MODULE` line with:
 
 ```text
 ENGINE-TONE output=125 Hz source=32000 Hz signed16 amplitude=28672 loop=256 frames song_loop=B00 interpolation=linear master=1/4
+```
+
+A `matched-tone` image renders the same controlled module underneath and reports:
+
+```text
+MATCHED-TONE output=125 Hz peaks=4796/5327 generator=integer-Q15 continuous underlay=engine-tone interpolation=linear master=1/4
 ```
 
 An `lcd` build's boot log has one more line before `MODULE` — `LCD  ST7789

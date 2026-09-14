@@ -25,10 +25,12 @@
 //! aligned. The 32-bit-slot experiment doubles the required DMA byte rate to 352 800 B/s. See
 //! `plans/reference/embedded-budget.md` §4a for the underlying esp-hal and Star FX analysis.
 //!
-//! With the board-only `tone` feature, the renderer still advances normally and an integer,
-//! compile-time-table diagnostic sine replaces each complete output quantum immediately before
-//! the shared 32-bit packer. The override state travels from ring prefill into steady refill, so
-//! phase and the one-second tone/silence gate never restart at the handoff. The default build's
+//! With the board-only `tone` or `matched-tone` feature, the renderer still advances normally
+//! and an integer diagnostic sine replaces each complete output quantum immediately before the
+//! shared 32-bit packer. The override state travels from ring prefill through the muted handoffs
+//! into steady refill, so phase never restarts at a handoff. `tone` uses the compile-time table
+//! and its one-second silence gate; `matched-tone` is a continuous full-turn Q15 accumulator
+//! matched to the engine-tone's measured channel peaks. The default and `engine-tone` builds'
 //! override is a zero-sized no-op.
 //!
 //! # Why construction and refill share core 1
@@ -134,11 +136,13 @@ static DESCRIPTOR_SCRATCH: ConstStaticCell<[i16; DESCRIPTOR_SAMPLES]> = ConstSta
 
 /// Optional post-render diagnostic carried from synchronous prefill into steady refill.
 ///
-/// The normal build is a zero-sized no-op. Under `tone`, the state preserves phase and gate
-/// position across every render call without a static mutable or an allocation.
+/// Normal and engine-tone builds are zero-sized no-ops. Diagnostic states preserve phase across
+/// every render call without a static mutable or an allocation.
 struct OutputOverride {
     #[cfg(feature = "tone")]
     tone: firmware_common::DiagnosticTone,
+    #[cfg(feature = "matched-tone")]
+    matched_tone: firmware_common::MatchedTone,
 }
 
 impl OutputOverride {
@@ -146,6 +150,8 @@ impl OutputOverride {
         OutputOverride {
             #[cfg(feature = "tone")]
             tone: firmware_common::DiagnosticTone::new(),
+            #[cfg(feature = "matched-tone")]
+            matched_tone: firmware_common::MatchedTone::new(),
         }
     }
 
@@ -153,7 +159,9 @@ impl OutputOverride {
     fn apply(&mut self, destination: &mut [i16]) {
         #[cfg(feature = "tone")]
         self.tone.overwrite(destination);
-        #[cfg(not(feature = "tone"))]
+        #[cfg(feature = "matched-tone")]
+        self.matched_tone.overwrite(destination);
+        #[cfg(not(any(feature = "tone", feature = "matched-tone")))]
         let _ = destination;
     }
 }

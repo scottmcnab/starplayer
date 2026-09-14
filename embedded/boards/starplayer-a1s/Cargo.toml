@@ -38,6 +38,11 @@ tone = []
 # `main.rs` rejects combinations with `bench`, `tone` and `web` at compile time.
 engine-tone = []
 
+# Strict post-render A/B against `engine-tone`: render that same native S3M underneath,
+# then replace each quantum with a continuous 125 Hz Q15 sine at its measured channel peaks.
+# `main.rs` rejects combinations with every other standalone/audio-network diagnostic.
+matched-tone = []
+
 # M8-I5: the ST7789 now-playing screen on the SD-card pin group. Off by default — the
 # audio build must not link `mipidsi`/`embedded-graphics`/`embedded-hal-bus` at all (M8
 # master-plan decision 4), so the three are `optional = true` below and pulled in only by
