@@ -195,3 +195,62 @@ This accepts the refill cadence, startup recovery, transport progress, ring geom
 routing configuration. **The plan remains open and must not be archived:** owner listening
 acceptance is still pending recognizable clean stereo music in both ears and confirmation of
 left/right identity through the headphone jack.
+
+### Listening-finding amendment: output gain staging (2026-09-14)
+
+The first owner run of the accepted transport played at the correct pitch and speed, but still
+sounded noisy or clipped at the 1/16 master setting. The I2S samples are already signed
+two's-complement `i16`: `FixedOut<i16, 2>` clamps the fixed accumulator, `RenderHalf` applies the
+master setting in the engine before its limiter, and `bytemuck::cast_slice` preserves those bits
+in the ESP32's native little-endian DMA buffer. The ES8388 is configured for 16-bit Philips I2S,
+whose sample interpretation is signed two's-complement PCM. Do not add an unsigned bias.
+
+The current gain distribution is nevertheless poor for headphones: the engine reduces the
+signal by about 24 dB while `LOUT2VOL`/`ROUT2VOL` run at analog 0 dB. An offline fixed/i16 render
+of the bundled `REFLEX.S3M` reaches full scale for 515 299 of 12 192 768 samples (4.226%), and a
+post-scale approximation at 1/16 uses only 3 446 distinct values. Preserve the owner's accepted
+maximum listening level while retaining more digital resolution:
+
+- boot and cap the A1S engine master at 1/4 (−12.04 dB), retaining two more signal bits and
+  enough headroom that this three-voice module does not reach the limiter;
+- set the enabled ES8388 headphone pair to −12 dB (`LOUT2VOL = ROUT2VOL = 0x16`), so the combined
+  nominal output remains about −24 dB; leave the disabled speaker pair at minimum and GPIO21 low;
+- apply the same A1S maximum to button and web volume commands, so no control path bypasses the
+  listening-safe cap; keep the existing 1/64 adjustment step;
+- flash and repeat the listening check at the same nominal loudness. Keep 16-bit I2S for this
+  controlled comparison. If the noise remains, the next isolated experiment is 32-bit Philips
+  slots with each signed `i16` sample sign-extended and shifted into the high 16 bits, matching
+  the known full-duplex board transport; do not combine that framing change with this test.
+
+The transport counters must remain at the accepted cadence after the gain change. Owner
+confirmation of clean stereo and left/right identity remains the final acceptance gate.
+
+Implementation keeps the I2S path at signed 16-bit Philips framing. The A1S boot value and
+board maximum are both exact `U0F16` bits 16 384, while the existing step remains bits 1 024.
+Button increase/decrease and the web control-task command boundary share host-tested saturating
+helpers, so an HTTP or WebSocket request cannot bypass the 1/4 cap. Codec initialization writes
+`0x16` to the enabled `LOUT2VOL`/`ROUT2VOL` pair and `0x00` to the disabled speaker pair while
+GPIO21 remains low. The firmware-common host suite passes all 57 tests, including the exact cap
+and step cases, and both the default and `web` A1S release builds pass. The owner listening rerun
+remains pending.
+
+### Gain-staging hardware run (2026-09-14)
+
+The gain-staged build passed its fresh-boot configuration and bounded transport check:
+
+- Exact `main` image SHA-256:
+  `1187941feaad1c06b9e143a5eddc5c1a695dcef67fa1626d6401c7f816235c06`
+  (477 600 bytes). The post-flash hash matched.
+- Boot reported the ES8388 as a 16-bit Philips slave with headphone analog −12 dB and the
+  speaker pair at minimum, held muted until audio readiness. I2S remained 44 100 Hz stereo i16
+  over the nine-quantum ring.
+- The play line confirmed engine master `1/4`, maximum `1/4`, headphone output only and speaker
+  PA off.
+- The first five telemetry lines advanced from 0:00 through 0:04. `written` advanced from
+  172 032 to 881 664 bytes and `pushes` from 76 to 385, with `underruns=0` throughout.
+  `dma_errors=1` was stable across all five lines, the same recovered startup transient accepted
+  by the longer transport soak rather than a recurring steady-state error.
+
+This accepts the gain-staging register writes, boot cap and post-change refill cadence. **Owner
+listening acceptance remains pending** for clean recognizable stereo in both ears and left/right
+identity; keep this plan open and unarchived until that check is complete.

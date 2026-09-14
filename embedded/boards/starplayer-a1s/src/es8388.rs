@@ -63,14 +63,13 @@
 //!
 //! # Real-time
 //!
-//! Every method here blocks on I2C. None of them may be called from the DMA refill: the
-//! codec is configured once at boot, and a volume change from a control task is a
-//! millisecond of bus traffic on a thread that can afford it.
+//! Every method here blocks on I2C. None of them may be called from the DMA refill. The codec's
+//! gain staging is fixed at boot; buttons and web commands change the engine master volume.
 
-// `set_volume_attenuation` and `release` have no caller in the audio build: volume is
-// M8-I5's (the keys) and M8-I6's (the web page), and `release` is for a build that puts a
-// second device on the control bus. A codec driver that only exposed what today's `main`
-// happens to call would have to be reopened for each of them.
+// `set_volume_attenuation` and `release` have no caller in the audio build: board controls
+// adjust the engine master under a board-local cap, while the codec's analog gain stays fixed.
+// `release` is for a build that puts a second device on the control bus. A codec driver that
+// only exposed what today's `main` happens to call would have to be reopened for each of them.
 #![allow(dead_code)]
 
 use embedded_hal::i2c::I2c;
@@ -141,11 +140,20 @@ pub mod outputs {
     pub const ALL: u8 = HEADPHONE | SPEAKER;
 }
 
-/// The analog output-volume register value for 0 dB.
+/// The disabled speaker pair's minimum analog output level, −45 dB.
+const ANALOG_SPEAKER_VOLUME: u8 = 0x00;
+
+/// The headphone pair's analog output level, −12 dB.
 ///
 /// `LOUT1VOL`/`ROUT1VOL` and their headphone siblings run −45 dB … +4.5 dB in 1.5 dB steps,
-/// so `0x00` is −45 dB and `0x1e` (30) is unity. ESP-ADF writes exactly this.
-const ANALOG_VOLUME_0DB: u8 = 0x1e;
+/// so `0x00` is −45 dB and `0x1e` (30) is unity. Eight steps below unity is −12 dB:
+/// `0x1e - 8 = 0x16`.
+const ANALOG_HEADPHONE_VOLUME: u8 = 0x16;
+
+const _: () = {
+    assert!(ANALOG_SPEAKER_VOLUME == 0x00);
+    assert!(ANALOG_HEADPHONE_VOLUME == 0x16);
+};
 
 /// `DACCONTROL3`'s mute bit.
 const DAC_MUTE_BIT: u8 = 0x04;
@@ -211,7 +219,8 @@ impl<Bus: I2c> Es8388<Bus> {
     }
 
     /// Configure the codec for DAC playback: I2S slave, Philips, 16-bit, MCLK/LRCK = 256,
-    /// both DACs into both mixers, `outputs` enabled, 0 dB everywhere, and **still muted**.
+    /// both DACs into both mixers, `outputs` enabled, digital 0 dB, headphone analog −12 dB,
+    /// disabled speaker analog minimum, and **still muted**.
     ///
     /// The chip is left muted deliberately. The DMA ring has nothing in it at the moment
     /// the codec comes up, and an unmuted codec fed an empty ring is how a bring-up
@@ -263,14 +272,14 @@ impl<Bus: I2c> Es8388<Bus> {
         self.write(register::LDACVOL, 0x00)?;
         self.write(register::RDACVOL, 0x00)?;
 
-        // Analog 0 dB on all four outputs. ESP-ADF leaves the speaker pair at −45 dB
-        // (0x00); this board has a speaker amplifier behind `LOUT1`/`ROUT1` and a PA-enable
-        // pin that already decides whether the speakers make sound, so the volume register
-        // is not the place to also decide it.
-        self.write(register::LOUT1VOL, ANALOG_VOLUME_0DB)?;
-        self.write(register::ROUT1VOL, ANALOG_VOLUME_0DB)?;
-        self.write(register::LOUT2VOL, ANALOG_VOLUME_0DB)?;
-        self.write(register::ROUT2VOL, ANALOG_VOLUME_0DB)?;
+        // The speaker pair remains disabled in `DACPOWER`, GPIO21 holds its board amplifier
+        // off, and these analog registers add a third independent minimum-level safeguard.
+        self.write(register::LOUT1VOL, ANALOG_SPEAKER_VOLUME)?;
+        self.write(register::ROUT1VOL, ANALOG_SPEAKER_VOLUME)?;
+        // Eight 1.5 dB steps below 0 dB. Combined with the engine's 1/4 cap (−12.04 dB),
+        // this preserves the owner's accepted nominal maximum with two more digital bits.
+        self.write(register::LOUT2VOL, ANALOG_HEADPHONE_VOLUME)?;
+        self.write(register::ROUT2VOL, ANALOG_HEADPHONE_VOLUME)?;
 
         // DACs on, and the requested output drivers with them. Last, so nothing is driven
         // while the format is half-configured.

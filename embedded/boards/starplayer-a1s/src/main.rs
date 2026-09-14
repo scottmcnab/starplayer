@@ -20,8 +20,8 @@
 //! 4. `esp_rtos::start`, then the board's own pins — including the keys and, under
 //!    `lcd`, the display.
 //! 5. An I2C scan, logged (research point 1), then the codec — configured but **muted**.
-//! 6. The module image → [`Module::from_image`] → [`EmbeddedPlayer`], set the board's safe
-//!    listening default of 1/16, then move the untouched I2S peripheral parts and renderer to
+//! 6. The module image → [`Module::from_image`] → [`EmbeddedPlayer`], set the board's capped
+//!    engine level of 1/4, then move the untouched I2S peripheral parts and renderer to
 //!    core 1.
 //! 7. Core 1 constructs the async I2S driver, prefills and starts its transfer, then completes
 //!    the muted silence pre-roll. Core 0 waits for the startup result, logs and unmutes the
@@ -415,7 +415,7 @@ async fn play(
     board.power_amplifier.set_low();
     let mut codec = es8388::Es8388::new(board.i2c, board::ES8388_I2C_ADDRESS);
     codec.init_dac_only(es8388::outputs::HEADPHONE).map_err(|_| "the ES8388 did not answer — is this the AC101 revision?")?;
-    println!("CODEC ES8388 at 0x{:02x}: DAC up, 16-bit Philips slave, MCLK/LRCK 256, headphone output, muted", board::ES8388_I2C_ADDRESS);
+    println!("CODEC ES8388 at 0x{:02x}: DAC up, 16-bit Philips slave, MCLK/LRCK 256, headphone -12 dB, speaker minimum, muted", board::ES8388_I2C_ADDRESS);
 
     #[cfg(feature = "lcd")]
     let display = lcd::LcdDisplay::take(lcd_parts);
@@ -483,7 +483,7 @@ async fn play(
     // steady refill owns the transfer. GPIO21 remains low and pair 1 remains disabled: this
     // boot is deliberately headphone-only after the first hardware run clipped at unity.
     codec.mute(false).map_err(|_| "the codec would not unmute")?;
-    println!("PLAY master_volume=1/16 output=headphone speaker_pa=off");
+    println!("PLAY master_volume=1/4 max=1/4 output=headphone speaker_pa=off");
 
     // The re-provision gesture, checked once, before the keys task exists. A boot nobody
     // is touching costs one GPIO read; a held key costs the five seconds it is held, with
@@ -576,13 +576,16 @@ fn report_i2c_scan(board: &mut board::Board<'static>) {
     }
 }
 
-/// The A1S boot volume: 1/16 of full scale, the loudest setting the owner wanted in the
-/// second headphone run.
+/// The A1S boot and maximum engine volume: exactly 1/4 of full scale.
 ///
-/// This is deliberately board-local. [`ControlHalf`] and the engine retain their unity
-/// defaults for every other host.
+/// The ES8388 headphone analog pair supplies another −12 dB, preserving the owner's accepted
+/// nominal maximum while retaining two more digital signal bits. This remains board-local:
+/// [`ControlHalf`] and the engine retain their unity defaults for every other host.
 #[cfg(not(feature = "bench"))]
-const BOOT_MASTER_VOLUME: U0F16 = U0F16::from_bits(4_096);
+pub(crate) const MAX_MASTER_VOLUME: U0F16 = U0F16::from_bits(16_384);
+
+#[cfg(not(feature = "bench"))]
+const BOOT_MASTER_VOLUME: U0F16 = MAX_MASTER_VOLUME;
 
 /// One A1S master-volume step: 1/64 of full scale for usable headphone adjustment.
 #[cfg(not(feature = "bench"))]
@@ -670,11 +673,11 @@ fn apply_key_event(control: &mut ControlHalf, event: KeyEvent, key1_hold_actione
             let _ = control.seek_order(current_order.saturating_add(1));
         }
         KeyEvent::Press(Key::Key5) | KeyEvent::Hold(Key::Key5, _) => {
-            let volume = U0F16::from_bits(control.master_volume().to_bits().saturating_sub(VOLUME_STEP.to_bits()));
+            let volume = firmware_common::lower_master_volume(control.master_volume(), VOLUME_STEP, MAX_MASTER_VOLUME);
             let _ = control.set_master_volume(volume);
         }
         KeyEvent::Press(Key::Key6) | KeyEvent::Hold(Key::Key6, _) => {
-            let volume = U0F16::from_bits(control.master_volume().to_bits().saturating_add(VOLUME_STEP.to_bits()));
+            let volume = firmware_common::raise_master_volume(control.master_volume(), VOLUME_STEP, MAX_MASTER_VOLUME);
             let _ = control.set_master_volume(volume);
         }
         _ => {}

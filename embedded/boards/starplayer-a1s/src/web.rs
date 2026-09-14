@@ -8,7 +8,8 @@
 //! module, and only through them:
 //!
 //! * [`COMMANDS`] — a bounded channel of fire-and-forget transport commands (play, seek,
-//!   volume, mute). A full channel drops the command rather than blocking a worker.
+//!   volume, mute). The control-task boundary clamps volume to the A1S's 1/4 maximum. A
+//!   full channel drops the command rather than blocking a worker.
 //! * [`Job`] — the four operations that have to answer the browser: load an upload,
 //!   select a stored module, store the playing one, forget the WiFi credentials. One at a
 //!   time, behind [`JOB_LOCK`], with the answer coming back on [`JOB_DONE`].
@@ -664,7 +665,7 @@ fn apply_command(control: &mut ControlHalf, command: Command) {
             let _ = control.seek_frame(frame);
         }
         Command::Volume(level) => {
-            let _ = control.set_master_volume(level);
+            let _ = control.set_master_volume(firmware_common::cap_master_volume(level, crate::MAX_MASTER_VOLUME));
         }
         Command::Mute { channel, muted } => {
             let _ = control.mute(ChannelId(channel), muted);

@@ -159,11 +159,14 @@ while tapping **RESET** if it does not enter the bootloader on its own. The tran
 
 The first hardware run confirmed advancing transport with `underruns=0` and `dma_errors=0`,
 but unity master volume was very loud and clipped repeatedly. In the second run the owner found
-1/16 was the loudest setting they wanted and the next 1/16 step was already very loud. The A1S
-firmware therefore boots at exact 1/16, uses 1/64 button steps, enables only the ES8388's pair-2
-headphone drivers (`0x0c`), and holds the GPIO21 speaker-amplifier enable low. Start a listening
-check with headphones off the listener's ears and raise the level only after the boot line
-confirms those settings.
+1/16 was the loudest setting they wanted and the next 1/16 step was already very loud. That run
+still sounded noisy or clipped because it discarded about four digital bits while driving the
+ES8388 headphone pair at analog 0 dB. The A1S now boots and caps its engine master at exact 1/4,
+uses 1/64 button steps, and sets the enabled ES8388 pair-2 headphone drivers (`0x0c`) to −12 dB
+(`LOUT2VOL = ROUT2VOL = 0x16`). The combined nominal maximum remains about −24 dB with two more
+digital signal bits. The disabled speaker pair stays at its −45 dB analog minimum and GPIO21
+holds the speaker-amplifier enable low. Start a listening check with headphones off the
+listener's ears and raise the level only after the boot line confirms those settings.
 
 The same run confirmed the DMA remediation from
 `plans/engine/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
@@ -281,12 +284,12 @@ CPU  240 MHz   heap 120.0 KiB
 PSRAM 4194304 bytes (4096.0 KiB) mapped at 0x3f800000
 I2C  device at 0x10 (ES8388)
 JACK headphone_detect=inserted
-CODEC ES8388 at 0x10: DAC up, 16-bit Philips slave, MCLK/LRCK 256, headphone output, muted
+CODEC ES8388 at 0x10: DAC up, 16-bit Philips slave, MCLK/LRCK 256, headphone -12 dB, speaker minimum, muted
 MODULE image=88036 bytes (85.9 KiB) channels=8 samples=5
 HEAP after open: …
 I2S  44100 Hz stereo 16-bit, MCLK on GPIO0, DMA ring 9 quanta (1152 frames, 26 ms)
 CORE1 audio refill running; pre-roll 8 silent descriptor handoffs complete (~70 ms)
-PLAY master_volume=1/16 output=headphone speaker_pa=off
+PLAY master_volume=1/4 max=1/4 output=headphone speaker_pa=off
 ord 000 pat 000 row 00/06 125 bpm   3/ 8 voices  0:01/2:47  peak=… underruns=0 dma_errors=0 offered=… written=… pushes=… …
 ```
 
@@ -358,9 +361,11 @@ Five-key map (`--features lcd`, GPIO13 is the display's MOSI so KEY2 is unavaila
 | KEY6 | 5 | volume + (1/64 step) | repeat every 200 ms |
 
 Volume is applied through `ControlHalf::set_master_volume` and lives in RAM only. The A1S
-firmware starts at exact **1/16** on every boot for safe headphone listening and KEY5/KEY6 move
-in exact **1/64** steps; the web control can also change it until the next reset. This board
-policy does not change the engine or other hosts, whose default remains unity.
+firmware starts at and caps every control path to exact **1/4**; KEY5/KEY6 move in exact
+**1/64** steps. HTTP and WebSocket requests above 1/4 are clamped to the same board maximum.
+The web slider exposes 0–1/4 and reports that engine scale as 0–25%. The ES8388 contributes
+another −12 dB in its headphone analog registers. This board policy does not change the engine
+or other hosts, whose default and available range remain unity.
 
 ### The display (M8-I5, `--features lcd`)
 
@@ -506,7 +511,7 @@ written for a person, not a code.
 | `GET /api/modules` | — | the compiled-in module plus every stored slot |
 | `POST /api/play`, `/api/stop`, `/api/next`, `/api/previous` | — | 204 |
 | `POST /api/seek` | `{"order":12}` | 204 |
-| `POST /api/volume` | `{"level":32768}` | 204 (0–65535) |
+| `POST /api/volume` | `{"level":16384}` | 204 (0–16384; higher values clamp to 16384) |
 | `POST /api/mute` | `{"channel":3,"muted":true}` | 204 |
 | `POST /api/modules` | raw module bytes, or a `.spmi` image | 201, or 409/413/507 with the reason |
 | `POST /api/modules/select` | `{"id":2}` | 204 — `0` is the compiled-in module, `1..5` a flash slot |
