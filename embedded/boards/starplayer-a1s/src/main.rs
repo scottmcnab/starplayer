@@ -3,7 +3,7 @@
 //! Two builds out of one crate:
 //!
 //! * the **audio** build (no features) plays `REFLEX.S3M` from flash through the ES8388
-//!   into the headphone jack and the speaker outputs, takes transport and volume
+//!   into the headphone jack, takes transport and volume
 //!   commands from six push-buttons (M8-I5), optionally shows the sounding row on an
 //!   ST7789 screen behind the `lcd` feature (M8-I5), and logs the transport once a
 //!   second;
@@ -20,11 +20,13 @@
 //! 4. `esp_rtos::start`, then the board's own pins — including the keys and, under
 //!    `lcd`, the display.
 //! 5. An I2C scan, logged (research point 1), then the codec — configured but **muted**.
-//! 6. The module image → [`Module::from_image`] → [`EmbeddedPlayer`], and only then I2S,
-//!    because the DMA ring is primed with real audio before the transfer starts.
-//! 7. Unmute, enable the speaker amplifier, start the second core with the audio refill
-//!    on it, and spawn the keys task, the control task and (under `lcd`) the display
-//!    task on core 0.
+//! 6. The module image → [`Module::from_image`] → [`EmbeddedPlayer`], set the board's safe
+//!    listening default of 1/16, then move the untouched I2S peripheral parts and renderer to
+//!    core 1.
+//! 7. Core 1 constructs the async I2S driver, prefills and starts its transfer, then completes
+//!    the muted silence pre-roll. Core 0 waits for the startup result, logs and unmutes the
+//!    headphone output while leaving the speaker amplifier disabled. Finally it spawns the keys
+//!    task, control task and (under `lcd`) display task.
 //!
 //! # PSRAM and atomics
 //!
@@ -47,8 +49,8 @@
 //!
 //! # Core pinning — corrected by M8-I5
 //!
-//! **The audio refill now runs on core 1**, with core 0 running the keys task, the
-//! control task and (under `lcd`) the display task. M8-I3's write-up blamed `RenderHalf`
+//! **The entire audio driver and refill now run on core 1**, with core 0 running the keys task,
+//! the control task and (under `lcd`) the display task. M8-I3's write-up blamed `RenderHalf`
 //! not being `Send` on `Engine`'s `Box<dyn EventSource>` and kept everything on core 0 as
 //! a result. That diagnosis does not hold: `EventSource: Send` and `Insert: Send` are
 //! already supertrait bounds in `starplayer-engine`/`starplayer-dsp`, so `RenderHalf` is
@@ -60,6 +62,14 @@
 //! this board only ever runs one task on core 1, so the refill is spawned directly inside
 //! the second core's entry closure rather than round-tripping a `SendSpawner` back to
 //! core 0 through a `Signal`).
+//!
+//! Moving only an already-created DMA transfer was insufficient. esp-hal 1.1.2's
+//! `ChannelTx::into_async` disables the DMA interrupt on `Cpu::other()` and binds its handler to
+//! `Cpu::current()`, so calling [`audio::start`] on core 0 left core 1 dependent on wakeups from
+//! the core that logs. [`audio::start`] now runs inside core 1's entry closure, matching Star FX
+//! and keeping UART critical sections away from the DMA interrupt it owns. A timestamped run of
+//! that arrangement still reached only 0:24 engine elapsed at +49.86 seconds, with both counters
+//! zero, so interrupt affinity was not the main cause of the gating.
 
 #![no_std]
 #![no_main]
@@ -171,10 +181,10 @@ const RECLAIMED_HEAP_BYTES: usize = 96 * 1024;
 #[cfg(not(feature = "bench"))]
 static RENDER: StaticCell<RenderHalf<Linear>> = StaticCell::new();
 
-/// Core 1's stack. Only the audio refill task runs there — no allocation, no logging, one
-/// small local scratch buffer (`audio::fill`'s `[i16; QUANTUM_FRAMES * 2]`, 512 bytes) —
-/// so this is deliberately far smaller than core 0's, which carries the whole engine's
-/// call depth.
+/// Core 1's stack. Only audio construction and the refill task run there — no allocation or
+/// logging. The synchronous prefill has one 512-byte quantum scratch; steady refill uses a
+/// `ConstStaticCell` descriptor buffer instead of task stack. This remains deliberately far
+/// smaller than core 0's stack, which carries the whole engine's call depth.
 #[cfg(not(feature = "bench"))]
 const CORE1_STACK_SIZE: usize = 8 * 1024;
 
@@ -188,25 +198,23 @@ static CORE1_STACK: static_cell::ConstStaticCell<esp_hal::system::Stack<CORE1_ST
 #[cfg(not(feature = "bench"))]
 static CORE1_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
 
-/// Carries [`audio::AudioTransfer`] across the one-time ownership handoff into core 1's
-/// entry closure.
+/// Carries the untouched I2S peripheral tokens across the one-time ownership handoff into core
+/// 1's entry closure.
 ///
-/// `AudioTransfer` is not `Send`: esp-hal's DMA transfer type addresses its descriptor
-/// ring through raw pointers (`*mut DmaDescriptor`, `*const u8`, and `Async`'s own marker
-/// `PhantomData<*const ()>`), none of which carry `unsafe impl Send`. This crate is the
-/// one place `unsafe` is tolerated in the whole workspace (M8 master-plan decision 6), and
-/// this is exactly the shape `esp_rtos::start_second_core`'s own internal
-/// `SecondCoreStack` wrapper exists to cross (`esp-rtos` 0.3.0's `lib.rs`): a value moved
-/// **once**, into the closure that becomes core 1's entire program, with core 0 never
-/// touching it again afterwards. `Send`'s actual safety property — no two threads ever
-/// read or write the same memory concurrently — holds because there is only ever one
-/// owner at a time, never two.
+/// [`audio::Parts`] is not `Send` because esp-hal's peripheral tokens deliberately carry
+/// non-`Send` markers. This crate is the one place `unsafe` is tolerated in the whole workspace
+/// (M8 master-plan decision 6), and this is exactly the shape `esp_rtos::start_second_core`'s own
+/// internal `SecondCoreStack` wrapper exists to cross (`esp-rtos` 0.3.0's `lib.rs`): each unique
+/// peripheral token is moved **once**, into the closure that becomes core 1's program, with core
+/// 0 never touching it again. The async driver is created only after that handoff, which also
+/// binds its DMA interrupt to the correct core. `Send`'s safety property holds because there is
+/// only ever one owner of each token, never concurrent access from two cores.
 #[cfg(not(feature = "bench"))]
-struct SendTransfer(audio::AudioTransfer);
+struct SendAudioParts(audio::Parts);
 
-// SAFETY: see the doc comment on `SendTransfer` above.
+// SAFETY: see the doc comment on `SendAudioParts` above.
 #[cfg(not(feature = "bench"))]
-unsafe impl Send for SendTransfer {}
+unsafe impl Send for SendAudioParts {}
 
 /// Key events flow from [`keys::keys_task`] (core 0, polling GPIO every 10 ms) to
 /// [`control_task`] (core 0, the sole owner of [`ControlHalf`]) over this channel.
@@ -402,9 +410,12 @@ async fn play(
     report_i2c_scan(&mut board);
     println!("JACK headphone_detect={}", if board.headphone_detect.is_low() { "inserted" } else { "empty" });
 
+    // Headphone-only playback: the constructor starts GPIO21 low, and writing it again here
+    // makes the listening policy independent of that implementation detail.
+    board.power_amplifier.set_low();
     let mut codec = es8388::Es8388::new(board.i2c, board::ES8388_I2C_ADDRESS);
-    codec.init_dac_only(es8388::outputs::ALL).map_err(|_| "the ES8388 did not answer — is this the AC101 revision?")?;
-    println!("CODEC ES8388 at 0x{:02x}: DAC up, 16-bit Philips slave, MCLK/LRCK 256, muted", board::ES8388_I2C_ADDRESS);
+    codec.init_dac_only(es8388::outputs::HEADPHONE).map_err(|_| "the ES8388 did not answer — is this the AC101 revision?")?;
+    println!("CODEC ES8388 at 0x{:02x}: DAC up, 16-bit Philips slave, MCLK/LRCK 256, headphone output, muted", board::ES8388_I2C_ADDRESS);
 
     #[cfg(feature = "lcd")]
     let display = lcd::LcdDisplay::take(lcd_parts);
@@ -427,13 +438,38 @@ async fn play(
     let render = RENDER.init(render);
     println!("HEAP after open: {}", esp_alloc::HEAP.stats());
 
+    control.set_master_volume(BOOT_MASTER_VOLUME).map_err(|_| "the command ring rejected the boot volume")?;
     control.play().map_err(|_| "the command ring rejected the first play")?;
 
-    // I2S last, and with the render half in hand: `audio::start` primes the whole DMA ring
-    // with real audio before the circular transfer begins, so the first sample the codec
-    // sees is music rather than 23 ms of silence.
-    let transfer = audio::start(audio_parts, firmware_common::SAMPLE_RATE_HZ, render)
-        .map_err(|_| "the I2S transmitter would not start")?;
+    // Construct the whole async driver on core 1, where its DMA interrupt belongs. The codec
+    // stays muted until construction, real-audio prefill, transfer start and the silent
+    // descriptor handoffs have all succeeded. Nothing crosses back: the refill is built inside
+    // the second core's entry closure and spawned on its executor, so core 0 never holds a
+    // `SendSpawner` for it and this board never spawns a second task there.
+    //
+    // The untouched peripheral tokens need the documented ownership wrapper above.
+    // `RenderHalf<Linear>` is already `Send` (see the module docs and the assertion beside its
+    // definition), so `&'static mut RenderHalf` needs no wrapper.
+    let core1_stack = CORE1_STACK.take();
+    let audio_parts = SendAudioParts(audio_parts);
+    esp_rtos::start_second_core(cpu_control, software_interrupt1, core1_stack, move || {
+        // Bind the whole wrapper before touching `.0`, or edition-2021 disjoint capture would
+        // reach through it and make the non-`Send` Parts field itself part of the closure.
+        let audio_parts = audio_parts;
+        let audio_parts = audio_parts.0;
+        let transfer = match audio::start(audio_parts, firmware_common::SAMPLE_RATE_HZ, render) {
+            Ok(transfer) => transfer,
+            Err(_) => {
+                audio::report_start_failure();
+                return;
+            }
+        };
+        CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new()).run(|core1_spawner| {
+            let token = audio::refill_task(transfer, render).expect("the refill task is the only thing core 1's executor ever spawns");
+            core1_spawner.spawn(token);
+        });
+    });
+    wait_for_audio_ready()?;
     println!(
         "I2S  44100 Hz stereo 16-bit, MCLK on GPIO{}, DMA ring {} quanta ({} frames, {} ms)",
         board::PIN_I2S_MCLK,
@@ -441,42 +477,13 @@ async fn play(
         audio::DMA_RING_QUANTA * audio::QUANTUM_FRAMES,
         audio::DMA_RING_QUANTA * audio::QUANTUM_FRAMES * 1000 / firmware_common::SAMPLE_RATE_HZ as usize,
     );
+    println!("CORE1 audio refill running; pre-roll {} silent descriptor handoffs complete (~70 ms)", audio::TX_PRIME_HANDOFFS);
 
-    // Sound, in this order: the DMA is already running, so unmuting the codec now cannot
-    // catch it with an empty ring, and the amplifier comes up after the codec so the
-    // speakers never hear the unmute transient.
+    // Sound only after the muted pre-roll has established descriptor accounting and the
+    // steady refill owns the transfer. GPIO21 remains low and pair 1 remains disabled: this
+    // boot is deliberately headphone-only after the first hardware run clipped at unity.
     codec.mute(false).map_err(|_| "the codec would not unmute")?;
-    board.power_amplifier.set_high();
-    println!("PLAY");
-
-    // The refill runs on core 1 — see the module docs, "Core pinning — corrected by
-    // M8-I5". Nothing crosses back: the whole task is built inside the second core's own
-    // entry closure and spawned on its own executor, so core 0 never holds a `SendSpawner`
-    // for it and this board never spawns a second task there.
-    //
-    // `transfer` (`audio::AudioTransfer`) has to cross into that closure and is not
-    // `Send`: esp-hal's DMA transfer type addresses its descriptor ring through raw
-    // pointers with no `unsafe impl Send`, the exact shape `esp_rtos::start_second_core`'s
-    // own internal `SecondCoreStack` wrapper exists to cross (`esp-rtos` 0.3.0's own
-    // `lib.rs`). `render` needs no such wrapper — `RenderHalf<Linear>` is `Send` (see the
-    // module docs and the assertion beside its definition), so `&'static mut RenderHalf`
-    // is `Send` too.
-    let core1_stack = CORE1_STACK.take();
-    let transfer = SendTransfer(transfer);
-    esp_rtos::start_second_core(cpu_control, software_interrupt1, core1_stack, move || {
-        // `let transfer = transfer;` before touching `.0` forces the closure to capture
-        // the *whole* `SendTransfer` by move rather than edition-2021 disjoint capture
-        // reaching in and capturing the `AudioTransfer` field directly — which would
-        // recreate exactly the `Send` error `SendTransfer` exists to route around, since
-        // the field itself carries no `unsafe impl Send`.
-        let transfer = transfer;
-        let transfer = transfer.0;
-        CORE1_EXECUTOR.init(esp_rtos::embassy::Executor::new()).run(|core1_spawner| {
-            let token = audio::refill_task(transfer, render).expect("the refill task is the only thing core 1's executor ever spawns");
-            core1_spawner.spawn(token);
-        });
-    });
-    println!("CORE1 audio refill running");
+    println!("PLAY master_volume=1/16 output=headphone speaker_pa=off");
 
     // The re-provision gesture, checked once, before the keys task exists. A boot nobody
     // is touching costs one GPIO read; a held key costs the five seconds it is held, with
@@ -569,9 +576,44 @@ fn report_i2c_scan(board: &mut board::Board<'static>) {
     }
 }
 
-/// One master-volume step: `1/16` of full scale, the task file's own figure for KEY5/KEY6.
+/// The A1S boot volume: 1/16 of full scale, the loudest setting the owner wanted in the
+/// second headphone run.
+///
+/// This is deliberately board-local. [`ControlHalf`] and the engine retain their unity
+/// defaults for every other host.
 #[cfg(not(feature = "bench"))]
-const VOLUME_STEP: U0F16 = U0F16::from_bits(u16::MAX / 16);
+const BOOT_MASTER_VOLUME: U0F16 = U0F16::from_bits(4_096);
+
+/// One A1S master-volume step: 1/64 of full scale for usable headphone adjustment.
+#[cfg(not(feature = "bench"))]
+const VOLUME_STEP: U0F16 = U0F16::from_bits(1_024);
+
+/// Maximum time core 0 waits for core 1's I2S startup and one-time muted pre-roll.
+///
+/// Eight descriptor periods take roughly 70 ms. One second leaves ample scheduling margin and
+/// converts a task that never starts into a muted boot error rather than an infinite spin.
+#[cfg(not(feature = "bench"))]
+const AUDIO_READY_TIMEOUT: esp_hal::time::Duration = esp_hal::time::Duration::from_secs(1);
+
+/// Wait synchronously so `play` gains no nested async frame while core 1 starts audio.
+///
+/// A construction or DMA-start error is distinct from a task that never reports back; either
+/// result returns while the codec is still muted.
+#[cfg(not(feature = "bench"))]
+fn wait_for_audio_ready() -> Result<(), &'static str> {
+    let started = esp_hal::time::Instant::now();
+    loop {
+        match audio::startup_status() {
+            audio::StartupStatus::Ready => return Ok(()),
+            audio::StartupStatus::Failed => return Err("the I2S transmitter would not start"),
+            audio::StartupStatus::Pending => {}
+        }
+        if started.elapsed() >= AUDIO_READY_TIMEOUT {
+            return Err("the core-1 audio refill did not complete its pre-roll");
+        }
+        core::hint::spin_loop();
+    }
+}
 
 /// How long the control task waits between polls of the key-event channel and the
 /// once-per-tick bookkeeping (garbage collection, the display refresh). 10 ms: fine
@@ -697,10 +739,13 @@ async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
             let title = control.module().map(|module| module.header().title.as_ref()).unwrap_or("");
             let view = NowPlaying::from_snapshot(&snapshot, firmware_common::SAMPLE_RATE_HZ, title, control.master_volume());
             println!(
-                "{view}  peak={} underruns={} dma_errors={} retired={} rejected={}",
+                "{view}  peak={} underruns={} dma_errors={} offered={} written={} pushes={} retired={} rejected={}",
                 control.peak(),
                 audio::underruns(),
                 audio::dma_errors(),
+                audio::steady_available_bytes(),
+                audio::steady_written_bytes(),
+                audio::steady_push_calls(),
                 retired,
                 control.commands_rejected(),
             );

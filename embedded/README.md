@@ -155,18 +155,78 @@ while tapping **RESET** if it does not enter the bootloader on its own. The tran
 `goldens/` hashes the A1S's do), and the full log is what fills
 `plans/reference/embedded-budget.md`'s C5 rows — its §6 has the line-by-line mapping.
 
-### Before the first flash — a known hazard
+### Before listening
 
-**The audio build may come up silent with `underruns=0`.** `refill_task` takes `continue` when
-`available()` errors, which skips the one call that can recover the DMA's descriptor accounting,
-so the loop can spin counting DMA errors with nothing reaching the DAC. It was found on an
-ESP32-A1S by the sibling project `../star-fx`, on the same esp-hal version, and it is written up
-with the fix in `plans/reference/embedded-budget.md` §4a and tracked as
-`plans/engine/M8-task-I3a-dma-refill-remediation.md`. Read one of those before spending time on
-a quiet board. Also read §4b: later listening confirmed headphones use ES8388 output
-pair 2 (`0x0c`), while this driver currently labels pair 1 as headphones. The current
-`ALL` output selection masks that alias error. DMA progress and audible stereo output
-are separate acceptance checks.
+The first hardware run confirmed advancing transport with `underruns=0` and `dma_errors=0`,
+but unity master volume was very loud and clipped repeatedly. In the second run the owner found
+1/16 was the loudest setting they wanted and the next 1/16 step was already very loud. The A1S
+firmware therefore boots at exact 1/16, uses 1/64 button steps, enables only the ES8388's pair-2
+headphone drivers (`0x0c`), and holds the GPIO21 speaker-amplifier enable low. Start a listening
+check with headphones off the listener's ears and raise the level only after the boot line
+confirms those settings.
+
+The same run confirmed the DMA remediation from
+`plans/engine/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
+refill falls through to `push_with`, which can recover the descriptor accounting. A fixed
+startup `dma_errors` count identifies a recovered transient; a count that keeps climbing still
+means the transport is unhealthy. A second run showed that recovery alone did not establish a
+steady lead: music had the right pitch but was heavily gated, and song time advanced at about
+half wall speed with both counters still zero. A real-audio pre-roll in core 0 then tripped the
+ProCpu stack guard. Replacing its closure with silence still panicked: the exact backtrace ended
+in the existing `audio::start` → `fill` → `RenderHalf::render` prefill, showing that adding any
+async prime call had enlarged `play`'s future enough for that older scratch frame to cross the
+guard.
+
+Moving the transfer to core 1 still left the underlying interrupt on core 0. The next 50-second
+monitor run advanced only about 24 seconds of song, with `underruns=0` and `dma_errors=0`.
+esp-hal 1.1.2 made interrupt affinity a concrete next hypothesis: `ChannelTx::into_async`
+disables the DMA interrupt on `Cpu::other()` and binds it to `Cpu::current()`. Constructing the
+driver on core 0 therefore left core 1's DMA futures dependent on wakeups from the core whose
+UART logging masks interrupts for 7–12 ms. Star FX avoids that affinity mismatch by constructing
+its whole I2S driver inside core 1.
+
+The firmware now moves the untouched I2S peripheral parts and renderer to core 1. That core calls
+`audio::start`, so driver construction, real-audio prefill and transfer start share the core that
+owns the DMA interrupt. Its refill task then completes eight `push_with` descriptor handoffs of
+silence and publishes a Release/Acquire startup result. Core 0 spins for at most one second with
+the codec muted, reports a start failure distinctly from a timeout, logs only after readiness,
+and then unmutes. An early recovery offer may be empty, while every non-empty offer is zero-filled
+in place without a render scratch or larger stack. StarPlayer's descriptors are about 8.7 ms
+each, making this a bounded roughly 70 ms startup pre-roll; eight is the count Star FX soaked for
+40 minutes on the same board and HAL version. DMA progress and audible stereo output remain
+separate acceptance checks; `plans/reference/embedded-budget.md` §4a/§4b records the underlying
+findings.
+
+A timestamped run after moving construction to core 1 unmuted at +0.57 seconds but still showed
+only 0:24 engine elapsed at +49.86 seconds, with both error counters at zero. Interrupt affinity
+was therefore not the main gating cause, although the ownership fix remains. The next diagnostic
+run found the actual refill cadence: at +1.59 seconds `offered=written=88748`, after which both
+grew by only 89–90 KB/s, `pushes` grew by about 43/s, and `empty` stayed zero. Stereo 16-bit at
+44.1 kHz requires 176 400 B/s.
+
+esp-hal ignores the macro's requested chunk when `DescriptorChain::new` constructs the ring. It
+split the old 4 096-byte small circular ring into three ragged 1 366 / 1 366 / 1 364-byte
+descriptors; steady `push_with` then accepted variable contiguous regions while returning
+descriptor ownership, producing only about half a ring of refill per physical ring cycle. The
+ring is now nine quanta = 4 608 bytes, the smallest nearby whole-quantum multiple of three. Its
+three equal descriptors are 1 536 bytes = three render quanta = 384 stereo frames, enforced by
+compile-time assertions.
+
+The first fixed-geometry build booted and made exactly one 1 536-byte steady push. Its transport
+line then stayed at `offered=written=1536 pushes=1` while `dma_errors` climbed by about 115/s and
+engine time stayed at 0:00. esp-hal's plain `push` performs a second `available()` internally;
+after the outer check and render delay that check returned `Late`, and the outer error path then
+skipped the descriptor handoff on every later iteration.
+
+Steady refill now preserves the explicit outer check and error count, but always falls through to
+`push_with`. Its internal check happens immediately and discards `Late`; rendering and copying
+then happen inside the closure with no fallible check between them and the handoff. The closure
+loops over every complete 1 536-byte descriptor in its offer, using `ConstStaticCell` scratch,
+and returns the full byte count. It never intentionally returns a partial descriptor. Equal
+descriptor geometry and full consumption are the conditions that make steady `push_with` safe
+here; an empty recovery offer renders and returns zero bytes. The cumulative transport fields
+`offered`, `written` and `pushes` count the outer whole descriptors, closure bytes, and calls,
+excluding muted pre-roll.
 
 ### What a good boot looks like
 
@@ -221,16 +281,16 @@ CPU  240 MHz   heap 120.0 KiB
 PSRAM 4194304 bytes (4096.0 KiB) mapped at 0x3f800000
 I2C  device at 0x10 (ES8388)
 JACK headphone_detect=inserted
-CODEC ES8388 at 0x10: DAC up, 16-bit Philips slave, MCLK/LRCK 256, muted
+CODEC ES8388 at 0x10: DAC up, 16-bit Philips slave, MCLK/LRCK 256, headphone output, muted
 MODULE image=88036 bytes (85.9 KiB) channels=8 samples=5
 HEAP after open: …
-I2S  44100 Hz stereo 16-bit, MCLK on GPIO0, DMA ring 8 quanta (1024 frames, 23 ms)
-PLAY
-CORE1 audio refill running
-ord 000 pat 000 row 00/06 125 bpm   3/ 8 voices  0:01/2:47  peak=… underruns=0 …
+I2S  44100 Hz stereo 16-bit, MCLK on GPIO0, DMA ring 9 quanta (1152 frames, 26 ms)
+CORE1 audio refill running; pre-roll 8 silent descriptor handoffs complete (~70 ms)
+PLAY master_volume=1/16 output=headphone speaker_pa=off
+ord 000 pat 000 row 00/06 125 bpm   3/ 8 voices  0:01/2:47  peak=… underruns=0 dma_errors=0 offered=… written=… pushes=… …
 ```
 
-An `lcd` build's boot log has one more line between `PLAY` and `CORE1` — `LCD  ST7789
+An `lcd` build's boot log has one more line before `MODULE` — `LCD  ST7789
 found` or `LCD  ST7789 not found — continuing headless`, from `LcdDisplay::take`'s probe.
 "Not found" is not fatal: the audio still plays and the six-vs-five-key map is unaffected
 either way (`lcd` always drops KEY2, whether or not a panel actually answered).
@@ -262,7 +322,7 @@ there is nothing wired to describe.
 | I2S BCLK / LRCK | 27 / 25 | |
 | I2S DOUT (ESP → codec DSDIN) | 26 | |
 | I2S DIN (codec ASDOUT → ESP) | 35 | unused; input-only pin |
-| PA enable (speaker amplifier) | 21 | driven high once audio is flowing |
+| PA enable (speaker amplifier) | 21 | held low; the default firmware is headphone-only |
 | Headphone detect | 39 | input-only |
 | KEY1–KEY6 | 36, 13, 19, 23, 18, 5 | KEY1 is on an input-only pin; six keys by default, five (no KEY2) when `--features lcd` is built |
 | LED4 / LED5 | 22 / 19 | LED5 shares KEY3 |
@@ -284,8 +344,8 @@ Six-key map (default build):
 | KEY2 | 13 | stop (rewind to order 0) | — (I6: re-provision) |
 | KEY3 | 19 | previous order | seek back one order every 200 ms |
 | KEY4 | 23 | next order | seek forward one order every 200 ms |
-| KEY5 | 18 | volume − (1/16 step) | repeat every 200 ms |
-| KEY6 | 5 | volume + (1/16 step) | repeat every 200 ms |
+| KEY5 | 18 | volume − (1/64 step) | repeat every 200 ms |
+| KEY6 | 5 | volume + (1/64 step) | repeat every 200 ms |
 
 Five-key map (`--features lcd`, GPIO13 is the display's MOSI so KEY2 is unavailable):
 
@@ -294,11 +354,13 @@ Five-key map (`--features lcd`, GPIO13 is the display's MOSI so KEY2 is unavaila
 | KEY1 | 36 | play / pause | stop (rewind to order 0) |
 | KEY3 | 19 | previous order | seek back one order every 200 ms |
 | KEY4 | 23 | next order | seek forward one order every 200 ms |
-| KEY5 | 18 | volume − (1/16 step) | repeat every 200 ms |
-| KEY6 | 5 | volume + (1/16 step) | repeat every 200 ms |
+| KEY5 | 18 | volume − (1/64 step) | repeat every 200 ms |
+| KEY6 | 5 | volume + (1/64 step) | repeat every 200 ms |
 
-Volume is applied through `ControlHalf::set_master_volume` and lives in RAM only — it does
-not persist across a reset.
+Volume is applied through `ControlHalf::set_master_volume` and lives in RAM only. The A1S
+firmware starts at exact **1/16** on every boot for safe headphone listening and KEY5/KEY6 move
+in exact **1/64** steps; the web control can also change it until the next reset. This board
+policy does not change the engine or other hosts, whose default remains unity.
 
 ### The display (M8-I5, `--features lcd`)
 
@@ -493,7 +555,7 @@ a write outright while the second core is running, and this firmware runs the au
 on core 1 — so a write parks it.
 
 `POST /api/modules/store` therefore **stops the transport first**, waits for the 64-frame
-ramp and the 23 ms DMA ring to drain to silence, writes, and plays again. Storing a 90 KB
+ramp and the 26 ms DMA ring to drain to silence, writes, and plays again. Storing a 90 KB
 module is a few seconds of silence, and that is the designed behaviour, not a fault; the
 page warns about it beside the button. `POST /api/modules/select` for a flash slot does the
 same for a long read, which is safe but contends for the flash bus badly enough to cost
@@ -542,16 +604,18 @@ the floor.
   atomic instructions do not work correctly on PSRAM, and this engine puts atomics on the
   heap (`Arc` refcounts, the host's seqlocks, the telemetry ring). `src/main.rs` has the
   full reasoning; M8-I6 inherits the constraint.
-* **The audio refill task runs on core 1** — moved there by M8-I5. M8-I3's write-up blamed
-  `RenderHalf` not being `Send` on the engine's `Box<dyn EventSource>` and kept everything
+* **The whole async audio driver and refill task run on core 1** — the refill moved there in
+  M8-I5, and the driver construction followed after the hardware result above. M8-I3's write-up
+  blamed `RenderHalf` not being `Send` on the engine's `Box<dyn EventSource>` and kept everything
   on core 0 as a result; that diagnosis did not hold once actually checked (`EventSource`
   and `Insert` both already carry a `Send` supertrait bound, so `RenderHalf` was already
   `Send` — see the compile-time assertion beside its definition in
   `crates/starplayer-host-embedded/src/player.rs`). The real, and genuinely unavoidable,
-  `Send` obstacle was `esp_hal`'s own DMA transfer type (`audio::AudioTransfer`), which
-  main.rs crosses with a small `unsafe impl Send` wrapper (`SendTransfer`) whose safety
+  `Send` obstacle is esp-hal's untouched peripheral-token bundle (`audio::Parts`), which
+  main.rs crosses with a small `unsafe impl Send` wrapper (`SendAudioParts`) whose safety
   argument is a one-time ownership handoff into core 1's entry closure, the same shape
-  `esp-rtos`'s own internal `SecondCoreStack` wrapper uses. Core 0 now runs the keys task,
+  `esp-rtos`'s own internal `SecondCoreStack` wrapper uses. `audio::start` calls `into_async`
+  only after that handoff, binding the DMA interrupt to core 1. Core 0 now runs the keys task,
   the control task and (under `lcd`) the display task; see the "Core pinning" section of
   `src/main.rs`.
 * The measured sizes live in `plans/reference/embedded-budget.md`, which is where any new

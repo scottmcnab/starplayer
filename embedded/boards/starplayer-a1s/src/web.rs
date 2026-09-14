@@ -613,8 +613,8 @@ impl Bridge {
     /// This is the flash-cache pause. esp-storage parks core 1 around each erase and each
     /// write chunk, so the refill is not running and the DMA ring plays whatever it holds
     /// — which after this pause is silence. Without it, a 90 KB slot write is several
-    /// seconds of a loudly repeated 23 ms fragment rather than a gap. 150 ms covers the
-    /// transport's 64-frame ramp and the ring's own 23 ms depth several times over.
+    /// seconds of a loudly repeated 26 ms fragment rather than a gap. 150 ms covers the
+    /// transport's 64-frame ramp and the ring's own 26 ms depth several times over.
     async fn pause_playback(&mut self, control: &mut ControlHalf) {
         let _ = control.stop();
         Timer::after(Duration::from_millis(150)).await;

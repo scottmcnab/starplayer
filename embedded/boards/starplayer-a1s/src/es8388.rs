@@ -45,7 +45,9 @@
 //!    transposed with respect to the datasheet's Register 4 (`bit5 = LOUT1`, `bit4 =
 //!    ROUT1`, `bit3 = LOUT2`, `bit2 = ROUT2`). It is invisible for "all four outputs"
 //!    (`0x3c` either way) and wrong the moment a build wants the headphone pair alone, so
-//!    [`Outputs`] spells the datasheet's bits.
+//!    [`Outputs`] spells the datasheet's bits. The Ai-Thinker ESP32-A1S specification maps
+//!    the board's `HPOUTL`/`HPOUTR` to codec pair 2 (`LOUT2`/`ROUT2`) and its speaker
+//!    outputs to pair 1 (`LOUT1`/`ROUT1`), so the board-function aliases follow that map.
 //!
 //! The three undocumented writes ADF makes at `0x35`, `0x37` and `0x39` ("disable the
 //! internal DLL to improve 8K sample rate") are **omitted**: they lie past the datasheet's
@@ -108,13 +110,13 @@ mod register {
     pub const DACCONTROL21: u8 = 0x2b;
     /// `VROI`: the Vref-to-output resistance.
     pub const DACCONTROL23: u8 = 0x2d;
-    /// `LOUT1VOL` — analog headphone-left output volume.
+    /// `LOUT1VOL` — analog speaker-left output volume on this board.
     pub const LOUT1VOL: u8 = 0x2e;
-    /// `ROUT1VOL`.
+    /// `ROUT1VOL` — analog speaker-right output volume on this board.
     pub const ROUT1VOL: u8 = 0x2f;
-    /// `LOUT2VOL` — analog speaker-left output volume.
+    /// `LOUT2VOL` — analog headphone-left output volume on this board.
     pub const LOUT2VOL: u8 = 0x30;
-    /// `ROUT2VOL`.
+    /// `ROUT2VOL` — analog headphone-right output volume on this board.
     pub const ROUT2VOL: u8 = 0x31;
 }
 
@@ -123,26 +125,25 @@ mod register {
 /// Not ESP-ADF's `es_dac_output_t`, whose `LOUT1` and `ROUT2` are transposed — see the
 /// module docs, decision 4.
 pub mod outputs {
-    /// Headphone left.
+    /// Speaker left on this board.
     pub const LOUT1: u8 = 0x20;
-    /// Headphone right.
+    /// Speaker right on this board.
     pub const ROUT1: u8 = 0x10;
-    /// Speaker left.
+    /// Headphone left on this board.
     pub const LOUT2: u8 = 0x08;
-    /// Speaker right.
+    /// Headphone right on this board.
     pub const ROUT2: u8 = 0x04;
     /// Headphone pair only.
-    pub const HEADPHONE: u8 = LOUT1 | ROUT1;
+    pub const HEADPHONE: u8 = LOUT2 | ROUT2;
     /// Speaker pair only.
-    pub const SPEAKER: u8 = LOUT2 | ROUT2;
-    /// All four — what this firmware enables, so the jack and the on-board amplifier both
-    /// work without a build flag.
+    pub const SPEAKER: u8 = LOUT1 | ROUT1;
+    /// All four output drivers, for callers that need the jack and on-board amplifier together.
     pub const ALL: u8 = HEADPHONE | SPEAKER;
 }
 
 /// The analog output-volume register value for 0 dB.
 ///
-/// `LOUT1VOL`/`ROUT1VOL` and their speaker siblings run −45 dB … +4.5 dB in 1.5 dB steps,
+/// `LOUT1VOL`/`ROUT1VOL` and their headphone siblings run −45 dB … +4.5 dB in 1.5 dB steps,
 /// so `0x00` is −45 dB and `0x1e` (30) is unity. ESP-ADF writes exactly this.
 const ANALOG_VOLUME_0DB: u8 = 0x1e;
 
@@ -263,7 +264,7 @@ impl<Bus: I2c> Es8388<Bus> {
         self.write(register::RDACVOL, 0x00)?;
 
         // Analog 0 dB on all four outputs. ESP-ADF leaves the speaker pair at −45 dB
-        // (0x00); this board has a speaker amplifier behind `LOUT2`/`ROUT2` and a PA-enable
+        // (0x00); this board has a speaker amplifier behind `LOUT1`/`ROUT1` and a PA-enable
         // pin that already decides whether the speakers make sound, so the volume register
         // is not the place to also decide it.
         self.write(register::LOUT1VOL, ANALOG_VOLUME_0DB)?;

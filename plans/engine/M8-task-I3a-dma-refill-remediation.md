@@ -3,9 +3,9 @@
 | Field | Value |
 |---|---|
 | Milestone | M8 ([master plan](M8-master-plan.md)), remediating [I3](complete/M8-task-I3-esp32-a1s-bringup.md)'s `audio.rs` |
-| Status | **Open, written 2026-09-14.** Found on hardware by the sibling project `../star-fx`; not yet reproduced here, because nothing in `embedded/` has ever been flashed |
+| Status | **Open, written 2026-09-14.** Digital transport accepted on hardware after a 310-second soak; owner headphone listening and stereo acceptance remain pending |
 | Depends on | — (the diagnosis is done; see `plans/reference/embedded-budget.md` §4a) |
-| Blocks | The first audible A1S run. M8's exit criterion is "sound from the headphone jack", transport progress and codec output routing must both be verified |
+| Blocks | Reliable A1S playback. M8's exit criterion is "sound from the headphone jack", transport progress and codec output routing must both be verified |
 | Parallel with | Work outside the A1S audio, codec and boot files |
 | Recommended model | GPT-5.6-sol, high effort — it is a handful of lines, but they are the real-time path, the failure mode is silence with a counter climbing, and the fix needs both esp-hal source review and a board run |
 | Verified by | the owner or an agent with the board: a bounded boot/run transcript with advancing transport and reported DMA error/underrun counters, plus clear stereo music from the headphone jack |
@@ -26,8 +26,9 @@ counter climbing by ~650 000/s, and ran 901 544 consecutive clean blocks once th
 `push_with` anyway), and the two hypotheses already disproved on hardware — ring depth and
 arming order — which must not be re-tested here.
 
-The same file's §4a also corrects a second, harmless claim: a DMA descriptor is not one render
-quantum. `audio.rs`'s module documentation has been corrected in place; no code depends on it.
+The initial task treated §4a's descriptor-granularity correction as documentation-only. The
+hardware-finding amendment below disproves that assumption: steady refill must align rendering
+and pushes to whole descriptors.
 
 ### Code you must read before changing anything
 
@@ -38,8 +39,9 @@ quantum. `audio.rs`'s module documentation has been corrected in place; no code 
   `let _avail = self.available().await;` and `push` writes `self.available().await?`.
 - `~/.cargo/registry/src/index.crates.io-*/esp-hal-1.1.2/src/dma/mod.rs` —
   `TxCircularState::{new, update, push_with}` and `DescriptorChain::fill`.
-- `../star-fx/firmware/src/audio/i2s.rs` — a worked implementation of the pre-roll, including
-  why the steady-state loop must keep `push` rather than `push_with`.
+- `../star-fx/firmware/src/audio/i2s.rs` — a worked implementation of the pre-roll and the
+  general danger of partial steady `push_with` calls. The amendment below records the stricter
+  equal-descriptor, full-consumption use required by this board run.
 
 ## Deliverables
 
@@ -58,11 +60,12 @@ prefill puts bytes in memory, whereas the problem is the descriptor bookkeeping.
 whether a pre-roll is wanted here or whether deliverable 1 alone suffices, and say which and
 why in the module documentation.
 
-**Do not** adopt `push_with` for the steady-state loop by analogy with `../star-fx`'s
-pre-roll: it returns the descriptor to the DMA whether or not anything was written, so a short
-offer desynchronises the ring for good. That firmware measured four builds wedging after 4–14
-blocks before confining `push_with` to the pre-roll. This firmware happens to be safe with it
-today only because `fill` renders whatever it is offered.
+**Initial constraint, superseded by the hardware amendment below:** do not adopt unconstrained
+steady `push_with` by analogy with `../star-fx`'s pre-roll. It returns descriptor ownership even
+when the closure writes nothing, so a short or partial offer can desynchronise the ring. The
+later board runs require `push_with` here because plain `push` wedges on its second availability
+check, but only with equal whole descriptors and a closure that consumes every complete
+descriptor it is offered.
 
 ### 3. Make a wedge visible rather than silent
 
@@ -90,11 +93,11 @@ handling against the board schematic. Make the output choice explicit in the run
 
 ## Research points
 
-1. Does this firmware actually wedge on the board, or does its 23 ms ring and its
-   render-anything `fill` happen to get the first `Ok` in before the ring drains? The bench
-   answers this in one flash, and the answer decides whether deliverable 2 is needed at all.
-2. With the fix in, what is the smallest `DMA_RING_QUANTA` that never underruns? That is M8-I3
-   research point 4, still open, and it is now cheap to measure.
+1. **Answered by the amendment below:** the firmware recovered startup accounting, but the old
+   23 ms ring and steady `push_with` discipline supplied only about half the required byte rate.
+2. **Answered for this implementation:** the nine-quantum, three-descriptor ring completed a
+   310-second soak with no underruns and the required steady 176 400 B/s write rate. A smaller
+   ring is not required for I3a acceptance.
 
 ## Verification
 
@@ -103,7 +106,7 @@ handling against the board schematic. Make the output choice explicit in the run
 cd embedded && cargo xtask build --board a1s
 # on the bench — an A1S is reachable over an rfc2217 bridge; see embedded-budget.md §4a
 cargo xtask flash --board a1s && cargo xtask monitor --board a1s
-#   → the transport line advances once a second, underruns=0, dma errors 0, and music plays
+#   → transport advances once a second, underruns=0, no recurring DMA errors, and music plays
 ```
 
 ### Board acceptance and shared-board coordination
@@ -129,8 +132,7 @@ run competing monitors. Start listening at low volume with headphones off the ow
 
 ## Out of scope
 
-The descriptor-granularity correction (documentation only, already applied). Any change to
-`fill`, `RenderHalf` or the render quantum. The C5.
+Changes to `RenderHalf` or the render quantum beyond board-local descriptor staging. The C5.
 
 Microphone removal, input-bank workarounds and other board modifications are outside this
 playback task. Do not change hardware to chase Star FX input noise.
@@ -140,3 +142,56 @@ playback task. Do not change hardware to chase Star FX input noise.
 Reviewed commit `631f785`, the current A1S codec initialization and refill code, Star FX
 M1-B4 listening evidence, and the recovery constant. Documentation-only amendment;
 `git diff --check` passed. No firmware build or flash performed, and no unsafe sites added.
+
+## Hardware-finding amendment (2026-09-14)
+
+This plan remains **open**. Successive bounded flashes established the following:
+
+- Moving async driver construction to core 1 preserved correct interrupt ownership but did not
+  fix the gating. The codec unmuted at +0.57 seconds and engine elapsed was only 0:24 at +49.86
+  seconds, with `underruns=0` and `dma_errors=0`.
+- The next diagnostic build reported `offered=written=88748` at +1.59 seconds, then only
+  89–90 KB/s and about 43 pushes/s, with no empty offers. Stereo 16-bit at 44.1 kHz requires
+  176 400 B/s, so engine time advanced at the exact rate at which the refill supplied bytes.
+- esp-hal 1.1.2's `DescriptorChain::new` ignores the allocation macro's chunk size and uses its
+  4 092-byte default when it fills the chain. The 4 096-byte ring was therefore split into three
+  ragged 1 366 / 1 366 / 1 364-byte descriptors. Returning variable contiguous regions through
+  steady `push_with` advanced descriptor ownership at only about half the physical byte rate.
+- The first equal-descriptor build booted and completed exactly one 1 536-byte steady `push`.
+  `offered=written=1536 pushes=1` then remained fixed, engine time stayed at 0:00, and
+  `dma_errors` climbed by about 115/s. The plain `push` call's internal second `available()`
+  returned `Late` after the outer check and render delay; the outer error path then skipped every
+  later descriptor handoff.
+
+The board-local remediation uses nine render quanta: a 4 608-byte ring split into three equal
+1 536-byte descriptors, each exactly three render quanta or 384 stereo frames. Compile-time
+assertions preserve that geometry. The steady loop preserves deliverable 1's explicit outer
+`available()` and error count, then always falls through to descriptor-aligned `push_with`. Its
+internal availability error is discarded before the closure renders, removing the fallible gap
+between rendering and descriptor handoff. The closure loops over every complete 1 536-byte
+descriptor in its contiguous offer, renders through static `i16` scratch, copies it, and returns
+the full byte count; it never intentionally returns a partial descriptor. An empty recovery offer
+returns zero without rendering. Unlike the old ragged-ring implementation, equal descriptor
+geometry plus this full-consumption invariant keeps `push_with` aligned in steady state. The
+eight muted recovery handoffs still take about 70 ms.
+
+### Successful transport soak (2026-09-14)
+
+The final descriptor-aligned build on `main` passed the bounded hardware transport run:
+
+- Exact image SHA-256:
+  `cfcad897bd3cdec42f128d9a3754ca404095c4a4298a5164b9f2359fec136f91`
+  (477 904 bytes).
+- A fresh-reset run soaked for 310 seconds. At the final telemetry line, engine time was 0:31
+  after two complete 2:18 loops: about 307 seconds of module time, tracking wall time after boot.
+- Final refill telemetry was `offered=63664128 written=54571008 pushes=23687`. The written rate
+  was approximately 176 400 B/s, exactly the stereo i16 rate required at 44.1 kHz.
+- `underruns=0`; `dma_errors=1` was already present in the first telemetry line and did not
+  increase during the soak. This is one recovered startup transient, with no steady-state errors.
+- `peak=1178`, `retired=0`, and `rejected=0`. The firmware booted at 1/16 master volume,
+  selected headphone output only, and kept the speaker PA off.
+
+This accepts the refill cadence, startup recovery, transport progress, ring geometry and output
+routing configuration. **The plan remains open and must not be archived:** owner listening
+acceptance is still pending recognizable clean stereo music in both ears and confirmation of
+left/right identity through the headphone jack.
