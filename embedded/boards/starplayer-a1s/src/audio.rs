@@ -9,13 +9,20 @@
 //! than the ring holds, and never into a region the DMA still owns, because
 //! `push_with` hands out only the free part.
 //!
-//! Each DMA descriptor is exactly one render quantum
-//! ([`QUANTUM_BYTES`] = 128 frames × 4 bytes), which makes the available-space figure a
-//! whole number of quanta and the refill's block size the engine's own. That is not
-//! required for correctness — design goal 3 says the output must be identical at *any*
-//! block size, and `RenderHalf::render`'s cadence is what makes that true through a host —
-//! but it means the DMA boundary and the control cadence coincide, so a seek or a stop
-//! lands on the frame the engine says it does with no extra ragged block in the way.
+//! **A DMA descriptor is not one render quantum, although this comment used to say it was.**
+//! The `chunk` argument to `dma_circular_buffers_chunk_size!` only decides how many
+//! descriptors are *allocated*; `DescriptorChain::new` hardcodes esp-hal's own `CHUNK_SIZE`
+//! and `fill` then cuts any circular ring of 8 184 bytes or fewer into exactly **three**
+//! descriptors of `len / 3 + len % 3` bytes. At [`DMA_RING_QUANTA`] = 8 that is three of
+//! 1 366 / 1 366 / 1 364 bytes, so `available()` and `push_with` deal in roughly 1 366-byte
+//! units — neither a whole quantum nor even a whole frame.
+//!
+//! This costs correctness nothing: design goal 3 says the output must be identical at *any*
+//! block size, `fill` renders whatever size it is offered, and `RenderHalf::render` carries
+//! its gain and stream alignment across calls. What it does cost is the tidiness this comment
+//! used to claim — a seek or a stop lands within a descriptor (341 frames, 7.7 ms), not on
+//! the exact frame the engine names. See `plans/reference/embedded-budget.md` §4a, which
+//! records how this was found on the board by the sibling project `../star-fx`.
 //!
 //! # Real-time rules in the refill
 //!
@@ -219,6 +226,28 @@ fn fill(destination: &mut [u8], render: &mut RenderHalf<Linear>) -> usize {
 /// An `available()` of the whole ring means the DMA consumed everything before this task
 /// was scheduled — an **underrun**, audible as a click — and is counted rather than
 /// logged. Errors are counted for the same reason: this is the real-time path.
+///
+/// # A known hazard on the first bench run — read before flashing
+///
+/// **The `continue` on the error arm below can wedge this task permanently, so that the board
+/// never plays.** `TxCircularState::update` reports nothing free through the ring's first pass
+/// and returns `DmaError::Late` as soon as it finds every descriptor CPU-owned, and of the two
+/// push calls only `push_with` can recover from that state — it discards `available()`'s error
+/// and hands a descriptor back to the DMA regardless, which is precisely what un-sticks the
+/// accounting. Taking `continue` on `Err` skips the one call that could help, so the loop
+/// spins on `available()` for ever, counting DMA errors at hundreds of thousands per second
+/// with the ring silent.
+///
+/// `../star-fx` hit exactly this on an ESP32-A1S with the same esp-hal version: its transport
+/// froze with one block processed while its overrun counter climbed by about 650 000 a second,
+/// and audio only flowed — 901 544 consecutive blocks — once the code reached `push_with`
+/// anyway.
+///
+/// The remediation is deliberately **not applied here**, because this firmware has never been
+/// flashed and a blind change to an untested audio path is worse than a documented hazard.
+/// `plans/reference/embedded-budget.md` §4a states the fix (fall through to `push_with`
+/// instead of `continue`; consider priming with silence; consider a reset backstop) and the
+/// two hypotheses already disproved on hardware, so the first bench run starts informed.
 #[embassy_executor::task]
 pub async fn refill_task(mut transfer: AudioTransfer, render: &'static mut RenderHalf<Linear>) {
     loop {

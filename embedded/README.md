@@ -155,6 +155,19 @@ while tapping **RESET** if it does not enter the bootloader on its own. The tran
 `goldens/` hashes the A1S's do), and the full log is what fills
 `plans/reference/embedded-budget.md`'s C5 rows — its §6 has the line-by-line mapping.
 
+### Before the first flash — a known hazard
+
+**The audio build may come up silent with `underruns=0`.** `refill_task` takes `continue` when
+`available()` errors, which skips the one call that can recover the DMA's descriptor accounting,
+so the loop can spin counting DMA errors with nothing reaching the DAC. It was found on an
+ESP32-A1S by the sibling project `../star-fx`, on the same esp-hal version, and it is written up
+with the fix in `plans/reference/embedded-budget.md` §4a and tracked as
+`plans/engine/M8-task-I3a-dma-refill-remediation.md`. Read one of those before spending time on
+a quiet board. Also read §4b: later listening confirmed headphones use ES8388 output
+pair 2 (`0x0c`), while this driver currently labels pair 1 as headphones. The current
+`ALL` output selection masks that alias error. DMA progress and audible stereo output
+are separate acceptance checks.
+
 ### What a good boot looks like
 
 The **bench** build prints, in order:

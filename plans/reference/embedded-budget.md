@@ -394,6 +394,172 @@ build's two renders both use `BLOCK_FRAMES = 128` (`boards/starplayer-c5/src/ben
 the same `RENDER_QUANTUM`, purely so the cycle figures in §3 are taken at the same block
 size the A1S's are and stay comparable — not because anything on the C5 consumes blocks.
 
+## 4a. What a bench run on the same board found about this DMA path (2026-09-14)
+
+**Nothing in `embedded/` has been flashed yet, and two claims in this document and in
+`audio.rs` are wrong.** Both were found on a real ESP32-A1S by the sibling project
+`../star-fx`, which drives the same `esp-hal` 1.1.2 I2S API on the same board and had
+copied this firmware's shape. Everything below is read out of
+`~/.cargo/registry/src/index.crates.io-*/esp-hal-1.1.2/src/{dma/mod.rs,i2s/master.rs}` and
+was confirmed against hardware there; it is recorded here so this firmware's first bench
+run is not spent rediscovering it.
+
+### A DMA descriptor is **not** one render quantum
+
+`audio.rs`'s module documentation says "each DMA descriptor is exactly one render quantum
+(`QUANTUM_BYTES` = 128 frames × 4 bytes)", so the available-space figure is a whole number
+of quanta and "the DMA boundary and the control cadence coincide". **That is not what
+happens.** The `chunk` argument to `dma_circular_buffers_chunk_size!` only decides how many
+descriptors are *allocated*. `I2sTx`/`I2sRx` build their chain with `DescriptorChain::new`,
+which hardcodes `esp_hal::dma::CHUNK_SIZE` (4 092), and `DescriptorChain::fill` then
+recomputes the length of each one:
+
+```rust
+let max_chunk_size = if circular && len <= self.chunk_size * 2 {
+    if len <= 3 { return Err(DmaError::BufferTooSmall); }
+    len / 3 + len % 3
+} else { self.chunk_size };
+```
+
+So **any circular ring of 8 184 bytes or fewer becomes exactly three descriptors**. For this
+firmware's shipped `DMA_RING_QUANTA = 8` (4 096 bytes) that is three descriptors of
+**1 366 / 1 366 / 1 364 bytes** — not eight of 512 — so eight descriptors are allocated and
+three are used, `available()` and `push_with` deal in ~1 366-byte units, and a unit is
+neither a whole quantum nor even a whole 4-byte frame. Research point 4's sweep
+(`DMA_RING_QUANTA` = 2, 4, 8) changes the ring's total size and therefore the latency, but
+every one of those depths still yields three descriptors.
+
+This is **harmless for this firmware** and that is worth stating plainly: `fill()` renders
+whatever size it is offered and carries its gain and stream alignment across calls, so a
+ragged offer costs nothing. What is wrong is only the claim — and the design goal built on
+it, that a seek or stop "lands on the frame the engine says it does with no extra ragged
+block in the way". It does not; it lands within ~1 366 bytes (341 frames, 7.7 ms). Fix the
+comment, not the code.
+
+### The refill task can wedge at start-up, and never play
+
+This one is a **defect, not a documentation slip**, and it is the reason to read this section
+before the first flash.
+
+`TxCircularState::update` counts a descriptor free only once the DMA's
+`last_out_dscr_address()` has moved *past* the one it last saw, and it starts pointed at the
+first descriptor — so `available` stays 0 through the ring's first pass. Worse, the same
+function returns `Err(DmaError::Late)` the moment its walk finds every descriptor
+CPU-owned, which is exactly what a ring that has drained without being refilled looks like.
+Meanwhile the two push calls differ in one decisive way:
+
+```rust
+pub async fn push(&mut self, data: &[u8]) -> Result<usize, Error> {
+    let avail = self.available().await?;          // propagates Late — never pushes
+    ...
+}
+pub async fn push_with(&mut self, f: impl FnOnce(&mut [u8]) -> usize) -> Result<usize, Error> {
+    let _avail = self.available().await;          // DISCARDS the error
+    Ok(self.state.push_with(f)?)                  // hands a descriptor back regardless
+}
+```
+
+`push_with` is therefore the only call that can rescue the accounting once `available()` has
+gone `Late`, because handing one descriptor back to the DMA is what un-sticks it.
+
+**`refill_task` currently cannot reach that call in the state where it is needed:**
+
+```rust
+match transfer.available().await {
+    Ok(available) => { if available >= DMA_RING_BYTES { UNDERRUNS.fetch_add(1, ..); } }
+    Err(_) => { DMA_ERRORS.fetch_add(1, ..); continue; }   // <-- skips push_with
+}
+if transfer.push_with(|destination| fill(destination, render)).await.is_err() { .. }
+```
+
+On `Err` it `continue`s, loops back to `available()`, gets the same `Late`, and spins —
+counting `DMA_ERRORS` at hundreds of thousands per second and never pushing a byte. Star FX
+saw precisely this on the board: its transport wedged with its block counter frozen at 1
+and its overrun counter climbing by ~650 000/s, and the fix that made audio flow for
+901 544 consecutive blocks was to reach `push_with` anyway.
+
+**Recommended remediation — not applied here**, because this firmware has not been bench-run
+and a blind change to an untested audio path is worse than a documented hazard:
+
+1. In `refill_task`, do not `continue` on `Err`: count it and **fall through to `push_with`**,
+   which is the call that can recover. Keep the counter, so a transient error is still visible.
+2. Consider priming the transfer with one or more `push_with` calls of silence before the
+   steady loop begins, which is what Star FX ended up doing (`Transport::begin`) — it brings
+   the accounting good before the first real block is due.
+3. A backstop is worth having whatever else is done: Star FX has a continuous-`Late` reset backstop and prints reset reasons.
+   Its current constant is `4_000 * 240_000` cycles: **4 seconds at 240 MHz**, not the
+   20 ms claimed by its stale comment. Neither 20 ms nor a 300 ms reboot is a verified
+   requirement for this player.
+
+Note the asymmetry that makes this survivable on the transmit side and fatal on the receive
+side: a **transmit** `Late` is recoverable exactly as above, but a **receive** `Late` is
+terminal in this `esp-hal` version — `RxCircularState::update` keeps returning it once it has
+wrapped, and `pop` begins with `available().await?`, so nothing can hand the descriptors
+back and the async circular type never gives up its `I2sRx` to be rebuilt. This firmware is
+transmit-only (`dma_circular_buffers_chunk_size!(0, DMA_RING_BYTES, QUANTUM_BYTES)`), so it
+is not exposed to that half — but any future capture path here is, and should be designed
+knowing it.
+
+### Two hypotheses already disproved on hardware
+
+Both cost Star FX most of a day; do not re-test them here. **Ring depth is not the cause** of
+a start-up wedge (16 ms behaved exactly as 8 ms). And **arming order is not the cause**
+either — moving the driver's construction onto the audio's own core changed the symptom but
+not the outcome. Keeping the driver on the core that owns the audio is still worth doing,
+because `into_async` binds the peripheral interrupt to the calling core and that should not
+be the core that logs, but it fixes nothing by itself.
+
+### The bench now exists
+
+The A1S that found all this is reachable over an rfc2217 bridge at **192.168.0.151:8086**
+(a board on a MacBook's USB). `esptool.py` can flash it over that bridge where `espflash`
+cannot, since `espflash`'s serial backend has no rfc2217 client; `../star-fx`'s `xtask`
+has a worked implementation of both the flash and the bounded console capture. Flashing this
+firmware there would overwrite Star FX's image, so it is a deliberate act rather than a
+casual one — but research point 4's depth sweep and the `underruns=` measurement this
+document has been waiting for are now a bench run away rather than a hardware purchase away.
+
+## 4b. Headphone and input findings after the DMA run (2026-09-14)
+
+These findings amend §4a's transport-only handoff. Star FX's stable DMA counters preceded
+its successful headphone check; 901 544 clean blocks prove transport progress, not audible
+output, channel identity or a measured analog noise floor.
+
+**Headphones are ES8388 output pair 2.** The Ai-Thinker ESP32-A1S Specification V2.3,
+page 13, maps module pin 27 HPOUTL to LOUT2 and pin 28 HPOUTR to ROUT2.
+[Manufacturer document mirror](https://probots.co.in/technical_data/ESP32-A1S_Datasheet.pdf).
+Star FX M1-B4 enabled pair 2 (`DACPOWER = 0x0c`) with pair-2 analog volumes at
+`0x1e` (0 dB), leaving GPIO21 PA low. The owner confirmed clear music in both ears
+without crackling. Previously pair 1 was enabled, digital input/output peaks tracked music,
+and only faint sound was audible. Do not infer correct output routing from peak telemetry.
+
+StarPlayer's `es8388.rs` currently reverses the board aliases: `HEADPHONE` names pair 1
+and `SPEAKER` pair 2, including the analog-volume comments. Its individual register bits
+are correct. `main.rs` uses `outputs::ALL = 0x3c`, with all four volumes at unity, which
+masks the alias error; **the alias error alone does not disable current StarPlayer output**.
+Correct the aliases before a worker chooses headphone-only operation.
+
+**LINE IN shares input bank 2 with onboard MIC2.** The same module document maps
+MIC2N (pin 14) and LINEINR (pin 21) to RIN2; MIC2P (pin 18) and LINEINL (pin 22)
+to LIN2. Its page-14 schematic shows the shared nets and microphone bias supplied from
+AVCC through R44/R45. The
+[Audio Kit V2.2 schematic, page 15](https://device.report/m/733d5ba2d731002bae35fd49d2f607f00a214056ed9d35b7bb477eecc9a2aa24.pdf)
+shows unused LINE IN jack normal contacts: plugging in does not disconnect MIC2.
+Disabling the codec's internal microphone-bias block does not remove this external bias.
+The owner heard speech near the microphone through Star FX, both with LINE IN open and
+with a paused MacBook connected. Selecting bank 2 cannot isolate those shared sources.
+This matters for future capture; it is **not a demonstrated defect in DAC-only playback**.
+
+**Noise remains unmeasured.** During Star FX ADC-to-DAC listening, MacBook USB power
+produced hiss and a computer-like whine. Switching to power-bank power reduced the noise
+substantially; disconnecting the MacBook charger alone made only a slight difference.
+LINE IN connection also changed the noise. These observations establish sensitivity to the
+power/source arrangement, but do not distinguish supply coupling from ground-loop effects,
+or quantify a residual noise floor. Open-input peaks may include actual microphone audio.
+StarPlayer should test digital silence and music in its own DAC-only configuration before
+attributing any noise to DMA, microphone pickup or a specific electrical cause. No hardware
+modification has been made or is part of the playback remediation.
+
 ## 5. Q2 — is 128 the right `RENDER_QUANTUM`?
 
 **Yes, and this path does not want a compile-time override.** Recorded in
