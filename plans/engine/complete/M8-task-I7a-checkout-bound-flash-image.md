@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md)) |
-| Status | **Implementation complete; hardware acceptance pending.** Hardware use found that Cargo can reuse an xtask binary compiled in another worktree |
-| Depends on | [I7](complete/M8-task-I7-rfc2217-flash-script.md), [I8](M8-task-I8-web-boot-stack-remediation.md) |
+| Milestone | M8 ([master plan](../M8-master-plan.md)) |
+| Status | **Complete 2026-09-14.** The wrapper rebuilt xtask and flashed the exact current-checkout image with a verified hash |
+| Depends on | [I7](M8-task-I7-rfc2217-flash-script.md), [I8](M8-task-I8-web-boot-stack-remediation.md) |
 | Recommended model | GPT-5.6-sol |
 | Verified by | Agent shell/harness tests and reviewer inspection, then an authorized RFC2217 flash from `main` and UART boot capture |
 
@@ -74,6 +74,11 @@ endpoint/path quoting. Its path-confused case writes an image under a different 
 proves the wrapper rejects it without invoking esptool. Both wrapper and harness pass `bash -n`,
 the harness passes, both scripts retain their executable bits, and `git diff --check` passes. The
 real wrapper was not run and no hardware was accessed during implementation.
+
+Hardware acceptance then ran the merged wrapper from `/home/scott/projects/starplayer`. Its log
+showed both the xtask compile and board build rooted in that checkout, wrote the new local merged
+image, flashed 1 338 128 bytes at address zero, and verified the flash hash before reset. The
+subsequent UART capture booted the intended 144 KiB-heap image.
 
 ## Out of scope
 

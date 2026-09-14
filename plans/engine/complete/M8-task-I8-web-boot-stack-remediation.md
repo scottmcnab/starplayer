@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md)) |
-| Status | **Implementation complete; hardware acceptance pending.** Hardware acceptance found a core-0 stack-guard panic on the first unprovisioned `web` boot |
-| Depends on | [I6](complete/M8-task-I6-web-control.md), [I3a](complete/M8-task-I3a-dma-refill-remediation.md), [I7](complete/M8-task-I7-rfc2217-flash-script.md) |
+| Milestone | M8 ([master plan](../M8-master-plan.md)) |
+| Status | **Complete 2026-09-14.** The unprovisioned `web` image reaches and sustains the captive portal without the former core-0 stack-guard panic |
+| Depends on | [I6](M8-task-I6-web-control.md), [I3a](M8-task-I3a-dma-refill-remediation.md), [I7](M8-task-I7-rfc2217-flash-script.md) |
 | Recommended model | GPT-5.6-sol |
 | Verified by | Agent host/build checks, reviewer diff and build checks, then hardware boot and captive-portal acceptance over RFC2217 |
 
@@ -126,8 +126,14 @@ for `web`, and 105 284 for `web,lcd`. The previous failing `web` image had 28 10
 floor is now 32 KiB and every boot logs its exact linked stack size. All 73 firmware-common tests
 and all 10 embedded-xtask tests pass, as do the default, `lcd`, `web` and `web,lcd` A1S release
 links. The `web,lcd` app image is 1 299 392 of 2 621 440 bytes (49.5%), and `git diff --check`
-passes. Hardware proof remains pending: this implementation did not flash or execute the image on
-the board.
+passes.
+
+Hardware acceptance used the later I8a heap build, which retains this task layout and leaves
+57 564 bytes of linked core-0 stack. The exact checkout-local merged image was flashed with a
+verified hash. It booted without a stack panic, claimed the 10 048-byte portal future from PSRAM,
+completed its scan, and announced `StarPlayer-D3E4` at `http://192.168.4.1/`. Transport advanced
+continuously for 43 seconds with zero underruns, no DMA recovery log, and a constant diagnostic
+`dma_errors=1` counter.
 
 ## Out of scope
 

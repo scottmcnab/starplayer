@@ -76,9 +76,13 @@ espflash writes.
 
 M8-I8's PSRAM-task relocation changes the `web` link. Its verified `web,lcd` app image is
 **1 299 392 B**, 49.5% of the same 2 621 440-byte partition. The M8-I6 rows remain the
-section-by-section baseline for the original web implementation; the current static-RAM
-table below records the I8 links because stack reclamation is this task's acceptance
-measurement.
+section-by-section baseline for the original web implementation; I8's reclaimed stack
+values remain recorded in the worker discussion below.
+
+M8-I8a then adds a 48 KiB `.bss` Internal heap region while retaining the first 96 KiB
+region in `dram2_seg`. Its verified `web,lcd` app image is **1 300 944 B**, 49.6% of the
+partition. The current static-RAM table below records the I8a links and the two-region
+144 KiB heap.
 
 The audio and `lcd` images moved by 32 and 16 bytes respectively when M8-I6 landed, which
 is the cost of one `#[cfg]` on a control-task branch and of the stack-floor linker
@@ -211,21 +215,23 @@ is where the real number belongs once it exists.
 
 From `xtensa-esp32-elf-size -A` and `xtensa-esp32-elf-nm`.
 
-| Item | Audio build | `lcd` build | Bench build | `web` build (M8-I8) | `web,lcd` build |
+| Item | Audio build | `lcd` build | Bench build | `web` build (M8-I8a) | `web,lcd` build |
 |---|---|---|---|---|---|
-| `.bss` total | 151 688 B | 152 648 B | 123 000 B | 71 124 B | 72 124 B |
-| — of which the heap array | 122 880 B | 122 880 B | 122 880 B | **0** (in `dram2_seg`) | **0** |
+| `.bss` total | 151 688 B | 152 648 B | 123 000 B | 120 276 B | 121 276 B |
+| — of which the `.bss` heap array | 122 880 B | 122 880 B | 122 880 B | **49 152 B** | **49 152 B** |
 | — everything else (`RenderHalf`, the DMA ring and descriptors, internal task storage, core 1's 8 KiB stack, the key/display channels) | 28 808 B | 29 768 B | 120 B | 71 124 B | 72 124 B |
 | `.data` | 9 312 B | 9 748 B | 4 400 B | 18 224 B | 18 656 B |
-| `.dram2_uninit` (the `web` build's heap) | — | — | — | 98 304 B | 98 304 B |
-| **Core 0's main stack** (`0x3ffe_0000 − _bss_end`) | **35 608 B** | **34 200 B** | **69 208 B** | **106 716 B** | **105 284 B** |
+| `.dram2_uninit` (the first `web` heap region) | — | — | — | 98 304 B | 98 304 B |
+| **Total heap** | **122 880 B** | **122 880 B** | **122 880 B** | **147 456 B** | **147 456 B** |
+| **Core 0's main stack** (`0x3ffe_0000 − _bss_end`) | **35 608 B** | **34 200 B** | **69 208 B** | **57 564 B** | **56 132 B** |
 
 The stack is the real constraint, and it is not obvious: on the classic ESP32 core 0's main
 stack is simply whatever internal DRAM is left over, so **every heap byte, and now every
 byte of core 1's own 8 KiB stack, is a byte core 0's stack does not get**. A 160 KiB heap
 still links and leaves 6 472 bytes of stack, which will not survive a boot. 120 KiB is the
-balance this firmware ships; `embedded/README.md` §7 has the one-line check to run after
-any change that moves a large static. **M8-I5 moved the audio refill task to core 1**
+non-web balance; the web personalities use 144 KiB after I8 reclaimed their static worker
+pools. `embedded/README.md` §7 has the one-line check to run after any change that moves a
+large static. **M8-I5 moved the audio refill task to core 1**
 (`esp_rtos::start_second_core`); core 1's own stack is a fixed, separate 8 KiB
 (`CORE1_STACK_SIZE` in `main.rs`) that this table's "Main stack" row does not measure —
 only core 0's is `0x3ffe_0000 − _bss_end`, since core 1's is a `static` array with its own
@@ -238,11 +244,11 @@ The I2S DMA ring is `DMA_RING_QUANTA × 128 × 4` bytes = **4 096 B** at the shi
 |---|---|
 | Peak stack of the audio refill task, on core 1's dedicated 8 KiB (`CORE1_STACK_SIZE`, M8-I5) | TBD (owner: run the audio build — esp-hal's stack-guard watchpoint fires on an overflow, and a clean run through a whole song is the evidence that 8 KiB is enough) |
 | Peak stack of core 0's control/keys/(`lcd`) display tasks, against the **35 608 B** (audio) / **34 200 B** (`lcd`) budget above | TBD (owner: run each build) |
-| Heap high-water with the web stack up, against the `web` build's 98 304 B `dram2_seg` heap | TBD (owner: `HEAP.stats()` is printed at boot and after each module swap) |
+| Heap high-water with the web stack up, against the `web` build's 147 456 B two-region Internal heap | TBD (owner: `HEAP.stats()` is printed at boot, after player/audio construction, immediately after radio initialization and after each module swap) |
 | Audio gap during a 90 KB `POST /api/modules/store` flash write (M8-I6 research point 2) | TBD (owner: time the silence; the firmware fades out first, so the figure to record is how long the music is *stopped*, not how long it glitches) |
 | Underruns during an upload with the radio busy | TBD (owner: the once-a-second transport line's `underruns=` field, before and after) |
 
-#### What the `web` build's DRAM and PSRAM actually go on (M8-I6/I8)
+#### What the `web` build's DRAM and PSRAM actually go on (M8-I6/I8/I8a)
 
 Two figures that are easy to assume wrongly, both measured with
 `xtensa-esp32-elf-nm -S --size-sort` on the `web,lcd` image:
@@ -263,7 +269,11 @@ Two figures that are easy to assume wrongly, both measured with
   personality claims them from the monotonic PSRAM arena. Each replacement Embassy task
   header plus pointer proxy is **48 B** in the internal heap, where its atomics remain
   valid. The resulting exact stack is **106 716 B** for `web` and **105 284 B** for
-  `web,lcd`.
+  `web,lcd` before I8a. I8a assigns 49 152 bytes of that recovered room to a second
+  Internal heap region, leaving **57 564 B** / **56 132 B** respectively while raising
+  total heap capacity to **147 456 B**. The existing 98 304-byte `dram2_seg` region is
+  registered first; the new `.bss` region is second. Both macro-created regions have
+  `MemoryCapability::Internal`.
 * **PSRAM remains claim-only.** The three 512 KiB upload/image buffers are claimed first,
   leaving 2 621 440 bytes on the installed 4 MiB board before network selection. Station
   mode consumes 68 480 bytes for its two futures and leaves 2 552 960; portal mode consumes

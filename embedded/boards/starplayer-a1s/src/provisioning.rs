@@ -116,6 +116,7 @@ pub async fn run(
 ) -> Result<(), &'static str> {
     let (mut controller, interfaces) =
         esp_radio::wifi::new(wifi, ControllerConfig::default()).map_err(|_| "the WiFi controller would not start")?;
+    println!("HEAP after WiFi init: {}", esp_alloc::HEAP.stats());
 
     // Station mode, and scan **before** the AP exists: see the module documentation.
     match controller.scan_async(&ScanConfig::default().with_max(MAX_NETWORKS)).await {

@@ -755,9 +755,10 @@ Two kinds of file are accepted at `POST /api/modules`:
 * **A raw module file** (`.mod`, `.s3m`, `.mtm`, `.xm`, `.it`). The device decodes it with
   the ordinary loader, which allocates the decoded PCM **in DRAM**, serialises the result
   back out to PSRAM, and frees the DRAM. The peak is the decoded module plus its image at
-  once, against a 96 KiB heap that already holds the engine — so this path is for small
+  once, against a 144 KiB heap that already holds the engine — so this path is for small
   modules, and it refuses with a sentence saying so rather than running out of memory. The
-  `web` build's heap lives in `dram2_seg`; `HEAP.stats()` is printed at boot.
+  `web` build's heap is 96 KiB in `dram2_seg` plus 48 KiB in `.bss`; `HEAP.stats()` is
+  printed at boot, after player/audio construction, and immediately after radio initialization.
 
 The `Arc` that owns an uploaded module, and everything else with an atomic in it, stays in
 **DRAM**: on the classic ESP32 the atomic instructions do not work on PSRAM, so this
@@ -783,12 +784,15 @@ anyway.
 ### The DRAM budget
 
 The `web` build is close to the chip's limit and the limit is **not** flash (the verified
-I8 `web,lcd` image uses 49.5% of its partition) — it is the 192 KiB of internal DRAM, out
+I8a `web,lcd` image uses 49.6% of its partition) — it is the 192 KiB of internal DRAM, out
 of which core 0's main stack is whatever `.bss` leaves behind. Three things keep it in
 bounds, and all are easy to undo by accident:
 
-* **The heap is in `dram2_seg`, not `.bss`** (`main.rs`'s `HEAP_BYTES`). With a `.bss` heap
-  the `web` build does not link at all.
+* **The 144 KiB web heap is split across two Internal regions** (`main.rs`'s
+  `WEB_RECLAIMED_HEAP_BYTES` and `WEB_INTERNAL_HEAP_BYTES`). The 96 KiB `dram2_seg`
+  region is registered first; the 48 KiB `.bss` reserve supplies the radio's dynamic
+  internal allocations after I8 recovered the necessary stack space. PSRAM is not an
+  allocator region.
 * **The picoserve worker bodies are in PSRAM, not static Embassy pools**
   (`psram_task.rs`). The pre-I8 image linked both mutually exclusive pools into `.bss`:
   68 560 bytes for the two station workers and 10 088 bytes for the one portal worker.
@@ -802,7 +806,7 @@ bounds, and all are easy to undo by accident:
   is 68 480 bytes in PSRAM now.
 
 `ld/stack-floor.x` fails the build if the main stack drops under 32 KiB. The exact linked
-core-0 stack is logged once at boot. The I8 links leave 106 716 bytes in `web` and 105 284
+core-0 stack is logged once at boot. The I8a links leave 57 564 bytes in `web` and 56 132
 bytes in `web,lcd`; default leaves 35 608 bytes and `lcd` leaves 34 200 bytes. If the
 assertion fires, shrink or move the new static — do not lower the floor.
 
@@ -827,8 +831,8 @@ assertion fires, shrink or move the new static — do not lower the floor.
 
   The non-web heap array reserves capacity in `.bss`; allocations consume that fixed region and
   do not move `_bss_end`. Audio's 2 048-byte packed descriptor is deliberately allocated from it
-  only after player open. The `web` build's same allocation comes from its fixed `dram2_seg` heap,
-  which likewise adds no `.bss` object.
+  only after player open. The `web` build's same allocation comes from its fixed two-region
+  Internal heap; both reserves already exist by then, so that allocation does not move `_bss_end`.
 
 * **PSRAM is mapped but not added to the general heap** in the audio build. The ESP32's
   atomic instructions do not work correctly on PSRAM, and this engine puts atomics on the

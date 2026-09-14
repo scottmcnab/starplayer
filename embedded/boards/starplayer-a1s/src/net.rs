@@ -85,6 +85,7 @@ pub fn start(spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>, creden
         ControllerConfig::default().with_rx_queue_size(20).with_tx_queue_size(16).with_initial_config(station_config(credentials)),
     )
     .map_err(|_| "the WiFi controller would not start")?;
+    println!("HEAP after WiFi init: {}", esp_alloc::HEAP.stats());
 
     // No DHCP hostname: `DhcpConfig::hostname` is a heapless 0.9 `String` and this crate
     // is on heapless 0.8 for picoserve's sake, so setting it would mean carrying a second

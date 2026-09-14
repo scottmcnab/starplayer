@@ -175,20 +175,19 @@ esp_app_desc!();
 /// packed descriptor only after `EmbeddedPlayer::open`, so player construction sees the full heap
 /// and the descriptor costs no additional main-stack address space.
 ///
-/// **The `web` build does not put its heap here at all.** It adds the WiFi driver's
-/// statics and embassy-net's socket storage to `.bss`, and every byte there comes out of
-/// the same main stack this array would. Its large picoserve worker futures are claimed
-/// from PSRAM at boot instead (see `psram_task.rs`). Measured: with the heap in `.bss`
-/// the firmware does not link, because `.bss` alone reaches past `0x3ffe_0000` and the
-/// stack has nowhere to start. So the `web` build's heap goes to
-/// [`RECLAIMED_HEAP_BYTES`] in `dram2_seg` instead, and `dram_seg` carries `.bss` and the
-/// stack and nothing else.
+/// **The `web` build has two Internal-capability heap regions.** The first 96 KiB lives
+/// in `dram2_seg`, where it does not shorten the main stack. M8-I8 moved the picoserve
+/// worker futures from `.bss` to claim-only PSRAM and recovered enough ordinary DRAM for
+/// a second 48 KiB `.bss` region. That raises the web heap from 96 KiB to 144 KiB for the
+/// radio while retaining about 56 KiB of stack in the tightest `web,lcd` personality.
+/// Both regions are ordinary internal DRAM, and PSRAM remains unregistered; see
+/// [`WEB_RECLAIMED_HEAP_BYTES`] and [`WEB_INTERNAL_HEAP_BYTES`].
 #[cfg(not(feature = "web"))]
 const HEAP_BYTES: usize = 120 * 1024;
 #[cfg(feature = "web")]
-const HEAP_BYTES: usize = RECLAIMED_HEAP_BYTES;
+const HEAP_BYTES: usize = WEB_RECLAIMED_HEAP_BYTES + WEB_INTERNAL_HEAP_BYTES;
 
-/// The `web` build's entire heap, in `dram2_seg`.
+/// The first `web` heap region, in `dram2_seg`.
 ///
 /// `dram2_seg` is the 98 768 bytes of DRAM above the ROM's own data and stacks
 /// (`esp-hal`'s `ld/esp32/memory.x`), which the ESP-IDF heap reclaims and which esp-hal
@@ -197,12 +196,20 @@ const HEAP_BYTES: usize = RECLAIMED_HEAP_BYTES;
 /// so it does not shorten the main stack. ampkeeper's classic-ESP32 build put 96 KiB of
 /// its heap here for exactly this reason after a provisioning-mode allocation failure.
 ///
-/// 96 KiB of the region's 98 768 bytes: all of it but a rounding margin. It is less than
-/// the default build's 120 KiB, which is the real cost of the radio — the engine's own
-/// requirement for `PETRI.S3M` is 71 576 bytes, so what is left over for the WiFi driver,
-/// the TCP stack and an uploaded module's index vectors is about 25 KiB.
+/// 96 KiB of the region's 98 768 bytes: all of it but a rounding margin. This region is
+/// registered first so ordinary boot/player allocations consume it before the second
+/// region takes space from the core-0 stack.
 #[cfg(feature = "web")]
-const RECLAIMED_HEAP_BYTES: usize = 96 * 1024;
+const WEB_RECLAIMED_HEAP_BYTES: usize = 96 * 1024;
+
+/// The second `web` heap region, in ordinary `.bss` internal DRAM.
+///
+/// I8's exact links left 106 716 bytes of stack in `web` and 105 284 in `web,lcd` after
+/// relocating picoserve futures to PSRAM. Giving 48 KiB back to the allocator leaves
+/// about 57 KiB / 56 KiB respectively, still well above the enforced 32 KiB floor, and
+/// supplies the internal-only dynamic allocations required by `esp_radio::wifi::new`.
+#[cfg(feature = "web")]
+const WEB_INTERNAL_HEAP_BYTES: usize = 48 * 1024;
 
 /// The render half lives in a `static`: `size_of::<RenderHalf<Linear>>()` is 11 744 bytes
 /// (I1 research point 3a), because the engine's telemetry publisher holds a working
@@ -276,11 +283,15 @@ async fn main(spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));
 
     esp_println::logger::init_logger_from_env();
-    // The `web` build's heap is in `dram2_seg`, not in `.bss` — see `HEAP_BYTES`.
+    // The web build registers its 96 KiB dram2 region first, then its 48 KiB `.bss`
+    // reserve. Both have the default Internal capability; PSRAM is never registered.
     #[cfg(not(feature = "web"))]
     esp_alloc::heap_allocator!(size: HEAP_BYTES);
     #[cfg(feature = "web")]
-    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: HEAP_BYTES);
+    {
+        esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: WEB_RECLAIMED_HEAP_BYTES);
+        esp_alloc::heap_allocator!(size: WEB_INTERNAL_HEAP_BYTES);
+    }
 
     let timer = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG1);
     let software_interrupts = esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
