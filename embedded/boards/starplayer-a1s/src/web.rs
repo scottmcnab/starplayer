@@ -87,11 +87,11 @@ use crate::store::{SLOT_IMAGE_MAX_BYTES, SLOT_NAME_BYTES, Store};
 
 /// How many connections the server handles at once.
 ///
-/// Two, not four. Each worker's future is a `.bss` task-pool slot with its own TCP
-/// buffers inside it, and on this chip every `.bss` byte is a byte the main stack does not
-/// get (see `main.rs`'s `HEAP_BYTES`). Two is also research point 5's cap on WebSocket
-/// clients, and it falls out of this rather than needing a counter of its own.
-pub const WEB_TASK_POOL_SIZE: usize = 2;
+/// Two, not four. Each worker's large future and its TCP buffers live in a boot-time
+/// PSRAM arena claim, while its pointer-sized task proxy and Embassy header remain in
+/// internal DRAM. Two is also research point 5's cap on WebSocket clients, and it falls
+/// out of this rather than needing a counter of its own.
+pub const WEB_WORKER_COUNT: usize = 2;
 
 /// TCP receive and transmit buffers, per worker.
 const TCP_BUFFER_BYTES: usize = 1024;
@@ -100,10 +100,10 @@ const TCP_BUFFER_BYTES: usize = 1024;
 const HTTP_BUFFER_BYTES: usize = 1024;
 /// The largest JSON body this API answers with — the status, with sixteen channel rows.
 ///
-/// Every byte here is counted twice in a worker's future (the scratch the encoder writes
-/// into and the [`Body`] it is copied to), and a worker's future is `.bss`, so this is
-/// sized to the largest real answer rather than rounded up: sixteen channel rows of
-/// roughly seventy bytes plus a header of about two hundred.
+/// Every byte here is counted twice in a worker's PSRAM-resident future (the scratch the
+/// encoder writes into and the [`Body`] it is copied to), so this is sized to the largest
+/// real answer rather than rounded up: sixteen channel rows of roughly seventy bytes plus
+/// a header of about two hundred.
 const BODY_BYTES: usize = 1408;
 
 /// The largest request body the upload endpoint accepts, which is the size of the PSRAM
@@ -291,6 +291,9 @@ pub async fn wait_for_reboot() { REBOOT_REQUESTED.wait().await }
 /// value so that the boot sequence's argument list stays readable.
 pub struct Boot {
     pub bridge: Bridge,
+    /// What remains after the upload and image buffers. Only the selected network
+    /// personality claims its picoserve worker futures from it.
+    pub psram_arena: psram::Arena,
     /// The stored credentials, or `None` when the device has never been provisioned.
     pub credentials: Option<crate::store::WifiCredentials>,
     pub wifi: esp_hal::peripherals::WIFI<'static>,
@@ -701,8 +704,8 @@ impl Body {
     /// into directly.
     ///
     /// Serialising into the body's own buffer rather than into a local array and copying
-    /// is not tidiness: a worker's future lives in `.bss`, and the local array would be a
-    /// second [`BODY_BYTES`] in it for every endpoint that answers with JSON.
+    /// is not tidiness: the local array would be a second [`BODY_BYTES`] in the worker's
+    /// PSRAM claim for every endpoint that answers with JSON.
     fn json() -> Body {
         let mut bytes = heapless::Vec::new();
         let _ = bytes.resize_default(BODY_BYTES);
@@ -852,10 +855,11 @@ async fn upload_response<R: Read>(request: &mut Request<'_, R>) -> (StatusCode, 
 /// registered route — that is why there is a single [`PathRouterService`] instead. And
 /// `IntoResponse::write_to` is monomorphised per *response* type, with each instantiation
 /// several kilobytes of the worker's future; the first draft of this file called it from
-/// fourteen match arms and the resulting task pool was 48 KiB **per worker**, which does
-/// not fit in this chip's DRAM beside the WiFi driver. So every JSON and text answer is
-/// the same [`Body`] type, the request body is extracted once as bytes and decoded
-/// synchronously, and `write_to` appears exactly three times below.
+/// fourteen match arms and the resulting task pool was 48 KiB **per worker**, which did
+/// not fit in this chip's DRAM beside the WiFi driver. Keeping one compact response type
+/// still bounds each worker's PSRAM claim and request-path depth. So every JSON and text
+/// answer is the same [`Body`] type, the request body is extracted once as bytes and
+/// decoded synchronously, and `write_to` appears exactly three times below.
 struct FlatRoutes;
 
 impl PathRouterService<()> for FlatRoutes {
@@ -1025,8 +1029,8 @@ fn apply_wire_command(command: api::WireCommand) {
 // The server
 // ---------------------------------------------------------------------------
 
-/// Spawn the web workers.
-pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), &'static str> {
+/// Spawn the web workers with their future bodies in PSRAM.
+pub fn start(spawner: Spawner, stack: Stack<'static>, arena: &mut psram::Arena) -> Result<(), &'static str> {
     static CONFIG: StaticCell<picoserve::Config> = StaticCell::new();
     let config: &'static picoserve::Config = CONFIG.init(
         picoserve::Config::new(picoserve::Timeouts {
@@ -1040,14 +1044,18 @@ pub fn start(spawner: Spawner, stack: Stack<'static>) -> Result<(), &'static str
         })
         .keep_connection_alive(),
     );
-    for id in 0..WEB_TASK_POOL_SIZE {
-        spawner.spawn(web_task(id, stack, config).map_err(|_| "a web worker would not spawn")?);
+    let remaining_before = arena.remaining();
+    for id in 0..WEB_WORKER_COUNT {
+        crate::psram_task::spawn_in_psram(arena, &spawner, move || web_task(id, stack, config)).map_err(|error| match error {
+            crate::psram_task::SpawnError::OutOfPsram => "not enough PSRAM for the web worker futures",
+            crate::psram_task::SpawnError::TaskStorageBusy => "a web worker task header was unexpectedly busy",
+        })?;
     }
+    println!("PSRAM web workers claimed {} bytes, {} left unclaimed", remaining_before - arena.remaining(), arena.remaining());
     Ok(())
 }
 
 /// One connection's worth of server.
-#[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
 async fn web_task(id: usize, stack: Stack<'static>, config: &'static picoserve::Config) {
     let mut receive_buffer = [0u8; TCP_BUFFER_BYTES];
     let mut transmit_buffer = [0u8; TCP_BUFFER_BYTES];

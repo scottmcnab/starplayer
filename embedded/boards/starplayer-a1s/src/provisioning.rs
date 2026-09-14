@@ -87,14 +87,14 @@ const DHCP_MIN_REPLY: usize = 300;
 /// How many networks the portal lists.
 const MAX_NETWORKS: usize = 12;
 
-/// One worker. The portal serves one phone at a time and the worker's future is `.bss`
-/// whether this personality runs or not — see `web.rs`'s `WEB_TASK_POOL_SIZE`.
-const PORTAL_POOL_SIZE: usize = 1;
+/// One worker. The portal serves one phone at a time. Its large future is claimed from
+/// PSRAM only when this personality starts; its Embassy header remains in internal DRAM.
+const PORTAL_WORKER_COUNT: usize = 1;
 const PORTAL_TCP_BUFFER_BYTES: usize = 1024;
 const PORTAL_HTTP_BUFFER_BYTES: usize = 1024;
 
 /// smoltcp sockets: DHCP, DNS and the portal worker, plus spare.
-const PORTAL_SOCKETS: usize = 2 + PORTAL_POOL_SIZE + 2;
+const PORTAL_SOCKETS: usize = 2 + PORTAL_WORKER_COUNT + 2;
 
 /// The networks the pre-AP scan found, for the portal's list.
 static NETWORKS: Mutex<CriticalSectionRawMutex, heapless::Vec<heapless::String<SSID_MAX_BYTES>, MAX_NETWORKS>> =
@@ -111,7 +111,9 @@ pub fn access_point_ssid() -> heapless::String<SSID_MAX_BYTES> {
 
 /// Run the portal personality. Never returns: the only way out is the soft reset
 /// `POST /save` arms.
-pub async fn run(spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>, seed: u64) -> Result<(), &'static str> {
+pub async fn run(
+    spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>, seed: u64, arena: &mut crate::psram::Arena,
+) -> Result<(), &'static str> {
     let (mut controller, interfaces) =
         esp_radio::wifi::new(wifi, ControllerConfig::default()).map_err(|_| "the WiFi controller would not start")?;
 
@@ -160,9 +162,14 @@ pub async fn run(spawner: Spawner, wifi: esp_hal::peripherals::WIFI<'static>, se
         read_request: Duration::from_secs(3),
         write: Duration::from_secs(3),
     }));
-    for id in 0..PORTAL_POOL_SIZE {
-        spawner.spawn(portal_task(id, stack, portal_config).map_err(|_| "the portal worker would not spawn")?);
+    let remaining_before = arena.remaining();
+    for id in 0..PORTAL_WORKER_COUNT {
+        crate::psram_task::spawn_in_psram(arena, &spawner, move || portal_task(id, stack, portal_config)).map_err(|error| match error {
+            crate::psram_task::SpawnError::OutOfPsram => "not enough PSRAM for the portal worker future",
+            crate::psram_task::SpawnError::TaskStorageBusy => "the portal worker task header was unexpectedly busy",
+        })?;
     }
+    println!("PSRAM portal worker claimed {} bytes, {} left unclaimed", remaining_before - arena.remaining(), arena.remaining());
 
     println!("PORTAL open network \"{ssid}\" — join it and browse to http://{AP_ADDRESS}/");
     Ok(())
@@ -545,7 +552,6 @@ impl picoserve::AppBuilder for PortalApplication {
 }
 
 /// One portal connection's worth of server.
-#[embassy_executor::task(pool_size = PORTAL_POOL_SIZE)]
 async fn portal_task(id: usize, stack: Stack<'static>, config: &'static picoserve::Config) {
     let mut receive_buffer = [0u8; PORTAL_TCP_BUFFER_BYTES];
     let mut transmit_buffer = [0u8; PORTAL_TCP_BUFFER_BYTES];

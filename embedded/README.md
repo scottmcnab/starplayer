@@ -654,14 +654,15 @@ embedded/
     src/lcd.rs             the ST7789 SPI driver, #[cfg(feature = "lcd")] only
     src/images.rs         the aligned include_bytes! wrappers
     src/bench.rs          the `bench` build's runner
-    src/psram.rs          the PSRAM arena, #[cfg(feature = "web")] only (M8-I6)
+    src/psram.rs          the PSRAM arena, #[cfg(feature = "web")] only (M8-I6/I8)
+    src/psram_task.rs     PSRAM picoserve futures with internal Embassy headers (`web` only)
     src/store.rs          the config and modules partitions, `web` only
     src/net.rs            station mode, embassy-net and mDNS, `web` only
     src/provisioning.rs   the captive portal personality, `web` only
     src/web.rs            picoserve, the JSON/WebSocket API and module upload, `web` only
     src/main.rs           boot, core pinning, the control/keys/display tasks
     ld/stack-floor.x      a linker ASSERT that fails the build if the main stack drops
-                          under 24 KiB (see §6)
+                          under 32 KiB (see §6)
     build.rs              adds that fragment to the link
   www/index.html          the page the `web` build serves, gzipped into assets/ by xtask
   boards/starplayer-c5/   the RISC-V bench firmware (M8-I4) — no audio hardware
@@ -777,21 +778,29 @@ anyway.
 
 ### The DRAM budget
 
-The `web` build is close to the chip's limit and the limit is **not** flash (52 % of the
-partition) — it is the 192 KiB of internal DRAM, out of which core 0's main stack is
-whatever `.bss` leaves behind. Two things keep it in bounds, and both are easy to undo by
-accident:
+The `web` build is close to the chip's limit and the limit is **not** flash (the verified
+I8 `web,lcd` image uses 49.5% of its partition) — it is the 192 KiB of internal DRAM, out
+of which core 0's main stack is whatever `.bss` leaves behind. Three things keep it in
+bounds, and all are easy to undo by accident:
 
 * **The heap is in `dram2_seg`, not `.bss`** (`main.rs`'s `HEAP_BYTES`). With a `.bss` heap
   the `web` build does not link at all.
+* **The picoserve worker bodies are in PSRAM, not static Embassy pools**
+  (`psram_task.rs`). The pre-I8 image linked both mutually exclusive pools into `.bss`:
+  68 560 bytes for the two station workers and 10 088 bytes for the one portal worker.
+  I8 keeps each 48-byte Embassy header/pointer proxy in the internal heap and constructs
+  only the selected personality's large future bodies directly in the claim-only PSRAM
+  arena: 68 480 bytes for station or 10 048 bytes for the portal. The arena is still not
+  registered with the global allocator.
 * **Routing is one flat `match`, and every JSON answer is one body type** (`web.rs`).
   picoserve monomorphises `write_to` per response type, and a `.route()` chain costs a
-  stack frame per route. The first draft's two web workers were 97 KiB of `.bss`; they are
-  68 KiB now.
+  stack frame per route. The first draft's two web workers were 97 KiB; the compact pair
+  is 68 480 bytes in PSRAM now.
 
-`ld/stack-floor.x` fails the build if the main stack drops under 24 KiB. It is 29 756 B in
-the `web,lcd` build. If it fires, shrink a static or move it to `dram2_seg` — do not lower
-the floor.
+`ld/stack-floor.x` fails the build if the main stack drops under 32 KiB. The exact linked
+core-0 stack is logged once at boot. The I8 links leave 106 716 bytes in `web` and 105 284
+bytes in `web,lcd`; default leaves 35 608 bytes and `lcd` leaves 34 200 bytes. If the
+assertion fires, shrink or move the new static — do not lower the floor.
 
 ## 7. Notes for the next person
 
@@ -803,10 +812,9 @@ the floor.
   ESP32 core 0's main stack is whatever DRAM is left between `_bss_end` and `0x3ffe_0000`,
   so every heap byte (and every other `.bss`/`.data` byte — core 1's 8 KiB stack included,
   since M8-I5) is a byte core 0's stack does not get. At 160 KiB the firmware links and
-  leaves 6 472 bytes of stack, which will not survive a boot; at 120 KiB the default
-  (six-key, no `lcd`) build's stack is 38 712 bytes and the `lcd` build's is 37 312 bytes —
-  both comfortably clear of the 6 472-byte failure point, but check after any change that
-  moves a large static:
+  leaves 6 472 bytes of stack, which will not survive a boot; at 120 KiB the current
+  default build's stack is 35 608 bytes and the `lcd` build's is 34 200 bytes. Both clear
+  the 32 KiB linker floor, but check after any change that moves a large static:
 
   ```sh
   xtensa-esp32-elf-nm target/xtensa-esp32-none-elf/release/starplayer-a1s \
@@ -821,7 +829,10 @@ the floor.
 * **PSRAM is mapped but not added to the general heap** in the audio build. The ESP32's
   atomic instructions do not work correctly on PSRAM, and this engine puts atomics on the
   heap (`Arc` refcounts, the host's seqlocks, the telemetry ring). `src/main.rs` has the
-  full reasoning; M8-I6 inherits the constraint.
+  full reasoning; M8-I6 inherits the constraint. I8's picoserve workers use direct,
+  aligned monotonic arena claims instead: their task headers and every shared atomic stay
+  in internal DRAM, while one portal future (10 048 bytes) or two station futures (68 480
+  bytes total) occupy the otherwise unused PSRAM after the three 512 KiB module buffers.
 * **The whole async audio driver and refill task run on core 1** — the refill moved there in
   M8-I5, and the driver construction followed after the hardware result above. M8-I3's write-up
   blamed `RenderHalf` not being `Send` on the engine's `Box<dyn EventSource>` and kept everything

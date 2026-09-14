@@ -43,7 +43,7 @@ pub const HTTP_PORT: u16 = 80;
 /// Deliberately counted rather than rounded up: every slot is a `SocketStorage` in
 /// `.bss`, and on this chip `.bss` is subtracted from the main stack (see `main.rs`'s
 /// `HEAP_BYTES` comment for the same arithmetic).
-const STACK_SOCKETS: usize = 1 + 1 + 1 + crate::web::WEB_TASK_POOL_SIZE + 2;
+const STACK_SOCKETS: usize = 1 + 1 + 1 + crate::web::WEB_WORKER_COUNT + 2;
 
 /// How long to wait between polls while the link comes up.
 const LINK_POLL: Duration = Duration::from_millis(250);

@@ -39,6 +39,12 @@
 //! Only the `Arc<Module>` itself, the module's four small index vectors and the
 //! sequencer are allocated — in DRAM, by the global allocator, as they always were.
 //!
+//! After those three fixed buffers, the selected network personality also claims its
+//! picoserve worker future bodies through [`Arena::claim_raw`]. The worker's Embassy task
+//! header, scheduler state and pointer proxy remain in internal DRAM; see
+//! [`crate::psram_task`] for the placement and safety argument. Station and portal are
+//! mutually exclusive, so only the futures that actually run consume arena space.
+//!
 //! # The other thing PSRAM cannot do
 //!
 //! On the classic ESP32 flash and PSRAM are reached through the same cache. An erase or
@@ -46,7 +52,11 @@
 //! "play out of PSRAM while writing flash" is not a trick that works here. `store.rs`
 //! says what is done instead.
 
-use core::slice;
+use core::{
+    alloc::Layout,
+    ptr::NonNull,
+    slice,
+};
 
 /// How much PSRAM one uploaded module may use, for each of the three buffers.
 ///
@@ -66,9 +76,9 @@ const ALIGNMENT: usize = 4;
 
 /// A bump allocator over the mapped PSRAM region.
 ///
-/// Claim-only: there is no `free`, because the three buffers are claimed at boot and live
-/// for the life of the program. That is the entire lifetime story, and it is what makes
-/// the `&'static` views [`Buffer::fill`] hands out sound.
+/// Claim-only: there is no `free`, because buffers and network-worker futures are claimed
+/// at boot and live for the life of the program. That is the entire lifetime story, and
+/// it is what makes the `&'static` views [`Buffer::fill`] hands out sound.
 pub struct Arena {
     next: usize,
     end: usize,
@@ -88,19 +98,36 @@ impl Arena {
     /// the upload buffers left behind.
     pub fn remaining(&self) -> usize { self.end.saturating_sub(self.next) }
 
+    /// Claim raw storage with `layout`'s size and alignment for the life of the program.
+    ///
+    /// This is deliberately the only allocator-like operation the arena exposes. It
+    /// advances the same monotonic cursor as [`Arena::claim`], cannot free or resize a
+    /// claim, and returns an untyped pointer rather than registering PSRAM with the
+    /// global allocator. [`crate::psram_task`] uses it to initialize one future directly
+    /// in its final address.
+    pub(crate) fn claim_raw(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+        // `Layout` guarantees a nonzero power-of-two alignment. Rounding with checked
+        // addition rejects address overflow before masking the low bits off.
+        let alignment_mask = layout.align() - 1;
+        let start = self.next.checked_add(alignment_mask)? & !alignment_mask;
+        let end = start.checked_add(layout.size())?;
+        if end > self.end {
+            return None;
+        }
+        let pointer = NonNull::new(start as *mut u8)?;
+        self.next = end;
+        Some(pointer)
+    }
+
     /// Claim `bytes` of PSRAM, 4-byte aligned, for the life of the program.
     ///
     /// `None` when the region has no room left — which is the normal answer on a module
     /// with no PSRAM fitted, and is reported as "the web build runs without upload"
     /// rather than as a boot failure.
     pub fn claim(&mut self, bytes: usize) -> Option<Buffer> {
-        let start = self.next.next_multiple_of(ALIGNMENT);
-        let end = start.checked_add(bytes)?;
-        if end > self.end {
-            return None;
-        }
-        self.next = end;
-        Some(Buffer { start: start as *mut u8, capacity: bytes })
+        let layout = Layout::from_size_align(bytes, ALIGNMENT).ok()?;
+        let start = self.claim_raw(layout)?;
+        Some(Buffer { start: start.as_ptr(), capacity: bytes })
     }
 }
 

@@ -122,6 +122,8 @@ mod provisioning;
 #[cfg(all(not(feature = "bench"), feature = "web"))]
 mod psram;
 #[cfg(all(not(feature = "bench"), feature = "web"))]
+mod psram_task;
+#[cfg(all(not(feature = "bench"), feature = "web"))]
 mod store;
 #[cfg(all(not(feature = "bench"), feature = "web"))]
 mod web;
@@ -173,13 +175,14 @@ esp_app_desc!();
 /// packed descriptor only after `EmbeddedPlayer::open`, so player construction sees the full heap
 /// and the descriptor costs no additional main-stack address space.
 ///
-/// **The `web` build does not put its heap here at all.** It adds a great deal of `.bss`
-/// — the WiFi driver's statics, embassy-net's socket storage, the web workers'
-/// task-pool futures with their TCP buffers inside them — and every byte of that comes
-/// out of the same main stack this array would. Measured: with the heap in `.bss` the
-/// firmware does not link, because `.bss` alone reaches past `0x3ffe_0000` and the stack
-/// has nowhere to start. So the `web` build's heap goes to [`RECLAIMED_HEAP_BYTES`] in
-/// `dram2_seg` instead, and `dram_seg` carries `.bss` and the stack and nothing else.
+/// **The `web` build does not put its heap here at all.** It adds the WiFi driver's
+/// statics and embassy-net's socket storage to `.bss`, and every byte there comes out of
+/// the same main stack this array would. Its large picoserve worker futures are claimed
+/// from PSRAM at boot instead (see `psram_task.rs`). Measured: with the heap in `.bss`
+/// the firmware does not link, because `.bss` alone reaches past `0x3ffe_0000` and the
+/// stack has nowhere to start. So the `web` build's heap goes to
+/// [`RECLAIMED_HEAP_BYTES`] in `dram2_seg` instead, and `dram_seg` carries `.bss` and the
+/// stack and nothing else.
 #[cfg(not(feature = "web"))]
 const HEAP_BYTES: usize = 120 * 1024;
 #[cfg(feature = "web")]
@@ -256,6 +259,18 @@ static KEY_EVENTS: keys::KeyEventChannel = keys::KeyEventChannel::new();
 static NOW_PLAYING: embassy_sync::signal::Signal<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, NowPlaying> =
     embassy_sync::signal::Signal::new();
 
+/// The core-0 stack is the linker-selected gap between `.bss` and the top of DRAM.
+/// `stack-floor.x` enforces its minimum; this reports the exact per-personality value.
+fn linked_main_stack_bytes() -> usize {
+    unsafe extern "C" {
+        static _stack_end: u8;
+        static _stack_start: u8;
+    }
+    let stack_end = core::ptr::addr_of!(_stack_end) as usize;
+    let stack_start = core::ptr::addr_of!(_stack_start) as usize;
+    stack_start.saturating_sub(stack_end)
+}
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));
@@ -274,6 +289,8 @@ async fn main(spawner: Spawner) {
     println!();
     println!("StarPlayer {} on the ESP32-A1S Audio Kit", env!("CARGO_PKG_VERSION"));
     println!("CPU  {} MHz   heap {}", esp_hal::clock::cpu_clock().as_mhz(), Kib(HEAP_BYTES));
+    let main_stack_bytes = linked_main_stack_bytes();
+    println!("STACK core0 linked {main_stack_bytes} bytes ({})", Kib(main_stack_bytes));
 
     // PSRAM: mapped and reported in both builds, registered only by the bench. See the
     // module docs, "PSRAM and atomics".
@@ -351,7 +368,7 @@ async fn main(spawner: Spawner) {
             if bridge.has_psram() { "claimed" } else { "unavailable — uploads will be refused" },
             Kib(psram_arena.remaining()),
         );
-        web::Boot { bridge, credentials, wifi: peripherals.WIFI, seed }
+        web::Boot { bridge, psram_arena, credentials, wifi: peripherals.WIFI, seed }
     };
 
     #[cfg(not(feature = "bench"))]
@@ -574,7 +591,7 @@ async fn play(
     };
 
     #[cfg(feature = "web")]
-    let web::Boot { bridge, credentials, wifi, seed } = web_boot;
+    let web::Boot { bridge, mut psram_arena, credentials, wifi, seed } = web_boot;
 
     spawner.spawn(keys::keys_task(board.keys, KEY_EVENTS.sender()).map_err(|_| "the keys task would not spawn")?);
     #[cfg(not(feature = "web"))]
@@ -592,9 +609,9 @@ async fn play(
             Some(credentials) => {
                 println!("WIFI joining {}", credentials.ssid.as_str());
                 let station = net::start(spawner, wifi, credentials, seed)?;
-                web::start(spawner, station.stack)?;
+                web::start(spawner, station.stack, &mut psram_arena)?;
             }
-            None => provisioning::run(spawner, wifi, seed).await?,
+            None => provisioning::run(spawner, wifi, seed, &mut psram_arena).await?,
         }
         spawner.spawn(reboot_task().map_err(|_| "the reboot watcher would not spawn")?);
     }
