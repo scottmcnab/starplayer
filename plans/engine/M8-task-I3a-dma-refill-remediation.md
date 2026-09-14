@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M8 ([master plan](M8-master-plan.md)), remediating [I3](complete/M8-task-I3-esp32-a1s-bringup.md)'s `audio.rs` |
-| Status | **Open, written 2026-09-14.** The 32-bit-slot experiment passed hardware framing and cadence checks; owner clean-stereo and left/right listening acceptance remain pending |
+| Status | **Open, written 2026-09-14.** The lower-frequency direct tone and gated silence are accepted clean; the allocation-safe engine-tone image, configuration, cadence and native `B00` loop are objectively accepted. Owner clean/grainy 125 Hz listening and normal-music acceptance remain pending |
 | Depends on | — (the diagnosis is done; see `plans/reference/embedded-budget.md` §4a) |
 | Blocks | Reliable A1S playback. M8's exit criterion is "sound from the headphone jack", transport progress and codec output routing must both be verified |
 | Parallel with | Work outside the A1S audio, codec and boot files |
@@ -305,3 +305,200 @@ The merged 32-bit image passed its fresh-boot framing and bounded cadence check:
 This accepts 32-bit codec/I2S framing, CPU sample packing, ring geometry and refill cadence.
 **Owner subjective listening remains pending** for clean recognizable stereo in both ears and
 left/right identity; keep this plan open and unarchived until that check is complete.
+
+### Listening-finding amendment: direct diagnostic tone (2026-09-14)
+
+The owner reports that the 32-bit-slot image remains grainy. Gain distribution and CPU slot
+packing are therefore not sufficient explanations. Add an A1S-only diagnostic feature which
+isolates the remaining path without replacing the normal firmware behavior:
+
+- under an explicit `tone` feature, continue rendering the bundled module so engine load and
+  refill scheduling remain representative, then overwrite each outgoing stereo `i16` quantum
+  immediately before the existing 32-bit packer;
+- generate equal left/right signed samples from a compile-time sine table and integer phase
+  accumulator only. Use a conservative amplitude near 4 096 (about −18 dBFS before the fixed
+  codec −12 dB) and alternate about one second of tone with about one second of exact digital
+  zero. Choose the gate length at a table-cycle boundary to avoid an intentional transition
+  click;
+- keep 32-bit Philips codec/I2S configuration, ring geometry, pre-roll, refill recovery, analog
+  gain and speaker routing byte-for-byte equivalent to the music image;
+- make the boot log unambiguously identify the diagnostic tone, its frequency/amplitude and
+  tone/silence cadence. Add host tests for signed extrema/range, stereo identity, phase
+  continuity, the zero interval and cycle-boundary gating;
+- build and flash only the `tone` image for this listening comparison. If the tone is clean, the
+  grain is upstream in module/sample rendering. If the tone is grainy, the defect is in the
+  remaining I2S/codec/analog output path. Record the owner observation before choosing another
+  change.
+
+Implemented as an A1S-only, default-off `tone` feature. It is compile-time incompatible with the
+no-audio `bench` feature. A 256-entry rounded sine table at signed amplitude 4 096 advances by one
+table entry per frame, producing 172.265625 Hz at 44 100 Hz and returning to its zero crossing
+every 256 frames. The active and exact-zero intervals are each 44 032 frames, or 172 full table
+cycles and about 998.46 ms. One integer-only state is created before the normal
+real-audio ring prefill and carried into steady refill. Both paths use the same quantum helper:
+it advances the engine, applies channel routing, then overwrites the interleaved samples
+immediately before the unchanged 32-bit packer. The eight muted recovery handoffs remain zeros
+and do not disturb the tone state. There is no allocation, logging, panic or transcendental
+calculation in the refill.
+
+Star FX's clean same-device ADC-to-DAC path remains useful but cannot settle this comparison. Its
+native 32-bit RX representation is byte-cast back to native 32-bit TX, so a matching representation
+can round-trip consistently without proving separately generated CPU sample packing or rendering.
+
+All 63 firmware-common host tests pass, including the diagnostic table's exact signed peaks and
+opposite halves, range, dual-mono identity, continuity across calls, exact-zero interval and
+cycle-boundary reset. Normal, `tone`, and `tone,web` A1S release builds pass. The normal image
+must remain module playback, and this plan remains open until the owner has recorded whether the
+gated sine itself is clean.
+
+### Direct-tone hardware run (2026-09-14)
+
+The main-checkout diagnostic image passed its objective flash, boot and bounded transport checks:
+
+- Exact image: `embedded/target/starplayer-a1s-tone-merged.bin`, 478 944 bytes, SHA-256
+  `cecdd7c752dcce50a8be37731500c74e273cf61010a3890a9efcf4910679cbb6`. Flash verification
+  passed on the A1S at MAC `b4:bf:e9:dd:d3:e4`.
+- A fresh reset explicitly reported the 1 033.59375 Hz dual-mono diagnostic at signed amplitude
+  4 096 with 44 032-frame tone and silence gates. It also retained the ES8388's 32-bit Philips
+  slave mode, headphone analog −12 dB, 44 100 Hz stereo 32-bit I2S and the six-quantum ring.
+- At engine `0:00`, telemetry reported `written=360448` and `pushes=119`; at `0:10`, it reported
+  `written=3930112` and `pushes=1280`. Engine time advanced with wall time. The 3 569 664-byte
+  delta over the ten displayed song seconds is about 357.0 KB/s when sampled on telemetry
+  boundaries, consistent with the required steady 352 800 B/s.
+- `underruns=0` throughout. `dma_errors=1` stayed fixed at the recovered startup transient.
+
+This accepts the diagnostic image identity, configuration and transport cadence. The owner
+subsequently judged the high tone apparently clean but difficult to assess, leading to the
+lower-frequency refinement below. **Owner subjective acceptance remains pending** for that
+refined tone and each gated silence interval. Keep this plan open and unarchived.
+
+### Lower-frequency listening refinement (2026-09-14)
+
+The owner reports that the 1 033.59375 Hz tone appears clean, but its pitch makes the remaining
+grain difficult to judge. Refine only the default-off diagnostic before recording acceptance:
+
+- retain the same 256-entry table, signed amplitude 4 096, dual-mono output, engine workload,
+  post-render override point, 32-bit packing, codec configuration and approximately one-second
+  tone/silence gates;
+- advance by one table entry per frame, producing exactly 172.265625 Hz at 44 100 Hz with a
+  256-frame table cycle;
+- retain 44 032 frames per gate interval, now exactly 172 complete cycles, so tone-to-silence and
+  silence-to-tone transitions remain on the table's zero-crossing boundary;
+- update tests, boot text and documentation which name the frequency or cycle count, and verify
+  firmware-common host tests plus normal, `tone`, and `tone,web` A1S release builds;
+- build the lower-frequency `tone` image from the main checkout, flash it, capture a fresh reset
+  and bounded transport run, and leave the plan open for the owner's clean/grainy and gated-silence
+  observation.
+
+Implemented by changing only the integer phase step and its exact frequency/cycle descriptions.
+The same 256-entry table now advances one entry per frame, so one table cycle is 256 frames and
+44 032 frames is exactly 172 cycles. Compile-time assertions pin both gate intervals to that
+geometry. The existing range/extrema, dual-mono, split-call continuity, exact-silence and
+cycle-boundary tests now exercise the longer table cycle. All 63 firmware-common host tests and
+normal, `tone`, and `tone,web` A1S release builds pass. The hardware run below accepts the refined
+image's objective behavior; its listening observation remains pending.
+
+### Lower-frequency direct-tone hardware run (2026-09-14)
+
+The main-checkout lower-frequency image passed its objective flash, boot and bounded transport
+checks:
+
+- Exact image: `embedded/target/starplayer-a1s-tone-merged.bin`, 478 944 bytes, SHA-256
+  `77451cbadf3aea86942ef5315778e2c277a485e81cba55e8ca240123893f5522`. Flash verification
+  passed on the A1S at MAC `b4:bf:e9:dd:d3:e4`.
+- A fresh reset explicitly reported 172.265625 Hz at signed amplitude 4 096 with 44 032-frame
+  tone and silence gates. It retained the ES8388's 32-bit Philips slave mode, headphone analog
+  −12 dB, 44 100 Hz stereo 32-bit I2S and the six-quantum ring.
+- At engine `0:00`, telemetry reported `written=360448` and `pushes=119`; at `0:06`, it reported
+  `written=2500608` and `pushes=818`. Engine time advanced with wall time. The 2 140 160-byte
+  delta over the six displayed song seconds is about 356.7 KB/s when sampled on telemetry
+  boundaries, consistent with the required steady 352 800 B/s.
+- `underruns=0` throughout. `dma_errors=1` stayed fixed at the recovered startup transient.
+
+This accepts the lower-frequency image identity, configuration and transport cadence. The owner
+listening result is recorded immediately below. Keep this plan open and unarchived until normal
+music is clean.
+
+### Direct-tone listening result and engine-path comparison (2026-09-14)
+
+The owner reports that the 172.265625 Hz tone is clean and the gated intervals are silent. This
+accepts CPU-generated signed samples, high-aligned 32-bit slot packing, DMA refill, I2S framing,
+the ES8388 configuration and the headphone analog path together. The remaining music grain is
+upstream of the post-render override. `REFLEX.S3M` is itself weak evidence of an engine defect: it
+is a 16 KB competition module whose four audible sources are 8-bit mono samples only 34, 130,
+1 978 and 34 frames long.
+
+Add one more A1S-only comparison which sends a controlled 16-bit sample through the actual
+sequencer, fixed mixer, linear interpolator, master gain and transport:
+
+- add a default-off `engine-tone` feature, compile-time incompatible with `bench`, the existing
+  post-render `tone`, and `web`; normal builds must continue to open `REFLEX.S3M` from its flash
+  image without constructing this diagnostic;
+- before the audio task starts, build a one-channel native S3M `Module` with `ModuleBuilder`.
+  Its single forward-looping sample is the existing 256-entry sine scaled to signed amplitude
+  28 672, retains values with real 16-bit precision, and has reference rate 32 000 Hz. Row zero
+  plays C-4 at volume 64; all remaining cells are native empty S3M cells. At 44 100 Hz output,
+  this produces a 125 Hz tone through a fractional resample step and repeatedly crosses the
+  sample loop seam;
+- keep the board's engine master at 1/4, ES8388 headphone gain at −12 dB, channel routing, PCM
+  packer and complete DMA path unchanged. Do not apply `OutputOverride` in this feature: every
+  audible sample must come from `EmbeddedPlayer<Linear>`;
+- make the boot log unambiguously identify `ENGINE-TONE`, its 125 Hz output frequency, 32 kHz
+  16-bit source, amplitude, loop length, interpolation and gain. Avoid allocation, logging,
+  locks and panics in `render()`; module construction may allocate before playback starts;
+- add host tests for module structure, native fixed-stride S3M pattern identity, full 16-bit
+  sample values, loop geometry, non-silent equal stereo render, bounded peak and warning-free
+  multi-quantum `EmbeddedPlayer<Linear>` output. Verify firmware-common host tests and A1S
+  normal, `tone`, `engine-tone`, and `engine-tone,lcd` release builds;
+- build and flash only the standalone `engine-tone` image. A clean uninterrupted 125 Hz tone
+  places the reported grain in `REFLEX.S3M`'s tiny 8-bit source material. A grainy tone leaves
+  the sequencer/mixer/interpolator/master path under investigation. Record the listening result
+  before changing normal playback or fidelity policy.
+
+Implementation result: the standalone feature builds the module once before playback with a
+256-frame signed-16 sample, full forward loop, 32 kHz reference rate, one-channel native S3M
+pattern and fixed five-byte cells. Row zero is C-4/instrument 1/volume 64, rows 1..62 are exact
+native empty cells, and row 63 carries `B00` to return to order zero. The order list remains the
+small `[pattern 0, ORDER_END]`; `ControlHalf` defaults to `AtEnd::Continue`, so the detected song
+loop runs indefinitely without a fade or stop. A rejected 64-copy order-list attempt sustained
+the tone for about 8 minutes 11 seconds, but its scanned timeline required a 49 152-byte allocation
+and the merged board image panicked before audio when that allocation failed. Native `B00` crosses
+the same sample-loop seam continuously without growing the timeline. The existing
+`EmbeddedPlayer<Linear>`, 1/4 master, 32-bit packer,
+six-quantum DMA ring and codec path are unchanged, and no `OutputOverride` is present. Normal
+firmware still borrows `REFLEX.S3M` from flash.
+
+Native S3M panning has no mathematically exact centre: its centre value is nibble 8 of a 0..15
+scale, about 6.7% right of centre. The host render test therefore requires non-silent output,
+matching polarity in both channels and a tight native centre-pan balance bound instead of
+byte-identical left and right samples. Changing the native pan law or duplicating samples after
+render would invalidate this engine-path comparison. The structural tests additionally verify
+every pattern cell including row 63's `B00`, every scaled sample value, real 16-bit precision,
+extrema, loop geometry and guard data. A ten-second host render crosses the first 7.68-second
+pattern loop, remains audible and warning-free, and stays within the 1/4-master peak bound.
+`cargo test -p starplayer-firmware-common` passes all 66 tests, and the A1S normal, `tone`,
+`engine-tone`, and `engine-tone,lcd` release builds all pass on `esp-1.97`. Owner listening of
+the engine-rendered tone remains pending.
+
+### Allocation-safe engine-tone hardware run (2026-09-14)
+
+The final native-`B00` image passed its objective identity, boot, cadence and loop checks:
+
+- Exact image: `embedded/target/starplayer-a1s-engine-tone-merged.bin`, 426 416 bytes,
+  SHA-256 `2efdbd30c05b34f9175fb704d9eeb9b154079772cdd4e824727bb20dfa79a60d`.
+  Flash verification passed on the A1S at MAC `b4:bf:e9:dd:d3:e4`.
+- A fresh reset reported `ENGINE-TONE output=125 Hz source=32000 Hz signed16 amplitude=28672
+  loop=256 frames song_loop=B00 interpolation=linear master=1/4`. The codec and I2S settings
+  remained the accepted 32-bit Philips slave, headphone −12 dB, speaker disabled, 44 100 Hz
+  stereo 32-bit transport and six-quantum ring. After `EmbeddedPlayer` opened, the 120 KiB heap
+  reported 27 932 bytes used and 94 948 bytes free, confirming that the allocation-heavy
+  64-order timeline is gone.
+- Hardware crossed the native song loop: telemetry reached row 59 at `0:07`, wrapped to row 03
+  at `0:00`, then continued through row 29 at `0:03`.
+- The first telemetry line reported `written=356352`, `pushes=118`; the final line reported
+  `written=4286464`, `pushes=1402`. Peak stayed at about 5 326–5 327,
+  `underruns=0`, and the recovered startup `dma_errors=1` remained fixed.
+
+This accepts the engine-path image, configuration, refill cadence and allocation-safe `B00`
+loop. The owner's clean/grainy listening result for the 125 Hz engine-rendered tone remains
+pending, as does clean normal-music acceptance. Keep this plan open and unarchived.

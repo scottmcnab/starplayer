@@ -24,6 +24,8 @@
 //! * [`volume`] — saturating fixed-point steps and a board-selected maximum, shared by a
 //!   board's physical and network controls without changing the engine default.
 //! * [`pcm`] — explicit allocation-free PCM slot packing for board transports.
+//! * [`tone`] — an integer-only diagnostic sine and exact silence gate, plus the controlled
+//!   native-S3M module used to test the complete engine path on a board.
 //!
 //! # Why a separate crate rather than a module in the board
 //!
@@ -46,6 +48,7 @@ pub mod keys;
 pub mod now_playing;
 pub mod pcm;
 pub mod screen;
+pub mod tone;
 pub mod volume;
 
 pub use api::{HostState, Status, Upload, decode_wire_command, pack_telemetry};
@@ -54,6 +57,12 @@ pub use keys::{HOLD_REPEAT_INTERVAL_MS, HOLD_THRESHOLD_MS, Key, KeyDebounce, Key
 pub use now_playing::{ChannelRow, FixedStr, MAX_DISPLAY_CHANNELS, NowPlaying};
 pub use pcm::pack_i16_high_aligned_le;
 pub use screen::Screen;
+pub use tone::{
+    DIAGNOSTIC_TONE_ACTIVE_FRAMES, DIAGNOSTIC_TONE_AMPLITUDE, DIAGNOSTIC_TONE_FREQUENCY,
+    DIAGNOSTIC_TONE_SILENT_FRAMES, DiagnosticTone, ENGINE_TONE_LOOP_FRAMES,
+    ENGINE_TONE_OUTPUT_FREQUENCY_HZ, ENGINE_TONE_REFERENCE_RATE_HZ, ENGINE_TONE_SOURCE_AMPLITUDE,
+    engine_tone_module,
+};
 pub use volume::{cap_master_volume, lower_master_volume, raise_master_volume};
 
 /// The sample rate every StarPlayer firmware runs at.

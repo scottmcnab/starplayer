@@ -76,6 +76,8 @@ cargo xtask build  --board a1s --features lcd      # the audio firmware, five ke
 cargo xtask build  --board a1s --features bench    # the bench firmware (no audio)
 cargo xtask build  --board a1s --features web      # the audio firmware plus WiFi, a page and uploads
 cargo xtask build  --board a1s --features web,lcd  # both
+cargo xtask build  --board a1s --features tone     # gated direct-tone listening diagnostic
+cargo xtask build  --board a1s --features engine-tone # standalone native-S3M engine-path diagnostic
 cargo xtask image  --board a1s [--merge]           # an espflash image under target/
 cargo xtask size   --board a1s                     # the image against its partition
 cargo xtask assets [--force]                       # regenerate the module images and gzip the page
@@ -132,6 +134,14 @@ cargo xtask monitor --board a1s
 cargo xtask flash --board a1s
 cargo xtask monitor --board a1s
 
+# the owner-only direct-tone comparison: ~1 second sine, ~1 second digital silence
+cargo xtask flash --board a1s --features tone
+cargo xtask monitor --board a1s
+
+# the owner-only engine-path comparison: native-S3M 125 Hz sine looped by B00
+cargo xtask flash --board a1s --features engine-tone
+cargo xtask monitor --board a1s
+
 # the C5 (M8-I4): one flash, no audio, no listening check — see the "C5" note below
 cargo xtask flash --board c5 --features bench
 cargo xtask monitor --board c5
@@ -177,6 +187,63 @@ CPU-generated sample framing without changing nominal loudness.
 Star FX's clean ADC-to-DAC path on the same device narrows the fault without settling this test.
 That path receives and transmits the same native 32-bit representation, so it proves the codec,
 analog path, clocks and wiring can be clean while leaving CPU-generated slot alignment open.
+
+The owner still heard grain in the 32-bit music image even though its transport cadence was
+correct. The first isolated comparison used `--features tone`. It continues the bundled
+module render so CPU load and scheduling stay representative, then replaces every outgoing
+quantum immediately before the existing 32-bit packer. The replacement is a compile-time-table,
+dual-mono 172.265625 Hz sine at signed amplitude 4 096, followed by the same duration of exact
+digital zero. Each interval is 44 032 frames (about 998.46 ms) and 172 complete 256-frame table
+cycles, so the gate changes at a zero crossing. Its integer phase and gate state
+continue from the initial ring prefill into steady refill. `tone` is off by default and is
+deliberately incompatible with the no-audio `bench` build. A clean tone would place the grain
+upstream in module/sample rendering; a grainy tone would leave it in the I2S/codec/analog output path.
+
+The first, higher-frequency 1 033.59375 Hz fresh-reset tone run used the verified 478 944-byte
+merged image with SHA-256
+`cecdd7c752dcce50a8be37731500c74e273cf61010a3890a9efcf4910679cbb6`. Boot confirmed every
+transport setting and its original 44 032-frame gates. From engine `0:00` to `0:10`, `written`
+advanced from 360 448 to 3 930 112 bytes and `pushes` from 119 to 1 280 while engine time tracked
+wall time; `underruns=0` and the recovered startup `dma_errors=1` stayed fixed. This accepts the
+tone image's configuration and cadence only. The owner judged that tone apparently clean but too
+high to assess the remaining grain confidently. The 172.265625 Hz refinement now needs a
+clean/grainy report and confirmation that the gated intervals are silent.
+
+The lower-frequency fresh-reset run used the verified 478 944-byte merged image with SHA-256
+`77451cbadf3aea86942ef5315778e2c277a485e81cba55e8ca240123893f5522`. Boot confirmed
+172.265625 Hz, amplitude 4 096, both 44 032-frame gates, 32-bit Philips codec mode, headphone
+analog −12 dB, 44 100 Hz stereo 32-bit I2S and the six-quantum ring. From engine `0:00` to `0:06`,
+`written` advanced from 360 448 to 2 500 608 bytes and `pushes` from 119 to 818 while engine time
+tracked wall time; `underruns=0` and the recovered startup `dma_errors=1` stayed fixed. The owner
+accepted the 172.265625 Hz tone as clean and every gated interval as silent. Together with the
+objective cadence, that accepts CPU-generated signed samples, high-aligned 32-bit packing, DMA,
+I2S, codec configuration and the headphone analog path. The remaining music grain is upstream
+of the post-render override.
+
+`REFLEX.S3M` is weak material for distinguishing an engine fault: its four audible sources are
+8-bit mono samples only 34, 130, 1 978 and 34 frames long. The standalone default-off
+`--features engine-tone` comparison therefore constructs a controlled one-channel native S3M
+before playback. Row zero plays C-4 at volume 64, rows 1 through 62 are empty fixed-stride S3M
+cells, and row 63 carries `B00`. Its single signed-16 sample is the existing 256-entry sine scaled
+to amplitude 28 672, has a full forward loop and a 32 kHz reference rate. `B00` returns the one-pattern
+order list to order zero, producing an uninterrupted 125 Hz tone through the real
+`EmbeddedPlayer<Linear>` path at 44.1 kHz under its default `AtEnd::Continue` policy. Board
+master remains 1/4 and no post-render override is installed. `engine-tone` is incompatible with
+`bench`, `tone` and `web`; it may be combined with `lcd`. A clean result would place the music
+grain in REFLEX's source material, while a grainy result would keep the sequencer, mixer,
+interpolator or master path under study.
+
+The allocation-safe engine-tone hardware run used the flash-verified 426 416-byte merged image
+with SHA-256 `2efdbd30c05b34f9175fb704d9eeb9b154079772cdd4e824727bb20dfa79a60d`.
+Fresh boot reported the expected 125 Hz/32 kHz/signed-16 source, amplitude 28 672, 256-frame
+sample loop, native `B00`, linear interpolation and 1/4 master. `EmbeddedPlayer` open left
+94 948 of the 120 KiB heap free. Telemetry reached row 59 at `0:07`, wrapped to row 03 at `0:00`
+and continued through row 29 at `0:03`, proving the bounded scan and native song loop on the
+board. Across the capture, `written` advanced from 356 352 to 4 286 464 and `pushes` from 118 to
+1 402; peak held around 5 326–5 327, `underruns=0`, and the recovered startup `dma_errors=1`
+stayed fixed. Image identity, configuration, cadence and looping are accepted. The owner still
+needs to report whether the 125 Hz tone is clean or grainy; clean normal music also remains
+pending.
 
 The same run confirmed the DMA remediation from
 `plans/engine/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
@@ -305,8 +372,16 @@ MODULE image=88036 bytes (85.9 KiB) channels=8 samples=5
 HEAP after open: …
 I2S  44100 Hz stereo 32-bit slots, MCLK on GPIO0, DMA ring 6 quanta (768 frames, 17 ms)
 CORE1 audio refill running; pre-roll 8 silent descriptor handoffs complete (~46 ms)
+TONE diagnostic dual-mono sine 172.265625 Hz amplitude=4096 gate=44032 frames (~998 ms) tone / 44032 frames (~998 ms) silence
 PLAY master_volume=1/4 max=1/4 output=headphone speaker_pa=off
 ord 000 pat 000 row 00/06 125 bpm   3/ 8 voices  0:01/2:47  peak=… underruns=0 dma_errors=0 offered=… written=… pushes=… …
+```
+
+The `TONE` line appears only in a `--features tone` image; normal audio images continue to play
+the module and omit it. An `engine-tone` image replaces the `MODULE` line with:
+
+```text
+ENGINE-TONE output=125 Hz source=32000 Hz signed16 amplitude=28672 loop=256 frames song_loop=B00 interpolation=linear master=1/4
 ```
 
 An `lcd` build's boot log has one more line before `MODULE` — `LCD  ST7789

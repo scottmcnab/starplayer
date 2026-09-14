@@ -28,6 +28,16 @@ default = []
 # figures are worth comparing.
 bench = []
 
+# A1S-only listening diagnostic: preserve normal engine work and the complete audio transport,
+# then replace each rendered quantum with a gated dual-mono sine immediately before packing.
+# Off by default and incompatible with `bench`, which never constructs the audio path.
+tone = []
+
+# Standalone controlled source through the actual S3M sequencer, fixed mixer and linear
+# interpolator. No post-render override, radio or upload path participates in this comparison.
+# `main.rs` rejects combinations with `bench`, `tone` and `web` at compile time.
+engine-tone = []
+
 # M8-I5: the ST7789 now-playing screen on the SD-card pin group. Off by default — the
 # audio build must not link `mipidsi`/`embedded-graphics`/`embedded-hal-bus` at all (M8
 # master-plan decision 4), so the three are `optional = true` below and pulled in only by

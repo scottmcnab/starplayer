@@ -25,6 +25,12 @@
 //! aligned. The 32-bit-slot experiment doubles the required DMA byte rate to 352 800 B/s. See
 //! `plans/reference/embedded-budget.md` §4a for the underlying esp-hal and Star FX analysis.
 //!
+//! With the board-only `tone` feature, the renderer still advances normally and an integer,
+//! compile-time-table diagnostic sine replaces each complete output quantum immediately before
+//! the shared 32-bit packer. The override state travels from ring prefill into steady refill, so
+//! phase and the one-second tone/silence gate never restart at the handoff. The default build's
+//! override is a zero-sized no-op.
+//!
 //! # Why construction and refill share core 1
 //!
 //! esp-hal 1.1.2's `ChannelTx::into_async` calls `set_interrupt_handler`, which disables
@@ -126,6 +132,32 @@ const _: () = assert!(DMA_RING_BYTES <= 8_184, "the ring must retain esp-hal's t
 /// with no copy, allocation or `unsafe`.
 static DESCRIPTOR_SCRATCH: ConstStaticCell<[i16; DESCRIPTOR_SAMPLES]> = ConstStaticCell::new([0; DESCRIPTOR_SAMPLES]);
 
+/// Optional post-render diagnostic carried from synchronous prefill into steady refill.
+///
+/// The normal build is a zero-sized no-op. Under `tone`, the state preserves phase and gate
+/// position across every render call without a static mutable or an allocation.
+struct OutputOverride {
+    #[cfg(feature = "tone")]
+    tone: firmware_common::DiagnosticTone,
+}
+
+impl OutputOverride {
+    const fn new() -> OutputOverride {
+        OutputOverride {
+            #[cfg(feature = "tone")]
+            tone: firmware_common::DiagnosticTone::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn apply(&mut self, destination: &mut [i16]) {
+        #[cfg(feature = "tone")]
+        self.tone.overwrite(destination);
+        #[cfg(not(feature = "tone"))]
+        let _ = destination;
+    }
+}
+
 /// Swap left and right on the way to the codec.
 ///
 /// `false` unless the owner's ears say otherwise; see the module docs. It is applied in
@@ -173,8 +205,14 @@ const STARTUP_FAILED: u8 = 2;
 /// never transitions backwards.
 static STARTUP_STATE: AtomicU8 = AtomicU8::new(STARTUP_PENDING);
 
-/// The in-progress circular transfer, with its ring.
-pub type AudioTransfer = esp_hal::i2s::master::asynch::I2sWriteDmaTransferAsync<'static, &'static mut [u8; DMA_RING_BYTES]>;
+/// The HAL's in-progress circular transfer, with its ring.
+type RawAudioTransfer = esp_hal::i2s::master::asynch::I2sWriteDmaTransferAsync<'static, &'static mut [u8; DMA_RING_BYTES]>;
+
+/// The circular transfer and the output override state that spans prefill and steady refill.
+pub struct AudioTransfer {
+    transfer: RawAudioTransfer,
+    output_override: OutputOverride,
+}
 
 /// The peripherals the I2S transmitter needs, as one value.
 ///
@@ -270,10 +308,13 @@ pub fn start(parts: Parts, sample_rate_hz: u32, render: &mut RenderHalf<Linear>)
         .with_dout(dout)
         .build(tx_descriptors);
 
-    // Prime the whole ring before the DMA reads a byte of it.
-    fill(tx_buffer.as_mut_slice(), render);
+    // Prime the whole ring before the DMA reads a byte of it. Carry the optional diagnostic
+    // state into steady refill so neither phase nor the tone/silence gate restarts.
+    let mut output_override = OutputOverride::new();
+    fill(tx_buffer.as_mut_slice(), render, &mut output_override);
 
-    i2s_tx.write_dma_circular_async(tx_buffer).map_err(|_| Error::Dma)
+    let transfer = i2s_tx.write_dma_circular_async(tx_buffer).map_err(|_| Error::Dma)?;
+    Ok(AudioTransfer { transfer, output_override })
 }
 
 /// Render into `destination`, one quantum at a time, and report how many bytes were
@@ -282,30 +323,32 @@ pub fn start(parts: Parts, sample_rate_hz: u32, render: &mut RenderHalf<Linear>)
 /// `destination` is the whole six-quantum DMA ring during the synchronous prefill. Like steady
 /// refill, it renders engine `i16` and uses [`firmware_common::pack_i16_high_aligned_le`] to
 /// sign-extend every sample into the high 16 bits of an explicit little-endian 32-bit slot.
-fn fill(destination: &mut [u8], render: &mut RenderHalf<Linear>) -> usize {
+fn fill(destination: &mut [u8], render: &mut RenderHalf<Linear>, output_override: &mut OutputOverride) -> usize {
     let mut scratch = [0i16; QUANTUM_FRAMES * 2];
     let mut written = 0usize;
     for output_quantum in destination.chunks_exact_mut(QUANTUM_BYTES) {
-        render.render(&mut scratch);
-        if SWAP_CHANNELS {
-            for frame in scratch.chunks_exact_mut(2) {
-                frame.swap(0, 1);
-            }
-        }
+        render_quantum(&mut scratch, render, output_override);
         written += firmware_common::pack_i16_high_aligned_le(&scratch, output_quantum);
     }
     written
 }
 
-/// Render exactly one complete DMA descriptor into static scratch.
-fn render_descriptor(destination: &mut [i16; DESCRIPTOR_SAMPLES], render: &mut RenderHalf<Linear>) {
-    for quantum in destination.chunks_exact_mut(QUANTUM_FRAMES * 2) {
-        render.render(quantum);
-        if SWAP_CHANNELS {
-            for frame in quantum.chunks_exact_mut(2) {
-                frame.swap(0, 1);
-            }
+/// Render one engine quantum, apply channel routing, then apply the optional diagnostic
+/// immediately before the caller packs the samples into I2S slots.
+fn render_quantum(destination: &mut [i16], render: &mut RenderHalf<Linear>, output_override: &mut OutputOverride) {
+    render.render(destination);
+    if SWAP_CHANNELS {
+        for frame in destination.chunks_exact_mut(2) {
+            frame.swap(0, 1);
         }
+    }
+    output_override.apply(destination);
+}
+
+/// Render exactly one complete DMA descriptor into static scratch.
+fn render_descriptor(destination: &mut [i16; DESCRIPTOR_SAMPLES], render: &mut RenderHalf<Linear>, output_override: &mut OutputOverride) {
+    for quantum in destination.chunks_exact_mut(QUANTUM_FRAMES * 2) {
+        render_quantum(quantum, render, output_override);
     }
 }
 
@@ -361,7 +404,8 @@ fn render_descriptor(destination: &mut [i16; DESCRIPTOR_SAMPLES], render: &mut R
 /// zero and renders nothing; the outer error already diagnosed it. See
 /// `plans/reference/embedded-budget.md` §4a for the esp-hal source analysis and Star FX evidence.
 #[embassy_executor::task]
-pub async fn refill_task(mut transfer: AudioTransfer, render: &'static mut RenderHalf<Linear>) {
+pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<Linear>) {
+    let AudioTransfer { mut transfer, mut output_override } = audio;
     // Match Star FX's soaked start-up sequence. The explicit `available()` keeps any initial
     // `Late` visible, while `push_with` ignores its own `available()` error and hands a
     // descriptor back anyway. An early offer may be empty; every non-empty offer becomes
@@ -408,7 +452,7 @@ pub async fn refill_task(mut transfer: AudioTransfer, render: &'static mut Rende
             .push_with(|destination| {
                 let mut written = 0usize;
                 for descriptor in destination.chunks_exact_mut(DESCRIPTOR_BYTES) {
-                    render_descriptor(descriptor_scratch, render);
+                    render_descriptor(descriptor_scratch, render, &mut output_override);
                     let packed = firmware_common::pack_i16_high_aligned_le(&descriptor_scratch[..], descriptor);
                     if packed != DESCRIPTOR_BYTES {
                         DMA_ERRORS.fetch_add(1, Ordering::Relaxed);

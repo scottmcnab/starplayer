@@ -7,6 +7,10 @@
 //!   commands from six push-buttons (M8-I5), optionally shows the sounding row on an
 //!   ST7789 screen behind the `lcd` feature (M8-I5), and logs the transport once a
 //!   second;
+//! * the audio build with **`tone`** still renders that module, then replaces each outgoing
+//!   quantum with a gated dual-mono diagnostic sine immediately before 32-bit I2S packing;
+//! * the standalone **`engine-tone`** build replaces the boot module before playback with a
+//!   one-channel native S3M whose 16-bit looping sine traverses the actual engine path;
 //! * the **`bench`** build ([`bench`]) makes no sound and instead renders every golden
 //!   fixture, printing its SHA-256 and its cost.
 //!
@@ -20,9 +24,9 @@
 //! 4. `esp_rtos::start`, then the board's own pins — including the keys and, under
 //!    `lcd`, the display.
 //! 5. An I2C scan, logged (research point 1), then the codec — configured but **muted**.
-//! 6. The module image → [`Module::from_image`] → [`EmbeddedPlayer`], set the board's capped
-//!    engine level of 1/4, then move the untouched I2S peripheral parts and renderer to
-//!    core 1.
+//! 6. The module image → [`Module::from_image`] (or the standalone diagnostic's native S3M
+//!    built before playback) → [`EmbeddedPlayer`], set the board's capped engine level of
+//!    1/4, then move the untouched I2S peripheral parts and renderer to core 1.
 //! 7. Core 1 constructs the async I2S driver, prefills and starts its transfer, then completes
 //!    the muted silence pre-roll. Core 0 waits for the startup result, logs and unmutes the
 //!    headphone output while leaving the speaker amplifier disabled. Finally it spawns the keys
@@ -78,6 +82,11 @@
 // firmware is its own workspace on its own toolchain (M8 master-plan decision 1).
 #![feature(impl_trait_in_assoc_type)]
 
+#[cfg(all(feature = "bench", feature = "tone"))]
+compile_error!("the A1S `tone` diagnostic needs the audio build and cannot be combined with `bench`");
+#[cfg(all(feature = "engine-tone", any(feature = "bench", feature = "tone", feature = "web")))]
+compile_error!("the standalone A1S `engine-tone` diagnostic cannot be combined with `bench`, `tone` or `web`");
+
 extern crate alloc;
 
 #[cfg(not(feature = "bench"))]
@@ -88,6 +97,7 @@ mod bench;
 mod board;
 #[cfg(not(feature = "bench"))]
 mod es8388;
+#[cfg(not(feature = "engine-tone"))]
 mod images;
 #[cfg(not(feature = "bench"))]
 mod keys;
@@ -116,7 +126,7 @@ use firmware_common::{Key, KeyEvent, NowPlaying};
 use starplayer::core::U0F16;
 #[cfg(not(feature = "bench"))]
 use starplayer::dsp::Linear;
-#[cfg(not(feature = "bench"))]
+#[cfg(all(not(feature = "bench"), not(feature = "engine-tone")))]
 use starplayer::model::Module;
 #[cfg(not(feature = "bench"))]
 use starplayer::rt::Arc;
@@ -422,15 +432,30 @@ async fn play(
     #[cfg(feature = "lcd")]
     println!("LCD  ST7789 {}", if display.is_present() { "found" } else { "not found — continuing headless" });
 
-    // The module: borrowed straight out of memory-mapped flash, PCM and all.
+    // Normal firmware borrows REFLEX straight from memory-mapped flash, PCM and all. The
+    // standalone engine diagnostic instead allocates its controlled native S3M once here,
+    // before either the player or audio task exists.
+    #[cfg(not(feature = "engine-tone"))]
     let image = images::boot_module();
+    #[cfg(not(feature = "engine-tone"))]
     let module = Arc::new(Module::from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?);
+    #[cfg(not(feature = "engine-tone"))]
     println!(
         "MODULE image={} bytes ({}) channels={} samples={}",
         image.len(),
         Kib(image.len()),
         module.header().channel_count,
         module.samples().len(),
+    );
+    #[cfg(feature = "engine-tone")]
+    let module = Arc::new(firmware_common::engine_tone_module().map_err(|_| "the engine-tone module would not build")?);
+    #[cfg(feature = "engine-tone")]
+    println!(
+        "ENGINE-TONE output={} Hz source={} Hz signed16 amplitude={} loop={} frames song_loop=B00 interpolation=linear master=1/4",
+        firmware_common::ENGINE_TONE_OUTPUT_FREQUENCY_HZ,
+        firmware_common::ENGINE_TONE_REFERENCE_RATE_HZ,
+        firmware_common::ENGINE_TONE_SOURCE_AMPLITUDE,
+        firmware_common::ENGINE_TONE_LOOP_FRAMES,
     );
 
     let (render, mut control) = EmbeddedPlayer::<Linear>::open(Arc::clone(&module), firmware_common::SAMPLE_RATE_HZ)
@@ -479,6 +504,14 @@ async fn play(
     );
     let pre_roll_ms = audio::TX_PRIME_HANDOFFS * audio::DESCRIPTOR_FRAMES * 1000 / firmware_common::SAMPLE_RATE_HZ as usize;
     println!("CORE1 audio refill running; pre-roll {} silent descriptor handoffs complete (~{} ms)", audio::TX_PRIME_HANDOFFS, pre_roll_ms);
+    #[cfg(feature = "tone")]
+    println!(
+        "TONE diagnostic dual-mono sine {} amplitude={} gate={} frames (~998 ms) tone / {} frames (~998 ms) silence",
+        firmware_common::DIAGNOSTIC_TONE_FREQUENCY,
+        firmware_common::DIAGNOSTIC_TONE_AMPLITUDE,
+        firmware_common::DIAGNOSTIC_TONE_ACTIVE_FRAMES,
+        firmware_common::DIAGNOSTIC_TONE_SILENT_FRAMES,
+    );
 
     // Sound only after the muted pre-roll has established descriptor accounting and the
     // steady refill owns the transfer. GPIO21 remains low and pair 1 remains disabled: this
