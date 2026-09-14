@@ -2059,7 +2059,6 @@ dependencies = [
 name = "starplayer-a1s"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
  "critical-section",
  "edge-mdns",
  "edge-nal",

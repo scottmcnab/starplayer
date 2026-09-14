@@ -107,7 +107,6 @@ starplayer = { workspace = true }
 starplayer-host-embedded = { workspace = true }
 starplayer-model = { workspace = true }
 firmware-common = { workspace = true }
-bytemuck = { workspace = true }
 
 # M8-I5's `lcd` feature only — see the `lcd` feature entry above for why these are
 # `optional`. Chip-agnostic (none is an `esp-*` crate), so the plain table is still the

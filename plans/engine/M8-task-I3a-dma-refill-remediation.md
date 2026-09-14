@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M8 ([master plan](M8-master-plan.md)), remediating [I3](complete/M8-task-I3-esp32-a1s-bringup.md)'s `audio.rs` |
-| Status | **Open, written 2026-09-14.** Digital transport accepted on hardware after a 310-second soak; owner headphone listening and stereo acceptance remain pending |
+| Status | **Open, written 2026-09-14.** The 32-bit-slot experiment passed hardware framing and cadence checks; owner clean-stereo and left/right listening acceptance remain pending |
 | Depends on | — (the diagnosis is done; see `plans/reference/embedded-budget.md` §4a) |
 | Blocks | Reliable A1S playback. M8's exit criterion is "sound from the headphone jack", transport progress and codec output routing must both be verified |
 | Parallel with | Work outside the A1S audio, codec and boot files |
@@ -254,3 +254,54 @@ The gain-staged build passed its fresh-boot configuration and bounded transport 
 This accepts the gain-staging register writes, boot cap and post-change refill cadence. **Owner
 listening acceptance remains pending** for clean recognizable stereo in both ears and left/right
 identity; keep this plan open and unarchived until that check is complete.
+
+### 32-bit CPU-generated framing experiment (2026-09-14)
+
+The owner reports that the gain-staged 16-bit build still sounds grainy. `../star-fx`'s
+same-device ADC-to-DAC path sounds clean, which proves that this ES8388, its analog path, clocks
+and board wiring can produce clean audio. It does not prove StarPlayer's CPU-generated sample
+packing: Star FX configures `Data32Channel32` and `DACCONTROL1 = 0x20`, receives native `i32`
+slots, processes them as `i32`, then byte-casts that matching representation back to TX. An
+RX/TX representation can round-trip consistently even when a separately generated `i16` stream
+would need different slot alignment.
+
+The next isolated image therefore keeps the engine 1/4 cap, codec analog −12 dB, headphone-only
+routing, module and all refill recovery behavior unchanged. It changes only the serial framing:
+
+- esp-hal uses `Data32Channel32` and the ES8388 uses 32-bit Philips (`DACCONTROL1 = 0x20`);
+- each signed engine `i16` is sign-extended to `i32`, shifted into the high 16 bits and emitted
+  as explicit little-endian bytes, with the same allocation-free packer in prefill and steady
+  refill;
+- each stereo frame is eight DMA bytes, so the required transport rate is 352 800 B/s;
+- the small ring is six quanta = 6 144 bytes, split into three equal 2 048-byte descriptors of
+  two quanta or 256 frames. The ring is about 17.4 ms and each descriptor about 5.8 ms, making
+  the eight muted recovery handoffs about 46 ms. Compile-time assertions retain three whole,
+  equal descriptors and the 8 184-byte small-ring limit.
+
+All 60 firmware-common host tests pass, including cases that pin zero, ±1, both signed extrema,
+stereo ordering and refusal to write a partial 32-bit slot. Default and `web` A1S release builds
+also pass.
+
+### 32-bit framing hardware run (2026-09-14)
+
+The merged 32-bit image passed its fresh-boot framing and bounded cadence check:
+
+- Exact `main` image SHA-256:
+  `6582f9f0a8b384fd61f6f9a1c4a2e0568142316d2f333d440d01d822fd14565c`
+  (477 744 bytes). The post-flash hash matched.
+- Boot reported the ES8388 as a 32-bit Philips slave with headphone analog −12 dB and the
+  speaker pair at minimum, held muted until readiness. I2S reported 44 100 Hz stereo 32-bit
+  slots, a six-quantum / 768-frame / 17 ms ring, and eight muted pre-roll handoffs in about
+  46 ms.
+- The play line confirmed engine master `1/4`, maximum `1/4`, headphone output only and speaker
+  PA off.
+- From +1.75 through +11.76 seconds, engine time advanced from 0:00 through 0:10. `written`
+  advanced from 354 304 to 3 909 632 bytes and `pushes` from 116 to 1 273. The 3 555 328-byte
+  delta over 10.01 seconds is about 355.2 KB/s when sampled on one-second telemetry boundaries,
+  consistent with the required 352 800 B/s while engine time tracked wall time.
+- `underruns=0` throughout. `dma_errors=1` was stable across the interval, the recovered startup
+  transient seen in the accepted 16-bit runs rather than a recurring steady-state error.
+
+This accepts 32-bit codec/I2S framing, CPU sample packing, ring geometry and refill cadence.
+**Owner subjective listening remains pending** for clean recognizable stereo in both ears and
+left/right identity; keep this plan open and unarchived until that check is complete.

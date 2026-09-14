@@ -218,7 +218,7 @@ impl<Bus: I2c> Es8388<Bus> {
         found
     }
 
-    /// Configure the codec for DAC playback: I2S slave, Philips, 16-bit, MCLK/LRCK = 256,
+    /// Configure the codec for DAC playback: I2S slave, Philips, 32-bit, MCLK/LRCK = 256,
     /// both DACs into both mixers, `outputs` enabled, digital 0 dB, headphone analog −12 dB,
     /// disabled speaker analog minimum, and **still muted**.
     ///
@@ -249,10 +249,9 @@ impl<Bus: I2c> Es8388<Bus> {
         // flow writes 0x05 (`EnRef` = 1, 50 kΩ) instead, which is the value to try if the
         // output pops or the Vmid ramp is audibly slow.
         self.write(register::CONTROL1, 0x12)?;
-        // `DACWL` = 011 (16-bit), `DACFORMAT` = 00 (I2S Philips). ESP-ADF reaches the same
-        // byte through `es8388_config_fmt` (mask 0xf9, `ES_I2S_NORMAL` = 0) and
-        // `es8388_set_bits_per_sample` (mask 0xc7, `BIT_LENGTH_16BITS` = 3 → 3 << 3).
-        self.write(register::DACCONTROL1, 0x18)?;
+        // `DACWL` = 100 (32-bit), `DACFORMAT` = 00 (I2S Philips). The CPU sign-extends each
+        // engine i16 sample and places it in the high 16 bits of the matching 32-bit slot.
+        self.write(register::DACCONTROL1, 0x20)?;
         // Single speed, MCLK/LRCK = 256.
         self.write(register::DACCONTROL2, 0x02)?;
         // Mixer input select: LIN1/RIN1. Irrelevant while the line-in mix bits are 0, and

@@ -168,6 +168,16 @@ digital signal bits. The disabled speaker pair stays at its −45 dB analog mini
 holds the speaker-amplifier enable low. Start a listening check with headphones off the
 listener's ears and raise the level only after the boot line confirms those settings.
 
+The owner still heard grainy output at that gain on the 16-bit-slot build. The next isolated
+image therefore keeps every gain, routing, module and refill decision above while changing the
+ES8388 and esp-hal transport to 32-bit Philips slots. Each signed engine `i16` is sign-extended
+to `i32`, shifted into the high 16 bits and written as explicit little-endian bytes. This tests
+CPU-generated sample framing without changing nominal loudness.
+
+Star FX's clean ADC-to-DAC path on the same device narrows the fault without settling this test.
+That path receives and transmits the same native 32-bit representation, so it proves the codec,
+analog path, clocks and wiring can be clean while leaving CPU-generated slot alignment open.
+
 The same run confirmed the DMA remediation from
 `plans/engine/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
 refill falls through to `push_with`, which can recover the descriptor accounting. A fixed
@@ -194,9 +204,9 @@ owns the DMA interrupt. Its refill task then completes eight `push_with` descrip
 silence and publishes a Release/Acquire startup result. Core 0 spins for at most one second with
 the codec muted, reports a start failure distinctly from a timeout, logs only after readiness,
 and then unmutes. An early recovery offer may be empty, while every non-empty offer is zero-filled
-in place without a render scratch or larger stack. StarPlayer's descriptors are about 8.7 ms
-each, making this a bounded roughly 70 ms startup pre-roll; eight is the count Star FX soaked for
-40 minutes on the same board and HAL version. DMA progress and audible stereo output remain
+in place without a render scratch or larger stack. StarPlayer's 32-bit-slot descriptors are about
+5.8 ms each, making this a bounded roughly 46 ms startup pre-roll; eight is the count Star FX
+soaked for 40 minutes on the same board and HAL version. DMA progress and audible stereo output remain
 separate acceptance checks; `plans/reference/embedded-budget.md` §4a/§4b records the underlying
 findings.
 
@@ -211,9 +221,8 @@ esp-hal ignores the macro's requested chunk when `DescriptorChain::new` construc
 split the old 4 096-byte small circular ring into three ragged 1 366 / 1 366 / 1 364-byte
 descriptors; steady `push_with` then accepted variable contiguous regions while returning
 descriptor ownership, producing only about half a ring of refill per physical ring cycle. The
-ring is now nine quanta = 4 608 bytes, the smallest nearby whole-quantum multiple of three. Its
-three equal descriptors are 1 536 bytes = three render quanta = 384 stereo frames, enforced by
-compile-time assertions.
+16-bit remediation used nine quanta = 4 608 bytes, with three equal 1 536-byte descriptors of
+three render quanta or 384 stereo frames.
 
 The first fixed-geometry build booted and made exactly one 1 536-byte steady push. Its transport
 line then stayed at `offered=written=1536 pushes=1` while `dma_errors` climbed by about 115/s and
@@ -221,15 +230,22 @@ engine time stayed at 0:00. esp-hal's plain `push` performs a second `available(
 after the outer check and render delay that check returned `Late`, and the outer error path then
 skipped the descriptor handoff on every later iteration.
 
-Steady refill now preserves the explicit outer check and error count, but always falls through to
+For the 32-bit framing experiment, each stereo frame doubles from four to eight DMA bytes. The
+ring is six quanta = 6 144 bytes, split into three equal 2 048-byte descriptors of two render
+quanta or 256 stereo frames. The whole ring is about 17.4 ms and each descriptor about 5.8 ms;
+compile-time assertions preserve the geometry and the 8 184-byte small-ring limit. Required DMA
+throughput is now 352 800 B/s.
+
+Steady refill preserves the explicit outer check and error count, but always falls through to
 `push_with`. Its internal check happens immediately and discards `Late`; rendering and copying
 then happen inside the closure with no fallible check between them and the handoff. The closure
-loops over every complete 1 536-byte descriptor in its offer, using `ConstStaticCell` scratch,
-and returns the full byte count. It never intentionally returns a partial descriptor. Equal
-descriptor geometry and full consumption are the conditions that make steady `push_with` safe
-here; an empty recovery offer renders and returns zero bytes. The cumulative transport fields
-`offered`, `written` and `pushes` count the outer whole descriptors, closure bytes, and calls,
-excluding muted pre-roll.
+loops over every complete 2 048-byte descriptor in its offer, using `ConstStaticCell` engine-i16
+scratch and the same explicit 32-bit-slot packer as the initial ring prefill, then returns the
+full byte count. It never intentionally returns a partial descriptor. Equal descriptor geometry
+and full consumption are the conditions that make steady `push_with` safe here; an empty
+recovery offer renders and returns zero bytes. The cumulative transport fields `offered`,
+`written` and `pushes` count the outer whole descriptors, closure bytes, and calls, excluding
+muted pre-roll.
 
 ### What a good boot looks like
 
@@ -284,11 +300,11 @@ CPU  240 MHz   heap 120.0 KiB
 PSRAM 4194304 bytes (4096.0 KiB) mapped at 0x3f800000
 I2C  device at 0x10 (ES8388)
 JACK headphone_detect=inserted
-CODEC ES8388 at 0x10: DAC up, 16-bit Philips slave, MCLK/LRCK 256, headphone -12 dB, speaker minimum, muted
+CODEC ES8388 at 0x10: DAC up, 32-bit Philips slave, MCLK/LRCK 256, headphone -12 dB, speaker minimum, muted
 MODULE image=88036 bytes (85.9 KiB) channels=8 samples=5
 HEAP after open: …
-I2S  44100 Hz stereo 16-bit, MCLK on GPIO0, DMA ring 9 quanta (1152 frames, 26 ms)
-CORE1 audio refill running; pre-roll 8 silent descriptor handoffs complete (~70 ms)
+I2S  44100 Hz stereo 32-bit slots, MCLK on GPIO0, DMA ring 6 quanta (768 frames, 17 ms)
+CORE1 audio refill running; pre-roll 8 silent descriptor handoffs complete (~46 ms)
 PLAY master_volume=1/4 max=1/4 output=headphone speaker_pa=off
 ord 000 pat 000 row 00/06 125 bpm   3/ 8 voices  0:01/2:47  peak=… underruns=0 dma_errors=0 offered=… written=… pushes=… …
 ```
@@ -560,7 +576,7 @@ a write outright while the second core is running, and this firmware runs the au
 on core 1 — so a write parks it.
 
 `POST /api/modules/store` therefore **stops the transport first**, waits for the 64-frame
-ramp and the 26 ms DMA ring to drain to silence, writes, and plays again. Storing a 90 KB
+ramp and the 17 ms DMA ring to drain to silence, writes, and plays again. Storing a 90 KB
 module is a few seconds of silence, and that is the designed behaviour, not a fault; the
 page warns about it beside the button. `POST /api/modules/select` for a flash slot does the
 same for a long read, which is safe but contends for the flash bus badly enough to cost

@@ -23,6 +23,7 @@
 //!   on a logging path.
 //! * [`volume`] — saturating fixed-point steps and a board-selected maximum, shared by a
 //!   board's physical and network controls without changing the engine default.
+//! * [`pcm`] — explicit allocation-free PCM slot packing for board transports.
 //!
 //! # Why a separate crate rather than a module in the board
 //!
@@ -43,6 +44,7 @@ pub mod bench;
 pub mod format;
 pub mod keys;
 pub mod now_playing;
+pub mod pcm;
 pub mod screen;
 pub mod volume;
 
@@ -50,6 +52,7 @@ pub use api::{HostState, Status, Upload, decode_wire_command, pack_telemetry};
 pub use bench::{BenchRow, CycleCounter, Kernel, PcmLocation, digest_row};
 pub use keys::{HOLD_REPEAT_INTERVAL_MS, HOLD_THRESHOLD_MS, Key, KeyDebounce, KeyEvent, KeyEvents};
 pub use now_playing::{ChannelRow, FixedStr, MAX_DISPLAY_CHANNELS, NowPlaying};
+pub use pcm::pack_i16_high_aligned_le;
 pub use screen::Screen;
 pub use volume::{cap_master_volume, lower_master_volume, raise_master_volume};
 

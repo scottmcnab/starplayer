@@ -415,7 +415,7 @@ async fn play(
     board.power_amplifier.set_low();
     let mut codec = es8388::Es8388::new(board.i2c, board::ES8388_I2C_ADDRESS);
     codec.init_dac_only(es8388::outputs::HEADPHONE).map_err(|_| "the ES8388 did not answer — is this the AC101 revision?")?;
-    println!("CODEC ES8388 at 0x{:02x}: DAC up, 16-bit Philips slave, MCLK/LRCK 256, headphone -12 dB, speaker minimum, muted", board::ES8388_I2C_ADDRESS);
+    println!("CODEC ES8388 at 0x{:02x}: DAC up, 32-bit Philips slave, MCLK/LRCK 256, headphone -12 dB, speaker minimum, muted", board::ES8388_I2C_ADDRESS);
 
     #[cfg(feature = "lcd")]
     let display = lcd::LcdDisplay::take(lcd_parts);
@@ -471,13 +471,14 @@ async fn play(
     });
     wait_for_audio_ready()?;
     println!(
-        "I2S  44100 Hz stereo 16-bit, MCLK on GPIO{}, DMA ring {} quanta ({} frames, {} ms)",
+        "I2S  44100 Hz stereo 32-bit slots, MCLK on GPIO{}, DMA ring {} quanta ({} frames, {} ms)",
         board::PIN_I2S_MCLK,
         audio::DMA_RING_QUANTA,
         audio::DMA_RING_QUANTA * audio::QUANTUM_FRAMES,
         audio::DMA_RING_QUANTA * audio::QUANTUM_FRAMES * 1000 / firmware_common::SAMPLE_RATE_HZ as usize,
     );
-    println!("CORE1 audio refill running; pre-roll {} silent descriptor handoffs complete (~70 ms)", audio::TX_PRIME_HANDOFFS);
+    let pre_roll_ms = audio::TX_PRIME_HANDOFFS * audio::DESCRIPTOR_FRAMES * 1000 / firmware_common::SAMPLE_RATE_HZ as usize;
+    println!("CORE1 audio refill running; pre-roll {} silent descriptor handoffs complete (~{} ms)", audio::TX_PRIME_HANDOFFS, pre_roll_ms);
 
     // Sound only after the muted pre-roll has established descriptor accounting and the
     // steady refill owns the transfer. GPIO21 remains low and pair 1 remains disabled: this
@@ -593,7 +594,7 @@ const VOLUME_STEP: U0F16 = U0F16::from_bits(1_024);
 
 /// Maximum time core 0 waits for core 1's I2S startup and one-time muted pre-roll.
 ///
-/// Eight descriptor periods take roughly 70 ms. One second leaves ample scheduling margin and
+/// Eight descriptor periods take roughly 46 ms. One second leaves ample scheduling margin and
 /// converts a task that never starts into a muted boot error rather than an infinite spin.
 #[cfg(not(feature = "bench"))]
 const AUDIO_READY_TIMEOUT: esp_hal::time::Duration = esp_hal::time::Duration::from_secs(1);
