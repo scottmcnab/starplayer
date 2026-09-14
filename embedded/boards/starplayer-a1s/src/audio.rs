@@ -2,8 +2,9 @@
 //!
 //! # The shape
 //!
-//! One I2S transmitter, Philips 32-bit stereo at 44 100 Hz, MCLK out on GPIO0, feeding a
-//! **circular** DMA transfer over a `'static` ring of [`DMA_RING_QUANTA`] render quanta.
+//! One I2S transmitter, Philips 32-bit stereo at the board-selected output rate, MCLK out on
+//! GPIO0, feeding a **circular** DMA transfer over a `'static` ring of [`DMA_RING_QUANTA`]
+//! render quanta.
 //! The refill is an Embassy task that renders and packs one complete [`DESCRIPTOR_BYTES`] block
 //! into static scratch, awaits DMA space, and submits those staged bytes through a constrained
 //! one-descriptor `push_with` closure.
@@ -13,8 +14,9 @@
 //! `DescriptorChain::fill` then cuts any circular ring of 8 184 bytes or fewer into exactly
 //! three descriptors. The ring is therefore six quanta = 6 144 bytes, producing three equal
 //! 2 048-byte descriptors. Each descriptor is exactly two render quanta, 256 stereo frames,
-//! or about 5.8 ms; the whole ring is about 17.4 ms and remains under the 8 184-byte small-ring
-//! limit.
+//! or about 5.3 ms at the audible 48 kHz rate; the whole ring is 16 ms and remains under the
+//! 8 184-byte small-ring limit. Historical 44.1 kHz diagnostics keep the byte geometry identical,
+//! where descriptors are about 5.8 ms and the ring is about 17.4 ms.
 //!
 //! Hardware established why equal descriptor geometry and fixed descriptor handoffs matter. With
 //! the old 4 096-byte ring, esp-hal made ragged 1 366 / 1 366 / 1 364-byte descriptors and
@@ -22,12 +24,12 @@
 //! At +1.59 seconds the diagnostic totals were `offered=written=88748`, then grew by only
 //! 89–90 KB/s with about 43 pushes/s — roughly half the then-required 176 400 B/s. Equal
 //! descriptors and exactly one complete descriptor per steady closure keep the write offset and
-//! descriptor ownership aligned. The 32-bit-slot experiment doubles the required DMA byte rate
-//! to 352 800 B/s. See
+//! descriptor ownership aligned. The adopted 48 kHz audible path requires 384 000 B/s; historical
+//! 44.1 kHz diagnostics retain their 352 800 B/s rate. See
 //! `plans/reference/embedded-budget.md` §4a for the underlying esp-hal and Star FX analysis.
 //!
-//! With the board-only `tone`, `matched-tone` or `swapped-tone` feature, the renderer still
-//! advances normally and an integer diagnostic sine replaces each complete output quantum
+//! With the board-only `tone`, `matched-tone`, `swapped-tone` or `reference-rate-tone` feature,
+//! the renderer still advances normally and an integer diagnostic sine replaces each output quantum
 //! immediately before the shared 32-bit packer. The override state travels from ring prefill
 //! through the muted handoffs into steady refill, so phase never restarts at a handoff. `tone`
 //! uses the compile-time table
@@ -145,42 +147,50 @@ static DESCRIPTOR_SCRATCH: ConstStaticCell<[i16; DESCRIPTOR_SAMPLES]> = ConstSta
 struct OutputOverride {
     #[cfg(feature = "tone")]
     tone: firmware_common::DiagnosticTone,
-    #[cfg(any(feature = "matched-tone", feature = "swapped-tone"))]
+    #[cfg(any(feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))]
     matched_tone: firmware_common::MatchedTone,
 }
 
 impl OutputOverride {
-    const fn new() -> OutputOverride {
-        OutputOverride {
+    fn new(sample_rate_hz: u32) -> Option<OutputOverride> {
+        #[cfg(not(any(feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
+        let _ = sample_rate_hz;
+        Some(OutputOverride {
             #[cfg(feature = "tone")]
             tone: firmware_common::DiagnosticTone::new(),
-            #[cfg(any(feature = "matched-tone", feature = "swapped-tone"))]
-            matched_tone: comparison_tone(),
-        }
+            #[cfg(any(feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))]
+            matched_tone: comparison_tone(sample_rate_hz)?,
+        })
     }
 
     #[inline(always)]
     fn apply(&mut self, destination: &mut [i16]) {
         #[cfg(feature = "tone")]
         self.tone.overwrite(destination);
-        #[cfg(any(feature = "matched-tone", feature = "swapped-tone"))]
+        #[cfg(any(feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))]
         self.matched_tone.overwrite(destination);
-        #[cfg(not(any(feature = "tone", feature = "matched-tone", feature = "swapped-tone")))]
+        #[cfg(not(any(feature = "tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
         let _ = destination;
     }
 }
 
-#[cfg(any(feature = "matched-tone", feature = "swapped-tone"))]
-const fn comparison_tone() -> firmware_common::MatchedTone {
+#[cfg(any(feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))]
+fn comparison_tone(sample_rate_hz: u32) -> Option<firmware_common::MatchedTone> {
+    #[cfg(not(feature = "reference-rate-tone"))]
+    let _ = sample_rate_hz;
+    #[cfg(feature = "reference-rate-tone")]
+    {
+        return firmware_common::MatchedTone::with_sample_rate(sample_rate_hz);
+    }
     #[cfg(feature = "swapped-tone")]
     {
-        return firmware_common::MatchedTone::with_peaks(
+        return Some(firmware_common::MatchedTone::with_peaks(
             firmware_common::SWAPPED_TONE_LEFT_PEAK,
             firmware_common::SWAPPED_TONE_RIGHT_PEAK,
-        );
+        ));
     }
-    #[cfg(not(feature = "swapped-tone"))]
-    firmware_common::MatchedTone::new()
+    #[cfg(feature = "matched-tone")]
+    Some(firmware_common::MatchedTone::new())
 }
 
 /// Swap left and right on the way to the codec.
@@ -194,9 +204,9 @@ pub const SWAP_CHANNELS: bool = false;
 ///
 /// One `push_with` is enough in principle to bring esp-hal's TX accounting to life. Eight is
 /// the precedent that `../star-fx` soaked for 40 minutes on the same ESP32-A1S and esp-hal
-/// 1.1.2. StarPlayer's descriptors are 256 frames, or 5.8 ms at 44.1 kHz, so this is a
-/// bounded roughly 46 ms pre-roll. It changes only muted startup time, not the steady-state
-/// ring depth or output latency.
+/// 1.1.2. StarPlayer's descriptors are 256 frames, or 5.3 ms at production's 48 kHz and
+/// 5.8 ms in the historical 44.1 kHz diagnostics, so this is a bounded roughly 42 ms or
+/// 46 ms pre-roll. It changes only muted startup time, not steady-state ring depth or latency.
 pub const TX_PRIME_HANDOFFS: usize = 8;
 
 /// How many times the refill found the ring completely empty.
@@ -366,7 +376,7 @@ pub fn start(parts: Parts, sample_rate_hz: u32, render: &mut RenderHalf<Linear>)
 
     // Prime the whole ring before the DMA reads a byte of it. Carry the optional diagnostic
     // state into steady refill so neither phase nor the tone/silence gate restarts.
-    let mut output_override = OutputOverride::new();
+    let mut output_override = OutputOverride::new(sample_rate_hz).ok_or(Error::Config)?;
     fill(tx_buffer.as_mut_slice(), render, &mut output_override);
 
     let transfer = i2s_tx.write_dma_circular_async(tx_buffer).map_err(|_| Error::Dma)?;

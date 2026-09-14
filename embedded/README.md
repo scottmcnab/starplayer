@@ -80,6 +80,7 @@ cargo xtask build  --board a1s --features tone     # gated direct-tone listening
 cargo xtask build  --board a1s --features engine-tone # standalone native-S3M engine-path diagnostic
 cargo xtask build  --board a1s --features matched-tone # strict post-render A/B against engine-tone
 cargo xtask build  --board a1s --features swapped-tone # matched A/B with only L/R peaks exchanged
+cargo xtask build  --board a1s --features reference-rate-tone # matched A/B at 48 kHz
 cargo xtask image  --board a1s [--merge]           # an espflash image under target/
 cargo xtask size   --board a1s                     # the image against its partition
 cargo xtask assets [--force]                       # regenerate the module images and gzip the page
@@ -92,6 +93,11 @@ cargo xtask size   --board c5 --features bench     # the bench image against its
 
 `--board a1s` is also the default, so a bare `cargo xtask build` (no `--board`) builds the
 A1S — `--board c5` always has to be spelled out.
+
+The A1S default, `lcd`, `web` and `web,lcd` production personalities render and transmit at
+48 000 Hz. `reference-rate-tone` uses that accepted audible rate too. The `bench` build and the
+historical `tone`, `engine-tone`, `matched-tone` and `swapped-tone` diagnostics remain at
+44 100 Hz so their golden hashes and recorded listening comparisons stay reproducible.
 
 `cargo xtask assets` runs the **main** workspace's `cargo xtask module-images`, which
 writes `embedded/assets/*.spmi` — the module images the firmware links with
@@ -150,6 +156,10 @@ cargo xtask monitor --board a1s
 
 # the owner-only channel discriminator: matched A/B with only its L/R peaks exchanged
 cargo xtask flash --board a1s --features swapped-tone
+cargo xtask monitor --board a1s
+
+# the owner-only rate discriminator: original matched A/B with only output changed to 48 kHz
+cargo xtask flash --board a1s --features reference-rate-tone
 cargo xtask monitor --board a1s
 
 # the C5 (M8-I4): one flash, no audio, no listening check — see the "C5" note below
@@ -261,8 +271,8 @@ before packing with a continuous 125 Hz integer-Q15 sine. A wrapping full-turn p
 advances by the exact rounded 12 173 944 units per 44.1 kHz frame and scales the channels to the
 host engine capture's signed peaks, 4 796 left and 5 327 right. Phase state continues from the
 initial ring prefill through muted handoffs and steady descriptor refill; there is no silence
-gate. `matched-tone` is incompatible with `bench`, `tone`, `engine-tone`, `swapped-tone` and
-`web`, but may be combined with `lcd`.
+gate. `matched-tone` is incompatible with `bench`, `tone`, `engine-tone`, `swapped-tone`,
+`reference-rate-tone` and `web`, but may be combined with `lcd`.
 
 The matched 125 Hz image also buzzed. In the owner's trimmed phone recording, unwanted lines
 begin at 297.363 Hz and repeat about every 86.13 Hz, exactly the cadence of 512 output frames or
@@ -270,18 +280,32 @@ two DMA descriptors. The earlier clean direct tone hid this splice because its w
 every 256 frames, exactly one descriptor, and its gates are descriptor aligned.
 
 After the heap-backed constrained handoff passed its objective transport checks, its matched tone
-still buzzed irregularly. KEY1 left the override tone in both channels while stopping the engine
-underlay, and the buzz moved from the centre to the right; resuming returned it to the centre. The
-default-off `--features swapped-tone` discriminator keeps that exact module, 1/4 master, 125 Hz
-Q15 phase and post-render placement, but exchanges only the generator peaks to 5 327 left and
-4 796 right. `MatchedTone::with_peaks` is the shared generator configuration, so phase still
-continues from prefill through startup and steady handoffs. `swapped-tone` is incompatible with
-`bench`, `tone`, `engine-tone`, `matched-tone` and `web`, may be combined with `lcd`, and leaves
-KEY1's ordinary play/stop mapping intact. If stopped buzz moves left it follows numeric level; if
-it remains right it follows the physical right output path.
+still buzzed irregularly. The default-off `--features swapped-tone` discriminator kept that exact
+module, 1/4 master, 125 Hz Q15 phase and post-render placement, but exchanged only the generator
+peaks to 5 327 left and 4 796 right. The owner heard one fixed-right buzz and one centred buzz while
+the engine played. KEY1 stopped the engine underlay and removed only the centred buzz; the right
+buzz and a very occasional centred pop remained. Resuming restored the centred buzz. Since the
+fixed component stayed right after the larger numeric peak moved left, numeric level, signedness
+and slot order do not explain it. The centred component follows engine work despite identical
+post-render samples.
+
+The default-off `--features reference-rate-tone` discriminator kept `matched-tone`'s controlled
+underlay, original 4 796-left/5 327-right peaks, 1/4 master, post-render placement, codec sequence,
+DMA geometry and KEY1 mapping. It changed only the complete A1S output path to 48 000 Hz: player
+open, I2S setup, timing text and now-playing elapsed conversion all share that selected rate. Its
+rounded full-turn phase increment is 11 184 811, retaining 125 Hz at the new rate. The historical
+`matched-tone` and `swapped-tone` images remain at 44.1 kHz and retain the 12 173 944 increment.
+`reference-rate-tone` is incompatible with `bench`, `tone`, `engine-tone`, `matched-tone`,
+`swapped-tone` and `web`, but may be combined with `lcd`. The listening run compared the centred
+buzz and intermittent pop while playing and after one KEY1 press, independently of the previously
+isolated fixed-right buzz.
+
+That reference image passed its objective run and the owner heard no buzzing at all, with no
+audible change on KEY1. Production A1S output therefore adopts 48 kHz. Normal music is the final
+listening check; the controlled historical diagnostic rates remain unchanged.
 
 The same run confirmed the DMA remediation from
-`plans/engine/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
+`plans/engine/complete/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
 refill falls through to `push_with`, which can recover the descriptor accounting. A fixed
 startup `dma_errors` count identifies a recovered transient; a count that keeps climbing still
 means the transport is unhealthy. A second run showed that recovery alone did not establish a
@@ -427,9 +451,8 @@ CODEC ES8388 at 0x10: DAC up, 32-bit Philips slave, MCLK/LRCK 256, headphone -12
 MODULE image=88036 bytes (85.9 KiB) channels=8 samples=5
 HEAP after open: …
 HEAP after audio start: …
-I2S  44100 Hz stereo 32-bit slots, MCLK on GPIO0, DMA ring 6 quanta (768 frames, 17 ms)
-CORE1 audio refill running; pre-roll 8 silent descriptor handoffs complete (~46 ms)
-TONE diagnostic dual-mono sine 172.265625 Hz amplitude=4096 gate=44032 frames (~998 ms) tone / 44032 frames (~998 ms) silence
+I2S  48000 Hz stereo 32-bit slots, MCLK on GPIO0, DMA ring 6 quanta (768 frames, 16 ms)
+CORE1 audio refill running; pre-roll 8 silent descriptor handoffs complete (~42 ms)
 PLAY master_volume=1/4 max=1/4 output=headphone speaker_pa=off
 ord 000 pat 000 row 00/06 125 bpm   3/ 8 voices  0:01/2:47  peak=… underruns=0 dma_errors=0 offered=… written=… pushes=… …
 ```
@@ -451,6 +474,13 @@ A `swapped-tone` image changes only those generator peaks and reports:
 
 ```text
 SWAPPED-TONE output=125 Hz peaks=5327/4796 generator=integer-Q15 continuous underlay=engine-tone interpolation=linear master=1/4
+```
+
+A `reference-rate-tone` image restores the original peaks and changes the selected rate:
+
+```text
+REFERENCE-RATE-TONE rate=48000 Hz output=125 Hz peaks=4796/5327 generator=integer-Q15 continuous underlay=engine-tone interpolation=linear master=1/4
+I2S  48000 Hz stereo 32-bit slots, MCLK on GPIO0, DMA ring 6 quanta (768 frames, 16 ms)
 ```
 
 An `lcd` build's boot log has one more line before `MODULE` — `LCD  ST7789

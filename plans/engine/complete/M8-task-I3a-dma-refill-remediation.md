@@ -2,8 +2,8 @@
 
 | Field | Value |
 |---|---|
-| Milestone | M8 ([master plan](M8-master-plan.md)), remediating [I3](complete/M8-task-I3-esp32-a1s-bringup.md)'s `audio.rs` |
-| Status | **Open, written 2026-09-14.** The descriptor-coherent 172 Hz direct tone is accepted clean, while both continuous 125 Hz comparisons buzz. The heap-backed constrained one-descriptor handoff and swapped-channel discriminator pass objective hardware checks; the owner's playing/stopped result and normal-music acceptance remain pending |
+| Milestone | M8 ([master plan](../M8-master-plan.md)), remediating [I3](M8-task-I3-esp32-a1s-bringup.md)'s `audio.rs` |
+| Status | **Complete 2026-09-14.** The heap-backed constrained handoff and normal 48 kHz production image pass objective hardware checks, and the owner accepts normal music as sounding good. The original DMA refill remediation goal is complete |
 | Depends on | — (the diagnosis is done; see `plans/reference/embedded-budget.md` §4a) |
 | Blocks | Reliable A1S playback. M8's exit criterion is "sound from the headphone jack", transport progress and codec output routing must both be verified |
 | Parallel with | Work outside the A1S audio, codec and boot files |
@@ -871,3 +871,183 @@ This accepts the swapped-tone image objectively: the exact exchanged channel pea
 allocation, controlled codec/I2S configuration, sustained one-descriptor cadence and native song
 loop all behaved as specified. The owner's playing/stopped listening result remains pending, as
 does clean normal music. Keep this plan open and unarchived.
+
+### Swapped-tone listening result and 48 kHz reference discriminator (2026-09-14)
+
+The owner hears two independent faults in the swapped image while the engine plays: one buzz fixed
+on the right and another centred. Pressing KEY1 once stops the engine underlay and removes only the
+centred buzz; the right buzz remains. A very occasional centred pop also remains over the stopped
+tone. Pressing KEY1 again resumes the engine and the centred buzz returns. Because `swapped-tone`
+moved the larger numeric peak from right to left while the fixed buzz stayed right, sample
+signedness, sample magnitude and left/right slot ordering do not explain that component. The
+centred buzz follows active engine work even though the post-render samples are identical. The pop
+shows that the stopped path is not perfectly continuous either.
+
+The clean same-board reference in `../star-fx` uses the same ES8388 slave, 32-bit Philips slots,
+256x MCLK ratio, output pair and esp-hal 1.1.2 I2S driver, but runs at 48 000 Hz rather than
+StarPlayer's 44 100 Hz. At a 160 MHz I2S source, esp-hal selects MCLK dividers 14 + 5/29 for
+44.1 kHz and 13 + 1/48 for an exact-average 48 kHz. Test that remaining clock/rate difference
+without changing the accepted handoff:
+
+- add a default-off A1S `reference-rate-tone` feature. It must use the same controlled native S3M
+  underlay, linear interpolation, 1/4 master, original 4 796-left/5 327-right comparison peaks,
+  post-render placement, heap-backed packed descriptor, constrained one-descriptor `push_with`,
+  codec register sequence, DMA geometry and KEY1 play/stop mapping as `matched-tone`;
+- change only the A1S output sample rate from 44 100 to 48 000 Hz and derive the continuous 125 Hz
+  Q15 phase increment from that selected rate. The phase increment is 11 184 811 at 48 kHz. Keep
+  `MatchedTone::new()` and the existing `matched-tone` and `swapped-tone` images byte-for-byte at
+  their current 44.1 kHz phase increment. Share a safe explicit sample-rate/configuration path;
+- use one selected A1S sample-rate value consistently for `EmbeddedPlayer::open`, I2S setup, DMA
+  timing text and `NowPlaying` elapsed-time conversion. Do not change firmware-common's 44.1 kHz
+  golden/bench constant or the C5 bench. Print `REFERENCE-RATE-TONE`, 48 000 Hz, 125 Hz and both
+  peaks at boot so the flashed image is unambiguous;
+- make `reference-rate-tone` incompatible with `bench`, `tone`, `engine-tone`, `matched-tone`,
+  `swapped-tone` and `web`, while allowing `lcd`. Add host assertions for the exact 48 kHz phase
+  increment, signed channel extrema, continuity across unequal descriptor-sized calls and the
+  unchanged 44.1 kHz constructor;
+- verify firmware-common tests and A1S normal, `matched-tone`, `swapped-tone`,
+  `reference-rate-tone`, and `reference-rate-tone,lcd` release builds. Build and flash only
+  `reference-rate-tone`, capture identity, heap, transport and `B00` evidence through at least one
+  loop, then have the owner listen while playing and after one KEY1 press. The owner should report
+  the centred buzz and intermittent pop separately and may ignore the already-isolated fixed-right
+  buzz for this comparison.
+
+If the centred buzz and pop disappear at 48 kHz, adopt 48 kHz as the A1S hardware rate and test
+normal music before closing I3a. If they remain, the sample clock/rate difference is ruled out;
+instrument render duration and replace the constrained steady `push_with` with the clean
+reference's post-prime `push` in a separate controlled step. Keep normal playback unchanged until
+this discriminator is heard.
+
+Implementation result: the default-off A1S `reference-rate-tone` feature selects the same native
+S3M underlay, linear interpolation, 1/4 master, original 4 796-left/5 327-right peaks and
+post-render override as `matched-tone`. It preserves the heap-backed packed descriptor, constrained
+one-descriptor handoff, codec sequence, ring geometry and KEY1 play/stop behavior. The feature is
+incompatible with `bench`, `tone`, `engine-tone`, `matched-tone`, `swapped-tone` and `web`, and may
+be combined with `lcd`.
+
+One board-local `OUTPUT_SAMPLE_RATE_HZ` selects 48 000 only for this feature and otherwise aliases
+firmware-common's unchanged 44 100 Hz constant. Player construction, I2S configuration, ring and
+pre-roll timing text, and both display/web and UART `NowPlaying` elapsed conversions use that one
+value. Boot identifies `REFERENCE-RATE-TONE`, 48 000 Hz, 125 Hz and the original channel peaks.
+`MatchedTone` now stores its phase increment and offers a checked sample-rate constructor; the
+reference build derives 11 184 811 from its selected rate, while `new()` and `with_peaks()` retain
+the original 12 173 944 step and existing matched/swapped output.
+
+Host tests reject a zero rate, prove nearest rounding at 48 kHz, pin both phase increments and the
+signed channel extrema, and compare byte-identical output/state across unequal one- and
+two-descriptor calls. All 73 firmware-common tests and A1S normal, `matched-tone`, `swapped-tone`,
+`reference-rate-tone`, and `reference-rate-tone,lcd` release builds pass. Hardware evidence and
+the owner's playing/stopped reference-rate result follow; normal-music acceptance remains pending.
+
+### Reference-rate-tone hardware and listening run (2026-09-14)
+
+The flashed 48 kHz discriminator passes its objective identity, allocation, codec, transport,
+cadence and native-loop checks:
+
+- Exact image: `embedded/target/starplayer-a1s-reference-rate-tone-merged.bin`, 431 504 bytes,
+  SHA-256 `4a16eafd5ffb3fee26d101f0de9dc3e5455d36376afabc8c56653279c40f603e`.
+  `esptool` flash-hash verification passed on the ESP32 at MAC `b4:bf:e9:dd:d3:e4`.
+- A fresh reset identified `REFERENCE-RATE-TONE` at 48 000 Hz, output 125 Hz, with peaks
+  4 796 left and 5 327 right. Heap use was 27 932 bytes with 94 948 free after player open,
+  then 29 980 used with 92 900 free after audio start: the expected exact 2 048-byte increase.
+- The codec remained ES8388 32-bit Philips slave with headphone analog at −12 dB. I2S ran at
+  48 000 Hz stereo 32-bit with the six-quantum, 768-frame, 16 ms ring; eight muted descriptor
+  handoffs took about 42 ms.
+- The native S3M crossed `B00` from row 59 to row 03. Final transport counters were
+  `offered=5804032 written=5804032 pushes=2834`; peak stayed at or below 5 327,
+  `underruns=0`, and the recovered startup `dma_errors=1` remained fixed.
+
+This accepts the reference-rate image objectively: its exact rate and generator identity,
+post-open allocation, controlled codec/I2S configuration, sustained one-descriptor cadence and
+native song loop all behaved as specified. The owner also accepts the listening result: the 48 kHz
+comparison is much better, with no buzzing at all, and pressing KEY1 has no audible effect. This
+implicates the 44.1 kHz output configuration in the previously reported buzz components and
+stopped-path pop. Clean normal music at 48 kHz remains pending. Keep this plan open and unarchived.
+
+### Adopt 48 kHz for audible A1S firmware (2026-09-14)
+
+The accepted comparison changes the diagnosis into a production fix. The same generated samples,
+peaks, engine work, codec registers, DMA geometry and constrained handoff buzzed at 44.1 kHz and
+were clean at 48 kHz. Make 48 000 Hz the hardware output rate for ordinary A1S playback and obtain
+the final normal-music listening result:
+
+- select 48 000 Hz for every production A1S audio personality: default, `lcd`, `web`, and
+  `web,lcd`. Use that rate consistently for player construction, I2S, DMA/pre-roll timing text and
+  `NowPlaying`, as the accepted reference image does. Keep `reference-rate-tone` at 48 kHz;
+- retain firmware-common's 44 100 Hz constant and every A1S/C5 bench render at 44.1 kHz so the
+  committed golden hashes and CPU-budget comparison remain byte-identical. Retain the historical
+  `tone`, `engine-tone`, `matched-tone` and `swapped-tone` diagnostic images at 44.1 kHz so every
+  accepted or failed diagnosis remains reproducible. Express this as one explicit board-rate
+  selection rather than scattering feature checks among call sites;
+- amend M8 master-plan decision 2: `Linear` and the `i16` stereo boundary remain fixed; 44.1 kHz is
+  the canonical bench/golden rate, while objective and owner evidence in I3a establishes 48 kHz as
+  the A1S ES8388 audible-output rate. Update the embedded budget configuration table and runbook
+  wherever they still describe normal A1S output as 44.1 kHz. Do not change product-wide golden or
+  accuracy policy;
+- do not change codec routing or gain, DMA buffers/descriptors, refill behavior, PCM packing,
+  engine semantics, module images, buttons or diagnostic generators. Normal playback must have no
+  post-render override;
+- verify all firmware-common tests and A1S release builds for normal, `lcd`, `web`, `web,lcd`,
+  `bench`, `matched-tone`, and `reference-rate-tone`. The 44.1 kHz golden hash test must remain
+  unchanged. Build and flash only the normal default image from merged `main`; capture its module
+  identity, 48 kHz I2S line, heap, transport counters and at least one native song loop. Then have
+  the owner listen to normal music, exercise several volume steps, stop/resume with KEY1, and report
+  whether it is clean and free of buzz, pops, gating and speed/pitch errors.
+
+If normal music is accepted, record the run, move this plan to `plans/engine/complete/`, update the
+plans index and close I3a. If the generated tone is clean but normal music is not, keep the plan
+open and diagnose only the remaining music-specific fault from that report.
+
+Implementation result: one board-local selector now assigns 48 000 Hz to every audible production
+A1S personality (`default`, `lcd`, `web` and `web,lcd`) and to `reference-rate-tone`. It assigns
+firmware-common's unchanged 44 100 Hz rate to the historical `tone`, `engine-tone`, `matched-tone`
+and `swapped-tone` audio diagnostics. The no-audio bench continues to use the firmware-common
+constant directly. The existing single audio rate value still feeds player construction, I2S,
+DMA and pre-roll timing text, and every `NowPlaying` conversion. Normal playback installs no
+post-render override.
+
+M8 decision 2 now distinguishes the canonical 44.1 kHz bench/golden rate from the accepted 48 kHz
+A1S ES8388 audible-output rate. The embedded budget configuration table and runbook make the same
+distinction, retain all historical rates, and show the production 48 kHz ring and pre-roll timing.
+Codec routing and gain, DMA geometry and refill, PCM packing, engine semantics, module images,
+buttons and diagnostic generators are unchanged.
+
+All 73 firmware-common tests pass, including the unchanged 44.1 kHz REFLEX golden-hash assertion.
+A1S normal, `lcd`, `web`, `web,lcd`, `bench`, `matched-tone` and `reference-rate-tone` release
+builds pass. The merged-main normal hardware and listening evidence follows. No separate volume or
+KEY1 acceptance is claimed.
+
+### Normal 48 kHz production objective hardware run (2026-09-14)
+
+The flashed default production image passes its objective identity, allocation, codec, transport,
+song-end restart and sustained-stability checks:
+
+- Exact image: `embedded/target/starplayer-a1s-merged.bin`, 479 072 bytes, SHA-256
+  `4939a5bfa86178e87b829f60adc281f6e6c742688be8f9bab031d265dfba5cd1`.
+  `esptool` flash-hash verification passed on the ESP32 at MAC `b4:bf:e9:dd:d3:e4`.
+- A fresh normal boot identified the linked module image as 14 984 bytes with three channels and
+  four samples. Heap use was 79 028 bytes with 43 852 free after player open, then 81 076 used
+  with 41 804 free after audio start: the expected exact 2 048-byte descriptor allocation.
+- The codec remained ES8388 32-bit Philips slave with headphone analog at −12 dB. I2S ran at
+  48 000 Hz stereo 32-bit with the six-quantum, 768-frame, 16 ms ring; the eight muted descriptor
+  handoffs took about 42 ms.
+- REFLEX progressed to `2:16`, reached its end, restarted at order zero and continued to `0:07`.
+  Final transport counters were `offered=57264128 written=57264128 pushes=27961`, with
+  `underruns=0` and the recovered startup `dma_errors=1` fixed throughout. No reboot occurred.
+
+This accepts the normal 48 kHz production image objectively: its module identity, post-open
+allocation, codec/I2S configuration, complete one-descriptor cadence, song-end restart and long
+run remained healthy. The owner's normal-music acceptance follows. Volume-step and KEY1 behavior
+were not reported separately.
+
+### Owner acceptance and completion (2026-09-14)
+
+After listening to the exact normal 48 kHz production image documented above, the owner reported:
+“Sounds good. How do I get it to play other tracks?” This accepts normal production sound and
+completes I3a's original remediation goal: the refill recovers its startup transient, sustains one
+complete descriptor per handoff at the required byte rate, restarts the song without gating or
+rebooting, and the adopted ES8388 output rate is audibly clean.
+
+The owner did not report a separate volume-step or KEY1 result, so this plan makes no such claim.
+Those broader UI checks and loading other tracks remain ordinary M8 follow-up and do not block the
+completed DMA/audio remediation. Archive this plan as complete.

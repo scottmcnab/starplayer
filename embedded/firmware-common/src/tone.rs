@@ -46,6 +46,9 @@ pub const SWAPPED_TONE_RIGHT_PEAK: i16 = MATCHED_TONE_LEFT_PEAK;
 pub const MATCHED_TONE_PHASE_INCREMENT: u32 =
     ((MATCHED_TONE_FREQUENCY_HZ as u64 * (1u64 << 32) + crate::SAMPLE_RATE_HZ as u64 / 2) / crate::SAMPLE_RATE_HZ as u64) as u32;
 
+/// Rounded full-turn phase increment for the 125 Hz comparison at 48 000 Hz.
+pub const REFERENCE_RATE_TONE_PHASE_INCREMENT: u32 = 11_184_811;
+
 const TABLE_LENGTH: usize = 256;
 const PHASE_STEP: usize = 1;
 const TABLE_CYCLE_FRAMES: u32 = 256;
@@ -62,6 +65,11 @@ const _: () = assert!(ENGINE_TONE_LOOP_FRAMES as usize == TABLE_LENGTH);
 const _: () = assert!(DIAGNOSTIC_TONE_AMPLITUDE as i32 * ENGINE_TONE_SAMPLE_SCALE as i32 == ENGINE_TONE_SOURCE_AMPLITUDE as i32);
 const _: () = assert!(ENGINE_TONE_REFERENCE_RATE_HZ / ENGINE_TONE_LOOP_FRAMES == ENGINE_TONE_OUTPUT_FREQUENCY_HZ);
 const _: () = assert!(MATCHED_TONE_PHASE_INCREMENT == 12_173_944);
+const _: () = assert!(REFERENCE_RATE_TONE_PHASE_INCREMENT == matched_tone_phase_increment(48_000));
+
+const fn matched_tone_phase_increment(sample_rate_hz: u32) -> u32 {
+    ((MATCHED_TONE_FREQUENCY_HZ as u64 * (1u64 << 32) + sample_rate_hz as u64 / 2) / sample_rate_hz as u64) as u32
+}
 
 /// One full, rounded 256-entry sine cycle at [`DIAGNOSTIC_TONE_AMPLITUDE`].
 const SINE: [i16; TABLE_LENGTH] = [
@@ -132,6 +140,7 @@ pub fn engine_tone_module() -> Result<Module, starplayer::core::Error> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MatchedTone {
     phase: u32,
+    phase_increment: u32,
     left_peak: i16,
     right_peak: i16,
 }
@@ -144,7 +153,30 @@ impl MatchedTone {
 
     /// Start the shared generator with explicit independent channel peaks.
     pub const fn with_peaks(left_peak: i16, right_peak: i16) -> MatchedTone {
-        MatchedTone { phase: 0, left_peak, right_peak }
+        MatchedTone { phase: 0, phase_increment: MATCHED_TONE_PHASE_INCREMENT, left_peak, right_peak }
+    }
+
+    /// Start the original-peak comparison at an explicitly selected output sample rate.
+    ///
+    /// A zero rate, or a rate whose rounded increment cannot fit the full-turn accumulator, is
+    /// rejected. Existing callers should keep [`MatchedTone::new`] so their 44.1 kHz output
+    /// remains unchanged.
+    pub const fn with_sample_rate(sample_rate_hz: u32) -> Option<MatchedTone> {
+        if sample_rate_hz == 0 {
+            None
+        } else {
+            let rounded_increment =
+                (MATCHED_TONE_FREQUENCY_HZ as u64 * (1u64 << 32) + sample_rate_hz as u64 / 2) / sample_rate_hz as u64;
+            if rounded_increment > u32::MAX as u64 {
+                return None;
+            }
+            Some(MatchedTone {
+                phase: 0,
+                phase_increment: rounded_increment as u32,
+                left_peak: MATCHED_TONE_LEFT_PEAK,
+                right_peak: MATCHED_TONE_RIGHT_PEAK,
+            })
+        }
     }
 
     /// Replace interleaved stereo with the continuous matched tone.
@@ -157,7 +189,7 @@ impl MatchedTone {
             let sine = starplayer::dsp::sin_q15(self.phase);
             frame[0] = scale_q15_to_peak(sine, self.left_peak);
             frame[1] = scale_q15_to_peak(sine, self.right_peak);
-            self.phase = self.phase.wrapping_add(MATCHED_TONE_PHASE_INCREMENT);
+            self.phase = self.phase.wrapping_add(self.phase_increment);
         }
         frames.into_remainder().fill(0);
     }
@@ -290,6 +322,51 @@ mod tests {
         let lower_error = (u64::from(MATCHED_TONE_PHASE_INCREMENT - 1) * sample_rate).abs_diff(numerator);
         let upper_error = (u64::from(MATCHED_TONE_PHASE_INCREMENT + 1) * sample_rate).abs_diff(numerator);
         assert!(chosen_error < lower_error && chosen_error < upper_error);
+    }
+
+    #[test]
+    fn reference_rate_tone_uses_exact_nearest_phase_step_and_preserves_the_default() {
+        assert!(MatchedTone::with_sample_rate(0).is_none());
+        assert!(MatchedTone::with_sample_rate(MATCHED_TONE_FREQUENCY_HZ).is_none());
+        let reference = MatchedTone::with_sample_rate(48_000).expect("nonzero reference rate");
+        assert_eq!(reference.phase_increment, REFERENCE_RATE_TONE_PHASE_INCREMENT);
+        assert_eq!(reference.phase_increment, 11_184_811);
+        assert_eq!(reference.left_peak, MATCHED_TONE_LEFT_PEAK);
+        assert_eq!(reference.right_peak, MATCHED_TONE_RIGHT_PEAK);
+        assert_eq!(MatchedTone::new().phase_increment, MATCHED_TONE_PHASE_INCREMENT);
+        assert_eq!(MatchedTone::new().phase_increment, 12_173_944);
+
+        let numerator = u64::from(MATCHED_TONE_FREQUENCY_HZ) * (1u64 << 32);
+        let sample_rate = 48_000u64;
+        let chosen_error = (u64::from(reference.phase_increment) * sample_rate).abs_diff(numerator);
+        let lower_error = (u64::from(reference.phase_increment - 1) * sample_rate).abs_diff(numerator);
+        let upper_error = (u64::from(reference.phase_increment + 1) * sample_rate).abs_diff(numerator);
+        assert!(chosen_error < lower_error && chosen_error < upper_error);
+    }
+
+    #[test]
+    fn reference_rate_tone_hits_signed_peaks_and_continues_across_unequal_calls() {
+        let mut positive = MatchedTone::with_sample_rate(48_000).expect("reference tone");
+        positive.phase = 1 << 30;
+        let mut frame = [0i16; 2];
+        positive.overwrite(&mut frame);
+        assert_eq!(frame, [MATCHED_TONE_LEFT_PEAK, MATCHED_TONE_RIGHT_PEAK]);
+
+        let mut negative = MatchedTone::with_sample_rate(48_000).expect("reference tone");
+        negative.phase = 3 << 30;
+        negative.overwrite(&mut frame);
+        assert_eq!(frame, [-MATCHED_TONE_LEFT_PEAK, -MATCHED_TONE_RIGHT_PEAK]);
+
+        let mut whole_tone = MatchedTone::with_sample_rate(48_000).expect("reference tone");
+        let mut whole = [i16::MAX; 1536];
+        whole_tone.overwrite(&mut whole);
+
+        let mut split_tone = MatchedTone::with_sample_rate(48_000).expect("reference tone");
+        let mut split = [i16::MAX; 1536];
+        split_tone.overwrite(&mut split[..512]);
+        split_tone.overwrite(&mut split[512..]);
+        assert_eq!(split, whole);
+        assert_eq!(split_tone, whole_tone);
     }
 
     #[test]

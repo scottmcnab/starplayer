@@ -23,7 +23,8 @@ inferred from a host build and then quoted as if it came off the device. Do not 
 | Item | Value |
 |---|---|
 | Engine | `Engine<FixedPath, Interp, FixedOut<i16, 2>>` via `starplayer-host-embedded` |
-| Sample rate | 44 100 Hz |
+| Bench/golden sample rate | 44 100 Hz |
+| A1S audible-output sample rate | 48 000 Hz (adopted after I3a's matched hardware A/B was clean only at this rate) |
 | `RENDER_QUANTUM` | 128 frames (architecture Q2 — see §5) |
 | Board | AI-Thinker ESP32-Audio-Kit, ESP32-A1S (classic ESP32, Xtensa LX6, 2 × 240 MHz, 4 MB flash, PSRAM) |
 | Toolchain | `esp-1.97` (rustc 1.97.0-nightly, Xtensa); `rustup` 1.97 for the host |
@@ -34,6 +35,11 @@ The profile is `opt-level = 3`, not the `"s"` a size-constrained firmware would 
 CPU figures below are a measurement of the mixer, and a figure taken at `"s"` would be a
 measurement of the size/speed tradeoff instead. Flash is not the constraint here: the
 `factory` partition is 2.5 MB and the audio build uses 17.7 % of it.
+
+All hashes and CPU measurements in this document remain canonical 44.1 kHz bench results. The
+A1S default, `lcd`, `web` and `web,lcd` personalities send audible output at 48 kHz; the historical
+`tone`, `engine-tone`, `matched-tone` and `swapped-tone` images stay at 44.1 kHz so their diagnosis
+remains reproducible. The C5 has no audible path and its bench remains at 44.1 kHz.
 
 ### C5 configuration (M8-I4)
 

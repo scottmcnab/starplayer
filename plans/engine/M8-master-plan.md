@@ -49,9 +49,11 @@ config that worked, and its `provisioning.rs` is the captive portal I6 copies in
    `rust-version = "1.97"`), `build-std`, and per-target dependency tables that must not
    be resolved by the main workspace's `cargo metadata`. Board-independent host logic lives
    in the main workspace as a `no_std` crate so the existing bare-metal CI covers it.
-2. **Fixed path, `Linear`, i16 stereo, 44 100 Hz.** That is the goldens' configuration, so
-   an on-device render can be hashed and compared against `goldens/` with no listening
-   required. The host boundary is `&mut [i16]` — the std host's `f32` callback is not used.
+2. **Fixed path, `Linear`, i16 stereo; 44 100 Hz bench/goldens and 48 000 Hz A1S output.**
+   The canonical bench rate remains the goldens' configuration, so an on-device render can be
+   hashed and compared against `goldens/` with no listening required. I3a's matched hardware A/B
+   established 48 kHz as the clean ES8388 audible-output rate; every production A1S personality
+   uses it. The host boundary remains `&mut [i16]` — the std host's `f32` callback is not used.
 3. **Flash-resident modules are host-built module images** (I2): the loader runs on the
    development machine, the built `Module` is serialised with its i16 PCM 4-byte aligned,
    and the device borrows the PCM straight out of the memory-mapped image. Modules

@@ -48,6 +48,11 @@ matched-tone = []
 # with the other diagnostics and `web`; `lcd` remains supported for the listening sequence.
 swapped-tone = []
 
+# Clock/rate discriminator for the matched post-render comparison: identical original peaks,
+# underlay and transport at 48 kHz. `main.rs` rejects combinations with the other diagnostics
+# and `web`; `lcd` remains supported for the listening sequence.
+reference-rate-tone = []
+
 # M8-I5: the ST7789 now-playing screen on the SD-card pin group. Off by default — the
 # audio build must not link `mipidsi`/`embedded-graphics`/`embedded-hal-bus` at all (M8
 # master-plan decision 4), so the three are `optional = true` below and pulled in only by

@@ -62,16 +62,17 @@ pub use tone::{
     DIAGNOSTIC_TONE_SILENT_FRAMES, DiagnosticTone, ENGINE_TONE_LOOP_FRAMES,
     ENGINE_TONE_OUTPUT_FREQUENCY_HZ, ENGINE_TONE_REFERENCE_RATE_HZ, ENGINE_TONE_SOURCE_AMPLITUDE,
     MATCHED_TONE_FREQUENCY_HZ, MATCHED_TONE_LEFT_PEAK, MATCHED_TONE_PHASE_INCREMENT,
-    MATCHED_TONE_RIGHT_PEAK, MatchedTone, SWAPPED_TONE_LEFT_PEAK, SWAPPED_TONE_RIGHT_PEAK,
-    engine_tone_module,
+    MATCHED_TONE_RIGHT_PEAK, MatchedTone, REFERENCE_RATE_TONE_PHASE_INCREMENT,
+    SWAPPED_TONE_LEFT_PEAK, SWAPPED_TONE_RIGHT_PEAK, engine_tone_module,
 };
 pub use volume::{cap_master_volume, lower_master_volume, raise_master_volume};
 
-/// The sample rate every StarPlayer firmware runs at.
+/// The canonical embedded golden and bench sample rate.
 ///
-/// Not a knob. It is the rate the committed goldens were rendered at (M8 master-plan
-/// decision 2), so a device that ran at any other rate could not compare its hash with
-/// `goldens/` — which is the milestone's exit criterion.
+/// It is the rate the committed goldens were rendered at (M8 master-plan decision 2), so a
+/// bench that ran at any other rate could not compare its hash with `goldens/`. A board-local
+/// listening discriminator may explicitly select another hardware output rate without changing
+/// this constant or the golden/bench path.
 pub const SAMPLE_RATE_HZ: u32 = 44_100;
 
 /// Frames in the ten-second golden render: `SAMPLE_RATE_HZ × 10`.

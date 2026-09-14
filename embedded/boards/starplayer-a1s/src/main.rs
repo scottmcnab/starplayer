@@ -15,6 +15,8 @@
 //!   quantum with a continuous 125 Hz Q15 sine matched to its measured left/right peaks;
 //! * the standalone **`swapped-tone`** build makes the same comparison with only those peaks
 //!   exchanged between left and right;
+//! * the standalone **`reference-rate-tone`** build keeps the original matched comparison and
+//!   changes only the complete A1S output path to 48 000 Hz;
 //! * the **`bench`** build ([`bench`]) makes no sound and instead renders every golden
 //!   fixture, printing its SHA-256 and its cost.
 //!
@@ -94,6 +96,8 @@ compile_error!("the standalone A1S `engine-tone` diagnostic cannot be combined w
 compile_error!("the standalone A1S `matched-tone` diagnostic cannot be combined with `bench`, `tone`, `engine-tone`, `swapped-tone` or `web`");
 #[cfg(all(feature = "swapped-tone", any(feature = "bench", feature = "tone", feature = "engine-tone", feature = "matched-tone", feature = "web")))]
 compile_error!("the standalone A1S `swapped-tone` diagnostic cannot be combined with `bench`, `tone`, `engine-tone`, `matched-tone` or `web`");
+#[cfg(all(feature = "reference-rate-tone", any(feature = "bench", feature = "tone", feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "web")))]
+compile_error!("the standalone A1S `reference-rate-tone` diagnostic cannot be combined with `bench`, `tone`, `engine-tone`, `matched-tone`, `swapped-tone` or `web`");
 
 extern crate alloc;
 
@@ -105,7 +109,7 @@ mod bench;
 mod board;
 #[cfg(not(feature = "bench"))]
 mod es8388;
-#[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone")))]
+#[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
 mod images;
 #[cfg(not(feature = "bench"))]
 mod keys;
@@ -134,7 +138,7 @@ use firmware_common::{Key, KeyEvent, NowPlaying};
 use starplayer::core::U0F16;
 #[cfg(not(feature = "bench"))]
 use starplayer::dsp::Linear;
-#[cfg(all(not(feature = "bench"), not(feature = "engine-tone"), not(feature = "matched-tone"), not(feature = "swapped-tone")))]
+#[cfg(all(not(feature = "bench"), not(feature = "engine-tone"), not(feature = "matched-tone"), not(feature = "swapped-tone"), not(feature = "reference-rate-tone")))]
 use starplayer::model::Module;
 #[cfg(not(feature = "bench"))]
 use starplayer::rt::Arc;
@@ -449,11 +453,11 @@ async fn play(
     // Normal firmware borrows REFLEX straight from memory-mapped flash, PCM and all. The
     // standalone engine diagnostic instead allocates its controlled native S3M once here,
     // before either the player or audio task exists.
-    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone")))]
+    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
     let image = images::boot_module();
-    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone")))]
+    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
     let module = Arc::new(Module::from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?);
-    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone")))]
+    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
     println!(
         "MODULE image={} bytes ({}) channels={} samples={}",
         image.len(),
@@ -461,7 +465,7 @@ async fn play(
         module.header().channel_count,
         module.samples().len(),
     );
-    #[cfg(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone"))]
+    #[cfg(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))]
     let module = Arc::new(firmware_common::engine_tone_module().map_err(|_| "the engine-tone module would not build")?);
     #[cfg(feature = "engine-tone")]
     println!(
@@ -485,8 +489,16 @@ async fn play(
         firmware_common::SWAPPED_TONE_LEFT_PEAK,
         firmware_common::SWAPPED_TONE_RIGHT_PEAK,
     );
+    #[cfg(feature = "reference-rate-tone")]
+    println!(
+        "REFERENCE-RATE-TONE rate={} Hz output={} Hz peaks={}/{} generator=integer-Q15 continuous underlay=engine-tone interpolation=linear master=1/4",
+        OUTPUT_SAMPLE_RATE_HZ,
+        firmware_common::MATCHED_TONE_FREQUENCY_HZ,
+        firmware_common::MATCHED_TONE_LEFT_PEAK,
+        firmware_common::MATCHED_TONE_RIGHT_PEAK,
+    );
 
-    let (render, mut control) = EmbeddedPlayer::<Linear>::open(Arc::clone(&module), firmware_common::SAMPLE_RATE_HZ)
+    let (render, mut control) = EmbeddedPlayer::<Linear>::open(Arc::clone(&module), OUTPUT_SAMPLE_RATE_HZ)
         .map_err(|_| "this build cannot play that module")?;
     let render = RENDER.init(render);
     println!("HEAP after open: {}", esp_alloc::HEAP.stats());
@@ -510,7 +522,7 @@ async fn play(
         // reach through it and make the non-`Send` Parts field itself part of the closure.
         let audio_parts = audio_parts;
         let audio_parts = audio_parts.0;
-        let transfer = match audio::start(audio_parts, firmware_common::SAMPLE_RATE_HZ, render) {
+        let transfer = match audio::start(audio_parts, OUTPUT_SAMPLE_RATE_HZ, render) {
             Ok(transfer) => transfer,
             Err(_) => {
                 audio::report_start_failure();
@@ -525,13 +537,14 @@ async fn play(
     wait_for_audio_ready()?;
     println!("HEAP after audio start: {}", esp_alloc::HEAP.stats());
     println!(
-        "I2S  44100 Hz stereo 32-bit slots, MCLK on GPIO{}, DMA ring {} quanta ({} frames, {} ms)",
+        "I2S  {} Hz stereo 32-bit slots, MCLK on GPIO{}, DMA ring {} quanta ({} frames, {} ms)",
+        OUTPUT_SAMPLE_RATE_HZ,
         board::PIN_I2S_MCLK,
         audio::DMA_RING_QUANTA,
         audio::DMA_RING_QUANTA * audio::QUANTUM_FRAMES,
-        audio::DMA_RING_QUANTA * audio::QUANTUM_FRAMES * 1000 / firmware_common::SAMPLE_RATE_HZ as usize,
+        audio::DMA_RING_QUANTA * audio::QUANTUM_FRAMES * 1000 / OUTPUT_SAMPLE_RATE_HZ as usize,
     );
-    let pre_roll_ms = audio::TX_PRIME_HANDOFFS * audio::DESCRIPTOR_FRAMES * 1000 / firmware_common::SAMPLE_RATE_HZ as usize;
+    let pre_roll_ms = audio::TX_PRIME_HANDOFFS * audio::DESCRIPTOR_FRAMES * 1000 / OUTPUT_SAMPLE_RATE_HZ as usize;
     println!("CORE1 audio refill running; pre-roll {} silent descriptor handoffs complete (~{} ms)", audio::TX_PRIME_HANDOFFS, pre_roll_ms);
     #[cfg(feature = "tone")]
     println!(
@@ -650,14 +663,30 @@ pub(crate) const MAX_MASTER_VOLUME: U0F16 = U0F16::from_bits(16_384);
 #[cfg(not(feature = "bench"))]
 const BOOT_MASTER_VOLUME: U0F16 = MAX_MASTER_VOLUME;
 
+/// The accepted ES8388 output rate for every audible production A1S personality.
+#[cfg(all(not(feature = "bench"), not(any(feature = "tone", feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone"))))]
+const A1S_AUDIBLE_SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// One board-selected output rate shared by player timing, I2S and presentation.
+///
+/// The four historical audio diagnostics remain pinned to firmware-common's golden 44.1 kHz rate
+/// for reproducibility. Default, `lcd`, `web`, `web,lcd` and the accepted reference-rate image use
+/// the A1S audible rate. Bench bypasses the audio path and uses the firmware-common constant
+/// directly.
+#[cfg(any(feature = "tone", feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone"))]
+const OUTPUT_SAMPLE_RATE_HZ: u32 = firmware_common::SAMPLE_RATE_HZ;
+#[cfg(all(not(feature = "bench"), not(any(feature = "tone", feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone"))))]
+const OUTPUT_SAMPLE_RATE_HZ: u32 = A1S_AUDIBLE_SAMPLE_RATE_HZ;
+
 /// One A1S master-volume step: 1/64 of full scale for usable headphone adjustment.
 #[cfg(not(feature = "bench"))]
 const VOLUME_STEP: U0F16 = U0F16::from_bits(1_024);
 
 /// Maximum time core 0 waits for core 1's I2S startup and one-time muted pre-roll.
 ///
-/// Eight descriptor periods take roughly 46 ms. One second leaves ample scheduling margin and
-/// converts a task that never starts into a muted boot error rather than an infinite spin.
+/// Eight descriptor periods take roughly 42 ms at the production 48 kHz rate and 46 ms in the
+/// historical 44.1 kHz diagnostics. One second leaves ample scheduling margin and converts a
+/// task that never starts into a muted boot error rather than an infinite spin.
 #[cfg(not(feature = "bench"))]
 const AUDIO_READY_TIMEOUT: esp_hal::time::Duration = esp_hal::time::Duration::from_secs(1);
 
@@ -791,7 +820,7 @@ async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
         if tick % DISPLAY_REFRESH_TICKS == 0 {
             let snapshot = *control.telemetry();
             let title = control.module().map(|module| module.header().title.as_ref()).unwrap_or("");
-            let view = NowPlaying::from_snapshot(&snapshot, firmware_common::SAMPLE_RATE_HZ, title, control.master_volume());
+            let view = NowPlaying::from_snapshot(&snapshot, OUTPUT_SAMPLE_RATE_HZ, title, control.master_volume());
             #[cfg(feature = "lcd")]
             NOW_PLAYING.signal(view);
             #[cfg(feature = "web")]
@@ -803,7 +832,7 @@ async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
             let retired = control.collect_garbage();
             let snapshot = *control.telemetry();
             let title = control.module().map(|module| module.header().title.as_ref()).unwrap_or("");
-            let view = NowPlaying::from_snapshot(&snapshot, firmware_common::SAMPLE_RATE_HZ, title, control.master_volume());
+            let view = NowPlaying::from_snapshot(&snapshot, OUTPUT_SAMPLE_RATE_HZ, title, control.master_volume());
             println!(
                 "{view}  peak={} underruns={} dma_errors={} offered={} written={} pushes={} retired={} rejected={}",
                 control.peak(),
