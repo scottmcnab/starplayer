@@ -4,9 +4,9 @@
 //!
 //! One I2S transmitter, Philips 32-bit stereo at 44 100 Hz, MCLK out on GPIO0, feeding a
 //! **circular** DMA transfer over a `'static` ring of [`DMA_RING_QUANTA`] render quanta.
-//! The refill is an Embassy task that awaits the DMA's available-space future, renders one or
-//! more complete [`DESCRIPTOR_BYTES`] blocks into static scratch, and copies them through a
-//! descriptor-aligned `push_with` closure.
+//! The refill is an Embassy task that renders and packs one complete [`DESCRIPTOR_BYTES`] block
+//! into static scratch, awaits DMA space, and submits those staged bytes through a constrained
+//! one-descriptor `push_with` closure.
 //!
 //! The `chunk` argument to `dma_circular_buffers_chunk_size!` decides how many descriptors are
 //! *allocated*, but `DescriptorChain::new` hardcodes esp-hal's own 4 092-byte `CHUNK_SIZE`.
@@ -16,13 +16,14 @@
 //! or about 5.8 ms; the whole ring is about 17.4 ms and remains under the 8 184-byte small-ring
 //! limit.
 //!
-//! Hardware established why equal descriptor geometry and the `push` discipline matter. With the old
-//! 4 096-byte ring, esp-hal made ragged 1 366 / 1 366 / 1 364-byte descriptors and steady
-//! `push_with` accepted variable contiguous regions while returning descriptor ownership. At
-//! +1.59 seconds the diagnostic totals were `offered=written=88748`, then grew by only
+//! Hardware established why equal descriptor geometry and fixed descriptor handoffs matter. With
+//! the old 4 096-byte ring, esp-hal made ragged 1 366 / 1 366 / 1 364-byte descriptors and
+//! steady `push_with` accepted variable contiguous regions while returning descriptor ownership.
+//! At +1.59 seconds the diagnostic totals were `offered=written=88748`, then grew by only
 //! 89–90 KB/s with about 43 pushes/s — roughly half the then-required 176 400 B/s. Equal
-//! descriptors and full closure consumption keep the write offset and descriptor ownership
-//! aligned. The 32-bit-slot experiment doubles the required DMA byte rate to 352 800 B/s. See
+//! descriptors and exactly one complete descriptor per steady closure keep the write offset and
+//! descriptor ownership aligned. The 32-bit-slot experiment doubles the required DMA byte rate
+//! to 352 800 B/s. See
 //! `plans/reference/embedded-budget.md` §4a for the underlying esp-hal and Star FX analysis.
 //!
 //! With the board-only `tone` or `matched-tone` feature, the renderer still advances normally
@@ -51,8 +52,8 @@
 //!
 //! These are architecture §8's rules, restated where they are actually enforced:
 //!
-//! * **no allocation** — the descriptor scratch is a [`ConstStaticCell`], and
-//!   `RenderHalf::render` allocates nothing;
+//! * **no allocation** — the render scratch is a [`ConstStaticCell`], the packed descriptor is
+//!   one fixed heap allocation made after player open, and `RenderHalf::render` allocates nothing;
 //! * **no logging** — `log!` takes a lock and formats; the refill counts underruns into an
 //!   atomic and the control task prints them;
 //! * **no blocking I2C** — the codec is configured at boot and its volume is changed from
@@ -73,6 +74,8 @@
 //!    The control task prints `underruns=` once a second; preserve the three-descriptor,
 //!    whole-quantum constraints in any later sweep.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use esp_hal::dma_circular_buffers_chunk_size;
@@ -188,16 +191,19 @@ pub const TX_PRIME_HANDOFFS: usize = 8;
 /// is right: it is a diagnostic counter with no other memory it orders.
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 
-/// How many times `available` or `push_with` returned an error.
+/// How many times a DMA operation failed or a steady offer/write violated descriptor geometry.
 static DMA_ERRORS: AtomicU32 = AtomicU32::new(0);
 
-/// Cumulative whole-descriptor bytes reported by the steady loop's outer `available()` call.
+/// Cumulative staged descriptor bytes admitted by valid steady outer offers.
+///
+/// One validated offer adds one descriptor even when the HAL reports two free, so the second
+/// descriptor is not counted again when the next loop observes it.
 static STEADY_AVAILABLE_BYTES: AtomicU32 = AtomicU32::new(0);
 
-/// Cumulative bytes copied by steady descriptor-aligned `push_with` closures.
+/// Cumulative bytes accepted by successful constrained steady `push_with` calls.
 static STEADY_WRITTEN_BYTES: AtomicU32 = AtomicU32::new(0);
 
-/// Cumulative steady-state `push_with` calls, including recovery and error calls.
+/// Cumulative constrained steady-state `push_with` calls, including error and short-write calls.
 static STEADY_PUSH_CALLS: AtomicU32 = AtomicU32::new(0);
 
 const STARTUP_PENDING: u8 = 0;
@@ -220,6 +226,16 @@ type RawAudioTransfer = esp_hal::i2s::master::asynch::I2sWriteDmaTransferAsync<'
 pub struct AudioTransfer {
     transfer: RawAudioTransfer,
     output_override: OutputOverride,
+    packed_descriptor: PackedDescriptorBuffer,
+}
+
+/// One exact, zeroed packed descriptor allocated after the player has opened.
+///
+/// The private fixed-length allocation moves through [`AudioTransfer`] into [`refill_task`]. It
+/// is never resized or freed there, and its construction never materialises a 2 048-byte stack
+/// temporary.
+struct PackedDescriptorBuffer {
+    bytes: Box<[u8]>,
 }
 
 /// The peripherals the I2S transmitter needs, as one value.
@@ -246,6 +262,8 @@ pub struct Parts {
 /// What could go wrong bringing I2S up.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The fixed packed-descriptor buffer could not be allocated from the firmware heap.
+    Allocation,
     /// The I2S peripheral rejected its configuration — an unreachable sample rate, or a
     /// data format this chip cannot produce.
     Config,
@@ -260,17 +278,30 @@ pub enum StartupStatus {
     Pending,
     /// The driver is running and the refill has entered its steady loop.
     Ready,
-    /// Core 1 could not configure I2S or start its DMA transfer.
+    /// Core 1 could not allocate the packed descriptor, configure I2S or start DMA.
     Failed,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Error::Allocation => formatter.write_str("the packed audio descriptor would not allocate"),
             Error::Config => formatter.write_str("the I2S peripheral rejected its configuration"),
             Error::Dma => formatter.write_str("the I2S DMA transfer would not start"),
         }
     }
+}
+
+/// Allocate the packed steady descriptor after player open and before playback.
+///
+/// `try_reserve_exact` makes allocation failure an ordinary audio-start error. Extending the
+/// successfully reserved vector with zeroes needs no further allocation, and converting it into
+/// a boxed slice transfers ownership without copying the descriptor through either core's stack.
+fn allocate_packed_descriptor() -> Result<PackedDescriptorBuffer, Error> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(DESCRIPTOR_BYTES).map_err(|_| Error::Allocation)?;
+    bytes.resize(DESCRIPTOR_BYTES, 0);
+    Ok(PackedDescriptorBuffer { bytes: bytes.into_boxed_slice() })
 }
 
 /// Bring I2S up, prime the ring with real audio and start the circular transfer on core 1.
@@ -292,6 +323,9 @@ impl core::fmt::Display for Error {
 /// `.into_async()` call binds the DMA interrupt to `Cpu::current()` and disables it on the other
 /// core; moving an already-created [`AudioTransfer`] does not move that interrupt affinity.
 pub fn start(parts: Parts, sample_rate_hz: u32, render: &mut RenderHalf<Linear>) -> Result<AudioTransfer, Error> {
+    // The only caller has already completed EmbeddedPlayer::open. Allocate before constructing
+    // DMA or rendering the prefill, and carry ordinary allocation failure through Error.
+    let packed_descriptor = allocate_packed_descriptor()?;
     let Parts { i2s0, dma, mclk, bclk, lrck, dout } = parts;
     // The macro chunk controls allocation count: 6 144 / 2 048 is exactly three. esp-hal's
     // later small-ring split also produces those same three equal descriptor lengths.
@@ -322,7 +356,7 @@ pub fn start(parts: Parts, sample_rate_hz: u32, render: &mut RenderHalf<Linear>)
     fill(tx_buffer.as_mut_slice(), render, &mut output_override);
 
     let transfer = i2s_tx.write_dma_circular_async(tx_buffer).map_err(|_| Error::Dma)?;
-    Ok(AudioTransfer { transfer, output_override })
+    Ok(AudioTransfer { transfer, output_override, packed_descriptor })
 }
 
 /// Render into `destination`, one quantum at a time, and report how many bytes were
@@ -362,9 +396,9 @@ fn render_descriptor(destination: &mut [i16; DESCRIPTOR_SAMPLES], render: &mut R
 
 /// Keep the ring fed, for ever.
 ///
-/// The loop is: wait for space, render and push each complete descriptor available, repeat.
-/// `available()` resolves only when the DMA has finished with at least one descriptor, so the
-/// task sleeps the rest of the time and the executor is free.
+/// The loop is: render and pack one descriptor, wait for space, push that staged descriptor,
+/// repeat. `available()` resolves only when the DMA has finished with at least one descriptor,
+/// so the task sleeps the rest of the time and the executor is free.
 ///
 /// An `available()` of the whole ring means the DMA consumed everything before this task
 /// was scheduled — an **underrun**, audible as a click — and is counted rather than
@@ -403,17 +437,23 @@ fn render_descriptor(destination: &mut [i16; DESCRIPTOR_SAMPLES], render: &mut R
 /// that second check returned `Late`, while the outer error arm skipped the only call capable of
 /// returning descriptor ownership.
 ///
-/// The loop therefore keeps the explicit outer `available()` for diagnostics, then always falls
-/// through to descriptor-aligned `push_with`. Its internal `available()` runs immediately and
-/// discards `Late`; only then does the closure render and copy, so no fallible check separates
-/// rendering from the descriptor handoff. Equal descriptor geometry makes this safe in steady
-/// state: the closure loops over every complete descriptor in its contiguous offer
-/// and returns their full byte count, never a partial descriptor. An empty recovery offer returns
-/// zero and renders nothing; the outer error already diagnosed it. See
+/// The matched 125 Hz recording later exposed an approximately 86.13 Hz comb, exactly one splice
+/// per 512 frames. The earlier direct tone masked it because its 256-frame period was descriptor
+/// coherent. `push_with` can return descriptor ownership after an empty or short closure write,
+/// separating its descriptor pointer from its byte offset; its discarded inner availability
+/// error also kept that event out of the counters.
+///
+/// A staged plain `push` still failed immediately after `PLAY`: its internal second
+/// `available()` remained a fallible gap even with rendering moved before the outer check.
+/// Steady state therefore renders and packs exactly one descriptor into static scratch, preserves
+/// it until a whole-descriptor offer, then immediately uses `push_with` only to copy and return
+/// that one descriptor. Unlike the rejected variable-region closure, it never renders or consumes
+/// a second descriptor. The write offset and descriptor pointer consequently advance together.
+/// See
 /// `plans/reference/embedded-budget.md` §4a for the esp-hal source analysis and Star FX evidence.
 #[embassy_executor::task]
 pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<Linear>) {
-    let AudioTransfer { mut transfer, mut output_override } = audio;
+    let AudioTransfer { mut transfer, mut output_override, mut packed_descriptor } = audio;
     // Match Star FX's soaked start-up sequence. The explicit `available()` keeps any initial
     // `Late` visible, while `push_with` ignores its own `available()` error and hands a
     // descriptor back anyway. An early offer may be empty; every non-empty offer becomes
@@ -433,50 +473,64 @@ pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<L
             DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    // Take the whole-descriptor scratch only after pre-roll, so it contributes neither to the
-    // task's async frame nor to core 1's stack. This task is spawned exactly once per reset.
+    // Take the whole-descriptor render scratch only after pre-roll, so it contributes neither to
+    // the task's async frame nor to core 1's stack. The packed descriptor already has unique heap
+    // ownership through AudioTransfer and remains a fixed allocation for this task's lifetime.
     let descriptor_scratch = DESCRIPTOR_SCRATCH.take();
     STARTUP_STATE.store(STARTUP_READY, Ordering::Release);
 
     loop {
-        match transfer.available().await {
-            Ok(available) => {
-                if available >= DMA_RING_BYTES {
-                    UNDERRUNS.fetch_add(1, Ordering::Relaxed);
-                }
-                if !available.is_multiple_of(DESCRIPTOR_BYTES) {
-                    DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
-                }
-                let whole_descriptor_bytes = available / DESCRIPTOR_BYTES * DESCRIPTOR_BYTES;
-                STEADY_AVAILABLE_BYTES.fetch_add(whole_descriptor_bytes as u32, Ordering::Relaxed);
-            }
-            Err(_) => {
-                DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
-            }
+        render_descriptor(descriptor_scratch, render, &mut output_override);
+        let packed = firmware_common::pack_i16_high_aligned_le(&descriptor_scratch[..], &mut packed_descriptor.bytes[..]);
+        if packed != DESCRIPTOR_BYTES {
+            DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
 
-        STEADY_PUSH_CALLS.fetch_add(1, Ordering::Relaxed);
-        if transfer
-            .push_with(|destination| {
-                let mut written = 0usize;
-                for descriptor in destination.chunks_exact_mut(DESCRIPTOR_BYTES) {
-                    render_descriptor(descriptor_scratch, render, &mut output_override);
-                    let packed = firmware_common::pack_i16_high_aligned_le(&descriptor_scratch[..], descriptor);
-                    if packed != DESCRIPTOR_BYTES {
-                        DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+        loop {
+            match transfer.available().await {
+                Ok(available) => {
+                    if available >= DMA_RING_BYTES {
+                        UNDERRUNS.fetch_add(1, Ordering::Relaxed);
                     }
-                    written += packed;
+                    if available < DESCRIPTOR_BYTES || !available.is_multiple_of(DESCRIPTOR_BYTES) {
+                        DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    STEADY_AVAILABLE_BYTES.fetch_add(DESCRIPTOR_BYTES as u32, Ordering::Relaxed);
                 }
-                if !destination.len().is_multiple_of(DESCRIPTOR_BYTES) {
+                Err(_) => {
+                    DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
+            // Keep this handoff immediately after the explicit diagnostic check. `push_with`
+            // discards its own availability error, then exposes the current contiguous region;
+            // no render, pack, log or other await may intervene. Even if two descriptors are
+            // free, copy and return only this one staged block.
+            STEADY_PUSH_CALLS.fetch_add(1, Ordering::Relaxed);
+            match transfer
+                .push_with(|destination| {
+                    let Some(first_descriptor) = destination.get_mut(..DESCRIPTOR_BYTES) else {
+                        return 0;
+                    };
+                    first_descriptor.copy_from_slice(&packed_descriptor.bytes[..]);
+                    DESCRIPTOR_BYTES
+                })
+                .await
+            {
+                Ok(written) => {
+                    STEADY_WRITTEN_BYTES.fetch_add(written as u32, Ordering::Relaxed);
+                    if written == DESCRIPTOR_BYTES {
+                        break;
+                    }
                     DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
                 }
-                STEADY_WRITTEN_BYTES.fetch_add(written as u32, Ordering::Relaxed);
-                written
-            })
-            .await
-            .is_err()
-        {
-            DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+                Err(_) => {
+                    DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 }
@@ -487,13 +541,13 @@ pub fn underruns() -> u32 { UNDERRUNS.load(Ordering::Relaxed) }
 /// How many DMA errors the refill has seen.
 pub fn dma_errors() -> u32 { DMA_ERRORS.load(Ordering::Relaxed) }
 
-/// Whole-descriptor bytes reported by steady outer `available()` calls; wraps after roughly 6.8 hours.
+/// Staged descriptor bytes admitted by valid steady outer offers; wraps after roughly 6.8 hours.
 pub fn steady_available_bytes() -> u32 { STEADY_AVAILABLE_BYTES.load(Ordering::Relaxed) }
 
-/// Bytes copied by steady descriptor-aligned closures; wraps after roughly 6.8 hours.
+/// Bytes accepted by constrained steady whole-descriptor `push_with` calls; wraps after roughly 6.8 hours.
 pub fn steady_written_bytes() -> u32 { STEADY_WRITTEN_BYTES.load(Ordering::Relaxed) }
 
-/// Number of steady-state `push_with` calls, including recovery and error calls.
+/// Number of constrained steady-state `push_with` calls, including error and short-write calls.
 pub fn steady_push_calls() -> u32 { STEADY_PUSH_CALLS.load(Ordering::Relaxed) }
 
 /// Publish an I2S construction or transfer-start failure from core 1.

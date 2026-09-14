@@ -160,6 +160,11 @@ esp_app_desc!();
 ///   | grep -E " (_bss_end|_stack_start)$"
 /// ```
 ///
+/// This array reserves heap *capacity* in `.bss`; later heap allocations consume that already
+/// reserved region and do not move `_bss_end`. In particular, audio allocates its fixed 2 048-byte
+/// packed descriptor only after `EmbeddedPlayer::open`, so player construction sees the full heap
+/// and the descriptor costs no additional main-stack address space.
+///
 /// **The `web` build does not put its heap here at all.** It adds a great deal of `.bss`
 /// — the WiFi driver's statics, embassy-net's socket storage, the web workers'
 /// task-pool futures with their TCP buffers inside them — and every byte of that comes
@@ -195,9 +200,10 @@ const RECLAIMED_HEAP_BYTES: usize = 96 * 1024;
 #[cfg(not(feature = "bench"))]
 static RENDER: StaticCell<RenderHalf<Linear>> = StaticCell::new();
 
-/// Core 1's stack. Only audio construction and the refill task run there — no allocation or
-/// logging. The synchronous prefill has one 512-byte quantum scratch; steady refill uses a
-/// `ConstStaticCell` descriptor buffer instead of task stack. This remains deliberately far
+/// Core 1's stack. Audio start makes one small fallible heap allocation before driver construction;
+/// the refill itself allocates and logs nothing. The synchronous prefill has one 512-byte quantum
+/// scratch; steady refill uses a `ConstStaticCell` render buffer and one already-owned heap
+/// descriptor instead of task stack. This remains deliberately far
 /// smaller than core 0's stack, which carries the whole engine's call depth.
 #[cfg(not(feature = "bench"))]
 const CORE1_STACK_SIZE: usize = 8 * 1024;
@@ -506,6 +512,7 @@ async fn play(
         });
     });
     wait_for_audio_ready()?;
+    println!("HEAP after audio start: {}", esp_alloc::HEAP.stats());
     println!(
         "I2S  44100 Hz stereo 32-bit slots, MCLK on GPIO{}, DMA ring {} quanta ({} frames, {} ms)",
         board::PIN_I2S_MCLK,

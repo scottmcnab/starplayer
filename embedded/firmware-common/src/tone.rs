@@ -1,5 +1,6 @@
 //! Integer-only diagnostic sine used by board audio-path experiments.
 
+use alloc::vec::Vec;
 use starplayer_model::{InstrumentDef, Module, ModuleBuilder, ModuleFormat, ModuleHeader, ORDER_END, SampleSpec};
 
 /// Peak signed amplitude of the diagnostic tone, about −18 dBFS.
@@ -83,22 +84,22 @@ const SINE: [i16; TABLE_LENGTH] = [
 /// cell at volume 64. Rows 1..62 are empty fixed-stride [`starplayer::s3m::S3mCell`]s;
 /// row 63 carries native `B00`, looping to order zero without growing the scanned timeline.
 pub fn engine_tone_module() -> Result<Module, starplayer::core::Error> {
-    let pcm: [i16; TABLE_LENGTH] = core::array::from_fn(|index| {
-        SINE.get(index).copied().unwrap_or(0) * ENGINE_TONE_SAMPLE_SCALE
-    });
+    // These exact-capacity temporary vectors keep the 512-byte PCM and 320-byte pattern off
+    // ProCpu's small boot stack. ModuleBuilder copies both slices into the completed module, so
+    // the temporary allocations drop before playback and never enter render or refill.
+    let mut pcm = Vec::with_capacity(TABLE_LENGTH);
+    pcm.extend(SINE.iter().map(|sample| *sample * ENGINE_TONE_SAMPLE_SCALE));
 
-    let mut pattern = [0u8; ENGINE_TONE_PATTERN_BYTES];
-    for cell in pattern.chunks_exact_mut(S3M_CELL_BYTES) {
-        cell.copy_from_slice(&starplayer::s3m::S3mCell::EMPTY.to_bytes());
+    let mut pattern = Vec::with_capacity(ENGINE_TONE_PATTERN_BYTES);
+    pattern.extend_from_slice(
+        &starplayer::s3m::S3mCell { note: 0x40, instrument: 1, volume: 64, command: 0, info: 0 }.to_bytes(),
+    );
+    for _ in 1..starplayer::s3m::ROWS - 1 {
+        pattern.extend_from_slice(&starplayer::s3m::S3mCell::EMPTY.to_bytes());
     }
-    if let Some(row_zero) = pattern.chunks_exact_mut(S3M_CELL_BYTES).next() {
-        row_zero.copy_from_slice(
-            &starplayer::s3m::S3mCell { note: 0x40, instrument: 1, volume: 64, command: 0, info: 0 }.to_bytes(),
-        );
-    }
-    if let Some(row_63) = pattern.chunks_exact_mut(S3M_CELL_BYTES).last() {
-        row_63.copy_from_slice(&starplayer::s3m::S3mCell { command: 2, info: 0, ..starplayer::s3m::S3mCell::EMPTY }.to_bytes());
-    }
+    pattern.extend_from_slice(
+        &starplayer::s3m::S3mCell { command: 2, info: 0, ..starplayer::s3m::S3mCell::EMPTY }.to_bytes(),
+    );
 
     let mut builder = ModuleBuilder::new();
     let sample = builder.add_sample(

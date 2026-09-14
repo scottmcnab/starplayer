@@ -256,9 +256,12 @@ advances by the exact rounded 12 173 944 units per 44.1 kHz frame and scales the
 host engine capture's signed peaks, 4 796 left and 5 327 right. Phase state continues from the
 initial ring prefill through muted handoffs and steady descriptor refill; there is no silence
 gate. `matched-tone` is incompatible with `bench`, `tone`, `engine-tone` and `web`, but may be
-combined with `lcd`. If it is clean, compare target engine render data before packing next. If it
-buzzes, the remaining cause is downstream and depends on this 125 Hz signal's level or stereo
-shape.
+combined with `lcd`.
+
+The matched 125 Hz image also buzzed. In the owner's trimmed phone recording, unwanted lines
+begin at 297.363 Hz and repeat about every 86.13 Hz, exactly the cadence of 512 output frames or
+two DMA descriptors. The earlier clean direct tone hid this splice because its waveform repeats
+every 256 frames, exactly one descriptor, and its gates are descriptor aligned.
 
 The same run confirmed the DMA remediation from
 `plans/engine/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
@@ -318,16 +321,37 @@ quanta or 256 stereo frames. The whole ring is about 17.4 ms and each descriptor
 compile-time assertions preserve the geometry and the 8 184-byte small-ring limit. Required DMA
 throughput is now 352 800 B/s.
 
-Steady refill preserves the explicit outer check and error count, but always falls through to
-`push_with`. Its internal check happens immediately and discards `Late`; rendering and copying
-then happen inside the closure with no fallible check between them and the handoff. The closure
-loops over every complete 2 048-byte descriptor in its offer, using `ConstStaticCell` engine-i16
-scratch and the same explicit 32-bit-slot packer as the initial ring prefill, then returns the
-full byte count. It never intentionally returns a partial descriptor. Equal descriptor geometry
-and full consumption are the conditions that make steady `push_with` safe here; an empty
-recovery offer renders and returns zero bytes. The cumulative transport fields `offered`,
-`written` and `pushes` count the outer whole descriptors, closure bytes, and calls, excluding
-muted pre-roll.
+The first staged-descriptor image used plain async `push`, but two fresh resets panicked after
+`PLAY` and before the first telemetry line. Its internal second `available()` remained a fallible
+gap even though rendering and packing had moved before the explicit outer check.
+
+Steady refill therefore renders and packs exactly one 2 048-byte descriptor into a static `i16`
+render buffer and a fixed boxed byte buffer before waiting for space, then preserves those bytes
+across every availability or handoff failure. The byte buffer is allocated once inside audio
+start, after `EmbeddedPlayer::open` and before DMA construction or prefill; ownership moves through
+`AudioTransfer` into refill, where it is never allocated, resized or freed. Its explicit outer
+`available()` validates and counts a whole-descriptor offer; the following `push_with` is
+immediate, with no rendering, packing, logging or other await in between. The closure copies and
+returns exactly the first staged 2 048 bytes, even when its contiguous offer contains two
+descriptors. This differs from the rejected steady closure, which rendered and consumed every
+offered descriptor and commonly batched the 512-frame cadence exposed by the recording. Fixed
+one-descriptor work keeps the write offset and descriptor pointer advancing together. The engine
+advances only after the handoff reports exactly 2 048 bytes; errors or short offers retry the same
+staged data.
+
+The packed buffer was previously another `ConstStaticCell`. Its 2 048 bytes enlarged `.bss` and
+reduced ProCpu's main stack enough that the constrained-handoff matched-tone image tripped the
+stack guard inside `EmbeddedPlayer::open`, before `HEAP after open`. Allocating those bytes only
+after open consumes the heap region already reserved by `HEAP_BYTES`; it does not move `_bss_end`
+or reduce main-stack address space. Allocation is fallible and reported as an audio-start error.
+
+Both startup recovery and steady state use `push_with`, for distinct reasons. The eight muted
+startup closures deliberately return descriptor ownership through `Late` and may receive an empty
+offer. The steady closure runs only after a valid outer offer and has a strict one-descriptor copy
+and complete-descriptor invariant. The cumulative transport fields `offered`, `written` and `pushes`
+count one staged descriptor per valid outer offer, bytes accepted by the constrained handoff, and
+steady calls, excluding muted pre-roll. Counting only the descriptor being submitted prevents a
+second free descriptor from being counted again on the next iteration.
 
 ### What a good boot looks like
 
@@ -385,6 +409,7 @@ JACK headphone_detect=inserted
 CODEC ES8388 at 0x10: DAC up, 32-bit Philips slave, MCLK/LRCK 256, headphone -12 dB, speaker minimum, muted
 MODULE image=88036 bytes (85.9 KiB) channels=8 samples=5
 HEAP after open: …
+HEAP after audio start: …
 I2S  44100 Hz stereo 32-bit slots, MCLK on GPIO0, DMA ring 6 quanta (768 frames, 17 ms)
 CORE1 audio refill running; pre-roll 8 silent descriptor handoffs complete (~46 ms)
 TONE diagnostic dual-mono sine 172.265625 Hz amplitude=4096 gate=44032 frames (~998 ms) tone / 44032 frames (~998 ms) silence
@@ -716,6 +741,11 @@ the floor.
   xtensa-esp32-elf-nm target/xtensa-esp32-none-elf/release/starplayer-a1s \
     | grep -E " (_bss_end|_stack_start)$"
   ```
+
+  The non-web heap array reserves capacity in `.bss`; allocations consume that fixed region and
+  do not move `_bss_end`. Audio's 2 048-byte packed descriptor is deliberately allocated from it
+  only after player open. The `web` build's same allocation comes from its fixed `dram2_seg` heap,
+  which likewise adds no `.bss` object.
 
 * **PSRAM is mapped but not added to the general heap** in the audio build. The ESP32's
   atomic instructions do not work correctly on PSRAM, and this engine puts atomics on the

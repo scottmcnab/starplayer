@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | M8 ([master plan](M8-master-plan.md)), remediating [I3](complete/M8-task-I3-esp32-a1s-bringup.md)'s `audio.rs` |
-| Status | **Open, written 2026-09-14.** The 172 Hz direct tone is accepted clean; the allocation-safe engine-tone and matched-tone images are objectively accepted, but the owner hears buzz from the engine-rendered 125 Hz output. Matched-tone clean/buzz listening and normal-music acceptance remain pending |
+| Status | **Open, written 2026-09-14.** The descriptor-coherent 172 Hz direct tone is accepted clean, while both continuous 125 Hz comparisons buzz. The heap-backed constrained one-descriptor handoff now passes objective hardware checks; owner clean/buzz listening and normal-music acceptance remain pending |
 | Depends on | — (the diagnosis is done; see `plans/reference/embedded-budget.md` §4a) |
 | Blocks | Reliable A1S playback. M8's exit criterion is "sound from the headphone jack", transport progress and codec output routing must both be verified |
 | Parallel with | Work outside the A1S audio, codec and boot files |
@@ -587,3 +587,212 @@ underlying-engine loop checks:
 This accepts the matched-tone image, configuration, engine work, refill cadence, bounded peak
 and native song loop objectively. The owner's clean/buzz listening result remains pending, as
 does clean normal-music acceptance. Keep this plan open and unarchived.
+
+### Recorded buzz and steady-`push_with` remediation (2026-09-14)
+
+The owner reports that the matched post-render 125 Hz tone also buzzes and supplied a 4.27-second
+phone recording. Analysis excludes the first and last second as requested, decodes the remaining
+2.27 seconds from mono AAC at 48 kHz, and finds a digital spectral comb rather than analog
+clipping. The strongest bin is the intended carrier at 125.244 Hz. The strongest unwanted line
+is 297.363 Hz at only −10.34 dB relative to the carrier, followed by 383.057 Hz at −12.11 dB,
+469.482 Hz at −12.92 dB, 555.908 Hz at −14.52 dB and 641.602 Hz at −16.47 dB. These lines are
+spaced by approximately 86.13 Hz, exactly the cadence of 512 output frames, or two current DMA
+descriptors, at 44.1 kHz.
+
+This also explains why the earlier direct tone falsely accepted the transport. Its 256-entry
+table advances by one entry per frame, so its waveform period is exactly one 256-frame DMA
+descriptor. Its 44 032-frame active and silent gates are also whole-descriptor aligned. Repeating,
+skipping or replaying a stale descriptor splices that diagnostic at the same waveform phase and
+is inaudible. The continuous 125 Hz comparison deliberately changes phase across descriptors and
+therefore reveals the transport splice.
+
+The remaining suspect is now concrete: steady state uses `push_with`, while the same esp-hal
+1.1.2 transport in `../star-fx` confines `push_with` to muted startup recovery and uses `push`
+for every steady descriptor. `TxCircularState::push_with` returns descriptor ownership even when
+its closure writes zero bytes; it advances `write_descr_ptr` by at least one descriptor while
+advancing `write_offset` only by the returned byte count. Any empty or short steady offer can
+therefore separate the descriptor pointer from the buffer offset. The existing counters miss an
+inner `available()` failure because async `push_with` deliberately discards it.
+
+Implement the steady-state correction without changing the accepted clock, codec or geometry:
+
+- keep the eight muted startup `push_with` recovery handoffs. After `STARTUP_READY`, never call
+  `push_with`; stage exactly one complete 2 048-byte descriptor and submit it with `push`;
+- add static byte scratch beside the existing static `i16` descriptor scratch. Render and pack
+  one descriptor once, before waiting for space, then preserve those exact bytes across any
+  availability or push error so the engine timeline is not advanced again until submission
+  succeeds;
+- retain an explicit outer `available()` for diagnostics, but place it after rendering and
+  immediately before `push`. There must be no rendering, packing, logging or other await between
+  that check and `push`'s internal availability check. This is the ordering used by Star FX's
+  clean steady loop;
+- require the outer offer to be a whole number of 2 048-byte descriptors, record it in the
+  existing offered counter, and submit only one descriptor even if two are free. Require a
+  successful `push` to report exactly 2 048 bytes before advancing to the next render. Count
+  full-ring offers as underruns and every malformed offer, short write or DMA error as an error;
+- preserve all real-time rules and existing feature behavior. Do not allocate, log, lock or
+  panic in refill. Do not change the six-quantum ring, three equal descriptors, 32-bit signed
+  high-aligned PCM, 44.1 kHz clocks, codec registers, gain, channel routing, engine, mixer or
+  tone generators;
+- update the refill documentation and the embedded runbook so they no longer endorse steady
+  `push_with`, clearly distinguish muted recovery from steady `push`, and record why the original
+  descriptor-coherent direct tone masked this defect;
+- run `cargo test -p starplayer-firmware-common`, `git diff --check`, and A1S release builds for
+  normal, `tone`, `engine-tone`, `matched-tone`, and `matched-tone,lcd`. Build and flash only the
+  matched-tone image. A fresh-reset capture must identify the image, cross native `B00`, advance
+  at 352 800 bytes/s within whole-descriptor quantisation, keep `underruns=0`, and keep DMA errors
+  stable after any recovered startup error.
+
+The decisive acceptance is a clean owner listening result from the same continuous matched 125 Hz
+tone. If clean, return to normal music without altering synthesis. If it still buzzes, capture a
+second recording and compare its comb spacing before changing another layer. Keep this plan open
+until normal music is accepted clean.
+
+### Staged-refill image boot failure (2026-09-14)
+
+The first merged staged-`push` image built and flash-verified but is not a valid listening image.
+Exact image `embedded/target/starplayer-a1s-matched-tone-merged.bin` was 429 744 bytes with
+SHA-256 `33e3e9c06868d0c32369cae666a246f530019efda898d5e6c7836e1e465bf4d2`. On a fresh reset it
+tripped ProCpu's stack guard after codec setup and before the controlled-module identity line.
+Decoded frames place the interrupted work in `ModuleBuilder::add_sample`, called by
+`engine_tone_module()` at `main.rs:455`. Audio never started and the owner must not evaluate this
+image.
+
+Remove the controlled module builder's sensitivity to small firmware-layout changes before
+reflashing:
+
+- replace its function-local 256-sample PCM array and 320-byte pattern array with small temporary
+  heap vectors built before playback. Reserve exact capacities, fill without panicking access,
+  pass their slices to `ModuleBuilder`, and let them drop when the completed module owns its copy;
+- preserve the module byte-for-byte at the public model boundary: identical signed 16-bit sample
+  values, guard data, native fixed-stride S3M cells, `B00`, orders, loop and reference rate. This
+  is boot-time construction only; no allocation may enter `render()` or refill;
+- add or retain host assertions that prove structure and rendered output are unchanged. Run the
+  70 firmware-common tests and rebuild `engine-tone`, `matched-tone`, and `matched-tone,lcd` in
+  release mode;
+- rebuild the main-checkout xtask, build and flash a new matched-tone image, then fresh-reset it.
+  It must pass module construction and heap reporting before the staged-refill cadence can be
+  evaluated. Record the new image identity and objective run separately from the rejected image.
+
+Implementation result: `engine_tone_module()` now constructs its 256 signed PCM samples and 320
+native pattern bytes in exact-capacity temporary heap `Vec`s instead of function-local arrays.
+The vectors are filled by iteration and slice extension without indexed or panicking access,
+then passed unchanged to `ModuleBuilder`; they drop after the completed module owns its copies.
+This keeps the 512-byte PCM and 320-byte pattern off ProCpu's boot stack while leaving all
+allocation before playback. Existing host tests continue to pin every source sample, its linear
+guard, the fixed-stride S3M cells and `B00`, orders, loop, reference rate, ten-second rendered
+signal and warning-free loop crossing. All 70 firmware-common tests and A1S `engine-tone`,
+`matched-tone`, and `matched-tone,lcd` release builds pass. A replacement hardware run remains
+pending.
+
+### Staged-`push` image steady-start failure (2026-09-14)
+
+The heap-backed replacement proves the module-construction fix but is still not a listening
+image. Exact image size is 430 528 bytes and SHA-256 is
+`bed2c6fcb5d03b6c9445254f6336ebda9211194dc07d8b4a1113338d5f96147c`; flash verification
+passed. A fresh reset reaches the `MATCHED-TONE` identity, reports the accepted 27 932-byte heap
+use, completes muted pre-roll, starts core 1 and prints `PLAY`, then panics before its first
+telemetry line. Two timestamped resets reproduce the failure immediately after `PLAY`. The
+compiled refill task pool is only 224 bytes and its poll entry frame is 96 bytes; both descriptor
+buffers are static. Do not enlarge a stack in response to this result.
+
+The plain async `push` path repeats `available()` internally. Earlier hardware already showed
+that this second check can fail after the explicit check; the new image confirms it cannot be
+used as the steady handoff on this transport. Retain the useful part of the staged design while
+removing that second fallible check:
+
+- continue to render and pack exactly one 2 048-byte descriptor into static scratch before the
+  outer availability wait, preserving it until a complete handoff;
+- after a valid outer offer, call `push_with` immediately, but use its closure only to copy the
+  already-staged first 2 048 bytes and return exactly 2 048. Do no rendering, packing or other
+  work in the closure, never consume a second descriptor from a larger contiguous offer, and
+  require the returned count to equal 2 048 before advancing;
+- document why this constrained steady use differs from the rejected implementation: the old
+  closure rendered and consumed every available descriptor, commonly batching 512 frames and
+  producing the recording's 86.13 Hz comb. The new closure has fixed one-descriptor work and
+  keeps `write_descr_ptr` and `write_offset` advancing by the same complete descriptor;
+- preserve all counters and accepted geometry/settings. Verify firmware-common tests and the
+  normal, `tone`, `engine-tone`, `matched-tone`, and `matched-tone,lcd` release builds, then flash
+  only `matched-tone` and capture a fresh reset through native `B00` before owner listening.
+
+### Constrained-handoff image main-stack failure (2026-09-14)
+
+The constrained one-descriptor handoff image is also rejected before listening. Exact image size
+is 430 208 bytes, SHA-256
+`d3ea857dc449559b03f9c138d730d9ba1eab81e19c465ba2b87ded96f56dafd3`, and flash verification
+passed. Its full fresh-reset log identifies `MATCHED-TONE` and then trips the ProCpu stack guard
+before `HEAP after open`. The decoded backtrace is
+`linked_list_allocator::HoleList::allocate_first_fit` → `NativeSequencer::new` → `build_source`
+→ `ControlHalf::load` → `EmbeddedPlayer::open` at `main.rs:472`. This confirms that moving the
+diagnostic module temporaries to the heap worked, and separately shows that adding the 2 048-byte
+packed descriptor as `.bss` removed too much headroom from the main stack during player open.
+
+Keep the staged handoff without spending another byte of `.bss` on its packed buffer:
+
+- remove `PACKED_DESCRIPTOR_SCRATCH`. Allocate one exact 2 048-byte zeroed buffer from the
+  already-reserved firmware heap only after `EmbeddedPlayer::open` has completed and before DMA
+  construction/playback. Move ownership into `AudioTransfer` and then the refill task; refill
+  must only borrow the fixed buffer and must never allocate, resize or free it;
+- make allocation failure an ordinary audio-start error where practical. Avoid constructing a
+  2 048-byte temporary array on either core's stack. Keep the existing static `i16` descriptor
+  scratch, whose earlier matched-tone image passed player open;
+- preserve the constrained one-descriptor `push_with` logic, all module data and all accepted
+  settings. Update memory documentation to distinguish reserved `.bss` heap capacity from bytes
+  consumed after player open;
+- run firmware-common tests and the normal, `tone`, `engine-tone`, `matched-tone`,
+  `matched-tone,lcd`, and `web` A1S release builds. Rebuild and flash only matched-tone. Require
+  successful player open, heap reporting, audio start, telemetry and native `B00` crossing before
+  owner listening. Record the exact replacement image separately.
+
+Implementation result: the six-quantum ring and three equal 2 048-byte descriptors remain
+unchanged. `PACKED_DESCRIPTOR_SCRATCH` has been removed from `.bss`. After
+`EmbeddedPlayer::open`, audio start fallibly reserves and zero-fills one exact 2 048-byte heap
+buffer without a stack array, moves its box through `AudioTransfer`, and gives refill sole
+ownership. Refill never allocates, resizes or frees it; the existing static `i16` render scratch
+remains. For each steady descriptor it renders and packs once, then retains those exact bytes
+inside a retry loop until submission succeeds. The explicit outer
+`available()` rejects and counts offers smaller than or not divisible by 2 048, adds one staged
+descriptor to `offered` for each valid offer, and counts a full-ring offer as an underrun. It is
+followed immediately by a constrained `push_with`: the closure only copies the first staged 2 048
+bytes and returns exactly 2 048, even when the contiguous offer is larger. It does not render,
+pack or consume a second descriptor. A DMA error or short result is counted and retries the same
+bytes; only an exact 2 048-byte result advances the engine to the next descriptor.
+
+The offered counter deliberately adds 2 048 rather than the HAL's complete available byte count.
+When two descriptors are free, this iteration submits only one and the next iteration can observe
+the other again; adding the complete offer both times would overcount physical descriptor bytes.
+
+The earlier steady `push_with` closure rendered and consumed every complete descriptor in its
+offer, commonly batching two descriptors or 512 frames; the recording exposed a comb at precisely
+that cadence. The new closure performs fixed one-descriptor work on already-staged bytes, keeping
+the descriptor pointer and byte offset moving together while avoiding plain `push`'s second
+fallible availability check. The default build's heap capacity remains reserved in `.bss` and the
+web heap remains in `dram2_seg`; consuming 2 048 bytes from either fixed heap after player open
+does not move `_bss_end` or reduce ProCpu's main-stack address space. The accepted clocks, codec
+registers, gain, routing, PCM packing, engine and diagnostic generators are unchanged. All 70
+firmware-common tests and A1S normal, `tone`, `engine-tone`, `matched-tone`,
+`matched-tone,lcd`, and `web` release builds pass. The objective hardware result follows.
+
+### Heap-backed constrained-handoff objective hardware run (2026-09-14)
+
+The replacement image passes its objective identity, allocation timing, codec, transport,
+cadence and native-loop checks:
+
+- Exact image: `embedded/target/starplayer-a1s-matched-tone-merged.bin`, 431 232 bytes,
+  SHA-256 `abea2c63d31ede16a6570c50a2bcf3b1be5fca2328986e93a6308c4e19c0476a`.
+  Flash hash verification passed on the A1S at MAC `b4:bf:e9:dd:d3:e4`.
+- A fresh reset identified `MATCHED-TONE`. Heap use was 27 932 bytes with 94 948 free after
+  `EmbeddedPlayer::open`, then 29 980 used with 92 900 free after audio start: the exact 2 048-byte
+  increase required by the packed descriptor, allocated only after the player opened.
+- The controlled transport remained ES8388 32-bit Philips slave with headphone analog −12 dB,
+  44 100 Hz stereo 32-bit I2S and the six-quantum ring.
+- The native S3M crossed `B00` from row 59 to row 03. The first transport line reported
+  `offered=362496 written=362496 pushes=177`; the final line reported
+  `offered=5330944 written=5330944 pushes=2603`. Peak stayed at or below 5 327,
+  `underruns=0`, and the recovered startup `dma_errors=1` remained fixed.
+
+This accepts the heap-backed constrained-handoff image objectively: player construction,
+post-open allocation, audio startup, complete one-descriptor handoffs, sustained byte cadence and
+the native song loop all ran without a stack failure or growing transport counter. The owner's
+clean/buzz result for the continuous matched 125 Hz output remains pending, as does clean normal
+music. Keep this plan open and unarchived.
