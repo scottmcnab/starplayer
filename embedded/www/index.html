@@ -103,6 +103,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .progress { height: 7px; border-radius: 4px; background: #202a37; overflow: hidden; margin-top: 10px; }
 .progress-fill { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s linear; }
 #upload-status { margin-top: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.upload-limits { margin-top: 8px; color: var(--muted); font-size: 12px; }
 
 .store-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .warn { margin-top: 8px; color: var(--accent-2); font-size: 12px; }
@@ -173,6 +174,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
         </div>
         <div class="progress"><span class="progress-fill" id="upload-progress"></span></div>
         <p id="upload-status"></p>
+        <p class="upload-limits" id="upload-limits">Reading device capacity&hellip;</p>
     </section>
 
     <section class="panel">
@@ -226,6 +228,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
     var uploadButton = document.getElementById('btn-upload');
     var uploadProgressEl = document.getElementById('upload-progress');
     var uploadStatusEl = document.getElementById('upload-status');
+    var uploadLimitsEl = document.getElementById('upload-limits');
     var storeSlotEl = document.getElementById('store-slot');
     var storeButton = document.getElementById('btn-store');
     var storeStatusEl = document.getElementById('store-status');
@@ -236,6 +239,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
     var channelRows = [];
     var effectNames = [];
     var volumeDragging = false;
+    var uploadLimits = null;
 
     // ---- small helpers, every one of them safe to call with nothing wired up yet ----
 
@@ -252,6 +256,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
     function formatBytes(bytes) {
         if (bytes === null || bytes === undefined) return '';
         if (bytes < 1024) return bytes + ' B';
+        if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
         return (bytes / 1024).toFixed(1) + ' KB';
     }
 
@@ -482,14 +487,63 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 
     // ---- upload: XHR for upload.onprogress, which fetch does not expose ----
 
+    function refreshUploadLimits(attempt) {
+        attempt = attempt || 0;
+        uploadButton.disabled = true;
+        fetch('/api/upload-limits').then(function (response) {
+            if (!response.ok) throw new Error('upload limits ' + response.status);
+            return response.json();
+        }).then(function (limits) {
+            var fields = ['max_upload_bytes', 'max_image_bytes', 'max_stored_image_bytes'];
+            if (!fields.every(function (field) { return Number.isSafeInteger(limits[field]) && limits[field] >= 0; })) {
+                throw new Error('invalid upload limits');
+            }
+            uploadLimits = limits;
+            if (limits.max_upload_bytes === 0 || limits.max_image_bytes === 0) {
+                uploadLimitsEl.textContent = 'Module uploads are unavailable because this device has no PSRAM capacity.';
+                return;
+            }
+            uploadButton.disabled = false;
+            uploadLimitsEl.textContent = 'Raw upload limit: ' + formatBytes(limits.max_upload_bytes)
+                + '. Decoded audio and metadata must fit ' + formatBytes(limits.max_image_bytes)
+                + '. Images over ' + formatBytes(limits.max_stored_image_bytes) + ' can play, but cannot be stored to flash.';
+        }).catch(function () {
+            if (attempt < 2) {
+                uploadLimitsEl.textContent = 'Reading device capacity…';
+                setTimeout(function () { refreshUploadLimits(attempt + 1); }, 500 * (attempt + 1));
+            } else {
+                uploadLimitsEl.textContent = 'Could not read this device\u2019s upload capacity. Reload the page before uploading.';
+            }
+        });
+    }
+
+    function capacityError(reason) {
+        var detail = reason ? reason + ' ' : '';
+        return detail + 'Raw modules expand when decoded; their audio and metadata must fit the '
+            + formatBytes(uploadLimits.max_image_bytes) + ' image capacity.';
+    }
+
+    function describesImageCapacityError(reason) {
+        return /image|decoded module/i.test(reason) && /larger|too large|exceed|does not fit|won\u2019t fit/i.test(reason);
+    }
+
     function uploadModule() {
         var file = uploadFileEl.files[0];
         if (!file) {
             uploadStatusEl.textContent = 'Choose a file first.';
             return;
         }
+        if (!uploadLimits) {
+            uploadStatusEl.textContent = 'Upload capacity is not available yet.';
+            return;
+        }
+        if (file.size > uploadLimits.max_upload_bytes) {
+            uploadStatusEl.textContent = 'That file is ' + formatBytes(file.size) + '; this device accepts raw uploads up to '
+                + formatBytes(uploadLimits.max_upload_bytes) + '.';
+            return;
+        }
         uploadProgressEl.style.width = '0%';
-        uploadStatusEl.textContent = 'Uploading…';
+        uploadStatusEl.textContent = 'Uploading… 0%';
         uploadButton.disabled = true;
 
         var request = new XMLHttpRequest();
@@ -497,22 +551,31 @@ button:disabled { opacity: .4; cursor: not-allowed; }
         request.setRequestHeader('Content-Type', 'application/octet-stream');
         request.upload.onprogress = function (event) {
             if (event.lengthComputable) {
-                uploadProgressEl.style.width = Math.round(event.loaded / event.total * 100) + '%';
+                var percent = Math.round(event.loaded / event.total * 100);
+                uploadProgressEl.style.width = percent + '%';
+                uploadStatusEl.textContent = 'Uploading… ' + percent + '%';
             }
+        };
+        request.upload.onload = function () {
+            uploadProgressEl.style.width = '100%';
+            uploadStatusEl.textContent = 'Preparing module… decoded audio and metadata must fit '
+                + formatBytes(uploadLimits.max_image_bytes) + '.';
         };
         request.onload = function () {
             uploadButton.disabled = false;
             if (request.status === 201) {
                 uploadProgressEl.style.width = '100%';
-                uploadStatusEl.textContent = 'Uploaded.';
+                uploadStatusEl.textContent = 'Ready and playing.';
                 refreshModules();
             } else if (request.status === 413) {
-                uploadStatusEl.textContent = 'That file is too large.';
+                uploadStatusEl.textContent = 'Upload refused: the raw file exceeds this device\u2019s '
+                    + formatBytes(uploadLimits.max_upload_bytes) + ' upload capacity.';
             } else {
                 // Every refusal this firmware sends carries a sentence written for a
                 // person, so show it rather than a status code.
                 var reason = (request.responseText || '').trim();
-                uploadStatusEl.textContent = reason ? 'Upload refused: ' + reason
+                uploadStatusEl.textContent = describesImageCapacityError(reason) ? 'Could not prepare module: ' + capacityError(reason)
+                    : reason ? 'Upload refused: ' + reason
                     : 'Upload failed (status ' + request.status + ').';
             }
         };
@@ -534,10 +597,26 @@ button:disabled { opacity: .4; cursor: not-allowed; }
         var slot = parseInt(storeSlotEl.value, 10);
         storeButton.disabled = true;
         storeStatusEl.textContent = 'Writing slot ' + slot + '… playback will pause briefly.';
-        post('/api/modules/store', { id: slot }).then(function () {
+        fetch('/api/modules/store', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: slot })
+        }).then(function (response) {
+            if (response.ok) return '';
+            return response.text().then(function (reason) {
+                var message = reason.trim() || 'store failed (status ' + response.status + ')';
+                if (/larger|capacity|fit/i.test(message) && uploadLimits) {
+                    message += '. Flash slots hold images up to ' + formatBytes(uploadLimits.max_stored_image_bytes);
+                }
+                throw new Error(message);
+            });
+        }).then(function () {
             storeStatusEl.textContent = 'Stored to slot ' + slot + '.';
             storeButton.disabled = false;
             refreshModules();
+        }).catch(function (error) {
+            storeButton.disabled = false;
+            storeStatusEl.textContent = 'Could not store module: ' + error.message + '.';
         });
     }
 
@@ -564,6 +643,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
     pollStatus();
     setInterval(pollStatus, 1000);
     refreshModules();
+    refreshUploadLimits();
 })();
 </script>
 </body>

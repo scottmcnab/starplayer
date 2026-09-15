@@ -32,31 +32,25 @@
 //!
 //! # The upload path, and why it is shaped like this
 //!
-//! `starplayer::load` decodes a module into the **heap**, which on this board is internal
-//! DRAM and nothing else (see `psram.rs` for the atomics erratum that keeps PSRAM out of
-//! the allocator). A decoded `PETRI.S3M` is 64 KB of PCM alone — more than the web
-//! build's whole DRAM heap. So an uploaded module is not *kept* the way `load` produced
-//! it:
+//! Raw module decoding cannot use the global heap on this board: it is internal DRAM and
+//! the WiFi build deliberately leaves only a small reserve there (see `psram.rs` for the
+//! atomics erratum that keeps PSRAM out of the allocator). The upload path therefore owns
+//! fixed PSRAM storage from end to end:
 //!
 //! 1. the request body streams into the **PSRAM staging buffer** — the raw file never
 //!    touches DRAM;
-//! 2. if it is already a module image (`SPMI` magic — what `cargo xtask module-image`
-//!    writes), it is copied straight into the free PSRAM image buffer;
-//! 3. otherwise `starplayer::load` decodes it in DRAM, `Module::to_image` serialises the
-//!    result, that image is copied into the free PSRAM image buffer, and both DRAM
-//!    allocations are dropped;
-//! 4. `Module::from_image` over the PSRAM image borrows the pattern blob and the PCM
+//! 2. an existing module image (`SPMI` magic — what `cargo xtask module-image` writes) is
+//!    copied to the free image buffer in bounded chunks;
+//! 3. any of the five raw formats is incrementally decoded straight into that image
+//!    buffer, using the separate 256 KiB PSRAM workspace and yielding between bounded
+//!    input/PCM steps;
+//! 4. `Module::try_from_image` over the PSRAM image borrows the pattern blob and the PCM
 //!    **in place**, so what stays in DRAM is the `Arc`, four small index vectors and the
 //!    sequencer.
-//!
-//! Step 3 is the ceiling: its peak DRAM is the decoded module plus its image, both at
-//! once, so a raw upload is limited by the heap even though the result is not. A
-//! `.spmi` upload skips it entirely and is limited only by PSRAM, which is why the page
-//! accepts both and why `cargo xtask module-image` is the answer for a large module.
 
 
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_net::Stack;
@@ -65,7 +59,7 @@ use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::{Mutex, MutexGuard};
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_println::println;
 use firmware_common::api::{self, HostState, Upload};
 use firmware_common::{FixedStr, NowPlaying};
@@ -76,9 +70,11 @@ use picoserve::ResponseSent;
 use picoserve::response::{Content, IntoResponse, ResponseWriter, StatusCode};
 use picoserve::routing::{PathRouterService, RequestHandlerService};
 use starplayer::core::{ChannelId, U0F16};
-use starplayer::model::Module;
+use starplayer::model::{Module, ModuleBuilder, ModuleFormat, ModuleHeader};
+use starplayer::model::PatternId;
 use starplayer::model::image::IMAGE_MAGIC;
 use starplayer::rt::Arc;
+use starplayer::{DecodeBudget, ImageDecodeError, ImageDecodeStatus, ModuleImageDecoder};
 use starplayer_host_embedded::ControlHalf;
 use static_cell::StaticCell;
 
@@ -93,6 +89,11 @@ use crate::store::{SLOT_IMAGE_MAX_BYTES, SLOT_NAME_BYTES, Store};
 /// out of this rather than needing a counter of its own.
 pub const WEB_WORKER_COUNT: usize = 2;
 
+/// Fixed web-player capacity. Scope rings and deep telemetry history are disabled for
+/// this personality so these eight channels and voices fit the same internal-RAM budget.
+pub const PLAYBACK_CHANNEL_CAPACITY: usize = 8;
+pub const PLAYBACK_VOICE_CAPACITY: usize = 8;
+
 /// TCP receive and transmit buffers, per worker.
 const TCP_BUFFER_BYTES: usize = 1024;
 /// picoserve's own request buffer, per worker: large enough for any header block a
@@ -105,22 +106,18 @@ const HTTP_BUFFER_BYTES: usize = 1024;
 /// these buffers in its PSRAM-resident future and lends it to [`Body`] while writing.
 const BODY_BYTES: usize = 1408;
 
-/// The largest request body the upload endpoint accepts, which is the size of the PSRAM
-/// staging buffer behind it.
-pub const UPLOAD_MAX_BYTES: usize = psram::BUFFER_BYTES;
+/// Internal heap that must still be free after image adoption and playback preparation.
+const INTERNAL_HEAP_HEADROOM_BYTES: usize = 8 * 1024;
 
-/// Free DRAM the control task insists on before it decodes a raw upload, over and above
-/// three times the file's own size.
-///
-/// A stated estimate rather than a measurement: `starplayer::load` allocates the decoded
-/// PCM (up to twice the file for 8-bit samples, plus pre-roll and guard frames), the
-/// pattern blob and four index vectors, and `Module::to_image` then allocates all of that
-/// again as one contiguous image. Refusing early is the difference between "that module
-/// is too big for this board" and a heap-exhaustion panic, which on a device is a reset.
-const UPLOAD_DRAM_MARGIN: usize = 24 * 1024;
+/// Decoder work handed to one incremental step before yielding to the executor.
+const DECODE_INPUT_BYTES_PER_STEP: usize = 4096;
+const DECODE_PCM_FRAMES_PER_STEP: usize = 1024;
 
 /// How long a worker waits for the control task to answer a [`Job`].
 const JOB_TIMEOUT: Duration = Duration::from_secs(30);
+/// Control-side deadline, deliberately shorter than the HTTP wait. The gap guarantees a
+/// timed-out request cannot race a late playback commit on the same cooperative executor.
+const JOB_CONTROL_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// How often the WebSocket pushes a telemetry frame: 10 Hz, the task file's figure.
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -166,12 +163,11 @@ static COMMANDS: Channel<CriticalSectionRawMutex, Command, COMMAND_CAPACITY> = C
 pub fn send_command(command: Command) -> bool { COMMANDS.try_send(command).is_ok() }
 
 /// An operation the browser is waiting on.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Job {
-    /// Decode (or borrow) these bytes and swap the result in. The slice points into the
-    /// PSRAM staging buffer and stays valid because the caller holds [`STAGING`] until
-    /// the answer comes back.
-    LoadUpload(&'static [u8]),
+enum Job {
+    /// Decode (or borrow) the initialized prefix of this staging buffer and swap the
+    /// result in. Ownership crosses with the job, so an HTTP timeout cannot free the
+    /// buffer for reuse while the control task still has a late request queued.
+    LoadUpload { staging: Staging, length: usize },
     /// Play the compiled-in image (`0`) or a stored slot (`1..=slot_count`).
     Select(u8),
     /// Write the playing module's image into a slot. Pauses playback.
@@ -197,17 +193,79 @@ pub enum JobOutcome {
 static PENDING_WIFI: Mutex<CriticalSectionRawMutex, Option<crate::store::WifiCredentials>> = Mutex::new(None);
 
 static JOB_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
-static JOB_REQUEST: Signal<CriticalSectionRawMutex, Job> = Signal::new();
-static JOB_DONE: Signal<CriticalSectionRawMutex, JobOutcome> = Signal::new();
+static JOB_REQUEST: Signal<CriticalSectionRawMutex, JobRequest> = Signal::new();
+static JOB_DONE: Signal<CriticalSectionRawMutex, JobReply> = Signal::new();
+static JOB_BUSY: AtomicBool = AtomicBool::new(false);
+static NEXT_JOB_ID: AtomicU32 = AtomicU32::new(1);
+static CANCELLED_JOB_ID: AtomicU32 = AtomicU32::new(0);
+
+struct JobRequest {
+    id: u32,
+    deadline: Instant,
+    job: Job,
+}
+
+#[derive(Copy, Clone)]
+struct JobReply {
+    id: u32,
+    outcome: JobOutcome,
+}
+
+struct QueuedJob {
+    id: u32,
+    completed: bool,
+}
+
+impl Drop for QueuedJob {
+    fn drop(&mut self) {
+        if !self.completed {
+            CANCELLED_JOB_ID.store(self.id, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct JobContext {
+    id: u32,
+    deadline: Instant,
+}
+
+impl JobContext {
+    fn cancelled(self) -> bool {
+        CANCELLED_JOB_ID.load(Ordering::Acquire) == self.id || Instant::now() >= self.deadline
+    }
+}
+
+fn queue_job(job: Job) -> Result<QueuedJob, Job> {
+    if JOB_BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err(job);
+    }
+    let mut id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
+    }
+    JOB_DONE.reset();
+    JOB_REQUEST.signal(JobRequest { id, deadline: Instant::now() + JOB_CONTROL_TIMEOUT, job });
+    Ok(QueuedJob { id, completed: false })
+}
+
+async fn wait_for_job(mut queued: QueuedJob) -> JobOutcome {
+    match with_timeout(JOB_TIMEOUT, JOB_DONE.wait()).await {
+        Ok(reply) if reply.id == queued.id => {
+            queued.completed = true;
+            reply.outcome
+        }
+        Ok(_) => JobOutcome::Failed("the player returned an obsolete request result; try again"),
+        Err(_) => JobOutcome::Failed("the player is still preparing that request; try again"),
+    }
+}
 
 /// Hand `job` to the control task and wait for its answer.
 async fn run_job(job: Job) -> JobOutcome {
     let _guard = JOB_LOCK.lock().await;
-    JOB_DONE.reset();
-    JOB_REQUEST.signal(job);
-    match with_timeout(JOB_TIMEOUT, JOB_DONE.wait()).await {
-        Ok(outcome) => outcome,
-        Err(_) => JobOutcome::Failed("the control task did not answer in time"),
+    match queue_job(job) {
+        Ok(queued) => wait_for_job(queued).await,
+        Err(_) => JobOutcome::Failed("the player is still finishing an earlier request; try again"),
     }
 }
 
@@ -279,6 +337,10 @@ static MODULES: Mutex<CriticalSectionRawMutex, heapless::Vec<SlotEntry, MODULE_L
 /// song, later" from "a different song".
 static GENERATION: AtomicU32 = AtomicU32::new(1);
 
+/// Dynamic capacity of each of the three equal PSRAM module buffers. Written once before
+/// the executor starts and read by `GET /api/upload-limits`.
+static MODULE_BUFFER_BYTES: AtomicU32 = AtomicU32::new(0);
+
 /// Set by `POST /api/reprovision` once the credentials are gone; `main`'s watcher reboots
 /// a moment later, so the browser sees its answer first.
 static REBOOT_REQUESTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -312,6 +374,15 @@ pub struct Bridge {
     /// for the next upload or slot read. `None` on a board with no PSRAM fitted, where
     /// the compiled-in module is the only one that can play.
     images: Option<[psram::Buffer; 2]>,
+    /// Stable internal-RAM ownership tokens paired with the two image buffers. A token
+    /// is replaced in place only when its strong count proves the control queue, render
+    /// engine and retired source have all released it.
+    modules: Option<[Arc<Module>; 2]>,
+    /// Reusable decoder scratch, present exactly when the three dynamic module buffers
+    /// were successfully claimed.
+    workspace: Option<psram::Buffer>,
+    /// Shared capacity of staging and both image buffers. Zero without usable PSRAM.
+    buffer_bytes: usize,
     live: usize,
     /// The image the playing module is borrowing, or `None` when what is playing is the
     /// compiled-in flash image and neither buffer is in use.
@@ -330,24 +401,73 @@ impl Bridge {
     /// device that cannot be provisioned at all. What it loses is upload and slot
     /// playback, which answer with a sentence saying so.
     pub fn new(store: Store, arena: &mut psram::Arena, format: &'static str) -> Bridge {
-        let images = match (arena.claim(UPLOAD_MAX_BYTES), arena.claim(psram::BUFFER_BYTES), arena.claim(psram::BUFFER_BYTES)) {
-            (Some(staging), Some(first), Some(second)) => {
+        let layout = firmware_common::PsramLayout::calculate(arena.remaining(), 0, psram::DECODER_WORKSPACE_BYTES);
+        let (mut workspace, images, mut buffer_bytes) = match layout.and_then(|layout| {
+            Some((arena.claim(layout.workspace_bytes)?, arena.claim(layout.buffer_bytes)?, arena.claim(layout.buffer_bytes)?, arena.claim(layout.buffer_bytes)?, layout.buffer_bytes))
+        }) {
+            Some((workspace, staging, first, second, buffer_bytes)) => {
                 // `try_lock`, not `lock`: this runs before any executor polls, so an
                 // await here would never complete.
                 if let Ok(mut guard) = STAGING.try_lock() {
                     *guard = Some(Staging { buffer: staging, upload: Upload::new() });
                 }
-                Some([first, second])
+                (Some(workspace), Some([first, second]), buffer_bytes)
             }
-            _ => None,
+            None => (None, None, 0),
         };
-        let mut bridge = Bridge { store, images, live: 0, live_image: None, source: FixedStr::new("flash"), module_id: 0, format };
+        let modules = if images.is_some() {
+            match (Module::try_from_image(crate::images::boot_module()), empty_module()) {
+                (Ok(first), Some(second)) => Some([Arc::new(first), Arc::new(second)]),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if modules.is_none() {
+            workspace = None;
+            buffer_bytes = 0;
+            if let Ok(mut guard) = STAGING.try_lock() {
+                *guard = None;
+            }
+        }
+        let mut bridge = Bridge { store, images, modules, workspace, buffer_bytes, live: 0, live_image: None, source: FixedStr::new("flash"), module_id: 0, format };
+        MODULE_BUFFER_BYTES.store(buffer_bytes.min(u32::MAX as usize) as u32, Ordering::Relaxed);
         bridge.refresh_modules();
         bridge
     }
 
     /// Whether this board can hold an uploaded or stored module at all.
-    pub fn has_psram(&self) -> bool { self.images.is_some() }
+    pub fn has_psram(&self) -> bool { self.images.is_some() && self.modules.is_some() }
+
+    /// The preallocated token used for initial flash playback. Cloning a token does not
+    /// allocate, and keeping the original here is what later proves every other owner
+    /// has retired.
+    pub fn initial_module(&self) -> Option<Arc<Module>> {
+        self.modules.as_ref().and_then(|modules| modules.get(self.live)).map(Arc::clone)
+    }
+
+    /// Install the compiled-in module with its timeline tables in the otherwise-empty
+    /// first image buffer. The module itself keeps borrowing flash; only the immutable
+    /// scan tables use PSRAM.
+    pub fn load_initial(&mut self, control: &mut ControlHalf, module: Arc<Module>) -> Result<(), &'static str> {
+        if !self.has_psram() {
+            return Err("PSRAM playback storage is unavailable");
+        }
+        let order_count = module.orders().len();
+        let mark_capacity = maximum_timeline_marks(&module).ok_or("the linked module's playback timeline is too large")?;
+        // SAFETY: no previous module has used either image buffer during boot. The tables
+        // become read-only as soon as the prepared source is committed.
+        let (marks, order_marks) = unsafe {
+            self.image_half(self.live).initialize_tail_tables::<Option<u32>, starplayer::engine::RowMark>(
+                0, order_count, mark_capacity,
+            )
+        }
+        .ok_or("the linked module's playback timeline does not fit in PSRAM")?;
+        let prepared = control
+            .try_prepare_load_in(module, marks, order_marks)
+            .map_err(|_| "there is not enough internal RAM to prepare the linked module")?;
+        control.commit_prepared_load(prepared).map_err(|_| "the command ring rejected the linked module")
+    }
 
     /// Re-read every slot header into [`MODULES`].
     fn refresh_modules(&mut self) {
@@ -370,9 +490,11 @@ impl Bridge {
         while let Ok(command) = COMMANDS.try_receive() {
             apply_command(control, command);
         }
-        if let Some(job) = JOB_REQUEST.try_take() {
-            let outcome = self.run(control, job).await;
-            JOB_DONE.signal(outcome);
+        if let Some(request) = JOB_REQUEST.try_take() {
+            let context = JobContext { id: request.id, deadline: request.deadline };
+            let outcome = self.run(control, request.job, context).await;
+            JOB_DONE.signal(JobReply { id: request.id, outcome });
+            JOB_BUSY.store(false, Ordering::Release);
         }
     }
 
@@ -402,10 +524,23 @@ impl Bridge {
     }
 
     /// Answer one job.
-    async fn run(&mut self, control: &mut ControlHalf, job: Job) -> JobOutcome {
+    async fn run(&mut self, control: &mut ControlHalf, job: Job, context: JobContext) -> JobOutcome {
+        if context.cancelled() {
+            if let Job::LoadUpload { staging, .. } = job {
+                *STAGING.lock().await = Some(staging);
+            }
+            return JobOutcome::Failed("the request was canceled before preparation began");
+        }
         match job {
-            Job::LoadUpload(body) => self.load_upload(control, body).await,
-            Job::Select(id) => self.select(control, id).await,
+            Job::LoadUpload { staging, length } => {
+                let outcome = match unsafe { staging.buffer.view(length) } {
+                    Some(body) => self.load_upload(control, body, context).await,
+                    None => JobOutcome::Failed("the staged upload could not be read back"),
+                };
+                *STAGING.lock().await = Some(staging);
+                outcome
+            }
+            Job::Select(id) => self.select(control, id, context).await,
             Job::Store(id) => self.store_current(control, id).await,
             Job::ForgetWifi => self.forget_wifi(control).await,
             Job::SaveWifi => self.save_wifi(control).await,
@@ -413,7 +548,7 @@ impl Bridge {
     }
 
     /// The free image buffer — the one the playing module is not borrowing.
-    fn free_image(&self) -> usize { if self.live_image.is_some() { 1 - self.live } else { self.live } }
+    fn free_image(&self) -> usize { 1 - self.live }
 
     /// Make sure the module that was borrowing the buffer about to be overwritten has
     /// actually been dropped.
@@ -428,19 +563,21 @@ impl Bridge {
     /// a guarantee, and the failure mode is a mixer reading PCM out from under itself, so
     /// this drains the channel explicitly and waits for it to stay empty.
     ///
-    /// The bound is what makes this honest rather than a spin: ten tries at 10 ms is
-    /// three hundred render quanta, and if something has still not come back the caller
-    /// proceeds anyway, because the alternative is an endpoint that never answers. The
-    /// only way that can happen is a render half that has stopped running, in which case
-    /// nothing is reading the buffer either.
-    async fn wait_for_retirement(&mut self, control: &mut ControlHalf) {
-        for _ in 0..10 {
-            let collected = control.collect_garbage();
-            if collected == 0 && control.pending_garbage() == 0 {
-                return;
+    /// The bound is what makes this honest rather than a spin: one hundred tries at 10 ms
+    /// covers hundreds of render quanta. If ownership has still not returned, the request
+    /// fails busy and this buffer stays untouched.
+    async fn wait_for_retirement(&mut self, control: &mut ControlHalf, slot: usize, context: JobContext) -> bool {
+        for _ in 0..100 {
+            if context.cancelled() {
+                return false;
+            }
+            let released = self.modules.as_ref().and_then(|modules| modules.get(slot)).is_some_and(|module| control.module_is_released(module));
+            if released {
+                return true;
             }
             Timer::after(Duration::from_millis(10)).await;
         }
+        false
     }
 
     /// One half of the ping-pong. Only reached once `images` is known to be `Some`.
@@ -448,18 +585,89 @@ impl Bridge {
         &mut self.images.as_mut().expect("the callers check `images` before claiming a half")[slot]
     }
 
-    /// Build a module from an image already sitting in PSRAM half `slot`, and swap it in.
-    fn adopt(&mut self, control: &mut ControlHalf, slot: usize, image: &'static [u8], source: &str, id: u8) -> JobOutcome {
-        let module = match Module::from_image(image) {
-            Ok(module) => module,
-            Err(_) => return JobOutcome::Failed("that image would not borrow — regenerate it with cargo xtask module-image"),
+    /// Drop the released inactive module's DRAM metadata before decoding its replacement.
+    /// The empty module owns no allocated elements and keeps the preallocated Arc token in
+    /// place, ready for `Arc::get_mut` adoption.
+    fn clear_module_slot(&mut self, slot: usize) -> bool {
+        let Some(empty) = empty_module() else { return false };
+        let Some(token) = self.modules.as_mut().and_then(|modules| modules.get_mut(slot)).and_then(Arc::get_mut) else {
+            return false;
         };
-        self.format = format_name(module.header().format);
-        if control.load(Arc::new(module)).is_err() {
+        *token = empty;
+        true
+    }
+
+    /// Build a module from an image already sitting in PSRAM half `slot`, and swap it in.
+    fn adopt(
+        &mut self, control: &mut ControlHalf, slot: usize, image: &'static [u8], source: &str, id: u8, context: JobContext,
+    ) -> JobOutcome {
+        if context.cancelled() {
+            return JobOutcome::Failed("module preparation was canceled");
+        }
+        let module = match Module::try_from_image(image) {
+            Ok(module) => module,
+            Err(starplayer::core::Error::Resource(message)) => return JobOutcome::Failed(message),
+            Err(_) => return JobOutcome::Failed("the module image is invalid or incompatible with this firmware"),
+        };
+        if module.header().channel_count as usize > control.channel_capacity() {
+            return JobOutcome::Failed("the module has more than this firmware's 8-channel playback limit");
+        }
+        let format = format_name(module.header().format);
+        let Some(token) = self.modules.as_mut().and_then(|modules| modules.get_mut(slot)).and_then(Arc::get_mut) else {
+            return JobOutcome::Failed("the previous module is still being released; try again");
+        };
+        *token = module;
+        let Some(module) = self.modules.as_ref().and_then(|modules| modules.get(slot)).map(Arc::clone) else {
+            return JobOutcome::Failed("the PSRAM module slot is unavailable");
+        };
+        let order_count = module.orders().len();
+        let Some(mark_capacity) = maximum_timeline_marks(&module) else {
+            drop(module);
+            self.clear_module_slot(slot);
+            return JobOutcome::Failed("the module's playback timeline is too large");
+        };
+        let timeline_prefix = if source == "flash" { 0 } else { image.len() };
+        // SAFETY: retirement was confirmed before this image or its tail was written;
+        // these initialized tables stay read-only in the scan/source until the same token
+        // is unique again.
+        let timeline_tables = unsafe {
+            self.image_half(slot).initialize_tail_tables::<Option<u32>, starplayer::engine::RowMark>(
+                timeline_prefix, order_count, mark_capacity,
+            )
+        };
+        let Some((marks, order_marks)) = timeline_tables else {
+            drop(module);
+            self.clear_module_slot(slot);
+            return JobOutcome::Failed("the decoded image leaves insufficient PSRAM for its playback timeline");
+        };
+        let prepared = match control.try_prepare_load_in(module, marks, order_marks) {
+            Ok(prepared) => prepared,
+            Err(starplayer_host_embedded::Error::Module(starplayer::core::Error::Resource(message))) => {
+                self.clear_module_slot(slot);
+                return JobOutcome::Failed(message);
+            }
+            Err(_) => {
+                self.clear_module_slot(slot);
+                return JobOutcome::Failed("the module could not be prepared for playback");
+            }
+        };
+        if context.cancelled() {
+            drop(prepared);
+            self.clear_module_slot(slot);
+            return JobOutcome::Failed("module preparation was canceled");
+        }
+        if esp_alloc::HEAP.free() < INTERNAL_HEAP_HEADROOM_BYTES {
+            drop(prepared);
+            self.clear_module_slot(slot);
+            return JobOutcome::Failed("module metadata would leave less than 8 KiB of internal RAM free");
+        }
+        if control.commit_prepared_load(prepared).is_err() {
+            self.clear_module_slot(slot);
             return JobOutcome::Failed("the command ring is full; try again in a moment");
         }
+        self.format = format;
         self.live = slot;
-        self.live_image = Some(image);
+        self.live_image = if source == "flash" { None } else { Some(image) };
         self.module_id = id;
         self.source = FixedStr::new(source);
         GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -468,72 +676,103 @@ impl Bridge {
     }
 
     /// `POST /api/modules`: whatever the browser sent is in PSRAM; decide what it is.
-    async fn load_upload(&mut self, control: &mut ControlHalf, body: &'static [u8]) -> JobOutcome {
-        if self.images.is_none() {
+    async fn load_upload(&mut self, control: &mut ControlHalf, body: &'static [u8], context: JobContext) -> JobOutcome {
+        if !self.has_psram() {
             return JobOutcome::Failed("this board has no PSRAM, so it can only play the compiled-in module");
         }
         let slot = self.free_image();
-        self.wait_for_retirement(control).await;
+        if !self.wait_for_retirement(control, slot, context).await {
+            return JobOutcome::Failed("the previous module is still being released; try again");
+        }
+        if !self.clear_module_slot(slot) {
+            return JobOutcome::Failed("the previous module is still being released; try again");
+        }
+        println!("HEAP upload before conversion: {}", esp_alloc::HEAP.stats());
 
         if body.starts_with(&IMAGE_MAGIC) {
-            // Already an image: PSRAM to PSRAM, no decode, no DRAM, any size that fits.
-            // SAFETY: `slot` is the half the playing module is *not* borrowing
-            // (`free_image`), so nothing reads what this overwrites, and `Bridge` is the
-            // only owner of either half.
-            let Some(image) = (unsafe { self.image_half(slot).fill(body) }) else {
+            if body.len() > self.buffer_bytes {
                 return JobOutcome::Failed("that image is larger than the PSRAM buffer");
-            };
-            return self.adopt(control, slot, image, "upload", 0);
+            }
+            // SAFETY: retirement and `clear_module_slot` proved nothing still borrows
+            // this image half. The staging body is a disjoint arena claim.
+            let destination = unsafe { self.image_half(slot).as_mut() };
+            for (source, destination) in body.chunks(DECODE_INPUT_BYTES_PER_STEP).zip(destination.chunks_mut(DECODE_INPUT_BYTES_PER_STEP)) {
+                if context.cancelled() {
+                    return JobOutcome::Failed("module preparation was canceled");
+                }
+                destination[..source.len()].copy_from_slice(source);
+                embassy_futures::yield_now().await;
+            }
+            let image: &'static [u8] = &destination[..body.len()];
+            println!("HEAP upload after conversion: {}", esp_alloc::HEAP.stats());
+            let outcome = self.adopt(control, slot, image, "upload", 0, context);
+            println!("HEAP upload after adoption: {}", esp_alloc::HEAP.stats());
+            return outcome;
         }
 
-        // A raw module file: the DRAM-bounded path. See the module documentation.
-        let needed = body.len().saturating_mul(3).saturating_add(UPLOAD_DRAM_MARGIN);
-        if esp_alloc::HEAP.free() < needed {
-            return JobOutcome::Failed("not enough free RAM to decode a module that size — upload a .spmi image instead");
-        }
-        let module = match starplayer::load(body) {
-            Ok(module) => module,
-            Err(_) => return JobOutcome::Failed("that is not a module this build can play"),
+        // SAFETY: as in the SPMI branch. Workspace is a separate boot-time claim and no
+        // other job can run while this one owns JOB_BUSY.
+        let destination = unsafe { self.image_half(slot).as_mut() };
+        let Some(workspace) = self.workspace.as_mut() else {
+            return JobOutcome::Failed("this board has no PSRAM decoder workspace");
         };
-        let image = module.to_image();
-        drop(module);
-        // SAFETY: as above — `slot` is the half nothing is borrowing.
-        let borrowed = unsafe { self.image_half(slot).fill(&image) };
-        drop(image);
-        match borrowed {
-            Some(borrowed) => self.adopt(control, slot, borrowed, "upload", 0),
-            None => JobOutcome::Failed("the decoded module is larger than the PSRAM buffer"),
-        }
+        let workspace = unsafe { workspace.as_mut() };
+        let image_length = {
+            let mut decoder = match ModuleImageDecoder::new(body, destination, workspace) {
+                Ok(decoder) => decoder,
+                Err(error) => return JobOutcome::Failed(decode_error_message(error)),
+            };
+            loop {
+                if context.cancelled() {
+                    return JobOutcome::Failed("module preparation was canceled");
+                }
+                match decoder.step(DecodeBudget {
+                    max_input_bytes: DECODE_INPUT_BYTES_PER_STEP,
+                    max_pcm_frames: DECODE_PCM_FRAMES_PER_STEP,
+                }) {
+                    Ok(ImageDecodeStatus::Pending) => embassy_futures::yield_now().await,
+                    Ok(ImageDecodeStatus::Complete { image_length }) => break image_length,
+                    Err(error) => return JobOutcome::Failed(decode_error_message(error)),
+                }
+            }
+        };
+        let image: &'static [u8] = &destination[..image_length];
+        println!("HEAP upload after conversion: {}", esp_alloc::HEAP.stats());
+        let outcome = self.adopt(control, slot, image, "upload", 0, context);
+        println!("HEAP upload after adoption: {}", esp_alloc::HEAP.stats());
+        outcome
     }
 
     /// `POST /api/modules/select`: the compiled-in image, or one read out of a slot.
-    async fn select(&mut self, control: &mut ControlHalf, id: u8) -> JobOutcome {
+    async fn select(&mut self, control: &mut ControlHalf, id: u8, context: JobContext) -> JobOutcome {
         if id == 0 {
-            let module = match Module::from_image(crate::images::boot_module()) {
-                Ok(module) => module,
-                Err(_) => return JobOutcome::Failed("the compiled-in image would not borrow"),
-            };
-            self.format = format_name(module.header().format);
-            if control.load(Arc::new(module)).is_err() {
-                return JobOutcome::Failed("the command ring is full; try again in a moment");
+            let slot = self.free_image();
+            if !self.wait_for_retirement(control, slot, context).await {
+                return JobOutcome::Failed("the previous module is still being released; try again");
             }
-            self.live_image = None;
-            self.module_id = 0;
-            self.source = FixedStr::new("flash");
-            GENERATION.fetch_add(1, Ordering::Relaxed);
-            let _ = control.play();
-            return JobOutcome::Done;
+            if !self.clear_module_slot(slot) {
+                return JobOutcome::Failed("the previous module is still being released; try again");
+            }
+            return self.adopt(control, slot, crate::images::boot_module(), "flash", 0, context);
         }
 
-        if self.images.is_none() {
+        if !self.has_psram() {
             return JobOutcome::Failed("this board has no PSRAM to read a stored module into");
         }
         let slot = self.free_image();
+        let was_playing = control.is_playing();
         // A long flash read contends for the flash bus with core 1's own instruction
         // fetches, so the transport stops around it — for audio quality, not for safety
         // (see `store.rs`).
         self.pause_playback(control).await;
-        self.wait_for_retirement(control).await;
+        if !self.wait_for_retirement(control, slot, context).await {
+            if was_playing { let _ = control.play(); }
+            return JobOutcome::Failed("the previous module is still being released; try again");
+        }
+        if !self.clear_module_slot(slot) {
+            if was_playing { let _ = control.play(); }
+            return JobOutcome::Failed("the previous module is still being released; try again");
+        }
         // SAFETY: `slot` is the half the playing module is not borrowing, and
         // `wait_for_retirement` has dropped whatever module was.
         let destination = unsafe { self.image_half(slot).as_mut() };
@@ -541,17 +780,21 @@ impl Bridge {
         let length = match read {
             Ok(length) => length,
             Err(_) => {
-                let _ = control.play();
+                if was_playing { let _ = control.play(); }
                 return JobOutcome::Failed("that slot is empty or would not read");
             }
         };
         // SAFETY: the same half, and `length` of its bytes were just written by the read.
         let Some(image) = (unsafe { self.image_half(slot).view(length) }) else {
-            let _ = control.play();
+            if was_playing { let _ = control.play(); }
             return JobOutcome::Failed("the slot image is larger than the PSRAM buffer");
         };
         let label = slot_label(id);
-        self.adopt(control, slot, image, label.as_str(), id)
+        let outcome = self.adopt(control, slot, image, label.as_str(), id, context);
+        if !matches!(outcome, JobOutcome::Done) && was_playing {
+            let _ = control.play();
+        }
+        outcome
     }
 
     /// `POST /api/modules/store`: write the playing module's image into a slot.
@@ -622,6 +865,35 @@ impl Bridge {
         let _ = control.stop();
         Timer::after(Duration::from_millis(150)).await;
     }
+}
+
+/// A valid allocation-free value for an inactive preallocated Arc token.
+fn empty_module() -> Option<Module> {
+    let mut builder = ModuleBuilder::new();
+    builder.set_header(ModuleHeader::new(ModuleFormat::S3m, 1));
+    builder.build().ok()
+}
+
+fn decode_error_message(error: ImageDecodeError) -> &'static str {
+    match error {
+        ImageDecodeError::DestinationTooSmall { .. } => "the decoded module is larger than the PSRAM image buffer",
+        ImageDecodeError::WorkspaceTooSmall { .. } => "the module needs more than the 256 KiB decoder workspace",
+        ImageDecodeError::BudgetTooSmall { .. } => "the firmware's decoder work budget is too small",
+        ImageDecodeError::Module(starplayer::core::Error::Resource(message)) => message,
+        ImageDecodeError::Module(_) => "that is not a valid module this build can play",
+    }
+}
+
+/// Upper bound on distinct row visits before a timeline repeats: every row of every
+/// playable order. Duplicate pattern orders count independently because their order
+/// number is part of a row mark.
+fn maximum_timeline_marks(module: &Module) -> Option<usize> {
+    let mut rows = 0usize;
+    for &order in module.orders() {
+        let Some(pattern) = module.pattern(PatternId(order)) else { continue };
+        rows = rows.checked_add(pattern.rows() as usize)?;
+    }
+    Some(rows)
 }
 
 /// A module format's name, for the status JSON.
@@ -787,6 +1059,27 @@ async fn modules_response(response_buffer: &ResponseBuffer) -> (StatusCode, Body
     }
 }
 
+/// `GET /api/upload-limits`.
+async fn upload_limits_response(response_buffer: &ResponseBuffer) -> (StatusCode, Body<'_>) {
+    let buffer_bytes = MODULE_BUFFER_BYTES.load(Ordering::Relaxed) as usize;
+    let limits = api::UploadLimits {
+        max_upload_bytes: buffer_bytes,
+        max_image_bytes: buffer_bytes,
+        max_stored_image_bytes: SLOT_IMAGE_MAX_BYTES,
+    };
+    let mut body = Body::new(response_buffer, "application/json").await;
+    match api::write_upload_limits_json(body.scratch(), &limits) {
+        Some(length) => {
+            body.truncate(length);
+            (StatusCode::OK, body)
+        }
+        None => {
+            drop(body);
+            text(response_buffer, StatusCode::INTERNAL_SERVER_ERROR, "the upload limits did not fit their buffer").await
+        }
+    }
+}
+
 /// `POST /api/modules`: stream the body into PSRAM, then ask the control task to adopt it.
 ///
 /// The staging lock is held for the whole call — that, and nothing else, is what makes a
@@ -796,12 +1089,20 @@ async fn upload_response<'a, R: Read>(request: &mut Request<'_, R>, response_buf
         return text(response_buffer, StatusCode::CONFLICT, "another upload is already in flight").await;
     };
     let Some(staging) = guard.as_mut() else {
-        return text(response_buffer, StatusCode::INSUFFICIENT_STORAGE, "this board has no PSRAM to stage an upload in").await;
+        return if MODULE_BUFFER_BYTES.load(Ordering::Relaxed) == 0 {
+            text(response_buffer, StatusCode::INSUFFICIENT_STORAGE, "this board has no PSRAM to stage an upload in").await
+        } else {
+            text(response_buffer, StatusCode::CONFLICT, "the previous upload is still being prepared").await
+        };
     };
 
     let capacity = staging.buffer.capacity();
     let body = request.body_connection.body();
     let expected = body.content_length();
+    // A canceled HTTP future drops this mutex guard but cannot run explicit cleanup. Since
+    // taking the guard proves no body reader or queued job owns this staging value, any
+    // surviving InFlight state belongs to that abandoned request and is safe to reset.
+    staging.upload.abort();
     if let Err(error) = staging.upload.reserve(expected, capacity) {
         staging.upload.abort();
         return match error {
@@ -838,13 +1139,31 @@ async fn upload_response<'a, R: Read>(request: &mut Request<'_, R>, response_buf
         return text(response_buffer, StatusCode::BAD_REQUEST, "the upload was cut short").await;
     };
 
-    // SAFETY: `length` bytes were just written through the `as_mut` borrow above, which
-    // has ended. The view stays valid while this function holds `STAGING`, which it does
-    // until after the control task has answered.
-    let Some(view) = (unsafe { staging.buffer.view(length) }) else {
-        return text(response_buffer, StatusCode::INTERNAL_SERVER_ERROR, "the staged upload could not be read back").await;
+    // Acquire the job serializer before moving the staging owner. If this HTTP future is
+    // canceled while waiting, the buffer is still present in `STAGING`.
+    let job_guard = JOB_LOCK.lock().await;
+    if JOB_BUSY.load(Ordering::Acquire) {
+        return text(response_buffer, StatusCode::CONFLICT, "the player is still finishing an earlier request; try again").await;
+    }
+
+    // Move the complete staging state into the job before releasing the mutex. A timed
+    // out or canceled HTTP future therefore leaves `STAGING` empty until the control
+    // task has finished every last borrow and restores the buffer itself.
+    let Some(staging) = guard.take() else {
+        return text(response_buffer, StatusCode::INTERNAL_SERVER_ERROR, "the staged upload was lost").await;
     };
-    match run_job(Job::LoadUpload(view)).await {
+    drop(guard);
+    let queued = match queue_job(Job::LoadUpload { staging, length }) {
+        Ok(queued) => queued,
+        Err(Job::LoadUpload { staging, .. }) => {
+            *STAGING.lock().await = Some(staging);
+            return text(response_buffer, StatusCode::CONFLICT, "the player is still finishing an earlier request; try again").await;
+        }
+        Err(_) => return text(response_buffer, StatusCode::INTERNAL_SERVER_ERROR, "the upload job changed shape").await,
+    };
+    let outcome = wait_for_job(queued).await;
+    drop(job_guard);
+    match outcome {
         JobOutcome::Done => text(response_buffer, StatusCode::CREATED, "playing").await,
         JobOutcome::Failed(message) => text(response_buffer, StatusCode::CONFLICT, message).await,
     }
@@ -909,6 +1228,7 @@ async fn dispatch<'a>(response_buffer: &'a ResponseBuffer, method: &str, path: &
     match (method, path) {
         ("GET", "/api/status") => status_response(response_buffer).await,
         ("GET", "/api/modules") => modules_response(response_buffer).await,
+        ("GET", "/api/upload-limits") => upload_limits_response(response_buffer).await,
         ("POST", "/api/play") => accepted(response_buffer, send_command(Command::Play)).await,
         ("POST", "/api/stop") => accepted(response_buffer, send_command(Command::Stop)).await,
         ("POST", "/api/next") => accepted(response_buffer, send_command(Command::Skip(1))).await,

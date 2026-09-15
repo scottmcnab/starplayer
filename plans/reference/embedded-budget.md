@@ -244,9 +244,9 @@ The I2S DMA ring is `DMA_RING_QUANTA × 128 × 4` bytes = **4 096 B** at the shi
 |---|---|
 | Peak stack of the audio refill task, on core 1's dedicated 8 KiB (`CORE1_STACK_SIZE`, M8-I5) | TBD (owner: run the audio build — esp-hal's stack-guard watchpoint fires on an overflow, and a clean run through a whole song is the evidence that 8 KiB is enough) |
 | Peak stack of core 0's control/keys/(`lcd`) display tasks, against the **35 608 B** (audio) / **34 200 B** (`lcd`) budget above | TBD (owner: run each build) |
-| Heap high-water with the web stack up, against the `web` build's 147 456 B two-region Internal heap | TBD (owner: `HEAP.stats()` is printed at boot, after player/audio construction, immediately after radio initialization and after each module swap) |
+| Heap high-water with the web stack up, against the `web` build's 147 456 B two-region Internal heap | I8d upload checkpoints: at most 102,320 B used, at least 45,136 B free; continuous high-water measurement remains TBD |
 | Audio gap during a 90 KB `POST /api/modules/store` flash write (M8-I6 research point 2) | TBD (owner: time the silence; the firmware fades out first, so the figure to record is how long the music is *stopped*, not how long it glitches) |
-| Underruns during an upload with the radio busy | TBD (owner: the once-a-second transport line's `underruns=` field, before and after) |
+| Underruns during an upload with the radio busy | I8d: zero throughout all-format/large-image uploads, a 60-second HTTP/WebSocket soak and about 220 seconds of UART capture; DMA errors remained at startup baseline 1 |
 
 #### What the `web` build's DRAM and PSRAM actually go on (M8-I6/I8/I8a)
 
@@ -274,10 +274,10 @@ Two figures that are easy to assume wrongly, both measured with
   total heap capacity to **147 456 B**. The existing 98 304-byte `dram2_seg` region is
   registered first; the new `.bss` region is second. Both macro-created regions have
   `MemoryCapability::Internal`.
-* **PSRAM remains claim-only.** The three 512 KiB upload/image buffers are claimed first,
-  leaving 2 621 440 bytes on the installed 4 MiB board before network selection. Station
-  mode consumes 25 584 bytes for its two futures after I8c and leaves 2 595 856; portal mode consumes
-  10 048 and leaves 2 611 392. The arena is never registered with `esp_alloc`, so engine
+* **PSRAM remains claim-only.** Before I8d, three 512 KiB upload/image buffers were claimed
+  first, leaving 2 621 440 bytes on the installed 4 MiB board before network selection.
+  Station mode consumed 25 584 bytes for its two futures after I8c and left 2 595 856;
+  portal mode consumed 10 048 and left 2 611 392. I8d replaces this layout as recorded below. The arena is never registered with `esp_alloc`, so engine
   `Arc`s, seqlocks and task-header atomics cannot spill into external memory. The future
   bodies directly own no cross-core atomics; private picoserve `Cell`/waker state is polled
   exclusively by core 0.
@@ -294,6 +294,17 @@ worker futures now occupy 25 584 bytes total (12 792 each). The exact scripted w
 image reports 57 548 bytes of linked stack; web,lcd retains 56 116. These measurements
 distinguish persistent future storage from temporary execution-stack usage: the prior
 PSRAM migration alone still overflowed core 0 when serving API requests.
+
+I8d (2026-09-15) uses the previously unallocated PSRAM: a 64 KiB network arena,
+256 KiB decoder workspace, and three 1,288,872-byte buffers. Immutable timelines live
+in the image-buffer tail; atomics and fallible metadata remain in internal DRAM. The
+web engine has eight channels/voices, no scope rings, and one-entry scalar telemetry
+queues. Main stack measures **55,948 B web / 54,500 B web,lcd**; application flash is
+**1,309,104 B (49.94%)**. The lowest free internal heap at logged upload checkpoints
+was **45,136 B**; this is not a continuously sampled high-water mark. ARMANI (17,554 B)
+and a 600,856-byte decoded image passed live uploads. A 60-second HTTP/WebSocket soak
+and about 220 seconds of UART capture had zero underruns and no crashes; DMA errors
+stayed at the startup baseline of 1. See the [I8d verification record](../engine/complete/M8-task-I8d-psram-module-decoding.md).
 
 A **linker assertion now guards the stack**: `boards/starplayer-a1s/ld/stack-floor.x` fails
 the build if `_stack_start − _stack_end` drops under 32 KiB, so the next large static is a

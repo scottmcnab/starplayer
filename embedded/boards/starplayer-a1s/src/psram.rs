@@ -24,8 +24,12 @@
 //!
 //! # What does live there
 //!
-//! Three buffers, claimed once at boot and never freed ([`Arena::claim`]):
+//! Five regions, claimed once at boot and never freed ([`Arena::claim`]):
 //!
+//! * **64 KiB reserved for network futures**. The selected station or portal personality
+//!   claims only its actual future bodies from this tail reservation;
+//! * **256 KiB decoder workspace**, reused by every raw upload and never visible to the
+//!   global allocator;
 //! * **the upload staging buffer** — the raw bytes of whatever a browser posted, streamed
 //!   straight off the socket so a 200 KB file never touches the 48 KiB DRAM heap;
 //! * **two module-image buffers**, used ping-pong. A [`Module`](starplayer_model::Module)
@@ -39,8 +43,9 @@
 //! Only the `Arc<Module>` itself, the module's four small index vectors and the
 //! sequencer are allocated — in DRAM, by the global allocator, as they always were.
 //!
-//! After those three fixed buffers, the selected network personality also claims its
-//! picoserve worker future bodies through [`Arena::claim_raw`]. The worker's Embassy task
+//! The selected network personality claims its picoserve worker future bodies from the
+//! reserved prefix through
+//! [`Arena::claim_raw`]. The worker's Embassy task
 //! header, scheduler state and pointer proxy remain in internal DRAM; see
 //! [`crate::psram_task`] for the placement and safety argument. Station and portal are
 //! mutually exclusive, so only the futures that actually run consume arena space.
@@ -54,18 +59,17 @@
 
 use core::{
     alloc::Layout,
+    mem::{align_of, size_of},
     ptr::NonNull,
     slice,
 };
 
-/// How much PSRAM one uploaded module may use, for each of the three buffers.
-///
-/// 512 KiB is six times `PETRI.S3M`'s 88 036-byte image and comfortably past anything the
-/// 4 MB flash could hold as a slot, while three of them together are under half of the
-/// smallest PSRAM fitted to an A1S module. It is a policy number, not a hardware one: the
-/// real ceiling on an uploaded module is DRAM, because `starplayer::load` decodes into the
-/// heap before `web::load_uploaded` serialises the result back into PSRAM.
-pub const BUFFER_BYTES: usize = 512 * 1024;
+/// Space kept available for the station's two picoserve worker futures or the mutually
+/// exclusive provisioning worker.
+pub const NETWORK_BYTES: usize = 64 * 1024;
+
+/// Reusable bulk scratch for incremental native-format decoding.
+pub const DECODER_WORKSPACE_BYTES: usize = 256 * 1024;
 
 /// What [`Arena::claim`] aligns every buffer to.
 ///
@@ -78,13 +82,18 @@ const ALIGNMENT: usize = 4;
 ///
 /// Claim-only: there is no `free`, because buffers and network-worker futures are claimed
 /// at boot and live for the life of the program. That is the entire lifetime story, and
-/// it is what makes the `&'static` views [`Buffer::fill`] hands out sound.
+/// it is what makes the `&'static` views [`Buffer::as_mut`] hands out sound.
 pub struct Arena {
     next: usize,
     end: usize,
 }
 
 impl Arena {
+    /// An arena with no storage, used when the board reported no PSRAM. Keeping this a
+    /// real value lets provisioning still start and report its ordinary out-of-PSRAM
+    /// error without inventing a nullable arena pointer.
+    pub const fn empty() -> Arena { Arena { next: 0, end: 0 } }
+
     /// Take the region `esp_hal::psram::Psram::raw_parts` reported.
     ///
     /// The caller must not register the same region with `esp_alloc::HEAP` — see the
@@ -129,6 +138,15 @@ impl Arena {
         let start = self.claim_raw(layout)?;
         Some(Buffer { start: start.as_ptr(), capacity: bytes })
     }
+
+    /// Claim and return the first `bytes` as a disjoint arena, leaving the remainder in
+    /// `self`. Used once at boot to make the network reservation structural: upload
+    /// buffers can never consume it, even if their layout changes later.
+    pub fn split_prefix(&mut self, bytes: usize) -> Option<Arena> {
+        let layout = Layout::from_size_align(bytes, ALIGNMENT).ok()?;
+        let start = self.claim_raw(layout)?;
+        Some(Arena { next: start.as_ptr() as usize, end: start.as_ptr() as usize + bytes })
+    }
 }
 
 /// One claimed PSRAM buffer.
@@ -137,7 +155,7 @@ impl Arena {
 /// is *reused*, and each use hands out a `&'static [u8]` that a [`Module`] borrows from.
 /// A `&'static mut` cannot express that — reborrowing it as `&'static [u8]` would freeze
 /// it for the rest of the program — so the aliasing obligation is carried by hand, stated
-/// on [`Buffer::fill`], and discharged by the ping-pong in `web.rs`.
+/// on [`Buffer::as_mut`], and discharged by the ping-pong in `web.rs`.
 ///
 /// [`Module`]: starplayer_model::Module
 pub struct Buffer {
@@ -172,36 +190,74 @@ impl Buffer {
         unsafe { slice::from_raw_parts_mut(self.start, self.capacity) }
     }
 
-    /// Copy `image` in and hand back the `'static` view a module borrows from.
-    ///
-    /// # Safety
-    ///
-    /// The same obligation as [`Buffer::as_mut`]: whatever module borrowed this buffer
-    /// last must have been dropped.
-    pub unsafe fn fill(&mut self, image: &[u8]) -> Option<&'static [u8]> {
-        if image.len() > self.capacity {
-            return None;
-        }
-        // SAFETY: the caller's obligation, forwarded. `image.len() <= capacity`, and the
-        // copy initialises every byte the returned view covers.
-        let destination = unsafe { slice::from_raw_parts_mut(self.start, image.len()) };
-        destination.copy_from_slice(image);
-        Some(destination)
-    }
-
     /// The `'static` view of the first `length` bytes, for a body that was streamed
     /// straight into this buffer rather than copied in.
     ///
     /// # Safety
     ///
-    /// The same obligation as [`Buffer::fill`], plus: `length` bytes must actually have
+    /// The same obligation as [`Buffer::as_mut`], plus: `length` bytes must actually have
     /// been written by a preceding [`Buffer::as_mut`] borrow.
     pub unsafe fn view(&self, length: usize) -> Option<&'static [u8]> {
         if length > self.capacity {
             return None;
         }
-        // SAFETY: as `fill`, with the initialisation obligation stated above instead of
+        // SAFETY: as `Buffer::as_mut`, with the initialisation obligation stated above instead of
         // discharged by a copy here.
         Some(unsafe { slice::from_raw_parts(self.start, length) })
     }
+
+    /// Initialize two typed tables in the unused tail after `prefix_bytes`.
+    ///
+    /// Both types receive exactly their requested entry count. This is used for a timeline's order map and row
+    /// marks after an SPMI image. Both tables are plain immutable playback data.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prove nothing still borrows any part of this buffer from a prior
+    /// use. The returned tables are exclusively writable during preparation, then must
+    /// remain immutable after publication until that borrower has been definitively
+    /// retired. `web.rs` discharges both obligations with its per-buffer module ownership
+    /// token.
+    pub unsafe fn initialize_tail_tables<Fixed: Copy + Default, Remainder: Copy + Default>(
+        &mut self, prefix_bytes: usize, fixed_count: usize, remainder_count: usize,
+    ) -> Option<(&'static mut [Remainder], &'static mut [Fixed])> {
+        if size_of::<Fixed>() == 0 || size_of::<Remainder>() == 0 || prefix_bytes > self.capacity {
+            return None;
+        }
+        let base = self.start as usize;
+        let end = base.checked_add(self.capacity)?;
+        let tail = base.checked_add(prefix_bytes)?;
+        let fixed_start = align_up(tail, align_of::<Fixed>())?;
+        let fixed_bytes = fixed_count.checked_mul(size_of::<Fixed>())?;
+        let fixed_end = fixed_start.checked_add(fixed_bytes)?;
+        let remainder_start = align_up(fixed_end, align_of::<Remainder>())?;
+        let remainder_bytes = remainder_count.checked_mul(size_of::<Remainder>())?;
+        let remainder_end = remainder_start.checked_add(remainder_bytes)?;
+        if remainder_end > end {
+            return None;
+        }
+
+        // SAFETY: the arithmetic above proves both disjoint ranges fit this uniquely
+        // owned buffer with each element's required alignment. Every element is written
+        // before the initialized slices are constructed.
+        unsafe {
+            let fixed_pointer = fixed_start as *mut Fixed;
+            for index in 0..fixed_count {
+                fixed_pointer.add(index).write(Fixed::default());
+            }
+            let remainder_pointer = remainder_start as *mut Remainder;
+            for index in 0..remainder_count {
+                remainder_pointer.add(index).write(Remainder::default());
+            }
+            Some((
+                slice::from_raw_parts_mut(remainder_pointer, remainder_count),
+                slice::from_raw_parts_mut(fixed_pointer, fixed_count),
+            ))
+        }
+    }
+}
+
+fn align_up(address: usize, alignment: usize) -> Option<usize> {
+    let mask = alignment.checked_sub(1)?;
+    address.checked_add(mask).map(|value| value & !mask)
 }

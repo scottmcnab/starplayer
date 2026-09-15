@@ -722,6 +722,7 @@ written for a person, not a code.
 | `GET /` | — | the page, gzipped, `Content-Encoding: gzip` |
 | `GET /api/status` | — | the transport, the module and up to 16 channel rows |
 | `GET /api/modules` | — | the compiled-in module plus every stored slot |
+| `GET /api/upload-limits` | — | current raw/image buffer limits and the 252 KiB flash-slot limit |
 | `POST /api/play`, `/api/stop`, `/api/next`, `/api/previous` | — | 204 |
 | `POST /api/seek` | `{"order":12}` | 204 |
 | `POST /api/volume` | `{"level":16384}` | 204 (0–16384; higher values clamp to 16384) |
@@ -749,16 +750,46 @@ are what keep the two in step.
 Two kinds of file are accepted at `POST /api/modules`:
 
 * **A module image** (`.spmi`, what `cargo xtask module-image` writes in the main
-  workspace). It is streamed into PSRAM and played **borrowed in place** — no decoding, no
-  heap, and the only limit is the 512 KiB PSRAM buffer. This is the way to put
-  `PETRI.S3M`-sized music on the device.
+  workspace). It is streamed into PSRAM, copied to the free image buffer in 4 KiB steps
+  and played **borrowed in place**.
 * **A raw module file** (`.mod`, `.s3m`, `.mtm`, `.xm`, `.it`). The device decodes it with
-  the ordinary loader, which allocates the decoded PCM **in DRAM**, serialises the result
-  back out to PSRAM, and frees the DRAM. The peak is the decoded module plus its image at
-  once, against a 144 KiB heap that already holds the engine — so this path is for small
-  modules, and it refuses with a sentence saying so rather than running out of memory. The
-  `web` build's heap is 96 KiB in `dram2_seg` plus 48 KiB in `.bss`; `HEAP.stats()` is
-  printed at boot, after player/audio construction, and immediately after radio initialization.
+  an incremental caller-buffer decoder. Canonical pattern bytes and decoded PCM go
+  directly from the staging buffer into the free PSRAM image buffer; the reusable 256 KiB
+  PSRAM workspace carries bulk decode state. A step scans at most 4 KiB of input or emits
+  at most 1,024 PCM frames before yielding.
+
+At boot the firmware reserves 64 KiB for network futures and 256 KiB for the decoder,
+then divides all remaining PSRAM into three equal, four-byte-aligned buffers: staging,
+current image and replacement image. A 4 MiB part gives each buffer 1,288,872 bytes (with
+8 bytes left over). `GET /api/upload-limits` reports those detected capacities; on a board
+without usable PSRAM the raw and image limits are zero. Saving remains limited by the
+252 KiB flash-slot format even when the playing image is larger.
+
+Only small image index tables, processor state and the sequencer use internal DRAM. Every
+allocation in replacement preparation is fallible, timeline tables live in the unused
+tail of the image buffer, and a replacement is refused if it would leave less than 8 KiB
+of internal heap free. A failed or cancelled request leaves the current playback intact.
+The web firmware supports up to eight channels and eight simultaneous voices; wider
+modules are refused with an explicit message.
+Each image buffer has a preallocated DRAM `Arc` token; reuse waits until its strong and
+weak reference counts prove that the command queue, render engine and retired source have
+all released it. A timeout returns busy and never overwrites the buffer.
+
+The owner's `ARMANI.S3M` acceptance file measures 17,554 bytes raw and 28,812 bytes as a
+byte-identical SPMI image. Host allocation instrumentation measured a 5,158-byte decoder
+peak with nothing retained, 4,034 bytes for fallible image adoption, 1,380 bytes for a
+scan using caller-owned tables, and 420 bytes retained by the live processor. Its scan is
+672 row marks over 122.88 seconds. These are 64-bit host allocation figures; the linked
+Xtensa measurements from the 2026-09-15 acceptance image are 55,948 bytes of main stack
+(`web`), 54,500 bytes (`web,lcd`), and 1,309,104 bytes of application flash (49.94% of
+the factory partition). The lowest free internal heap at logged upload checkpoints was
+45,136 bytes. ARMANI uploaded in 0.71 seconds; a 300,304-byte raw S3M producing a
+600,856-byte image uploaded in 3.02 seconds, and that SPMI uploaded in 5.46 seconds.
+All five formats, malformed/oversized refusal, interrupted/concurrent uploads, repeated
+replacement, and oversized flash-store refusal passed `tests/web_upload_smoke.py`.
+The 60-second HTTP/WebSocket soak delivered 542 telemetry frames. About 220 seconds
+of UART capture showed zero underruns, no crashes, and a DMA error count unchanged
+from its startup baseline of one. Owner listening acceptance remains separate.
 
 The `Arc` that owns an uploaded module, and everything else with an atomic in it, stays in
 **DRAM**: on the classic ESP32 the atomic instructions do not work on PSRAM, so this
@@ -807,6 +838,10 @@ bounds, and all are easy to undo by accident:
   buffer and passes a borrowed handle through the response code. This reduces the two
   largest nested request frames from 38 912 / 27 824 bytes to 8 496 / 2 992 bytes;
   putting future state in PSRAM alone did not bound execution-stack usage.
+* **The web engine has eight channels and eight voices, with scope sample rings disabled
+  and both scalar telemetry rings one snapshot deep.** Scalar status and WebSocket
+  telemetry remain available. This fixed width admits the five-channel owner fixture and
+  rejects wider modules explicitly instead of silently omitting their channels.
 
 `ld/stack-floor.x` fails the build if the main stack drops under 32 KiB. The exact linked
 core-0 stack is logged once at boot. The I8c links leave 57 548 bytes in `web` and 56 116
@@ -842,8 +877,9 @@ assertion fires, shrink or move the new static — do not lower the floor.
   heap (`Arc` refcounts, the host's seqlocks, the telemetry ring). `src/main.rs` has the
   full reasoning; M8-I6 inherits the constraint. I8's picoserve workers use direct,
   aligned monotonic arena claims instead: their task headers and every shared atomic stay
-  in internal DRAM, while one portal future (10 048 bytes) or two station futures (25 584
-  bytes total) occupy the otherwise unused PSRAM after the three 512 KiB module buffers.
+  in internal DRAM. A structural 64 KiB prefix holds one portal future (10 048 bytes) or
+  two station futures (25 584 bytes total); the remainder holds the decoder workspace and
+  three equal dynamic module buffers described above.
 * **The whole async audio driver and refill task run on core 1** — the refill moved there in
   M8-I5, and the driver construction followed after the hardware result above. M8-I3's write-up
   blamed `RenderHalf` not being `Send` on the engine's `Box<dyn EventSource>` and kept everything

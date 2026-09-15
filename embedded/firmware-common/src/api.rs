@@ -362,6 +362,20 @@ pub struct ModuleEntry<'a> {
 /// contract as [`write_status_json`].
 pub fn write_modules_json(out: &mut [u8], entries: &[ModuleEntry]) -> Option<usize> { serde_json_core::to_slice(entries, out).ok() }
 
+/// `GET /api/upload-limits`'s body. Raw uploads and decoded images share the three
+/// dynamically sized PSRAM buffers; stored images retain the fixed flash-slot ceiling.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UploadLimits {
+    pub max_upload_bytes: usize,
+    pub max_image_bytes: usize,
+    pub max_stored_image_bytes: u32,
+}
+
+/// Serialise upload limits into a caller-owned response buffer.
+pub fn write_upload_limits_json(out: &mut [u8], limits: &UploadLimits) -> Option<usize> {
+    serde_json_core::to_slice(limits, out).ok()
+}
+
 /// `POST /api/seek`'s body.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct SeekRequest {
@@ -746,6 +760,23 @@ mod tests {
         assert_eq!(write_status_json(&mut buffer, &status), None);
     }
 
+    #[test]
+    fn write_upload_limits_json_uses_the_public_field_names() {
+        let limits = UploadLimits { max_upload_bytes: 1_288_872, max_image_bytes: 1_288_872, max_stored_image_bytes: 258_048 };
+        let mut buffer = [0u8; 128];
+        let written = write_upload_limits_json(&mut buffer, &limits).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&buffer[..written]).unwrap(),
+            "{\"max_upload_bytes\":1288872,\"max_image_bytes\":1288872,\"max_stored_image_bytes\":258048}"
+        );
+    }
+
+    #[test]
+    fn write_upload_limits_json_reports_a_short_buffer() {
+        let limits = UploadLimits { max_upload_bytes: 1, max_image_bytes: 1, max_stored_image_bytes: 1 };
+        assert_eq!(write_upload_limits_json(&mut [0u8; 8], &limits), None);
+    }
+
     // -- upload state machine --------------------------------------------------------------
 
     #[test]
@@ -817,10 +848,13 @@ mod tests {
     }
 
     #[test]
-    fn abort_frees_the_staging_buffer_for_a_new_reserve() {
+    fn abort_after_an_abandoned_body_frees_staging_for_the_first_retry() {
         let mut upload = Upload::new();
         upload.reserve(100, 1_000).unwrap();
         upload.append(40).unwrap();
+        // A dropped HTTP future leaves this exact state behind. The next handler owns
+        // staging exclusively, aborts the abandoned transfer, and must accept its first
+        // valid retry rather than answer Busy once.
         upload.abort();
         assert!(!upload.in_flight());
         assert_eq!(upload.reserve(200, 1_000), Ok(()));

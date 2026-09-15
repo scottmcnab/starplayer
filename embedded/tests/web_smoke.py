@@ -59,13 +59,28 @@ def get(path):
         return len(body)
 
 
-for path in ["/", "/api/status", "/api/modules"]:
+def get_json(path):
+    with connect_with_retry(lambda: opener.open(base + path, timeout=10)) as response:
+        assert response.status == 200
+        return json.load(response)
+
+
+for path in ["/", "/api/status", "/api/modules", "/api/upload-limits"]:
     print(path, get(path), flush=True)
 
+upload_limits = get_json("/api/upload-limits")
+assert set(upload_limits) == {"max_upload_bytes", "max_image_bytes", "max_stored_image_bytes"}, upload_limits
+assert all(isinstance(value, int) and value >= 0 for value in upload_limits.values()), upload_limits
+assert upload_limits["max_stored_image_bytes"] == 252 * 1024, upload_limits
+assert (upload_limits["max_upload_bytes"] == 0) == (upload_limits["max_image_bytes"] == 0), upload_limits
+if upload_limits["max_image_bytes"]:
+    assert upload_limits["max_stored_image_bytes"] <= upload_limits["max_image_bytes"], upload_limits
+print("upload capacities:", upload_limits, flush=True)
+
 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-    lengths = list(pool.map(get, ["/api/status", "/api/modules"] * 10))
+    lengths = list(pool.map(get, ["/api/status", "/api/modules", "/api/upload-limits"] * 7))
 assert all(length > 0 for length in lengths)
-print("20 concurrent API requests passed", flush=True)
+print("21 concurrent API requests passed", flush=True)
 
 error_cases = [
     ("/missing", None, 404),
@@ -127,6 +142,7 @@ with connect_with_retry(lambda: socket.create_connection((host, 80), timeout=10)
         if time.monotonic() >= next_request:
             get("/api/status")
             get("/api/modules")
+            get("/api/upload-limits")
             next_request = time.monotonic() + 2
 
     connection.sendall(b"\x88\x80" + os.urandom(4))

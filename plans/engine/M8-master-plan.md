@@ -57,7 +57,10 @@ config that worked, and its `provisioning.rs` is the captive portal I6 copies in
 3. **Flash-resident modules are host-built module images** (I2): the loader runs on the
    development machine, the built `Module` is serialised with its i16 PCM 4-byte aligned,
    and the device borrows the PCM straight out of the memory-mapped image. Modules
-   uploaded at run time (I6) are loaded on the device into the PSRAM heap instead.
+   uploaded at run time (I8d) are streamed and decoded directly into claim-only PSRAM
+   buffers. PCM, native patterns and immutable timelines stay there; fallible metadata
+   allocations and atomic reference counts remain in internal DRAM. PSRAM is never a
+   general heap. The web personality has an eight-channel/eight-voice playback limit.
 4. **The display takes the SD-card pin group** (HSPI: GPIO 14/13/15/2/4), so all six keys
    stay available for controls and the SD slot is unsupported. The display is a
    **build-time feature** (`lcd`), off by default, so the audio path is testable without it.

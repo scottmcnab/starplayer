@@ -140,6 +140,8 @@ use firmware_common::{Key, KeyEvent, NowPlaying};
 use starplayer::core::U0F16;
 #[cfg(not(feature = "bench"))]
 use starplayer::dsp::Linear;
+#[cfg(all(not(feature = "bench"), feature = "web"))]
+use starplayer::engine::EngineSettings;
 #[cfg(all(not(feature = "bench"), not(feature = "engine-tone"), not(feature = "matched-tone"), not(feature = "swapped-tone"), not(feature = "reference-rate-tone")))]
 use starplayer::model::Module;
 #[cfg(not(feature = "bench"))]
@@ -317,6 +319,15 @@ async fn main(spawner: Spawner) {
     #[cfg(all(not(feature = "bench"), feature = "web"))]
     let mut psram_arena = psram::Arena::new(psram_start, psram_size);
 
+    #[cfg(all(not(feature = "bench"), feature = "web"))]
+    let network_psram_arena = match psram_arena.split_prefix(psram::NETWORK_BYTES) {
+        Some(network) => network,
+        None => {
+            psram_arena = psram::Arena::empty();
+            psram::Arena::empty()
+        }
+    };
+
     #[cfg(feature = "bench")]
     if psram_size > 0 {
         // SAFETY: `raw_parts` reports the region esp-hal has just mapped, exclusively —
@@ -379,7 +390,7 @@ async fn main(spawner: Spawner) {
             if bridge.has_psram() { "claimed" } else { "unavailable — uploads will be refused" },
             Kib(psram_arena.remaining()),
         );
-        web::Boot { bridge, psram_arena, credentials, wifi: peripherals.WIFI, seed }
+        web::Boot { bridge, psram_arena: network_psram_arena, credentials, wifi: peripherals.WIFI, seed }
     };
 
     #[cfg(not(feature = "bench"))]
@@ -459,7 +470,7 @@ async fn play(
     spawner: Spawner, mut board: board::Board<'static>, audio_parts: audio::Parts, cpu_control: esp_hal::peripherals::CPU_CTRL<'static>,
     software_interrupt1: esp_hal::interrupt::software::SoftwareInterrupt<'static, 1>,
     #[cfg(feature = "lcd")] lcd_parts: lcd::Parts,
-    #[cfg(feature = "web")] web_boot: web::Boot,
+    #[cfg(feature = "web")] mut web_boot: web::Boot,
 ) -> Result<(), &'static str> {
     // Research point 1: what is actually on the control bus. Printed before anything is
     // configured, so a board that answers nowhere is diagnosable from the first boot.
@@ -484,7 +495,13 @@ async fn play(
     #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
     let image = images::boot_module();
     #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
-    let module = Arc::new(Module::from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?);
+    #[cfg(not(feature = "web"))]
+    let module = Arc::new(Module::try_from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?);
+    #[cfg(all(feature = "web", not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))))]
+    let module = match web_boot.bridge.initial_module() {
+        Some(module) => module,
+        None => Arc::new(Module::try_from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?),
+    };
     #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
     println!(
         "MODULE image={} bytes ({}) channels={} samples={}",
@@ -526,8 +543,28 @@ async fn play(
         firmware_common::MATCHED_TONE_RIGHT_PEAK,
     );
 
-    let (render, mut control) = EmbeddedPlayer::<Linear>::open(Arc::clone(&module), OUTPUT_SAMPLE_RATE_HZ)
+    #[cfg(not(feature = "web"))]
+    let (render, mut control) = EmbeddedPlayer::<Linear>::open(module, OUTPUT_SAMPLE_RATE_HZ)
         .map_err(|_| "this build cannot play that module")?;
+    #[cfg(feature = "web")]
+    let (render, mut control) = {
+        let settings = EngineSettings {
+            sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+            channel_count: web::PLAYBACK_CHANNEL_CAPACITY,
+            voice_capacity: web::PLAYBACK_VOICE_CAPACITY,
+            scope_taps: false,
+            telemetry_depth: 1,
+            ..EngineSettings::default()
+        };
+        let (render, mut control) = EmbeddedPlayer::<Linear>::open_empty(OUTPUT_SAMPLE_RATE_HZ, settings)
+            .map_err(|_| "this build cannot allocate the fixed web player")?;
+        if web_boot.bridge.has_psram() {
+            web_boot.bridge.load_initial(&mut control, module)?;
+        } else {
+            control.load(module).map_err(|_| "this build cannot play the linked module")?;
+        }
+        (render, control)
+    };
     let render = RENDER.init(render);
     println!("HEAP after open: {}", esp_alloc::HEAP.stats());
 
