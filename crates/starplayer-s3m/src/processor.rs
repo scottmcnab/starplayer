@@ -187,6 +187,34 @@ impl S3mProcessor {
         }
     }
 
+    /// Fallible form of [`S3mProcessor::with_quirks`] for bounded embedded replacement
+    /// preparation.
+    pub fn try_with_quirks(
+        module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection,
+    ) -> Result<S3mProcessor, alloc::collections::TryReserveError> {
+        let header = module.header();
+        let quirks = quirks.resolve(header.dialect);
+        let global_volume = ((header.global_volume.to_bits() as u32 * 64 + 32767) / 65535) as u8;
+        let channel_count = header.channel_count as usize;
+        let mut channels = alloc::vec::Vec::new();
+        channels.try_reserve_exact(channel_count)?;
+        for index in 0..header.channel_count {
+            let pan = header.default_pan.get(index as usize).copied().map(pan_to_nibble).unwrap_or(crate::header::PAN_CENTRE);
+            channels.push(S3mChannel::new(index, pan));
+        }
+        let flow = PatternFlowState::try_new(quirks.s3m_pattern_loop.flow(), channel_count)?;
+        Ok(S3mProcessor {
+            amiga_limits: header.flags.amiga_limits,
+            module,
+            channels: channels.into_boxed_slice(),
+            sample_rate_hz,
+            global_volume,
+            quirks,
+            flow,
+            last_order: None,
+        })
+    }
+
     /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
     pub const fn quirks(&self) -> QuirkSet { self.quirks }
 

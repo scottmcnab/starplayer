@@ -30,7 +30,7 @@ use alloc::boxed::Box;
 
 use starplayer::core::quirks::QuirkSelection;
 use starplayer::core::{AtEnd, Error, Frame};
-use starplayer::engine::{EngineContext, EventSource, ScanLimits};
+use starplayer::engine::{EngineContext, EventSource, ScanLimits, try_box_source};
 use starplayer::model::Module;
 use starplayer::{NativeSequencer, ScannedSong};
 use starplayer_rt::Arc;
@@ -168,13 +168,44 @@ pub struct SeekableModuleSource {
     request: Arc<SeekMailbox>,
     at_end: Arc<AtEndSlot>,
     applied_at_end: AtEnd,
+    /// Prepared replacement work may span many live audio frames. Rebase its requested
+    /// start once, on the render owner and at the exact frame adoption actually occurs.
+    initial_seek: Option<SeekKind>,
 }
 
 impl SeekableModuleSource {
     /// Wrap `sequencer` around a mailbox and a repeat slot the host keeps a handle to.
     pub fn new(sequencer: NativeSequencer, request: Arc<SeekMailbox>, at_end: Arc<AtEndSlot>) -> SeekableModuleSource {
         let applied_at_end = at_end.get();
-        SeekableModuleSource { sequencer, request, at_end, applied_at_end }
+        SeekableModuleSource { sequencer, request, at_end, applied_at_end, initial_seek: None }
+    }
+
+    /// A fallibly prepared replacement whose first tick will be rebased at adoption.
+    fn prepared(
+        sequencer: NativeSequencer, request: Arc<SeekMailbox>, at_end: Arc<AtEndSlot>, initial_seek: SeekKind,
+    ) -> SeekableModuleSource {
+        let applied_at_end = at_end.get();
+        SeekableModuleSource { sequencer, request, at_end, applied_at_end, initial_seek: Some(initial_seek) }
+    }
+
+    fn seek_at(&mut self, seek: SeekKind, frame: Frame) {
+        match seek {
+            SeekKind::Frame(song_frame) => { let _ = self.sequencer.seek_frame(song_frame, frame); }
+            SeekKind::Order(order) => { let _ = self.sequencer.seek_order_at(order, frame); }
+            SeekKind::Row(row) => self.sequencer.seek_row(row),
+            SeekKind::None => { let _ = self.sequencer.seek_order_at(0, frame); }
+        }
+        self.sequencer.restart_clock_at(frame);
+    }
+
+    fn initial_seek_at(&mut self, seek: SeekKind, frame: Frame) {
+        if let SeekKind::Row(row) = seek {
+            let _ = self.sequencer.seek_order_at(0, frame);
+            self.sequencer.seek_row(row);
+            self.sequencer.restart_clock_at(frame);
+        } else {
+            self.seek_at(seek, frame);
+        }
     }
 }
 
@@ -193,6 +224,9 @@ impl EventSource for SeekableModuleSource {
     fn advance_to(&mut self, frame: Frame) { self.sequencer.advance_to(frame); }
 
     fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        if let Some(initial_seek) = self.initial_seek.take() {
+            self.initial_seek_at(initial_seek, frame);
+        }
         let at_end = self.at_end.get();
         if at_end != self.applied_at_end {
             self.sequencer.set_at_end(at_end);
@@ -204,13 +238,7 @@ impl EventSource for SeekableModuleSource {
             // An order the module does not have, or a frame past the end of the scan, is a
             // caller-side mistake and not something the audio realm can report: the
             // sequencer stays where it was, which is the only answer that keeps playing.
-            match request.kind {
-                SeekKind::Order(order) => { let _ = self.sequencer.seek_order_at(order, frame); }
-                SeekKind::Row(row) => self.sequencer.seek_row(row),
-                SeekKind::Frame(song_frame) => { let _ = self.sequencer.seek_frame(song_frame, frame); }
-                SeekKind::None => {}
-            }
-            self.sequencer.restart_clock_at(frame);
+            self.seek_at(request.kind, frame);
         }
         if self.sequencer.next_event_frame().is_some_and(|next| next <= frame) {
             self.sequencer.dispatch(frame, context);
@@ -276,6 +304,46 @@ pub fn build_source(module: Arc<Module>, sample_rate_hz: u32, start: SeekKind, f
     sequencer.restart_clock_at(frame);
     let source = SeekableModuleSource::new(sequencer, Arc::clone(&handles.seek), Arc::clone(&handles.at_end));
     Ok(BuiltSource { source: Box::new(source), scanned })
+}
+
+/// Fallible replacement preparation. This performs the same scan and builds the same
+/// native sequencer as [`build_source`], while reporting every allocation failure to the
+/// control task before anything is queued to the render half.
+pub fn try_build_source(
+    module: Arc<Module>, sample_rate_hz: u32, start: SeekKind, handles: &SourceHandles, voice_capacity: usize,
+) -> Result<BuiltSource, Error> {
+    let scanned = starplayer::try_scan_song_with_voice_capacity(
+        &module, sample_rate_hz, ScanLimits::for_rate(sample_rate_hz), voice_capacity,
+    )?;
+    finish_try_build_source(module, sample_rate_hz, start, handles, voice_capacity, scanned)
+}
+
+/// [`try_build_source`] with the scan's large immutable row tables supplied by the
+/// caller, so an embedded host can keep them in the unused tail of its module-image
+/// buffer rather than internal RAM.
+pub fn try_build_source_in(
+    module: Arc<Module>, sample_rate_hz: u32, start: SeekKind, handles: &SourceHandles, voice_capacity: usize,
+    marks: &'static mut [starplayer::engine::RowMark], order_marks: &'static mut [Option<u32>],
+) -> Result<BuiltSource, Error> {
+    let scanned = starplayer::try_scan_song_in_with_voice_capacity(
+        &module, sample_rate_hz, ScanLimits::for_rate(sample_rate_hz), voice_capacity, marks, order_marks,
+    )?;
+    finish_try_build_source(module, sample_rate_hz, start, handles, voice_capacity, scanned)
+}
+
+fn finish_try_build_source(
+    module: Arc<Module>, sample_rate_hz: u32, start: SeekKind, handles: &SourceHandles, voice_capacity: usize,
+    scanned: ScannedSong,
+) -> Result<BuiltSource, Error> {
+    let at_end = handles.at_end.get();
+    let quirks = QuirkSelection::Override(scanned.quirks);
+    let mut sequencer = NativeSequencer::try_new_with_voice_capacity(module, sample_rate_hz, quirks, voice_capacity)?;
+    let timeline = scanned.timeline.try_clone().map_err(|_| Error::Resource("not enough memory for the playback timeline"))?;
+    sequencer.set_timeline(timeline);
+    sequencer.set_at_end(at_end);
+    let source = SeekableModuleSource::prepared(sequencer, Arc::clone(&handles.seek), Arc::clone(&handles.at_end), start);
+    let source = try_box_source(source).map_err(|_| Error::Resource("not enough memory for the playback source"))?;
+    Ok(BuiltSource { source, scanned })
 }
 
 #[cfg(test)]

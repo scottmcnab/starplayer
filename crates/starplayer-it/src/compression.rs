@@ -184,7 +184,7 @@ fn decode_block(bytes: &[u8], wanted: usize, parameters: Parameters, is_215: boo
                 let Some(fetched) = stream.read(parameters.fetch_a) else { return };
                 width = change_width(width, fetched);
             } else {
-                write_sample(value, top_bit, parameters, is_215, &mut integrators, output);
+                output.push(decode_sample(value, top_bit, parameters, is_215, &mut integrators));
                 remaining -= 1;
             }
         } else if width < parameters.default_width {
@@ -194,7 +194,7 @@ fn decode_block(bytes: &[u8], wanted: usize, parameters: Parameters, is_215: boo
             if value >= low && value <= high {
                 width = change_width(width, (value - low) as u32);
             } else {
-                write_sample(value, top_bit, parameters, is_215, &mut integrators, output);
+                output.push(decode_sample(value, top_bit, parameters, is_215, &mut integrators));
                 remaining -= 1;
             }
         } else {
@@ -202,7 +202,7 @@ fn decode_block(bytes: &[u8], wanted: usize, parameters: Parameters, is_215: boo
             if value & top_bit != 0 {
                 width = ((value & !top_bit) as u32).saturating_add(1);
             } else {
-                write_sample(value & !top_bit, 0, parameters, is_215, &mut integrators, output);
+                output.push(decode_sample(value & !top_bit, 0, parameters, is_215, &mut integrators));
                 remaining -= 1;
             }
         }
@@ -210,7 +210,7 @@ fn decode_block(bytes: &[u8], wanted: usize, parameters: Parameters, is_215: boo
 }
 
 /// Sign-extend, integrate and store one residual.
-fn write_sample(value: i32, top_bit: i32, parameters: Parameters, is_215: bool, integrators: &mut Integrators, output: &mut Vec<i16>) {
+fn decode_sample(value: i32, top_bit: i32, parameters: Parameters, is_215: bool, integrators: &mut Integrators) -> i16 {
     let residual = match top_bit != 0 && value & top_bit != 0 {
         true => value - (top_bit << 1),
         false => value,
@@ -221,12 +221,279 @@ fn write_sample(value: i32, top_bit: i32, parameters: Parameters, is_215: bool, 
         true => integrators.second,
         false => integrators.first,
     };
-    output.push(match parameters.wide {
+    match parameters.wide {
         true => integrated as u16 as i16,
         // The decompressed 8-bit value is *signed*, unlike raw IT 8-bit PCM, so it widens
         // by a shift rather than through the unsigned-origin exclusive-or.
         false => (integrated as u8 as i8 as i16) * 256,
-    });
+    }
+}
+
+/// Progress made by one bounded call to [`IncrementalDecompressor::decode_into`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DecodeChunk {
+    /// Frames written to the start of the caller's output slice.
+    pub written: usize,
+    /// Source bytes crossed during this call, including headers and skipped block tails.
+    pub input_consumed: usize,
+    /// Whether decoding and the final current-block skip are complete.
+    pub finished: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ReadBits {
+    Value(u32),
+    NeedInput,
+    EndOfBlock,
+}
+
+/// Resumable state for one compressed block.
+#[derive(Copy, Clone, Debug)]
+struct IncrementalBlock {
+    end: usize,
+    samples_remaining: usize,
+    width: u32,
+    integrators: Integrators,
+    bit_buffer: u32,
+    available_bits: u32,
+    pending_mode_a_escape: bool,
+    skipping: bool,
+}
+
+impl IncrementalBlock {
+    const fn new(end: usize, samples: usize, default_width: u32) -> IncrementalBlock {
+        IncrementalBlock {
+            end,
+            samples_remaining: samples,
+            width: default_width,
+            integrators: Integrators { first: 0, second: 0 },
+            bit_buffer: 0,
+            available_bits: 0,
+            pending_mode_a_escape: false,
+            skipping: false,
+        }
+    }
+}
+
+/// Allocation-free, bounded IT 2.14 / 2.15 sample decompression.
+///
+/// The decoder borrows the complete compressed channel stream and retains all block,
+/// bit-reader, width-change and integrator state between calls. Each call crosses at
+/// most `max_input_bytes` new source bytes and writes at most `output.len()` frames.
+/// [`DecodeChunk::input_consumed`] is the per-call source-byte count; use
+/// [`IncrementalDecompressor::total_input_consumed`] after completion to locate a stereo
+/// sample's right-channel stream.
+#[derive(Clone, Debug)]
+pub struct IncrementalDecompressor<'data> {
+    data: &'data [u8],
+    frames: usize,
+    frames_written: usize,
+    parameters: Parameters,
+    is_215: bool,
+    cursor: usize,
+    header_low: Option<u8>,
+    block: Option<IncrementalBlock>,
+    finished: bool,
+}
+
+impl<'data> IncrementalDecompressor<'data> {
+    /// Construct a decoder for one compressed sample channel.
+    pub const fn new(data: &'data [u8], frames: usize, wide: bool, is_215: bool) -> IncrementalDecompressor<'data> {
+        IncrementalDecompressor {
+            data,
+            frames,
+            frames_written: 0,
+            parameters: Parameters::for_width(wide),
+            is_215,
+            cursor: 0,
+            header_low: None,
+            block: None,
+            finished: frames == 0,
+        }
+    }
+
+    /// Total source offset crossed since construction.
+    ///
+    /// Once a returned chunk has `finished == true`, this equals [`decompress`]'s
+    /// consumed-byte result and can be used as the start of a stereo right channel.
+    pub const fn total_input_consumed(&self) -> usize {
+        self.cursor
+    }
+
+    /// Decode a bounded chunk into caller-owned storage.
+    ///
+    /// A zero input budget can still emit a frame whose bits were buffered by an earlier
+    /// call. An empty output stops before reading another symbol, except that after all
+    /// requested frames have been emitted it may spend the input budget skipping the
+    /// current block's tail so the final consumed offset remains exact.
+    pub fn decode_into(&mut self, output: &mut [i16], max_input_bytes: usize) -> DecodeChunk {
+        let starting_cursor = self.cursor;
+        let mut input_remaining = max_input_bytes;
+        let mut written = 0usize;
+
+        while !self.finished {
+            if self.block.is_none() {
+                if self.frames_written >= self.frames {
+                    self.finished = true;
+                    break;
+                }
+                if written >= output.len() {
+                    break;
+                }
+
+                if self.header_low.is_none() {
+                    // Match the eager decoder: a lone header byte is not consumed.
+                    if self.data.len().saturating_sub(self.cursor) < 2 {
+                        self.finished = true;
+                        break;
+                    }
+                    if input_remaining == 0 {
+                        break;
+                    }
+                    let Some(low) = self.data.get(self.cursor).copied() else {
+                        self.finished = true;
+                        break;
+                    };
+                    self.header_low = Some(low);
+                    self.cursor = self.cursor.saturating_add(1);
+                    input_remaining -= 1;
+                }
+
+                if input_remaining == 0 {
+                    break;
+                }
+                let Some(high) = self.data.get(self.cursor).copied() else {
+                    self.finished = true;
+                    break;
+                };
+                self.cursor = self.cursor.saturating_add(1);
+                input_remaining -= 1;
+                let Some(low) = self.header_low.take() else {
+                    self.finished = true;
+                    break;
+                };
+                let size = u16::from_le_bytes([low, high]) as usize;
+                if size == 0 {
+                    continue;
+                }
+
+                let end = core::cmp::min(self.cursor.saturating_add(size), self.data.len());
+                let wanted = core::cmp::min(self.frames - self.frames_written, self.parameters.block_samples);
+                self.block = Some(IncrementalBlock::new(end, wanted, self.parameters.default_width));
+                continue;
+            }
+
+            let Some(block) = self.block.as_mut() else { continue };
+            if block.skipping
+                || block.samples_remaining == 0
+                || block.width > self.parameters.default_width
+                || self.frames_written >= self.frames
+            {
+                block.skipping = true;
+                let skipped = core::cmp::min(block.end.saturating_sub(self.cursor), input_remaining);
+                self.cursor = self.cursor.saturating_add(skipped);
+                input_remaining -= skipped;
+                if self.cursor < block.end {
+                    break;
+                }
+                self.block = None;
+                if self.frames_written >= self.frames {
+                    self.finished = true;
+                }
+                continue;
+            }
+
+            if written >= output.len() {
+                break;
+            }
+
+            if block.pending_mode_a_escape {
+                match read_incremental_bits(self.data, &mut self.cursor, &mut input_remaining, block, self.parameters.fetch_a) {
+                    ReadBits::Value(fetched) => {
+                        block.width = change_width(block.width, fetched);
+                        block.pending_mode_a_escape = false;
+                        continue;
+                    }
+                    ReadBits::NeedInput => break,
+                    ReadBits::EndOfBlock => {
+                        block.skipping = true;
+                        continue;
+                    }
+                }
+            }
+
+            let value = match read_incremental_bits(self.data, &mut self.cursor, &mut input_remaining, block, block.width) {
+                ReadBits::Value(value) => value as i32,
+                ReadBits::NeedInput => break,
+                ReadBits::EndOfBlock => {
+                    block.skipping = true;
+                    continue;
+                }
+            };
+            let top_bit = 1i32 << (block.width - 1);
+
+            let sample = if block.width <= 6 {
+                if value == top_bit {
+                    block.pending_mode_a_escape = true;
+                    continue;
+                }
+                decode_sample(value, top_bit, self.parameters, self.is_215, &mut block.integrators)
+            } else if block.width < self.parameters.default_width {
+                let low = top_bit + self.parameters.lower_b;
+                let high = top_bit + self.parameters.upper_b;
+                if value >= low && value <= high {
+                    block.width = change_width(block.width, (value - low) as u32);
+                    continue;
+                }
+                decode_sample(value, top_bit, self.parameters, self.is_215, &mut block.integrators)
+            } else if value & top_bit != 0 {
+                block.width = ((value & !top_bit) as u32).saturating_add(1);
+                continue;
+            } else {
+                decode_sample(value & !top_bit, 0, self.parameters, self.is_215, &mut block.integrators)
+            };
+
+            let Some(slot) = output.get_mut(written) else { break };
+            *slot = sample;
+            written += 1;
+            self.frames_written += 1;
+            block.samples_remaining -= 1;
+        }
+
+        DecodeChunk {
+            written,
+            input_consumed: self.cursor - starting_cursor,
+            finished: self.finished,
+        }
+    }
+}
+
+fn read_incremental_bits(
+    data: &[u8],
+    cursor: &mut usize,
+    input_remaining: &mut usize,
+    block: &mut IncrementalBlock,
+    count: u32,
+) -> ReadBits {
+    while block.available_bits < count {
+        if *cursor >= block.end {
+            return ReadBits::EndOfBlock;
+        }
+        if *input_remaining == 0 {
+            return ReadBits::NeedInput;
+        }
+        let Some(byte) = data.get(*cursor).copied() else { return ReadBits::EndOfBlock };
+        block.bit_buffer |= (byte as u32) << block.available_bits;
+        block.available_bits += 8;
+        *cursor = (*cursor).saturating_add(1);
+        *input_remaining -= 1;
+    }
+
+    let mask = (1u32 << count) - 1;
+    let value = block.bit_buffer & mask;
+    block.bit_buffer >>= count;
+    block.available_bits -= count;
+    ReadBits::Value(value)
 }
 
 /// Decode one channel of an IT 2.14 / 2.15 compressed sample.
@@ -327,6 +594,44 @@ mod tests {
             writer.write(DEFAULT_WIDTH_8, *residual as u32);
         }
         block(writer.finish())
+    }
+
+    fn sixteen_bit_mode_c(residuals: &[u16]) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        for residual in residuals {
+            writer.write(DEFAULT_WIDTH_16, *residual as u32);
+        }
+        block(writer.finish())
+    }
+
+    fn invalid_width_block(wide: bool) -> Vec<u8> {
+        let default_width = Parameters::for_width(wide).default_width;
+        let mut writer = BitWriter::default();
+        writer.write(default_width, (1 << (default_width - 1)) | default_width);
+        let mut bits = writer.finish();
+        bits.extend_from_slice(&[0xAA; 9]);
+        block(bits)
+    }
+
+    fn incrementally_decompress(data: &[u8], frames: usize, wide: bool, is_215: bool) -> (Vec<i16>, usize) {
+        let mut decoder = IncrementalDecompressor::new(data, frames, wide, is_215);
+        let mut pcm = Vec::new();
+        let mut call = 0usize;
+        loop {
+            let output_capacity = call % 7 + 1;
+            let input_budget = call % 3 + 1;
+            let mut output = [0i16; 7];
+            let chunk = decoder.decode_into(&mut output[..output_capacity], input_budget);
+            assert!(chunk.written <= output_capacity);
+            assert!(chunk.input_consumed <= input_budget);
+            assert!(chunk.finished || chunk.written > 0 || chunk.input_consumed > 0, "call {call} made no progress");
+            pcm.extend_from_slice(&output[..chunk.written]);
+            call += 1;
+            assert!(call <= data.len().saturating_mul(4).saturating_add(frames).saturating_add(16));
+            if chunk.finished {
+                return (pcm, decoder.total_input_consumed());
+            }
+        }
     }
 
     #[test]
@@ -475,6 +780,130 @@ mod tests {
         for current in 1..=DEFAULT_WIDTH_16 {
             for fetched in 0..16u32 {
                 assert_ne!(change_width(current, fetched), current, "current {current}, fetched {fetched}");
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_input_and_output_steps_match_the_eager_decoder_for_all_variants() {
+        let eight_residuals = [1, 255, 4, 128, 127, 2, 254, 0, 19, 237, 3, 8, 248];
+        let sixteen_residuals = [1, 0xFFFF, 4, 0x8000, 0x7FFF, 2, 0xFFFE, 0, 1234, 0xFB2E, 3, 8, 0xFFF8];
+
+        for is_215 in [false, true] {
+            let mut eight_data = vec![0, 0];
+            eight_data.extend_from_slice(&invalid_width_block(false));
+            eight_data.extend_from_slice(&eight_bit_mode_c(&eight_residuals));
+            assert_eq!(
+                incrementally_decompress(&eight_data, eight_residuals.len(), false, is_215),
+                decompress(&eight_data, eight_residuals.len(), false, is_215),
+            );
+
+            let mut sixteen_data = vec![0, 0];
+            sixteen_data.extend_from_slice(&invalid_width_block(true));
+            sixteen_data.extend_from_slice(&sixteen_bit_mode_c(&sixteen_residuals));
+            assert_eq!(
+                incrementally_decompress(&sixteen_data, sixteen_residuals.len(), true, is_215),
+                decompress(&sixteen_data, sixteen_residuals.len(), true, is_215),
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_decoding_crosses_real_sample_block_limits_and_resets_integrators() {
+        let mut eight_residuals = vec![0u8; Parameters::EIGHT_BIT.block_samples];
+        eight_residuals[0] = 1;
+        let mut eight_data = eight_bit_mode_c(&eight_residuals);
+        eight_data.extend_from_slice(&eight_bit_mode_c(&[2]));
+        assert_eq!(
+            incrementally_decompress(&eight_data, eight_residuals.len() + 1, false, false),
+            decompress(&eight_data, eight_residuals.len() + 1, false, false),
+        );
+
+        let mut sixteen_residuals = vec![0u16; Parameters::SIXTEEN_BIT.block_samples];
+        sixteen_residuals[0] = 1;
+        let mut sixteen_data = sixteen_bit_mode_c(&sixteen_residuals);
+        sixteen_data.extend_from_slice(&sixteen_bit_mode_c(&[2]));
+        assert_eq!(
+            incrementally_decompress(&sixteen_data, sixteen_residuals.len() + 1, true, false),
+            decompress(&sixteen_data, sixteen_residuals.len() + 1, true, false),
+        );
+    }
+
+    #[test]
+    fn a_mode_a_escape_resumes_between_its_value_and_width_bits() {
+        let mut writer = BitWriter::default();
+        writer.write(DEFAULT_WIDTH_8, (1 << (DEFAULT_WIDTH_8 - 1)) | 3);
+        writer.write(4, 1);
+        writer.write(4, 1 << 3);
+        writer.write(FETCH_A_8, 7);
+        writer.write(DEFAULT_WIDTH_8, 2);
+        let data = block(writer.finish());
+
+        assert_eq!(incrementally_decompress(&data, 2, false, false), decompress(&data, 2, false, false));
+    }
+
+    #[test]
+    fn buffered_bits_can_emit_with_no_new_input_and_empty_output_can_finish_a_block_skip() {
+        let mut writer = BitWriter::default();
+        writer.write(DEFAULT_WIDTH_8, 1 << (DEFAULT_WIDTH_8 - 1));
+        for _ in 0..8 {
+            writer.write(1, 0);
+        }
+        let mut bits = writer.finish();
+        bits.extend_from_slice(&[0x55; 9]);
+        let data = block(bits);
+        let mut decoder = IncrementalDecompressor::new(&data, 2, false, false);
+        let mut first = [0i16; 1];
+        let first_chunk = decoder.decode_into(&mut first, 4);
+        assert_eq!(first_chunk, DecodeChunk { written: 1, input_consumed: 4, finished: false });
+
+        let mut second = [1i16; 1];
+        let second_chunk = decoder.decode_into(&mut second, 0);
+        assert_eq!(second_chunk, DecodeChunk { written: 1, input_consumed: 0, finished: false });
+        assert_eq!(second, [0]);
+
+        while !decoder.decode_into(&mut [], 3).finished {}
+        assert_eq!(decoder.total_input_consumed(), data.len());
+    }
+
+    #[test]
+    fn zero_capacity_and_zero_budget_do_not_start_or_consume_a_stream() {
+        let data = eight_bit_mode_c(&[1]);
+        let mut decoder = IncrementalDecompressor::new(&data, 1, false, false);
+        assert_eq!(decoder.decode_into(&mut [], usize::MAX), DecodeChunk { written: 0, input_consumed: 0, finished: false });
+        assert_eq!(decoder.decode_into(&mut [0], 0), DecodeChunk { written: 0, input_consumed: 0, finished: false });
+        assert_eq!(decoder.total_input_consumed(), 0);
+    }
+
+    #[test]
+    fn incremental_truncation_and_header_consumption_match_the_eager_offset() {
+        let mut data = eight_bit_mode_c(&[1, 2, 3]);
+        data.truncate(4);
+        assert_eq!(incrementally_decompress(&data, 20, false, false), decompress(&data, 20, false, false));
+
+        let singleton = [0x10];
+        let mut decoder = IncrementalDecompressor::new(&singleton, 20, false, false);
+        assert_eq!(decoder.decode_into(&mut [0], 1), DecodeChunk { written: 0, input_consumed: 0, finished: true });
+    }
+
+    #[test]
+    fn incremental_and_eager_decoders_agree_on_malformed_byte_streams() {
+        let mut random = 0x9E37_79B9u32;
+        for length in 0..128usize {
+            let mut data = Vec::with_capacity(length);
+            for _ in 0..length {
+                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                data.push((random >> 24) as u8);
+            }
+            let frames = (random as usize) % 41;
+            for wide in [false, true] {
+                for is_215 in [false, true] {
+                    assert_eq!(
+                        incrementally_decompress(&data, frames, wide, is_215),
+                        decompress(&data, frames, wide, is_215),
+                        "length {length}, frames {frames}, wide {wide}, IT 2.15 {is_215}",
+                    );
+                }
             }
         }
     }

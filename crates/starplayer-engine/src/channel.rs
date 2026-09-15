@@ -6,7 +6,8 @@
 //! not the same thing, because IT lets a channel keep sounding *several* voices at once.
 
 use alloc::boxed::Box;
-use alloc::vec;
+use alloc::collections::TryReserveError;
+use alloc::vec::Vec;
 
 use starplayer_core::{ChannelId, Step, VoiceId, VoiceParams};
 use starplayer_mixer::{SampleRegion, VoicePool, VoiceTag};
@@ -68,7 +69,16 @@ impl ChannelTable {
     /// A table of `count` silent, unmuted channels, clamped to
     /// [`ChannelTable::MAX_CHANNELS`].
     pub fn new(count: usize) -> ChannelTable {
-        ChannelTable { channels: vec![Channel::default(); count.min(ChannelTable::MAX_CHANNELS)].into_boxed_slice() }
+        Self::try_new(count).expect("channel table allocation failed")
+    }
+
+    /// Allocate channel state, returning an error if the allocator cannot supply it.
+    pub fn try_new(count: usize) -> Result<ChannelTable, TryReserveError> {
+        let count = count.min(ChannelTable::MAX_CHANNELS);
+        let mut channels = Vec::new();
+        channels.try_reserve_exact(count)?;
+        channels.resize(count, Channel::default());
+        Ok(ChannelTable { channels: channels.into_boxed_slice() })
     }
 
     /// How many lanes there are.

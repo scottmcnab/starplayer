@@ -704,7 +704,12 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// If the order list has no playable entry at all the sequencer starts stopped, which
     /// is the only safe answer for a module that a fuzzer produced.
     pub fn new(tempo_model: Tempo, data: Data, processor: Processor, settings: SequencerSettings) -> PatternSequencer<Tempo, Processor, Data> {
-        let detector = LoopDetector::new(&data);
+        Self::try_new(tempo_model, data, processor, settings).expect("sequencer allocation failed")
+    }
+
+    /// Construct the sequencer with fallible loop-detector allocation.
+    pub fn try_new(tempo_model: Tempo, data: Data, processor: Processor, settings: SequencerSettings) -> Result<PatternSequencer<Tempo, Processor, Data>, alloc::collections::TryReserveError> {
+        let detector = LoopDetector::try_new(&data)?;
         let mut sequencer = PatternSequencer {
             clock: FrameClock::new(tempo_model, settings.sample_rate_hz, settings.first_tick_frame),
             processor,
@@ -734,7 +739,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         // `move_to_order` may have reported a wrap on the way in; a song that has not
         // started yet has not come round again.
         sequencer.last_arrival = RowArrival::Start;
-        sequencer
+        Ok(sequencer)
     }
 
     /// The tempo model this sequencer's clock runs on.

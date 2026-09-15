@@ -119,6 +119,9 @@ macro_rules! forward_mut {
     }};
 }
 
+#[cfg(any(feature = "s3m", feature = "mod", feature = "mtm", feature = "xm", feature = "it"))]
+fn preparation_resource(_: alloc::collections::TryReserveError) -> Error { Error::Resource("not enough memory for playback preparation") }
+
 impl NativeSequencer {
     /// The playback sequencer for `module`'s format, built exactly as that format crate's
     /// `sequencer_with_quirks` builds it: the selection is resolved once against the
@@ -205,6 +208,84 @@ impl NativeSequencer {
                 let processor = starplayer_it::ItProcessor::with_quirks(Arc::clone(&module), rate, QuirkSelection::Override(resolved));
                 let data = starplayer_it::ItPatternData(module);
                 Ok(NativeSequencer::It(PatternSequencer::new(resolved.tempo_model, data, processor, settings)))
+            }
+            // Every `ModuleFormat` now has an arm, so this is dead in the default build
+            // and live only where a format feature is off.
+            #[allow(unreachable_patterns)]
+            _ => Err(NO_NATIVE_PROCESSOR),
+        }
+    }
+
+    /// Fallible counterpart of [`Self::new`], for memory-constrained hosts.
+    pub fn try_new(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection) -> Result<NativeSequencer, Error> {
+        let voice_capacity = crate::recommended_voice_capacity(&module);
+        Self::try_new_with_voice_capacity(module, sample_rate_hz, quirks, voice_capacity)
+    }
+
+    /// Prepare for the host's actual fixed voice pool. IT only allocates reachable voice states.
+    pub fn try_new_with_voice_capacity(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection, voice_capacity: usize) -> Result<NativeSequencer, Error> {
+        let restart_order = match module.header().format {
+            #[cfg(feature = "xm")]
+            ModuleFormat::Xm => starplayer_xm::XmFormatExtra::from_header(module.header()).restart_position,
+            _ => 0,
+        };
+        let settings = SequencerSettings {
+            sample_rate_hz, first_tick_frame: Frame::ZERO,
+            initial_speed: module.header().initial_speed, initial_tempo_bpm: module.header().initial_tempo,
+            restart_order, end_of_song: starplayer_engine::EndOfSongPolicy::Loop,
+        };
+        Self::try_with_settings_and_voice_capacity(module, quirks, settings, voice_capacity)
+    }
+
+    /// Fallible counterpart of [`Self::with_settings`].
+    pub fn try_with_settings(module: Arc<Module>, quirks: QuirkSelection, settings: SequencerSettings) -> Result<NativeSequencer, Error> {
+        let voice_capacity = crate::recommended_voice_capacity(&module);
+        Self::try_with_settings_and_voice_capacity(module, quirks, settings, voice_capacity)
+    }
+
+    /// Fallibly prepare explicit timing settings with the host's actual voice capacity.
+    pub fn try_with_settings_and_voice_capacity(module: Arc<Module>, quirks: QuirkSelection, settings: SequencerSettings, voice_capacity: usize) -> Result<NativeSequencer, Error> {
+        let rate = settings.sample_rate_hz;
+        let _ = (&module, quirks, settings, rate, voice_capacity);
+        match module.header().format {
+            #[cfg(feature = "s3m")]
+            ModuleFormat::S3m => {
+                let resolved = quirks.resolve(module.header().dialect);
+                let processor = starplayer_s3m::S3mProcessor::try_with_quirks(Arc::clone(&module), rate, QuirkSelection::Override(resolved)).map_err(preparation_resource)?;
+                let data = starplayer_s3m::S3mPatternData(module);
+                Ok(NativeSequencer::S3m(PatternSequencer::try_new(resolved.tempo_model, data, processor, settings).map_err(preparation_resource)?))
+            }
+            #[cfg(feature = "mod")]
+            ModuleFormat::Mod => {
+                let resolved = quirks.resolve(module.header().dialect);
+                let semantics = starplayer_mod::EffectSemantics::ProTracker;
+                let processor = starplayer_mod::ModProcessor::try_with_semantics_and_quirks(Arc::clone(&module), rate, semantics, QuirkSelection::Override(resolved)).map_err(preparation_resource)?;
+                let data = starplayer_mod::ModPatternData(module);
+                Ok(NativeSequencer::Mod(PatternSequencer::try_new(resolved.tempo_model, data, processor, settings).map_err(preparation_resource)?))
+            }
+            #[cfg(feature = "mtm")]
+            ModuleFormat::Mtm => {
+                // An MTM *is* the MultiTracker dialect by construction, so it resolves
+                // against that rather than against the header — `sequencer_with_quirks`
+                // does the same, and a header a test assembled by hand is still an MTM.
+                let resolved = quirks.resolve(starplayer_core::quirks::FormatDialect::MultiTracker);
+                let processor = starplayer_mtm::MtmProcessor::try_with_quirks(Arc::clone(&module), rate, QuirkSelection::Override(resolved)).map_err(preparation_resource)?;
+                let data = starplayer_mtm::MtmPatternData(module);
+                Ok(NativeSequencer::Mtm(PatternSequencer::try_new(resolved.tempo_model, data, processor, settings).map_err(preparation_resource)?))
+            }
+            #[cfg(feature = "xm")]
+            ModuleFormat::Xm => {
+                let resolved = quirks.resolve(module.header().dialect);
+                let processor = starplayer_xm::XmProcessor::try_with_quirks(Arc::clone(&module), rate, QuirkSelection::Override(resolved)).map_err(preparation_resource)?;
+                let data = starplayer_xm::XmPatternData(module);
+                Ok(NativeSequencer::Xm(PatternSequencer::try_new(resolved.tempo_model, data, processor, settings).map_err(preparation_resource)?))
+            }
+            #[cfg(feature = "it")]
+            ModuleFormat::It => {
+                let resolved = quirks.resolve(module.header().dialect);
+                let processor = starplayer_it::ItProcessor::try_with_quirks_and_voice_capacity(Arc::clone(&module), rate, QuirkSelection::Override(resolved), voice_capacity).map_err(preparation_resource)?;
+                let data = starplayer_it::ItPatternData(module);
+                Ok(NativeSequencer::It(PatternSequencer::try_new(resolved.tempo_model, data, processor, settings).map_err(preparation_resource)?))
             }
             // Every `ModuleFormat` now has an arm, so this is dead in the default build
             // and live only where a format feature is off.

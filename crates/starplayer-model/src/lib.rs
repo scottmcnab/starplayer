@@ -107,7 +107,11 @@ pub mod text;
 pub use builder::{ModuleBuilder, ping_pong_reflect};
 pub use enhance::{EnhancedPcm, SampleEnhancer, SamplePcm};
 pub use header::{ModuleFlags, ModuleFormat, ModuleHeader};
-pub use image::{IMAGE_MAGIC, IMAGE_VERSION};
+pub use image::{
+    DecodeBudget, IMAGE_MAGIC, IMAGE_VERSION, ImageDecodeError, ImageDecodeStatus,
+    image_workspace_i16, ModuleImageOutput, ModuleImagePlan, SliceImageOutput,
+    MINIMUM_DECODE_INPUT_BUDGET,
+};
 pub use instrument::{
     DuplicateAction, DuplicateCheck, Envelope, EnvelopePoint, EnvelopeSpan, InstrumentDef,
     NOTE_MAP_LENGTH, NewNoteAction,
@@ -123,7 +127,7 @@ pub use sample::{
     SampleIndex, SampleSpec, SustainLoop,
 };
 pub use storage::{BlobStorage, PcmStorage};
-pub use text::{cp437_char, decode_cp437};
+pub use text::{cp437_char, decode_cp437, try_clone_text, try_decode_cp437};
 
 // Re-exported so a format crate can name every type it needs from this one crate.
 pub use starplayer_core::quirks::FormatDialect;

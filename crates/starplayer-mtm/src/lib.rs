@@ -13,10 +13,12 @@
 extern crate alloc;
 
 pub mod loader;
+pub mod image;
 pub mod pattern;
 pub mod processor;
 
 pub use loader::{TempoMode, load, load_from, probe, probe_reader, tempo_mode, track_count};
+pub use image::ImageDecoder;
 pub use pattern::{CELL_BYTES, MtmCell, PatternView, ROWS};
 pub use processor::{MtmPatternData, MtmProcessor, recommended_voice_capacity, sequencer_for, sequencer_with_quirks};
 

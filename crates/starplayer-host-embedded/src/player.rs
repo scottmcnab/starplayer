@@ -50,7 +50,7 @@ use starplayer_telemetry::{Snapshot, SongEnd, TelemetryReader};
 
 use crate::Error;
 use crate::seqlock::SeqlockU64;
-use crate::source::{SeekKind, SeekRequest, SourceHandles, build_source};
+use crate::source::{BuiltSource, SeekKind, SeekRequest, SourceHandles, build_source, try_build_source, try_build_source_in};
 use crate::transport::{TRANSPORT_GAIN_UNITY, Transport};
 
 /// Commands the control side may have outstanding before it starts getting refusals.
@@ -468,12 +468,22 @@ pub struct ControlHalf {
     taps: Arc<Taps>,
     handles: SourceHandles,
     sample_rate_hz: u32,
+    voice_capacity: usize,
+    channel_capacity: usize,
     at_end: AtEnd,
     fade_frames: u32,
     master_volume: U0F16,
     module: Option<Arc<Module>>,
     scanned: Option<ScannedSong>,
     collected: usize,
+}
+
+/// A completely built replacement that has not crossed to the render half yet. A board
+/// may inspect its remaining heap budget or a request-cancellation flag before committing
+/// it; dropping this value leaves current playback untouched.
+pub struct PreparedLoad {
+    module: Arc<Module>,
+    built: BuiltSource,
 }
 
 impl ControlHalf {
@@ -494,10 +504,46 @@ impl ControlHalf {
         // is monotonic and has been running since the player opened. Starting the clock
         // where the engine actually is stops the engine burning ticks catching up.
         let frame = Frame(self.taps.source_frame.load());
-        // A seek asked for against the outgoing module means nothing to the incoming one.
-        self.handles.seek.clear();
         let built = build_source(Arc::clone(&module), self.sample_rate_hz, SeekKind::None, frame, &self.handles)?;
-        self.queue(HostCommand::Load { module: Arc::clone(&module), source: built.source })?;
+        self.queue_load(Arc::clone(&module), built.source)?;
+        self.scanned = Some(built.scanned);
+        self.module = Some(module);
+        Ok(())
+    }
+
+    /// Prepare and queue a replacement using only fallible allocation paths. A failure
+    /// leaves the current module, scan and queued render state unchanged.
+    pub fn try_load(&mut self, module: Arc<Module>) -> Result<(), Error> {
+        let prepared = self.try_prepare_load(module)?;
+        self.commit_prepared_load(prepared)
+    }
+
+    /// Build every allocation-backed part of a replacement without queueing it.
+    pub fn try_prepare_load(&mut self, module: Arc<Module>) -> Result<PreparedLoad, Error> {
+        if module.header().channel_count as usize > self.channel_capacity {
+            return Err(Error::Module(starplayer::core::Error::Resource("the module has more channels than this host can play")));
+        }
+        let built = try_build_source(Arc::clone(&module), self.sample_rate_hz, SeekKind::None, &self.handles, self.voice_capacity)?;
+        Ok(PreparedLoad { module, built })
+    }
+
+    /// [`ControlHalf::try_prepare_load`] with caller-owned storage for the scan timeline.
+    pub fn try_prepare_load_in(
+        &mut self, module: Arc<Module>, marks: &'static mut [starplayer::engine::RowMark], order_marks: &'static mut [Option<u32>],
+    ) -> Result<PreparedLoad, Error> {
+        if module.header().channel_count as usize > self.channel_capacity {
+            return Err(Error::Module(starplayer::core::Error::Resource("the module has more channels than this host can play")));
+        }
+        let built = try_build_source_in(
+            Arc::clone(&module), self.sample_rate_hz, SeekKind::None, &self.handles, self.voice_capacity, marks, order_marks,
+        )?;
+        Ok(PreparedLoad { module, built })
+    }
+
+    /// Queue a fully prepared replacement. This performs no allocation.
+    pub fn commit_prepared_load(&mut self, prepared: PreparedLoad) -> Result<(), Error> {
+        let PreparedLoad { module, built } = prepared;
+        self.queue_load(Arc::clone(&module), built.source)?;
         self.scanned = Some(built.scanned);
         self.module = Some(module);
         Ok(())
@@ -621,6 +667,19 @@ impl ControlHalf {
         self.collected
     }
 
+    /// Drain completed retirements and prove whether `module` is now owned only by its
+    /// caller, with no weak handle that could become another owner after the check. This
+    /// identity check covers the control half, queued command, render engine and both the
+    /// retired module and retired source; an empty retirement queue alone cannot provide
+    /// that proof.
+    pub fn module_is_released(&mut self, module: &Arc<Module>) -> bool {
+        self.collect_garbage();
+        Arc::strong_count(module) == 1 && Arc::weak_count(module) == 0
+    }
+
+    /// Maximum native module width this persistent engine was constructed to play.
+    pub const fn channel_capacity(&self) -> usize { self.channel_capacity }
+
     /// How many retirements are waiting for [`ControlHalf::collect_garbage`].
     pub fn pending_garbage(&self) -> usize { self.retired.len() }
 
@@ -630,6 +689,19 @@ impl ControlHalf {
 
     fn queue(&mut self, command: HostCommand) -> Result<(), Error> {
         self.commands.push(command).map_err(|_| Error::CommandQueueFull)
+    }
+
+    fn queue_load(&mut self, module: Arc<Module>, source: Box<dyn EventSource>) -> Result<(), Error> {
+        // This control half is the ring's only producer and the render half can only free
+        // capacity, so a non-full observation guarantees the immediately following push.
+        // Clear before publication: the outgoing source cannot race adoption and hand its
+        // pending seek to the incoming one. A seek issued after this method returns is new
+        // work and remains for the incoming source.
+        if self.commands.is_full() {
+            return Err(Error::CommandQueueFull);
+        }
+        self.handles.seek.clear();
+        self.commands.push(HostCommand::Load { module, source }).map_err(|_| Error::CommandQueueFull)
     }
 }
 
@@ -675,6 +747,9 @@ impl<Interp: Interpolate> EmbeddedPlayer<Interp> {
     /// from; [`settings_for`] is what a caller with one uses.
     pub fn open_empty(sample_rate_hz: u32, settings: EngineSettings) -> Result<(RenderHalf<Interp>, ControlHalf), Error> {
         let settings = EngineSettings { sample_rate_hz, ..settings };
+        let voice_capacity = settings.voice_capacity;
+        let channel_capacity = settings.channel_count.min(ChannelTable::MAX_CHANNELS);
+        let telemetry_depth = settings.telemetry_depth;
         let mut engine = EmbeddedEngine::<Interp>::with_settings(settings);
         let mut control = engine.take_control().ok_or(Error::EngineHandleUnavailable)?;
         let telemetry = engine.telemetry_reader().ok_or(Error::EngineHandleUnavailable)?;
@@ -685,7 +760,7 @@ impl<Interp: Interpolate> EmbeddedPlayer<Interp> {
 
         let (command_producer, command_consumer) = channel(HOST_COMMAND_CAPACITY);
         let (retired_producer, retired_consumer) = channel(RETIRED_CAPACITY);
-        let (forwarded, snapshot_reader) = snapshot_channel(TELEMETRY_DEPTH, Snapshot::default());
+        let (forwarded, snapshot_reader) = snapshot_channel(telemetry_depth, Snapshot::default());
         let taps = Arc::new(Taps::default());
         // Made once, for the life of the player, and shared. A pair made per module would
         // leave the render half holding the last handle to the outgoing one on every load.
@@ -713,6 +788,8 @@ impl<Interp: Interpolate> EmbeddedPlayer<Interp> {
             taps,
             handles,
             sample_rate_hz,
+            voice_capacity,
+            channel_capacity,
             at_end: AtEnd::Continue,
             fade_frames: 0,
             master_volume: U0F16::MAX,

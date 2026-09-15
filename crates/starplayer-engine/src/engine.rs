@@ -118,6 +118,11 @@ pub struct EngineSettings {
     pub voice_capacity: usize,
     /// Control lanes. 32 covers S3M; IT's 64 is [`ChannelTable::MAX_CHANNELS`].
     pub channel_count: usize,
+    /// Allocate oscilloscope tap rings when telemetry is enabled. Scalar snapshots remain
+    /// available when false; hosts without a scope display can save these per-channel rings.
+    pub scope_taps: bool,
+    /// Queued scalar snapshots when telemetry is enabled; a latest-state host can use one.
+    pub telemetry_depth: usize,
     /// Output rate, for the synthesised control clock.
     pub sample_rate_hz: u32,
     /// How many [`EventSource`]s may be merged at once.
@@ -137,6 +142,8 @@ impl Default for EngineSettings {
         EngineSettings {
             voice_capacity: 64,
             channel_count: 32,
+            scope_taps: true,
+            telemetry_depth: starplayer_rt::DEFAULT_SNAPSHOT_DEPTH,
             sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
             source_capacity: SourceMux::DEFAULT_CAPACITY,
             command_capacity: DEFAULT_COMMAND_CAPACITY,
@@ -285,11 +292,11 @@ where
         let channels = ChannelTable::new(settings.channel_count);
         let bus_count = channels.len();
         #[cfg(feature = "telemetry")]
-        let (telemetry, telemetry_reader) = starplayer_telemetry::telemetry_channel();
+        let (telemetry, telemetry_reader) = starplayer_telemetry::telemetry_channel_with_depth(settings.telemetry_depth);
         // One scope ring per control lane, allocated here with everything else. A ring is
         // ~2 KB, so even IT's 64 channels cost 128 KB once, never in `render()`.
         #[cfg(feature = "telemetry")]
-        let (scope_taps, scope_readers) = crate::scope::ScopeTaps::new(settings.channel_count);
+        let (scope_taps, scope_readers) = crate::scope::ScopeTaps::new(if settings.scope_taps { settings.channel_count } else { 0 });
 
         Engine {
             voices: VoicePool::new(settings.voice_capacity),

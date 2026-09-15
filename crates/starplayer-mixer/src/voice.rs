@@ -1,6 +1,9 @@
 //! [`Voice`], [`VoiceTag`] and the fixed-capacity [`VoicePool`] (architecture §5).
 
+#[cfg(test)]
 use alloc::vec;
+use alloc::collections::TryReserveError;
+use alloc::vec::Vec;
 use alloc::boxed::Box;
 
 use starplayer_core::{DirtyBits, FilterParams, VoiceId, VoiceParams};
@@ -467,8 +470,15 @@ impl VoicePool {
     /// Allocate a pool of `capacity` voices. This is the **only** allocation the pool
     /// ever performs; `capacity` is clamped to [`VoicePool::MAX_CAPACITY`].
     pub fn new(capacity: usize) -> VoicePool {
+        Self::try_new(capacity).expect("voice pool allocation failed")
+    }
+
+    /// Allocate a voice pool without aborting on allocation failure.
+    pub fn try_new(capacity: usize) -> Result<VoicePool, TryReserveError> {
         let capacity = capacity.min(VoicePool::MAX_CAPACITY);
-        let mut slots = vec![VoiceSlot::default(); capacity];
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(capacity)?;
+        slots.resize(capacity, VoiceSlot::default());
 
         // Link every slot onto the free list, lowest index first, so a fresh pool hands
         // out slot 0, then 1, then 2 — deterministic, and readable in a trace.
@@ -480,7 +490,7 @@ impl VoicePool {
             }
         }
 
-        VoicePool { slots: slots.into_boxed_slice(), free_head, active_count: 0 }
+        Ok(VoicePool { slots: slots.into_boxed_slice(), free_head, active_count: 0 })
     }
 
     /// How many voices the pool can hold.

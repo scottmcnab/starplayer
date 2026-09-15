@@ -26,7 +26,8 @@
 //! order anyway.
 
 use alloc::boxed::Box;
-use alloc::vec;
+use alloc::collections::TryReserveError;
+use alloc::vec::Vec;
 use starplayer_core::quirks::PatternFlow;
 
 use crate::sequencer::Jump;
@@ -69,9 +70,17 @@ pub struct PatternFlowState {
 impl PatternFlowState {
     /// A fresh state machine for `channel_count` channels under `flow`.
     pub fn new(flow: PatternFlow, channel_count: usize) -> PatternFlowState {
-        PatternFlowState {
+        Self::try_new(flow, channel_count).expect("pattern flow allocation failed")
+    }
+
+    /// Allocate loop bookkeeping without aborting on allocation failure.
+    pub fn try_new(flow: PatternFlow, channel_count: usize) -> Result<PatternFlowState, TryReserveError> {
+        let mut channels = Vec::new();
+        channels.try_reserve_exact(channel_count)?;
+        channels.resize(channel_count, ChannelLoop::default());
+        Ok(PatternFlowState {
             flow,
-            channels: vec![ChannelLoop::default(); channel_count].into_boxed_slice(),
+            channels: channels.into_boxed_slice(),
             global_start: None,
             global_count: 0,
             loop_destination: None,
@@ -79,7 +88,7 @@ impl PatternFlowState {
             pending_break: false,
             jump_order: None,
             jump_row: 0,
-        }
+        })
     }
 
     /// The flow rules in force. Fixed for the lifetime of the loaded module.

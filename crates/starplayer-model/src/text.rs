@@ -12,6 +12,7 @@
 //! field.
 
 use alloc::string::String;
+use starplayer_core::Error;
 
 /// The glyph for each byte `0x01..=0x1F`, then `0x80..=0xFF`. `0x20..=0x7F` is ASCII.
 const CP437_LOW: [char; 31] = [
@@ -61,6 +62,28 @@ pub fn decode_cp437(bytes: &[u8]) -> String {
         text.pop();
     }
     text
+}
+
+/// Fallible form of [`decode_cp437`] for memory-constrained loader paths.
+pub fn try_decode_cp437(bytes: &[u8]) -> Result<String, Error> {
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let mut field = bytes.get(..end).unwrap_or(bytes);
+    while field.last().copied().map(cp437_char).is_some_and(|character| matches!(character, ' ' | '\t' | '\r' | '\n' | '\u{a0}')) {
+        field = field.get(..field.len().saturating_sub(1)).unwrap_or_default();
+    }
+    let encoded_bytes = field.iter().map(|byte| cp437_char(*byte).len_utf8()).sum();
+    let mut text = String::new();
+    text.try_reserve_exact(encoded_bytes)
+        .map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
+    for byte in field { text.push(cp437_char(*byte)); }
+    Ok(text)
+}
+
+pub fn try_clone_text(text: &str) -> Result<String, Error> {
+    let mut owned = String::new();
+    owned.try_reserve_exact(text.len()).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
+    owned.push_str(text);
+    Ok(owned)
 }
 
 #[cfg(test)]

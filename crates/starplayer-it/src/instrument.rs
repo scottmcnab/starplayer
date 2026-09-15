@@ -91,30 +91,25 @@ pub struct ItEnvelope {
 }
 
 impl ItEnvelope {
-    /// Parse the 82-byte structure at `bytes`.
-    pub fn parse(bytes: &[u8]) -> ItEnvelope {
+    pub fn try_parse(bytes: &[u8]) -> Result<ItEnvelope, Error> {
         let byte = |offset: usize| bytes.get(offset).copied().unwrap_or(0);
-        // Bounded by the format's limit *and* by what the slice actually holds, so a
-        // truncated structure reads the nodes that are there rather than inventing silent
-        // ones behind them.
         let readable = (bytes.len().saturating_sub(6) / 3).min(MAX_ENVELOPE_NODES) as u8;
         let node_count = byte(1).min(readable);
-        let mut nodes = Vec::with_capacity(node_count as usize);
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(node_count as usize).map_err(|_| Error::Resource("not enough memory for IT envelope metadata"))?;
         for node in 0..node_count as usize {
             let base = 6 + node * 3;
-            let value = byte(base) as i8;
-            let tick = u16::from_le_bytes([byte(base + 1), byte(base + 2)]);
-            nodes.push((value, tick));
+            nodes.push((byte(base) as i8, u16::from_le_bytes([byte(base + 1), byte(base + 2)])));
         }
-        ItEnvelope {
-            flags: byte(0),
-            node_count,
-            loop_start: byte(2),
-            loop_end: byte(3),
-            sustain_start: byte(4),
-            sustain_end: byte(5),
-            nodes,
-        }
+        Ok(ItEnvelope {
+            flags: byte(0), node_count, loop_start: byte(2), loop_end: byte(3),
+            sustain_start: byte(4), sustain_end: byte(5), nodes,
+        })
+    }
+
+    /// Parse the 82-byte structure at `bytes`.
+    pub fn parse(bytes: &[u8]) -> ItEnvelope {
+        Self::try_parse(bytes).unwrap_or_default()
     }
 
     /// Whether the envelope is on.
@@ -147,6 +142,25 @@ impl ItEnvelope {
             carry: self.flags & ENVELOPE_CARRY != 0,
             points: points.into_boxed_slice(),
         })
+    }
+
+    pub fn try_to_model(&self, low: i16, high: i16) -> Result<Option<Envelope>, Error> {
+        if !self.is_enabled() { return Ok(None); }
+        let mut points = Vec::new();
+        points.try_reserve_exact(self.nodes.len()).map_err(|_| Error::Resource("not enough memory for IT envelope metadata"))?;
+        for (value, tick) in &self.nodes {
+            points.push(EnvelopePoint { tick: *tick, value: (*value as i16).clamp(low, high) });
+        }
+        let node_count = points.len();
+        let span = |enabled: bool, start: u8, end: u8| match enabled && (start as usize) < node_count && (end as usize) < node_count && start <= end {
+            true => Some(EnvelopeSpan { start, end }), false => None,
+        };
+        Ok(Some(Envelope {
+            sustain: span(self.flags & ENVELOPE_SUSTAIN != 0, self.sustain_start, self.sustain_end),
+            loop_span: span(self.flags & ENVELOPE_LOOP != 0, self.loop_start, self.loop_end),
+            carry: self.flags & ENVELOPE_CARRY != 0,
+            points: points.into_boxed_slice(),
+        }))
     }
 }
 
@@ -199,6 +213,24 @@ pub struct ItInstrument {
 }
 
 impl ItInstrument {
+    pub fn try_parse(bytes: &[u8], name: String) -> Result<ItInstrument, Error> {
+        let bytes = bytes.get(..HEADER_LENGTH).ok_or(Error::Truncated { offset: 0, needed: HEADER_LENGTH })?;
+        let byte = |offset: usize| bytes.get(offset).copied().unwrap_or(0);
+        let (note_map, sample_map) = keyboard_maps(bytes);
+        Ok(ItInstrument {
+            has_magic: bytes.get(..4) == Some(&MAGIC[..]), name,
+            new_note_action: byte(0x11), duplicate_check: byte(0x12), duplicate_action: byte(0x13),
+            fadeout: u16::from_le_bytes([byte(0x14), byte(0x15)]), pitch_pan_separation: byte(0x16) as i8,
+            pitch_pan_centre: byte(0x17), global_volume: byte(0x18), default_pan: byte(0x19),
+            random_volume_variation: byte(0x1A), random_pan_variation: byte(0x1B),
+            tracker_version: u16::from_le_bytes([byte(0x1C), byte(0x1D)]), sample_count: byte(0x1E),
+            filter_cutoff: byte(0x3A), filter_resonance: byte(0x3B), note_map, sample_map,
+            volume_envelope: ItEnvelope::try_parse(bytes.get(VOLUME_ENVELOPE_OFFSET..VOLUME_ENVELOPE_OFFSET + ENVELOPE_LENGTH).unwrap_or_default())?,
+            panning_envelope: ItEnvelope::try_parse(bytes.get(PANNING_ENVELOPE_OFFSET..PANNING_ENVELOPE_OFFSET + ENVELOPE_LENGTH).unwrap_or_default())?,
+            pitch_envelope: ItEnvelope::try_parse(bytes.get(PITCH_ENVELOPE_OFFSET..PITCH_ENVELOPE_OFFSET + ENVELOPE_LENGTH).unwrap_or_default())?,
+        })
+    }
+
     /// Parse the IT 2.xx layout (`Cmwt >= 0x200`).
     ///
     /// # Errors
@@ -301,6 +333,31 @@ impl ItInstrument {
         })
     }
 
+    pub fn try_parse_old(bytes: &[u8], name: String) -> Result<ItInstrument, Error> {
+        let bytes = bytes.get(..HEADER_LENGTH).ok_or(Error::Truncated { offset: 0, needed: HEADER_LENGTH })?;
+        let byte = |offset: usize| bytes.get(offset).copied().unwrap_or(0);
+        let (note_map, sample_map) = keyboard_maps(bytes);
+        let flags = byte(0x11) & (ENVELOPE_ENABLED | ENVELOPE_LOOP | ENVELOPE_SUSTAIN);
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(MAX_ENVELOPE_NODES).map_err(|_| Error::Resource("not enough memory for IT envelope metadata"))?;
+        for node in 0..MAX_ENVELOPE_NODES {
+            let tick = byte(OLD_ENVELOPE_NODES_OFFSET + node * 2);
+            if tick == 0xFF { break; }
+            nodes.push((byte(OLD_ENVELOPE_NODES_OFFSET + node * 2 + 1) as i8, tick as u16));
+        }
+        Ok(ItInstrument {
+            has_magic: bytes.get(..4) == Some(&MAGIC[..]), name,
+            new_note_action: byte(0x1A), duplicate_check: byte(0x1B), duplicate_action: 0,
+            fadeout: u16::from_le_bytes([byte(0x18), byte(0x19)]).saturating_mul(OLD_FADEOUT_SCALE),
+            pitch_pan_separation: 0, pitch_pan_centre: 60, global_volume: MAX_GLOBAL_VOLUME,
+            default_pan: PAN_IGNORED, random_volume_variation: 0, random_pan_variation: 0,
+            tracker_version: u16::from_le_bytes([byte(0x1C), byte(0x1D)]), sample_count: byte(0x1E),
+            filter_cutoff: 0, filter_resonance: 0, note_map, sample_map,
+            volume_envelope: ItEnvelope { flags, node_count: nodes.len() as u8, loop_start: byte(0x12), loop_end: byte(0x13), sustain_start: byte(0x14), sustain_end: byte(0x15), nodes },
+            panning_envelope: ItEnvelope::default(), pitch_envelope: ItEnvelope::default(),
+        })
+    }
+
     /// Turn this header into the model's [`InstrumentDef`].
     ///
     /// `sample_count` is the module's, so a keyboard entry naming a sample the file does
@@ -363,6 +420,35 @@ impl ItInstrument {
             },
             pitch_envelope_is_filter: self.pitch_envelope.is_filter(),
         }
+    }
+
+    pub fn try_to_model(&self, sample_count: usize) -> Result<InstrumentDef, Error> {
+        let mut note_sample_map = [0u16; NOTE_MAP_LENGTH];
+        let mut note_transpose_map = [0u8; NOTE_MAP_LENGTH];
+        for (note, (mapped_sample, mapped_note)) in note_sample_map.iter_mut().zip(note_transpose_map.iter_mut()).enumerate() {
+            let sample = self.sample_map.get(note).copied().unwrap_or(0);
+            *mapped_sample = if sample as usize <= sample_count { sample as u16 } else { 0 };
+            *mapped_note = self.note_map.get(note).copied().unwrap_or(note as u8);
+        }
+        Ok(InstrumentDef {
+            name: starplayer_model::try_clone_text(&self.name)?.into_boxed_str(), sample: None,
+            default_volume: U0F16::MAX, note_sample_map, note_transpose_map,
+            volume_envelope: self.volume_envelope.try_to_model(0, 64)?,
+            panning_envelope: self.panning_envelope.try_to_model(-32, 32)?,
+            pitch_envelope: self.pitch_envelope.try_to_model(-32, 32)?, fadeout: self.fadeout,
+            new_note_action: match self.new_note_action { 1 => NewNoteAction::Continue, 2 => NewNoteAction::NoteOff, 3 => NewNoteAction::NoteFade, _ => NewNoteAction::Cut },
+            duplicate_check: match self.duplicate_check { 1 => DuplicateCheck::Note, 2 => DuplicateCheck::Sample, 3 => DuplicateCheck::Instrument, _ => DuplicateCheck::Off },
+            duplicate_action: match self.duplicate_action { 1 => DuplicateAction::NoteOff, 2 => DuplicateAction::NoteFade, _ => DuplicateAction::Cut },
+            global_volume: unit_from_ratio(core::cmp::min(self.global_volume, MAX_GLOBAL_VOLUME) as u32, MAX_GLOBAL_VOLUME as u32),
+            default_pan: if self.default_pan & PAN_IGNORED == 0 { Some(pan_to_bipolar(self.default_pan & 0x7F)) } else { None },
+            pitch_pan_separation: self.pitch_pan_separation.clamp(-32, 32),
+            pitch_pan_centre: core::cmp::min(self.pitch_pan_centre, (NOTE_MAP_LENGTH - 1) as u8),
+            random_volume_variation: core::cmp::min(self.random_volume_variation, 100),
+            random_pan_variation: core::cmp::min(self.random_pan_variation, 64),
+            initial_filter_cutoff: if self.filter_cutoff & FILTER_ENABLED != 0 { Some(self.filter_cutoff & 0x7F) } else { None },
+            initial_filter_resonance: if self.filter_resonance & FILTER_ENABLED != 0 { Some(self.filter_resonance & 0x7F) } else { None },
+            pitch_envelope_is_filter: self.pitch_envelope.is_filter(),
+        })
     }
 }
 

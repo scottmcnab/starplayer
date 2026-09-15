@@ -250,6 +250,80 @@ fn a_load_retires_the_previous_module_and_its_sequencer_to_the_control_side() {
     assert!(!control.warnings().retired_module_dropped, "and neither was dropped in the refill");
 }
 
+#[test]
+fn module_release_waits_for_every_control_queue_render_and_source_reference() {
+    let first = module(PETRI);
+    let weak = Arc::downgrade(&first);
+    let (mut render, mut control) = EmbeddedPlayer::<Linear>::open(Arc::clone(&first), RATE_HZ).expect("the embedded player opens");
+    assert!(!control.module_is_released(&first), "the live control, engine and source references remain");
+
+    control.try_load(module(REFLEX)).expect("the replacement prepares");
+    assert!(!control.module_is_released(&first), "queueing a replacement does not release the live source early");
+
+    let mut output = vec![0i16; RENDER_QUANTUM * 2 * starplayer_host_embedded::OUTPUT_CHANNELS];
+    render.render(&mut output);
+    assert!(!control.module_is_released(&first), "a surviving weak handle can still regain ownership after the check");
+    drop(weak);
+    assert!(control.module_is_released(&first), "the token is unique only after every strong and weak reference is gone");
+}
+
+#[test]
+fn fallible_load_rejects_a_wider_module_without_replacing_the_current_one() {
+    let first = module(REFLEX);
+    let (_render, mut control) = EmbeddedPlayer::<Linear>::open(Arc::clone(&first), RATE_HZ).expect("the embedded player opens");
+    assert!(control.try_load(module(PETRI)).is_err(), "an eight-channel replacement does not fit a three-channel engine");
+    assert!(control.module().is_some_and(|current| Arc::ptr_eq(current, &first)), "the original control-side module remains selected");
+}
+
+#[test]
+fn a_prepared_replacement_rebases_its_first_tick_at_render_side_adoption() {
+    let (mut render, mut control) = open(PETRI);
+    control.play().expect("play");
+    let prepared = control.try_prepare_load(module(REFLEX)).expect("the replacement prepares");
+
+    // Stand in for a long decode/scan while the current module and the engine's monotonic
+    // frame keep advancing. A source clock captured during preparation would now be more
+    // than a dozen rows overdue.
+    let mut old_output = vec![0i16; RATE_HZ as usize * 2 * starplayer_host_embedded::OUTPUT_CHANNELS];
+    render.render(&mut old_output);
+    control.commit_prepared_load(prepared).expect("the prepared load queues");
+
+    let mut adoption = vec![0i16; RENDER_QUANTUM * starplayer_host_embedded::OUTPUT_CHANNELS];
+    render.render(&mut adoption);
+    let first = *control.telemetry();
+    assert_eq!((first.transport.order, first.transport.row), (0, 0), "adoption dispatches only the replacement's first row");
+
+    render.render(&mut adoption);
+    let second = *control.telemetry();
+    assert_eq!((second.transport.order, second.transport.row), (0, 0), "the next tracker tick is in the future instead of catching up in one render");
+}
+
+#[test]
+fn a_seek_queued_after_a_prepared_load_targets_the_incoming_module() {
+    let (mut render, mut control) = open(PETRI);
+    let prepared = control.try_prepare_load(module(REFLEX)).expect("the replacement prepares");
+    control.commit_prepared_load(prepared).expect("the prepared load queues");
+    control.seek_order(1).expect("a seek queues after the load");
+    control.play().expect("play");
+
+    let mut output = vec![0i16; RENDER_QUANTUM * starplayer_host_embedded::OUTPUT_CHANNELS];
+    render.render(&mut output);
+    assert_eq!(control.telemetry().transport.order, 1, "render-side adoption preserves a newer seek for the incoming source");
+}
+
+#[test]
+fn a_full_load_queue_leaves_the_existing_seek_pending() {
+    let (mut render, mut control) = open(PETRI);
+    let mut output = vec![0i16; RENDER_QUANTUM * starplayer_host_embedded::OUTPUT_CHANNELS];
+    render.render(&mut output);
+    let prepared = control.try_prepare_load(module(REFLEX)).expect("the replacement prepares");
+    control.seek_order(1).expect("the current module has a pending seek");
+    while control.play().is_ok() {}
+
+    assert!(control.commit_prepared_load(prepared).is_err(), "the full command queue refuses the replacement");
+    assert_eq!(control.pending_seek().kind, starplayer_host_embedded::SeekKind::Order(1), "a refused load does not clear current work");
+}
+
 // ── the rest of the control surface ────────────────────────────────────────────────
 
 #[test]

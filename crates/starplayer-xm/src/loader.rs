@@ -1254,6 +1254,28 @@ mod tests {
         assert_eq!(module.pattern(PatternId(1)).map(|index| index.rows()), Some(64));
     }
 
+    #[test]
+    fn an_unreadable_pattern_run_that_starts_past_eof_matches_the_eager_reader_error() {
+        let mut bytes = XmFile::minimal().bytes();
+        let header_size = 10_000u32;
+        bytes[0x3C..0x40].copy_from_slice(&header_size.to_le_bytes());
+        let pattern_offset = header::HEADER_SIZE_ORIGIN + header_size as usize;
+        let expected = Error::Truncated { offset: pattern_offset, needed: 0 };
+        assert_eq!(load(&bytes), Err(expected));
+
+        let mut destination = [];
+        let mut workspace = [];
+        let mut decoder = crate::ImageDecoder::new(&bytes, &mut destination, &mut workspace);
+        assert_eq!(
+            decoder.step(starplayer_model::DecodeBudget { max_input_bytes: 4096, max_pcm_frames: 1 }),
+            Ok(starplayer_model::ImageDecodeStatus::Pending),
+        );
+        assert_eq!(
+            decoder.step(starplayer_model::DecodeBudget { max_input_bytes: 4096, max_pcm_frames: 1 }),
+            Err(starplayer_model::ImageDecodeError::Module(expected)),
+        );
+    }
+
     // ── the production allocation cap ───────────────────────────────────────────────
 
     /// A header declaring `pattern_count` patterns whose headers are all present but
@@ -1296,5 +1318,75 @@ mod tests {
         assert_eq!(text(b"Reflex\0\0\0"), "Reflex");
         assert_eq!(text(b"Reflex   "), "Reflex");
         assert_eq!(text(b""), "");
+    }
+
+    fn assert_incremental_image(bytes: &[u8]) {
+        let expected = load(bytes).expect("the eager XM loader accepts the fixture").to_image();
+        let mut destination = vec![0u8; expected.len()];
+        let mut workspace = vec![0u8; 4096];
+        let image_length = {
+            let mut decoder = crate::ImageDecoder::new(bytes, &mut destination, &mut workspace);
+            let mut calls = 0usize;
+            loop {
+                calls += 1;
+                assert!(calls < 100_000, "incremental conversion must make progress");
+                match decoder.step(starplayer_model::DecodeBudget { max_input_bytes: 4096, max_pcm_frames: 3 }).expect("incremental XM conversion") {
+                    starplayer_model::ImageDecodeStatus::Pending => {}
+                    starplayer_model::ImageDecodeStatus::Complete { image_length } => break image_length,
+                }
+            }
+        };
+        assert_eq!(image_length, expected.len());
+        assert_eq!(destination, expected);
+    }
+
+    #[test]
+    fn incremental_image_matches_packed_patterns_delta_widths_stereo_and_loop_guards() {
+        let mut file = XmFile::minimal();
+        file.channels = 2;
+        file.patterns = vec![(2, vec![
+            49, 1, 0x30, 0x0A, 0xF0,
+            pattern::MASK_IS_MASK | pattern::MASK_NOTE, 50,
+            pattern::MASK_IS_MASK | pattern::MASK_INSTRUMENT | pattern::MASK_EFFECT, 1, 0x0F,
+        ])];
+        let mut forward = Sample::simple(&[3, 4, 5, 6]);
+        forward.flags = sample::FLAG_FORWARD_LOOP;
+        forward.loop_start = 1;
+        forward.loop_length = 3;
+        let mut wide_stereo_bytes = Vec::new();
+        for delta in [100i16, -50, 300, -200] { wide_stereo_bytes.extend_from_slice(&delta.to_le_bytes()); }
+        let wide_stereo = Sample {
+            deltas: wide_stereo_bytes,
+            flags: sample::FLAG_SIXTEEN_BIT | sample::FLAG_STEREO | sample::FLAG_PING_PONG_LOOP,
+            volume: 48, pan: 200, relative_note: -3, finetune: 17,
+            loop_start: 0, loop_length: 8, reserved: 0,
+        };
+        file.instruments = vec![one_instrument(vec![forward, wide_stereo])];
+        assert_incremental_image(&file.bytes());
+    }
+
+    #[test]
+    fn incremental_image_matches_adpcm_and_both_old_file_layouts() {
+        let mut file = XmFile::minimal();
+        let mut table = vec![0u8; sample::ADPCM_TABLE_BYTES];
+        table[1] = 4;
+        table[2] = (-8i8) as u8;
+        table.extend_from_slice(&[0x21, 0x11]);
+        let mut adpcm = Sample::simple(&table);
+        adpcm.reserved = sample::RESERVED_ADPCM;
+        file.instruments = vec![one_instrument(vec![adpcm])];
+        let mut bytes = file.bytes();
+        let length_offset = bytes.len() - table.len() - sample::HEADER_LENGTH;
+        bytes[length_offset..length_offset + 4].copy_from_slice(&4u32.to_le_bytes());
+        assert_incremental_image(&bytes);
+
+        for version in [0x0102, 0x0103] {
+            let mut file = XmFile::minimal();
+            file.version = version;
+            file.channels = 1;
+            file.patterns = vec![(if version == 0x0102 { 4 } else { 96 }, vec![pattern::MASK_IS_MASK | pattern::MASK_NOTE, 49])];
+            file.instruments = vec![one_instrument(vec![Sample::simple(&[10, 10, (-5i8) as u8])])];
+            assert_incremental_image(&file.bytes());
+        }
     }
 }

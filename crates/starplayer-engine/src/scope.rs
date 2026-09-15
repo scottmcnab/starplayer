@@ -105,6 +105,7 @@ impl ScopeTaps {
     /// Call it **before** the segment is accumulated, with the same `pcm` blob the mixer
     /// is about to read, so the positions sampled are the ones the segment renders from.
     pub fn sample_segment(&mut self, voices: &VoicePool, pcm: &[i16], offset: usize, span: usize) {
+        if self.writers.is_empty() { return; }
         let first_bucket = offset.div_ceil(TAP_BUCKET_FRAMES);
         let last_bucket = offset.saturating_add(span).div_ceil(TAP_BUCKET_FRAMES).min(TAP_BUCKETS_PER_QUANTUM);
         if first_bucket >= last_bucket {

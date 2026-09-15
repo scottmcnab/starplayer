@@ -81,6 +81,7 @@ extern crate alloc;
 
 pub mod data;
 pub mod header;
+pub mod image;
 pub mod instrument;
 pub mod loader;
 pub mod pattern;
@@ -92,6 +93,7 @@ pub use data::XmPatternData;
 pub use header::{
     FT2_HEADER_SIZE, MAGIC, MAX_CHANNELS, MAX_INSTRUMENTS, MAX_PATTERNS, XmFormatExtra, XmHeader,
 };
+pub use image::ImageDecoder;
 pub use instrument::{XmEnvelope, XmInstrumentHeader};
 pub use loader::{load, load_from, probe, probe_reader};
 pub use processor::{

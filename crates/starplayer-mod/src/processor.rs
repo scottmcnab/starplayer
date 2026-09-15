@@ -256,6 +256,36 @@ impl ModProcessor {
         }
     }
 
+    /// Fallible form of [`ModProcessor::with_semantics_and_quirks`] for memory-constrained
+    /// hosts preparing a replacement module. No live state changes if an allocation is
+    /// refused.
+    pub fn try_with_semantics_and_quirks(
+        module: Arc<Module>, sample_rate_hz: u32, semantics: EffectSemantics, quirks: QuirkSelection,
+    ) -> Result<ModProcessor, alloc::collections::TryReserveError> {
+        let quirks = quirks.resolve(module.header().dialect);
+        let channel_count = module.header().channel_count as usize;
+        let mut channels = Vec::new();
+        channels.try_reserve_exact(channel_count)?;
+        for channel in 0..module.header().channel_count {
+            let pan = module.header().channel_pan(channel).unwrap_or(I1F15::ZERO);
+            channels.push(ModChannel::new(channel, pan));
+        }
+        let flow = PatternFlowState::try_new(quirks.mod_pattern_loop.flow(), channels.len())?;
+        Ok(ModProcessor {
+            amiga_limits: module.header().flags.amiga_limits,
+            flow,
+            module,
+            channels: channels.into_boxed_slice(),
+            sample_rate_hz,
+            last_pattern: None,
+            row_pattern_break: false,
+            waveform_random_state: Xorshift32::new(WAVEFORM_RANDOM_SEED),
+            pending_tempo: None,
+            semantics,
+            quirks,
+        })
+    }
+
     /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
     pub const fn quirks(&self) -> QuirkSet { self.quirks }
 

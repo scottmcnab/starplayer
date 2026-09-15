@@ -612,6 +612,59 @@ impl ItProcessor {
         }
     }
 
+    /// Fallible form of [`ItProcessor::with_quirks`] for bounded embedded replacement
+    /// preparation. Both the channel table and IT's complete background-voice state are
+    /// reserved before they are populated.
+    pub fn try_with_quirks(
+        module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection,
+    ) -> Result<ItProcessor, alloc::collections::TryReserveError> {
+        Self::try_with_quirks_and_voice_capacity(module, sample_rate_hz, quirks, MAX_VOICE_CAPACITY)
+    }
+
+    /// Fallible IT state sized to the voice pool a persistent host actually owns. The
+    /// canonical constructor above retains all 256 virtual channels; a small embedded
+    /// host cannot sound more voices than its fixed engine pool and need not duplicate
+    /// unreachable state for the other entries.
+    pub fn try_with_quirks_and_voice_capacity(
+        module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection, voice_capacity: usize,
+    ) -> Result<ItProcessor, alloc::collections::TryReserveError> {
+        let header = module.header();
+        let quirks = quirks.resolve(header.dialect);
+        let extra = ItFormatExtra::from_header(header);
+        let global_volume = ((header.global_volume.to_bits() as u32 * MAX_GLOBAL_VOLUME as u32 + 32_767) / 65_535) as u8;
+        let channel_count = header.channel_count as usize;
+        let mut channels = alloc::vec::Vec::new();
+        channels.try_reserve_exact(channel_count)?;
+        for index in 0..channel_count {
+            let (pan, surround) = default_pan(&module, index as u8);
+            channels.push(ItChannel::new(index as u8, pan, surround, default_channel_volume(&module, index as u8)));
+        }
+        let mut voices = alloc::vec::Vec::new();
+        let voice_capacity = voice_capacity.min(MAX_VOICE_CAPACITY);
+        voices.try_reserve_exact(voice_capacity)?;
+        voices.resize(voice_capacity, ItVoiceState::default());
+        let flow = PatternFlowState::try_new(quirks.it_pattern_loop.flow(), channel_count)?;
+        Ok(ItProcessor {
+            channels: channels.into_boxed_slice(),
+            voices: voices.into_boxed_slice(),
+            sample_rate_hz,
+            global_volume,
+            song_speed: header.initial_speed,
+            frame_delay: 0,
+            instrument_mode: extra.is_instrument_mode(),
+            old_effects: extra.is_old_effects(),
+            compatible_gxx: extra.is_compatible_gxx(),
+            linear_slides: header.flags.linear_slides,
+            extended_filter_range: extra.has_extended_filter_range(),
+            quirks,
+            flow,
+            last_order: None,
+            random: Xorshift32::new(0x1D_F0_5A_C7),
+            module,
+            last_moved_voice: None,
+        })
+    }
+
     /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
     pub const fn quirks(&self) -> QuirkSet { self.quirks }
 
@@ -3074,9 +3127,9 @@ impl TrackerProcessor for ItProcessor {
         self.random = Xorshift32::new(0x1D_F0_5A_C7);
     }
 
-    /// IT sounds several voices per channel, so the pool is the format's own virtual
-    /// channel count rather than the module's.
-    fn recommended_voice_capacity(&self, _channel_count: usize) -> usize { VIRTUAL_CHANNELS }
+    /// Canonical processors hold all virtual channels; a bounded host constructor holds
+    /// exactly the number its fixed voice pool can address.
+    fn recommended_voice_capacity(&self, _channel_count: usize) -> usize { self.voices.len().min(VIRTUAL_CHANNELS) }
 }
 
 /// How many voices an IT module wants in the pool, without building a processor.

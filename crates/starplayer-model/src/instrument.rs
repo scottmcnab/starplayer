@@ -205,6 +205,18 @@ impl Default for InstrumentDef {
 }
 
 impl InstrumentDef {
+    pub fn try_from_sample(name: &str, sample: SampleId, default_volume: U0F16) -> Result<InstrumentDef, starplayer_core::Error> {
+        let mut owned_name = String::new();
+        owned_name.try_reserve_exact(name.len()).map_err(|_| starplayer_core::Error::Resource("not enough memory for module image metadata"))?;
+        owned_name.push_str(name);
+        Ok(InstrumentDef {
+            name: owned_name.into_boxed_str(),
+            sample: Some(sample),
+            default_volume,
+            ..InstrumentDef::default()
+        })
+    }
+
     /// The one-sample instrument S3M, MOD and MTM all describe: a name, a sample and a
     /// volume, with every XM/IT field left at its default.
     pub fn from_sample(name: &str, sample: SampleId, default_volume: U0F16) -> InstrumentDef {

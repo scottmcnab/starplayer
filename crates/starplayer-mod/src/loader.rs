@@ -12,12 +12,12 @@ use crate::pattern::{CELL_BYTES, ROWS};
 use crate::tables::{AMIGA_CHANNEL_MAP, FINETUNE_REFERENCE_RATES};
 use crate::timing::{ModTimingEvidence, encode_evidence, high_fxx_only_at_end};
 
-const HEADER_BYTES: usize = 1084;
-const MAGIC_OFFSET: usize = 1080;
-const SAMPLE_COUNT: usize = 31;
-const SAMPLE_HEADER_BYTES: usize = 30;
-const SONG_LENGTH_OFFSET: usize = 950;
-const ORDER_OFFSET: usize = 952;
+pub(crate) const HEADER_BYTES: usize = 1084;
+pub(crate) const MAGIC_OFFSET: usize = 1080;
+pub(crate) const SAMPLE_COUNT: usize = 31;
+pub(crate) const SAMPLE_HEADER_BYTES: usize = 30;
+pub(crate) const SONG_LENGTH_OFFSET: usize = 950;
+pub(crate) const ORDER_OFFSET: usize = 952;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StereoSeparation(u8);
@@ -223,13 +223,13 @@ fn scan_timing_evidence(pattern: &[u8], channels: u8) -> (u8, bool) {
 /// patterns are stored, how many bytes sit between the tag and the pattern data, and which
 /// tracker wrote it.
 #[derive(Copy, Clone)]
-struct ModLayout {
-    channels: u8,
-    paired_four_channel_patterns: bool,
+pub(crate) struct ModLayout {
+    pub(crate) channels: u8,
+    pub(crate) paired_four_channel_patterns: bool,
     /// Bytes between the end of the 1084-byte header and the pattern data. Four for
     /// Digital Tracker, zero for everything else.
-    extra_header_bytes: usize,
-    dialect: FormatDialect,
+    pub(crate) extra_header_bytes: usize,
+    pub(crate) dialect: FormatDialect,
 }
 
 impl ModLayout {
@@ -243,7 +243,7 @@ impl ModLayout {
 ///
 /// `.M.K` — Software Visions DMF — is deliberately **not** here: its first 2108 bytes are
 /// word-flipped to little endian and reading it needs a byte-order pass, not a tag entry.
-fn layout(magic: &[u8]) -> Option<ModLayout> {
+pub(crate) fn layout(magic: &[u8]) -> Option<ModLayout> {
     match magic {
         // `M!K!` is what ProTracker itself writes once a module exceeds 64 patterns.
         b"M.K." | b"M!K!" => Some(ModLayout::plain(4, FormatDialect::ProTracker)),
@@ -279,11 +279,11 @@ fn layout(magic: &[u8]) -> Option<ModLayout> {
     }
 }
 
-fn logical_order(order: u8, layout: ModLayout) -> u8 {
+pub(crate) fn logical_order(order: u8, layout: ModLayout) -> u8 {
     if layout.paired_four_channel_patterns { order >> 1 } else { order }
 }
 
-fn default_pan(channels: u8, separation: StereoSeparation) -> alloc::boxed::Box<[I1F15]> {
+pub(crate) fn default_pan(channels: u8, separation: StereoSeparation) -> alloc::boxed::Box<[I1F15]> {
     let amount = separation.get() as i32;
     (0..channels).map(|channel| {
         let mapped = AMIGA_CHANNEL_MAP[channel as usize % AMIGA_CHANNEL_MAP.len()];
@@ -291,7 +291,7 @@ fn default_pan(channels: u8, separation: StereoSeparation) -> alloc::boxed::Box<
     }).collect::<Vec<_>>().into_boxed_slice()
 }
 
-fn be_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
+pub(crate) fn be_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
     match bytes.get(offset..offset + 2) {
         Some([high, low]) => Ok(u16::from_be_bytes([*high, *low])),
         _ => Err(Error::Truncated { offset, needed: 2 }),

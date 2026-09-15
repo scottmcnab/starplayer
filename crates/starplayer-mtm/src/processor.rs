@@ -71,6 +71,19 @@ impl MtmProcessor {
         }
     }
 
+    /// Fallible form of [`MtmProcessor::with_quirks`] for replacement preparation on a
+    /// bounded embedded heap.
+    pub fn try_with_quirks(
+        module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection,
+    ) -> Result<MtmProcessor, alloc::collections::TryReserveError> {
+        let reset_counterpart = tempo_mode(&module) == Some(TempoMode::MultiTracker);
+        let semantics = EffectSemantics::MultiTracker { reset_counterpart };
+        let resolved = QuirkSelection::Override(quirks.resolve(FormatDialect::MultiTracker));
+        Ok(MtmProcessor {
+            effects: ModProcessor::try_with_semantics_and_quirks(module, sample_rate_hz, semantics, resolved)?,
+        })
+    }
+
     /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
     pub fn quirks(&self) -> QuirkSet { self.effects.quirks() }
 

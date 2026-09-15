@@ -80,12 +80,12 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use starplayer_core::quirks::FormatDialect;
-use starplayer_core::{Error, I1F15, SampleId, U0F16};
+use starplayer_core::{Error, GUARD_FRAMES, I1F15, InstrumentId, PRE_ROLL_FRAMES, SampleId, U0F16};
 
 use crate::header::{ModuleFlags, ModuleFormat, ModuleHeader};
 use crate::instrument::{DuplicateAction, DuplicateCheck, Envelope, EnvelopePoint, EnvelopeSpan, InstrumentDef, NOTE_MAP_LENGTH, NewNoteAction, identity_transpose_map};
 use crate::module::Module;
-use crate::pattern::PatternIndex;
+use crate::pattern::{PatternId, PatternIndex};
 use crate::sample::{AutoVibrato, AutoVibratoWaveform, LoopMode, SampleIndex, SampleSpec, SustainLoop};
 use crate::storage::{BlobStorage, PcmStorage};
 
@@ -103,6 +103,47 @@ pub const IMAGE_VERSION: u16 = 1;
 /// `#[repr(C, align(4))]` wrapper around `include_bytes!` gives, so the format pins the
 /// larger number and the reader checks it.
 pub const IMAGE_ALIGNMENT: usize = 4;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DecodeBudget {
+    pub max_input_bytes: usize,
+    pub max_pcm_frames: usize,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ImageDecodeStatus {
+    Pending,
+    Complete { image_length: usize },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ImageDecodeError {
+    Module(Error),
+    BudgetTooSmall { minimum_input_bytes: usize, minimum_pcm_frames: usize },
+    DestinationTooSmall { required: usize, available: usize },
+    WorkspaceTooSmall { required: usize, available: usize },
+}
+
+pub const MINIMUM_DECODE_INPUT_BUDGET: usize = 4096;
+
+impl From<Error> for ImageDecodeError {
+    fn from(error: Error) -> ImageDecodeError { ImageDecodeError::Module(error) }
+}
+
+/// Borrow `frames` aligned `i16` values from caller-owned decoder workspace.
+///
+/// Byte storage has no alignment guarantee, so an odd-addressed slice loses its first
+/// byte. The capacity error reports that alignment byte as part of the exact requirement.
+pub fn image_workspace_i16(workspace: &mut [u8], frames: usize) -> Result<&mut [i16], ImageDecodeError> {
+    let byte_length = frames.checked_mul(core::mem::size_of::<i16>())
+        .ok_or(Error::TooLarge("module image decoder workspace"))?;
+    let alignment = (workspace.as_ptr() as usize) % core::mem::align_of::<i16>();
+    let required = alignment.checked_add(byte_length).ok_or(Error::TooLarge("module image decoder workspace"))?;
+    let available = workspace.len();
+    let bytes = workspace.get_mut(alignment..required)
+        .ok_or(ImageDecodeError::WorkspaceTooSmall { required, available })?;
+    bytemuck::try_cast_slice_mut(bytes).map_err(|_| Error::Invalid("module image decoder workspace alignment").into())
+}
 
 const MISALIGNED: Error = Error::Invalid("a module image must be 4-byte aligned in memory to borrow its PCM");
 const RESERVED_FLAGS: Error = Error::Invalid("a module image's reserved flags must be zero");
@@ -123,6 +164,17 @@ const MINIMUM_ENVELOPE_POINT_BYTES: usize = 4;
 // ── reading ─────────────────────────────────────────────────────────────────────────
 
 impl Module {
+    /// Fallibly build a module that borrows its PCM and pattern bytes from an image.
+    /// Every internal allocation is reserved explicitly and reports [`Error::Resource`]
+    /// instead of invoking the allocation error handler.
+    pub fn try_from_image(image: &'static [u8]) -> Result<Module, Error> {
+        let parts = parse_image(image)?;
+        let blob = image.get(parts.blob_bytes.clone()).ok_or(Error::OutOfRange)?;
+        let pcm_bytes = image.get(parts.pcm_bytes.clone()).ok_or(Error::OutOfRange)?;
+        let pcm = borrow_frames(pcm_bytes)?;
+        parts.into_module(BlobStorage::Borrowed(blob), PcmStorage::Borrowed(pcm))
+    }
+
     /// Build a module that **borrows** its PCM and its pattern blob from a memory-mapped
     /// image.
     ///
@@ -144,11 +196,7 @@ impl Module {
     /// * [`Error::Truncated`] — a length field names more bytes than the image holds.
     /// * [`Error::OutOfRange`] — an index table points outside the blob it indexes.
     pub fn from_image(image: &'static [u8]) -> Result<Module, Error> {
-        let parts = parse_image(image)?;
-        let blob = image.get(parts.blob_bytes.clone()).ok_or(Error::OutOfRange)?;
-        let pcm_bytes = image.get(parts.pcm_bytes.clone()).ok_or(Error::OutOfRange)?;
-        let pcm = borrow_frames(pcm_bytes)?;
-        parts.into_module(BlobStorage::Borrowed(blob), PcmStorage::Borrowed(pcm))
+        Self::try_from_image(image)
     }
 
     /// [`Module::from_image`], but an image whose PCM cannot be borrowed — because the
@@ -314,7 +362,10 @@ impl<'image> Cursor<'image> {
         let length = self.length()?;
         let bytes = self.take(length)?;
         let text = core::str::from_utf8(bytes).map_err(|_| BAD_TEXT)?;
-        Ok(String::from(text).into_boxed_str())
+        let mut owned = String::new();
+        owned.try_reserve_exact(text.len()).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
+        owned.push_str(text);
+        Ok(owned.into_boxed_str())
     }
 
     /// A `u32` byte length, as a `usize`.
@@ -363,19 +414,23 @@ fn parse_image(image: &[u8]) -> Result<ImageParts, Error> {
     let order_count = cursor.count(MINIMUM_ORDER_BYTES)?;
     let instrument_count = cursor.count(MINIMUM_INSTRUMENT_BYTES)?;
 
-    let mut samples = Vec::with_capacity(sample_count);
+    let mut samples = Vec::new();
+    samples.try_reserve_exact(sample_count).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
     for _ in 0..sample_count {
         samples.push(read_sample(&mut cursor)?);
     }
-    let mut patterns = Vec::with_capacity(pattern_count);
+    let mut patterns = Vec::new();
+    patterns.try_reserve_exact(pattern_count).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
     for _ in 0..pattern_count {
         patterns.push(read_pattern(&mut cursor)?);
     }
-    let mut orders = Vec::with_capacity(order_count);
+    let mut orders = Vec::new();
+    orders.try_reserve_exact(order_count).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
     for _ in 0..order_count {
         orders.push(cursor.u16()?);
     }
-    let mut instruments = Vec::with_capacity(instrument_count);
+    let mut instruments = Vec::new();
+    instruments.try_reserve_exact(instrument_count).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
     for _ in 0..instrument_count {
         instruments.push(read_instrument(&mut cursor)?);
     }
@@ -411,17 +466,22 @@ fn read_header(cursor: &mut Cursor<'_>) -> Result<ModuleHeader, Error> {
     let format_extra = cursor.u32()?;
 
     let pan_count = cursor.count(2)?;
-    let mut default_pan = Vec::with_capacity(pan_count);
+    let mut default_pan = Vec::new();
+    default_pan.try_reserve_exact(pan_count).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
     for _ in 0..pan_count {
         default_pan.push(I1F15::from_bits(cursor.i16()?));
     }
     let channel_volume_count = cursor.count(2)?;
-    let mut default_channel_volume = Vec::with_capacity(channel_volume_count);
+    let mut default_channel_volume = Vec::new();
+    default_channel_volume.try_reserve_exact(channel_volume_count).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
     for _ in 0..channel_volume_count {
         default_channel_volume.push(U0F16::from_bits(cursor.u16()?));
     }
     let format_data_length = cursor.length()?;
-    let format_data = Box::from(cursor.take(format_data_length)?);
+    let format_data_bytes = cursor.take(format_data_length)?;
+    let mut format_data = Vec::new();
+    format_data.try_reserve_exact(format_data_length).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
+    format_data.extend_from_slice(format_data_bytes);
 
     Ok(ModuleHeader {
         title,
@@ -436,7 +496,7 @@ fn read_header(cursor: &mut Cursor<'_>) -> Result<ModuleHeader, Error> {
         dialect,
         format_extra,
         default_channel_volume: default_channel_volume.into_boxed_slice(),
-        format_data,
+        format_data: format_data.into_boxed_slice(),
     })
 }
 
@@ -460,7 +520,7 @@ fn read_sample(cursor: &mut Cursor<'_>) -> Result<SampleIndex, Error> {
         },
         sustain_loop: read_optional_sustain_loop(cursor)?,
         rate_scale_log2: cursor.u8()?,
-        name: String::from(cursor.text()?),
+        name: cursor.text()?.into_string(),
     };
     Ok(SampleIndex::new(pcm_offset, length_frames, specification))
 }
@@ -541,7 +601,8 @@ fn read_optional_envelope(cursor: &mut Cursor<'_>) -> Result<Option<Envelope>, E
         return Ok(None);
     }
     let point_count = cursor.count(MINIMUM_ENVELOPE_POINT_BYTES)?;
-    let mut points = Vec::with_capacity(point_count);
+    let mut points = Vec::new();
+    points.try_reserve_exact(point_count).map_err(|_| Error::Resource("not enough memory for module image metadata"))?;
     for _ in 0..point_count {
         points.push(EnvelopePoint { tick: cursor.u16()?, value: cursor.i16()? });
     }
@@ -590,6 +651,264 @@ fn read_module_flags(bits: u8) -> Result<ModuleFlags, Error> {
 
 // ── writing ─────────────────────────────────────────────────────────────────────────
 
+/// Byte destination used by the canonical SPMI metadata writer.
+///
+/// The owned [`Vec`] implementation backs [`Module::to_image`]. [`SliceImageOutput`]
+/// is the caller-buffer implementation used by incremental decoders. A slice records
+/// overflow and clips writes; callers must check [`SliceImageOutput::finish`].
+pub trait ModuleImageOutput {
+    fn write_bytes(&mut self, bytes: &[u8]);
+    fn write_byte(&mut self, byte: u8) { self.write_bytes(core::slice::from_ref(&byte)); }
+    fn position(&self) -> usize;
+}
+
+impl ModuleImageOutput for Vec<u8> {
+    fn write_bytes(&mut self, bytes: &[u8]) { self.extend_from_slice(bytes); }
+    fn position(&self) -> usize { self.len() }
+}
+
+/// Fixed-capacity implementation of [`ModuleImageOutput`].
+pub struct SliceImageOutput<'buffer> {
+    bytes: &'buffer mut [u8],
+    written: usize,
+    required: usize,
+}
+
+impl<'buffer> SliceImageOutput<'buffer> {
+    pub fn new(bytes: &'buffer mut [u8]) -> SliceImageOutput<'buffer> {
+        SliceImageOutput { bytes, written: 0, required: 0 }
+    }
+
+    pub fn finish(self) -> Result<usize, usize> {
+        if self.required > self.bytes.len() { Err(self.required) } else { Ok(self.written) }
+    }
+}
+
+impl ModuleImageOutput for SliceImageOutput<'_> {
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        let start = self.required;
+        self.required = self.required.saturating_add(bytes.len());
+        let writable = self.bytes.len().saturating_sub(start).min(bytes.len());
+        if writable != 0
+            && let (Some(destination), Some(source)) = (self.bytes.get_mut(start..start + writable), bytes.get(..writable))
+        {
+            destination.copy_from_slice(source);
+        }
+        self.written = self.required.min(self.bytes.len());
+    }
+
+    fn position(&self) -> usize { self.required }
+}
+
+#[derive(Default)]
+struct CountingImageOutput(usize);
+
+impl ModuleImageOutput for CountingImageOutput {
+    fn write_bytes(&mut self, bytes: &[u8]) { self.0 = self.0.saturating_add(bytes.len()); }
+    fn position(&self) -> usize { self.0 }
+}
+
+/// Metadata and exact blob extents for a module image whose large pattern and PCM
+/// regions are written separately into caller storage.
+///
+/// Format decoders use this as the second implementation of the module-building output
+/// contract: [`ModuleBuilder`](crate::ModuleBuilder) owns its blobs, while this plan owns
+/// only small index tables and records where caller-written blobs will live.
+#[derive(Clone, Debug, Default)]
+pub struct ModuleImagePlan {
+    header: Option<ModuleHeader>,
+    samples: Vec<SampleIndex>,
+    patterns: Vec<PatternIndex>,
+    orders: Vec<u16>,
+    instruments: Vec<InstrumentDef>,
+    pcm_frames: usize,
+    blob_bytes: usize,
+    entry_metadata_bytes: usize,
+}
+
+impl ModuleImagePlan {
+    pub fn new() -> ModuleImagePlan { ModuleImagePlan::default() }
+
+    pub fn try_add_sample(&mut self, source_frames: usize, specification: SampleSpec) -> Result<SampleId, Error> {
+        let id = u16::try_from(self.samples.len()).map_err(|_| Error::TooLarge("more than 65536 samples"))?;
+        let source_frames = u32::try_from(source_frames).map_err(|_| Error::TooLarge("a sample longer than 4 GFrames"))?;
+        if specification.reference_rate_hz == 0 { return Err(Error::Invalid("a sample needs a non-zero reference rate")); }
+        if specification.loop_mode.is_looping() {
+            if specification.loop_start >= specification.loop_end { return Err(Error::Invalid("a looping sample needs loop_start < loop_end")); }
+            if specification.loop_end > source_frames { return Err(Error::OutOfRange); }
+        }
+        let has_sustain_loop = if let Some(sustain) = specification.sustain_loop {
+            if !sustain.mode.is_looping() { return Err(Error::Invalid("a sustain loop needs a looping mode")); }
+            if sustain.start >= sustain.end { return Err(Error::Invalid("a sustain loop needs start < end")); }
+            if sustain.end > source_frames { return Err(Error::OutOfRange); }
+            true
+        } else {
+            false
+        };
+        let stored_frames = if has_sustain_loop {
+            source_frames
+        } else {
+            match specification.loop_mode {
+                LoopMode::Forward | LoopMode::PingPong => specification.loop_end,
+                LoopMode::None => source_frames,
+            }
+        };
+        let pcm_offset = u32::try_from(self.pcm_frames).map_err(|_| Error::TooLarge("module PCM larger than 4 GFrames"))?
+            .checked_add(PRE_ROLL_FRAMES as u32).ok_or(Error::TooLarge("module PCM larger than 4 GFrames"))?;
+        let stored_total = (stored_frames as usize)
+            .checked_add(PRE_ROLL_FRAMES + GUARD_FRAMES).ok_or(Error::TooLarge("sample length"))?;
+        self.pcm_frames = self.pcm_frames.checked_add(stored_total).ok_or(Error::TooLarge("module PCM"))?;
+        u32::try_from(self.pcm_frames).map_err(|_| Error::TooLarge("module PCM larger than 4 GFrames"))?;
+        self.samples.try_reserve(1).map_err(|_| metadata_resource())?;
+        let sample = SampleIndex::new(pcm_offset, stored_frames, specification);
+        self.entry_metadata_bytes = self.entry_metadata_bytes.saturating_add(encoded_sample_bytes(&sample));
+        self.samples.push(sample);
+        Ok(SampleId(id))
+    }
+
+    pub fn try_add_pattern(&mut self, length_bytes: usize, rows: u16, channels: u8) -> Result<PatternId, Error> {
+        let id = u16::try_from(self.patterns.len()).map_err(|_| Error::TooLarge("more than 65536 patterns"))?;
+        if rows == 0 || channels == 0 { return Err(Error::Invalid("a pattern needs at least one row and one channel")); }
+        let blob_offset = u32::try_from(self.blob_bytes).map_err(|_| Error::TooLarge("module blob larger than 4 GB"))?;
+        let length_bytes_u32 = u32::try_from(length_bytes).map_err(|_| Error::TooLarge("a pattern larger than 4 GB"))?;
+        self.blob_bytes = self.blob_bytes.checked_add(length_bytes).ok_or(Error::TooLarge("module blob"))?;
+        u32::try_from(self.blob_bytes).map_err(|_| Error::TooLarge("module blob larger than 4 GB"))?;
+        self.patterns.try_reserve(1).map_err(|_| metadata_resource())?;
+        let pattern = PatternIndex::new(blob_offset, length_bytes_u32, rows, channels);
+        self.entry_metadata_bytes = self.entry_metadata_bytes.saturating_add(encoded_pattern_bytes(&pattern));
+        self.patterns.push(pattern);
+        Ok(PatternId(id))
+    }
+
+    pub fn try_add_instrument(&mut self, instrument: InstrumentDef) -> Result<InstrumentId, Error> {
+        let id = u16::try_from(self.instruments.len()).map_err(|_| Error::TooLarge("more than 65536 instruments"))?;
+        self.instruments.try_reserve(1).map_err(|_| metadata_resource())?;
+        self.entry_metadata_bytes = self.entry_metadata_bytes.saturating_add(encoded_instrument_bytes(&instrument));
+        self.instruments.push(instrument);
+        Ok(InstrumentId(id))
+    }
+
+    pub fn try_set_orders(&mut self, orders: &[u16]) -> Result<(), Error> {
+        self.entry_metadata_bytes = self.entry_metadata_bytes.saturating_sub(self.orders.len().saturating_mul(2));
+        self.orders.clear();
+        self.orders.try_reserve_exact(orders.len()).map_err(|_| metadata_resource())?;
+        self.orders.extend_from_slice(orders);
+        self.entry_metadata_bytes = self.entry_metadata_bytes.saturating_add(self.orders.len().saturating_mul(2));
+        Ok(())
+    }
+
+    pub fn try_push_order(&mut self, order: u16) -> Result<(), Error> {
+        self.orders.try_reserve(1).map_err(|_| metadata_resource())?;
+        self.orders.push(order);
+        self.entry_metadata_bytes = self.entry_metadata_bytes.saturating_add(2);
+        Ok(())
+    }
+
+    pub fn set_header(&mut self, header: ModuleHeader) { self.header = Some(header); }
+    pub fn samples(&self) -> &[SampleIndex] { &self.samples }
+    pub fn patterns(&self) -> &[PatternIndex] { &self.patterns }
+    pub fn pcm_frames(&self) -> usize { self.pcm_frames }
+    pub fn blob_bytes(&self) -> usize { self.blob_bytes }
+
+    pub fn metadata_bytes(&self) -> Result<usize, Error> {
+        let header = self.header.as_ref().ok_or(Error::Invalid("a module needs a header"))?;
+        Ok(28usize.saturating_add(encoded_header_bytes(header)).saturating_add(self.entry_metadata_bytes))
+    }
+
+    pub fn metadata_part_count(&self) -> usize {
+        let format_data_parts = self.header.as_ref().map_or(0, |header| header.format_data.len().div_ceil(MINIMUM_DECODE_INPUT_BUDGET));
+        3usize.saturating_add(format_data_parts).saturating_add(self.samples.len()).saturating_add(self.patterns.len())
+            .saturating_add(self.orders.len()).saturating_add(self.instruments.len())
+    }
+
+    /// Write one bounded canonical metadata record. The header's potentially large
+    /// format-specific byte string is split into 4096-byte parts; every table entry is
+    /// its own part. No call walks any other entry.
+    pub fn write_metadata_part(&self, part: usize, destination: &mut [u8]) -> Result<usize, Error> {
+        let mut output = SliceImageOutput::new(destination);
+        let header = self.header.as_ref().ok_or(Error::Invalid("a module needs a header"))?;
+        let format_data_parts = header.format_data.len().div_ceil(MINIMUM_DECODE_INPUT_BUDGET);
+        if part == 0 {
+            output.write_bytes(&IMAGE_MAGIC);
+            push_u16(&mut output, IMAGE_VERSION);
+            push_u16(&mut output, 0);
+            write_header_prefix(&mut output, header);
+        } else if part <= format_data_parts {
+            let start = (part - 1).saturating_mul(MINIMUM_DECODE_INPUT_BUDGET);
+            let end = start.saturating_add(MINIMUM_DECODE_INPUT_BUDGET).min(header.format_data.len());
+            output.write_bytes(header.format_data.get(start..end).ok_or(Error::OutOfRange)?);
+        } else if part == format_data_parts + 1 {
+            push_length(&mut output, self.samples.len());
+            push_length(&mut output, self.patterns.len());
+            push_length(&mut output, self.orders.len());
+            push_length(&mut output, self.instruments.len());
+        } else {
+            let mut index = part - format_data_parts - 2;
+            if let Some(sample) = self.samples.get(index) { write_sample(&mut output, sample); return output.finish().map_err(|_| metadata_resource()); }
+            index = index.saturating_sub(self.samples.len());
+            if let Some(pattern) = self.patterns.get(index) { write_pattern(&mut output, pattern); return output.finish().map_err(|_| metadata_resource()); }
+            index = index.saturating_sub(self.patterns.len());
+            if let Some(order) = self.orders.get(index) { push_u16(&mut output, *order); return output.finish().map_err(|_| metadata_resource()); }
+            index = index.saturating_sub(self.orders.len());
+            if let Some(instrument) = self.instruments.get(index) { write_instrument(&mut output, instrument); return output.finish().map_err(|_| metadata_resource()); }
+            index = index.saturating_sub(self.instruments.len());
+            if index == 0 { push_length(&mut output, self.blob_bytes); }
+            else { return Err(Error::OutOfRange); }
+        }
+        output.finish().map_err(|_| metadata_resource())
+    }
+
+    pub fn write_metadata(&self, destination: &mut [u8]) -> Result<usize, Error> {
+        let mut output = SliceImageOutput::new(destination);
+        self.write_metadata_to(&mut output)?;
+        output.finish().map_err(|_| Error::Resource("module image decoder workspace is too small"))
+    }
+
+    fn write_metadata_to(&self, output: &mut impl ModuleImageOutput) -> Result<(), Error> {
+        let header = self.header.as_ref().ok_or(Error::Invalid("a module needs a header"))?;
+        output.write_bytes(&IMAGE_MAGIC);
+        push_u16(output, IMAGE_VERSION);
+        push_u16(output, 0);
+        write_header(output, header);
+        push_length(output, self.samples.len());
+        push_length(output, self.patterns.len());
+        push_length(output, self.orders.len());
+        push_length(output, self.instruments.len());
+        for sample in &self.samples { write_sample(output, sample); }
+        for pattern in &self.patterns { write_pattern(output, pattern); }
+        for order in &self.orders { push_u16(output, *order); }
+        for instrument in &self.instruments { write_instrument(output, instrument); }
+        push_length(output, self.blob_bytes);
+        Ok(())
+    }
+}
+
+fn metadata_resource() -> Error { Error::Resource("not enough memory for module image metadata") }
+
+fn encoded_header_bytes(header: &ModuleHeader) -> usize {
+    let mut counter = CountingImageOutput::default();
+    write_header(&mut counter, header);
+    counter.position()
+}
+
+fn encoded_sample_bytes(sample: &SampleIndex) -> usize {
+    let mut counter = CountingImageOutput::default();
+    write_sample(&mut counter, sample);
+    counter.position()
+}
+
+fn encoded_pattern_bytes(pattern: &PatternIndex) -> usize {
+    let mut counter = CountingImageOutput::default();
+    write_pattern(&mut counter, pattern);
+    counter.position()
+}
+
+fn encoded_instrument_bytes(instrument: &InstrumentDef) -> usize {
+    let mut counter = CountingImageOutput::default();
+    write_instrument(&mut counter, instrument);
+    counter.position()
+}
+
 impl Module {
     /// Serialise this module as a module image — the inverse of [`Module::from_image`].
     ///
@@ -605,7 +924,7 @@ impl Module {
     /// own offsets are `u32` already.
     pub fn to_image(&self) -> Vec<u8> {
         let mut image = Vec::new();
-        image.extend_from_slice(&IMAGE_MAGIC);
+        image.write_bytes(&IMAGE_MAGIC);
         push_u16(&mut image, IMAGE_VERSION);
         push_u16(&mut image, 0);
 
@@ -629,15 +948,15 @@ impl Module {
         }
 
         push_length(&mut image, self.blob().len());
-        image.extend_from_slice(self.blob());
+        image.write_bytes(self.blob());
         // The PCM's own length field is four bytes, so aligning *before* it is what lands
         // the frames themselves on a 4-byte boundary.
         while !image.len().is_multiple_of(IMAGE_ALIGNMENT) {
-            image.push(0);
+            image.write_byte(0);
         }
         push_length(&mut image, self.pcm().len());
         for frame in self.pcm().iter() {
-            image.extend_from_slice(&frame.to_le_bytes());
+            image.write_bytes(&frame.to_le_bytes());
         }
         image
     }
@@ -648,12 +967,17 @@ impl Module {
     pub fn image_pcm_bytes(&self) -> usize { self.pcm().len().saturating_mul(2) }
 }
 
-fn write_header(image: &mut Vec<u8>, header: &ModuleHeader) {
+fn write_header(image: &mut impl ModuleImageOutput, header: &ModuleHeader) {
+    write_header_prefix(image, header);
+    image.write_bytes(&header.format_data);
+}
+
+fn write_header_prefix(image: &mut impl ModuleImageOutput, header: &ModuleHeader) {
     push_text(image, &header.title);
-    image.push(module_format_code(header.format));
-    image.push(header.channel_count);
-    image.push(header.initial_speed);
-    image.push(module_flags_bits(header.flags));
+    image.write_byte(module_format_code(header.format));
+    image.write_byte(header.channel_count);
+    image.write_byte(header.initial_speed);
+    image.write_byte(module_flags_bits(header.flags));
     push_u16(image, header.initial_tempo);
     push_u16(image, header.global_volume.to_bits());
     push_u16(image, header.master_volume.to_bits());
@@ -669,46 +993,45 @@ fn write_header(image: &mut Vec<u8>, header: &ModuleHeader) {
         push_u16(image, volume.to_bits());
     }
     push_length(image, header.format_data.len());
-    image.extend_from_slice(&header.format_data);
 }
 
-fn write_sample(image: &mut Vec<u8>, sample: &SampleIndex) {
-    let specification = sample.to_spec();
+fn write_sample(image: &mut impl ModuleImageOutput, sample: &SampleIndex) {
     push_u32(image, sample.pcm_offset());
     push_u32(image, sample.length_frames());
-    image.push(loop_mode_code(specification.loop_mode));
-    push_u32(image, specification.loop_start);
-    push_u32(image, specification.loop_end);
-    push_u16(image, specification.default_volume.to_bits());
-    push_u32(image, specification.reference_rate_hz);
-    image.push(specification.relative_note as u8);
-    image.push(specification.finetune as u8);
-    write_optional_pan(image, specification.default_pan);
-    image.push(auto_vibrato_waveform_code(specification.auto_vibrato.waveform));
-    image.push(specification.auto_vibrato.sweep);
-    image.push(specification.auto_vibrato.depth);
-    image.push(specification.auto_vibrato.rate);
-    write_optional_sustain_loop(image, specification.sustain_loop);
-    image.push(specification.rate_scale_log2);
-    push_text(image, &specification.name);
+    image.write_byte(loop_mode_code(sample.loop_mode()));
+    push_u32(image, sample.loop_start());
+    push_u32(image, sample.loop_end());
+    push_u16(image, sample.default_volume().to_bits());
+    push_u32(image, sample.reference_rate_hz());
+    image.write_byte(sample.relative_note() as u8);
+    image.write_byte(sample.finetune() as u8);
+    write_optional_pan(image, sample.default_pan());
+    let auto_vibrato = sample.auto_vibrato();
+    image.write_byte(auto_vibrato_waveform_code(auto_vibrato.waveform));
+    image.write_byte(auto_vibrato.sweep);
+    image.write_byte(auto_vibrato.depth);
+    image.write_byte(auto_vibrato.rate);
+    write_optional_sustain_loop(image, sample.sustain_loop());
+    image.write_byte(sample.rate_scale_log2());
+    push_text(image, sample.name());
 }
 
-fn write_pattern(image: &mut Vec<u8>, pattern: &PatternIndex) {
+fn write_pattern(image: &mut impl ModuleImageOutput, pattern: &PatternIndex) {
     push_u32(image, pattern.blob_offset());
     push_u32(image, pattern.length_bytes());
     push_u16(image, pattern.rows());
-    image.push(pattern.channels());
+    image.write_byte(pattern.channels());
 }
 
-fn write_instrument(image: &mut Vec<u8>, instrument: &InstrumentDef) {
+fn write_instrument(image: &mut impl ModuleImageOutput, instrument: &InstrumentDef) {
     push_text(image, &instrument.name);
     match instrument.sample {
         Some(SampleId(sample)) => {
-            image.push(1);
+            image.write_byte(1);
             push_u16(image, sample);
         }
         None => {
-            image.push(0);
+            image.write_byte(0);
             push_u16(image, 0);
         }
     }
@@ -718,42 +1041,42 @@ fn write_instrument(image: &mut Vec<u8>, instrument: &InstrumentDef) {
     // is 360 bytes saved per instrument, which on a 31-instrument MOD is most of the
     // image; see `Module::to_image`.
     let note_sample_map_is_default = instrument.note_sample_map.iter().all(|entry| *entry == 0);
-    image.push(u8::from(!note_sample_map_is_default));
+    image.write_byte(u8::from(!note_sample_map_is_default));
     if !note_sample_map_is_default {
         for entry in instrument.note_sample_map.iter() {
             push_u16(image, *entry);
         }
     }
     let note_transpose_map_is_default = instrument.note_transpose_map == identity_transpose_map();
-    image.push(u8::from(!note_transpose_map_is_default));
+    image.write_byte(u8::from(!note_transpose_map_is_default));
     if !note_transpose_map_is_default {
-        image.extend_from_slice(&instrument.note_transpose_map);
+        image.write_bytes(&instrument.note_transpose_map);
     }
 
     write_optional_envelope(image, instrument.volume_envelope.as_ref());
     write_optional_envelope(image, instrument.panning_envelope.as_ref());
     write_optional_envelope(image, instrument.pitch_envelope.as_ref());
     push_u16(image, instrument.fadeout);
-    image.push(new_note_action_code(instrument.new_note_action));
-    image.push(duplicate_check_code(instrument.duplicate_check));
-    image.push(duplicate_action_code(instrument.duplicate_action));
+    image.write_byte(new_note_action_code(instrument.new_note_action));
+    image.write_byte(duplicate_check_code(instrument.duplicate_check));
+    image.write_byte(duplicate_action_code(instrument.duplicate_action));
     push_u16(image, instrument.global_volume.to_bits());
     write_optional_pan(image, instrument.default_pan);
-    image.push(instrument.pitch_pan_separation as u8);
-    image.push(instrument.pitch_pan_centre);
-    image.push(instrument.random_volume_variation);
-    image.push(instrument.random_pan_variation);
+    image.write_byte(instrument.pitch_pan_separation as u8);
+    image.write_byte(instrument.pitch_pan_centre);
+    image.write_byte(instrument.random_volume_variation);
+    image.write_byte(instrument.random_pan_variation);
     write_optional_byte(image, instrument.initial_filter_cutoff);
     write_optional_byte(image, instrument.initial_filter_resonance);
-    image.push(u8::from(instrument.pitch_envelope_is_filter));
+    image.write_byte(u8::from(instrument.pitch_envelope_is_filter));
 }
 
-fn write_optional_envelope(image: &mut Vec<u8>, envelope: Option<&Envelope>) {
+fn write_optional_envelope(image: &mut impl ModuleImageOutput, envelope: Option<&Envelope>) {
     let Some(envelope) = envelope else {
-        image.push(0);
+        image.write_byte(0);
         return;
     };
-    image.push(1);
+    image.write_byte(1);
     push_length(image, envelope.points.len());
     for point in envelope.points.iter() {
         push_u16(image, point.tick);
@@ -761,44 +1084,44 @@ fn write_optional_envelope(image: &mut Vec<u8>, envelope: Option<&Envelope>) {
     }
     write_optional_span(image, envelope.sustain);
     write_optional_span(image, envelope.loop_span);
-    image.push(u8::from(envelope.carry));
+    image.write_byte(u8::from(envelope.carry));
 }
 
-fn write_optional_span(image: &mut Vec<u8>, span: Option<EnvelopeSpan>) {
-    image.push(u8::from(span.is_some()));
+fn write_optional_span(image: &mut impl ModuleImageOutput, span: Option<EnvelopeSpan>) {
+    image.write_byte(u8::from(span.is_some()));
     let span = span.unwrap_or_default();
-    image.push(span.start);
-    image.push(span.end);
+    image.write_byte(span.start);
+    image.write_byte(span.end);
 }
 
-fn write_optional_pan(image: &mut Vec<u8>, pan: Option<I1F15>) {
-    image.push(u8::from(pan.is_some()));
+fn write_optional_pan(image: &mut impl ModuleImageOutput, pan: Option<I1F15>) {
+    image.write_byte(u8::from(pan.is_some()));
     push_u16(image, pan.unwrap_or(I1F15::ZERO).to_bits() as u16);
 }
 
-fn write_optional_byte(image: &mut Vec<u8>, value: Option<u8>) {
-    image.push(u8::from(value.is_some()));
-    image.push(value.unwrap_or(0));
+fn write_optional_byte(image: &mut impl ModuleImageOutput, value: Option<u8>) {
+    image.write_byte(u8::from(value.is_some()));
+    image.write_byte(value.unwrap_or(0));
 }
 
-fn write_optional_sustain_loop(image: &mut Vec<u8>, sustain: Option<SustainLoop>) {
-    image.push(u8::from(sustain.is_some()));
+fn write_optional_sustain_loop(image: &mut impl ModuleImageOutput, sustain: Option<SustainLoop>) {
+    image.write_byte(u8::from(sustain.is_some()));
     let sustain = sustain.unwrap_or(SustainLoop { mode: LoopMode::None, start: 0, end: 0 });
-    image.push(loop_mode_code(sustain.mode));
+    image.write_byte(loop_mode_code(sustain.mode));
     push_u32(image, sustain.start);
     push_u32(image, sustain.end);
 }
 
-fn push_u16(image: &mut Vec<u8>, value: u16) { image.extend_from_slice(&value.to_le_bytes()); }
+fn push_u16(image: &mut impl ModuleImageOutput, value: u16) { image.write_bytes(&value.to_le_bytes()); }
 
-fn push_u32(image: &mut Vec<u8>, value: u32) { image.extend_from_slice(&value.to_le_bytes()); }
+fn push_u32(image: &mut impl ModuleImageOutput, value: u32) { image.write_bytes(&value.to_le_bytes()); }
 
 /// A length or a count, as a `u32`. See [`Module::to_image`] for what saturation means.
-fn push_length(image: &mut Vec<u8>, value: usize) { push_u32(image, u32::try_from(value).unwrap_or(u32::MAX)); }
+fn push_length(image: &mut impl ModuleImageOutput, value: usize) { push_u32(image, u32::try_from(value).unwrap_or(u32::MAX)); }
 
-fn push_text(image: &mut Vec<u8>, text: &str) {
+fn push_text(image: &mut impl ModuleImageOutput, text: &str) {
     push_length(image, text.len());
-    image.extend_from_slice(text.as_bytes());
+    image.write_bytes(text.as_bytes());
 }
 
 fn module_flags_bits(flags: ModuleFlags) -> u8 {

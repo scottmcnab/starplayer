@@ -35,7 +35,7 @@
 //! [`LoopDetector::reset_marking_before`] are bit operations over buffers that already
 //! exist.
 
-use alloc::vec;
+use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
 use starplayer_core::{AtEnd, Frame, TempoModel};
@@ -110,7 +110,7 @@ pub enum Visit {
 }
 
 /// One row of one pattern, and when the song first reached it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RowMark {
     /// Index into the order list.
     pub order: u16,
@@ -157,6 +157,92 @@ pub enum EndReason {
     Budget,
 }
 
+/// Failure to prepare a timeline in caller-owned storage.
+#[derive(Debug)]
+pub enum TimelineBufferError {
+    Allocation(TryReserveError),
+    TooSmall { required: usize, available: usize },
+}
+
+impl From<TryReserveError> for TimelineBufferError {
+    fn from(error: TryReserveError) -> Self { Self::Allocation(error) }
+}
+
+#[derive(Clone, Debug)]
+enum TimelineTable<T: 'static> {
+    Owned(Vec<T>),
+    Borrowed(&'static [T]),
+}
+
+impl<T> core::ops::Deref for TimelineTable<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self { Self::Owned(values) => values, Self::Borrowed(values) => values }
+    }
+}
+
+impl<T: PartialEq> PartialEq for TimelineTable<T> {
+    fn eq(&self, other: &Self) -> bool { **self == **other }
+}
+impl<T: Eq> Eq for TimelineTable<T> {}
+
+impl<T: Copy> TimelineTable<T> {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        match self {
+            Self::Borrowed(values) => Ok(Self::Borrowed(values)),
+            Self::Owned(values) => {
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(values.len())?;
+                copy.extend_from_slice(values);
+                Ok(Self::Owned(copy))
+            }
+        }
+    }
+}
+
+// Mutable only during preparation; frozen before publication to the audio thread.
+enum TimelineWriter<T: 'static> {
+    Discard,
+    Owned(Vec<T>),
+    Borrowed { values: &'static mut [T], length: usize },
+}
+
+impl<T> TimelineWriter<T> {
+    fn len(&self) -> usize {
+        match self { Self::Discard => 0, Self::Owned(values) => values.len(), Self::Borrowed { length, .. } => *length }
+    }
+
+    fn push(&mut self, value: T) -> Result<(), TimelineBufferError> {
+        match self {
+            Self::Discard => {},
+            Self::Owned(values) => { values.try_reserve(1)?; values.push(value); }
+            Self::Borrowed { values, length } => {
+                let available = values.len();
+                let slot = values.get_mut(*length).ok_or(TimelineBufferError::TooSmall { required: *length + 1, available })?;
+                *slot = value;
+                *length += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        match self {
+            Self::Discard => None,
+            Self::Owned(values) => values.get_mut(index),
+            Self::Borrowed { values, length } => values.get_mut(..*length)?.get_mut(index),
+        }
+    }
+
+    fn finish(self) -> TimelineTable<T> {
+        match self {
+            Self::Discard => TimelineTable::Owned(Vec::new()),
+            Self::Owned(values) => TimelineTable::Owned(values),
+            Self::Borrowed { values, length } => TimelineTable::Borrowed(values.get(..length).unwrap_or_default()),
+        }
+    }
+}
+
 /// The scanned shape of one song: every row it plays, when, and how it ends.
 ///
 /// Plain data with no behaviour beyond lookups, built once off the audio thread and then
@@ -164,8 +250,8 @@ pub enum EndReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SongTimeline {
     sample_rate_hz: u32,
-    marks: Vec<RowMark>,
-    order_marks: Vec<Option<u32>>,
+    marks: TimelineTable<RowMark>,
+    order_marks: TimelineTable<Option<u32>>,
     end_frame: u64,
     end: EndReason,
 }
@@ -173,7 +259,14 @@ pub struct SongTimeline {
 impl SongTimeline {
     /// An empty timeline for a module with nothing to play.
     pub fn empty(sample_rate_hz: u32) -> SongTimeline {
-        SongTimeline { sample_rate_hz, marks: Vec::new(), order_marks: Vec::new(), end_frame: 0, end: EndReason::Stopped }
+        SongTimeline { sample_rate_hz, marks: TimelineTable::Owned(Vec::new()), order_marks: TimelineTable::Owned(Vec::new()), end_frame: 0, end: EndReason::Stopped }
+    }
+
+    /// Clone the timeline without aborting when its row tables cannot be allocated.
+    pub fn try_clone(&self) -> Result<SongTimeline, TryReserveError> {
+        let marks = self.marks.try_clone()?;
+        let order_marks = self.order_marks.try_clone()?;
+        Ok(SongTimeline { sample_rate_hz: self.sample_rate_hz, marks, order_marks, end_frame: self.end_frame, end: self.end })
     }
 
     /// The output rate the frames in this timeline are counted at.
@@ -265,9 +358,16 @@ pub struct LoopDetector {
 impl LoopDetector {
     /// A detector sized for `data`'s order list. The only allocation this type ever does.
     pub fn new<Data: PatternData>(data: &Data) -> LoopDetector {
+        Self::try_new(data).expect("loop detector allocation failed")
+    }
+
+    /// Allocate the fixed row-visit tables without aborting on allocation failure.
+    pub fn try_new<Data: PatternData>(data: &Data) -> Result<LoopDetector, TryReserveError> {
         let order_count = data.order_count() as usize;
-        let mut order_offsets = Vec::with_capacity(order_count);
-        let mut order_rows = Vec::with_capacity(order_count);
+        let mut order_offsets = Vec::new();
+        order_offsets.try_reserve_exact(order_count)?;
+        let mut order_rows = Vec::new();
+        order_rows.try_reserve_exact(order_count)?;
         let mut total_bits = 0u32;
         for order in 0..data.order_count() {
             let rows = match data.order(order) {
@@ -278,8 +378,11 @@ impl LoopDetector {
             order_rows.push(rows);
             total_bits = total_bits.saturating_add(rows as u32);
         }
-        let words = vec![0u64; (total_bits as usize).div_ceil(64)];
-        LoopDetector { order_offsets, order_rows, words, inside_loop: false, loop_arrivals: 0, armed: true }
+        let word_count = (total_bits as usize).div_ceil(64);
+        let mut words = Vec::new();
+        words.try_reserve_exact(word_count)?;
+        words.resize(word_count, 0);
+        Ok(LoopDetector { order_offsets, order_rows, words, inside_loop: false, loop_arrivals: 0, armed: true })
     }
 
     /// Whether the detector is still watching. It disarms once it has fired.
@@ -427,25 +530,85 @@ where
     Processor: TrackerProcessor + Send,
     Data: PatternData + Send,
 {
+    try_scan_timeline(sequencer, limits).expect("timeline scan allocation failed")
+}
+
+/// Scan with the same event semantics as [`scan_timeline`], reporting allocation failure.
+pub fn try_scan_timeline<Tempo, Processor, Data>(sequencer: &mut PatternSequencer<Tempo, Processor, Data>, limits: ScanLimits) -> Result<SongTimeline, TryReserveError>
+where
+    Tempo: TempoModel + Send,
+    Processor: TrackerProcessor + Send,
+    Data: PatternData + Send,
+{
+    let order_count = sequencer.data().order_count() as usize;
+    let mut order_marks = Vec::new();
+    order_marks.try_reserve_exact(order_count)?;
+    order_marks.resize(order_count, None);
+    match scan_with_tables(sequencer, limits, TimelineWriter::Owned(Vec::new()), TimelineWriter::Owned(order_marks)) {
+        Ok(timeline) => Ok(timeline),
+        Err(TimelineBufferError::Allocation(error)) => Err(error),
+        Err(TimelineBufferError::TooSmall { .. }) => unreachable!("owned tables grow fallibly"),
+    }
+}
+
+/// Run the canonical scan without recording row tables, for timing-mode comparisons.
+/// The processor, voice pool and channel state still use fallible allocations.
+pub fn try_scan_timeline_end<Tempo, Processor, Data>(sequencer: &mut PatternSequencer<Tempo, Processor, Data>, limits: ScanLimits) -> Result<(EndReason, u64), TryReserveError>
+where
+    Tempo: TempoModel + Send,
+    Processor: TrackerProcessor + Send,
+    Data: PatternData + Send,
+{
+    match scan_with_tables(sequencer, limits, TimelineWriter::Discard, TimelineWriter::Discard) {
+        Ok(timeline) => Ok((timeline.end(), timeline.end_frame())),
+        Err(TimelineBufferError::Allocation(error)) => Err(error),
+        Err(TimelineBufferError::TooSmall { .. }) => unreachable!("discarded tables have no capacity limit"),
+    }
+}
+
+/// Scan into initialized caller-owned row and order tables, without allocating those tables.
+///
+/// `order_marks` needs at least the module's order count entries. `marks` needs one
+/// entry per distinct visited row; insufficient capacity returns an error. Borrowed
+/// tables are immutable after success and their timeline clones allocate nothing.
+/// Hosts reclaiming a static arena must drop every timeline clone before reuse.
+pub fn try_scan_timeline_in<Tempo, Processor, Data>(sequencer: &mut PatternSequencer<Tempo, Processor, Data>, limits: ScanLimits, marks: &'static mut [RowMark], order_marks: &'static mut [Option<u32>]) -> Result<SongTimeline, TimelineBufferError>
+where
+    Tempo: TempoModel + Send,
+    Processor: TrackerProcessor + Send,
+    Data: PatternData + Send,
+{
+    let order_count = sequencer.data().order_count() as usize;
+    let available = order_marks.len();
+    let Some(order_marks) = order_marks.get_mut(..order_count) else {
+        return Err(TimelineBufferError::TooSmall { required: order_count, available });
+    };
+    order_marks.fill(None);
+    scan_with_tables(sequencer, limits, TimelineWriter::Borrowed { values: marks, length: 0 }, TimelineWriter::Borrowed { values: order_marks, length: order_count })
+}
+
+fn scan_with_tables<Tempo, Processor, Data>(sequencer: &mut PatternSequencer<Tempo, Processor, Data>, limits: ScanLimits, mut marks: TimelineWriter<RowMark>, mut order_marks: TimelineWriter<Option<u32>>) -> Result<SongTimeline, TimelineBufferError>
+where
+    Tempo: TempoModel + Send,
+    Processor: TrackerProcessor + Send,
+    Data: PatternData + Send,
+{
     let sample_rate_hz = sequencer.sample_rate_hz();
     let channel_count = (sequencer.data().channel_count() as usize).max(1);
-    let order_count = sequencer.data().order_count() as usize;
     // The processor, not the channel count, says how wide the pool has to be: a format
     // whose channel can sound several voices at once — XM, IT — would otherwise scan
     // through a pool it keeps filling, and measure a song shape the player never plays.
     // MOD, S3M and MTM keep the default, which is the channel count, so their scans are
     // unchanged.
     let voice_capacity = sequencer.processor().recommended_voice_capacity(channel_count).max(1);
-    let mut voices = VoicePool::new(voice_capacity);
-    let mut channels = ChannelTable::new(channel_count);
+    let mut voices = VoicePool::try_new(voice_capacity)?;
+    let mut channels = ChannelTable::try_new(channel_count)?;
     let mut control = ControlClock::new(sample_rate_hz, Frame::ZERO);
 
     // The scan is the one place that wants the sequencer to stop dead at the loop point:
     // that is the frame it is trying to measure.
     sequencer.set_at_end(AtEnd::Stop);
 
-    let mut marks: Vec<RowMark> = Vec::new();
-    let mut order_marks: Vec<Option<u32>> = vec![None; order_count];
     // Assigned on every path out of the loop below, which only ever leaves through a
     // `break`; declaring them uninitialised is what makes the compiler check that.
     let end_frame: u64;
@@ -487,7 +650,7 @@ where
                 {
                     *slot = Some(marks.len() as u32);
                 }
-                marks.push(visit.mark);
+                marks.push(visit.mark)?;
             }
             Visit::Looped => {
                 end = EndReason::Looped {
@@ -512,7 +675,7 @@ where
         }
     }
 
-    SongTimeline { sample_rate_hz, marks, order_marks, end_frame, end }
+    Ok(SongTimeline { sample_rate_hz, marks: marks.finish(), order_marks: order_marks.finish(), end_frame, end })
 }
 
 /// Whole frames of one tick at the timing the sequencer currently holds.

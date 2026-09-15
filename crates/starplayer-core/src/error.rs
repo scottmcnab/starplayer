@@ -39,6 +39,9 @@ pub enum Error {
     /// A value that would not fit the model's `u32` offsets, or a count past a hard limit
     /// the engine imposes.
     TooLarge(&'static str),
+    /// A fallible allocation could not reserve the small amount of internal memory
+    /// needed for indexes or decoder state.
+    Resource(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -50,6 +53,7 @@ impl fmt::Display for Error {
             Error::Invalid(what) => write!(formatter, "invalid module: {what}"),
             Error::OutOfRange => write!(formatter, "index or offset out of range"),
             Error::TooLarge(what) => write!(formatter, "too large: {what}"),
+            Error::Resource(what) => write!(formatter, "resource unavailable: {what}"),
         }
     }
 }

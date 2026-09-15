@@ -191,6 +191,24 @@ pub trait EventSource: Send {
     fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>);
 }
 
+/// A one-element array delegates to its source. This permits fallible boxing via
+/// `Vec::try_reserve_exact` and a checked boxed-slice conversion on stable Rust,
+/// without raw-pointer casts or an allocator API feature.
+impl<Source: EventSource> EventSource for [Source; 1] {
+    fn next_event_frame(&self) -> Option<Frame> { let [source] = self; source.next_event_frame() }
+    fn advance_to(&mut self, frame: Frame) { let [source] = self; source.advance_to(frame); }
+    fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) { let [source] = self; source.dispatch(frame, context); }
+}
+
+/// Allocate one dynamic source, returning allocation failure to the control thread.
+pub fn try_box_source<Source: EventSource + 'static>(source: Source) -> Result<Box<dyn EventSource>, alloc::collections::TryReserveError> {
+    let mut sources = Vec::new();
+    sources.try_reserve_exact(1)?;
+    sources.push(source);
+    let boxed: Box<[Source; 1]> = sources.into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!("one source was inserted"));
+    Ok(boxed)
+}
+
 /// A source with nothing to say. What a fresh [`Engine`](crate::Engine) starts with, so
 /// that "no source yet" needs no `Option` in the render loop.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]

@@ -407,6 +407,32 @@ impl XmProcessor {
         }
     }
 
+    /// Fallible form of [`XmProcessor::with_quirks`] for a host that must reject a
+    /// replacement cleanly when its internal heap is exhausted.
+    pub fn try_with_quirks(
+        module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection,
+    ) -> Result<XmProcessor, alloc::collections::TryReserveError> {
+        let header = module.header();
+        let quirks = quirks.resolve(header.dialect);
+        let channel_count = header.channel_count as usize;
+        let mut channels = Vec::new();
+        channels.try_reserve_exact(channel_count)?;
+        for _ in 0..channel_count {
+            channels.push(XmChannel::new());
+        }
+        let flow = PatternFlowState::try_new(quirks.xm_pattern_loop.flow(), channel_count)?;
+        Ok(XmProcessor {
+            linear_periods: header.flags.linear_slides,
+            global_volume: 64,
+            module,
+            channels: channels.into_boxed_slice(),
+            sample_rate_hz,
+            quirks,
+            flow,
+            carried_break_row: 0,
+        })
+    }
+
     /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
     pub const fn quirks(&self) -> QuirkSet { self.quirks }
 

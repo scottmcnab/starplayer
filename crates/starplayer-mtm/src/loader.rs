@@ -10,14 +10,14 @@ use starplayer_mod::FINETUNE_REFERENCE_RATES;
 
 use crate::pattern::{CELL_BYTES, ROWS};
 
-const HEADER_BYTES: usize = 66;
-const SAMPLE_HEADER_BYTES: usize = 37;
-const ORDER_BYTES: usize = 128;
-const TRACK_BYTES: usize = ROWS as usize * CELL_BYTES;
-const PATTERN_CHANNELS: usize = 32;
-const PATTERN_TABLE_BYTES: usize = PATTERN_CHANNELS * 2;
-const FORMAT_TRACK_MASK: u32 = 0xFFFF;
-const FORMAT_NATIVE_TEMPO_RESETS: u32 = 1 << 16;
+pub(crate) const HEADER_BYTES: usize = 66;
+pub(crate) const SAMPLE_HEADER_BYTES: usize = 37;
+pub(crate) const ORDER_BYTES: usize = 128;
+pub(crate) const TRACK_BYTES: usize = ROWS as usize * CELL_BYTES;
+pub(crate) const PATTERN_CHANNELS: usize = 32;
+pub(crate) const PATTERN_TABLE_BYTES: usize = PATTERN_CHANNELS * 2;
+pub(crate) const FORMAT_TRACK_MASK: u32 = 0xFFFF;
+pub(crate) const FORMAT_NATIVE_TEMPO_RESETS: u32 = 1 << 16;
 
 /// Timing personality selected from the module's Fxx usage.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -230,14 +230,14 @@ fn detect_tempo_mode(tracks: &[u8], patterns: &[Vec<u8>], channel_count: u8) -> 
 
 pub(crate) fn mtm_pan(value: u8) -> I1F15 { bipolar_from_ratio(value.min(15) as i32 * 2 - 15, 15) }
 
-fn le_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
+pub(crate) fn le_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
     match bytes.get(offset..offset + 2) {
         Some([low, high]) => Ok(u16::from_le_bytes([*low, *high])),
         _ => Err(Error::Truncated { offset, needed: 2 }),
     }
 }
 
-fn le_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
+pub(crate) fn le_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
     match bytes.get(offset..offset + 4) {
         Some([a, b, c, d]) => Ok(u32::from_le_bytes([*a, *b, *c, *d])),
         _ => Err(Error::Truncated { offset, needed: 4 }),

@@ -126,10 +126,10 @@ pub use sequencer::{
     EndOfSongPolicy, Jump, OrderEntry, PatternData, PatternSequencer, RowRef, RowVisit, SequencerSettings,
     SongPosition, TickContext, TickOutcome, TraceChannelState, TrackerProcessor,
 };
-pub use source::{EngineContext, EventSource, ScriptedAction, ScriptedSource, SilentSource, SourceMux, SourceSlot};
+pub use source::{EngineContext, EventSource, ScriptedAction, ScriptedSource, SilentSource, SourceMux, SourceSlot, try_box_source};
 pub use timeline::{
     EndReason, LoopDetector, MAX_PATTERN_LOOP_ARRIVALS, MAX_ROWS_PER_ORDER, RowArrival, RowMark, ScanLimits,
-    SongTimeline, Visit, scan_timeline,
+    SongTimeline, Visit, scan_timeline, try_scan_timeline, try_scan_timeline_in, try_scan_timeline_end, TimelineBufferError,
 };
 #[cfg(feature = "trace")]
 pub use trace::{TRACE_FORMAT_VERSION, Trace, TraceChannel, TraceTick, TraceVoice};

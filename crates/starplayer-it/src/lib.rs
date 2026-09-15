@@ -74,6 +74,7 @@
 extern crate alloc;
 
 pub mod compression;
+pub mod image;
 pub mod header;
 pub mod instrument;
 pub mod loader;

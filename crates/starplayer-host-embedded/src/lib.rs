@@ -90,11 +90,11 @@ mod transport;
 
 pub use player::{
     CONTROL_CADENCE_FRAMES, ControlHalf, EmbeddedPlayer, HOST_COMMAND_CAPACITY, OUTPUT_CHANNELS, RETIRED_CAPACITY,
-    RenderHalf, TELEMETRY_DEPTH, settings_for,
+    PreparedLoad, RenderHalf, TELEMETRY_DEPTH, settings_for,
 };
 pub use source::{
     AtEndSlot, BuiltSource, SeekKind, SeekMailbox, SeekRequest, SeekableModuleSource, SourceHandles, build_source,
-    scan_module,
+    scan_module, try_build_source, try_build_source_in,
 };
 pub use transport::{DEFAULT_FADE_FRAMES, TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES, Transport};
 
@@ -102,9 +102,10 @@ use starplayer::engine::EngineWarnings;
 
 /// What can go wrong on this host's control side.
 ///
-/// Short on purpose. There is no device to fail to open, no file system and no allocator
-/// error to report: what is left is a module this build cannot play, a ring the caller has
-/// overrun, and the two "you asked before there was anything to ask about" cases.
+/// Short on purpose. There is no device to fail to open or file system here: what is left
+/// is a module this build cannot play (including a fallible replacement's resource
+/// refusal), a ring the caller has overrun, and the two "you asked before there was
+/// anything to ask about" cases.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The module could not be loaded, scanned, or played by any processor in this build.

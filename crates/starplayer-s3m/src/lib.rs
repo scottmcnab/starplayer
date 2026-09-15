@@ -76,6 +76,7 @@
 extern crate alloc;
 
 pub mod header;
+pub mod image;
 pub mod loader;
 pub mod pattern;
 pub mod processor;
@@ -86,6 +87,7 @@ pub use header::{
     pan_nibble_to_bipolar,
 };
 pub use loader::{load, load_from, probe, probe_reader};
+pub use image::ImageDecoder;
 pub use pattern::{
     COMMAND_NONE, INSTRUMENT_NONE, NOTE_CUT, NOTE_NONE, PatternView, ROWS, S3mCell, VOLUME_NONE, unpack,
 };

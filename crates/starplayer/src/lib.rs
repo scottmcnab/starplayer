@@ -123,6 +123,10 @@ pub use starplayer_model as model;
 pub use starplayer_rt as rt;
 
 mod sequencer;
+mod preparation;
+mod image;
+pub use image::{ModuleImageDecoder, DecodeBudget, ImageDecodeError, ImageDecodeStatus};
+pub use preparation::{try_scan_song, try_scan_song_with_voice_capacity, try_scan_song_in, try_scan_song_in_with_voice_capacity};
 
 pub use sequencer::NativeSequencer;
 #[cfg(feature = "mod")]
