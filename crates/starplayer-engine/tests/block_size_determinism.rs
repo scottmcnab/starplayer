@@ -16,26 +16,26 @@
 //! Samples are compared as **bit patterns**, never with `==` on floats: `==` would accept
 //! `0.0 == -0.0` and reject two identical NaNs, and byte identity is the actual claim.
 
-use starplayer_core::{ChannelId, ExactFixedPoint, FilterParams, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
+use starplayer_core::{ChannelId, Command, ExactFixedPoint, FilterParams, Frame, I1F15, Step, U0F16, VoiceParam, VoiceParams};
 use starplayer_dsp::effects::chorus::{CHORUS_DEPTH_PARAM, CHORUS_RATE_PARAM};
 use starplayer_dsp::effects::compressor::{COMPRESSOR_RATIO_PARAM, COMPRESSOR_THRESHOLD_PARAM};
 use starplayer_dsp::effects::delay::{DELAY_MIX_PARAM, DELAY_TIME_PARAM};
 use starplayer_dsp::effects::eq::{EQ_HIGH_GAIN_PARAM, EQ_PEAK_GAIN_PARAM};
 use starplayer_dsp::effects::reverb::{REVERB_MIX_PARAM, REVERB_ROOM_PARAM};
 use starplayer_dsp::effects::{GAIN_MIN_CENTI_DB, GAIN_PARAM};
-use starplayer_dsp::{Cubic, InsertKind, Interpolate, Linear, Nearest, Sinc, build_insert};
+use starplayer_dsp::{Cubic, InsertKind, Interpolate, Linear, Nearest, Sinc, build_insert, round_shift_nearest};
 use starplayer_engine::demo::{
     DEMO_BREAK_ROW, DEMO_NOTE_CUT, DEMO_ORDER_JUMP, DEMO_PATTERN_DELAY, DEMO_SET_SPEED, DEMO_SET_TEMPO, DemoCell,
     DemoPatternData, DemoProcessor,
 };
 use starplayer_engine::{
-    ChannelTable, ControlDriver, Engine, EngineContext, EngineSettings, EventSource, InsertCommand, InsertHandle,
-    InsertTarget, MAX_VOICE_CAPACITY, MAX_ZERO_ADVANCE, PatternSequencer, RENDER_QUANTUM, ScriptedAction,
+    ChannelTable, ControlDriver, Engine, EngineContext, EngineLayout, EngineSettings, EventSource, InsertCommand,
+    InsertHandle, InsertTarget, MAX_VOICE_CAPACITY, MAX_ZERO_ADVANCE, PatternSequencer, RENDER_QUANTUM, ScriptedAction,
     ScriptedSource, SequencerSettings,
 };
 use starplayer_mixer::{
-    FixedPath, FloatPath, LoopSpan, MixPath, MonoI16, OutputFormat, SampleRegion, StereoF32, StereoI16, VoiceTag,
-    append_guarded_sample,
+    FixedPath, FloatPath, Limiter, LoopSpan, MixPath, MonoI16, OutputFormat, SampleRegion, StereoF32, StereoI16, VoicePool,
+    VoiceTag, append_guarded_sample, voice_gain_units,
 };
 
 // ── the scenario ────────────────────────────────────────────────────────────────────
@@ -762,6 +762,95 @@ fn a_wider_voice_pool_and_channel_table_render_byte_identical_output() {
     assert!(narrow.iter().any(|sample| *sample != 0), "the scenario has to actually make sound");
     assert_eq!(first_difference(&wide, &narrow), None, "256 voices / 64 channels changed a sample against 64 / 32");
     assert_eq!(byte_image(&wide), byte_image(&narrow), "the wider engine is not byte-identical");
+}
+
+/// The A1S layout removes channel buses and channel insert chains. Its one reusable
+/// routing quantum must produce the same bytes as the full empty routing graph.
+#[test]
+fn the_fixed_master_only_layout_is_byte_identical_to_empty_full_routing() {
+    let full = render_with_settings(EngineSettings {
+        voice_capacity: 64,
+        channel_count: ChannelTable::MAX_CHANNELS,
+        layout: EngineLayout::Full,
+        ..EngineSettings::default()
+    });
+    let master_only = render_with_settings(EngineSettings {
+        voice_capacity: 64,
+        channel_count: ChannelTable::MAX_CHANNELS,
+        scope_taps: false,
+        telemetry_depth: 1,
+        layout: EngineLayout::MasterOnly,
+        ..EngineSettings::default()
+    });
+
+    assert!(full.iter().any(|sample| *sample != 0), "the scenario has to actually make sound");
+    assert_eq!(first_difference(&master_only, &full), None, "master-only routing changed a fixed-path sample");
+    assert_eq!(byte_image(&master_only), byte_image(&full), "master-only routing is not byte-identical");
+}
+
+/// Exercise the order-dependent case directly: enough resonant full-scale voices to
+/// saturate one channel's i32 bus, followed by an opposite-sign voice on the next
+/// channel. The master is turned down after routing so the two possible saturation
+/// orders remain distinguishable in i16 output.
+fn render_saturating_layout(layout: EngineLayout) -> Vec<i16> {
+    let positive = vec![i16::MAX; 64];
+    let negative = vec![i16::MIN + 1; 64];
+    let mut blob = Vec::new();
+    let positive_region = append_guarded_sample(&mut blob, &positive, LoopSpan::new(0, 64));
+    let negative_region = append_guarded_sample(&mut blob, &negative, LoopSpan::new(0, 64));
+    let mut engine: Engine<FixedPath, Linear, StereoI16> = Engine::with_settings(EngineSettings {
+        voice_capacity: VoicePool::MAX_CAPACITY,
+        channel_count: 2,
+        layout,
+        ..EngineSettings::default()
+    });
+    engine.set_pcm(blob);
+    engine.set_limiter(Limiter::Clamp);
+    let mut control = engine.take_control().expect("fresh engine control");
+    control.send(Command::SetMasterVolume(U0F16::from_bits(1))).expect("empty command ring");
+
+    let params = VoiceParams {
+        step: Step::ONE,
+        volume: U0F16::MAX,
+        pan: I1F15::from_bits(i16::MIN),
+        filter: FILTER_BEFORE,
+        ..VoiceParams::SILENT
+    };
+    let negative_voice = engine.voices_mut()
+        .allocate(VoiceTag { channel: 1, ..VoiceTag::default() }, negative_region, params, 0)
+        .expect("fresh pool has room");
+    engine.voices_mut().get_mut(negative_voice).expect("new voice is live").settle_gains();
+    for _ in 1..VoicePool::MAX_CAPACITY {
+        let voice = engine.voices_mut()
+            .allocate(VoiceTag { channel: 0, ..VoiceTag::default() }, positive_region, params, 0)
+            .expect("maximum-sized pool has room");
+        engine.voices_mut().get_mut(voice).expect("new voice is live").settle_gains();
+    }
+
+    let mut output = vec![0i16; RENDER_QUANTUM * 2 * StereoI16::CHANNELS];
+    engine.render(&mut output);
+    output
+}
+
+#[test]
+fn master_only_preserves_channel_major_saturation_at_maximum_pool_capacity() {
+    let pan = I1F15::from_bits(i16::MIN);
+    let left_gain = FixedPath::gain(voice_gain_units(U0F16::MAX, pan).left);
+    let coefficients = FixedPath::coefficients(24, 112, 44_100, false);
+    let mut state = [0; 2];
+    let peak_contribution = (0..RENDER_QUANTUM * 2)
+        .map(|_| FixedPath::filter(i16::MAX as i32, &mut state, &coefficients))
+        .map(|sample| round_shift_nearest(sample as i64 * left_gain as i64, 15).abs())
+        .max()
+        .expect("the response contains frames");
+    assert!(peak_contribution * (VoicePool::MAX_CAPACITY as i64 - 1) > i32::MAX as i64,
+        "the loud fixture must actually exceed one fixed channel accumulator");
+
+    let full = render_saturating_layout(EngineLayout::Full);
+    let master_only = render_saturating_layout(EngineLayout::MasterOnly);
+    assert!(full.iter().any(|sample| *sample != 0), "the routed cancellation must remain observable after master attenuation");
+    assert_eq!(first_difference(&master_only, &full), None, "master-only changed channel-major saturation semantics");
+    assert_eq!(byte_image(&master_only), byte_image(&full), "saturating master-only routing is not byte-identical");
 }
 
 // ── events land on exact frames, not on buffer boundaries ───────────────────────────

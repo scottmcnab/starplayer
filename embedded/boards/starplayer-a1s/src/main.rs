@@ -90,6 +90,8 @@
 
 #[cfg(all(feature = "bench", feature = "tone"))]
 compile_error!("the A1S `tone` diagnostic needs the audio build and cannot be combined with `bench`");
+#[cfg(all(feature = "voice-bench", any(feature = "bench", feature = "tone", feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone", feature = "lcd")))]
+compile_error!("the A1S `voice-bench` personality may only be combined with `web` or `voice-bench-filtered`");
 #[cfg(all(feature = "engine-tone", any(feature = "bench", feature = "tone", feature = "swapped-tone", feature = "web")))]
 compile_error!("the standalone A1S `engine-tone` diagnostic cannot be combined with `bench`, `tone`, `swapped-tone` or `web`");
 #[cfg(all(feature = "matched-tone", any(feature = "bench", feature = "tone", feature = "engine-tone", feature = "swapped-tone", feature = "web")))]
@@ -119,7 +121,7 @@ mod lcd;
 mod net;
 #[cfg(all(not(feature = "bench"), feature = "web"))]
 mod provisioning;
-#[cfg(all(not(feature = "bench"), feature = "web"))]
+#[cfg(all(not(feature = "bench"), any(feature = "web", feature = "voice-bench")))]
 mod psram;
 #[cfg(all(not(feature = "bench"), feature = "web"))]
 mod psram_task;
@@ -135,13 +137,17 @@ use esp_bootloader_esp_idf::esp_app_desc;
 use esp_println::println;
 use firmware_common::format::Kib;
 #[cfg(not(feature = "bench"))]
-use firmware_common::{Key, KeyEvent, NowPlaying};
+use firmware_common::{Key, KeyEvent};
+#[cfg(all(not(feature = "bench"), any(feature = "lcd", feature = "web", not(feature = "voice-bench"))))]
+use firmware_common::NowPlaying;
 #[cfg(not(feature = "bench"))]
 use starplayer::core::U0F16;
 #[cfg(not(feature = "bench"))]
 use starplayer::dsp::Linear;
-#[cfg(all(not(feature = "bench"), feature = "web"))]
+#[cfg(all(not(feature = "bench"), any(feature = "web", feature = "voice-bench")))]
 use starplayer::engine::EngineSettings;
+#[cfg(feature = "voice-bench")]
+use starplayer::engine::EngineLayout;
 #[cfg(all(not(feature = "bench"), not(feature = "engine-tone"), not(feature = "matched-tone"), not(feature = "swapped-tone"), not(feature = "reference-rate-tone")))]
 use starplayer::model::Module;
 #[cfg(not(feature = "bench"))]
@@ -156,9 +162,9 @@ esp_app_desc!();
 /// The internal-DRAM heap.
 ///
 /// **120 KiB, and the number is a balance, not a guess.** The engine's own cost is
-/// `27 800 + 184 × voices + 5 288 × channels` bytes
+/// `27 808 + 168 × voices + 5 288 × channels` bytes
 /// (`starplayer_host_embedded::settings_for`), which for `PETRI.S3M` — eight channels,
-/// eight voices — is 71 576; the scanned song timeline, the `Arc`s and the sequencer sit
+/// eight voices — is 71 456; the scanned song timeline, the `Arc`s and the sequencer sit
 /// on top of that, and the `bench` build asks for a further 32 KiB of DRAM staging.
 ///
 /// The balance is against the **stack**. This is a `.bss` array, and on the classic ESP32
@@ -217,8 +223,35 @@ const WEB_INTERNAL_HEAP_BYTES: usize = 48 * 1024;
 /// (I1 research point 3a), because the engine's telemetry publisher holds a working
 /// `Snapshot` inline and this host holds another. Passing that down a call chain by value
 /// would put two copies of it on the stack.
-#[cfg(not(feature = "bench"))]
+#[cfg(all(not(feature = "bench"), not(feature = "voice-bench")))]
 static RENDER: StaticCell<RenderHalf<Linear>> = StaticCell::new();
+
+/// Module construction runs as a separately polled task. The async main poll frame is
+/// already close to core 0's linked stack limit; yielding before this task runs prevents
+/// `ModuleBuilder` and image serialization frames from nesting underneath it.
+#[cfg(feature = "voice-bench")]
+static VOICE_BENCH_IMAGE_BUFFER: StaticCell<psram::Buffer> = StaticCell::new();
+#[cfg(feature = "voice-bench")]
+static VOICE_BENCH_MODULE_READY: embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    Result<Arc<Module>, &'static str>,
+> = embassy_sync::signal::Signal::new();
+/// `init_with` constructs this pair directly in static storage. In particular, no
+/// 11,744-byte `RenderHalf` value is copied through the setup task's stack frame.
+#[cfg(feature = "voice-bench")]
+static VOICE_BENCH_PLAYER: StaticCell<Option<(RenderHalf<Linear>, ControlHalf)>> = StaticCell::new();
+
+#[cfg(feature = "voice-bench")]
+struct VoiceBenchPlayer {
+    render: &'static mut RenderHalf<Linear>,
+    control: &'static mut ControlHalf,
+}
+
+#[cfg(feature = "voice-bench")]
+static VOICE_BENCH_PLAYER_READY: embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    Result<VoiceBenchPlayer, &'static str>,
+> = embassy_sync::signal::Signal::new();
 
 /// Core 1's stack. Audio start makes one small fallible heap allocation before driver construction;
 /// the refill itself allocates and logs nothing. The synchronous prefill has one 512-byte quantum
@@ -311,12 +344,18 @@ async fn main(spawner: Spawner) {
     let (psram_start, psram_size) = psram.raw_parts();
     println!("PSRAM {psram_size} bytes ({}) mapped at {psram_start:p}", Kib(psram_size));
 
-    #[cfg(not(any(feature = "bench", feature = "web")))]
+    // esptool resets the board before the runner can reopen its serial connection. Keep
+    // every voice-bench machine record and setup attempt behind a short capture window;
+    // ordinary firmware personalities have no added boot delay.
+    #[cfg(feature = "voice-bench")]
+    Timer::after(Duration::from_secs(firmware_common::voice_bench::CAPTURE_GRACE_SECONDS)).await;
+
+    #[cfg(not(any(feature = "bench", feature = "web", feature = "voice-bench")))]
     let _ = psram_start;
 
     // The `web` build takes the PSRAM region as an arena of its own instead of handing it
     // to the allocator — see `psram.rs` for the atomics erratum that forbids the latter.
-    #[cfg(all(not(feature = "bench"), feature = "web"))]
+    #[cfg(all(not(feature = "bench"), any(feature = "web", feature = "voice-bench")))]
     let mut psram_arena = psram::Arena::new(psram_start, psram_size);
 
     #[cfg(all(not(feature = "bench"), feature = "web"))]
@@ -325,6 +364,37 @@ async fn main(spawner: Spawner) {
         None => {
             psram_arena = psram::Arena::empty();
             psram::Arena::empty()
+        }
+    };
+
+    #[cfg(feature = "voice-bench")]
+    let voice_bench_image_buffer = match psram_arena.claim(firmware_common::voice_bench::IMAGE_BUFFER_BYTES) {
+        Some(buffer) => VOICE_BENCH_IMAGE_BUFFER.init(buffer),
+        None => {
+            emit_voice_bench_setup_reject("psram_claim", psram_arena.remaining());
+            loop {
+                Timer::after(Duration::from_secs(60)).await;
+            }
+        }
+    };
+    #[cfg(feature = "voice-bench")]
+    match voice_bench_module_task(voice_bench_image_buffer) {
+        Ok(token) => spawner.spawn(token),
+        Err(_) => {
+            emit_voice_bench_setup_reject("module_task", psram_arena.remaining());
+            loop {
+                Timer::after(Duration::from_secs(60)).await;
+            }
+        }
+    }
+    #[cfg(feature = "voice-bench")]
+    let voice_bench_module = match VOICE_BENCH_MODULE_READY.wait().await {
+        Ok(module) => module,
+        Err(message) => {
+            emit_voice_bench_setup_reject(message, psram_arena.remaining());
+            loop {
+                Timer::after(Duration::from_secs(60)).await;
+            }
         }
     };
 
@@ -364,7 +434,12 @@ async fn main(spawner: Spawner) {
         let mut store = match store::Store::take(peripherals.FLASH) {
             Ok(store) => store,
             Err(error) => {
+                #[cfg(feature = "voice-bench")]
+                emit_voice_bench_setup_reject("flash_store", psram_arena.remaining());
+                #[cfg(not(feature = "voice-bench"))]
                 println!("FATAL: the flash partitions are not what this firmware expects: {error:?}");
+                #[cfg(feature = "voice-bench")]
+                println!("VOICE_BENCH_SETUP flash partitions: {error:?}");
                 loop {
                     Timer::after(Duration::from_secs(5)).await;
                 }
@@ -392,6 +467,9 @@ async fn main(spawner: Spawner) {
         );
         web::Boot { bridge, psram_arena: network_psram_arena, credentials, wifi: peripherals.WIFI, seed }
     };
+
+    #[cfg(feature = "voice-bench")]
+    let voice_bench_external_heap = psram_arena.remaining();
 
     #[cfg(not(feature = "bench"))]
     let started = {
@@ -445,6 +523,10 @@ async fn main(spawner: Spawner) {
                     lcd_parts,
                     #[cfg(feature = "web")]
                     web_boot,
+                    #[cfg(feature = "voice-bench")]
+                    voice_bench_module,
+                    #[cfg(feature = "voice-bench")]
+                    voice_bench_external_heap,
                 )
                 .await
             }
@@ -454,9 +536,13 @@ async fn main(spawner: Spawner) {
 
     #[cfg(not(feature = "bench"))]
     if let Err(message) = started {
+        #[cfg(feature = "voice-bench")]
+        emit_voice_bench_setup_reject(message, voice_bench_external_heap);
+        #[cfg(not(feature = "voice-bench"))]
         // A boot that cannot make sound is not a boot that should pretend to. Say what
         // failed, loudly and repeatedly, rather than resetting into the same failure.
         loop {
+            #[cfg(not(feature = "voice-bench"))]
             println!("FATAL: {message}");
             Timer::after(Duration::from_secs(5)).await;
         }
@@ -470,8 +556,12 @@ async fn play(
     spawner: Spawner, mut board: board::Board<'static>, audio_parts: audio::Parts, cpu_control: esp_hal::peripherals::CPU_CTRL<'static>,
     software_interrupt1: esp_hal::interrupt::software::SoftwareInterrupt<'static, 1>,
     #[cfg(feature = "lcd")] lcd_parts: lcd::Parts,
-    #[cfg(feature = "web")] mut web_boot: web::Boot,
+    #[cfg(feature = "web")] web_boot: web::Boot,
+    #[cfg(feature = "voice-bench")] voice_bench_module: Arc<Module>,
+    #[cfg(feature = "voice-bench")] voice_bench_external_heap: usize,
 ) -> Result<(), &'static str> {
+    #[cfg(all(feature = "web", not(feature = "voice-bench")))]
+    let mut web_boot = web_boot;
     // Research point 1: what is actually on the control bus. Printed before anything is
     // configured, so a board that answers nowhere is diagnosable from the first boot.
     report_i2c_scan(&mut board);
@@ -492,17 +582,19 @@ async fn play(
     // Normal firmware borrows REFLEX straight from memory-mapped flash, PCM and all. The
     // standalone engine diagnostic instead allocates its controlled native S3M once here,
     // before either the player or audio task exists.
-    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
+    #[cfg(all(not(feature = "voice-bench"), not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))))]
     let image = images::boot_module();
-    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
+    #[cfg(all(not(feature = "voice-bench"), not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))))]
     #[cfg(not(feature = "web"))]
     let module = Arc::new(Module::try_from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?);
-    #[cfg(all(feature = "web", not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))))]
+    #[cfg(all(not(feature = "voice-bench"), feature = "web", not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))))]
     let module = match web_boot.bridge.initial_module() {
         Some(module) => module,
         None => Arc::new(Module::try_from_image(image).map_err(|_| "the linked module image would not borrow — is it 4-byte aligned?")?),
     };
-    #[cfg(not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone")))]
+    #[cfg(feature = "voice-bench")]
+    let module = voice_bench_module;
+    #[cfg(all(not(feature = "voice-bench"), not(any(feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone", feature = "reference-rate-tone"))))]
     println!(
         "MODULE image={} bytes ({}) channels={} samples={}",
         image.len(),
@@ -543,10 +635,10 @@ async fn play(
         firmware_common::MATCHED_TONE_RIGHT_PEAK,
     );
 
-    #[cfg(not(feature = "web"))]
+    #[cfg(all(not(feature = "web"), not(feature = "voice-bench")))]
     let (render, mut control) = EmbeddedPlayer::<Linear>::open(module, OUTPUT_SAMPLE_RATE_HZ)
         .map_err(|_| "this build cannot play that module")?;
-    #[cfg(feature = "web")]
+    #[cfg(all(feature = "web", not(feature = "voice-bench")))]
     let (render, mut control) = {
         let settings = EngineSettings {
             sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
@@ -565,7 +657,15 @@ async fn play(
         }
         (render, control)
     };
+    #[cfg(not(feature = "voice-bench"))]
     let render = RENDER.init(render);
+    #[cfg(feature = "voice-bench")]
+    match voice_bench_player_task(module) {
+        Ok(token) => spawner.spawn(token),
+        Err(_) => return Err("the voice benchmark player task would not spawn"),
+    }
+    #[cfg(feature = "voice-bench")]
+    let VoiceBenchPlayer { render, control } = VOICE_BENCH_PLAYER_READY.wait().await?;
     println!("HEAP after open: {}", esp_alloc::HEAP.stats());
 
     control.set_master_volume(BOOT_MASTER_VOLUME).map_err(|_| "the command ring rejected the boot volume")?;
@@ -643,9 +743,9 @@ async fn play(
 
     spawner.spawn(keys::keys_task(board.keys, KEY_EVENTS.sender()).map_err(|_| "the keys task would not spawn")?);
     #[cfg(not(feature = "web"))]
-    spawner.spawn(control_task(control, ()).map_err(|_| "the control task would not spawn")?);
-    #[cfg(feature = "web")]
-    spawner.spawn(control_task(control, bridge).map_err(|_| "the control task would not spawn")?);
+    spawner.spawn(control_task(control, (), #[cfg(feature = "voice-bench")] voice_bench_external_heap).map_err(|_| "the control task would not spawn")?);
+    #[cfg(all(feature = "web", not(feature = "voice-bench")))]
+    spawner.spawn(control_task(control, bridge, #[cfg(feature = "voice-bench")] voice_bench_external_heap).map_err(|_| "the control task would not spawn")?);
     #[cfg(feature = "lcd")]
     spawner.spawn(display_task(display).map_err(|_| "the display task would not spawn")?);
 
@@ -653,6 +753,10 @@ async fn play(
     // so the radio's own bring-up cannot delay the first sample.
     #[cfg(feature = "web")]
     {
+        #[cfg(feature = "voice-bench")]
+        if !firmware_common::voice_bench::web_network_preflight_passes(esp_alloc::HEAP.free()) {
+            return Err("insufficient internal heap before the voice benchmark network start");
+        }
         match credentials.filter(|_| !reprovision) {
             Some(credentials) => {
                 println!("WIFI joining {}", credentials.ssid.as_str());
@@ -663,6 +767,8 @@ async fn play(
         }
         spawner.spawn(reboot_task().map_err(|_| "the reboot watcher would not spawn")?);
     }
+    #[cfg(all(feature = "web", feature = "voice-bench"))]
+    spawner.spawn(control_task(control, bridge, voice_bench_external_heap).map_err(|_| "the control task would not spawn")?);
     Ok(())
 }
 
@@ -742,6 +848,123 @@ const A1S_AUDIBLE_SAMPLE_RATE_HZ: u32 = 48_000;
 const OUTPUT_SAMPLE_RATE_HZ: u32 = firmware_common::SAMPLE_RATE_HZ;
 #[cfg(all(not(feature = "bench"), not(any(feature = "tone", feature = "engine-tone", feature = "matched-tone", feature = "swapped-tone"))))]
 const OUTPUT_SAMPLE_RATE_HZ: u32 = A1S_AUDIBLE_SAMPLE_RATE_HZ;
+
+#[cfg(feature = "voice-bench")]
+const VOICE_BENCH_CHANNELS: usize = decimal_constant(env!("STARPLAYER_VOICE_BENCH_CHANNELS"));
+#[cfg(feature = "voice-bench")]
+const VOICE_BENCH_VOICES: usize = decimal_constant(env!("STARPLAYER_VOICE_BENCH_VOICES"));
+#[cfg(feature = "voice-bench")]
+const VOICE_BENCH_SECONDS: usize = decimal_constant(env!("STARPLAYER_VOICE_BENCH_SECONDS"));
+#[cfg(feature = "voice-bench")]
+const VOICE_BENCH_LOW: usize = decimal_constant(env!("STARPLAYER_VOICE_BENCH_LOW"));
+#[cfg(feature = "voice-bench")]
+const VOICE_BENCH_HIGH: usize = decimal_constant(env!("STARPLAYER_VOICE_BENCH_HIGH"));
+#[cfg(feature = "voice-bench")]
+const VOICE_BENCH_PHASE: &str = env!("STARPLAYER_VOICE_BENCH_PHASE");
+#[cfg(feature = "voice-bench")]
+const VOICE_BENCH_AXIS: &str = env!("STARPLAYER_VOICE_BENCH_AXIS");
+#[cfg(feature = "voice-bench")]
+const VOICE_BENCH_CASE: &str = env!("STARPLAYER_VOICE_BENCH_CASE");
+
+#[cfg(feature = "voice-bench")]
+fn emit_voice_bench_setup_reject(message: &str, external_heap: usize) {
+    println!("VOICE_BENCH_SETUP {message}");
+    println!(
+        "VOICE_BENCH v=1 seq=0 kind=START case={} mode={} filtered={} channels={} voices={} rate=48000 descriptor_frames=256 duration_s={} phase={} axis={} low={} high={} dma_base={}",
+        VOICE_BENCH_CASE,
+        if cfg!(feature = "web") { "web" } else { "audio" },
+        u8::from(cfg!(feature = "voice-bench-filtered")),
+        VOICE_BENCH_CHANNELS,
+        VOICE_BENCH_VOICES,
+        VOICE_BENCH_SECONDS,
+        VOICE_BENCH_PHASE,
+        VOICE_BENCH_AXIS,
+        VOICE_BENCH_LOW,
+        VOICE_BENCH_HIGH,
+        audio::dma_errors(),
+    );
+    println!(
+        "VOICE_BENCH v=1 seq=1 kind=END case={} elapsed_ms=0 frames=0 active=0 peak_active=0 render_max_us=0 render_p50_us=0 render_p95_us=0 misses=0 underruns={} dma_errors={} warnings=0 steals=0 heap_internal={} heap_external={} web_http_ok=0 web_upload_ok=0 web_ws_ok=0 status=reject reason=setup",
+        VOICE_BENCH_CASE,
+        audio::underruns(),
+        audio::dma_errors(),
+        esp_alloc::HEAP.free(),
+        external_heap,
+    );
+}
+
+#[cfg(feature = "voice-bench")]
+const fn decimal_constant(value: &str) -> usize {
+    let bytes = value.as_bytes();
+    let mut result = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        result = result * 10 + (bytes[index] - b'0') as usize;
+        index += 1;
+    }
+    result
+}
+
+/// Build the deterministic workload in ordinary DRAM, serialise it once into a claimed
+/// PSRAM buffer, then release the owned PCM before the engine is constructed. The
+/// resulting module borrows both pattern bytes and sample PCM directly from PSRAM.
+#[cfg(feature = "voice-bench")]
+#[inline(never)]
+fn build_voice_bench_module(buffer: &mut psram::Buffer) -> Result<Arc<Module>, &'static str> {
+    let config = firmware_common::voice_bench::StressConfig {
+        channels: VOICE_BENCH_CHANNELS,
+        voices: VOICE_BENCH_VOICES,
+        filtered: cfg!(feature = "voice-bench-filtered"),
+    };
+    let owned = firmware_common::voice_bench::stress_module(config).map_err(|_| "stress_module")?;
+    let image = owned.to_image();
+    if image.len() > buffer.capacity() {
+        return Err("psram_image_capacity");
+    }
+    // SAFETY: this fresh claim has no borrowers. Every byte is initialized by the copy,
+    // then the buffer is never written again for the life of the returned module.
+    let destination = unsafe { buffer.as_mut() };
+    destination.get_mut(..image.len()).ok_or("psram_bounds")?.copy_from_slice(&image);
+    // SAFETY: the preceding copy initialized exactly this range, and it remains immutable.
+    let view = unsafe { buffer.view(image.len()) }.ok_or("psram_view")?;
+    let borrowed = Module::try_from_image(view).map_err(|_| "psram_image")?;
+    drop(image);
+    drop(owned);
+    Ok(Arc::new(borrowed))
+}
+
+#[cfg(feature = "voice-bench")]
+#[embassy_executor::task]
+async fn voice_bench_module_task(buffer: &'static mut psram::Buffer) {
+    VOICE_BENCH_MODULE_READY.signal(build_voice_bench_module(buffer));
+}
+
+/// Open and load the benchmark player on a clean executor stack, then leave both large
+/// halves in static storage. Async main receives only two references after this task has
+/// completed, so its poll frame cannot retain player construction temporaries at boot.
+#[cfg(feature = "voice-bench")]
+#[inline(never)]
+fn build_voice_bench_player(module: Arc<Module>) -> Result<VoiceBenchPlayer, &'static str> {
+    let settings = EngineSettings {
+        sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
+        channel_count: VOICE_BENCH_CHANNELS,
+        voice_capacity: VOICE_BENCH_VOICES,
+        scope_taps: false,
+        telemetry_depth: 1,
+        layout: EngineLayout::MasterOnly,
+        ..EngineSettings::default()
+    };
+    let player = VOICE_BENCH_PLAYER.init_with(|| EmbeddedPlayer::<Linear>::open_empty(OUTPUT_SAMPLE_RATE_HZ, settings).ok());
+    let (render, control) = player.as_mut().ok_or("this build cannot allocate the fixed voice benchmark player")?;
+    control.try_load(module).map_err(|_| "this build cannot prepare the voice benchmark")?;
+    Ok(VoiceBenchPlayer { render, control })
+}
+
+#[cfg(feature = "voice-bench")]
+#[embassy_executor::task]
+async fn voice_bench_player_task(module: Arc<Module>) {
+    VOICE_BENCH_PLAYER_READY.signal(build_voice_bench_player(module));
+}
 
 /// One A1S master-volume step: 1/64 of full scale for usable headphone adjustment.
 #[cfg(not(feature = "bench"))]
@@ -851,13 +1074,18 @@ type WebBridge = web::Bridge;
 #[cfg(all(not(feature = "bench"), not(feature = "web")))]
 type WebBridge = ();
 
+#[cfg(feature = "voice-bench")]
+type ControlTaskControl = &'static mut ControlHalf;
+#[cfg(all(not(feature = "bench"), not(feature = "voice-bench")))]
+type ControlTaskControl = ControlHalf;
+
 /// The control task: the sole owner of [`ControlHalf`]. Drains key events and turns them
 /// into transport/volume commands, collects the render half's garbage, signals the
 /// display task its next frame (`lcd` only, at [`DISPLAY_REFRESH_TICKS`]), and prints the
 /// transport line once a second — everything the audio refill (now on core 1) may not do.
 #[cfg(not(feature = "bench"))]
 #[embassy_executor::task]
-async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
+async fn control_task(mut control: ControlTaskControl, bridge: WebBridge, #[cfg(feature = "voice-bench")] voice_bench_external_heap: usize) {
     // One binding, two builds: in a build without `web` the parameter is `()` and exists
     // only so that `#[embassy_executor::task]` sees one signature rather than two.
     #[cfg(feature = "web")]
@@ -868,9 +1096,62 @@ async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
     let receiver: keys::KeyEventReceiver = KEY_EVENTS.receiver();
     let mut key1_hold_actioned = false;
     let mut tick: u32 = 0;
+    #[cfg(feature = "voice-bench")]
+    let benchmark_started = esp_hal::time::Instant::now();
+    #[cfg(feature = "voice-bench")]
+    let benchmark_start_frame = control.output_frame().0;
+    #[cfg(feature = "voice-bench")]
+    let benchmark_dma_base = audio::dma_errors();
+    #[cfg(feature = "voice-bench")]
+    let mut benchmark_sequence = 0u32;
+    #[cfg(feature = "voice-bench")]
+    let mut benchmark_peak_active = 0u16;
+    #[cfg(feature = "voice-bench")]
+    let mut benchmark_minimum_heap = esp_alloc::HEAP.free();
+    #[cfg(feature = "voice-bench")]
+    let mut benchmark_plateau_failed = false;
+    #[cfg(feature = "voice-bench")]
+    let mut benchmark_web_load_failed = false;
+    #[cfg(feature = "voice-bench")]
+    let mut benchmark_previous_web_counts = [0u32; 3];
+    #[cfg(feature = "voice-bench")]
+    let mut benchmark_web_last_advance_ms = [0u64; 3];
+    #[cfg(all(feature = "voice-bench", feature = "web"))]
+    let benchmark_web_base = web::voice_bench_load_counts();
+    #[cfg(all(feature = "voice-bench", not(feature = "web")))]
+    let benchmark_web_base = [0u32; 3];
+    #[cfg(feature = "voice-bench")]
+    let mut benchmark_finished = false;
+    #[cfg(feature = "voice-bench")]
+    println!(
+        "VOICE_BENCH v=1 seq={} kind=START case={} mode={} filtered={} channels={} voices={} rate={} descriptor_frames={} duration_s={} phase={} axis={} low={} high={} dma_base={}",
+        benchmark_sequence,
+        VOICE_BENCH_CASE,
+        if cfg!(feature = "web") { "web" } else { "audio" },
+        u8::from(cfg!(feature = "voice-bench-filtered")),
+        VOICE_BENCH_CHANNELS,
+        VOICE_BENCH_VOICES,
+        OUTPUT_SAMPLE_RATE_HZ,
+        audio::DESCRIPTOR_FRAMES,
+        VOICE_BENCH_SECONDS,
+        VOICE_BENCH_PHASE,
+        VOICE_BENCH_AXIS,
+        VOICE_BENCH_LOW,
+        VOICE_BENCH_HIGH,
+        benchmark_dma_base,
+    );
+    #[cfg(feature = "voice-bench")]
+    {
+        benchmark_sequence = benchmark_sequence.wrapping_add(1);
+    }
     loop {
         Timer::after(CONTROL_TICK).await;
         tick = tick.wrapping_add(1);
+
+        #[cfg(feature = "voice-bench")]
+        {
+            benchmark_minimum_heap = benchmark_minimum_heap.min(esp_alloc::HEAP.free());
+        }
 
         while let Ok(event) = receiver.try_receive() {
             apply_key_event(&mut control, event, &mut key1_hold_actioned);
@@ -880,6 +1161,11 @@ async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
         // single owner of `ControlHalf`.
         #[cfg(feature = "web")]
         bridge.poll(&mut control).await;
+
+        #[cfg(feature = "voice-bench")]
+        {
+            benchmark_minimum_heap = benchmark_minimum_heap.min(esp_alloc::HEAP.free());
+        }
 
         #[cfg(any(feature = "lcd", feature = "web"))]
         if tick % DISPLAY_REFRESH_TICKS == 0 {
@@ -896,6 +1182,88 @@ async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
         if tick % LOG_TICKS == 0 {
             let retired = control.collect_garbage();
             let snapshot = *control.telemetry();
+            #[cfg(feature = "voice-bench")]
+            {
+                let _ = retired;
+                benchmark_peak_active = benchmark_peak_active.max(snapshot.voices_active);
+                let timing = audio::render_timing();
+                let elapsed_ms = benchmark_started.elapsed().as_millis();
+                let frames = control.output_frame().0.saturating_sub(benchmark_start_frame);
+                let warnings = u8::from(control.warnings().any());
+                if elapsed_ms >= firmware_common::voice_bench::VOICE_PLATEAU_SETTLE_MS
+                    && snapshot.voices_active as usize != VOICE_BENCH_VOICES
+                {
+                    benchmark_plateau_failed = true;
+                }
+                #[cfg(feature = "web")]
+                let web_counts = web::voice_bench_load_counts();
+                #[cfg(not(feature = "web"))]
+                let web_counts = [0u32; 3];
+                let web_counts = [
+                    web_counts[0].wrapping_sub(benchmark_web_base[0]),
+                    web_counts[1].wrapping_sub(benchmark_web_base[1]),
+                    web_counts[2].wrapping_sub(benchmark_web_base[2]),
+                ];
+                for index in 0..web_counts.len() {
+                    if web_counts[index] > benchmark_previous_web_counts[index] {
+                        benchmark_web_last_advance_ms[index] = elapsed_ms;
+                    } else if cfg!(feature = "web")
+                        && elapsed_ms >= firmware_common::voice_bench::WEB_LOAD_SETTLE_MS
+                        && web_counts[index] < benchmark_previous_web_counts[index]
+                    {
+                        benchmark_web_load_failed = true;
+                    }
+                }
+                if cfg!(feature = "web") && elapsed_ms >= firmware_common::voice_bench::WEB_LOAD_SETTLE_MS {
+                    for index in 0..web_counts.len() {
+                        if web_counts[index] == 0
+                            || elapsed_ms.saturating_sub(benchmark_web_last_advance_ms[index])
+                                > firmware_common::voice_bench::WEB_LOAD_STALL_MS
+                        {
+                            benchmark_web_load_failed = true;
+                        }
+                    }
+                }
+                benchmark_previous_web_counts = web_counts;
+                let finished_now = elapsed_ms >= (VOICE_BENCH_SECONDS as u64).saturating_mul(1_000);
+                let kind = if finished_now { "END" } else { "SAMPLE" };
+                let pass = snapshot.voices_active as usize == VOICE_BENCH_VOICES
+                    && benchmark_peak_active as usize >= VOICE_BENCH_VOICES
+                    && !benchmark_plateau_failed
+                    && !benchmark_web_load_failed
+                    && timing.maximum_us <= 4_266
+                    && timing.misses == 0
+                    && audio::underruns() == 0
+                    && audio::dma_errors() == benchmark_dma_base
+                    && warnings == 0
+                    && control.voice_steals() > 0
+                    && benchmark_minimum_heap >= 8 * 1024
+                    && (!cfg!(feature = "web") || web_counts.iter().all(|count| *count > 0));
+                if !benchmark_finished {
+                    if finished_now {
+                        println!(
+                            "VOICE_BENCH v=1 seq={} kind={} case={} elapsed_ms={} frames={} active={} peak_active={} render_max_us={} render_p50_us={} render_p95_us={} misses={} underruns={} dma_errors={} warnings={} steals={} heap_internal={} heap_external={} web_http_ok={} web_upload_ok={} web_ws_ok={} status={} reason={}",
+                            benchmark_sequence, kind, VOICE_BENCH_CASE, elapsed_ms, frames, snapshot.voices_active,
+                            benchmark_peak_active, timing.maximum_us, timing.p50_us, timing.p95_us, timing.misses,
+                            audio::underruns(), audio::dma_errors(), warnings, control.voice_steals(), benchmark_minimum_heap,
+                            voice_bench_external_heap, web_counts[0], web_counts[1], web_counts[2],
+                            if pass { "pass" } else { "reject" }, if pass { "none" } else { "criteria" },
+                        );
+                        benchmark_finished = true;
+                    } else {
+                        println!(
+                            "VOICE_BENCH v=1 seq={} kind={} case={} elapsed_ms={} frames={} active={} peak_active={} render_max_us={} render_p50_us={} render_p95_us={} misses={} underruns={} dma_errors={} warnings={} steals={} heap_internal={} heap_external={} web_http_ok={} web_upload_ok={} web_ws_ok={}",
+                            benchmark_sequence, kind, VOICE_BENCH_CASE, elapsed_ms, frames, snapshot.voices_active,
+                            benchmark_peak_active, timing.maximum_us, timing.p50_us, timing.p95_us, timing.misses,
+                            audio::underruns(), audio::dma_errors(), warnings, control.voice_steals(), benchmark_minimum_heap,
+                            voice_bench_external_heap, web_counts[0], web_counts[1], web_counts[2],
+                        );
+                    }
+                    benchmark_sequence = benchmark_sequence.wrapping_add(1);
+                }
+            }
+            #[cfg(not(feature = "voice-bench"))]
+            {
             let title = control.module().map(|module| module.header().title.as_ref()).unwrap_or("");
             let view = NowPlaying::from_snapshot(&snapshot, OUTPUT_SAMPLE_RATE_HZ, title, control.master_volume());
             println!(
@@ -909,6 +1277,7 @@ async fn control_task(mut control: ControlHalf, bridge: WebBridge) {
                 retired,
                 control.commands_rejected(),
             );
+            }
         }
     }
 }

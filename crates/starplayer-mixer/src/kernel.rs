@@ -138,7 +138,7 @@ pub fn accumulate_voice<Path: MixPath, Interp: Interpolate>(
         // ── the run itself ──────────────────────────────────────────────────────────
         let frames = sample.stored();
         let (gains, filter) = voice.run_state_mut();
-        let path_filter = Path::path_filter(filter);
+        let Some(path_filter) = Path::path_filter(filter) else { return VoiceStatus::Finished };
         let coefficients = path_filter.coefficients;
         let state = &mut path_filter.state;
         match (filtered, ramp_frames > 0, reverse) {

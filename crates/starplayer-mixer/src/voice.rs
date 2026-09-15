@@ -67,6 +67,24 @@ impl<'buses, Accumulator> BusSegment<'buses, Accumulator> {
     }
 }
 
+/// The three same-length windows used by compact channel-major routing.
+pub struct ChannelMajorBuffers<'buffers, Accumulator> {
+    destination: &'buffers mut [Accumulator],
+    routing: &'buffers mut [Accumulator],
+    discard: &'buffers mut [Accumulator],
+}
+
+impl<'buffers, Accumulator> ChannelMajorBuffers<'buffers, Accumulator> {
+    /// Group the master destination, reusable channel buffer and muted discard buffer.
+    pub const fn new(
+        destination: &'buffers mut [Accumulator],
+        routing: &'buffers mut [Accumulator],
+        discard: &'buffers mut [Accumulator],
+    ) -> ChannelMajorBuffers<'buffers, Accumulator> {
+        ChannelMajorBuffers { destination, routing, discard }
+    }
+}
+
 /// What a voice is playing, for the benefit of code that has to *find* voices rather than
 /// drive them (architecture §5.1).
 ///
@@ -114,16 +132,24 @@ impl Default for PathFilter<i32> {
     fn default() -> PathFilter<i32> { PathFilter { state: [0; 2], coefficients: FilterCoefficients::<i32>::PASS_THROUGH } }
 }
 
+/// The one arithmetic representation a voice's resonant filter currently uses.
+///
+/// A pool remains path-agnostic, but each live voice renders through only one engine
+/// path. Keeping that path as an enum avoids carrying an unused floating-point delay line
+/// and coefficient set in every fixed-only embedded voice.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum VoiceFilterState {
+    /// Floating-point mixer state.
+    Float(PathFilter<f32>),
+    /// Fixed-point mixer state.
+    Fixed(PathFilter<i32>),
+}
+
+impl Default for VoiceFilterState {
+    fn default() -> VoiceFilterState { VoiceFilterState::Fixed(PathFilter::<i32>::default()) }
+}
+
 /// One voice's resonant low-pass state (IT; architecture §7.2).
-///
-/// # Why both paths are carried at once
-///
-/// A [`Voice`] is not generic over the mixing path — one pool serves whichever path the
-/// engine was built with — so the struct holds a delay line and a coefficient set for
-/// each and [`MixPath::path_filter`] picks. The unused
-/// half costs twenty bytes and is never touched: in particular `refresh` computes only
-/// the coefficients of the path that asked, so a bare-metal fixed-path build never
-/// evaluates a float expression here.
 ///
 /// # Why there is no dirty bit
 ///
@@ -135,10 +161,8 @@ impl Default for PathFilter<i32> {
 /// sample-rate change as well.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct VoiceFilter {
-    /// The float path's delay line and coefficients.
-    pub float: PathFilter<f32>,
-    /// The fixed path's delay line and coefficients.
-    pub fixed: PathFilter<i32>,
+    /// The active mix path's delay line and coefficients.
+    state: VoiceFilterState,
     /// What the coefficients were computed from.
     source: FilterParams,
     /// The sample rate they were computed at. Zero means "nothing computed yet", which no
@@ -157,6 +181,48 @@ impl VoiceFilter {
     /// Whether this voice's cutoff law uses IT's extended filter range.
     pub const fn has_extended_range(&self) -> bool { self.extended_range }
 
+    /// Fixed state when this voice has rendered on the fixed path.
+    pub const fn fixed(&self) -> Option<&PathFilter<i32>> {
+        match &self.state {
+            VoiceFilterState::Fixed(filter) => Some(filter),
+            VoiceFilterState::Float(_) => None,
+        }
+    }
+
+    /// Float state when this voice has rendered on the float path.
+    pub const fn float(&self) -> Option<&PathFilter<f32>> {
+        match &self.state {
+            VoiceFilterState::Float(filter) => Some(filter),
+            VoiceFilterState::Fixed(_) => None,
+        }
+    }
+
+    /// Select and return fixed state. A path change can only occur before this voice's
+    /// first filtered frame in an engine, so replacing the other representation loses no
+    /// audible state.
+    pub fn fixed_mut(&mut self) -> Option<&mut PathFilter<i32>> {
+        if !matches!(self.state, VoiceFilterState::Fixed(_)) {
+            self.state = VoiceFilterState::Fixed(PathFilter::<i32>::default());
+            self.source_sample_rate_hz = 0;
+        }
+        match &mut self.state {
+            VoiceFilterState::Fixed(filter) => Some(filter),
+            VoiceFilterState::Float(_) => None,
+        }
+    }
+
+    /// Select and return float state. See [`VoiceFilter::fixed_mut`].
+    pub fn float_mut(&mut self) -> Option<&mut PathFilter<f32>> {
+        if !matches!(self.state, VoiceFilterState::Float(_)) {
+            self.state = VoiceFilterState::Float(PathFilter::<f32>::default());
+            self.source_sample_rate_hz = 0;
+        }
+        match &mut self.state {
+            VoiceFilterState::Float(filter) => Some(filter),
+            VoiceFilterState::Fixed(_) => None,
+        }
+    }
+
     /// Select the extended filter range, invalidating any cached coefficients.
     ///
     /// A module-level property that only the format's own processor knows, so the owner
@@ -169,8 +235,10 @@ impl VoiceFilter {
 
     /// Zero the delay line — a new note, not a change of parameters.
     pub const fn reset_state(&mut self) {
-        self.float.state = [0.0; 2];
-        self.fixed.state = [0; 2];
+        match &mut self.state {
+            VoiceFilterState::Float(filter) => filter.state = [0.0; 2],
+            VoiceFilterState::Fixed(filter) => filter.state = [0; 2],
+        }
     }
 
     /// Recompute `Path`'s coefficients if, and only if, something they depend on moved.
@@ -179,6 +247,7 @@ impl VoiceFilter {
     /// and never again for one that is not — never per frame, which is the whole point of
     /// caching them on the voice.
     pub fn refresh<Path: MixPath>(&mut self, filter: FilterParams, sample_rate_hz: u32) {
+        let _ = Path::path_filter(self);
         if self.source == filter && self.source_sample_rate_hz == sample_rate_hz {
             return;
         }
@@ -190,7 +259,10 @@ impl VoiceFilter {
         self.active = !filter.is_bypass();
         if self.active {
             let (cutoff, resonance) = filter.to_it();
-            Path::path_filter(self).coefficients = Path::coefficients(cutoff, resonance, sample_rate_hz, self.extended_range);
+            let extended_range = self.extended_range;
+            if let Some(path_filter) = Path::path_filter(self) {
+                path_filter.coefficients = Path::coefficients(cutoff, resonance, sample_rate_hz, extended_range);
+            }
         }
     }
 }
@@ -416,6 +488,9 @@ impl Voice {
 /// Sentinel for "no slot" in the free list. A pool can hold at most
 /// [`VoicePool::MAX_CAPACITY`] voices, so this index is never a real one.
 const NO_SLOT: u16 = u16::MAX;
+/// The engine's 64 tracker channels plus one final spill group.
+const CHANNEL_MAJOR_GROUPS: usize = 65;
+const MAX_CHANNEL_MAJOR_CHANNELS: usize = CHANNEL_MAJOR_GROUPS - 1;
 
 #[derive(Copy, Clone, Debug)]
 struct VoiceSlot {
@@ -424,11 +499,14 @@ struct VoiceSlot {
     active: bool,
     /// Next slot on the free list, or [`NO_SLOT`].
     next_free: u16,
+    /// Next active slot in this render's stable channel group. This occupies the former
+    /// tail padding of `VoiceSlot`, so it adds no pool allocation cost.
+    route_next: u16,
 }
 
 impl Default for VoiceSlot {
     fn default() -> VoiceSlot {
-        VoiceSlot { voice: Voice::default(), generation: 0, active: false, next_free: NO_SLOT }
+        VoiceSlot { voice: Voice::default(), generation: 0, active: false, next_free: NO_SLOT, route_next: NO_SLOT }
     }
 }
 
@@ -460,6 +538,7 @@ pub struct VoicePool {
     slots: Box<[VoiceSlot]>,
     free_head: u16,
     active_count: u16,
+    steals: u32,
 }
 
 impl VoicePool {
@@ -490,7 +569,7 @@ impl VoicePool {
             }
         }
 
-        Ok(VoicePool { slots: slots.into_boxed_slice(), free_head, active_count: 0 })
+        Ok(VoicePool { slots: slots.into_boxed_slice(), free_head, active_count: 0, steals: 0 })
     }
 
     /// How many voices the pool can hold.
@@ -498,6 +577,13 @@ impl VoicePool {
 
     /// How many voices are currently sounding.
     pub fn voices_active(&self) -> usize { self.active_count as usize }
+
+    /// Voices explicitly replaced by a format's saturated-pool stealing policy.
+    pub const fn steals(&self) -> u32 { self.steals }
+
+    /// Record one policy-driven steal. Formats call this immediately before releasing
+    /// their selected victim; ordinary note cuts and natural endings do not count.
+    pub fn record_steal(&mut self) { self.steals = self.steals.saturating_add(1); }
 
     /// Take a free slot, or `None` if the pool is full.
     ///
@@ -509,6 +595,7 @@ impl VoicePool {
 
         self.free_head = slot.next_free;
         slot.next_free = NO_SLOT;
+        slot.route_next = NO_SLOT;
         slot.active = true;
         slot.voice = Voice::new(tag, region, params, offset_frames);
         self.active_count = self.active_count.saturating_add(1);
@@ -679,6 +766,102 @@ impl VoicePool {
         self.active_count = active_count;
     }
 
+    /// Render voices through one reusable routing buffer in the same channel-major
+    /// saturation order as a full set of empty channel buses.
+    ///
+    /// This is the compact embedded route: one slot-order pass builds stable linked
+    /// groups in the slots' padding, then each channel is accumulated, added to
+    /// `destination`, and the buffer is cleared and reused. Voices outside the engine's
+    /// at-most-64 `channel_count` form the final spill group. Finished slots are linked
+    /// back onto the free list in slot order after every group has run, preserving the
+    /// allocation order of [`VoicePool::accumulate_masked`]. Grouping and traversal are
+    /// O(channels + voice capacity); no allocation occurs in the render path.
+    pub fn accumulate_channel_major<Path: MixPath, Interp: Interpolate>(
+        &mut self,
+        pcm: &[i16],
+        buffers: ChannelMajorBuffers<'_, Path::Accumulator>,
+        channel_count: usize,
+        sample_rate_hz: u32,
+        is_muted: impl Fn(u8) -> bool,
+    ) {
+        let ChannelMajorBuffers { destination, routing, discard } = buffers;
+        let frames = destination.len().min(routing.len());
+        let Some(destination) = destination.get_mut(..frames) else { return };
+        let Some(routing) = routing.get_mut(..frames) else { return };
+        let mut discard = discard.get_mut(..frames);
+        let mut active_count = self.active_count;
+        let channel_count = channel_count.min(MAX_CHANNEL_MAJOR_CHANNELS);
+        let mut heads = [NO_SLOT; CHANNEL_MAJOR_GROUPS];
+        let mut tails = [NO_SLOT; CHANNEL_MAJOR_GROUPS];
+        self.link_channel_major_groups(channel_count, &mut heads, &mut tails);
+
+        for group in 0..=channel_count {
+            routing.fill(Path::Accumulator::default());
+            let mut index = heads.get(group).copied().unwrap_or(NO_SLOT);
+            while index != NO_SLOT {
+                let Some(slot) = self.slots.get_mut(index as usize) else { break };
+                let next = slot.route_next;
+                let status = if is_muted(slot.voice.tag.channel) {
+                    match discard.as_deref_mut() {
+                        Some(discard) => accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, discard, sample_rate_hz),
+                        None => VoiceStatus::Sounding,
+                    }
+                } else {
+                    accumulate_voice::<Path, Interp>(&mut slot.voice, pcm, routing, sample_rate_hz)
+                };
+                if status == VoiceStatus::Finished {
+                    slot.active = false;
+                    slot.generation = slot.generation.wrapping_add(1);
+                    slot.next_free = index;
+                    slot.voice = Voice::default();
+                    active_count = active_count.saturating_sub(1);
+                }
+                index = next;
+            }
+            Path::add_block(destination, routing);
+        }
+
+        let mut free_head = self.free_head;
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if !slot.active && slot.next_free == index as u16 {
+                slot.next_free = free_head;
+                free_head = index as u16;
+            }
+        }
+        self.free_head = free_head;
+        self.active_count = active_count;
+    }
+
+    fn link_channel_major_groups(
+        &mut self,
+        channel_count: usize,
+        heads: &mut [u16; CHANNEL_MAJOR_GROUPS],
+        tails: &mut [u16; CHANNEL_MAJOR_GROUPS],
+    ) -> usize {
+        let mut visited = 0;
+        for index in 0..self.slots.len() {
+            visited += 1;
+            let Some(slot) = self.slots.get_mut(index) else { continue };
+            if !slot.active {
+                continue;
+            }
+            let group = (slot.voice.tag.channel as usize).min(channel_count);
+            slot.route_next = NO_SLOT;
+            let previous = tails.get(group).copied().unwrap_or(NO_SLOT);
+            if previous == NO_SLOT {
+                if let Some(head) = heads.get_mut(group) {
+                    *head = index as u16;
+                }
+            } else if let Some(previous_slot) = self.slots.get_mut(previous as usize) {
+                previous_slot.route_next = index as u16;
+            }
+            if let Some(tail) = tails.get_mut(group) {
+                *tail = index as u16;
+            }
+        }
+        visited
+    }
+
     fn live_slot_mut(&mut self, id: VoiceId) -> Option<&mut VoiceSlot> {
         let slot = self.slots.get_mut(id.index() as usize)?;
         if slot.active && slot.generation == id.generation() { Some(slot) } else { None }
@@ -693,7 +876,7 @@ mod tests {
     use starplayer_dsp::Linear;
 
     use crate::gain::RAMP_FRAMES;
-    use crate::path::{FixedFrame, FixedPath};
+    use crate::path::{FixedFrame, FixedPath, FloatPath};
     use crate::sample::{LoopSpan, append_guarded_sample};
 
     fn sounding_params() -> VoiceParams {
@@ -708,6 +891,20 @@ mod tests {
     }
 
     #[test]
+    fn filter_coefficients_refresh_when_the_mix_path_representation_changes() {
+        let mut filter = VoiceFilter::default();
+        let parameters = FilterParams::from_it(56, 96);
+        filter.refresh::<FixedPath>(parameters, 48_000);
+        assert_ne!(filter.fixed().expect("fixed representation").coefficients, FilterCoefficients::<i32>::PASS_THROUGH);
+
+        filter.refresh::<FloatPath>(parameters, 48_000);
+        assert_ne!(filter.float().expect("float representation").coefficients, FilterCoefficients::<f32>::PASS_THROUGH);
+
+        filter.refresh::<FixedPath>(parameters, 48_000);
+        assert_ne!(filter.fixed().expect("fixed representation again").coefficients, FilterCoefficients::<i32>::PASS_THROUGH);
+    }
+
+    #[test]
     fn a_fresh_pool_is_empty_and_hands_out_slots_in_order() {
         let mut pool = VoicePool::new(3);
         assert_eq!(pool.capacity(), 3);
@@ -717,6 +914,89 @@ mod tests {
         let second = pool.allocate(VoiceTag::default(), SampleRegion::default(), VoiceParams::SILENT, 0).expect("slot 1");
         assert_eq!((first.index(), second.index()), (0, 1));
         assert_eq!(pool.voices_active(), 2);
+    }
+
+    #[test]
+    fn channel_major_links_use_slot_padding_and_group_every_active_voice_once() {
+        assert_eq!(core::mem::size_of::<VoiceSlot>(), 168, "the routing link must not increase the established slot stride");
+
+        let mut pool = VoicePool::new(6);
+        let channels = [2, 0, 70, 2, 4, 1];
+        let mut ids = Vec::new();
+        for channel in channels {
+            ids.push(pool.allocate(VoiceTag { channel, ..VoiceTag::default() }, SampleRegion::default(), VoiceParams::SILENT, 0).expect("one slot per channel"));
+        }
+        assert!(pool.release(ids.get(1).copied().expect("second id")));
+        assert!(pool.release(ids.get(4).copied().expect("fifth id")));
+
+        let mut heads = [NO_SLOT; CHANNEL_MAJOR_GROUPS];
+        let mut tails = [NO_SLOT; CHANNEL_MAJOR_GROUPS];
+        let visited = pool.link_channel_major_groups(3, &mut heads, &mut tails);
+        assert_eq!(visited, pool.capacity(), "group construction examines each slot exactly once");
+
+        let grouped = (0..=3)
+            .map(|group| {
+                let mut indices = Vec::new();
+                let mut index = heads.get(group).copied().expect("one head per group");
+                while index != NO_SLOT {
+                    indices.push(index);
+                    index = pool.slots.get(index as usize).map(|slot| slot.route_next).expect("linked slot");
+                }
+                indices
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(grouped, alloc::vec![alloc::vec![], alloc::vec![5], alloc::vec![0, 3], alloc::vec![2]]);
+    }
+
+    #[test]
+    fn channel_major_matches_full_routing_for_spill_mute_finish_and_reuse() {
+        const CHANNELS: usize = 2;
+        const FRAMES: usize = 3;
+        let (blob, region) = one_shot_blob(4);
+        let make_pool = || {
+            let mut pool = VoicePool::new(4);
+            for channel in [1, 7, 0, 1] {
+                pool.allocate(VoiceTag { channel, ..VoiceTag::default() }, region, sounding_params(), 0).expect("one slot per voice");
+            }
+            pool
+        };
+        let mut full = make_pool();
+        let mut compact = make_pool();
+
+        for _ in 0..2 {
+            let mut buses = [FixedFrame::default(); CHANNELS * FRAMES];
+            let mut spill = [FixedFrame::default(); FRAMES];
+            let mut full_discard = [FixedFrame::default(); FRAMES];
+            let mut view = BusSegment::new(&mut buses, FRAMES, 0, FRAMES);
+            full.accumulate_masked::<FixedPath, Linear>(&blob, &mut view, &mut spill, &mut full_discard, 44_100, |channel| channel == 0);
+            let mut expected = [FixedFrame::default(); FRAMES];
+            for channel in 0..CHANNELS {
+                let bus = buses.get(channel * FRAMES..(channel + 1) * FRAMES).expect("channel bus");
+                <FixedPath as MixPath>::add_block(&mut expected, bus);
+            }
+            <FixedPath as MixPath>::add_block(&mut expected, &spill);
+
+            let mut actual = [FixedFrame::default(); FRAMES];
+            let mut routing = [FixedFrame::default(); FRAMES];
+            let mut compact_discard = [FixedFrame::default(); FRAMES];
+            compact.accumulate_channel_major::<FixedPath, Linear>(
+                &blob,
+                ChannelMajorBuffers::new(&mut actual, &mut routing, &mut compact_discard),
+                CHANNELS,
+                44_100,
+                |channel| channel == 0,
+            );
+            assert_eq!(actual, expected, "stable grouping preserves full channel/spill saturation order");
+            assert_eq!(compact_discard, full_discard, "muted voices advance through the same discard path");
+            assert_eq!(compact.voices_active(), full.voices_active());
+        }
+
+        let refill = |pool: &mut VoicePool| {
+            (0..4)
+                .map(|_| pool.allocate(VoiceTag::default(), SampleRegion::default(), VoiceParams::SILENT, 0).expect("finished slot is reusable").index())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(refill(&mut compact), refill(&mut full), "finished slots return to the free list in the same order");
     }
 
     #[test]

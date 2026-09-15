@@ -28,6 +28,13 @@ default = []
 # figures are worth comparing.
 bench = []
 
+# Audible 48 kHz IT capacity measurement. It reuses production codec/I2S/core placement,
+# selects the compact master-only engine layout while retaining production's 256-frame
+# descriptors and six-quantum ring. `web` may be added to measure the production network
+# personality under load.
+voice-bench = []
+voice-bench-filtered = ["voice-bench"]
+
 # A1S-only listening diagnostic: preserve normal engine work and the complete audio transport,
 # then replace each rendered quantum with a gated dual-mono sine immediately before packing.
 # Off by default and incompatible with `bench`, which never constructs the audio path.

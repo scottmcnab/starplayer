@@ -106,7 +106,7 @@ pub use command::{
 };
 pub use control::{ControlClock, ControlDriver, DEFAULT_CONTROL_INTERVAL_MICROS};
 pub use engine::{
-    DEFAULT_SAMPLE_RATE_HZ, Engine, EngineSettings, EngineWarnings, MAX_EVENTS_PER_BLOCK, MAX_ZERO_ADVANCE,
+    DEFAULT_SAMPLE_RATE_HZ, Engine, EngineLayout, EngineSettings, EngineWarnings, MAX_EVENTS_PER_BLOCK, MAX_ZERO_ADVANCE,
     RENDER_QUANTUM,
 };
 pub use insert::{

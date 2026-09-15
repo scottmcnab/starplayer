@@ -272,15 +272,19 @@ fn a_retrigger_resets_the_delay_line_but_a_sample_swap_does_not() {
 
     let mut voice = steady_voice(region, filter);
     accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, SAMPLE_RATE_HZ);
-    assert_ne!(voice.filter().fixed.state, [0; 2], "the delay line should be carrying something by now");
+    assert_ne!(voice.filter().fixed().expect("fixed state").state, [0; 2], "the delay line should be carrying something by now");
 
     let mut retriggered = voice;
     retriggered.retrigger(0);
-    assert_eq!(retriggered.filter().fixed.state, [0; 2], "a new note starts the filter from silence");
+    assert_eq!(retriggered.filter().fixed().expect("fixed state").state, [0; 2], "a new note starts the filter from silence");
 
     let mut swapped = voice;
     swapped.set_region(region);
-    assert_eq!(swapped.filter().fixed.state, voice.filter().fixed.state, "a mid-note sample swap is not a new note");
+    assert_eq!(
+        swapped.filter().fixed().expect("fixed state").state,
+        voice.filter().fixed().expect("fixed state").state,
+        "a mid-note sample swap is not a new note",
+    );
 }
 
 /// The coefficients are cached against the parameters they were derived from, so a voice
@@ -292,16 +296,16 @@ fn coefficients_follow_the_parameters_without_a_dirty_bit() {
     let mut voice = steady_voice(region, FilterParams::from_it(20, 0));
     let mut output = vec![FixedFrame::default(); 64];
     accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, SAMPLE_RATE_HZ);
-    let first = voice.filter().fixed.coefficients;
+    let first = voice.filter().fixed().expect("fixed state").coefficients;
     assert_eq!(first, FixedPath::coefficients(20, 0, SAMPLE_RATE_HZ, false));
 
     voice.params.set_filter(FilterParams::from_it(90, 0));
     accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, SAMPLE_RATE_HZ);
-    assert_eq!(voice.filter().fixed.coefficients, FixedPath::coefficients(90, 0, SAMPLE_RATE_HZ, false));
+    assert_eq!(voice.filter().fixed().expect("fixed state").coefficients, FixedPath::coefficients(90, 0, SAMPLE_RATE_HZ, false));
 
     // A sample-rate change is picked up the same way, without anyone having to say so.
     accumulate_voice::<FixedPath, Linear>(&mut voice, &blob, &mut output, 22_050);
-    assert_eq!(voice.filter().fixed.coefficients, FixedPath::coefficients(90, 0, 22_050, false));
+    assert_eq!(voice.filter().fixed().expect("fixed state").coefficients, FixedPath::coefficients(90, 0, 22_050, false));
 }
 
 #[test]
@@ -315,10 +319,13 @@ fn the_extended_filter_range_opens_the_cutoff_further() {
     let mut output = vec![FixedFrame::default(); 64];
     accumulate_voice::<FixedPath, Linear>(&mut standard, &blob, &mut output, SAMPLE_RATE_HZ);
     accumulate_voice::<FixedPath, Linear>(&mut extended, &blob, &mut output, SAMPLE_RATE_HZ);
-    assert_ne!(standard.filter().fixed.coefficients, extended.filter().fixed.coefficients);
+    assert_ne!(standard.filter().fixed().expect("fixed state").coefficients, extended.filter().fixed().expect("fixed state").coefficients);
 
     // A wider-open filter passes more of a broadband signal, so its `input_gain` is larger.
-    assert!(extended.filter().fixed.coefficients.input_gain > standard.filter().fixed.coefficients.input_gain);
+    assert!(
+        extended.filter().fixed().expect("fixed state").coefficients.input_gain
+            > standard.filter().fixed().expect("fixed state").coefficients.input_gain
+    );
 }
 
 /// A guard on the seam rather than on the filter: the interpolate/accumulate split the

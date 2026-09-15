@@ -116,6 +116,7 @@ separate worktrees — I3 is the first consumer of both.
 | [I4](complete/M8-task-I4-esp32-c5-riscv-bench.md) | C5 bench firmware, second CI target, `embedded.yml` | I3 | I5, I6 | Sonnet |
 | [I5](complete/M8-task-I5-buttons-and-display.md) | Six keys, ST7789 now-playing screen (`lcd` feature) | I3 | I4, I6 | Sonnet |
 | [I6](complete/M8-task-I6-web-control.md) | Captive portal, HTTP/WebSocket API, page, module upload | I3 | I4, I5 | Opus |
+| [I9](complete/M8-task-I9-a1s-voice-capacity-benchmark.md) | 48 kHz audible channel/voice bisection benchmark and compact log verifier | I8d | Complete | GPT-5.6-sol |
 
 ## Exit criteria
 

@@ -751,6 +751,39 @@ x86/ARM/WASM) already commits to, and this milestone is where RISC-V joins that 
   `-C link-arg=-Tlinkall.x`, and `embedded/xtask`'s `Board::linker` is `None` for this
   board because there is nothing to check for on `PATH`.
 
+### M8-I9 A1S voice-capacity acceptance record
+
+The host allocation probe for I9 measures the compact engine as
+`17,344 + 168 × voice_capacity + 8 × channel_count` bytes with the fixed mixer,
+master-only routing, scope taps disabled and telemetry depth one. A maximum-width
+64-channel/256-voice engine is therefore 60,864 bytes before the module sequencer and
+board allocations. The compact route builds 64 stable channel lists plus spill in one
+slot-order pass; its `u16` link occupies existing `VoiceSlot` padding, so O(C+V) traversal
+does not change the measured 168-byte per-voice stride. The generated IT workload's
+pattern and looping PCM live in the claim-only PSRAM arena; hot voices and their active
+fixed-filter delay state remain in internal RAM. The full layout remains the default and measures
+`27,808 + 168 × voices + 5,288 × channels` bytes in the same host allocation test.
+
+The 2026-09-15 hardware run started every mode at 64 channels/256 voices. That maximum
+probe reached the structured setup rejection; the next 64-channel/144-voice probe
+constructed and ran in all four modes, so timing rather than allocation determined the
+useful limits below. The production recommendation is two unfiltered voices for the web
+personality. Filtered playback has no verified web capacity at the required 20% timing
+headroom. The shipping 8/8 constants remain unchanged until owner acceptance.
+
+| Personality | IT filter | Passing channels / voices | Adjacent rejection | Pass p50 / p95 / max µs | Minimum internal / external heap | Evidence |
+|---|---:|---:|---:|---:|---:|---|
+| audio-only | off | 1 / 11 | 1 / 12, max 4,530 µs | 4,266 / 4,266 / 4,189 | 101,292 / 4,161,536 bytes | `audio-f0-soak-pass-1x11`, `audio-f0-soak-reject-1x12` |
+| audio-only | on | 1 / 5 | 1 / 6, max 4,620 µs | 4,266 / 4,266 / 4,225 | 102,972 / 4,161,536 bytes | `audio-f1-soak-pass-1x5`, `audio-f1-soak-reject-1x6` |
+| web-loaded | off | 1 / 2 | 1 / 3, max 4,343 µs | 2,200 / 3,200 / 4,185 | 61,568 / 0 bytes | `web-f0-soak-pass-1x2`, `web-f0-soak-pass-1x3` |
+| web-loaded | on | 1 / 0 | 1 / 1, max 4,672 µs | no passing case | 61,848 / 0 bytes at rejection | `web-f1-q20-voices-1x1` |
+
+The acceptance gate uses the production 256-frame descriptor at 48 kHz: 5,333.33 µs
+deadline, maximum render time at or below 4,266 µs, zero misses and post-startup
+underruns, no DMA-error increase, correct transport rate and active-voice plateau, no
+engine warnings, and at least 8 KiB of internal heap. The command and artifact layout are
+documented in `embedded/README.md` under “A1S voice-capacity benchmark”.
+
 ## 8. Toolchain (M8-I4 research point 2)
 
 **Plain `rustup` was preferred, and it needed no fallback.** The task file's two candidate

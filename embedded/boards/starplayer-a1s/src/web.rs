@@ -341,6 +341,23 @@ static GENERATION: AtomicU32 = AtomicU32::new(1);
 /// the executor starts and read by `GET /api/upload-limits`.
 static MODULE_BUFFER_BYTES: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(feature = "voice-bench")]
+static VOICE_BENCH_HTTP_SUCCESSES: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "voice-bench")]
+static VOICE_BENCH_UPLOAD_SUCCESSES: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "voice-bench")]
+static VOICE_BENCH_WS_SUCCESSES: AtomicU32 = AtomicU32::new(0);
+
+/// Successful benchmark HTTP reads, upload-parser responses and WebSocket telemetry sends.
+#[cfg(feature = "voice-bench")]
+pub fn voice_bench_load_counts() -> [u32; 3] {
+    [
+        VOICE_BENCH_HTTP_SUCCESSES.load(Ordering::Relaxed),
+        VOICE_BENCH_UPLOAD_SUCCESSES.load(Ordering::Relaxed),
+        VOICE_BENCH_WS_SUCCESSES.load(Ordering::Relaxed),
+    ]
+}
+
 /// Set by `POST /api/reprovision` once the credentials are gone; `main`'s watcher reboots
 /// a moment later, so the browser sees its answer first.
 static REBOOT_REQUESTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -1023,6 +1040,8 @@ async fn status_response(response_buffer: &ResponseBuffer) -> (StatusCode, Body<
     match api::write_status_json(body.scratch(), &status) {
         Some(length) => {
             body.truncate(length);
+            #[cfg(feature = "voice-bench")]
+            VOICE_BENCH_HTTP_SUCCESSES.fetch_add(1, Ordering::Relaxed);
             (StatusCode::OK, body)
         }
         None => {
@@ -1050,6 +1069,8 @@ async fn modules_response(response_buffer: &ResponseBuffer) -> (StatusCode, Body
     match api::write_modules_json(body.scratch(), &list) {
         Some(length) => {
             body.truncate(length);
+            #[cfg(feature = "voice-bench")]
+            VOICE_BENCH_HTTP_SUCCESSES.fetch_add(1, Ordering::Relaxed);
             (StatusCode::OK, body)
         }
         None => {
@@ -1071,6 +1092,8 @@ async fn upload_limits_response(response_buffer: &ResponseBuffer) -> (StatusCode
     match api::write_upload_limits_json(body.scratch(), &limits) {
         Some(length) => {
             body.truncate(length);
+            #[cfg(feature = "voice-bench")]
+            VOICE_BENCH_HTTP_SUCCESSES.fetch_add(1, Ordering::Relaxed);
             (StatusCode::OK, body)
         }
         None => {
@@ -1208,6 +1231,8 @@ impl PathRouterService<ResponseBuffer> for FlatRoutes {
         }
         if (method, path) == ("POST", "/api/modules") {
             let response = upload_response(&mut request, response_buffer).await;
+            #[cfg(feature = "voice-bench")]
+            VOICE_BENCH_UPLOAD_SUCCESSES.fetch_add(1, Ordering::Relaxed);
             return response.write_to(request.body_connection.finalize().await?, response_writer).await;
         }
 
@@ -1315,7 +1340,10 @@ impl WebSocketCallback for TelemetrySocket {
                     if telemetry.length > 0 {
                         let send = tx.send_binary(&telemetry.bytes[..telemetry.length]);
                         match with_timeout(WEBSOCKET_WRITE_TIMEOUT, send).await {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(())) => {
+                                #[cfg(feature = "voice-bench")]
+                                VOICE_BENCH_WS_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+                            }
                             Ok(Err(error)) => return Err(error),
                             Err(_) => break Some((1011, "send timeout")),
                         }

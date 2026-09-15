@@ -107,21 +107,18 @@ type EmbeddedEngine<Interp> = Engine<FixedPath, Interp, FixedOut<i16, OUTPUT_CHA
 /// accumulator frame is two `i32`; `FixedOut<i16, 2>`; `telemetry` on):
 ///
 /// ```text
-///   heap bytes = 27_800 + 184 × voice_capacity + 5_288 × channel_count
+///   heap bytes = 27_808 + 168 × voice_capacity + 5_288 × channel_count
 /// ```
 ///
-/// So `REFLEX.S3M` (3 channels, 3 voices) costs 44 216 bytes, `PETRI.S3M` (8 and 8) costs
-/// 71 576, and a 32-channel module with a 64-voice pool costs 209 kB — all before the
+/// So `REFLEX.S3M` (3 channels, 3 voices) costs 44 176 bytes, `PETRI.S3M` (8 and 8) costs
+/// 71 456, and a 32-channel module with a 64-voice pool costs about 208 kB — all before the
 /// module's own PCM, which is what I2's flash-resident images exist to keep out of RAM.
 ///
 /// Where it goes, and the three things worth knowing before writing a budget:
 ///
-/// * **184 bytes per voice**, which is `size_of::<Voice>()` (176) plus the pool's
-///   free-list link. About twenty of those bytes are the `PathFilter<f32>` that only the
-///   float path reads: a `Voice` is not generic over the mix path, so a fixed-path build
-///   carries the float filter's delay line and coefficients and never touches them
-///   (research point 3). Removing it is a `starplayer-mixer` change and is out of scope
-///   here.
+/// * **168 bytes per voice**, which is `size_of::<Voice>()` (160) plus the pool's
+///   free-list link. The filter stores only the active arithmetic representation, so a
+///   fixed-path voice carries no unused floating-point delay or coefficient state.
 /// * **5 288 bytes per channel**, of which about 2.1 kB is a **scope tap ring** — 1024
 ///   `i16` buckets plus two `Arc` headers — and 1 kB is the channel's own bus. The task
 ///   file assumed the taps exist only once `Engine::scope_readers` has been taken; they do
@@ -141,6 +138,11 @@ type EmbeddedEngine<Interp> = Engine<FixedPath, Interp, FixedOut<i16, OUTPUT_CHA
 /// [`RenderHalf<Linear>`] is **11 744 bytes by value**, because the engine's telemetry
 /// publisher holds a working `Snapshot` inline and this host holds another. Move it into a
 /// `static` or a `Box` rather than down a call chain.
+///
+/// I9's explicit `EngineLayout::MasterOnly`, with scope taps disabled and telemetry depth
+/// one, measures `17_344 + 168 × voice_capacity + 8 × channel_count` bytes. The eight
+/// bytes per channel are the control table only; there are no channel audio buffers or
+/// insert chains in that layout.
 pub fn settings_for(module: &Module, sample_rate_hz: u32) -> EngineSettings {
     EngineSettings {
         sample_rate_hz,
@@ -189,6 +191,8 @@ struct Taps {
     fading: AtomicBool,
     /// The last block's peak, as an absolute `i16` magnitude.
     peak: AtomicU32,
+    /// Policy-driven mixer voice steals observed after the last render call.
+    voice_steals: AtomicU32,
     /// Blocks and refusals since the player opened. `u32` rather than a second pair of
     /// seqlocks: these are diagnostics, and one that wrapped after four billion DMA blocks
     /// — five months at 128 frames and 44.1 kHz — would still be telling the truth about
@@ -425,6 +429,7 @@ impl<Interp: Interpolate> RenderHalf<Interp> {
         self.taps.playing.store(self.engine.is_playing() && !self.transport.stop_is_pending(), Ordering::Relaxed);
         self.taps.fading.store(self.transport.is_fading(), Ordering::Relaxed);
         self.taps.peak.store(peak.clamp(0, i16::MAX as i32) as u32, Ordering::Relaxed);
+        self.taps.voice_steals.store(self.engine.voices().steals(), Ordering::Relaxed);
         self.taps.blocks_rendered.fetch_add(1, Ordering::Relaxed);
         // A snapshot the control side is too slow to collect is dropped rather than queued,
         // which is the same bargain the engine's own telemetry channel strikes.
@@ -647,6 +652,9 @@ impl ControlHalf {
     /// The last block's peak magnitude, `0 ..= 32767`. A lossy tap: a stale reading costs a
     /// meter nothing.
     pub fn peak(&self) -> i16 { self.taps.peak.load(Ordering::Relaxed).min(i16::MAX as u32) as i16 }
+
+    /// Policy-driven mixer voice steals since this engine was constructed.
+    pub fn voice_steals(&self) -> u32 { self.taps.voice_steals.load(Ordering::Relaxed) }
 
     /// Blocks the device has asked for since the player opened. Zero after a second of
     /// playing means the DMA refill is not running.

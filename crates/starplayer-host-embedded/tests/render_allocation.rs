@@ -13,7 +13,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use starplayer::dsp::Linear;
-use starplayer::engine::EngineSettings;
+use starplayer::engine::{EngineLayout, EngineSettings};
 use starplayer::mixer::Voice;
 use starplayer::telemetry::Snapshot;
 use starplayer::rt::Arc;
@@ -172,10 +172,9 @@ fn the_heap_cost_of_an_engine_is_linear_in_the_voice_and_channel_counts() {
         size_of::<Snapshot>(),
     );
 
-    // Research point 3: a `Voice` carries a `PathFilter<f32>` that the fixed path never
-    // reads — two `f32` of delay line and a `FilterCoefficients<f32>` — and that dead
-    // state is inside every one of these bytes. The pool's slot is a little wider than the
-    // voice itself, because it also carries the free-list link.
+    // I9 stores only the active filter arithmetic in a voice, so the fixed path carries no
+    // dead float delay line. The pool's slot is a little wider than the voice itself,
+    // because it also carries the free-list link.
     assert!((size_of::<Voice>()..size_of::<Voice>() + 32).contains(&per_voice), "the voice pool is the only per-voice allocation: {per_voice} against {}", size_of::<Voice>());
     // Ranges rather than equalities, so that a field added to a `Voice` or a `Channel` is a
     // review conversation about the budget rather than a red test — but a *structural*
@@ -189,7 +188,7 @@ fn the_heap_cost_of_an_engine_is_linear_in_the_voice_and_channel_counts() {
 
     // And the formula `settings_for`'s documentation quotes is *this* formula, so a change
     // to any of the three constants fails here and is fixed in both places at once.
-    assert_eq!((fixed, per_voice, per_channel), (27_800, 184, 5_288), "the heap formula in `settings_for`'s documentation is out of date");
+    assert_eq!((fixed, per_voice, per_channel), (27_808, 168, 5_288), "the heap formula in `settings_for`'s documentation is out of date");
 
     // A `RenderHalf` is not small **by value**: the engine's telemetry publisher holds a
     // working `Snapshot` inline and this host holds another. A firmware that moves one down
@@ -212,6 +211,32 @@ fn a_real_module_reports_what_it_costs() {
             seen.bytes,
             module.pcm().len() * 2,
         );
-        assert_eq!(seen.bytes, 27_800 + 184 * settings.voice_capacity + 5_288 * settings.channel_count, "{name} did not follow the documented formula");
+        assert_eq!(seen.bytes, 27_808 + 168 * settings.voice_capacity + 5_288 * settings.channel_count, "{name} did not follow the documented formula");
     }
+}
+
+#[test]
+fn master_only_layout_removes_channel_bus_and_insert_storage() {
+    let base = EngineSettings {
+        sample_rate_hz: 48_000,
+        voice_capacity: 32,
+        channel_count: 16,
+        telemetry_depth: 1,
+        scope_taps: false,
+        layout: EngineLayout::MasterOnly,
+        ..EngineSettings::default()
+    };
+    let measure = |settings| {
+        let (_, seen) = while_watching(|| EmbeddedPlayer::<Linear>::open_empty(48_000, settings).expect("it opens"));
+        seen.bytes
+    };
+    let baseline = measure(base);
+    let more_voices = measure(EngineSettings { voice_capacity: 64, ..base });
+    let more_channels = measure(EngineSettings { channel_count: 32, ..base });
+    let per_voice = (more_voices - baseline) / 32;
+    let per_channel = (more_channels - baseline) / 16;
+    let fixed = baseline - 32 * per_voice - 16 * per_channel;
+    println!("master-only heap = {fixed} + {per_voice} * voices + {per_channel} * channels");
+    assert_eq!((fixed, per_voice, per_channel), (17_344, 168, 8), "the compact heap formula in the embedded budget is out of date");
+    assert!(baseline < 48_000, "the compact 32-voice/16-channel engine is unexpectedly large: {baseline}");
 }

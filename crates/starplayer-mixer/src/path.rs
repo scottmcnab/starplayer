@@ -127,13 +127,8 @@ pub trait MixPath {
     /// path's arithmetic.
     fn coefficients(cutoff: u8, resonance: u8, sample_rate_hz: u32, extended_range: bool) -> FilterCoefficients<Self::Mono>;
 
-    /// This path's half of a voice's [`VoiceFilter`].
-    ///
-    /// A [`Voice`](crate::Voice) is not generic over the path — one pool serves whichever
-    /// path the engine was built with — so it carries a delay line and a coefficient set
-    /// for each, and the path picks its own. The unused half costs twenty bytes per
-    /// voice and is never read, written or recomputed.
-    fn path_filter(filter: &mut VoiceFilter) -> &mut PathFilter<Self::Mono>;
+    /// Select this path's representation of a voice's [`VoiceFilter`].
+    fn path_filter(filter: &mut VoiceFilter) -> Option<&mut PathFilter<Self::Mono>>;
 
     /// Interpolate one source frame and add it to `destination`.
     ///
@@ -218,7 +213,7 @@ impl MixPath for FloatPath {
         resonant_low_pass_f32(cutoff, resonance, sample_rate_hz, extended_range)
     }
 
-    fn path_filter(filter: &mut VoiceFilter) -> &mut PathFilter<f32> { &mut filter.float }
+    fn path_filter(filter: &mut VoiceFilter) -> Option<&mut PathFilter<f32>> { filter.float_mut() }
 
     fn add_frame(destination: &mut FloatFrame, source: FloatFrame) {
         destination.left += source.left;
@@ -270,7 +265,7 @@ impl MixPath for FixedPath {
         resonant_low_pass_fixed(cutoff, resonance, sample_rate_hz, extended_range)
     }
 
-    fn path_filter(filter: &mut VoiceFilter) -> &mut PathFilter<i32> { &mut filter.fixed }
+    fn path_filter(filter: &mut VoiceFilter) -> Option<&mut PathFilter<i32>> { filter.fixed_mut() }
 
     fn add_frame(destination: &mut FixedFrame, source: FixedFrame) {
         destination.left = destination.left.saturating_add(source.left);

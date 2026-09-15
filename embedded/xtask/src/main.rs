@@ -314,8 +314,118 @@ fn command_build(selectors: &Selectors) -> Result<(), String> {
         command.arg(flag);
     }
     run(command)?;
+    verify_voice_bench_stack(selectors)?;
     eprintln!("xtask: built {}", selectors.elf_path().display());
     Ok(())
+}
+
+/// Keep enough real call depth above the linked stack floor for formatting, allocation
+/// and timeline scanning. The linker only knows total stack address space; this check
+/// also guards the two generated frames which execute benchmark startup on core 0.
+fn verify_voice_bench_stack(selectors: &Selectors) -> Result<(), String> {
+    if selectors.board.name != "a1s" || !selectors.features.split(',').any(|feature| feature.trim() == "voice-bench") {
+        return Ok(());
+    }
+
+    const MAX_MAIN_POLL_FRAME: usize = 8 * 1024;
+    const MAX_PLAYER_SETUP_FRAME: usize = 27 * 1024;
+    const MIN_DYNAMIC_HEADROOM: usize = 4 * 1024;
+
+    let elf = selectors.elf_path();
+    let mut nm = Command::new("xtensa-esp32-elf-nm");
+    nm.arg("-S").arg("-C").arg(&elf);
+    let nm_output = command_stdout(nm)?;
+    let bss_end = symbol_address(&nm_output, "_bss_end")?;
+    let stack_start = symbol_address(&nm_output, "_stack_start")?;
+    let main_functions = symbol_addresses_containing(
+        &nm_output,
+        &["starplayer_a1s::__main", "embassy_main_task_inner_function::{closure#0}"],
+    )?;
+    let player_setup = symbol_address_containing(&nm_output, &["starplayer_a1s::build_voice_bench_player"])?;
+    // Depending on LLVM's inlining decision the generated async body is either the
+    // TaskStorage poll itself or a separate callee. Guard the largest text symbol in
+    // that generated main path so a later no-inline decision cannot hide the real frame.
+    let main_frame = main_functions
+        .into_iter()
+        .map(|address| xtensa_frame_bytes(&elf, address))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or("the A1S async main has no text symbols")?;
+    let player_frame = xtensa_frame_bytes(&elf, player_setup)?;
+    let linked_stack = stack_start.checked_sub(bss_end).ok_or("the A1S stack symbols are reversed")?;
+    let main_headroom = linked_stack.saturating_sub(main_frame);
+    let player_headroom = linked_stack.saturating_sub(player_frame);
+
+    if main_frame > MAX_MAIN_POLL_FRAME {
+        return Err(format!("voice-bench async main poll frame is {main_frame} bytes; maximum is {MAX_MAIN_POLL_FRAME}"));
+    }
+    if player_frame > MAX_PLAYER_SETUP_FRAME {
+        return Err(format!("voice-bench player setup frame is {player_frame} bytes; maximum is {MAX_PLAYER_SETUP_FRAME}"));
+    }
+    if main_headroom < MIN_DYNAMIC_HEADROOM || player_headroom < MIN_DYNAMIC_HEADROOM {
+        return Err(format!(
+            "voice-bench dynamic stack headroom is too small: linked={linked_stack} main={main_headroom} player_setup={player_headroom}, minimum={MIN_DYNAMIC_HEADROOM}"
+        ));
+    }
+    eprintln!(
+        "xtask: voice-bench stack linked={linked_stack} main_poll={main_frame} main_headroom={main_headroom} player_setup={player_frame} player_headroom={player_headroom}"
+    );
+    Ok(())
+}
+
+fn command_stdout(mut command: Command) -> Result<String, String> {
+    eprintln!("+ {command:?}");
+    let output = command.output().map_err(|error| format!("cannot run {command:?}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{command:?} exited with {}", output.status));
+    }
+    String::from_utf8(output.stdout).map_err(|error| format!("{command:?} produced non-UTF-8 output: {error}"))
+}
+
+fn symbol_address(symbols: &str, name: &str) -> Result<usize, String> {
+    let line = symbols.lines().find(|line| line.split_whitespace().last() == Some(name)).ok_or_else(|| format!("ELF has no {name} symbol"))?;
+    parse_hex_address(line, name)
+}
+
+fn symbol_address_containing(symbols: &str, fragments: &[&str]) -> Result<usize, String> {
+    Ok(symbol_addresses_containing(symbols, fragments)?[0])
+}
+
+fn symbol_addresses_containing(symbols: &str, fragments: &[&str]) -> Result<Vec<usize>, String> {
+    let mut addresses = Vec::new();
+    for line in symbols.lines().filter(|line| fragments.iter().all(|fragment| line.contains(fragment))) {
+        let symbol_type = line.split_whitespace().nth(2);
+        if matches!(symbol_type, Some("t" | "T")) {
+            addresses.push(parse_hex_address(line, &fragments.join(", "))?);
+        }
+    }
+    if addresses.is_empty() {
+        return Err(format!("ELF has no text symbol containing {}", fragments.join(", ")));
+    }
+    Ok(addresses)
+}
+
+fn parse_hex_address(line: &str, name: &str) -> Result<usize, String> {
+    let address = line.split_whitespace().next().ok_or_else(|| format!("ELF symbol {name} has no address"))?;
+    usize::from_str_radix(address, 16).map_err(|_| format!("ELF symbol {name} has invalid address {address:?}"))
+}
+
+fn xtensa_frame_bytes(elf: &Path, address: usize) -> Result<usize, String> {
+    let mut objdump = Command::new("xtensa-esp32-elf-objdump");
+    objdump
+        .arg("-d")
+        .arg(format!("--start-address={address:#x}"))
+        .arg(format!("--stop-address={:#x}", address + 16))
+        .arg(elf);
+    let disassembly = command_stdout(objdump)?;
+    parse_xtensa_entry_frame(&disassembly).ok_or_else(|| format!("no Xtensa entry frame at {address:#x} in {}", elf.display()))
+}
+
+fn parse_xtensa_entry_frame(disassembly: &str) -> Option<usize> {
+    let operands = disassembly.lines().find_map(|line| line.split_once("entry\ta1,").map(|(_, operands)| operands.trim()))?;
+    let value = operands.split_whitespace().next()?.trim_end_matches(',');
+    value.strip_prefix("0x").map_or_else(|| value.parse().ok(), |hex| usize::from_str_radix(hex, 16).ok())
 }
 
 /// `cargo xtask image` — an espflash image beside the ELF.
@@ -358,6 +468,7 @@ fn command_image(selectors: &Selectors, merge: bool, out: Option<&str>) -> Resul
     command.arg("--flash-size").arg(selectors.board.flash_size);
     command.arg(&out_path);
     run(command)?;
+    verify_voice_bench_stack(selectors)?;
     eprintln!("xtask: wrote {}", out_path.display());
     Ok(out_path)
 }
@@ -570,6 +681,23 @@ mod tests {
         assert_eq!(selectors.output_stem(), "starplayer-a1s-bench-dev");
         let plain = Selectors { board: A1S, features: String::new(), dev: false };
         assert_eq!(plain.output_stem(), "starplayer-a1s");
+    }
+
+    #[test]
+    fn xtensa_stack_frame_parser_accepts_decimal_and_hex_entry_sizes() {
+        assert_eq!(parse_xtensa_entry_frame("400f6984:\t006136\tentry\ta1, 48\n"), Some(48));
+        assert_eq!(parse_xtensa_entry_frame("400f76c4:\t044136\tentry\ta1, 0x220\n"), Some(544));
+        assert_eq!(parse_xtensa_entry_frame("400f76c4:\t000000\tretw.n\n"), None);
+    }
+
+    #[test]
+    fn stack_symbol_parser_finds_exact_and_demangled_symbols() {
+        let symbols = "3ffd6f48 A _bss_end\n3ffe0000 A _stack_start\n400ef5f0 000047f5 t starplayer_a1s::__main::embassy_main_task_inner_function::{closure#0}\n400f76c4 00002cee t <embassy_executor::raw::TaskStorage<starplayer_a1s::__main::embassy_main_task_inner_function::{closure#0}>>::poll\n3ffb6e50 0001e000 b starplayer_a1s::__main::embassy_main_task_inner_function::{closure#0}::HEAP\n";
+        assert_eq!(symbol_address(symbols, "_bss_end").unwrap(), 0x3ffd6f48);
+        assert_eq!(
+            symbol_addresses_containing(symbols, &["starplayer_a1s::__main", "embassy_main_task_inner_function::{closure#0}"]).unwrap(),
+            vec![0x400ef5f0, 0x400f76c4]
+        );
     }
 
     #[test]

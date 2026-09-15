@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use starplayer_core::{ChannelId, Command, Frame, U0F16};
 use starplayer_dsp::{DSP_BLOCK_FRAMES, Insert, Interpolate};
-use starplayer_mixer::{BusSegment, Limiter, MasterSettings, MixPath, OutputFormat, VoicePool};
+use starplayer_mixer::{BusSegment, ChannelMajorBuffers, Limiter, MasterSettings, MixPath, OutputFormat, VoicePool};
 use starplayer_rt::{Consumer, GarbageChannel, garbage_channel};
 
 use crate::channel::ChannelTable;
@@ -46,6 +46,23 @@ pub const MAX_ZERO_ADVANCE: u32 = 64;
 
 /// Events dispatched within one render quantum before the engine stops asking.
 pub const MAX_EVENTS_PER_BLOCK: u32 = 4096;
+
+/// Preallocated routing storage for one engine.
+///
+/// [`EngineLayout::Full`] is the desktop/WASM layout: one bus and insert chain per
+/// channel, a spill lane and the master chain. [`EngineLayout::MasterOnly`] is the
+/// concrete embedded fixed-path layout: one quantum routing buffer is reused channel by
+/// channel, preserving the full graph's fixed-point saturation order while only the
+/// master insert chain exists. Muted voices still render into the fixed scratch lane, so
+/// their sample and filter state advance normally.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum EngineLayout {
+    /// Per-channel buses and insert chains, plus the master chain.
+    #[default]
+    Full,
+    /// A master mix, one reusable routing quantum and the master insert chain.
+    MasterOnly,
+}
 
 /// The output rate an [`Engine::new`] assumes, in Hz.
 ///
@@ -123,6 +140,8 @@ pub struct EngineSettings {
     pub scope_taps: bool,
     /// Queued scalar snapshots when telemetry is enabled; a latest-state host can use one.
     pub telemetry_depth: usize,
+    /// Routing and insert storage allocated with the engine.
+    pub layout: EngineLayout,
     /// Output rate, for the synthesised control clock.
     pub sample_rate_hz: u32,
     /// How many [`EventSource`]s may be merged at once.
@@ -144,6 +163,7 @@ impl Default for EngineSettings {
             channel_count: 32,
             scope_taps: true,
             telemetry_depth: starplayer_rt::DEFAULT_SNAPSHOT_DEPTH,
+            layout: EngineLayout::Full,
             sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
             source_capacity: SourceMux::DEFAULT_CAPACITY,
             command_capacity: DEFAULT_COMMAND_CAPACITY,
@@ -212,12 +232,13 @@ where
     /// channel-major, then the spill lane. Allocated once.
     accumulator: Box<[Path::Accumulator]>,
     /// One `RENDER_QUANTUM`-long bus per control lane, channel-major in one allocation
-    /// (M7-H1). Always on: there is no "no inserts, old path" branch.
+    /// (M7-H1). Empty only for the explicit [`EngineLayout::MasterOnly`] layout.
     buses: Box<[Path::Accumulator]>,
-    /// How many buses [`Engine::buses`] holds — the channel table's width.
+    /// How many buses [`Engine::buses`] holds: the channel table's width for the full
+    /// layout, zero for master-only.
     bus_count: usize,
-    /// Where a voice whose `tag.channel` has no bus renders. Summed into the mix after
-    /// every bus, so such a voice is still heard; what it has not got is an insert chain.
+    /// Where a voice whose `tag.channel` has no bus renders in the full layout. The
+    /// master-only layout reuses this quantum as its one channel-routing buffer.
     spill: Box<[Path::Accumulator]>,
     /// One chain per bus, plus the master chain last. `bus_count + 1` entries.
     chains: Box<[InsertChain<Path::Mono>]>,
@@ -290,7 +311,10 @@ where
         // from the table rather than from the request: 64 buses is the widest the engine
         // can be asked for, and the two must agree or a lane's voices would spill.
         let channels = ChannelTable::new(settings.channel_count);
-        let bus_count = channels.len();
+        let bus_count = match settings.layout {
+            EngineLayout::Full => channels.len(),
+            EngineLayout::MasterOnly => 0,
+        };
         #[cfg(feature = "telemetry")]
         let (telemetry, telemetry_reader) = starplayer_telemetry::telemetry_channel_with_depth(settings.telemetry_depth);
         // One scope ring per control lane, allocated here with everything else. A ring is
@@ -601,10 +625,22 @@ where
                 // `cargo xtask goldens --check` proves.
                 #[cfg(feature = "telemetry")]
                 self.scope_taps.sample_segment(&self.voices, pcm, offset, span);
-                if let Some(spill_window) = self.spill.get_mut(offset..end) {
-                    let scratch = self.muted_scratch.get_mut(offset..end).unwrap_or(&mut []);
-                    let channels = &self.channels;
-                    let is_muted = |channel: u8| channels.get(ChannelId(channel as u16)).is_some_and(|lane| lane.muted);
+                let scratch = self.muted_scratch.get_mut(offset..end).unwrap_or(&mut []);
+                let channels = &self.channels;
+                let is_muted = |channel: u8| channels.get(ChannelId(channel as u16)).is_some_and(|lane| lane.muted);
+                if self.bus_count == 0 {
+                    // Reuse the spill allocation as one channel-routing quantum. This
+                    // retains the full graph's channel-major fixed saturation semantics
+                    // without retaining one quantum per channel.
+                    if let (Some(master_window), Some(routing_window)) =
+                        (self.accumulator.get_mut(offset..end), self.spill.get_mut(offset..end))
+                    {
+                        self.voices.accumulate_channel_major::<Path, Interp>(
+                            pcm, ChannelMajorBuffers::new(master_window, routing_window, scratch), self.channels.len(), self.sample_rate_hz,
+                            is_muted,
+                        );
+                    }
+                } else if let Some(spill_window) = self.spill.get_mut(offset..end) {
                     // A view, not a slice of slices: the buses are one channel-major
                     // allocation and this segment covers `offset..end` of each of them.
                     // Building a `&mut [&mut [_]]` here would be an allocation in
@@ -638,7 +674,9 @@ where
         // their own buses, then the channel-major sum into the pre-master mix, then the
         // spill lane, then the master chain, then master volume and the limiter.
         Self::process_channel_inserts(&mut self.buses, &mut self.chains, &mut self.accumulator);
-        Path::add_block(&mut self.accumulator, &self.spill);
+        if self.bus_count != 0 {
+            Path::add_block(&mut self.accumulator, &self.spill);
+        }
         if let Some(master_chain) = self.chains.get_mut(self.bus_count)
             && !master_chain.is_empty()
         {

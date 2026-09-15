@@ -886,17 +886,30 @@ blocks (§1.4). Effects: reverb, chorus, delay, compressor, EQ.
 
 #### The graph as it landed (M7-H1)
 
-**The buses are always on.** `VoicePool::accumulate_masked` sums each voice into the bus of
+**The full desktop/WASM layout keeps the buses on.** `VoicePool::accumulate_masked` sums each voice into the bus of
 its `tag.channel` rather than into one shared accumulator, through a `BusSegment` view over
 one channel-major allocation the engine makes in `Engine::with_settings`; a voice whose
 lane has no bus goes to a **spill lane**. There is deliberately no "no inserts, take the
-old path" branch, because two summation orders would be two things to keep in step and only
-one of them would be under test.
+old path" selection inside the full layout: every existing desktop/WASM configuration
+retains the channel-major sum that the golden suite covers.
+
+M8-I9 adds an explicit `EngineLayout::MasterOnly` setting for fixed-path embedded builds
+that expose no channel inserts. It allocates one reusable routing quantum instead of one
+bus per channel. One slot-order pass links voices into 64 stable channel groups plus a
+spill group, using a `u16` link in the voice slot's existing tail padding; fixed head/tail
+arrays then render every voice once. Each channel is accumulated in slot order and added
+to the master in channel order, preserving fixed-point saturation exactly in O(C+V) work.
+Muted voices advance in the usual scratch lane. The master chain, master volume, limiter,
+event splitting and whole-quantum DSP remain the same. `Full` stays the default for every existing host, and
+fixed-path equivalence tests cover both an ordinary mix and a maximum-pool resonant mix
+that saturates a channel accumulator. On the measured embedded host the compact allocation
+is `17,344 + 168 × voices + 8 × channels` bytes with one-entry telemetry and scope taps off.
 
 **The nine fixed goldens did not move for it**, which is the claim the design rests on.
-Voices are still walked in slot order *within* a bus, and on the fixed path `i32` addition
-is associative unless an intermediate sum saturates — which needs 65,536× full scale and no
-real module reaches it. H1 proved it two ways: `cargo xtask goldens --check` byte-identical,
+Voices are still walked in slot order *within* a bus. Fixed `i32` saturating addition is
+order-dependent, including for resonant voices whose filter can overshoot full scale, so
+the compact layout explicitly retains the full layout's channel-major order. H1 proved
+the existing full routing two ways: `cargo xtask goldens --check` byte-identical,
 and the pinned corpus's three dense `data/m/*.it` modules — the mixes most likely to
 saturate an intermediate sum — rendered on the fixed path to identical SHA-256 digests
 before and after. The float path's last bits may move, which no golden pins.

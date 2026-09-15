@@ -51,6 +51,7 @@ pub mod pcm;
 pub mod screen;
 pub mod tone;
 pub mod volume;
+pub mod voice_bench;
 
 pub use api::{HostState, Status, Upload, decode_wire_command, pack_telemetry};
 pub use bench::{BenchRow, CycleCounter, Kernel, PcmLocation, digest_row};

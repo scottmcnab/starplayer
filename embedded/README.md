@@ -176,18 +176,23 @@ embedded/flash_image.sh
 
 The wrapper resolves `embedded/` from its own path, so invoking it by any valid relative or
 absolute path does not depend on the caller's working directory. It sources
-`~/export-esp-1.97.sh`, deletes its checkout's old merged image, package-cleans and rebuilds
-`embedded/xtask` for that checkout, and uses `esptool.py` to write
-`target/starplayer-a1s-web-merged.bin` at address zero. The wrapper refuses to run esptool unless
-that rebuild creates a non-empty image at the expected checkout-local path. This prevents Cargo
-from reusing an xtask compiled with another worktree's embedded manifest path and silently
-flashing a stale artifact. It defaults to the proven
-`rfc2217://192.168.0.151:8086?ign_set_control` endpoint at 460800 baud. Override either for another
+`~/export-esp-1.97.sh`, deletes its checkout's old merged image, asks that checkout's
+`embedded/xtask` package to clean its own stale binary, asks that checkout's xtask to
+rebuild the image, and uses `esptool.py` to write
+`target/starplayer-a1s-current-merged.bin` at address zero. The wrapper refuses to run esptool unless
+that build creates a non-empty image at the expected checkout-local path. It defaults to the `web`
+feature and the proven
+`rfc2217://192.168.0.151:8086?ign_set_control` endpoint at 460800 flash baud. Override either for another
 bridge without changing the fixed firmware personality:
 
 ```sh
 STARPLAYER_RFC2217_ENDPOINT='rfc2217://192.168.0.152:8086?ign_set_control' STARPLAYER_FLASH_BAUD=115200 embedded/flash_image.sh
 ```
+
+Owner tooling may select another personality and image path through
+`STARPLAYER_FEATURES` and `STARPLAYER_IMAGE_PATH`. A Cargo/link failure returns status 20;
+an esptool failure returns status 30. Both abort the I9 controller: only a structured
+`START`/`END reason=setup` response from running firmware is capacity evidence.
 
 `flash` builds a merged image (bootloader + partition table + app) with `--skip-padding`,
 so a reflash leaves the `modules` and `config` partitions alone, and attaches the monitor
@@ -847,6 +852,127 @@ bounds, and all are easy to undo by accident:
 core-0 stack is logged once at boot. The I8c links leave 57 548 bytes in `web` and 56 116
 bytes in `web,lcd`; default leaves 35 608 bytes and `lcd` leaves 34 200 bytes. If the
 assertion fires, shrink or move the new static — do not lower the floor.
+
+### A1S voice-capacity benchmark (M8-I9)
+
+`voice-bench` keeps the accepted audible path intact: fixed-point stereo at 48 kHz, six
+128-frame quanta in the three-descriptor DMA ring, and therefore 256 frames and a
+5,333.33 µs deadline per descriptor. Its 20% headroom gate is 4,266 µs. The workload is
+a generated native instrument-mode IT module whose looping PCM and pattern data are
+borrowed from the claim-only PSRAM arena. The engine uses the explicit master-only
+layout, one-entry scalar telemetry and no scope rings. Normal `web` and `web,lcd` retain
+their shipping eight-channel/eight-voice settings. The benchmark reserves a fixed 32 KiB
+PSRAM image buffer whose maximum workload fit is host-tested. Module construction runs in
+a separate Embassy task after async main yields. Player allocation and the fallible
+timeline load run in a second separately-polled task; `StaticCell::init_with` constructs
+the 11,744-byte render half in place, and only static references return to main. In the
+maximum audio-only build this reduces main's poll frame from 34,112 to 544 bytes; its
+37,048-byte linked stack leaves 36,504 bytes above main and 11,176 bytes above the
+25,872-byte player setup frame. `cargo xtask build` and `image` inspect the ELF and reject
+voice-bench builds if main exceeds 8 KiB, player setup exceeds 27 KiB, or either leaves
+less than 4 KiB dynamic headroom. The production heap, timeline and 32 KiB linked stack
+floor remain intact.
+
+The owner runs the complete four-way search from the repository root:
+
+```sh
+python3 embedded/tests/a1s_voice_bench.py run \
+  --board-ip starplayer.local \
+  --raw-log a1s-voice-bench.log \
+  --json-report a1s-voice-bench.json
+```
+
+For every audio/web and filtered/unfiltered candidate, the controller exports its exact
+channel/voice count and bisection bounds, invokes `embedded/flash_image.sh`, then captures
+that reboot through RFC2217. Each candidate's UART is preserved verbatim under
+`a1s-voice-bench.log.d/`; the top-level log is the globally sequenced proof assembled
+from those runs. The search probes 64 channels/256 voices first, bisects voices from 32
+through 256 at 64 channels, and falls back to bisecting channels at 32 voices. If no
+channel passes at 32 voices, it holds one channel and bisects voices from 1 through 31,
+starting at 31, so the report still records the actual hardware limit and adjacent reject.
+When a channel ceiling exists and the repeated voice search reaches 256, the controller
+retains and soaks the known adjacent channel reject at its measured 32-voice baseline.
+After opening the firmware console at 115200 baud, the benchmark runner
+uses DTR/RTS to reset the attached app, then begins its capture deadline. The firmware
+waits three seconds after its human-readable boot banner before workload construction or
+any machine record, so capture is ready after that attached reset. The wrapper's
+460800 baud setting applies only while esptool writes the image. Each candidate build sets
+`RUST_MIN_STACK=268435456` for stable Xtensa thin-LTO worker threads during the repeated
+search. The controller requires
+`--board-ip` before starting any candidate because all four searches include web-loaded
+cases. The web cases keep two HTTP clients issuing status/module/upload-limit reads and
+invalid upload requests while a WebSocket telemetry client remains connected.
+Invalid uploads exercise staging and decoding without replacing the stress module. The
+host records locked success/failure counts per workload class, while boot-reset firmware
+counters in every `SAMPLE`/`END` prove successful HTTP reads, upload-parser responses and
+WebSocket telemetry came from the candidate board and continued throughout the case.
+
+After an interrupted run, add `--resume` with the same artifact directory and durations.
+The runner strictly validates each existing `<case>.uart.log` and web-load sidecar against the current mode,
+filter, capacity, duration, phase, axis and bisection bounds before reusing it. Missing
+artifacts run normally; malformed or mismatched artifacts abort without being overwritten.
+Without `--resume`, every candidate is rebuilt, flashed and captured as before.
+
+Qualification lasts 60 seconds. The controller then rebuilds, flashes and captures the
+highest pass and its adjacent rejection for 600 seconds, so both soaks execute. If the
+provisional pass rejects during its long soak, the controller retains the completed
+qualification outcomes and tries the highest qualified lower capacity. It performs a
+bounded qualification/long-soak bisection when needed until the final long pass and long
+reject are numerically adjacent. The failed provisional soak remains reusable under its
+original case name and may become the final reject proof. A
+firmware setup failure is a structured capacity rejection, including a fallible timeline
+scan that keeps the shipping host's timeline memory in the measured capacity. Build,
+link, flash and serial failures abort the search. Replay is hardware-free:
+
+Before a web benchmark starts either station or provisioning networking, it requires
+56 KiB of total free internal heap. The web heap's added 48 KiB exists for radio and
+esp-rtos dynamic allocations; the remaining 8 KiB is the benchmark's retained heap gate.
+This voice-bench-only preflight catches an already consumed or fragmented heap before the
+radio reaches its infallible task-stack allocation. Normal web startup is unchanged, and
+the preflight does not replace the post-start 8 KiB pass criterion.
+
+```sh
+python3 embedded/tests/a1s_voice_bench.py verify a1s-voice-bench.log \
+  --json-report a1s-voice-bench-replay.json
+```
+
+The verifier requires all four final `RESULT` records and rejects wrong production DMA
+geometry, missing or reordered records, a post-START reset, inconsistent counters,
+truncated duration and incomplete or incorrectly bound boundary soaks. RESULT records must
+name the exact mode/filter search result and its expected voice- or channel-axis reject.
+After long-soak fallback, the verifier replays the bounded refinement order and requires
+the named stable pass and immediately higher long reject; the reject's historical case
+name does not need to say `reject`.
+A rejecting minimum 1-channel/1-voice qualification is represented explicitly as a
+zero-voice limit with `pass_case=none`; the exact 1x1 case remains the rejection proof.
+A claimed pass must
+also have correct transport rate, voice plateau and heap reserve with no warnings, DMA
+growth, underruns or deadline misses. Those predicate failures are retained as legitimate
+`reason=criteria` rejection evidence instead of aborting bisection.
+Periodic voice checks after a five-second workload settle must remain at the requested
+plateau. Web-load counters may remain zero or unchanged during their own five-second
+connection settle. Starting with the first sample at or after that boundary, all three
+must be positive and each must have advanced within the preceding five seconds. A counter
+exactly five seconds past its last observed increase still passes; a longer stall fails.
+`END` applies the same window. The firmware updates the heap low-water mark every 10 ms control tick and around
+web control polling; the verifier requires that minimum never recover in later records.
+The capture path streams each decoded UART line to its artifact before validation, so
+panic, reboot, malformed, sequence and wrong-case failures retain the evidence that caused them.
+
+The complete 2026-09-15 run and independent replay produced these reliable limits:
+
+| Personality | IT filter | Limit | Adjacent rejection | Passing p50 / p95 / max |
+|---|---:|---:|---:|---:|
+| audio-only | off | 1 channel / 11 voices | 1 / 12 at 4,530 µs | 4,266 / 4,266 / 4,189 µs |
+| audio-only | on | 1 channel / 5 voices | 1 / 6 at 4,620 µs | 4,266 / 4,266 / 4,225 µs |
+| web-loaded | off | 1 channel / 2 voices | 1 / 3 at 4,343 µs | 2,200 / 3,200 / 4,185 µs |
+| web-loaded | on | zero voices | 1 / 1 at 4,672 µs | no passing case |
+
+All accepted cases had zero deadline misses, underruns, DMA-error growth and engine
+warnings. The web result retained at least 61,568 bytes of internal heap, so CPU timing
+is the limiting resource. The measured production recommendation is two voices with IT
+filters disabled while the web personality is active. The normal firmware remains at
+eight channels/eight voices pending owner acceptance.
 
 ## 7. Notes for the next person
 

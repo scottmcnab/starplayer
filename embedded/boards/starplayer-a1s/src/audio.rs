@@ -106,7 +106,8 @@ pub const QUANTUM_BYTES: usize = QUANTUM_FRAMES * FRAME_BYTES;
 /// DMA descriptors in the small circular ring. esp-hal fixes this at three.
 pub const RING_DESCRIPTORS: usize = 3;
 
-/// How many render quanta the DMA ring holds: three descriptors of two quanta.
+/// How many render quanta the DMA ring holds: the production geometry of three
+/// descriptors, two quanta each.
 pub const DMA_RING_QUANTA: usize = 6;
 
 /// How many render quanta one DMA descriptor holds.
@@ -128,8 +129,8 @@ const _: () = assert!(DMA_RING_QUANTA.is_multiple_of(RING_DESCRIPTORS), "each de
 const _: () = assert!(DESCRIPTOR_BYTES == DESCRIPTOR_QUANTA * QUANTUM_BYTES);
 const _: () = assert!(DESCRIPTOR_BYTES == DESCRIPTOR_SAMPLES * SLOT_BYTES);
 const _: () = assert!(DMA_RING_BYTES == RING_DESCRIPTORS * DESCRIPTOR_BYTES);
-const _: () = assert!(DESCRIPTOR_BYTES == 2_048, "the 32-bit-slot descriptor must be 2 048 bytes");
-const _: () = assert!(DMA_RING_BYTES == 6_144, "the 32-bit-slot ring must be 6 144 bytes");
+const _: () = assert!(DESCRIPTOR_BYTES == 2_048, "the production descriptor must remain 2 048 bytes");
+const _: () = assert!(DMA_RING_BYTES == 6_144, "the production ring must remain 6 144 bytes");
 const _: () = assert!(DESCRIPTOR_BYTES <= 4_092, "one descriptor must fit esp-hal's chunk limit");
 const _: () = assert!(DMA_RING_BYTES <= 8_184, "the ring must retain esp-hal's three-descriptor geometry");
 
@@ -229,6 +230,67 @@ static STEADY_WRITTEN_BYTES: AtomicU32 = AtomicU32::new(0);
 
 /// Cumulative constrained steady-state `push_with` calls, including error and short-write calls.
 static STEADY_PUSH_CALLS: AtomicU32 = AtomicU32::new(0);
+
+/// Descriptor render timing, updated only by core 1 and formatted only by core 0.
+#[cfg(feature = "voice-bench")]
+static RENDER_COUNT: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "voice-bench")]
+static RENDER_MAX_US: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "voice-bench")]
+static RENDER_MISSES: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "voice-bench")]
+static RENDER_BUCKETS: [AtomicU32; 8] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+
+#[cfg(feature = "voice-bench")]
+const RENDER_BUCKET_UPPER_US: [u32; 8] = [500, 1_000, 1_600, 2_200, 3_200, 4_266, 5_333, u32::MAX];
+
+/// Lock-free bounded timing snapshot for the control core.
+#[cfg(feature = "voice-bench")]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct RenderTiming {
+    pub maximum_us: u32,
+    pub p50_us: u32,
+    pub p95_us: u32,
+    pub misses: u32,
+}
+
+#[cfg(feature = "voice-bench")]
+fn record_render_time(elapsed_us: u32) {
+    RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+    RENDER_MAX_US.fetch_max(elapsed_us, Ordering::Relaxed);
+    if elapsed_us > 5_333 {
+        RENDER_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    let bucket = RENDER_BUCKET_UPPER_US.iter().position(|upper| elapsed_us <= *upper).unwrap_or(RENDER_BUCKET_UPPER_US.len() - 1);
+    RENDER_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "voice-bench")]
+fn percentile(count: u32, numerator: u32) -> u32 {
+    let wanted = u64::from(count).saturating_mul(u64::from(numerator)).div_ceil(100) as u32;
+    let mut seen = 0u32;
+    for (index, bucket) in RENDER_BUCKETS.iter().enumerate() {
+        seen = seen.saturating_add(bucket.load(Ordering::Relaxed));
+        if seen >= wanted {
+            return RENDER_BUCKET_UPPER_US[index];
+        }
+    }
+    0
+}
+
+#[cfg(feature = "voice-bench")]
+pub fn render_timing() -> RenderTiming {
+    let count = RENDER_COUNT.load(Ordering::Relaxed);
+    RenderTiming {
+        maximum_us: RENDER_MAX_US.load(Ordering::Relaxed),
+        p50_us: percentile(count, 50),
+        p95_us: percentile(count, 95),
+        misses: RENDER_MISSES.load(Ordering::Relaxed),
+    }
+}
 
 const STARTUP_PENDING: u8 = 0;
 const STARTUP_READY: u8 = 1;
@@ -504,7 +566,11 @@ pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<L
     STARTUP_STATE.store(STARTUP_READY, Ordering::Release);
 
     loop {
+        #[cfg(feature = "voice-bench")]
+        let render_started = esp_hal::time::Instant::now();
         render_descriptor(descriptor_scratch, render, &mut output_override);
+        #[cfg(feature = "voice-bench")]
+        record_render_time(render_started.elapsed().as_micros().min(u64::from(u32::MAX)) as u32);
         let packed = firmware_common::pack_i16_high_aligned_le(&descriptor_scratch[..], &mut packed_descriptor.bytes[..]);
         if packed != DESCRIPTOR_BYTES {
             DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
@@ -566,12 +632,15 @@ pub fn underruns() -> u32 { UNDERRUNS.load(Ordering::Relaxed) }
 pub fn dma_errors() -> u32 { DMA_ERRORS.load(Ordering::Relaxed) }
 
 /// Staged descriptor bytes admitted by valid steady outer offers; wraps after roughly 6.8 hours.
+#[cfg(not(feature = "voice-bench"))]
 pub fn steady_available_bytes() -> u32 { STEADY_AVAILABLE_BYTES.load(Ordering::Relaxed) }
 
 /// Bytes accepted by constrained steady whole-descriptor `push_with` calls; wraps after roughly 6.8 hours.
+#[cfg(not(feature = "voice-bench"))]
 pub fn steady_written_bytes() -> u32 { STEADY_WRITTEN_BYTES.load(Ordering::Relaxed) }
 
 /// Number of constrained steady-state `push_with` calls, including error and short-write calls.
+#[cfg(not(feature = "voice-bench"))]
 pub fn steady_push_calls() -> u32 { STEADY_PUSH_CALLS.load(Ordering::Relaxed) }
 
 /// Publish an I2S construction or transfer-start failure from core 1.

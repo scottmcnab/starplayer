@@ -1367,6 +1367,7 @@ impl ItProcessor {
         if let Some(entry) = self.voices.get_mut(victim.index() as usize) {
             entry.release();
         }
+        context.voices.record_steal();
         context.voices.release(victim);
         context.trigger_channel(channel, tag, region, params, offset)
     }
