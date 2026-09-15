@@ -295,6 +295,11 @@ image reports 57 548 bytes of linked stack; web,lcd retains 56 116. These measur
 distinguish persistent future storage from temporary execution-stack usage: the prior
 PSRAM migration alone still overflowed core 0 when serving API requests.
 
+I10 raises each borrowed status-response buffer from 1,408 to 2,048 bytes so sixteen
+maximum-size channel rows and the measured-limit warning fit together. That adds 640 bytes
+to each worker future, making the current station pair 26,864 bytes in claim-only PSRAM;
+it does not consume internal DRAM or change the fixed 64 KiB network arena.
+
 I8d (2026-09-15) uses the previously unallocated PSRAM: a 64 KiB network arena,
 256 KiB decoder workspace, and three 1,288,872-byte buffers. Immutable timelines live
 in the image-buffer tail; atomics and fallible metadata remain in internal DRAM. The
@@ -769,7 +774,17 @@ probe reached the structured setup rejection; the next 64-channel/144-voice prob
 constructed and ran in all four modes, so timing rather than allocation determined the
 useful limits below. The production recommendation is two unfiltered voices for the web
 personality. Filtered playback has no verified web capacity at the required 20% timing
-headroom. The shipping 8/8 constants remain unchanged until owner acceptance.
+headroom. I10 subsequently selects a 64-channel/64-voice compact production engine. The
+allocation formula above puts that engine at **28,608 bytes** before the module sequencer
+and board allocations: 9,856 bytes above the former compact 8/8 engine. Channel admission
+and active voice capacity are separate: all native-width traditional modules have one
+voice per channel, while IT NNA activity beyond 64 simultaneous voices uses the established
+stealing policy. Modules above 11 declared channels keep playing but expose the
+measured-limit warning; eleven came from the audio-only unfiltered voice workload and is
+not an independent S3M channel certification.
+The I10 release links retain **55,940 bytes** of core-0 stack for `web` and **54,492
+bytes** for `web,lcd`, both above the 32 KiB linker floor. The `web,lcd` application
+image is **1,340,464 bytes (51.13%)** of the factory partition.
 
 | Personality | IT filter | Passing channels / voices | Adjacent rejection | Pass p50 / p95 / max µs | Minimum internal / external heap | Evidence |
 |---|---:|---:|---:|---:|---:|---|

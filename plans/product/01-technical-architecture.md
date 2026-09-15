@@ -904,6 +904,9 @@ event splitting and whole-quantum DSP remain the same. `Full` stays the default 
 fixed-path equivalence tests cover both an ordinary mix and a maximum-pool resonant mix
 that saturates a channel accumulator. On the measured embedded host the compact allocation
 is `17,344 + 168 × voices + 8 × channels` bytes with one-entry telemetry and scope taps off.
+M8-I10 applies that layout to the A1S web player with 64 channels and 64 voices. This
+admits every native tracker width and supplies one foreground voice per IT channel;
+additional IT NNA voices use the existing voice-stealing policy.
 
 **The nine fixed goldens did not move for it**, which is the claim the design rests on.
 Voices are still walked in slot order *within* a bus. Fixed `i32` saturating addition is

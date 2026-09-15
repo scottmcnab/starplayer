@@ -732,4 +732,32 @@ mod tests {
         let now = SystemTime::now();
         assert!(web_asset_is_stale(now, Some(now), true));
     }
+
+    #[test]
+    fn the_web_page_presents_and_hides_the_status_channel_warning() {
+        let page = include_str!("../../www/index.html");
+        assert!(page.contains("<p id=\"channel-warning\" hidden></p>"));
+        assert!(page.contains("channelWarningEl.textContent = status.channel_warning || '';"));
+        assert!(page.contains("channelWarningEl.hidden = !status.channel_warning;"));
+    }
+
+    #[test]
+    fn the_a1s_web_player_admits_the_full_native_width() {
+        let web = include_str!("../../boards/starplayer-a1s/src/web.rs");
+        let main = include_str!("../../boards/starplayer-a1s/src/main.rs");
+        assert!(web.contains("pub const PLAYBACK_CHANNEL_CAPACITY: usize = 64;"));
+        assert!(web.contains("pub const PLAYBACK_VOICE_CAPACITY: usize = 64;"));
+        assert!(!web.contains("8-channel playback limit"));
+        assert!(main.contains("layout: EngineLayout::MasterOnly"));
+    }
+
+    #[test]
+    fn the_a1s_initial_module_warns_after_either_successful_load_path() {
+        let main = include_str!("../../boards/starplayer-a1s/src/main.rs");
+        let capture = main.find("let initial_channel_count = module.header().channel_count;").unwrap();
+        let psram_branch = main[capture..].find("if web_boot.bridge.has_psram()").unwrap() + capture;
+        let warning = main[psram_branch..].find("web::print_channel_warning(initial_channel_count);").unwrap() + psram_branch;
+        let completed_branch = main[psram_branch..warning].find("control.load(module)").unwrap() + psram_branch;
+        assert!(capture < psram_branch && psram_branch < completed_branch && completed_branch < warning);
+    }
 }

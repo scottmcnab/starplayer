@@ -145,9 +145,7 @@ use starplayer::core::U0F16;
 #[cfg(not(feature = "bench"))]
 use starplayer::dsp::Linear;
 #[cfg(all(not(feature = "bench"), any(feature = "web", feature = "voice-bench")))]
-use starplayer::engine::EngineSettings;
-#[cfg(feature = "voice-bench")]
-use starplayer::engine::EngineLayout;
+use starplayer::engine::{EngineLayout, EngineSettings};
 #[cfg(all(not(feature = "bench"), not(feature = "engine-tone"), not(feature = "matched-tone"), not(feature = "swapped-tone"), not(feature = "reference-rate-tone")))]
 use starplayer::model::Module;
 #[cfg(not(feature = "bench"))]
@@ -640,12 +638,14 @@ async fn play(
         .map_err(|_| "this build cannot play that module")?;
     #[cfg(all(feature = "web", not(feature = "voice-bench")))]
     let (render, mut control) = {
+        let initial_channel_count = module.header().channel_count;
         let settings = EngineSettings {
             sample_rate_hz: OUTPUT_SAMPLE_RATE_HZ,
             channel_count: web::PLAYBACK_CHANNEL_CAPACITY,
             voice_capacity: web::PLAYBACK_VOICE_CAPACITY,
             scope_taps: false,
             telemetry_depth: 1,
+            layout: EngineLayout::MasterOnly,
             ..EngineSettings::default()
         };
         let (render, mut control) = EmbeddedPlayer::<Linear>::open_empty(OUTPUT_SAMPLE_RATE_HZ, settings)
@@ -655,6 +655,7 @@ async fn play(
         } else {
             control.load(module).map_err(|_| "this build cannot play the linked module")?;
         }
+        web::print_channel_warning(initial_channel_count);
         (render, control)
     };
     #[cfg(not(feature = "voice-bench"))]

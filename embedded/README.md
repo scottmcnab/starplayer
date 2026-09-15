@@ -774,8 +774,13 @@ Only small image index tables, processor state and the sequencer use internal DR
 allocation in replacement preparation is fallible, timeline tables live in the unused
 tail of the image buffer, and a replacement is refused if it would leave less than 8 KiB
 of internal heap free. A failed or cancelled request leaves the current playback intact.
-The web firmware supports up to eight channels and eight simultaneous voices; wider
-modules are refused with an explicit message.
+The web firmware admits the full 64-channel native tracker width and provides 64
+simultaneous voices through the compact master-only engine layout. Traditional formats
+therefore have one voice available per channel. IT New Note Action activity can need more
+than 64 simultaneous voices; when it does, the established voice-stealing policy applies.
+Modules declaring more than 11 channels remain playable and raise a persistent browser
+warning plus one UART warning when adopted, because 11 is the measured audio-only
+unfiltered voice limit rather than an independently certified S3M channel limit.
 Each image buffer has a preallocated DRAM `Arc` token; reuse waits until its strong and
 weak reference counts prove that the command queue, render engine and retired source have
 all released it. A timeout returns busy and never overwrites the buffer.
@@ -839,19 +844,22 @@ bounds, and all are easy to undo by accident:
 * **Routing is one flat `match`, and every JSON answer is one body type** (`web.rs`).
   picoserve monomorphises `write_to` per response type, and a `.route()` chain costs a
   stack frame per route. The first draft's two web workers were 97 KiB; the compact pair
-  is 25 584 bytes in PSRAM after I8c. Each worker retains one 1 408-byte response
+  is 26 864 bytes in PSRAM after I10. Each worker retains one 2 048-byte response
   buffer and passes a borrowed handle through the response code. This reduces the two
   largest nested request frames from 38 912 / 27 824 bytes to 8 496 / 2 992 bytes;
   putting future state in PSRAM alone did not bound execution-stack usage.
-* **The web engine has eight channels and eight voices, with scope sample rings disabled
-  and both scalar telemetry rings one snapshot deep.** Scalar status and WebSocket
-  telemetry remain available. This fixed width admits the five-channel owner fixture and
-  rejects wider modules explicitly instead of silently omitting their channels.
+* **The web engine has 64 channels and 64 voices, with master-only routing, scope sample
+  rings disabled and both scalar telemetry rings one snapshot deep.** Scalar status and
+  WebSocket telemetry remain available. The channel capacity admits every native tracker
+  width. The separate voice capacity covers one foreground voice per IT channel; additional
+  IT NNA voices use the normal stealing policy.
 
 `ld/stack-floor.x` fails the build if the main stack drops under 32 KiB. The exact linked
 core-0 stack is logged once at boot. The I8c links leave 57 548 bytes in `web` and 56 116
 bytes in `web,lcd`; default leaves 35 608 bytes and `lcd` leaves 34 200 bytes. If the
 assertion fires, shrink or move the new static — do not lower the floor.
+The I10 64/64 release links retain 55 940 bytes in `web` and 54 492 bytes in
+`web,lcd`, so both continue to clear that floor.
 
 ### A1S voice-capacity benchmark (M8-I9)
 
@@ -860,8 +868,9 @@ assertion fires, shrink or move the new static — do not lower the floor.
 5,333.33 µs deadline per descriptor. Its 20% headroom gate is 4,266 µs. The workload is
 a generated native instrument-mode IT module whose looping PCM and pattern data are
 borrowed from the claim-only PSRAM arena. The engine uses the explicit master-only
-layout, one-entry scalar telemetry and no scope rings. Normal `web` and `web,lcd` retain
-their shipping eight-channel/eight-voice settings. The benchmark reserves a fixed 32 KiB
+layout, one-entry scalar telemetry and no scope rings. Normal `web` and `web,lcd` use
+the compact 64-channel/64-voice settings selected in I10. The benchmark reserves a fixed
+32 KiB
 PSRAM image buffer whose maximum workload fit is host-tested. Module construction runs in
 a separate Embassy task after async main yields. Player allocation and the fallible
 timeline load run in a second separately-polled task; `StaticCell::init_with` constructs
@@ -971,8 +980,10 @@ The complete 2026-09-15 run and independent replay produced these reliable limit
 All accepted cases had zero deadline misses, underruns, DMA-error growth and engine
 warnings. The web result retained at least 61,568 bytes of internal heap, so CPU timing
 is the limiting resource. The measured production recommendation is two voices with IT
-filters disabled while the web personality is active. The normal firmware remains at
-eight channels/eight voices pending owner acceptance.
+filters disabled while the web personality is active. I10 deliberately selects a
+64-channel/64-voice production pool so all native widths load and each IT channel has one
+foreground voice available; the status/UI warning above 11 makes the measured timing limit
+visible without turning it into an admission limit.
 
 ## 7. Notes for the next person
 
@@ -1004,7 +1015,7 @@ eight channels/eight voices pending owner acceptance.
   full reasoning; M8-I6 inherits the constraint. I8's picoserve workers use direct,
   aligned monotonic arena claims instead: their task headers and every shared atomic stay
   in internal DRAM. A structural 64 KiB prefix holds one portal future (10 048 bytes) or
-  two station futures (25 584 bytes total); the remainder holds the decoder workspace and
+  two station futures (26 864 bytes total); the remainder holds the decoder workspace and
   three equal dynamic module buffers described above.
 * **The whole async audio driver and refill task run on core 1** — the refill moved there in
   M8-I5, and the driver construction followed after the hardware result above. M8-I3's write-up

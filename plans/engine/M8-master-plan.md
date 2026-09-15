@@ -60,7 +60,8 @@ config that worked, and its `provisioning.rs` is the captive portal I6 copies in
    uploaded at run time (I8d) are streamed and decoded directly into claim-only PSRAM
    buffers. PCM, native patterns and immutable timelines stay there; fallible metadata
    allocations and atomic reference counts remain in internal DRAM. PSRAM is never a
-   general heap. The web personality has an eight-channel/eight-voice playback limit.
+   general heap. The web personality uses the compact master-only layout with 64 channels
+   and 64 voices; IT NNA activity beyond that pool uses the established stealing policy.
 4. **The display takes the SD-card pin group** (HSPI: GPIO 14/13/15/2/4), so all six keys
    stay available for controls and the SD slot is unsupported. The display is a
    **build-time feature** (`lcd`), off by default, so the audio path is testable without it.
@@ -117,6 +118,7 @@ separate worktrees — I3 is the first consumer of both.
 | [I5](complete/M8-task-I5-buttons-and-display.md) | Six keys, ST7789 now-playing screen (`lcd` feature) | I3 | I4, I6 | Sonnet |
 | [I6](complete/M8-task-I6-web-control.md) | Captive portal, HTTP/WebSocket API, page, module upload | I3 | I4, I5 | Opus |
 | [I9](complete/M8-task-I9-a1s-voice-capacity-benchmark.md) | 48 kHz audible channel/voice bisection benchmark and compact log verifier | I8d | Complete | GPT-5.6-sol |
+| [I10](complete/M8-task-I10-a1s-wide-channel-admission.md) | Admit 64-channel/64-voice modules and warn above the measured threshold | I9 | Complete | GPT-5.6-sol |
 
 ## Exit criteria
 

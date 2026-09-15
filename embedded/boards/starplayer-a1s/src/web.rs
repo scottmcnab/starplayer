@@ -89,22 +89,29 @@ use crate::store::{SLOT_IMAGE_MAX_BYTES, SLOT_NAME_BYTES, Store};
 /// out of this rather than needing a counter of its own.
 pub const WEB_WORKER_COUNT: usize = 2;
 
-/// Fixed web-player capacity. Scope rings and deep telemetry history are disabled for
-/// this personality so these eight channels and voices fit the same internal-RAM budget.
-pub const PLAYBACK_CHANNEL_CAPACITY: usize = 8;
-pub const PLAYBACK_VOICE_CAPACITY: usize = 8;
+/// Fixed web-player capacity. Master-only routing, disabled scope rings and shallow
+/// telemetry keep the full native tracker width within the board's internal-RAM budget.
+pub const PLAYBACK_CHANNEL_CAPACITY: usize = 64;
+pub const PLAYBACK_VOICE_CAPACITY: usize = 64;
+
+/// Print the shared measured-limit warning once after a module is successfully adopted.
+pub fn print_channel_warning(channel_count: u8) {
+    if let Some(warning) = api::channel_warning(channel_count) {
+        println!("{warning}");
+    }
+}
 
 /// TCP receive and transmit buffers, per worker.
 const TCP_BUFFER_BYTES: usize = 1024;
 /// picoserve's own request buffer, per worker: large enough for any header block a
 /// browser sends.
 const HTTP_BUFFER_BYTES: usize = 1024;
-/// The largest JSON body this API answers with — the status, with sixteen channel rows.
+/// The largest JSON body this API answers with — the status, with sixteen channel rows
+/// and the wide-module warning.
 ///
-/// This is sized to the largest real answer rather than rounded up: sixteen channel rows
-/// of roughly seventy bytes plus a header of about two hundred. Each worker owns one of
-/// these buffers in its PSRAM-resident future and lends it to [`Body`] while writing.
-const BODY_BYTES: usize = 1408;
+/// Each worker owns one of these buffers in its PSRAM-resident future and lends it to
+/// [`Body`] while writing. Firmware-common tests the widest status against the same bound.
+const BODY_BYTES: usize = api::STATUS_RESPONSE_BYTES;
 
 /// Internal heap that must still be free after image adoption and playback preparation.
 const INTERNAL_HEAP_HEADROOM_BYTES: usize = 8 * 1024;
@@ -626,9 +633,10 @@ impl Bridge {
             Err(starplayer::core::Error::Resource(message)) => return JobOutcome::Failed(message),
             Err(_) => return JobOutcome::Failed("the module image is invalid or incompatible with this firmware"),
         };
-        if module.header().channel_count as usize > control.channel_capacity() {
-            return JobOutcome::Failed("the module has more than this firmware's 8-channel playback limit");
-        }
+        // `ControlHalf::try_prepare_load_in` retains the generic host-capacity guard. The
+        // A1S itself admits every native tracker width, so there is no board-specific
+        // width refusal here.
+        let channel_count = module.header().channel_count;
         let format = format_name(module.header().format);
         let Some(token) = self.modules.as_mut().and_then(|modules| modules.get_mut(slot)).and_then(Arc::get_mut) else {
             return JobOutcome::Failed("the previous module is still being released; try again");
@@ -689,6 +697,7 @@ impl Bridge {
         self.source = FixedStr::new(source);
         GENERATION.fetch_add(1, Ordering::Relaxed);
         let _ = control.play();
+        print_channel_warning(channel_count);
         JobOutcome::Done
     }
 

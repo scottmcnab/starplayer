@@ -44,6 +44,8 @@
 //! on — depends on `serde-json-core 0.6.0` and `heapless 0.8`; pinning here to the same
 //! versions means the workspace resolves one copy of each rather than two.
 
+use core::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 
 use starplayer::core::{AtEnd, U0F16};
@@ -67,6 +69,29 @@ pub const TELEMETRY_MAX_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_MAX_CH
 /// [`TELEMETRY_MAX_WORDS`] as bytes — the largest buffer [`pack_telemetry`] can ever fill,
 /// and the size a caller with no smaller module in mind can safely allocate once.
 pub const TELEMETRY_MAX_BYTES: usize = TELEMETRY_MAX_WORDS * 4;
+
+/// Declared channels above this measured A1S limit remain playable but warrant a warning.
+///
+/// M8-I9 measured eleven unfiltered voices in its audio-only workload. That is not a
+/// format-specific channel certification, so this number is presented as a tested limit
+/// rather than an admission limit.
+pub const MEASURED_CHANNEL_WARNING_THRESHOLD: u8 = 11;
+/// Fixed response budget for the largest status body: sixteen full channel rows plus a
+/// measured-limit warning for a wide module.
+pub const STATUS_RESPONSE_BYTES: usize = 2048;
+
+/// Build the warning shared by the status API, browser and headless UART log.
+pub fn channel_warning(channel_count: u8) -> Option<heapless::String<128>> {
+    if channel_count <= MEASURED_CHANNEL_WARNING_THRESHOLD {
+        return None;
+    }
+    let mut warning = heapless::String::new();
+    let _ = write!(
+        warning,
+        "This module declares {channel_count} channels. Playback continues, but this exceeds the tested limit of {MEASURED_CHANNEL_WARNING_THRESHOLD} channels."
+    );
+    Some(warning)
+}
 
 /// What the device knows that a [`Snapshot`] does not: the control half's own state.
 ///
@@ -301,6 +326,7 @@ pub struct Status<'a> {
     pub loops: bool,
     pub end_reached: bool,
     pub warned: bool,
+    pub channel_warning: Option<heapless::String<128>>,
     pub channels: heapless::Vec<StatusChannel<'a>, MAX_DISPLAY_CHANNELS>,
 }
 
@@ -338,6 +364,7 @@ impl<'a> Status<'a> {
             loops: view.loops,
             end_reached: view.end_reached,
             warned: view.warned,
+            channel_warning: channel_warning(view.channel_count),
             channels,
         }
     }
@@ -746,9 +773,68 @@ mod tests {
             json,
             "{\"title\":\"Ace\",\"format\":\"S3M\",\"source\":\"flash\",\"playing\":true,\"order\":1,\"pattern\":2,\
              \"row\":3,\"speed\":6,\"bpm\":125,\"volume\":65535,\"voices\":4,\"channel_count\":1,\"elapsed\":10,\
-             \"total\":20,\"peak\":200,\"loops\":true,\"end_reached\":false,\"warned\":false,\"channels\":\
+             \"total\":20,\"peak\":200,\"loops\":true,\"end_reached\":false,\"warned\":false,\"channel_warning\":null,\"channels\":\
              [{\"instrument\":2,\"note\":\"C-5\",\"vu\":8,\"effect\":\"vibrato\",\"active\":true}]}"
         );
+    }
+
+    #[test]
+    fn channel_warning_starts_above_the_measured_eleven_channel_limit() {
+        assert_eq!(channel_warning(11), None);
+        assert_eq!(
+            channel_warning(12).as_deref(),
+            Some("This module declares 12 channels. Playback continues, but this exceeds the tested limit of 11 channels.")
+        );
+    }
+
+    #[test]
+    fn status_json_exposes_the_current_modules_channel_warning() {
+        let host = HostState::default();
+        let mut view = distinctive_now_playing();
+        let mut buffer = [0u8; STATUS_RESPONSE_BYTES];
+
+        view.channel_count = 11;
+        let narrow_status = Status::new(&view, &host, "S3M", "upload");
+        let written = write_status_json(&mut buffer, &narrow_status).unwrap();
+        let narrow_json = core::str::from_utf8(&buffer[..written]).unwrap();
+        assert!(narrow_json.contains("\"channel_warning\":null"));
+        drop(narrow_status);
+
+        view.channel_count = 12;
+        let wide_status = Status::new(&view, &host, "S3M", "slot 2");
+        let written = write_status_json(&mut buffer, &wide_status).unwrap();
+        let wide_json = core::str::from_utf8(&buffer[..written]).unwrap();
+        assert!(wide_json.contains(
+            "\"channel_warning\":\"This module declares 12 channels. Playback continues, but this exceeds the tested limit of 11 channels.\""
+        ));
+    }
+
+    #[test]
+    fn widest_status_with_the_channel_warning_fits_the_fixed_response_budget() {
+        let mut view = distinctive_now_playing();
+        view.title = FixedStr::new("1234567890123456789012345678");
+        view.channel_count = 64;
+        view.channels.fill(ChannelRow {
+            instrument: u8::MAX,
+            note: *b"C#9",
+            vu: 16,
+            effect_name: "tone porta & volume slide",
+            active: true,
+        });
+        let host = HostState {
+            playing: true,
+            fading: true,
+            peak: i16::MAX,
+            output_frame: u64::MAX,
+            pending_garbage: u16::MAX,
+            module_generation: u32::MAX,
+            retired_collected: u32::MAX,
+            master_volume: U0F16::MAX,
+        };
+        let status = Status::new(&view, &host, "S3M", "1234567890123456");
+        let mut buffer = [0u8; STATUS_RESPONSE_BYTES];
+        let written = write_status_json(&mut buffer, &status).expect("the widest A1S status must fit its response buffer");
+        assert!(written <= STATUS_RESPONSE_BYTES);
     }
 
     #[test]

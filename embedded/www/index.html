@@ -107,6 +107,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 
 .store-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .warn { margin-top: 8px; color: var(--accent-2); font-size: 12px; }
+#channel-warning { margin: 0; padding: 10px 12px; border: 1px solid var(--accent-2); border-radius: 7px; color: var(--accent-2); }
 #store-status { margin-top: 6px; color: var(--muted); font-size: 12px; }
 
 @media (max-width: 460px) {
@@ -125,6 +126,8 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 </header>
 
 <main>
+    <p id="channel-warning" hidden></p>
+
     <section class="panel transport">
         <button id="btn-prev" title="Previous">&#9198;</button>
         <button id="btn-play" title="Play / pause">&#9654;</button>
@@ -222,6 +225,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
     var posElapsedEl = document.getElementById('pos-elapsed');
     var posTotalEl = document.getElementById('pos-total');
     var posVoicesEl = document.getElementById('pos-voices');
+    var channelWarningEl = document.getElementById('channel-warning');
     var channelBodyEl = document.getElementById('channel-body');
     var moduleListEl = document.getElementById('module-list');
     var uploadFileEl = document.getElementById('upload-file');
@@ -438,6 +442,8 @@ button:disabled { opacity: .4; cursor: not-allowed; }
         }).then(function (status) {
             moduleTitleEl.textContent = status.title || '(untitled)';
             moduleFormatEl.textContent = status.format || '';
+            channelWarningEl.textContent = status.channel_warning || '';
+            channelWarningEl.hidden = !status.channel_warning;
             effectNames = (status.channels || []).map(function (channel) { return channel.effect || ''; });
         }).catch(function () { /* device unreachable this tick; keep showing the last known state */ });
     }
