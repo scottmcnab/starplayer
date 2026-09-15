@@ -521,7 +521,7 @@ pub async fn push_with(&mut self, f: impl FnOnce(&mut [u8]) -> usize) -> Result<
 `push_with` is therefore the only call that can rescue the accounting once `available()` has
 gone `Late`, because handing one descriptor back to the DMA is what un-sticks it.
 
-**`refill_task` currently cannot reach that call in the state where it is needed:**
+The original refill could not reach that call in the state where it was needed:
 
 ```rust
 match transfer.available().await {
@@ -537,21 +537,57 @@ saw precisely this on the board: its transport wedged with its block counter fro
 and its overrun counter climbing by ~650 000/s, and the fix that made audio flow for
 901 544 consecutive blocks was to reach `push_with` anyway.
 
-**Recommended remediation — not applied here**, because this firmware has not been bench-run
-and a blind change to an untested audio path is worse than a documented hazard:
+The startup remediation and later fixed-descriptor work applied the underlying `push_with`
+behavior, but initially left one steady-state error branch with the same permanent exclusion.
+The owner's `unreal.s3m` reproduced it under web-firmware load at order 0, pattern 5, row 32:
+playback position and `offered`, `written` and `pushes` froze, the control task kept logging, and
+`dma_errors` rose from 133 through 3,569 at about 190/s. The file had reached seven active voices;
+this exceeded the measured web-firmware capacity, but overload should cause temporary audible
+breakup rather than wedge the transport.
 
-1. In `refill_task`, do not `continue` on `Err`: count it and **fall through to `push_with`**,
-   which is the call that can recover. Keep the counter, so a transient error is still visible.
-2. Consider priming the transfer with one or more `push_with` calls of silence before the
-   steady loop begins, which is what Star FX ended up doing (`Transport::begin`) — it brings
-   the accounting good before the first real block is due.
-3. A backstop is worth having whatever else is done: Star FX has a continuous-`Late` reset backstop and prints reset reasons.
-   Its current constant is `4_000 * 240_000` cycles: **4 seconds at 240 MHz**, not the
-   20 ms claimed by its stale comment. Neither 20 ms nor a 300 ms reboot is a verified
-   requirement for this player.
+The first proposed steady fix tried to classify an outer availability error as a recovery handoff.
+Reading the complete esp-hal 1.1.2 sequence shows why that cannot work:
+
+```rust
+let _avail = self.available().await; // a second availability check happens before the closure
+Ok(self.state.push_with(f)?)
+```
+
+An external `available()` which finds every descriptor CPU-owned clears EOF and returns `Late`
+before adding any bytes, leaving `state.available == 0`. Calling async `push_with` afterward enters
+its own `available()` and can await forever because EOF was cleared and no DMA-owned descriptor
+remains to produce another completion. Its closure is never reached. A zero-byte closure would not
+be a sound fallback anyway: `TxCircularState::push_with` advances its descriptor pointer even for
+zero bytes but leaves its byte offset and availability unchanged, breaking the paired geometry and
+failing to create writable capacity.
+
+The implemented fix reserves before rendering. The explicit outer `available()` first validates
+at least one aligned 2,048-byte descriptor, leaving those bytes in `state.available`. Only then does
+StarPlayer render and pack one descriptor. It calls constrained `push_with` immediately afterward,
+with no log or other await in between. If DMA drains during that expensive render, `push_with`'s
+inner `available()` can return and discard `Late`, but the earlier 2,048-byte reservation remains;
+`state.push_with` therefore receives a complete destination, copies exactly one descriptor and
+advances its descriptor pointer and byte offset together. An external availability error retries
+before rendering. A failed or unexpected short handoff retains and retries the staged descriptor
+without another render. No partial descriptor, recovery silence, second render, allocation, lock,
+log, panic or timed delay was added to the refill path.
+
+This is deliberately a prevention within the pinned public API, not a claim that arbitrary
+zero-reservation `Late` is recoverable. If the physical ring has already lost every DMA-owned
+descriptor before the outer reservation exists, the async wrapper exposes neither a working
+handoff nor a stop/rebuild operation. Hardware acceptance must establish that reserving before
+the expensive render prevents the observed `unreal.s3m` failure. If it does not, a follow-up needs
+an esp-hal surface change or an explicit device-reset policy rather than another retry loop.
+
+Owner hardware acceptance remains open: upload `unreal.s3m`, play beyond pattern 5 row 32, and
+verify playback time plus `offered`, `written` and `pushes` continue advancing after any late
+event. Temporary distortion is acceptable. A frozen row or permanently rising error-only loop is
+not. This change deliberately adds no voice ceiling and makes no clean-audio claim above the
+measured web-firmware capacity.
 
 Note the asymmetry that makes this survivable on the transmit side and fatal on the receive
-side: a **transmit** `Late` is recoverable exactly as above, but a **receive** `Late` is
+side: a **transmit** `Late` discovered by `push_with` while bytes remain reserved is recoverable
+as above, but an external zero-reservation `Late` is not. A **receive** `Late` is
 terminal in this `esp-hal` version — `RxCircularState::update` keeps returning it once it has
 wrapped, and `pop` begins with `available().await?`, so nothing can hand the descriptors
 back and the async circular type never gives up its `I2sRx` to be rebuilt. This firmware is

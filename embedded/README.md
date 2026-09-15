@@ -331,11 +331,11 @@ That reference image passed its objective run and the owner heard no buzzing at 
 audible change on KEY1. Production A1S output therefore adopts 48 kHz. Normal music is the final
 listening check; the controlled historical diagnostic rates remain unchanged.
 
-The same run confirmed the DMA remediation from
+The same run confirmed the startup DMA remediation from
 `plans/engine/complete/M8-task-I3a-dma-refill-remediation.md`: an `available()` error is counted and the
-refill falls through to `push_with`, which can recover the descriptor accounting. A fixed
-startup `dma_errors` count identifies a recovered transient; a count that keeps climbing still
-means the transport is unhealthy. A second run showed that recovery alone did not establish a
+muted pre-roll still reaches `push_with`, which can recover the descriptor accounting. A fixed
+startup `dma_errors` count identifies a recovered transient. A second run showed that recovery
+alone did not establish a
 steady lead: music had the right pitch but was heavily gated, and song time advanced at about
 half wall speed with both counters still zero. A real-audio pre-roll in core 0 then tripped the
 ProCpu stack guard. Replacing its closure with silence still panicked: the exact backtrace ended
@@ -393,19 +393,19 @@ The first staged-descriptor image used plain async `push`, but two fresh resets 
 `PLAY` and before the first telemetry line. Its internal second `available()` remained a fallible
 gap even though rendering and packing had moved before the explicit outer check.
 
-Steady refill therefore renders and packs exactly one 2 048-byte descriptor into a static `i16`
-render buffer and a fixed boxed byte buffer before waiting for space, then preserves those bytes
-across every availability or handoff failure. The byte buffer is allocated once inside audio
+Steady refill therefore reserves one valid whole-descriptor offer, then renders and packs exactly
+one 2 048-byte descriptor into a static `i16` render buffer and a fixed boxed byte buffer. The byte
+buffer is allocated once inside audio
 start, after `EmbeddedPlayer::open` and before DMA construction or prefill; ownership moves through
 `AudioTransfer` into refill, where it is never allocated, resized or freed. Its explicit outer
-`available()` validates and counts a whole-descriptor offer; the following `push_with` is
-immediate, with no rendering, packing, logging or other await in between. The closure copies and
+`available()` validates and counts a whole-descriptor offer before rendering. The following
+`push_with` is immediate after render and pack, with no logging or other await in between. The
+closure copies and
 returns exactly the first staged 2 048 bytes, even when its contiguous offer contains two
 descriptors. This differs from the rejected steady closure, which rendered and consumed every
 offered descriptor and commonly batched the 512-frame cadence exposed by the recording. Fixed
-one-descriptor work keeps the write offset and descriptor pointer advancing together. The engine
-advances only after the handoff reports exactly 2 048 bytes; errors or short offers retry the same
-staged data.
+one-descriptor work keeps the write offset and descriptor pointer advancing together. A failed or
+short handoff retries the same staged data without rendering again.
 
 The packed buffer was previously another `ConstStaticCell`. Its 2 048 bytes enlarged `.bss` and
 reduced ProCpu's main stack enough that the constrained-handoff matched-tone image tripped the
@@ -413,13 +413,52 @@ stack guard inside `EmbeddedPlayer::open`, before `HEAP after open`. Allocating 
 after open consumes the heap region already reserved by `HEAP_BYTES`; it does not move `_bss_end`
 or reduce main-stack address space. Allocation is fallible and reported as an audio-start error.
 
-Both startup recovery and steady state use `push_with`, for distinct reasons. The eight muted
-startup closures deliberately return descriptor ownership through `Late` and may receive an empty
-offer. The steady closure runs only after a valid outer offer and has a strict one-descriptor copy
-and complete-descriptor invariant. The cumulative transport fields `offered`, `written` and `pushes`
-count one staged descriptor per valid outer offer, bytes accepted by the constrained handoff, and
-steady calls, excluding muted pre-roll. Counting only the descriptor being submitted prevents a
-second free descriptor from being counted again on the next iteration.
+Both startup and steady state use `push_with`, for distinct reasons. The eight muted startup
+closures call it directly so its own availability check can discard an initial `Late`; a separate
+outer check could clear EOF first and prevent the recovery closure from running. Steady closures
+follow a valid outer reservation and have a strict one-descriptor copy and complete-descriptor
+invariant. The cumulative transport fields `offered`, `written` and `pushes` count one staged
+descriptor per valid outer reservation, bytes accepted by the constrained handoff, and all steady
+calls, excluding muted pre-roll. Counting only the descriptor being submitted prevents a second
+free descriptor from being counted again on the next iteration.
+
+### Steady late-DMA recovery under overload
+
+The owner's `unreal.s3m` web-firmware run exceeded its render deadline at order 0, pattern 5,
+row 32. The control task and once-per-second log remained alive, but playback position and
+`offered`, `written` and `pushes` froze while `dma_errors` rose from 133 through 3,569 at about
+190 errors per second. This was not a reset or invalid module data: the steady refill's
+`available()` error arm retried `available()` forever and therefore excluded the only operation
+which could return a descriptor to DMA.
+
+The pinned HAL rules out calling `push_with` after that external error. `available()` has already
+cleared EOF and returned `Late` with `TxCircularState::available == 0`; `push_with` immediately
+calls `available()` again and can await forever before reaching its closure because no descriptor
+is DMA-owned. Even a hypothetical zero-byte kick would advance the descriptor pointer without the
+byte offset and would not replenish `available`.
+
+The refill now prevents that zero-reservation recovery state by moving the explicit availability
+check before rendering. A valid whole-descriptor result reserves 2,048 bytes in the HAL state.
+Rendering and packing occur against that reservation, followed immediately by the constrained
+`push_with`. If expensive rendering drains the physical ring, `push_with`'s internal availability
+check can report and discard `Late` while the earlier reservation remains available, so the
+closure still copies exactly 2,048 bytes and returns the corresponding descriptor. External
+availability errors retry without rendering. Failed or unexpected short handoffs preserve the
+staged descriptor and retry it without advancing the engine again. No padding, partial handoff,
+allocation, logging, lock, panic or timed delay was added.
+
+This ordering prevents a late handoff only while the outer reservation was acquired before the
+physical ring fully drained. esp-hal's public async I2S transfer cannot stop/rebuild itself or
+recover an arbitrary `Late` which already has zero bytes reserved. That pinned-HAL boundary is why
+the `unreal.s3m` hardware run below remains acceptance rather than a result inferred from host
+tests. If the observed workload still reaches zero-reservation `Late`, the follow-up must change
+the HAL surface or define a device-reset policy; neither is hidden inside this patch.
+
+Owner hardware acceptance remains required: upload `unreal.s3m`, pass pattern 5 row 32, and
+confirm playback time and the descriptor counters continue advancing after a late event.
+Temporary audible breakup is acceptable at a load above the measured web-firmware capacity; a
+frozen row or a permanently rising error-only loop is not. This prevention does not add a production
+voice ceiling or promise clean playback above the measured limit.
 
 ### What a good boot looks like
 
