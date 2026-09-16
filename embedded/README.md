@@ -414,10 +414,9 @@ after open consumes the heap region already reserved by `HEAP_BYTES`; it does no
 or reduce main-stack address space. Allocation is fallible and reported as an audio-start error.
 
 Both startup and steady state use `push_with`, for distinct reasons. The eight muted startup
-closures call it directly so its own availability check can discard an initial `Late`; a separate
-outer check could clear EOF first and prevent the recovery closure from running. Steady closures
-follow a valid outer reservation and have a strict one-descriptor copy and complete-descriptor
-invariant. The cumulative transport fields `offered`, `written` and `pushes` count one staged
+closures call it directly so its own availability check can discard an initial `Late`. Steady
+closures follow a valid outer reservation and have a strict one-descriptor copy and
+complete-descriptor invariant. The cumulative transport fields `offered`, `written` and `pushes` count one staged
 descriptor per valid outer reservation, bytes accepted by the constrained handoff, and all steady
 calls, excluding muted pre-roll. Counting only the descriptor being submitted prevents a second
 free descriptor from being counted again on the next iteration.
@@ -431,34 +430,53 @@ row 32. The control task and once-per-second log remained alive, but playback po
 `available()` error arm retried `available()` forever and therefore excluded the only operation
 which could return a descriptor to DMA.
 
-The pinned HAL rules out calling `push_with` after that external error. `available()` has already
-cleared EOF and returned `Late` with `TxCircularState::available == 0`; `push_with` immediately
-calls `available()` again and can await forever before reaching its closure because no descriptor
-is DMA-owned. Even a hypothetical zero-byte kick would advance the descriptor pointer without the
-byte offset and would not replenish `available`.
+A first attempt moved the explicit availability check *before* rendering, so that rendering and
+packing happened against a held reservation. Hardware rejected it twice: it did not stop the
+`unreal.s3m` wedge, and it never played `REFLEX.S3M` cleanly either, because holding a reservation
+across the render spends ring lead on every cycle and the same change dropped the pre-roll's
+explicit `available()`. The steady loop is back to the arrangement that soaked two minutes at
+`underruns=0` — render and pack one descriptor, hold it until a whole-descriptor offer, then hand
+it over with nothing in between — and only the error arm is new.
 
-The refill now prevents that zero-reservation recovery state by moving the explicit availability
-check before rendering. A valid whole-descriptor result reserves 2,048 bytes in the HAL state.
-Rendering and packing occur against that reservation, followed immediately by the constrained
-`push_with`. If expensive rendering drains the physical ring, `push_with`'s internal availability
-check can report and discard `Late` while the earlier reservation remains available, so the
-closure still copies exactly 2,048 bytes and returns the corresponding descriptor. External
-availability errors retry without rendering. Failed or unexpected short handoffs preserve the
-staged descriptor and retry it without advancing the engine again. No padding, partial handoff,
-allocation, logging, lock, panic or timed delay was added.
+The wedge itself is what the error arm addresses. Once wedged, the device stayed silent for every
+later module, including the built-in `REFLEX.S3M`, until reset. `update` returns `Late` whenever
+its walk finds every descriptor CPU-owned, and it reports success only once one is DMA-owned
+again, which only the refill can arrange. Retrying the check was the wedge, not a recovery from
+it.
 
-This ordering prevents a late handoff only while the outer reservation was acquired before the
-physical ring fully drained. esp-hal's public async I2S transfer cannot stop/rebuild itself or
-recover an arbitrary `Late` which already has zero bytes reserved. That pinned-HAL boundary is why
-the `unreal.s3m` hardware run below remains acceptance rather than a result inferred from host
-tests. If the observed workload still reaches zero-reservation `Late`, the follow-up must change
-the HAL surface or define a device-reset policy; neither is hidden inside this patch.
+The error arm now hands a descriptor back instead. `push_with` after an external `Late` does reach
+its closure: every circular descriptor carries `suc_eof`, so EOF returns at the descriptor rate —
+187.5/s at 48 kHz, the ~190/s the wedge logged — and the inner `update` returns `Late` by value
+rather than awaiting. `push_with` discards it and runs the closure against a zero-length region;
+returning 0 still hands one descriptor back, which is exactly what breaks `update`'s ownership
+walk so the next check can credit the bytes that are free in hardware but read as 0 in
+`state.available`.
 
-Owner hardware acceptance remains required: upload `unreal.s3m`, pass pattern 5 row 32, and
-confirm playback time and the descriptor counters continue advancing after a late event.
-Temporary audible breakup is acceptable at a load above the measured web-firmware capacity; a
-frozen row or a permanently rising error-only loop is not. This prevention does not add a production
-voice ceiling or promise clean playback above the measured limit.
+**One descriptor, and only on a proven run of `Late`.** A first attempt handed back a whole ring,
+on the geometry argument that three kicks walk esp-hal's descriptor pointer back into step with
+its write offset. That ignored `state.available`, which a zero-byte handoff does not consume: the
+HAL was left believing a ring was writable while the DMA owned all of it. The 2026-09-16 hardware
+run was unambiguous — `REFLEX.S3M`, clean at `underruns=0` in the previous build, degraded audibly
+and logged about four ring-empty events a second. What triggered it was a single harmless startup
+transient, the constant `dma_errors=1` the clean build's log had always carried, being mistaken
+for a `Late`. The refill now matches `Error::DmaError(DmaError::Late)` specifically, retries
+everything else, and recovers only after `LATE_RECOVERY_THRESHOLD` (8) consecutive `Late` results
+— about 43 ms, an evidence bar no transient reaches. The engine does not advance to manufacture
+recovery audio, and no padding, partial handoff, allocation, logging, lock, panic or timed delay
+was added.
+
+A `Late` run adds one `dma_errors` per failed check, plus one `underruns` and one `pushes` per
+recovery. `dma_errors` climbing alone is the wedge signature; `underruns` tracking `dma_errors`
+one-for-one is the signature of the disproved ring recovery.
+
+Owner hardware acceptance remains required: upload `unreal.s3m`, pass pattern 5 row 32, confirm
+playback time and the descriptor counters continue advancing after a late event, and confirm that
+switching back to `REFLEX.S3M` still plays. Confirm first that `REFLEX.S3M` on its own is
+unchanged from the clean build — `underruns=0` and a fixed `dma_errors` — since the previous
+attempt regressed exactly there. Temporary audible breakup is acceptable at a load
+above the measured web-firmware capacity; a frozen row or a permanently rising error-only loop is
+not. This recovery does not add a production voice ceiling or promise clean playback above the
+measured limit.
 
 ### What a good boot looks like
 

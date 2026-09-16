@@ -56,7 +56,7 @@ pub mod voice_bench;
 
 pub use api::{HostState, Status, Upload, decode_wire_command, pack_telemetry};
 pub use bench::{BenchRow, CycleCounter, Kernel, PcmLocation, digest_row};
-pub use dma_refill::{AvailabilityDecision, WriteDecision, decide_availability, decide_write};
+pub use dma_refill::{AvailabilityDecision, AvailabilityError, WriteDecision, decide_availability, decide_write};
 pub use keys::{HOLD_REPEAT_INTERVAL_MS, HOLD_THRESHOLD_MS, Key, KeyDebounce, KeyEvent, KeyEvents};
 pub use memory::PsramLayout;
 pub use now_playing::{ChannelRow, FixedStr, MAX_DISPLAY_CHANNELS, NowPlaying};

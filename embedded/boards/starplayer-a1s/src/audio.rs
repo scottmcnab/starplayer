@@ -5,9 +5,9 @@
 //! One I2S transmitter, Philips 32-bit stereo at the board-selected output rate, MCLK out on
 //! GPIO0, feeding a **circular** DMA transfer over a `'static` ring of [`DMA_RING_QUANTA`]
 //! render quanta.
-//! The refill is an Embassy task that reserves DMA space, renders and packs one complete
-//! [`DESCRIPTOR_BYTES`] block into static scratch, and submits those staged bytes through a
-//! constrained one-descriptor `push_with` closure.
+//! The refill is an Embassy task that renders and packs one complete [`DESCRIPTOR_BYTES`] block
+//! into static scratch, awaits DMA space, and submits those staged bytes through a constrained
+//! one-descriptor `push_with` closure.
 //!
 //! The `chunk` argument to `dma_circular_buffers_chunk_size!` decides how many descriptors are
 //! *allocated*, but `DescriptorChain::new` hardcodes esp-hal's own 4 092-byte `CHUNK_SIZE`.
@@ -28,12 +28,11 @@
 //! 44.1 kHz diagnostics retain their 352 800 B/s rate. See
 //! `plans/reference/embedded-budget.md` §4a for the underlying esp-hal and Star FX analysis.
 //!
-//! Steady refill reserves one valid whole-descriptor offer **before** rendering. If that render
-//! drains the ring, the following `push_with` sees and discards its internal `Late` while the
-//! earlier 2 048-byte reservation remains in esp-hal's state, so it can still copy the complete
-//! staged descriptor and return ownership. Calling `push_with` only after an external
-//! `available()` error cannot do this: that check already cleared EOF with zero bytes reserved,
-//! leaving `push_with` able to await forever before its closure runs.
+//! Staging before the offer, and letting nothing come between the offer and the handoff, is the
+//! arrangement hardware soaked clean; the reverse was tried twice and failed both times. If the
+//! ring drains completely, `available()` reports `Late` and goes on reporting it until the CPU
+//! gives a descriptor back; after a run of them long enough to rule out a transient, the refill
+//! hands back one zero-byte descriptor and resumes. See [`refill_task`] for the full sequence.
 //!
 //! With the board-only `tone`, `matched-tone`, `swapped-tone` or `reference-rate-tone` feature,
 //! the renderer still advances normally and an integer diagnostic sine replaces each output quantum
@@ -219,14 +218,18 @@ pub const TX_PRIME_HANDOFFS: usize = 8;
 
 /// How many times the refill found the ring completely empty.
 ///
-/// Written only by the refill (which may not log) and read by the control task. `Relaxed`
-/// is right: it is a diagnostic counter with no other memory it orders.
+/// Counts a whole-ring offer, and one per `Late` recovery — the same event seen one descriptor
+/// later, when the DMA has replayed everything and owns nothing. A `Late` run therefore adds one
+/// here and one per failed check to `DMA_ERRORS`, so the two stay far apart and a wedge is
+/// legible. Written only by the refill (which may not log) and read by the control task.
+/// `Relaxed` is right: it is a diagnostic counter with no other memory it orders.
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 
 /// How many times a DMA operation failed or a steady offer/write violated descriptor geometry.
 ///
-/// A steady availability error is counted and retried before rendering. Late recovery happens
-/// inside `push_with` while a prior whole-descriptor reservation is still held.
+/// A `Late` run adds one per failed check, as it always has, and `underruns` and `pushes` each
+/// gain one when the run is long enough to be recovered. This counter climbing *alone*, with
+/// `underruns` and `pushes` frozen, is the wedge signature.
 static DMA_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Cumulative staged descriptor bytes admitted by valid normal steady outer offers.
@@ -239,7 +242,7 @@ static STEADY_AVAILABLE_BYTES: AtomicU32 = AtomicU32::new(0);
 static STEADY_WRITTEN_BYTES: AtomicU32 = AtomicU32::new(0);
 
 /// Cumulative constrained steady-state `push_with` calls, including internally recovered late,
-/// error and short-write calls.
+/// error, short-write and zero-byte ownership-recovery calls.
 static STEADY_PUSH_CALLS: AtomicU32 = AtomicU32::new(0);
 
 /// Descriptor render timing, updated only by core 1 and formatted only by core 0.
@@ -541,47 +544,63 @@ fn render_descriptor(destination: &mut [i16; DESCRIPTOR_SAMPLES], render: &mut R
 /// error also kept that event out of the counters.
 ///
 /// A staged plain `push` still failed immediately after `PLAY`: its internal second
-/// `available()` remained a fallible gap even with rendering moved before the outer check.
-/// Steady state therefore reserves a whole-descriptor offer before rendering and packing exactly
-/// one descriptor into static scratch, then immediately uses `push_with` only to copy and return
-/// that one descriptor. Unlike the rejected variable-region closure, it never renders or consumes
-/// a second descriptor. The write offset and descriptor pointer consequently advance together.
-/// See
+/// `available()` remained a fallible gap. Steady state therefore renders and packs exactly one
+/// descriptor into static scratch, preserves it until a whole-descriptor offer, then immediately
+/// uses `push_with` only to copy and return that one descriptor. Unlike the rejected
+/// variable-region closure, it never renders or consumes a second descriptor. The write offset
+/// and descriptor pointer consequently advance together. See
 /// `plans/reference/embedded-budget.md` §4a for the esp-hal source analysis and Star FX evidence.
 ///
 /// # Steady late recovery
 ///
 /// A production web run of `unreal.s3m` exhausted the render budget at order 0, pattern 5,
 /// row 32. `offered`, `written`, `pushes` and playback position froze while `dma_errors` rose
-/// about 190/s: the steady availability error arm permanently excluded `push_with`.
+/// about 190/s, and the device stayed silent for every later module — including the built-in
+/// `REFLEX.S3M` — until reset. The steady availability error arm retried for ever and so never
+/// reached the only operation that can return a descriptor to the DMA.
 ///
-/// The first proposed fix attempted `push_with` after the external error, but the pinned HAL makes
-/// that path unable to reach its closure: `TxCircularState::update` clears EOF, returns `Late` with
-/// `available == 0`, then `push_with` calls `available()` again and can await forever because no
-/// descriptor is DMA-owned. A zero-byte ownership kick would also advance esp-hal's descriptor
-/// pointer without its byte offset and would not replenish `available`.
+/// `update` returns `Late` whenever its walk finds every descriptor owned by the CPU, and it
+/// reports success only once one is DMA-owned again, which only this task can arrange. Retrying
+/// is therefore the wedge, not a recovery from it.
 ///
-/// Instead, the outer availability check now runs before rendering. A valid result leaves at least
-/// 2 048 bytes reserved in `TxCircularState::available`. No await occurs between the subsequent
-/// render/pack and `push_with`. If DMA becomes late during that expensive work, `push_with`'s
-/// internal check can return `Late`, discard it, and still copy the complete staged descriptor
-/// against the retained reservation. The descriptor pointer and byte offset therefore advance
-/// together. External availability errors retry without rendering; failed or short handoffs retry
-/// the same staged descriptor without advancing the engine again.
+/// `push_with` after that error *does* reach its closure. Every circular descriptor carries
+/// `suc_eof`, so the EOF the outer check cleared returns at the descriptor rate — about 190/s at
+/// 48 kHz, exactly the rate the wedge logged — and the inner `update` returns `Late` by value
+/// rather than awaiting. `push_with` discards it and runs the closure against a zero-length
+/// region; returning 0 still hands one descriptor back.
 ///
-/// This is prevention within esp-hal's public API, not recovery from arbitrary complete lead
-/// exhaustion. If all descriptor ownership is already lost before a reservation exists, the
-/// async transfer exposes neither a usable zero-reservation handoff nor a stop/rebuild operation.
-/// The owner hardware run must prove this ordering prevents the `unreal.s3m` failure; a remaining
-/// zero-reservation `Late` would require a HAL change or a separate reset policy.
+/// Recovery hands back **exactly one**. In the `Late` state all three are free in hardware but
+/// `state.available` reads 0, because `update` returned before crediting anything and only
+/// `update` can credit it. One returned descriptor is precisely what breaks its ownership walk,
+/// after which the next check credits the free bytes and the steady loop resumes. A zero-byte
+/// handoff consumes nothing from `state.available`, so a *ring* of them leaves the HAL believing
+/// a whole ring is writable while the DMA owns all of it — a build which did that turned a clean
+/// `REFLEX.S3M` into about four ring-empty events a second with audibly degraded playback.
+///
+/// Recovery also waits for [`firmware_common::LATE_RECOVERY_THRESHOLD`] consecutive `Late`
+/// results and treats every other error as a plain retry. Perturbing the ring is the expensive
+/// mistake, so it happens only on evidence no transient can produce.
+///
+/// # What hardware has rejected here
+///
+/// Two builds tried to reserve a whole-descriptor offer *before* rendering, on the theory that a
+/// `Late` arising during the render would be absorbed by `push_with` against the retained
+/// reservation. Neither ever played `REFLEX.S3M` cleanly. Holding a reservation across the render
+/// spends ring lead on every cycle, and the reordering also dropped the pre-roll's explicit
+/// `available()`. The arrangement above — render, pack, *then* offer, with nothing between the
+/// offer and the handoff — is the one that soaked two minutes at `underruns=0`, and it is
+/// restored unchanged. Only the error arm is new.
 #[embassy_executor::task]
 pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<Linear>) {
     let AudioTransfer { mut transfer, mut output_override, mut packed_descriptor } = audio;
-    // Match Star FX's soaked start-up sequence. Call `push_with` directly: a separate external
-    // `available()` could clear a `Late` EOF with no reservation and leave this call awaiting
-    // forever before its recovery closure. An early offer may be empty; every non-empty offer
-    // becomes silence. Keep render and fill out of this loop so pre-roll needs no render scratch.
+    // Match Star FX's soaked start-up sequence. The explicit `available()` keeps any initial
+    // `Late` visible, while `push_with` ignores its own `available()` error and hands a
+    // descriptor back anyway. An early offer may be empty; every non-empty offer becomes
+    // silence. Keep render and fill out of this loop so pre-roll needs no render scratch.
     for _ in 0..TX_PRIME_HANDOFFS {
+        if transfer.available().await.is_err() {
+            DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
         if transfer
             .push_with(|destination| {
                 destination.fill(0);
@@ -599,21 +618,11 @@ pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<L
     let descriptor_scratch = DESCRIPTOR_SCRATCH.take();
     STARTUP_STATE.store(STARTUP_READY, Ordering::Release);
 
-    loop {
-        let available = transfer.available().await.ok();
-        match firmware_common::decide_availability(available, DESCRIPTOR_BYTES, DMA_RING_BYTES) {
-            firmware_common::AvailabilityDecision::Retry => {
-                DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            firmware_common::AvailabilityDecision::RenderReserved { underrun } => {
-                if underrun {
-                    UNDERRUNS.fetch_add(1, Ordering::Relaxed);
-                }
-                STEADY_AVAILABLE_BYTES.fetch_add(DESCRIPTOR_BYTES as u32, Ordering::Relaxed);
-            }
-        }
+    // The unbroken run of `Late` results ending at the current check. Only a run long enough to
+    // rule out a transient may perturb the ring; see `firmware_common::LATE_RECOVERY_THRESHOLD`.
+    let mut consecutive_late: u32 = 0;
 
+    loop {
         #[cfg(feature = "voice-bench")]
         let render_started = esp_hal::time::Instant::now();
         render_descriptor(descriptor_scratch, render, &mut output_override);
@@ -622,13 +631,53 @@ pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<L
         let packed = firmware_common::pack_i16_high_aligned_le(&descriptor_scratch[..], &mut packed_descriptor.bytes[..]);
         if packed != DESCRIPTOR_BYTES {
             DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
 
         loop {
-            // Keep this handoff immediately after the reserved render and pack. `push_with`
-            // discards its own availability error while retaining the outer reservation, then
-            // exposes the current contiguous region; no log or other await may intervene. Even
-            // if two descriptors are free, copy and return only this one staged block.
+            let available = match transfer.available().await {
+                Ok(bytes) => Ok(bytes),
+                Err(esp_hal::i2s::master::Error::DmaError(esp_hal::dma::DmaError::Late)) => Err(firmware_common::AvailabilityError::Late),
+                Err(_) => Err(firmware_common::AvailabilityError::Transient),
+            };
+            consecutive_late = match available {
+                Err(firmware_common::AvailabilityError::Late) => consecutive_late.saturating_add(1),
+                _ => 0,
+            };
+
+            match firmware_common::decide_availability(available, consecutive_late, DESCRIPTOR_BYTES, DMA_RING_BYTES) {
+                firmware_common::AvailabilityDecision::RecoverOwnership => {
+                    DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+                    // Every descriptor is free in hardware, but `state.available` reads 0 and only
+                    // `update` can credit it — which it refuses to do while its walk finds the
+                    // whole chain CPU-owned. One returned descriptor breaks that walk. The closure
+                    // returns 0 because there is nothing reserved to write into: this buys
+                    // ownership, not audio. Exactly one, never a ring: a zero-byte handoff takes
+                    // nothing from `state.available`, so more of them leave the HAL believing
+                    // bytes are writable which the DMA now owns. The staged descriptor survives
+                    // untouched and the next offer hands it over, so the engine does not advance.
+                    STEADY_PUSH_CALLS.fetch_add(1, Ordering::Relaxed);
+                    let _ = transfer.push_with(|_| 0).await;
+                    consecutive_late = 0;
+                    continue;
+                }
+                firmware_common::AvailabilityDecision::Retry => {
+                    DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                firmware_common::AvailabilityDecision::HandOffStaged { underrun } => {
+                    if underrun {
+                        UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    STEADY_AVAILABLE_BYTES.fetch_add(DESCRIPTOR_BYTES as u32, Ordering::Relaxed);
+                }
+            }
+
+            // Keep this handoff immediately after the explicit diagnostic check. `push_with`
+            // discards its own availability error, then exposes the current contiguous region;
+            // no render, pack, log or other await may intervene. Even if two descriptors are
+            // free, copy and return only this one staged block.
             STEADY_PUSH_CALLS.fetch_add(1, Ordering::Relaxed);
             let written = transfer
                 .push_with(|destination| {
@@ -669,7 +718,7 @@ pub fn steady_available_bytes() -> u32 { STEADY_AVAILABLE_BYTES.load(Ordering::R
 pub fn steady_written_bytes() -> u32 { STEADY_WRITTEN_BYTES.load(Ordering::Relaxed) }
 
 /// Number of constrained steady-state `push_with` calls, including internally recovered late,
-/// error and short-write calls.
+/// error, short-write and zero-byte ownership-recovery calls.
 #[cfg(not(feature = "voice-bench"))]
 pub fn steady_push_calls() -> u32 { STEADY_PUSH_CALLS.load(Ordering::Relaxed) }
 
