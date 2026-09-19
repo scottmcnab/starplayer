@@ -246,23 +246,23 @@ static STEADY_WRITTEN_BYTES: AtomicU32 = AtomicU32::new(0);
 static STEADY_PUSH_CALLS: AtomicU32 = AtomicU32::new(0);
 
 /// Descriptor render timing, updated only by core 1 and formatted only by core 0.
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 static RENDER_COUNT: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 static RENDER_MAX_US: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 static RENDER_MISSES: AtomicU32 = AtomicU32::new(0);
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 static RENDER_BUCKETS: [AtomicU32; 8] = [
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
     AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
 ];
 
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 const RENDER_BUCKET_UPPER_US: [u32; 8] = [500, 1_000, 1_600, 2_200, 3_200, 4_266, 5_333, u32::MAX];
 
 /// Lock-free bounded timing snapshot for the control core.
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct RenderTiming {
     pub maximum_us: u32,
@@ -271,7 +271,7 @@ pub struct RenderTiming {
     pub misses: u32,
 }
 
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 fn record_render_time(elapsed_us: u32) {
     RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
     RENDER_MAX_US.fetch_max(elapsed_us, Ordering::Relaxed);
@@ -282,7 +282,7 @@ fn record_render_time(elapsed_us: u32) {
     RENDER_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
 }
 
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 fn percentile(count: u32, numerator: u32) -> u32 {
     let wanted = u64::from(count).saturating_mul(u64::from(numerator)).div_ceil(100) as u32;
     let mut seen = 0u32;
@@ -295,7 +295,7 @@ fn percentile(count: u32, numerator: u32) -> u32 {
     0
 }
 
-#[cfg(feature = "voice-bench")]
+#[cfg(feature = "render-timing")]
 pub fn render_timing() -> RenderTiming {
     let count = RENDER_COUNT.load(Ordering::Relaxed);
     RenderTiming {
@@ -577,9 +577,11 @@ fn render_descriptor(destination: &mut [i16; DESCRIPTOR_SAMPLES], render: &mut R
 /// a whole ring is writable while the DMA owns all of it — a build which did that turned a clean
 /// `REFLEX.S3M` into about four ring-empty events a second with audibly degraded playback.
 ///
-/// Recovery also waits for [`firmware_common::LATE_RECOVERY_THRESHOLD`] consecutive `Late`
-/// results and treats every other error as a plain retry. Perturbing the ring is the expensive
-/// mistake, so it happens only on evidence no transient can produce.
+/// Recovery fires on the first `Late` and treats every other error as a plain retry. Waiting for
+/// corroboration is not free: the failed check cleared the EOF the next one needs, so each extra
+/// opinion costs a descriptor period. A build that waited for eight of them spent 501 ms of every
+/// overloaded wall second waiting to be told what a `Late` already proves, and halved the audio
+/// the refill could produce.
 ///
 /// # What hardware has rejected here
 ///
@@ -618,15 +620,11 @@ pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<L
     let descriptor_scratch = DESCRIPTOR_SCRATCH.take();
     STARTUP_STATE.store(STARTUP_READY, Ordering::Release);
 
-    // The unbroken run of `Late` results ending at the current check. Only a run long enough to
-    // rule out a transient may perturb the ring; see `firmware_common::LATE_RECOVERY_THRESHOLD`.
-    let mut consecutive_late: u32 = 0;
-
     loop {
-        #[cfg(feature = "voice-bench")]
+        #[cfg(feature = "render-timing")]
         let render_started = esp_hal::time::Instant::now();
         render_descriptor(descriptor_scratch, render, &mut output_override);
-        #[cfg(feature = "voice-bench")]
+        #[cfg(feature = "render-timing")]
         record_render_time(render_started.elapsed().as_micros().min(u64::from(u32::MAX)) as u32);
         let packed = firmware_common::pack_i16_high_aligned_le(&descriptor_scratch[..], &mut packed_descriptor.bytes[..]);
         if packed != DESCRIPTOR_BYTES {
@@ -640,12 +638,7 @@ pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<L
                 Err(esp_hal::i2s::master::Error::DmaError(esp_hal::dma::DmaError::Late)) => Err(firmware_common::AvailabilityError::Late),
                 Err(_) => Err(firmware_common::AvailabilityError::Transient),
             };
-            consecutive_late = match available {
-                Err(firmware_common::AvailabilityError::Late) => consecutive_late.saturating_add(1),
-                _ => 0,
-            };
-
-            match firmware_common::decide_availability(available, consecutive_late, DESCRIPTOR_BYTES, DMA_RING_BYTES) {
+            match firmware_common::decide_availability(available, DESCRIPTOR_BYTES, DMA_RING_BYTES) {
                 firmware_common::AvailabilityDecision::RecoverOwnership => {
                     DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
                     UNDERRUNS.fetch_add(1, Ordering::Relaxed);
@@ -659,7 +652,6 @@ pub async fn refill_task(audio: AudioTransfer, render: &'static mut RenderHalf<L
                     // untouched and the next offer hands it over, so the engine does not advance.
                     STEADY_PUSH_CALLS.fetch_add(1, Ordering::Relaxed);
                     let _ = transfer.push_with(|_| 0).await;
-                    consecutive_late = 0;
                     continue;
                 }
                 firmware_common::AvailabilityDecision::Retry => {

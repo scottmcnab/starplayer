@@ -597,8 +597,15 @@ any future change to the steady ordering needs its own soak before it is claimed
 The applied recovery is one zero-byte handoff, and only on evidence no transient can produce:
 `firmware_common::decide_availability` returns `AvailabilityDecision::RecoverOwnership` only for
 `AvailabilityError::Late` — matched on `Error::DmaError(DmaError::Late)`, not on any error — and
-only after `LATE_RECOVERY_THRESHOLD` (8) consecutive ones, about 43 ms at the descriptor rate.
-Everything else retries, exactly as the clean build did. One descriptor is also the *right*
+on the first one. Everything else retries, exactly as the clean build did.
+
+Recovering on sight rather than on corroboration is itself a hardware finding. A build waited for
+eight consecutive `Late` results first, reasoning that more evidence is safer. It is not free: the
+check clears EOF, so each failed `available()` after the first of a run must wait for the next
+descriptor completion before it can fail again — 5.3 ms each at 48 kHz. An overloaded `unreal.s3m`
+logged 108 errors across 14 recoveries in one wall second, so **501 ms of that second went on
+waiting to be told what the first `Late` already proved**, and the audio the refill could produce
+halved. A `Late` is self-perpetuating by construction, so there was never anything to corroborate. One descriptor is also the *right*
 number on the merits: in the `Late` state all three are free in hardware but `state.available`
 reads 0, only `update` can credit it, and it refuses while its walk finds the whole chain
 CPU-owned — so one returned descriptor is precisely what breaks the walk and lets the next check

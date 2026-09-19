@@ -32,7 +32,8 @@ bench = []
 # selects the compact master-only engine layout while retaining production's 256-frame
 # descriptors and six-quantum ring. `web` may be added to measure the production network
 # personality under load.
-voice-bench = []
+render-timing = []
+voice-bench = ["render-timing"]
 voice-bench-filtered = ["voice-bench"]
 
 # A1S-only listening diagnostic: preserve normal engine work and the complete audio transport,

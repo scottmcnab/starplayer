@@ -5,16 +5,6 @@
 //! failures has proved the ring needs a descriptor handed back before anything else can happen,
 //! and whether a completed handoff may stage the next descriptor.
 
-/// Consecutive `Late` results which prove a self-perpetuating wedge rather than a transient.
-///
-/// A `Late` is self-perpetuating by construction — `TxCircularState::update` returns it whenever
-/// its walk finds every descriptor owned by the CPU, and only the refill can make that untrue —
-/// so in principle one is proof enough. The threshold exists because the *cost of being wrong* is
-/// asymmetric. Recovery perturbs esp-hal's free-space accounting; a run of this length cannot be
-/// anything else, so normal playback keeps exactly the behaviour a 2026-09-15 hardware run soaked
-/// clean. At the 48 kHz descriptor rate of 187.5/s this bounds the wedge to about 43 ms.
-pub const LATE_RECOVERY_THRESHOLD: u32 = 8;
-
 /// What to do after an explicit availability check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AvailabilityDecision {
@@ -38,16 +28,25 @@ pub enum AvailabilityError {
 
 /// Classify a circular TX availability result for a fixed whole-descriptor handoff.
 ///
-/// `consecutive_late` counts the unbroken run of [`AvailabilityError::Late`] results ending with
-/// this one, so a single `Late` is 1. Only a run of [`LATE_RECOVERY_THRESHOLD`] asks for recovery.
+/// A [`AvailabilityError::Late`] recovers on sight. It cannot be a transient: `update` returns it
+/// whenever its walk finds every descriptor CPU-owned, and it reports success only once one is
+/// DMA-owned again, which only this refill can arrange. Every other failure retries, which is what
+/// the transport did through a clean two-minute hardware soak — that run logged exactly one
+/// startup error and then none, so the path a healthy transport actually takes stays a plain
+/// retry.
+///
+/// Recovering on sight also matters for *pace*, which is what a run of hardware measurements
+/// settled. An earlier build waited for eight consecutive `Late` results before recovering, on
+/// the theory that more evidence is safer. It is not free: the check clears EOF, so every failed
+/// `available()` after the first of a run must wait for the next descriptor completion before it
+/// can fail again. At 48 kHz that is 5.3 ms each, and an overloaded `unreal.s3m` logged 108
+/// errors across 14 recoveries in one wall second — **501 ms of that second spent waiting to be
+/// told something already known**, which halved the audio the refill could produce. Evidence
+/// that costs a descriptor period per sample is the wrong kind of caution.
 ///
 /// The caller has already rendered and packed the descriptor before the check that reaches here.
 /// A reversed order — reserving an offer first and rendering against it — was tried and twice
-/// failed on hardware; see [`crate::dma_refill`] callers and the A1S `audio.rs` record.
-///
-/// Every other failure retries, which is what the transport did through a clean two-minute
-/// hardware soak: that run logged exactly one startup error and then none, so the error path a
-/// healthy transport actually takes must stay a plain retry.
+/// failed on hardware; see the A1S `audio.rs` record.
 ///
 /// # Why recovery hands back one descriptor and not a ring
 ///
@@ -64,15 +63,13 @@ pub enum AvailabilityError {
 /// build turned a clean `REFLEX.S3M` into about four ring-empty events a second and audibly
 /// degraded playback, from a single harmless startup transient the previous build had simply
 /// retried.
-pub const fn decide_availability(
-    available: Result<usize, AvailabilityError>, consecutive_late: u32, descriptor_bytes: usize, ring_bytes: usize,
-) -> AvailabilityDecision {
+pub const fn decide_availability(available: Result<usize, AvailabilityError>, descriptor_bytes: usize, ring_bytes: usize) -> AvailabilityDecision {
     match available {
         Ok(bytes) if bytes >= descriptor_bytes && bytes.is_multiple_of(descriptor_bytes) => {
             AvailabilityDecision::HandOffStaged { underrun: bytes >= ring_bytes }
         }
-        Err(AvailabilityError::Late) if consecutive_late >= LATE_RECOVERY_THRESHOLD => AvailabilityDecision::RecoverOwnership,
-        Ok(_) | Err(_) => AvailabilityDecision::Retry,
+        Err(AvailabilityError::Late) => AvailabilityDecision::RecoverOwnership,
+        Ok(_) | Err(AvailabilityError::Transient) => AvailabilityDecision::Retry,
     }
 }
 
@@ -105,40 +102,33 @@ mod tests {
     const DESCRIPTOR_BYTES: usize = 2_048;
     const RING_BYTES: usize = 6_144;
 
-    fn decide(available: Result<usize, AvailabilityError>, consecutive_late: u32) -> AvailabilityDecision {
-        decide_availability(available, consecutive_late, DESCRIPTOR_BYTES, RING_BYTES)
+    fn decide(available: Result<usize, AvailabilityError>) -> AvailabilityDecision {
+        decide_availability(available, DESCRIPTOR_BYTES, RING_BYTES)
     }
 
     #[test]
     fn a_transient_error_only_ever_retries() {
-        for consecutive_late in [0, 1, LATE_RECOVERY_THRESHOLD, 10 * LATE_RECOVERY_THRESHOLD] {
-            assert_eq!(decide(Err(AvailabilityError::Transient), consecutive_late), AvailabilityDecision::Retry);
-        }
+        assert_eq!(decide(Err(AvailabilityError::Transient)), AvailabilityDecision::Retry);
     }
 
     #[test]
-    fn a_short_run_of_late_retries_without_perturbing_the_ring() {
-        for consecutive_late in 1..LATE_RECOVERY_THRESHOLD {
-            assert_eq!(decide(Err(AvailabilityError::Late), consecutive_late), AvailabilityDecision::Retry);
-        }
-    }
-
-    #[test]
-    fn a_proven_run_of_late_hands_one_descriptor_back() {
-        assert_eq!(decide(Err(AvailabilityError::Late), LATE_RECOVERY_THRESHOLD), AvailabilityDecision::RecoverOwnership);
-        assert_eq!(decide(Err(AvailabilityError::Late), LATE_RECOVERY_THRESHOLD + 1), AvailabilityDecision::RecoverOwnership);
+    fn the_first_late_recovers_on_sight() {
+        // Waiting for a second opinion costs a descriptor period per check, because the failed
+        // check cleared the EOF the next one needs. `Late` is self-perpetuating, so there is
+        // nothing to wait for.
+        assert_eq!(decide(Err(AvailabilityError::Late)), AvailabilityDecision::RecoverOwnership);
     }
 
     #[test]
     fn recovery_never_renders_or_stages() {
         // The board reads this off the variant: `RecoverOwnership` carries no descriptor to write,
         // so the engine cannot advance to manufacture recovery audio.
-        assert_eq!(decide(Err(AvailabilityError::Late), LATE_RECOVERY_THRESHOLD), AvailabilityDecision::RecoverOwnership);
+        assert_eq!(decide(Err(AvailabilityError::Late)), AvailabilityDecision::RecoverOwnership);
     }
 
     #[test]
     fn a_whole_offer_hands_the_staged_descriptor_over() {
-        assert_eq!(decide(Ok(DESCRIPTOR_BYTES), 0), AvailabilityDecision::HandOffStaged { underrun: false });
+        assert_eq!(decide(Ok(DESCRIPTOR_BYTES)), AvailabilityDecision::HandOffStaged { underrun: false });
     }
 
     #[test]
@@ -155,14 +145,14 @@ mod tests {
 
     #[test]
     fn only_aligned_whole_descriptor_offers_admit_a_handoff() {
-        assert_eq!(decide(Ok(DESCRIPTOR_BYTES), 0), AvailabilityDecision::HandOffStaged { underrun: false });
-        assert_eq!(decide(Ok(2 * DESCRIPTOR_BYTES), 0), AvailabilityDecision::HandOffStaged { underrun: false });
-        assert_eq!(decide(Ok(0), 0), AvailabilityDecision::Retry);
-        assert_eq!(decide(Ok(DESCRIPTOR_BYTES + 1), 0), AvailabilityDecision::Retry);
+        assert_eq!(decide(Ok(DESCRIPTOR_BYTES)), AvailabilityDecision::HandOffStaged { underrun: false });
+        assert_eq!(decide(Ok(2 * DESCRIPTOR_BYTES)), AvailabilityDecision::HandOffStaged { underrun: false });
+        assert_eq!(decide(Ok(0)), AvailabilityDecision::Retry);
+        assert_eq!(decide(Ok(DESCRIPTOR_BYTES + 1)), AvailabilityDecision::Retry);
     }
 
     #[test]
     fn a_whole_ring_is_reported_as_an_underrun() {
-        assert_eq!(decide(Ok(RING_BYTES), 0), AvailabilityDecision::HandOffStaged { underrun: true });
+        assert_eq!(decide(Ok(RING_BYTES)), AvailabilityDecision::HandOffStaged { underrun: true });
     }
 }

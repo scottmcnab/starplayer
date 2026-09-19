@@ -74,6 +74,7 @@ cd embedded
 cargo xtask build  --board a1s                     # the audio firmware, six keys, no display
 cargo xtask build  --board a1s --features lcd      # the audio firmware, five keys, the ST7789 screen
 cargo xtask build  --board a1s --features bench    # the bench firmware (no audio)
+cargo xtask build  --board a1s --features render-timing # adds a RENDER p50/p95/max/over_budget line
 cargo xtask build  --board a1s --features web      # the audio firmware plus WiFi, a page and uploads
 cargo xtask build  --board a1s --features web,lcd  # both
 cargo xtask build  --board a1s --features tone     # gated direct-tone listening diagnostic
@@ -459,9 +460,11 @@ HAL was left believing a ring was writable while the DMA owned all of it. The 20
 run was unambiguous — `REFLEX.S3M`, clean at `underruns=0` in the previous build, degraded audibly
 and logged about four ring-empty events a second. What triggered it was a single harmless startup
 transient, the constant `dma_errors=1` the clean build's log had always carried, being mistaken
-for a `Late`. The refill now matches `Error::DmaError(DmaError::Late)` specifically, retries
-everything else, and recovers only after `LATE_RECOVERY_THRESHOLD` (8) consecutive `Late` results
-— about 43 ms, an evidence bar no transient reaches. The engine does not advance to manufacture
+for a `Late`. The refill now matches `Error::DmaError(DmaError::Late)` specifically and retries
+everything else, recovering on the first `Late`. Waiting for corroboration was tried and cost
+dearly: the failed check clears EOF, so each extra opinion waits a descriptor period, and an
+overloaded `unreal.s3m` spent 501 ms of every wall second waiting to be told what a `Late`
+already proves. A `Late` is self-perpetuating by construction, so there is nothing to corroborate. The engine does not advance to manufacture
 recovery audio, and no padding, partial handoff, allocation, logging, lock, panic or timed delay
 was added.
 

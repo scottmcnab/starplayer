@@ -1267,6 +1267,18 @@ async fn control_task(mut control: ControlTaskControl, bridge: WebBridge, #[cfg(
             {
             let title = control.module().map(|module| module.header().title.as_ref()).unwrap_or("");
             let view = NowPlaying::from_snapshot(&snapshot, OUTPUT_SAMPLE_RATE_HZ, title, control.master_volume());
+            // What one descriptor of audio actually costs to render, against the 5 333 us it is
+            // worth. This is the number that decides whether a slow song is the transport or the
+            // renderer, and inferring it from the transport counters cannot separate rendering
+            // from the refill's legitimate waiting.
+            #[cfg(feature = "render-timing")]
+            {
+                let timing = audio::render_timing();
+                println!(
+                    "RENDER p50={}us p95={}us max={}us over_budget={} (budget 5333us)",
+                    timing.p50_us, timing.p95_us, timing.maximum_us, timing.misses,
+                );
+            }
             println!(
                 "{view}  peak={} underruns={} dma_errors={} offered={} written={} pushes={} retired={} rejected={}",
                 control.peak(),

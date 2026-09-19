@@ -71,12 +71,13 @@ source tree, run `cargo fmt`, or add attribution.
    partial descriptor, render a second descriptor inside the closure, allocate, log,
    lock, or panic in the refill path. Preserve sample-exact engine advancement: do not
    advance the renderer merely to manufacture recovery padding.
-3. Recover only a proven `Late`, and with exactly one zero-byte handoff. Match
+3. Recover a `Late`, and only a `Late`, with exactly one zero-byte handoff, on sight. Match
    `Error::DmaError(DmaError::Late)` specifically; retry every other error exactly as the clean
-   build did. Require `LATE_RECOVERY_THRESHOLD` consecutive `Late` results before perturbing the
-   ring, so normal playback keeps the refill behaviour that soaked clean. Handle a failed or
-   short handoff by preserving the staged descriptor without rendering again. Yield only through
-   the actual async operations; do not introduce a time-based delay into normal refill.
+   build did. Do not wait for consecutive `Late` results before recovering: the failed check
+   clears EOF, so each extra opinion costs a descriptor period, and an eight-deep gate spent
+   501 ms of every overloaded wall second waiting. Handle a failed or short handoff by preserving
+   the staged descriptor without rendering again. Yield only through the actual async operations;
+   do not introduce a time-based delay into normal refill.
 4. Extract the smallest host-testable decision/state helper needed to regress the late
    path if direct esp-hal mocking is impractical. Tests must prove a transient error only ever
    retries, a short run of `Late` only retries, a proven run asks for one re-ownership handoff
@@ -115,6 +116,8 @@ source tree, run `cargo fmt`, or add attribution.
 - Hardware acceptance after merge: upload `unreal.s3m`, pass pattern 5 row 32, and verify
   playback time and descriptor counters continue advancing after any late event. Temporary
   audible breakup is acceptable; a frozen row or permanently rising error-only loop is not.
+  Overload pace is tracked separately: above the render budget the song currently stretches
+  rather than keeping wall-clock time. That is a playback-policy question, not a DMA one.
   Then switch back to the built-in `REFLEX.S3M` and confirm it still plays — after the first
   attempt the wedge outlived the module that caused it. Check `REFLEX.S3M` alone **first**, and
   treat anything but `underruns=0` with a fixed `dma_errors` as a regression: that is how the
