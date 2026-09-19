@@ -177,10 +177,16 @@ impl Jump {
 pub struct TickOutcome {
     /// Tempo in effect at the end of the tick. `Txx` writes it.
     pub tempo_bpm: u16,
-    /// Ticks per row in effect at the end of the tick. `Axx` writes it.
+    /// Ticks per row the module asks for at the end of the tick. `Axx` writes it.
     ///
     /// Applied to the row clock immediately, so a mid-row change lengthens or shortens the
     /// row in progress — see [`RowClock::set_speed`] for the wrap rule.
+    ///
+    /// It is what the *module* asked for, which is what the row clock runs at unless a
+    /// host has set [`PatternSequencer::set_speed_adjust`]. Under a non-zero adjustment
+    /// the two differ by exactly that adjustment, and it is this value — the request —
+    /// that carries forward into the next tick's outcome, so re-requesting a speed the
+    /// clock is already running at still means the same request.
     pub speed: u8,
     /// Extra whole repeats of this row (`SEx` / `EEx`).
     ///
@@ -223,6 +229,11 @@ pub struct TickContext<'engine> {
     pub position: SongPosition,
     /// The tempo in effect as the tick begins.
     pub tempo_bpm: u16,
+    /// The ticks-per-row the module last asked for, which is what [`TickContext::outcome`]
+    /// carries forward. Equal to `row_clock.speed` unless the host has biased playback
+    /// with [`PatternSequencer::set_speed_adjust`]; private because a processor reports
+    /// speed *requests* and reads its tick budget from `row_clock`, and never needs this.
+    requested_speed: u8,
     /// Where the tick describes itself for the UI. Reached through the `report_*` methods
     /// rather than directly, so that a format crate never mentions the feature.
     #[cfg(feature = "telemetry")]
@@ -272,6 +283,7 @@ impl<'engine> TickContext<'engine> {
             row_clock,
             position,
             tempo_bpm,
+            requested_speed: row_clock.speed,
             #[cfg(feature = "telemetry")]
             telemetry: None,
             #[cfg(feature = "trace")]
@@ -287,7 +299,7 @@ impl<'engine> TickContext<'engine> {
     pub const fn outcome(&self) -> TickOutcome {
         TickOutcome {
             tempo_bpm: self.tempo_bpm,
-            speed: self.row_clock.speed,
+            speed: self.requested_speed,
             pattern_delay: self.row_clock.pattern_delay,
             jump: None,
             stop: false,
@@ -647,6 +659,13 @@ pub struct PatternSequencer<Tempo: TempoModel, Processor: TrackerProcessor, Data
     row_clock: RowClock,
     position: SongPosition,
     tempo_bpm: u16,
+    /// The ticks-per-row the module itself last asked for, before [`Self::speed_adjust`].
+    /// Every tick's outcome starts from this rather than from the row clock, so a bias is
+    /// applied to the *request* and re-requesting the speed already running still moves.
+    requested_speed: u8,
+    /// Added to every speed the module asks for. Zero is canonical playback and the only
+    /// value any golden or conformance trace ever runs at.
+    speed_adjust: i8,
     state: SequencerState,
     end_of_song: EndOfSongPolicy,
     restart_order: u16,
@@ -717,6 +736,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             row_clock: RowClock::new(settings.initial_speed),
             position: SongPosition::default(),
             tempo_bpm: settings.initial_tempo_bpm,
+            requested_speed: settings.initial_speed,
+            speed_adjust: 0,
             state: SequencerState::Ready,
             end_of_song: settings.end_of_song,
             restart_order: settings.restart_order,
@@ -775,6 +796,48 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
 
     /// The tempo in effect.
     pub const fn tempo_bpm(&self) -> u16 { self.tempo_bpm }
+
+    /// Bias every speed the module asks for by `adjust` ticks per row.
+    ///
+    /// Zero — the default — is canonical playback, and nothing that has to match an
+    /// oracle may set anything else. A non-zero value exists for a module written for a
+    /// game's own replayer rather than for a tracker: several Amiga titles shipped a
+    /// player that added a constant to every `Fxx`, so the module's own speeds are one
+    /// short of what it was composed against and it plays too fast everywhere else.
+    ///
+    /// **It biases requests, not the initial speed.** A song starts at the speed its
+    /// header names, and moves to `requested + adjust` on the first speed command. The
+    /// result is clamped to at least 1: a bias must not be able to stall the row clock.
+    ///
+    /// A host that installs a [`SongTimeline`] must scan the song at the same adjustment
+    /// it plays at, or the two disagree about how long the song is. Setting it on a
+    /// running sequencer therefore changes nothing that is already sounding: the row in
+    /// progress keeps its budget, and the bias reaches the clock on the next speed
+    /// command. Hosts set it once, on a freshly built sequencer, before playback.
+    pub fn set_speed_adjust(&mut self, adjust: i8) { self.speed_adjust = adjust; }
+
+    /// The bias [`Self::set_speed_adjust`] is applying.
+    pub const fn speed_adjust(&self) -> i8 { self.speed_adjust }
+
+    /// The row clock's ticks-per-row for a speed the module asked for.
+    ///
+    /// Zero is left alone: a format that reports speed 0 is reporting a value it has
+    /// already decided not to act on (ST3 ignores `A00` — accuracy policy D6), and
+    /// biasing it would invent a speed change the module never made.
+    const fn adjusted_speed(&self, requested: u8) -> u8 {
+        if self.speed_adjust == 0 || requested == 0 { return requested; }
+        let adjusted = requested as i16 + self.speed_adjust as i16;
+        if adjusted < 1 { 1 } else if adjusted > u8::MAX as i16 { u8::MAX } else { adjusted as u8 }
+    }
+
+    /// The inverse of [`Self::adjusted_speed`], for the one place an already-biased speed
+    /// has to be turned back into the request behind it: a seek restores the timing the
+    /// scan recorded, and the scan ran with this same bias applied.
+    const fn requested_speed_behind(&self, adjusted: u8) -> u8 {
+        if self.speed_adjust == 0 || adjusted == 0 { return adjusted; }
+        let requested = adjusted as i16 - self.speed_adjust as i16;
+        if requested < 1 { 1 } else if requested > u8::MAX as i16 { u8::MAX } else { requested as u8 }
+    }
 
     /// Whether the song has ended.
     pub const fn is_stopped(&self) -> bool { matches!(self.state, SequencerState::Stopped) }
@@ -934,6 +997,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         if let Some(mark) = timeline.mark_at(self.position.order, self.position.row).copied() {
             self.tempo_bpm = mark.tempo_bpm;
             self.row_clock.start_row(mark.speed);
+            self.requested_speed = self.requested_speed_behind(mark.speed);
             self.detector.reset_marking_before(&timeline, mark.frame);
         }
         self.timeline = Some(timeline);
@@ -983,6 +1047,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             row_clock: self.row_clock,
             position: self.position,
             tempo_bpm: self.tempo_bpm,
+            requested_speed: self.requested_speed,
             #[cfg(feature = "telemetry")]
             telemetry: context.telemetry.as_deref_mut(),
             #[cfg(feature = "trace")]
@@ -1028,7 +1093,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// the time it runs, because all of it arrives inside `outcome`.
     fn commit(&mut self, outcome: TickOutcome) {
         self.tempo_bpm = outcome.tempo_bpm;
-        self.row_clock.set_speed(outcome.speed);
+        self.requested_speed = outcome.speed;
+        self.row_clock.set_speed(self.adjusted_speed(outcome.speed));
         if self.row_clock.is_first_tick_of_row() {
             self.row_clock.set_pattern_delay(outcome.pattern_delay);
         }
@@ -1500,6 +1566,59 @@ mod tests {
         harness.ticks(&mut sequencer, 3);
         assert_eq!(sequencer.position().row, 1, "Axx applies to the row it is on: three ticks, not six");
         assert_eq!(sequencer.row_clock().speed, 3);
+    }
+
+    /// The game-replayer bias: every speed the module asks for is one tick longer, the
+    /// header speed it starts at is not, and asking again for the speed already running
+    /// still moves — which is the case a "did the effective speed change?" test misses.
+    #[test]
+    fn a_speed_adjustment_biases_every_request_and_leaves_the_initial_speed_alone() {
+        let mut data = DemoPatternData::new(1, 4, 1);
+        data.set(0, 0, 0, DemoCell::command(DEMO_SET_SPEED, 5));
+        data.set(0, 1, 0, DemoCell::command(DEMO_SET_SPEED, 6));
+        let mut sequencer = sequencer(data, SequencerSettings::default());
+        sequencer.set_speed_adjust(1);
+        let mut harness = Harness::new();
+
+        assert_eq!(sequencer.row_clock().speed, 6, "the header speed is played as written");
+        harness.ticks(&mut sequencer, 1);
+        assert_eq!(sequencer.row_clock().speed, 6, "A05 under +1 is a six-tick row");
+        harness.ticks(&mut sequencer, 5);
+        assert_eq!(sequencer.position().row, 1, "six ticks, not five");
+        harness.ticks(&mut sequencer, 1);
+        assert_eq!(sequencer.row_clock().speed, 7, "A06 under +1 is seven, though the clock already ran at six");
+    }
+
+    #[test]
+    fn a_speed_adjustment_can_never_stall_the_row_clock() {
+        let mut data = DemoPatternData::new(1, 4, 1);
+        data.set(0, 0, 0, DemoCell::command(DEMO_SET_SPEED, 2));
+        let mut sequencer = sequencer(data, SequencerSettings::default());
+        sequencer.set_speed_adjust(-8);
+        let mut harness = Harness::new();
+
+        harness.ticks(&mut sequencer, 1);
+        assert_eq!(sequencer.row_clock().speed, 1, "a negative bias clamps at one tick per row");
+        assert_eq!(sequencer.position().row, 1, "and the row still ends");
+    }
+
+    /// The bias is applied where a request arrives, not where it is stored: setting it on
+    /// a running sequencer leaves the row in progress alone and reaches the clock on the
+    /// next speed command. It is why a host scans and plays at one fixed adjustment.
+    #[test]
+    fn setting_the_adjustment_mid_song_waits_for_the_next_request() {
+        let mut data = DemoPatternData::new(1, 4, 1);
+        data.set(0, 0, 0, DemoCell::command(DEMO_SET_SPEED, 4));
+        data.set(0, 1, 0, DemoCell::command(DEMO_SET_SPEED, 4));
+        let mut sequencer = sequencer(data, SequencerSettings::default());
+        let mut harness = Harness::new();
+
+        harness.ticks(&mut sequencer, 1);
+        assert_eq!(sequencer.row_clock().speed, 4);
+        sequencer.set_speed_adjust(2);
+        assert_eq!(sequencer.row_clock().speed, 4, "the row already running keeps its budget");
+        harness.ticks(&mut sequencer, 4);
+        assert_eq!(sequencer.row_clock().speed, 6, "the next A04 arrives biased");
     }
 
     #[test]

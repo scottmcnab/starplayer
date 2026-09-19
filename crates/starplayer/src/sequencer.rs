@@ -354,6 +354,14 @@ impl NativeSequencer {
     /// Choose what happens at the detected loop point.
     pub fn set_at_end(&mut self, at_end: AtEnd) { forward_mut!(self, (at_end), |sequencer| sequencer.set_at_end(at_end)) }
 
+    /// Bias every speed the module asks for, for a module written against a game's own
+    /// replayer rather than against a tracker — see
+    /// [`PatternSequencer::set_speed_adjust`](starplayer_engine::PatternSequencer::set_speed_adjust).
+    ///
+    /// Set it before playback, and scan the song at the same value: a timeline measured
+    /// at a different adjustment describes a different song.
+    pub fn set_speed_adjust(&mut self, adjust: i8) { forward_mut!(self, (adjust), |sequencer| sequencer.set_speed_adjust(adjust)) }
+
     /// How far into the song `now` is, in frames — what a progress slider draws.
     pub fn song_frame(&self, now: Frame) -> u64 { forward!(self, (now), |sequencer| sequencer.song_frame(now)) }
 

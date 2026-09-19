@@ -186,6 +186,38 @@ those would justify its own variant. None does: the three fixtures that name the
 trackers, `data/mt2_xm_double_toneporta.xm`, `data/rstst_double_toneporta.xm` and
 `openmpt/xm/3xx-no-old-samp-noft.xm`, all agree with libxmp's single bit.
 
+### Deliberately non-canonical playback options
+
+A **playback option** is neither a profile nor a dialect: it is the listener asking, for
+one session, for something the file does not say. It is recorded here because the rule at
+the top of this document applies to it too — a way of not playing the module as written,
+if it is not written down, is a defect rather than a decision.
+
+| Option | Default | What it does | Where |
+|---|---|---|---|
+| Speed adjustment | **0 — canonical playback** | Adds a constant number of ticks per row to every speed the module *asks for*, leaving the header's initial speed alone. Clamped to at least 1, so it cannot stall the row clock | `PatternSequencer::set_speed_adjust`, applied in `commit` where a `TickOutcome`'s speed request reaches the row clock; surfaced by `Player::set_speed_adjust`, the wasm `load_module_with_options` and the web player's **Adjust speed** control |
+
+The speed adjustment exists for modules written against a **game's own replayer** rather
+than against a tracker. Several Amiga titles shipped a player that added a constant to
+every speed command, so the module's own `Fxx` values are short of what the music was
+composed against and it plays too fast in a canonical player — the owner's Cubulus rips
+are the case that prompted it. It is not a quirk of any tracker, so it is not a
+`QuirkSet` field and not a `FormatDialect`: no property of the file selects it, and it
+cannot be detected, only chosen.
+
+Three properties keep it out of the accuracy machinery:
+
+* It biases the **request**, never the row clock directly. A sequencer carries the
+  unbiased speed the module asked for and applies the bias where the request lands, so
+  re-requesting the speed already running still moves the clock, and the option composes
+  with `Axx` mid-row exactly as an unbiased request does.
+* A host that sets it **scans the song at the same value**
+  (`starplayer::scan_song_with_speed_adjust`). The timeline is the song's length and
+  every seek target; a timeline measured at another adjustment describes another song.
+* Every golden, every conformance trace and every offline render runs at 0, and nothing
+  on those paths can set it — `scan_song`, `NativeSequencer::new` and each format's own
+  `sequencer_settings` all start at 0 and only an explicit setter moves it.
+
 ## 3. Documented deviations from the reference implementations
 
 Entries D1–D9 and D21–D32 are coding defects in the original assembly and are implemented

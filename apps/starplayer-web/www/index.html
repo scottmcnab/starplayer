@@ -61,14 +61,31 @@
                  hand-written because it is MOD-specific; the enhancement checkboxes below
                  it are built entirely from the wasm host's own `enhancements_json()`
                  (`starplayer-enhance::CATALOGUE`), so nothing about a specific enhancer is
-                 transcribed here — the same rule the Effects panel follows. -->
-            <div id="load-options" class="load-options">
-                <label class="mod-panning-option">
-                    <input id="mod-headphone-panning" type="checkbox">
-                    <span><strong>Headphone-friendly MOD panning</strong><small>Uses S3M-style 60% stereo spacing instead of hard left/right.</small></span>
-                </label>
-                <div id="enhancement-options"></div>
-            </div>
+                 transcribed here — the same rule the Effects panel follows.
+
+                 They sit inside a <details> because none of them is part of loading a
+                 file: a first visit should see the file controls and nothing else, and a
+                 listener comparing enhancers leaves it open. The disclosure state is
+                 remembered with the rest of the preferences. Every control keeps its id
+                 and stays in the DOM while closed, so nothing here depends on it. -->
+            <details id="load-options-disclosure" class="load-options-disclosure">
+                <summary>Rendering options<span id="load-options-summary" class="load-options-summary">default</span></summary>
+                <div id="load-options" class="load-options">
+                    <label class="mod-panning-option">
+                        <input id="mod-headphone-panning" type="checkbox">
+                        <span><strong>Headphone-friendly MOD panning</strong><small>Uses S3M-style 60% stereo spacing instead of hard left/right.</small></span>
+                    </label>
+                    <div id="enhancement-options"></div>
+                    <!-- Experimental. Some game modules were written against the game's own
+                         replayer rather than against a tracker, and that replayer added a
+                         constant to every speed command; played canonically they run fast.
+                         This is that constant, and zero is canonical playback. -->
+                    <label class="speed-adjust-option">
+                        <span><strong>Adjust speed <em>(experimental)</em></strong><small>Added to every speed the module asks for, so a track written for a game's own replayer plays at the rate it was composed at. 0 is canonical playback.</small></span>
+                        <input id="speed-adjust" type="number" min="-8" max="8" step="1" value="0" inputmode="numeric" aria-label="Ticks added to every speed change">
+                    </label>
+                </div>
+            </details>
         </div>
         <div id="drop-zone" class="drop-zone" tabindex="0">
             <strong>Drop .s3m, .mod, .mtm, .xm, .it, or .zip here</strong>

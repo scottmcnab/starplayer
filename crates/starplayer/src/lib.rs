@@ -235,13 +235,33 @@ pub fn scan_song(
     sample_rate_hz: u32,
     limits: starplayer_engine::ScanLimits,
 ) -> Result<ScannedSong, starplayer_core::Error> {
-    let _ = (module, sample_rate_hz, limits);
+    scan_song_with_speed_adjust(module, sample_rate_hz, limits, 0)
+}
+
+/// [`scan_song`] for a host that plays the module at a biased speed
+/// ([`NativeSequencer::set_speed_adjust`]).
+///
+/// The scan *is* the song's length, so it has to run at the adjustment playback will run
+/// at; a timeline measured at any other value describes a different song, and every seek
+/// against it lands at the wrong time. `speed_adjust` of 0 is [`scan_song`] exactly, and
+/// is what every golden and conformance path uses.
+///
+/// For a MOD this also feeds the CIA-against-vertical-blank length comparison, which is
+/// the right answer: both candidate readings are measured under the same bias, so the
+/// choice between them is made on the lengths the listener will actually hear.
+pub fn scan_song_with_speed_adjust(
+    module: &starplayer_rt::Arc<starplayer_model::Module>,
+    sample_rate_hz: u32,
+    limits: starplayer_engine::ScanLimits,
+    speed_adjust: i8,
+) -> Result<ScannedSong, starplayer_core::Error> {
+    let _ = (module, sample_rate_hz, limits, speed_adjust);
     match module.header().format {
         #[cfg(feature = "mod")]
-        starplayer_model::ModuleFormat::Mod => scan_mod(module, sample_rate_hz, limits),
+        starplayer_model::ModuleFormat::Mod => scan_mod(module, sample_rate_hz, limits, speed_adjust),
         _ => {
             let quirks = module.header().dialect.quirks();
-            scan_with(module, sample_rate_hz, limits, quirks)
+            scan_with(module, sample_rate_hz, limits, quirks, speed_adjust)
         }
     }
 }
@@ -261,9 +281,11 @@ fn scan_with(
     sample_rate_hz: u32,
     limits: starplayer_engine::ScanLimits,
     quirks: starplayer_core::quirks::QuirkSet,
+    speed_adjust: i8,
 ) -> Result<ScannedSong, starplayer_core::Error> {
     let selection = starplayer_core::quirks::QuirkSelection::Override(quirks);
     let mut sequencer = NativeSequencer::new(starplayer_rt::Arc::clone(module), sample_rate_hz, selection)?;
+    sequencer.set_speed_adjust(speed_adjust);
     // `match sequencer` on the value rather than on a reference: with every format feature
     // off the enum is uninhabited, and an empty match is only accepted on a place
     // expression of an uninhabited type.
@@ -346,6 +368,7 @@ fn scan_mod(
     module: &starplayer_rt::Arc<starplayer_model::Module>,
     sample_rate_hz: u32,
     limits: starplayer_engine::ScanLimits,
+    speed_adjust: i8,
 ) -> Result<ScannedSong, starplayer_core::Error> {
     use starplayer_core::quirks::{ModTiming, QuirkSet};
     use starplayer_engine::EndReason;
@@ -356,10 +379,10 @@ fn scan_mod(
     let vblank = QuirkSet { mod_timing: ModTiming::VBlank, ..dialect };
     let verdict = starplayer_mod::timing_verdict_for(module).unwrap_or(TimingVerdict::Cia);
     match verdict {
-        TimingVerdict::Cia => scan_mod_with(module, sample_rate_hz, limits, cia),
-        TimingVerdict::VBlank => scan_mod_with(module, sample_rate_hz, limits, vblank),
+        TimingVerdict::Cia => scan_mod_with(module, sample_rate_hz, limits, cia, speed_adjust),
+        TimingVerdict::VBlank => scan_mod_with(module, sample_rate_hz, limits, vblank, speed_adjust),
         TimingVerdict::CompareLengths => {
-            let first = scan_mod_with(module, sample_rate_hz, limits, cia)?;
+            let first = scan_mod_with(module, sample_rate_hz, limits, cia, speed_adjust)?;
             // A scan that ran out its budget is past the threshold by definition: it never
             // reached the end of one pass.
             let over_budget = matches!(first.timeline.end(), EndReason::Budget);
@@ -367,7 +390,7 @@ fn scan_mod(
             if !over_budget && first.timeline.end_frame() < threshold_frames { return Ok(first); }
             // The rescan gets its own fresh `ScanLimits`, so a module that is over budget
             // both ways is not compared on two truncated lengths — it keeps CIA.
-            let second = scan_mod_with(module, sample_rate_hz, limits, vblank)?;
+            let second = scan_mod_with(module, sample_rate_hz, limits, vblank, speed_adjust)?;
             let both_over_budget = over_budget && matches!(second.timeline.end(), EndReason::Budget);
             let shorter = !both_over_budget && second.timeline.end_frame() < first.timeline.end_frame();
             Ok(if shorter { second } else { first })
@@ -381,8 +404,9 @@ fn scan_mod_with(
     sample_rate_hz: u32,
     limits: starplayer_engine::ScanLimits,
     quirks: starplayer_core::quirks::QuirkSet,
+    speed_adjust: i8,
 ) -> Result<ScannedSong, starplayer_core::Error> {
-    scan_with(module, sample_rate_hz, limits, quirks)
+    scan_with(module, sample_rate_hz, limits, quirks, speed_adjust)
 }
 
 /// Identify a module using the probes for the format capabilities compiled into this

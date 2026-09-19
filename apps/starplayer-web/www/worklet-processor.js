@@ -123,6 +123,10 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                     new Uint8Array(message.bytes),
                     message.headphoneFriendlyModPanning === true,
                     message.enhancementFlags >>> 0 || 0,
+                    // The song is scanned during this call, so the speed bias has to
+                    // arrive with the module: the timeline must measure the song at the
+                    // speed it will play at. The wasm side clamps it.
+                    Math.trunc(Number(message.speedAdjust)) || 0,
                 );
                 // Activation may consume more of the pre-reserved heap. Rebind once here,
                 // outside process; any growth after this point is a fatal RT-path defect.

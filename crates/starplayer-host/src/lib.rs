@@ -110,6 +110,6 @@ pub fn message_to_event(status: u8, data1: u8, data2: u8) -> Option<(u8, starpla
 pub use player::{CONTROL_CADENCE_FRAMES, HOST_COMMAND_CAPACITY, Player, RETIRED_CAPACITY, TELEMETRY_DEPTH};
 pub use source::{
     AtEndSlot, BuiltSource, SeekKind, SeekMailbox, SeekRequest, SeekableModuleSource, SourceHandles, build_source,
-    scan_module,
+    scan_module, scan_module_with_speed_adjust,
 };
 pub use transport::{DEFAULT_FADE_FRAMES, TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES, Transport};

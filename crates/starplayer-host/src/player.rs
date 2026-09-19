@@ -454,6 +454,10 @@ pub struct Player {
     taps: Arc<PlayerTaps>,
     handles: SourceHandles,
     at_end: AtEnd,
+    /// Ticks added to every speed the module asks for, for a module written against a
+    /// game's own replayer. Applied when a module is installed, so it is both what the
+    /// song is scanned at and what it plays at.
+    speed_adjust: i8,
     fade_frames: u32,
     master_volume: U0F16,
     module: Option<RtArc<Module>>,
@@ -513,6 +517,7 @@ impl Player {
             taps: control.taps,
             handles: control.handles,
             at_end: AtEnd::Continue,
+            speed_adjust: 0,
             fade_frames: 0,
             master_volume: U0F16::MAX,
             module: None,
@@ -696,7 +701,7 @@ impl Player {
         let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
         // A seek asked for against the outgoing module means nothing to the incoming one.
         self.handles.seek.clear();
-        let built = build_source(RtArc::clone(&module), self.spec.sample_rate_hz, start, frame, &self.handles, cached_scan)?;
+        let built = build_source(RtArc::clone(&module), self.spec.sample_rate_hz, start, frame, &self.handles, cached_scan, self.speed_adjust)?;
         let (source, events) = if self.live_input == LiveInputMode::Jam {
             let (source, producer) = self.build_jam_source(&module, frame, built.source)?;
             (source, Some(EventSender::new(producer, Arc::clone(&self.event_clock))))
@@ -782,6 +787,28 @@ impl Player {
 
     /// What the caller last chose to happen when the song has been heard through once.
     pub fn at_end(&self) -> AtEnd { self.at_end }
+
+    /// The bias [`Player::set_speed_adjust`] is applying.
+    pub fn speed_adjust(&self) -> i8 { self.speed_adjust }
+
+    /// Add `adjust` ticks per row to every speed a module asks for.
+    ///
+    /// Zero — the default — is canonical playback. A non-zero value is for a module
+    /// written against a game's own replayer rather than against a tracker; see
+    /// [`NativeSequencer::set_speed_adjust`](starplayer::NativeSequencer::set_speed_adjust).
+    ///
+    /// **It takes effect on the next load.** The song's timeline is measured at the
+    /// adjustment it plays at, and the scan happens at load; changing this without
+    /// reloading would leave the progress slider describing a song that is no longer
+    /// being played. Dropping the cached scan here is what makes a caller that sets this
+    /// and then reloads the same bytes get a fresh measurement.
+    pub fn set_speed_adjust(&mut self, adjust: i8) {
+        if adjust == self.speed_adjust {
+            return;
+        }
+        self.speed_adjust = adjust;
+        self.scan = None;
+    }
 
     /// Choose what happens when the song has been heard through once.
     pub fn set_at_end(&mut self, at_end: AtEnd) -> Result<(), HostError> {
@@ -871,6 +898,7 @@ impl Player {
             frame,
             &self.handles,
             self.scan.clone(),
+            self.speed_adjust,
         )?;
         let (source, events) = if enabled {
             let (source, producer) = self.build_jam_source(&module, frame, built.source)?;

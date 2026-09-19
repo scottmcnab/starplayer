@@ -52,6 +52,10 @@ const elements = {
     // Load-time sample enhancement (M10-W4). The checkboxes themselves are built into this
     // container from the wasm host's own `enhancements_json()`.
     enhancementOptions: byId('enhancement-options'),
+    // The disclosure every load option lives behind, its one-line summary, and the
+    // experimental tracker-speed bias.
+    loadOptionsDisclosure: byId('load-options-disclosure'), loadOptionsSummary: byId('load-options-summary'),
+    speedAdjust: byId('speed-adjust'),
     // Insert effects (M7-H7).
     effectsTarget: byId('effects-target'), effectsSlots: byId('effects-slots'), effectsReset: byId('effects-reset'),
     // Live input (task E6).
@@ -105,7 +109,7 @@ const state = {
     // bits describe; `sinc4x` may have been silently narrowed by the host's frame budget
     // (`build_enhancement`), which is why `moduleLoaded`/`loadOptionsApplied` also carry
     // the factor that actually ran.
-    activeLoadOptions: { headphoneFriendlyModPanning: false, enhancementFlags: 0 },
+    activeLoadOptions: { headphoneFriendlyModPanning: false, enhancementFlags: 0, speedAdjust: 0 },
     loadOptionsReloadInProgress: false,
     loadOptionsReloadRequested: null,
     /// Parsed from the worklet's first `ready` message: `enhancements_json()`, in
@@ -221,6 +225,12 @@ function restorePreferences() {
         // `ensureEnhancementCheckboxes` can apply it.
         state.pendingEnhancementFlags = Number(saved.enhancementFlags) >>> 0 || 0;
         writeEnhancementFlagsToControls(state.pendingEnhancementFlags);
+        elements.speedAdjust.value = String(clampSpeedAdjust(saved.speedAdjust));
+        // Remembered, so a listener comparing enhancers finds the panel as they left it.
+        // Whether it is open or closed, `renderLoadOptionsSummary` names every option that
+        // is not at its default in the summary line — an option that is silently on and
+        // out of sight is the one thing this disclosure must not do.
+        elements.loadOptionsDisclosure.open = saved.loadOptionsOpen === true;
         if (typeof saved.sinkId === 'string') elements.outputDevice.dataset.savedSinkId = saved.sinkId;
     } catch (_) {
         // Storage may be disabled or contain data from a broken older development build.
@@ -243,6 +253,8 @@ function persistPreferences() {
             // carries.
             headphoneFriendlyModPanning: elements.modHeadphonePanning.checked,
             enhancementFlags: enhancementFlagsFromControls(),
+            speedAdjust: speedAdjustFromControls(),
+            loadOptionsOpen: elements.loadOptionsDisclosure.open,
         }));
     } catch (_) {
         // A private or storage-blocked page still gets fully working in-memory controls.
@@ -251,12 +263,34 @@ function persistPreferences() {
 
 // ── load options (M10-W4) ────────────────────────────────────────────────────────────
 //
-// A load option is anything applied by decoding the module a particular way: the
-// MOD-only panning checkbox and the sample-enhancement checkboxes built from
-// `enhancements_json()`. `loadOptionsFromControls()` is the one record `activateModuleOnNode`
-// and `applyLoadOptions` both send; nothing about a specific enhancer's id, label or
-// description is written here — the checkboxes carry their bit in `dataset.bit`, read
-// straight off `starplayer-enhance::CATALOGUE` through the wasm host.
+// A load option is anything applied when the module is prepared: the MOD-only panning
+// checkbox, the sample-enhancement checkboxes built from `enhancements_json()`, and the
+// experimental speed bias. `loadOptionsFromControls()` is the one record
+// `activateModuleOnNode` and `applyLoadOptions` both send; nothing about a specific
+// enhancer's id, label or description is written here — the checkboxes carry their bit in
+// `dataset.bit`, read straight off `starplayer-enhance::CATALOGUE` through the wasm host.
+//
+// The speed bias is a load option rather than a live command for one reason: the song's
+// timeline — its length, and every seek against it — is measured by the scan that runs
+// during the load. Applying the bias without rescanning would leave the progress slider
+// describing a song nobody is playing.
+
+/// The range the "Adjust speed" control offers, matching the `min`/`max` on the input. A
+/// tracker speed is 1..255, so anything wider than a few ticks either way is a different
+/// song rather than a corrected one.
+const SPEED_ADJUST_LIMIT = 8;
+
+/// Whatever is in the number input, as an integer within range. An empty or unparseable
+/// field is zero: the control's own default, and canonical playback.
+function clampSpeedAdjust(value) {
+    const number = Math.trunc(Number(value));
+    if (!Number.isFinite(number)) return 0;
+    return Math.min(SPEED_ADJUST_LIMIT, Math.max(-SPEED_ADJUST_LIMIT, number));
+}
+
+function speedAdjustFromControls() {
+    return clampSpeedAdjust(elements.speedAdjust.value);
+}
 
 function enhancementFlagsFromControls() {
     let flags = 0;
@@ -276,12 +310,28 @@ function loadOptionsFromControls() {
     return {
         headphoneFriendlyModPanning: elements.modHeadphonePanning.checked,
         enhancementFlags: enhancementFlagsFromControls(),
+        speedAdjust: speedAdjustFromControls(),
     };
 }
 
 function writeLoadOptionsToControls(options) {
     elements.modHeadphonePanning.checked = options.headphoneFriendlyModPanning;
     writeEnhancementFlagsToControls(options.enhancementFlags);
+    elements.speedAdjust.value = String(clampSpeedAdjust(options.speedAdjust));
+}
+
+/// What the closed disclosure says about itself. A summary is the whole point of hiding
+/// these: a listener must be able to see that an option is on without opening the panel.
+function renderLoadOptionsSummary() {
+    const chosen = [];
+    if (elements.modHeadphonePanning.checked) chosen.push('headphone panning');
+    for (const enhancement of state.enhancements) {
+        const input = byId(`enhancement-${enhancement.id}`);
+        if (input && input.checked) chosen.push(enhancement.label.toLowerCase());
+    }
+    const adjust = speedAdjustFromControls();
+    if (adjust !== 0) chosen.push(`speed ${adjust > 0 ? '+' : ''}${adjust}`);
+    elements.loadOptionsSummary.textContent = chosen.length === 0 ? 'default' : chosen.join(' · ');
 }
 
 /** Build one checkbox per `enhancements_json()` entry, the first time `state.enhancements`
@@ -309,6 +359,7 @@ function ensureEnhancementCheckboxes() {
         input.addEventListener('change', () => applyLoadOptions('enhancementFlags').catch(showError));
     }
     writeEnhancementFlagsToControls(state.pendingEnhancementFlags);
+    renderLoadOptionsSummary();
 }
 
 /// The enhancer id `CATALOGUE` gives the sinc upsampler's checkbox, so a reduced
@@ -591,6 +642,7 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
     state.activeLoadOptions = {
         headphoneFriendlyModPanning: metadata.isMod && loadOptions.headphoneFriendlyModPanning,
         enhancementFlags: result.appliedEnhancementFlags ?? loadOptions.enhancementFlags,
+        speedAdjust: loadOptions.speedAdjust,
     };
     state.activationMemoryBytes = result.memoryBytes;
     state.loadCount += 1;
@@ -770,6 +822,7 @@ function activateModuleOnNode(node, buffer, loadOptions = loadOptionsFromControl
             bytes: buffer,
             headphoneFriendlyModPanning: loadOptions.headphoneFriendlyModPanning,
             enhancementFlags: loadOptions.enhancementFlags,
+            speedAdjust: loadOptions.speedAdjust,
         }, [buffer]);
     });
 }
@@ -781,6 +834,7 @@ function activateModuleOnNode(node, buffer, loadOptions = loadOptionsFromControl
 function updateModPanningAvailability() {
     const disabled = state.pendingLoads.size > 0 || state.loadOptionsReloadInProgress;
     elements.modHeadphonePanning.disabled = disabled;
+    elements.speedAdjust.disabled = disabled;
     for (const input of elements.enhancementOptions.querySelectorAll('input[type=checkbox]')) {
         input.disabled = disabled;
     }
@@ -1199,27 +1253,59 @@ function sendCommandsToCurrentGraph(commands) {
     }
 }
 
-/// A load-option checkbox reloads the module the page is holding. `changedKey` is
-/// `'headphoneFriendlyModPanning'` for the panning checkbox or `'enhancementFlags'` for
-/// any enhancement checkbox; only the panning checkbox's early-out is format-restricted —
-/// an enhancement applies to every format, so it always reloads if a module is retained.
+/// How a change to one load option is worded, in the three places `applyLoadOptions` has
+/// to say something: deferred to the next load, being applied, and applied. Keeping the
+/// three together is what stops a new option growing a third ternary in each of them.
+function describeLoadOptionChange(changedKey, options) {
+    if (changedKey === 'headphoneFriendlyModPanning') {
+        const choice = options.headphoneFriendlyModPanning ? 'Headphone-friendly S3M-style 60% spacing' : 'Authentic hard MOD panning';
+        return {
+            deferred: options.headphoneFriendlyModPanning
+                ? 'Headphone-friendly MOD panning saved for the next MOD load.'
+                : 'Authentic MOD panning saved for the next MOD load.',
+            reloading: `Reloading this MOD with ${options.headphoneFriendlyModPanning ? 'S3M-style 60% spacing' : 'authentic hard panning'}…`,
+            applied: `${choice} applied`,
+        };
+    }
+    if (changedKey === 'speedAdjust') {
+        const adjust = options.speedAdjust;
+        const choice = adjust === 0 ? 'Canonical speed' : `Speed adjustment of ${adjust > 0 ? '+' : ''}${adjust}`;
+        return {
+            deferred: `${choice} saved for the next load.`,
+            reloading: `Rescanning and reloading at ${adjust === 0 ? 'the module\u2019s own speeds' : `every speed ${adjust > 0 ? '+' : ''}${adjust}`}…`,
+            applied: `${choice} applied`,
+        };
+    }
+    return {
+        deferred: 'Sample enhancement choice saved for the next load.',
+        reloading: 'Reloading with the new sample enhancement choice…',
+        applied: 'Sample enhancement choice applied',
+    };
+}
+
+/// A load-option control reloads the module the page is holding. `changedKey` is
+/// `'headphoneFriendlyModPanning'` for the panning checkbox, `'speedAdjust'` for the
+/// speed bias, or `'enhancementFlags'` for any enhancement checkbox; only the panning
+/// checkbox's early-out is format-restricted — the other two apply to every format, so
+/// they always reload if a module is retained.
 async function applyLoadOptions(changedKey) {
     const requested = loadOptionsFromControls();
     if (state.loadOptionsReloadInProgress) {
         // A disabled checkbox cannot normally emit another user change, but keeping this
         // guard deterministic also covers scripted changes and a racing load interaction.
         writeLoadOptionsToControls(state.loadOptionsReloadRequested);
+        renderLoadOptionsSummary();
         persistPreferences();
         return;
     }
+    // After the guard, so a refused change is summarised as what is still loading rather
+    // than as what was refused.
+    renderLoadOptionsSummary();
     persistPreferences();
     const modOnlyChange = changedKey === 'headphoneFriendlyModPanning';
+    const wording = describeLoadOptionChange(changedKey, requested);
     if (state.currentModuleBytes === null || state.node === null || (modOnlyChange && !state.metadata?.isMod)) {
-        showMessage(modOnlyChange
-            ? (requested.headphoneFriendlyModPanning
-                ? 'Headphone-friendly MOD panning saved for the next MOD load.'
-                : 'Authentic MOD panning saved for the next MOD load.')
-            : 'Sample enhancement choice saved for the next load.');
+        showMessage(wording.deferred);
         return;
     }
 
@@ -1235,25 +1321,21 @@ async function applyLoadOptions(changedKey) {
     state.loadOptionsReloadRequested = requested;
     updateModPanningAvailability();
     clearError();
-    showMessage(modOnlyChange
-        ? `Reloading this MOD with ${requested.headphoneFriendlyModPanning ? 'S3M-style 60% spacing' : 'authentic hard panning'}…`
-        : 'Reloading with the new sample enhancement choice…');
+    showMessage(wording.reloading);
     try {
         const activation = await activateModuleOnNode(node, state.currentModuleBytes.slice(0), requested);
         if (revision !== state.moduleRevision || node !== state.node) return;
         state.activeLoadOptions = {
             headphoneFriendlyModPanning: requested.headphoneFriendlyModPanning,
             enhancementFlags: activation.appliedEnhancementFlags ?? requested.enhancementFlags,
+            speedAdjust: requested.speedAdjust,
         };
         state.activationMemoryBytes = activation.memoryBytes;
         state.loadCount += 1;
         sendCommandsToCurrentGraph(restoreCommands);
         persistPreferences();
         const reduction = describeEnhancementReduction(requested.enhancementFlags, activation.appliedEnhancementFactor);
-        const applied = modOnlyChange
-            ? `${requested.headphoneFriendlyModPanning ? 'Headphone-friendly S3M-style 60% spacing' : 'Authentic hard MOD panning'} applied`
-            : 'Sample enhancement choice applied';
-        showMessage(`${applied}; playback restored at the sounding order.${reduction ? ` (${reduction}.)` : ''}`);
+        showMessage(`${wording.applied}; playback restored at the sounding order.${reduction ? ` (${reduction}.)` : ''}`);
         setTimeout(requestGarbageCollection, 100);
         setTimeout(requestGarbageCollection, 500);
     } catch (error) {
@@ -1261,6 +1343,7 @@ async function applyLoadOptions(changedKey) {
         // put back whatever else has happened since — a revision check here would leave a
         // failed toggle stored as the user's choice for every future session.
         writeLoadOptionsToControls(previous);
+        renderLoadOptionsSummary();
         persistPreferences();
         if (revision === state.moduleRevision && node === state.node) {
             showError(`Could not change load options: ${error && error.message ? error.message : error}`);
@@ -2138,6 +2221,15 @@ elements.applyOutputDevice.addEventListener('click', () => applyOutputDevice().c
 elements.chooseOutputDevice.addEventListener('click', () => chooseOutputDevice().catch(showError));
 elements.applyMixer.addEventListener('click', applyMixerMode);
 elements.modHeadphonePanning.addEventListener('change', () => applyLoadOptions('headphoneFriendlyModPanning').catch(showError));
+// `change` rather than `input`: a spinner arrow or a typed digit should reload the module
+// once the value has settled, not once per keystroke. The field is normalised back into
+// range first, so a typed 99 reloads at the limit the control offers rather than silently
+// asking the engine for a bias it will clamp anyway.
+elements.speedAdjust.addEventListener('change', () => {
+    elements.speedAdjust.value = String(speedAdjustFromControls());
+    applyLoadOptions('speedAdjust').catch(showError);
+});
+elements.loadOptionsDisclosure.addEventListener('toggle', persistPreferences);
 elements.effectsTarget.addEventListener('change', renderEffectSlotRows);
 // A choice is remembered as it is made, not only when it is applied: the owner's test
 // setup should survive a reload even if the page is reloaded mid-comparison.
@@ -2156,6 +2248,7 @@ if (!sharedMemoryAvailable()) {
     elements.scopeTransport.textContent = 'postMessage fallback (COOP/COEP unavailable)';
 }
 restorePreferences();
+renderLoadOptionsSummary();
 state.activeModeWire = mixerModeFromControls();
 updateOutputPanel();
 updateLiveInputPanel();

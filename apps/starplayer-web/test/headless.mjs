@@ -143,8 +143,10 @@ function buildZip(entries) {
 }
 
 /// A minimal two-pattern MOD. `channels` picks the tag, so the caller can build two
-/// modules that are distinguishable in telemetry by their channel count alone.
-function syntheticMod({ channels = 4, tag = 'M.K.', title = 'headphone test' } = {}) {
+/// modules that are distinguishable in telemetry by their channel count alone. `speed`
+/// puts an `Fxx` speed command on row 0 of channel 0, which is what the "Adjust speed"
+/// option biases — a module with no speed command of its own would show nothing.
+function syntheticMod({ channels = 4, tag = 'M.K.', title = 'headphone test', speed = null } = {}) {
     const headerBytes = 1084;
     const patternBytes = 64 * channels * 4;
     const sampleFrames = 256;
@@ -159,6 +161,12 @@ function syntheticMod({ channels = 4, tag = 'M.K.', title = 'headphone test' } =
     for (let channel = 0; channel < channels; channel += 1) {
         bytes.set([0x01, 0xAC, 0x10, 0x00], headerBytes + channel * 4);
         bytes.set([0x01, 0xAC, 0x10, 0x00], headerBytes + patternBytes + channel * 4);
+    }
+    if (speed !== null) {
+        // Effect F in the low nibble of byte 2, its parameter in byte 3 — on row 0 of both
+        // patterns, so the speed is re-requested rather than merely inherited.
+        bytes.set([0x01, 0xAC, 0x1F, speed], headerBytes);
+        bytes.set([0x01, 0xAC, 0x1F, speed], headerBytes + patternBytes);
     }
     for (let index = headerBytes + patternBytes * 2; index < bytes.length; index += 1) {
         bytes[index] = index & 1 ? 0x80 : 0x7F;
@@ -573,6 +581,37 @@ async function run(executable, mode) {
         assert.deepEqual(raced.pans, ['3', 'C', 'C', '3'], 'the sounding module carries the panning the checkbox claims');
         assert.equal(raced.errorShown, false, 'a raced toggle is not an error');
         report.panningRace = `ui ${displayedChannels}ch = audio ${raced.pans.length}ch, toggle ${raced.headphonePanning}`;
+
+        // ── the experimental speed bias ────────────────────────────────────────────
+        //
+        // The module asks for speed 5 on every row 0. Canonically it plays at 5; biased by
+        // +2 it plays at 7 — deliberately neither 5 nor the MOD's own initial 6, so the
+        // reading cannot be satisfied by the bias being ignored *or* by it reaching the
+        // initial speed, which it must not. Like every load option this rescans, so the
+        // song length the slider draws is measured at the speed being played.
+        await loadFile(page, syntheticMod({ title: 'speed test', speed: 5 }), 'speed.mod');
+        await page.waitFor('the speed-command MOD', "document.getElementById('module-detail').textContent.includes('speed.mod')");
+        await page.waitFor('its first telemetry frame', "document.getElementById('speed').textContent === '5'");
+        const canonicalSpeed = await page.evaluate("return document.getElementById('speed').textContent;");
+        await page.evaluate("const option = document.getElementById('speed-adjust'); option.value = '2'; option.dispatchEvent(new Event('change')); return true;");
+        await page.waitFor('the biased reload', "document.getElementById('speed-adjust').disabled === false && document.getElementById('message').textContent.includes('Speed adjustment of +2 applied')");
+        await page.waitFor('the biased speed to sound', "document.getElementById('speed').textContent === '7'");
+        const biasedSpeed = await page.evaluate("return document.getElementById('speed').textContent;");
+        assert.equal(canonicalSpeed, '5', 'the module asks for speed 5 and canonically gets it');
+        assert.equal(biasedSpeed, '7', 'a +2 adjustment makes every requested speed two ticks longer');
+        assert.match(
+            await page.evaluate("return localStorage.getItem('starplayer.output-and-mixer.v1');"),
+            /"speedAdjust":2/,
+            'the speed adjustment is persisted'
+        );
+        assert.match(
+            await page.evaluate("return document.getElementById('load-options-summary').textContent;"),
+            /speed \+2/,
+            'a non-default option is named in the closed disclosure summary'
+        );
+        await page.evaluate("const option = document.getElementById('speed-adjust'); option.value = '0'; option.dispatchEvent(new Event('change')); return true;");
+        await page.waitFor('the canonical reload', "document.getElementById('speed-adjust').disabled === false && document.getElementById('speed').textContent === '5'");
+        report.speedAdjust = `${canonicalSpeed} \u2192 ${biasedSpeed} \u2192 ${await page.evaluate("return document.getElementById('speed').textContent;")}`;
 
         await loadFixture(page, FIRST_MODULE);
         await page.waitFor('the first module', "document.getElementById('title').textContent !== 'No module loaded'");

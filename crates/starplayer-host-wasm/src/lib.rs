@@ -386,17 +386,23 @@ impl Host {
     /// Decode, construct and queue a module. Called from the worklet's message handler,
     /// never from `process()`; a failed decode leaves the previous module and source live.
     #[cfg(test)]
-    fn load_module(&mut self, bytes: &[u8]) -> Result<u32, String> { self.load_module_with_options(bytes, false, 0) }
+    fn load_module(&mut self, bytes: &[u8]) -> Result<u32, String> { self.load_module_with_options(bytes, false, 0, 0) }
 
     /// `rate_ceiling_hz` for the upsampler is twice the context's own negotiated rate: the
     /// mixer interpolates between real frames up to that rate, and doubling it (rather than
     /// passing the rate itself) leaves room for a resampling interpolator to still find
     /// something to do above the output rate. See [`build_enhancement`] for the frame-budget
     /// fallback `enhancement_flags` may trigger.
-    fn load_module_with_options(&mut self, bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags: u32) -> Result<u32, String> {
+    ///
+    /// `speed_adjust` is added to every speed the module asks for, for a module written
+    /// against a game's own replayer rather than against a tracker. It is set on the
+    /// player *before* the load, because the load is where the song is scanned and the
+    /// timeline has to be measured at the speed the song will play at.
+    fn load_module_with_options(&mut self, bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags: u32, speed_adjust: i8) -> Result<u32, String> {
         let rate_ceiling_hz = self.sample_rate_hz.saturating_mul(2);
         let (module, applied_flags, factor) =
             decode(bytes, headphone_friendly_mod_panning, enhancement_flags, rate_ceiling_hz).map_err(|error| error.to_string())?;
+        self.player.set_speed_adjust(speed_adjust);
         // Everything expensive — the scan, the sequencer, the per-channel state — happens
         // inside this call, on this thread. Only a `Box` and two `Arc`s cross to the render
         // callback, and whatever they replace comes back here to be dropped.
@@ -709,19 +715,25 @@ mod exports {
 
     /// Decode and activate one validated native module byte buffer outside `process()`.
     #[wasm_bindgen]
-    pub fn load_module(bytes: &[u8]) -> Result<u32, JsValue> { load_module_with_options(bytes, false, 0) }
+    pub fn load_module(bytes: &[u8]) -> Result<u32, JsValue> { load_module_with_options(bytes, false, 0, 0) }
 
     /// Decode and activate a module with web-player loading preferences. The panning
     /// option is deliberately MOD-specific; every other format continues through its
     /// native loader. `enhancement_flags` is the bit word [`enhancements_json`] describes
     /// (M10-W4); [`applied_enhancement_flags`] and [`applied_enhancement_factor`] report
     /// what this call actually did, since a frame-budget fallback can narrow the request.
+    ///
+    /// `speed_adjust` is added to every speed the module asks for — zero is canonical
+    /// playback, and the page's own "Adjust speed" control is the only thing that sets it.
+    /// It is clamped to a tick count a row clock can hold, so a page cannot ask for a
+    /// bias the engine has no way to express.
     #[wasm_bindgen]
-    pub fn load_module_with_options(bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags: u32) -> Result<u32, JsValue> {
+    pub fn load_module_with_options(bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags: u32, speed_adjust: i32) -> Result<u32, JsValue> {
+        let speed_adjust = speed_adjust.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
         HOST.with(|cell| {
             let mut slot = cell.try_borrow_mut().map_err(|_| JsValue::from_str("the worklet host is busy"))?;
             let host = slot.as_mut().ok_or_else(|| JsValue::from_str("the worklet host is not initialized"))?;
-            host.load_module_with_options(bytes, headphone_friendly_mod_panning, enhancement_flags).map_err(|message| JsValue::from_str(&message))
+            host.load_module_with_options(bytes, headphone_friendly_mod_panning, enhancement_flags, speed_adjust).map_err(|message| JsValue::from_str(&message))
         })
     }
 
@@ -985,6 +997,28 @@ mod tests {
         bytes
     }
 
+    /// [`minimal_mod`] whose first row asks for speed 5, so a speed *request* exists for
+    /// `load_module_with_options`'s `speed_adjust` to bias.
+    fn speed_requesting_mod() -> Vec<u8> {
+        let mut bytes = minimal_mod();
+        let cell = starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0xF, param: 0x05 };
+        bytes[1084..1088].copy_from_slice(&cell.to_bytes());
+        bytes
+    }
+
+    /// The page's "Adjust speed" control, end to end: the module asks for speed 5 and the
+    /// engine runs the row at 5 + the adjustment, with the module's own bytes untouched.
+    #[test]
+    fn the_speed_adjustment_biases_what_the_module_asks_for() {
+        let bytes = speed_requesting_mod();
+        for (adjust, expected) in [(0i32, 5u8), (1, 6), (3, 8), (-4, 1)] {
+            let mut host = Host::new(48_000);
+            assert_eq!(host.load_module_with_options(&bytes, false, 0, adjust as i8), Ok(1));
+            for _ in 0..4 { host.process(RENDER_QUANTUM); }
+            assert_eq!(host.player.telemetry().transport.speed, expected, "speed 5 biased by {adjust}");
+        }
+    }
+
     fn minimal_mtm() -> Vec<u8> {
         const SAMPLE_FRAMES: usize = 256;
         const SAMPLE_HEADER: usize = 66;
@@ -1180,22 +1214,22 @@ mod tests {
     fn mod_headphone_option_changes_only_mod_initial_panning() {
         let mut host = Host::new(48_000);
         let mod_bytes = minimal_mod();
-        assert_eq!(host.load_module_with_options(&mod_bytes, false, 0), Ok(1));
+        assert_eq!(host.load_module_with_options(&mod_bytes, false, 0, 0), Ok(1));
         let hard: Vec<i16> = host.player.module().expect("MOD retained").header().default_pan.iter().map(|pan| pan.to_bits()).collect();
         assert_eq!(hard, [-32_767, 32_767, 32_767, -32_767]);
-        assert_eq!(host.load_module_with_options(&mod_bytes, true, 0), Ok(2));
+        assert_eq!(host.load_module_with_options(&mod_bytes, true, 0, 0), Ok(2));
         let headphone: Vec<i16> = host.player.module().expect("MOD retained").header().default_pan.iter().map(|pan| pan.to_bits()).collect();
         assert_eq!(headphone, [-19_660, 19_660, 19_660, -19_660]);
 
-        assert_eq!(host.load_module_with_options(FIXTURE, false, 0), Ok(3));
+        assert_eq!(host.load_module_with_options(FIXTURE, false, 0, 0), Ok(3));
         let s3m_authentic = host.player.module().expect("S3M retained").header().default_pan.to_vec();
-        assert_eq!(host.load_module_with_options(FIXTURE, true, 0), Ok(4));
+        assert_eq!(host.load_module_with_options(FIXTURE, true, 0, 0), Ok(4));
         assert_eq!(host.player.module().expect("S3M retained").header().default_pan.as_ref(), s3m_authentic.as_slice());
 
         let mtm_bytes = minimal_mtm();
-        assert_eq!(host.load_module_with_options(&mtm_bytes, false, 0), Ok(5));
+        assert_eq!(host.load_module_with_options(&mtm_bytes, false, 0, 0), Ok(5));
         let mtm_authentic = host.player.module().expect("MTM retained").header().default_pan.to_vec();
-        assert_eq!(host.load_module_with_options(&mtm_bytes, true, 0), Ok(6));
+        assert_eq!(host.load_module_with_options(&mtm_bytes, true, 0, 0), Ok(6));
         assert_eq!(host.player.module().expect("MTM retained").header().default_pan.as_ref(), mtm_authentic.as_slice());
     }
 
@@ -1208,7 +1242,7 @@ mod tests {
         let plain_lengths: Vec<u32> = plain.player.module().expect("retained").samples().iter().map(|sample| sample.length_frames()).collect();
 
         let mut unflagged = Host::new(48_000);
-        assert_eq!(unflagged.load_module_with_options(FIXTURE, false, 0), Ok(1));
+        assert_eq!(unflagged.load_module_with_options(FIXTURE, false, 0, 0), Ok(1));
         let unflagged_lengths: Vec<u32> =
             unflagged.player.module().expect("retained").samples().iter().map(|sample| sample.length_frames()).collect();
         assert_eq!(unflagged_lengths, plain_lengths, "flags 0 is byte-identical to the no-options load");
@@ -1224,7 +1258,7 @@ mod tests {
         assert!(plain_lengths.iter().all(|length| *length > 0), "the fixture actually carries samples to enhance");
 
         let mut enhanced = Host::new(48_000);
-        assert_eq!(enhanced.load_module_with_options(FIXTURE, false, ENHANCE_FLAG_UPSAMPLE), Ok(1));
+        assert_eq!(enhanced.load_module_with_options(FIXTURE, false, ENHANCE_FLAG_UPSAMPLE, 0), Ok(1));
         let enhanced_module = enhanced.player.module().expect("retained");
         for (plain_length, sample) in plain_lengths.iter().zip(enhanced_module.samples().iter()) {
             assert_eq!(sample.length_frames(), plain_length * 4, "sinc4x quadruples every sample's stored length");
@@ -1317,7 +1351,7 @@ mod tests {
         assert_eq!(all_bits, 0b1111, "four checkbox enhancers, bits 0 to 3");
 
         let mut host = Host::new(48_000);
-        assert_eq!(host.load_module_with_options(FIXTURE, false, all_bits), Ok(1));
+        assert_eq!(host.load_module_with_options(FIXTURE, false, all_bits, 0), Ok(1));
         assert_eq!(host.last_applied_enhancement_flags, all_bits, "every bit engaged");
         assert_eq!(host.last_enhancement_factor, 4);
         assert!((0..40).any(|_| host.process(RENDER_QUANTUM) > 0.0), "the enhanced module still plays");
@@ -1326,7 +1360,7 @@ mod tests {
     #[test]
     fn an_unknown_enhancement_bit_is_ignored_like_from_flags() {
         let mut host = Host::new(48_000);
-        assert_eq!(host.load_module_with_options(FIXTURE, false, 0xFFFF_FFF0), Ok(1), "no known bit is set");
+        assert_eq!(host.load_module_with_options(FIXTURE, false, 0xFFFF_FFF0, 0), Ok(1), "no known bit is set");
         assert_eq!(host.last_applied_enhancement_flags, 0);
         assert_eq!(host.last_enhancement_factor, 1);
     }
@@ -1359,11 +1393,11 @@ mod tests {
         // difference is `Module::enhanced`'s own polyphase-filter work.
         let mut host = Host::new(48_000);
         let plain_started = std::time::Instant::now();
-        assert_eq!(host.load_module_with_options(LARGEST_FIXTURE, false, 0), Ok(1));
+        assert_eq!(host.load_module_with_options(LARGEST_FIXTURE, false, 0, 0), Ok(1));
         let plain_elapsed = plain_started.elapsed();
 
         let enhanced_started = std::time::Instant::now();
-        assert_eq!(host.load_module_with_options(LARGEST_FIXTURE, false, ENHANCE_FLAG_UPSAMPLE), Ok(2));
+        assert_eq!(host.load_module_with_options(LARGEST_FIXTURE, false, ENHANCE_FLAG_UPSAMPLE, 0), Ok(2));
         let enhanced_elapsed = enhanced_started.elapsed();
         assert_eq!(host.last_enhancement_factor, 4, "PETRI.S3M is nowhere near the frame budget, so the full 4x ran");
 

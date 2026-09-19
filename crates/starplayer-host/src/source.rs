@@ -238,7 +238,14 @@ pub struct BuiltSource {
 ///
 /// Off the audio thread: it allocates the scan's sequencer, voice pool and timeline.
 pub fn scan_module(module: &RtArc<Module>, sample_rate_hz: u32) -> Result<ScannedSong, Error> {
-    starplayer::scan_song(module, sample_rate_hz, ScanLimits::for_rate(sample_rate_hz))
+    scan_module_with_speed_adjust(module, sample_rate_hz, 0)
+}
+
+/// [`scan_module`] at the speed adjustment playback will run at, so the timeline measures
+/// the song the listener hears — see
+/// [`Player::set_speed_adjust`](crate::Player::set_speed_adjust).
+pub fn scan_module_with_speed_adjust(module: &RtArc<Module>, sample_rate_hz: u32, speed_adjust: i8) -> Result<ScannedSong, Error> {
+    starplayer::scan_song_with_speed_adjust(module, sample_rate_hz, ScanLimits::for_rate(sample_rate_hz), speed_adjust)
 }
 
 /// Build the playback source, scanning the song first unless the caller already has the
@@ -246,7 +253,9 @@ pub fn scan_module(module: &RtArc<Module>, sample_rate_hz: u32) -> Result<Scanne
 ///
 /// A caller that already holds one passes it: a mixer-mode rebuild changes nothing the scan
 /// depends on — the timeline is a function of the output rate and the module's dialect, and
-/// of nothing the mixer chooses (architecture §4.1).
+/// of nothing the mixer chooses (architecture §4.1). `speed_adjust` is not in that set: a
+/// cached scan is only reusable at the adjustment it was measured under, so a caller that
+/// changes it must pass `None` and let the song be scanned again.
 ///
 /// The scan decides the quirks — for a MOD it is the scan, not the header, that settles CIA
 /// against VBlank — and the playback sequencer is built from exactly the set the timeline
@@ -260,14 +269,18 @@ pub fn build_source(
     frame: Frame,
     handles: &SourceHandles,
     cached_scan: Option<Arc<ScannedSong>>,
+    speed_adjust: i8,
 ) -> Result<BuiltSource, Error> {
     let scanned = match cached_scan {
         Some(scanned) => scanned,
-        None => Arc::new(scan_module(&module, sample_rate_hz)?),
+        None => Arc::new(scan_module_with_speed_adjust(&module, sample_rate_hz, speed_adjust)?),
     };
     let at_end = handles.at_end.get();
     let quirks = QuirkSelection::Override(scanned.quirks);
     let mut sequencer = NativeSequencer::new(module, sample_rate_hz, quirks)?;
+    // Before the timeline, and before any seek: a seek restores the timing the scan
+    // recorded, which is already biased, and the sequencer needs the bias to read it back.
+    sequencer.set_speed_adjust(speed_adjust);
     sequencer.set_timeline(scanned.timeline.clone());
     sequencer.set_at_end(at_end);
     match start {
