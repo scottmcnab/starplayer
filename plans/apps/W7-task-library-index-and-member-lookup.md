@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W11, branch `library-playlist`) |
-| Status | Specified 2026-10-21; not started |
+| Status | Implemented 2026-10-21 on `library-playlist` |
 | Depends on | B8/B10 (`starplayer-archive`, landed) |
 | Blocks | [W8](W8-task-library-sources-and-resolver.md), [W9](W9-task-library-view.md), [W10](W10-task-playback-controller-and-playlist.md), [W11](W11-task-playlist-uploads-and-persistence.md) |
 | Recommended model | gpt-6.1-sol |
@@ -237,3 +237,66 @@ Report the measured scale timings and the Hornet-file parse result in the final 
 
 UI, sources, the dev server and playback (W8–W10); persistence (W11); 669/FAR/ULT/MED
 playback; fetching `source_url`.
+
+## Research-point results
+
+1. Confirmed against zip 9.0.5: `read/zip_archive.rs::by_index_raw` constructs a
+   `ZipFileReader::Raw` with borrowed name bytes. `types.rs::find_content` reads the
+   fixed local header to locate the payload and returns a bounded raw reader; it
+   neither reads compressed payload bytes nor constructs a decompressor.
+   `read/zipfile.rs` exposes both `name_raw()` and `is_dir()` on this entry. The new
+   lookup regression passes for methods 0, 1, 2, 3, 4, 5, 6 and 8 with deliberately
+   invalid payload streams, covering every B10-supported compression method.
+2. Final standalone Node run on this machine (37,674 synthetic records): parse and
+   normalise **223.5 ms** (<1000), two-token search **3.7 ms** (<50), title sort
+   **25.0 ms** (<300), tree construction **30.6 ms** (<300). No profiling or parser
+   restructuring was necessary. The local Hornet CSV parsed read-only as **9,585
+   rows, zero issues**, **77.4 ms** including the file read. No metadata rows were
+   copied into the repository; fixtures and scale records are synthetic.
+
+## Implementation results
+
+Implemented W7's archive lookup, page-thread extraction exports, pure JavaScript
+library/playlist data layer, synthetic regression/scale tests, and public CSV
+contract linked from the web README. Existing app load/UI behavior is unchanged;
+W8–W11's specified interfaces remain the downstream integration boundary.
+
+Design decisions:
+
+* Lookup scans raw entries and retains the first raw-byte and encoded-byte matches
+  independently, so a later explicit raw match wins over an earlier UTF-8/CP437
+  candidate. Only the decoded case/separator fallback requires uniqueness.
+* Both extraction exports delegate to plain Rust functions. Inner ZIP extraction
+  uses the existing size-limited extractor and validates the inner ZIP signature.
+  Raw hex is validated before decoding and applies only to the final member.
+* CSV scanning preserves embedded field text and records physical row-start lines.
+  Browse ids are contiguous after filtering and deduplication. Search haystacks and
+  lower-case lexical sort keys are parallel arrays computed once during parsing.
+  Numeric nulls sort first ascending; ties use folder, name, then original row id.
+* `buildTree` returns a root node (`path: ''`) with recursive playable counts and
+  explicit ZIP/nested-ZIP nodes. Playlist import retains duplicate locators and
+  their order. Library identity hashes exact CSV bytes followed by UTF-8 name bytes
+  and returns `{sha256, name}`; these choices are documented in `LIBRARY-CSV.md`.
+
+Final verification, builds run sequentially:
+
+```text
+cargo test -p starplayer-archive -p starplayer-web
+  archive: 20 passed, 0 failed, 1 existing ignored manual oracle test
+  web:     11 passed, 0 failed
+  doc-tests: passed
+node --test apps/starplayer-web/test/library-index.test.mjs
+  11 passed, 0 failed, 0 skipped (timings and Hornet result above)
+cargo xtask ci
+  xtask ci: 11 job(s) passed
+```
+
+The initial CI run lacked the pinned libxmp corpus cache, so conformance and
+real-time safety could not run. `cargo xtask conformance --fetch-only` downloaded
+and checksum-verified it under this worktree's `target/`; the complete CI rerun
+passed, including both previously blocked jobs. Verification logs are retained
+under `target/w7-verification/` (ignored build artifacts).
+
+No W7 implementation items remain open. UI, sources, resolver, playback and
+persistence remain W8–W11 work. No staging, commits, formatting runs, unsafe blocks
+or npm dependencies were introduced. ModDNA and the Hornet mirror were not modified.

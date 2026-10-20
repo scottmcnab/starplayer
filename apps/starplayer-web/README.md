@@ -1,5 +1,8 @@
 # StarPlayer web player
 
+The [library and playlist CSV contract](LIBRARY-CSV.md) describes indexes accepted
+by the library data layer and the locator format used by library/playlist work.
+
 Build and serve the player from the repository root:
 
 ```text
