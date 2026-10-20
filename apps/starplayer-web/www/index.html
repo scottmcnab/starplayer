@@ -52,6 +52,17 @@
                 <select id="archive-tracks" aria-label="Track from the last ZIP" hidden></select>
                 <button id="load-archive-track" hidden>Load from ZIP</button>
             </div>
+            <div class="load-actions" aria-label="Library sources">
+                <span>Library</span>
+                <button id="library-folder" type="button">Open library folder</button>
+                <button id="library-reconnect" type="button" hidden>Reconnect</button>
+                <button id="library-open-index" type="button">Open index CSV…</button>
+                <button id="library-server" type="button" hidden>Server library</button>
+                <input id="library-files" type="file" webkitdirectory multiple hidden>
+                <input id="library-index" type="file" accept=".csv,text/csv" hidden>
+                <select id="library-choices" aria-label="Library index CSV" hidden></select>
+            </div>
+            <p id="library-summary" role="status"></p>
             <form id="url-form" class="url-form">
                 <input id="url" type="url" inputmode="url" value="https://modland.com/pub/modules/Screamtracker%203/Purple%20Motion/unreal%20%5D%5B.s3m" placeholder="https://example.com/song.xm" aria-label="S3M, MOD, MTM, XM, IT, or ZIP URL">
                 <button type="submit">Load URL</button>

@@ -1,3 +1,4 @@
+import { wireLibraryControls } from './library-controls.js';
 import initLoader, * as Loader from './starplayer_web.js';
 
 const Ring = globalThis.StarPlayerRing;
@@ -65,6 +66,7 @@ const elements = {
 };
 
 const state = {
+    library: null,
     context: null,
     node: null,
     startPromise: null,
@@ -2258,6 +2260,7 @@ requestAnimationFrame(refresh);
 // The fixture menu is part of start-up, not a background nicety: the harness picks an
 // entry the moment `playerReady` appears, so the fetch has to have settled before it does.
 await populateFixtureMenu();
+await wireLibraryControls({ state, loader: Loader });
 
 // `app.js` is a module and therefore deferred. This is the one honest signal that its
 // listeners are attached, which is what the headless harness waits on before clicking.

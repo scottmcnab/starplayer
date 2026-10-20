@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W11, branch `library-playlist`) |
-| Status | Specified 2026-10-21; not started |
+| Status | Implemented 2026-10-21 on `library-playlist`; owner check of the external folder picker and permission regrant outstanding |
 | Depends on | [W7](W7-task-library-index-and-member-lookup.md) (interfaces, `library-index.js`, `archive_extract_path`) |
 | Blocks | [W9](W9-task-library-view.md), [W10](W10-task-playback-controller-and-playlist.md), [W11](W11-task-playlist-uploads-and-persistence.md) |
 | Recommended model | gpt-6.1-sol |
@@ -154,3 +154,114 @@ the summary line reads 9,585 tracks. Never write into `/mnt/d/hornet-music`.
 
 The library table/tree/search UI (W9), playing tracks and the playlist (W10), uploads and
 persistence of the playlist (W11), fetching `source_url`.
+
+## Research-point results
+
+1. Chromium supports structured-cloning file/directory handles into IndexedDB;
+   permissions are separate from handle persistence. Chrome documents rechecking
+   with `queryPermission` / `requestPermission` on subsequent visits, including
+   optional persistent grants since Chrome 122:
+   [File System Access](https://developer.chrome.com/docs/capabilities/web-apis/file-system-access),
+   [persistent permissions](https://developer.chrome.com/blog/persistent-permissions-for-the-file-system-access-api).
+   In installed headless Chrome 156.0.8078.4, an actual OPFS directory handle passed
+   through this implementation's `starplayer-library` / `handles` store, retained
+   `isSameEntry`, survived a page reload, displayed Reconnect, and returned
+   `granted` from both permission methods. OPFS permissions are always granted;
+   this does **not** validate the external-folder permission prompt. Selecting an
+   external folder and exercising permission denial/regrant across visits remains
+   interactive owner acceptance.
+2. The isolated localhost page reported `crossOriginIsolated: true`, secure context,
+   and `showDirectoryPicker` availability. Invoking the picker through DevTools
+   with user activation reached a headless cancellation (`AbortError`), rather
+   than `SecurityError`. This agrees with the
+   [picker specification](https://wicg.github.io/file-system-access/#api-showdirectorypicker):
+   secure context, same-origin top-level access, and transient activation govern
+   access; COOP/COEP does not prohibit it. Completing native folder selection is
+   still an interactive check.
+
+## Implementation results
+
+Implemented W8 in this worktree without staging or committing. W7's parser and
+archive lookup are unchanged; member/container names (including DOS backslashes)
+pass unchanged to the wasm lookup.
+
+Files and responsibilities:
+
+* `www/library-source.js`: directory, FileList and HTTP adapters; root CSV
+  discovery; immediate read-only picker invocation; handle persistence in the
+  version-1 `starplayer-library` IndexedDB database; reconnect permission request.
+  FileList mapping strips exactly one root component without reading contents.
+  HTTP paths encode individual segments; HEAD supplies sizes, including unknown
+  lengths; source errors include the path.
+* `www/track-resolver.js`: library-only resolver, size checks before reads and
+  again after unknown-size reads, byte-budgeted LRU, oversized-cache bypass,
+  fresh returned buffers, cancellation after each asynchronous boundary,
+  serialized reads/extractions, cache-only prefetch and cache clearing.
+* `www/library-controls.js`, `www/index.html`, `www/app.js`: source row,
+  separately selected CSV followed by a separate folder click, multiple-CSV
+  choice, reconnect, optional server source, summary and first three issues.
+  Successful selections replace `state.library` with
+  `{ source, library, identity, resolver }` and clear the previous resolver.
+* `dev-server.mjs`: optional library/index mappings; segment validation and
+  realpath confinement for library and document roots; malformed URL handling;
+  GET/HEAD, regular-file checks and common isolation headers. HEAD does not read
+  file contents. Port 0 supports ephemeral integration-test servers and logs the
+  actual assigned port.
+* `xtask/src/main.rs`: both library flags in `serve` and `wasm --serve`, with
+  usage text and otherwise unchanged serving/build behavior.
+* `test/{dev-server-library,library-source,track-resolver}.test.mjs`: synthetic
+  tests for route confinement, headers/methods, index mapping, source discovery,
+  encoded names, size handling, picker ordering, denial, LRU/copies, aborts,
+  serialization, errors and prefetch failure recovery.
+* `LIBRARY-CSV.md`: source selection, reconnect, FileList reload limitation and
+  server-option documentation.
+
+Design decisions:
+
+* Source validation applies only to filesystem paths; archive member names are
+  opaque lookup arguments. HTTP and document routes decode once per segment,
+  reject encoded separators/dot segments, then require realpath containment.
+  The explicitly mapped index may live outside the library root.
+* Cache storage owns a copy of read bytes and the extractor receives another
+  copy, protecting cache contents even from a mutating loader. Extracted results
+  are copied into a fresh caller-owned ArrayBuffer. A generation counter prevents
+  an in-flight read from repopulating a cleared cache.
+* Source-control logic is isolated from the existing app, whose changes are only
+  an import, the library state slot and the startup wiring call. Folder picking
+  and reconnect permission requests start directly in their click handlers.
+  IndexedDB storage failure does not prevent the current selection from working.
+
+Verification (build commands ran sequentially):
+
+```text
+node --test apps/starplayer-web/test/*.test.mjs
+  24 passed, 0 failed, 0 skipped
+  Hornet CSV (read-only): 9,585 rows, 0 issues
+  37,674-row scale: parse 248.2 ms, search 4.1 ms, title sort 30.0 ms,
+  tree 29.4 ms (all W7 budgets passed)
+cargo xtask wasm
+  passed; final package includes all three new JavaScript modules
+cargo xtask ci
+  xtask ci: 11 job(s) passed
+  host-tests, conformance, rt-safety, goldens, simd, fma-check,
+  trace-zero-cost, wasm-build, no-std-check, clippy, no-std-purity
+git diff --check
+  passed
+```
+
+The actual `cargo xtask serve --library /mnt/d/hornet-music --library-index
+/home/scott/projects/moddna/index/hornet/hornet-modules.csv` mapping was exercised
+with an ephemeral port in headless Chromium. On the final package, the browser
+showed **9,585 tracks, 0 issues, from server library** and the HTTP source plus
+resolver plus actual wasm loader extracted a real archive member into a fresh
+**16,646-byte** module buffer. No playback was initiated. No unexpected browser
+console errors occurred. Handle persistence/reload and isolated picker checks are
+detailed above. Logs and browser harnesses are ignored artifacts under
+`target/w8-verification/`.
+
+No implementation items remain open. Interactive external-folder selection and
+permission denial/regrant remain owner acceptance, as distinguished from the
+headless OPFS persistence and picker-cancellation evidence above. W9–W11 UI,
+playback, uploads and playlist persistence remain out of scope. No formatting run,
+unsafe code or npm dependency was introduced. The Hornet mirror and ModDNA files
+were read only; no CSV rows were copied into repository fixtures or source files.

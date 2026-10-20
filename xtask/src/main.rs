@@ -316,11 +316,11 @@ fn print_usage() {
     println!("  perceptual [--corpus PATH]... [--threshold-snr DB] [--offline]");
     println!("                     score the float render against libopenmpt's; nightly report, never a gate");
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
-    println!("  wasm [--serve] [--pages]   build and package the web player into apps/starplayer-web/dist");
+    println!("  wasm [--serve] [--pages] [--library DIR] [--library-index FILE]   build and package the web player into apps/starplayer-web/dist");
     println!("                     --pages packages it for GitHub Pages: no bundled fixtures, and index.html");
     println!("                     loads the coi-serviceworker shim that supplies the COOP/COEP headers Pages cannot;");
     println!("                     it also stages the A4-N1 cast probe under dist/cast-probe/ (see `cast-probe` above)");
-    println!("  serve [--port N] [--host ADDR]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
+    println!("  serve [--port N] [--host ADDR] [--library DIR] [--library-index FILE]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
     println!("                     --host 0.0.0.0 exposes it to the LAN; add --tls [--tls-san ip,ip] there, since AudioWorklet");
     println!("                     and SharedArrayBuffer only exist in a secure context (https or localhost)");
     println!();
@@ -2032,6 +2032,7 @@ const CAST_PROBE_STAGING_SUBDIRECTORY: &str = "cast-probe";
 /// `coi-serviceworker` script tag, since Pages cannot send the COOP/COEP headers
 /// `SharedArrayBuffer` needs. The development build leaves both alone.
 fn run_wasm(arguments: &[String]) -> bool {
+    let mut library_options = Vec::new();
     let mut serve_afterwards = false;
     let mut pages_build = false;
     let mut port = DEFAULT_SERVE_PORT;
@@ -2045,6 +2046,15 @@ fn run_wasm(arguments: &[String]) -> bool {
             "--pages" => {
                 pages_build = true;
                 index += 1;
+            }
+            "--library" | "--library-index" => {
+                let Some(value) = arguments.get(index + 1).filter(|value| !value.starts_with("--")) else {
+                    eprintln!("xtask: `{}` needs a value", arguments[index]);
+                    return false;
+                };
+                library_options.push(arguments[index].clone());
+                library_options.push(value.clone());
+                index += 2;
             }
             "--port" => {
                 let Some(value) = arguments.get(index + 1) else {
@@ -2140,7 +2150,7 @@ fn run_wasm(arguments: &[String]) -> bool {
     println!();
     println!("xtask wasm: packaged into {}", output_directory.display());
     if serve_afterwards {
-        return serve(&root, port, DEFAULT_SERVE_HOST, None);
+        return serve(&root, port, DEFAULT_SERVE_HOST, None, &library_options);
     }
     println!("     run `cargo xtask serve` and open http://localhost:{DEFAULT_SERVE_PORT}/");
     true
@@ -2521,6 +2531,7 @@ fn collect_output_listing(directory: &Path, prefix: &str, listing: &mut Vec<(Str
 /// Serve the packaged build with the COOP/COEP headers `SharedArrayBuffer` requires.
 fn run_serve(arguments: &[String]) -> bool {
     let mut port = DEFAULT_SERVE_PORT;
+    let mut library_options = Vec::new();
     let mut host = DEFAULT_SERVE_HOST.to_string();
     let mut tls_subject_alt_names: Option<String> = None;
     let mut index = 0;
@@ -2546,6 +2557,15 @@ fn run_serve(arguments: &[String]) -> bool {
                 host = value.clone();
                 index += 2;
             }
+            "--library" | "--library-index" => {
+                let Some(value) = arguments.get(index + 1).filter(|value| !value.starts_with("--")) else {
+                    eprintln!("xtask: `{}` needs a value", arguments[index]);
+                    return false;
+                };
+                library_options.push(arguments[index].clone());
+                library_options.push(value.clone());
+                index += 2;
+            }
             "--port" => {
                 let Some(value) = arguments.get(index + 1) else {
                     eprintln!("xtask serve: `--port` needs a value");
@@ -2564,12 +2584,12 @@ fn run_serve(arguments: &[String]) -> bool {
             }
         }
     }
-    serve(&workspace_root(), port, &host, tls_subject_alt_names.as_deref())
+    serve(&workspace_root(), port, &host, tls_subject_alt_names.as_deref(), &library_options)
 }
 
 /// `tls_subject_alt_names`: `None` for plain http; `Some(list)` for https with a self-signed
 /// certificate whose subjectAltName carries the comma-separated `list` (may be empty).
-fn serve(root: &Path, port: u16, host: &str, tls_subject_alt_names: Option<&str>) -> bool {
+fn serve(root: &Path, port: u16, host: &str, tls_subject_alt_names: Option<&str>, library_options: &[String]) -> bool {
     let output_directory = root.join(WEB_OUTPUT_DIRECTORY);
     if !output_directory.join("index.html").exists() {
         eprintln!("xtask serve: `{}` is not packaged yet — run `cargo xtask wasm` first", output_directory.display());
@@ -2579,6 +2599,7 @@ fn serve(root: &Path, port: u16, host: &str, tls_subject_alt_names: Option<&str>
     let script = root.join(DEV_SERVER_SCRIPT);
     let mut node = Command::new("node");
     node.arg(&script).args(["--port", &port.to_string(), "--host", host, "--root"]).arg(&output_directory);
+    node.args(library_options);
     if let Some(subject_alt_names) = tls_subject_alt_names {
         node.arg("--tls");
         if !subject_alt_names.is_empty() {

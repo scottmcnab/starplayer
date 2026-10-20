@@ -109,3 +109,21 @@ source_path,container_member,member_path,member_path_raw_hex,title,format_detect
 An A–B–A list stays A–B–A on export/import. Non-ASCII names and raw hex survive,
 as do titles containing quotes, commas and newlines. The CSV records locators and
 library names; identity rebinding and persistence belong to W11.
+
+## Opening a library in the web player
+
+Use **Open library folder** to select the root. The player prefers a root
+`index.csv` (case-insensitive), otherwise the only root CSV, or offers a choice
+when several exist. **Open index CSV…** selects an index stored elsewhere; then
+click **Open library folder** separately to grant access to its files.
+
+Chromium's directory picker requires a secure context (localhost or HTTPS). Its
+read-only handle is stored in IndexedDB when available; after reloading, click
+**Reconnect <name>** to request read permission again. Other browsers use a folder
+file input: this selection cannot be restored, so choose the folder again after
+every reload. No library files are uploaded to a server.
+
+For a local HTTP source, run `cargo xtask serve --library <directory>` and select
+**Server library**. The default index is `<directory>/index.csv`; supply
+`--library-index <file>` when it lives elsewhere. Both options also work with
+`cargo xtask wasm --serve`. Without `--library`, the server source is hidden.

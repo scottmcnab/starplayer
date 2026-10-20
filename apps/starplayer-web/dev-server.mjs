@@ -17,7 +17,7 @@
 // of the player is exercised: the page detects that `SharedArrayBuffer` is unavailable,
 // says so, and drives the worklet over batched `postMessage` instead.
 //
-// Usage: node apps/starplayer-web/dev-server.mjs [--port 8080] [--host 127.0.0.1] [--root <dir>] [--no-isolation] [--tls [--tls-san IP,DNS,...]]
+// Usage: node apps/starplayer-web/dev-server.mjs [--port 8080] [--host 127.0.0.1] [--root <dir>] [--library <dir>] [--library-index <file>] [--no-isolation] [--tls [--tls-san IP,DNS,...]]
 //
 // `--host 0.0.0.0` exposes the server to the LAN (a phone, or another machine). Note that a
 // plain-http LAN origin is not a secure context, so the browser withholds
@@ -36,8 +36,8 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readFile, stat } from 'node:fs/promises';
-import { join, normalize, extname, resolve } from 'node:path';
+import { readFile, stat, realpath } from 'node:fs/promises';
+import { join, extname, resolve, sep } from 'node:path';
 
 const CONTENT_TYPES = {
     '.html': 'text/html; charset=utf-8',
@@ -64,6 +64,9 @@ function parseArguments(argv) {
         } else if (argv[index] === '--root') {
             options.root = argv[index + 1];
             index += 1;
+        } else if (argv[index] === '--library' || argv[index] === '--library-index') {
+            if (!argv[index + 1] || argv[index + 1].startsWith('--')) throw new Error(`${argv[index]} needs a value`);
+            options[argv[index] === '--library' ? 'library' : 'libraryIndex'] = argv[++index];
         } else if (argv[index] === '--no-isolation') {
             options.isolate = false;
         } else if (argv[index] === '--tls') {
@@ -75,14 +78,16 @@ function parseArguments(argv) {
             throw new Error(`unexpected argument \`${argv[index]}\``);
         }
     }
-    if (!Number.isInteger(options.port) || options.port <= 0 || options.port > 65535) {
+    if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
         throw new Error(`invalid port \`${options.port}\``);
     }
     return options;
 }
 
 const options = parseArguments(process.argv.slice(2));
-const documentRoot = resolve(options.root);
+const documentRoot = await realpath(resolve(options.root));
+const libraryRoot = options.library ? await realpath(resolve(options.library)) : null;
+const libraryIndex = libraryRoot ? resolve(options.libraryIndex ?? join(libraryRoot, 'index.csv')) : null;
 
 function applyCommonHeaders(response) {
     if (options.isolate) {
@@ -95,16 +100,15 @@ function applyCommonHeaders(response) {
     response.setHeader('Cache-Control', 'no-store');
 }
 
-/**
- * Resolves a URL path to a file inside the document root, or null if it escapes it.
- * `normalize` collapses `..` before the prefix check, so `/../../etc/passwd` cannot
- * reach outside the root.
- */
-function resolveRequestPath(urlPath) {
-    const decoded = decodeURIComponent(urlPath.split('?')[0]);
-    const relative = normalize(decoded === '/' ? '/index.html' : decoded).replace(/^(\.\.[/\\])+/, '');
-    const candidate = resolve(join(documentRoot, relative));
-    return candidate === documentRoot || candidate.startsWith(documentRoot + '/') ? candidate : null;
+// Decode each segment once. Encoded separators must never become filesystem paths.
+async function confinedPath(root, urlPath) {
+    const segments = urlPath.split('/').map(segment => decodeURIComponent(segment));
+    if (segments.some(segment => !segment || segment === '.' || segment === '..' || /[/\\\0]/.test(segment))) {
+        throw Object.assign(new Error('forbidden'), { status: 403 });
+    }
+    const target = await realpath(join(root, ...segments));
+    if (target !== root && !target.startsWith(root + sep)) throw Object.assign(new Error('forbidden'), { status: 403 });
+    return target;
 }
 
 /// A self-signed certificate for `--tls`, generated once with the system `openssl`.
@@ -139,29 +143,32 @@ const server = createServer(async (request, response) => {
         return;
     }
 
-    const filePath = resolveRequestPath(request.url);
-    if (filePath === null) {
-        response.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-        response.end('forbidden\n');
-        return;
-    }
-
     try {
+        const urlPath = request.url.split('?')[0];
+        let filePath;
+        let isIndex = false;
+        if (urlPath === '/library-index.csv' || urlPath === '/library' || urlPath.startsWith('/library/')) {
+            if (!libraryRoot) throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+            isIndex = urlPath === '/library-index.csv';
+            filePath = isIndex ? libraryIndex : await confinedPath(libraryRoot, urlPath.slice('/library/'.length));
+        } else {
+            filePath = await confinedPath(documentRoot, urlPath === '/' ? 'index.html' : urlPath.slice(1));
+        }
         const info = await stat(filePath);
         if (!info.isFile()) {
             throw Object.assign(new Error('not a file'), { code: 'ENOENT' });
         }
-        const body = await readFile(filePath);
+        const body = request.method === 'HEAD' ? undefined : await readFile(filePath);
         response.writeHead(200, {
             // Lower-cased: the packaged modules are `REFLEX.S3M`, not `reflex.s3m`.
-            'Content-Type': CONTENT_TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
-            'Content-Length': body.length,
+            'Content-Type': isIndex ? 'text/csv; charset=utf-8' : CONTENT_TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
+            'Content-Length': info.size,
         });
         response.end(request.method === 'HEAD' ? undefined : body);
     } catch (error) {
         const missing = error.code === 'ENOENT' || error.code === 'ENOTDIR';
-        response.writeHead(missing ? 404 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
-        response.end(missing ? 'not found\n' : `server error: ${error.message}\n`);
+        response.writeHead(error instanceof URIError ? 400 : error.status ?? (missing ? 404 : 500), { 'Content-Type': 'text/plain; charset=utf-8' });
+        response.end(missing ? 'not found\n' : `${error.message}\n`);
     } finally {
         // One line per request: a 404 that nobody sees is a 404 that gets debugged in the
         // browser console instead of here.
@@ -171,11 +178,12 @@ const server = createServer(async (request, response) => {
 
 server.listen(options.port, options.host, () => {
     const scheme = options.tls ? 'https' : 'http';
-    console.log(`starplayer dev server: ${scheme}://localhost:${options.port}/`);
+    console.log(`starplayer dev server: ${scheme}://localhost:${server.address().port}/`);
     if (options.host !== '127.0.0.1') {
         console.log(`  bound to ${options.host} — reachable from the LAN${options.tls ? '' : ' (plain http there is NOT a secure context: no AudioWorklet, no SharedArrayBuffer — use --tls)'}`);
     }
     console.log(`  document root: ${documentRoot}`);
+    if (libraryRoot) console.log(`  library root: ${libraryRoot}`);
     if (options.isolate) {
         console.log('  Cross-Origin-Opener-Policy: same-origin');
         console.log('  Cross-Origin-Embedder-Policy: require-corp');
