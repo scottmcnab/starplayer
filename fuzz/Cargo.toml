@@ -23,6 +23,7 @@ arbitrary = { version = "1", features = ["derive"] }
 # The loaders under test, by path. No facade and no `starplayer-offline`: a fuzz target
 # should link the smallest graph that contains the code being exercised, so a crash points
 # at a loader rather than at everything downstream of one.
+starplayer-archive = { path = "../crates/starplayer-archive" }
 starplayer-core = { path = "../crates/starplayer-core" }
 starplayer-model = { path = "../crates/starplayer-model" }
 starplayer-mod = { path = "../crates/starplayer-mod" }
@@ -130,6 +131,13 @@ bench = false
 [[bin]]
 name = "image"
 path = "fuzz_targets/image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
 test = false
 doc = false
 bench = false

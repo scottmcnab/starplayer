@@ -10,3 +10,6 @@ rust-version.workspace = true
 starplayer-model = { workspace = true }
 zip = { workspace = true }
 flate2 = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }

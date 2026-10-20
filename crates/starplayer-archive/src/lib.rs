@@ -66,37 +66,57 @@ pub fn is_zip(bytes: &[u8]) -> bool {
     bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06")
 }
 
-/// List recognised module entries in central-directory order.
+/// List supported, unencrypted module entries in central-directory order.
+///
+/// Unsupported module entries are skipped. If all module entries are unsupported,
+/// return [`ArchiveError::UnsupportedMethod`] with their methods and names; an archive
+/// without recognised module entries returns [`ArchiveError::NoModules`].
 pub fn list_modules(bytes: &[u8]) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     let mut archive = open_archive(bytes)?;
     let mut modules = Vec::new();
+    let mut unsupported = Vec::new();
     for index in 0..archive.len() {
-        let entry = archive.by_index(index).map_err(map_zip_error)?;
-        let name = entry.name().to_string();
+        let entry = archive.by_index_raw(index).map_err(map_zip_error)?;
+        let name = entry.name().map_err(map_zip_error)?.into_owned();
         if entry.is_dir() || is_resource_fork(&name) {
             continue;
         }
         let Some(format) = format_from_name(&name) else { continue };
-        ensure_supported(&entry)?;
+        if let Err(ArchiveError::UnsupportedMethod(reason)) = ensure_supported(&entry) {
+            unsupported.push(reason);
+            continue;
+        }
         modules.push(ArchiveEntry { index, name, size: entry.size(), format });
     }
-    if modules.is_empty() { Err(ArchiveError::NoModules) } else { Ok(modules) }
+    if !modules.is_empty() {
+        Ok(modules)
+    } else if !unsupported.is_empty() {
+        Err(ArchiveError::UnsupportedMethod(unsupported.join("; ")))
+    } else {
+        Err(ArchiveError::NoModules)
+    }
 }
 
-/// Extract one central-directory entry, with declared-size and streaming size guards.
+/// Extract one supported, unencrypted central-directory entry.
+///
+/// Stored, Deflate, Shrink, Implode and Reduce (factors 1–4) are supported.
+/// Check the central-directory size before reading. Legacy decoders buffer compressed
+/// input and retain decoded output; a streaming size guard also limits the output.
 pub fn extract(bytes: &[u8], index: usize) -> Result<Vec<u8>, ArchiveError> {
     let mut archive = open_archive(bytes)?;
     if index >= archive.len() {
         return Err(ArchiveError::NoSuchEntry);
     }
-    let entry = archive.by_index(index).map_err(map_zip_error)?;
+    let entry = archive.by_index_raw(index).map_err(map_zip_error)?;
     ensure_supported(&entry)?;
-    let name = entry.name().to_string();
+    let name = entry.name().map_err(map_zip_error)?.into_owned();
     let declared_size = entry.size();
     if declared_size > MAX_ENTRY_BYTES {
         return Err(ArchiveError::TooLarge { name, size: declared_size });
     }
 
+    drop(entry);
+    let entry = archive.by_index(index).map_err(map_zip_error)?;
     let initial_capacity = usize::try_from(declared_size).unwrap_or(usize::MAX);
     let mut output = Vec::with_capacity(initial_capacity);
     entry.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut output)
@@ -137,8 +157,9 @@ fn is_resource_fork(name: &str) -> bool {
 
 fn ensure_supported<R: Read>(entry: &ZipFile<'_, R>) -> Result<(), ArchiveError> {
     match entry.compression() {
-        CompressionMethod::Stored | CompressionMethod::Deflated if !entry.encrypted() => Ok(()),
-        method => Err(ArchiveError::UnsupportedMethod(format!("{method:?} for `{}`", entry.name()))),
+        CompressionMethod::Stored | CompressionMethod::Deflated | CompressionMethod::Shrink
+        | CompressionMethod::Implode | CompressionMethod::Reduce(1..=4) if !entry.encrypted() => Ok(()),
+        method => Err(ArchiveError::UnsupportedMethod(format!("{method:?}{} for `{}`", if entry.encrypted() { " (encrypted)" } else { "" }, String::from_utf8_lossy(entry.name_raw())))),
     }
 }
 

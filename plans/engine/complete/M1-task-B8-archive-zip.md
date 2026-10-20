@@ -50,15 +50,15 @@ crates/starplayer-archive/
 ```
 
 Dependencies, pinned in the workspace `[workspace.dependencies]`:
-- `zip = { version = "6", default-features = false, features = ["deflate-flate2"] }`
+- `zip` 9.0.1+ (`default-features = false`, features `deflate-flate2`, `legacy-zip`)
 - `flate2 = { version = "1", default-features = false, features = ["rust_backend"] }`
   (selects miniz_oxide — pure Rust, no C, builds for `wasm32-unknown-unknown`).
   `zip`'s own `deflate` feature pulls in zopfli (a *compressor*) and zlib-rs; neither is
-  wanted. Stored (method 0) and Deflate (method 8) are the only methods a module zip
-  ever uses; anything else is reported as unsupported, not silently skipped.
+  wanted. B10 extends Stored and Deflate with legacy Shrink, Reduce and Implode. Unsupported
+  module entries are skipped; if none are playable, their methods are reported.
   **Verify at implementation** that this feature pair builds for wasm32 with no
   `getrandom`/`time` in the graph (`cargo tree -p starplayer-archive --target
-  wasm32-unknown-unknown`); if `zip` 6 needs a different spelling, use it and record why.
+  wasm32-unknown-unknown`); if `zip` needs a different spelling, use it and record why.
 
 API (small, format-agnostic, extension-driven now, probe-driven when MOD/MTM land):
 

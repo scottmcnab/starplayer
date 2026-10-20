@@ -105,3 +105,159 @@ fn missing_and_empty_entries_have_specific_errors() {
     assert!(matches!(list_modules(&bytes), Err(ArchiveError::NoModules)));
     assert!(matches!(extract(&bytes, 2), Err(ArchiveError::NoSuchEntry)));
 }
+
+#[path = "support/legacy_encode.rs"]
+mod legacy_encode;
+
+#[test]
+fn legacy_entries_round_trip() {
+    let input = legacy_encode::payload();
+    for (method, flags, compressed) in legacy_streams() {
+        let bytes = legacy_encode::archive(&[("reflex.s3m", input, method, flags, &compressed)]);
+        assert_eq!(list_modules(&bytes).unwrap()[0].size, input.len() as u64);
+        assert_eq!(extract(&bytes, 0).unwrap(), input, "method {method}, flags {flags}");
+    }
+}
+
+#[test]
+fn shrink_code_8191_survives_initial_allocation_and_partial_clear() {
+    for partial_clear in [false, true] {
+        let (input, compressed) = legacy_encode::shrink_max_code(partial_clear);
+        let bytes = legacy_encode::archive(&[("max-code.s3m", &input, 1, 0, &compressed)]);
+        assert_eq!(extract(&bytes, 0).unwrap(), input);
+    }
+}
+
+fn legacy_streams() -> Vec<(u16, u16, Vec<u8>)> {
+    let input = legacy_encode::payload();
+    let mut streams = vec![(1, 0, legacy_encode::shrink(input))];
+    for flags in [0, 2, 4, 6] { streams.push((6, flags, legacy_encode::implode(input, flags))); }
+    for method in 2..=5 { streams.push((method, 0, legacy_encode::reduce(input))); }
+    streams
+}
+
+#[test]
+fn imploded_declared_oversize_is_refused_before_reading() {
+    // Invalid stream, small local size, oversized central size: the guard wins.
+    let mut bytes = legacy_encode::archive(&[("bomb.s3m", b"x", 6, 0, &[255])]);
+    set_central_directory_size(&mut bytes, (MAX_ENTRY_BYTES + 1) as u32);
+    assert!(matches!(extract(&bytes, 0), Err(ArchiveError::TooLarge { size, .. }) if size == MAX_ENTRY_BYTES + 1));
+}
+
+#[test]
+fn legacy_decoder_uses_central_size_even_when_local_size_differs() {
+    let input = legacy_encode::payload();
+    for (method, flags, compressed) in legacy_streams() {
+        let mut bytes = legacy_encode::archive(&[("reflex.s3m", input, method, flags, &compressed)]);
+        bytes[22..26].copy_from_slice(&((MAX_ENTRY_BYTES + 1) as u32).to_le_bytes());
+        assert_eq!(extract(&bytes, 0).unwrap(), input, "method {method}, flags {flags}");
+    }
+}
+
+#[test]
+fn truncated_imploded_stream_is_corrupt() {
+    let input = legacy_encode::payload();
+    let compressed = legacy_encode::implode(input, 0);
+    let bytes = legacy_encode::archive(&[("reflex.s3m", input, 6, 0, &compressed[..compressed.len() / 2])]);
+    assert!(matches!(extract(&bytes, 0), Err(ArchiveError::Corrupt(_))));
+}
+
+#[test]
+fn mixed_deflated_and_imploded_modules_are_listed() {
+    use flate2::{Compression, write::DeflateEncoder};
+    let input = legacy_encode::payload();
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(input).unwrap();
+    let deflated = encoder.finish().unwrap();
+    let imploded = legacy_encode::implode(input, 0);
+    let bytes = legacy_encode::archive(&[("first.s3m", input, 8, 0, &deflated), ("second.s3m", input, 6, 0, &imploded)]);
+    assert_eq!(list_modules(&bytes).unwrap().len(), 2);
+    assert_eq!(extract(&bytes, 0).unwrap(), input);
+    assert_eq!(extract(&bytes, 1).unwrap(), input);
+}
+
+#[test]
+fn unsupported_entries_are_skipped_with_reasons_when_none_remain() {
+    let bytes = legacy_encode::archive(&[
+        ("deflate64.mod", b"x", 9, 0, b"x"),
+        ("encrypted.s3m", b"x", 0, 1, b"x"),
+        ("bzip2.it", b"x", 12, 0, b"x"),
+        ("lzma.xm", b"x", 14, 0, b"x"),
+        ("readme.txt", b"x", 98, 0, b"x"),
+    ]);
+    let Err(ArchiveError::UnsupportedMethod(reason)) = list_modules(&bytes) else { panic!("expected unsupported methods") };
+    for name in ["deflate64.mod", "encrypted.s3m", "bzip2.it", "lzma.xm", "Unsupported(9)", "encrypted", "Unsupported(12)", "Unsupported(14)"] { assert!(reason.contains(name), "{reason}"); }
+    assert!(!reason.contains("readme"));
+    for index in 0..4 { assert!(matches!(extract(&bytes, index), Err(ArchiveError::UnsupportedMethod(_)))); }
+    let mixed = legacy_encode::archive(&[("bad.mod", b"x", 9, 0, b"x"), ("good.s3m", b"ok", 0, 0, b"ok"), ("encrypted.it", b"x", 0, 1, b"x")]);
+    let modules = list_modules(&mixed).unwrap();
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0].index, 1);
+    assert_eq!(extract(&mixed, modules[0].index).unwrap(), b"ok");
+    let notes = legacy_encode::archive(&[("notes.txt", b"x", 9, 0, b"x")]);
+    assert!(matches!(list_modules(&notes), Err(ArchiveError::NoModules)));
+}
+
+#[test]
+fn legacy_mutations_never_panic() {
+    let input = legacy_encode::payload();
+    let mut panics = Vec::new();
+    for (method, flags, compressed) in legacy_streams() {
+        // Preserve the ZIP directory while truncating the decoder's actual input.
+        for length in 0..=compressed.len() {
+            let bytes = legacy_encode::archive(&[("reflex.s3m", input, method, flags, &compressed[..length])]);
+            if std::panic::catch_unwind(|| extract(&bytes, 0)).is_err() {
+                panics.push(format!("method {method}, flags {flags}, truncate {length}"));
+            }
+        }
+        for position in (0..compressed.len()).step_by(3) {
+            for mask in [1, 8, 128, 252, 255] {
+                let mut mutated = compressed.clone();
+                mutated[position] ^= mask;
+                let bytes = legacy_encode::archive(&[("reflex.s3m", input, method, flags, &mutated)]);
+                if std::panic::catch_unwind(|| extract(&bytes, 0)).is_err() {
+                    panics.push(format!("method {method}, flags {flags}, position {position}, mask {mask}"));
+                }
+            }
+        }
+    }
+    assert!(panics.is_empty(), "decoder panics: {panics:?}");
+}
+
+/// Optional scratch output for the independent Info-ZIP oracle and fuzz seed generation.
+#[test]
+#[ignore = "writes generated archives under target/ for manual oracle checks"]
+fn write_legacy_oracle_archives() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/legacy-zip-oracle");
+    std::fs::create_dir_all(&directory).unwrap();
+    let input = legacy_encode::payload();
+    std::fs::write(directory.join("payload.bin"), input).unwrap();
+    for (method, flags, compressed) in legacy_streams() {
+        let bytes = legacy_encode::archive(&[("reflex.s3m", input, method, flags, &compressed)]);
+        std::fs::write(directory.join(format!("method-{method}-flags-{flags}.zip")), bytes).unwrap();
+    }
+    let (max_code_input, compressed) = legacy_encode::shrink_max_code(true);
+    std::fs::write(directory.join("shrink-max-code.zip"), legacy_encode::archive(&[("max-code.s3m", &max_code_input, 1, 0, &compressed)])).unwrap();
+    std::fs::write(directory.join("max-code-payload.bin"), max_code_input).unwrap();
+    for (name, method) in [("stored", CompressionMethod::Stored), ("deflated", CompressionMethod::Deflated)] {
+        std::fs::write(directory.join(format!("{name}.zip")), archive(&[("reflex.s3m", input, method)], &[])).unwrap();
+    }
+}
+
+// Regression for the Implode tree-count overflow fixed in zip 9.0.1 (zip2 PR #1028).
+#[test]
+fn malformed_implode_tree_count_is_corrupt() {
+    let bytes = legacy_encode::archive(&[("x.mod", b"x", 6, 0, &[255])]);
+    assert!(matches!(extract(&bytes, 0), Err(ArchiveError::Corrupt(_))));
+}
+
+#[test]
+fn committed_archive_fuzz_seeds_extract() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/zip");
+    for name in ["stored.zip", "deflated.zip", "imploded.zip", "shrunk.zip"] {
+        let bytes = std::fs::read(directory.join(name)).unwrap();
+        let modules = list_modules(&bytes).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(extract(&bytes, modules[0].index).unwrap(), legacy_encode::payload());
+    }
+}

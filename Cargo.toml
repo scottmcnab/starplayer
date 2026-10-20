@@ -56,7 +56,10 @@ bytemuck = { version = "1.25", default-features = false }
 # Archive decoding stays on the pure-Rust miniz_oxide path for native and wasm builds.
 # Do not use zip's broad `deflate` feature: it also enables compressor and zlib-rs code
 # that the read-only module archive path does not need.
-zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
+# Legacy PKZIP shrink/reduce/implode entries occur in the Hornet music archive.
+# 9.0.1 fixes Implode arithmetic overflows (zip2 PR #1028) and Shrink
+# skipping LZW code 8191 on allocation/partial clear (zip2 PR #1029).
+zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2", "legacy-zip"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Canonical golden renders are SHA-256 fingerprints. Hashing lives in the std-only
 # offline crate; no digest code or dependency enters the real-time graph.

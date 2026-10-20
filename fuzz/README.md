@@ -11,6 +11,7 @@ always returns either `Err` or a clamped-but-valid `Module`.**
 |---|---|
 | `fuzz_targets/{mod,s3m,mtm,it}_loader.rs` | byte-level: arbitrary bytes into one loader |
 | `fuzz_targets/{mod,s3m,mtm,it}_structured.rs` | structured: a valid module with its fields disturbed |
+| `fuzz_targets/archive.rs` | byte-level: ZIP discovery, then extraction of every listed module |
 | `fuzz_targets/image.rs` | byte-level: arbitrary bytes into the module-image reader (M8-I2) |
 | `src/lib.rs` | the memory cap, the mutation program, the post-load walk |
 | `seeds/<format>/` | committed seeds — ours or the owner's, never third-party bytes |
@@ -47,3 +48,8 @@ images are a *build product* of the six golden fixtures, so `cargo xtask fuzz --
 `cargo xtask module-images` and copies the result in, rather than committing binaries that
 would go stale the moment `IMAGE_VERSION` moves. `crates/starplayer-offline/tests/module_image.rs`
 is the pinned-stable half, replaying all six images on every commit.
+
+The `archive` target uses `seeds/zip/`: small generated Stored, Deflate, Implode and
+Shrink archives. Seed and run it with `cargo xtask fuzz --seed --target archive --seconds 60`.
+Direct `cargo +nightly fuzz run archive corpus/archive -- -max_total_time=60` runs
+from `fuzz/`; use the ignored working corpus, since libFuzzer adds mutations there.

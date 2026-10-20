@@ -65,5 +65,5 @@ starting B2 or B4.
 
 ## Status
 
-**Complete.** All seven tasks plus follow-ups B8 and B9 are in `complete/`; the owner's
+**Complete.** All seven tasks plus follow-ups B8, B9 and B10 (legacy ZIP methods) are in `complete/`; the owner's
 listening check on real modules passed on 2026-08-30.

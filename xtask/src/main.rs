@@ -167,6 +167,7 @@ const FUZZ_TARGETS: &[(&str, Option<&str>)] = &[
     ("xm_structured", None),
     ("it_structured", None),
     ("image", Some(MODULE_IMAGE_FORMAT)),
+    ("archive", Some("zip")),
 ];
 
 /// [`classify_module`]'s name for a module image, and therefore the `image` target's seed
@@ -1092,6 +1093,9 @@ fn copy_seeds_into_corpus(source: &Path, origin: &str, format: &str, destination
 /// restated here. They are short byte comparisons; the risk of drift is real but small,
 /// and a seed that stops being recognised only means a slightly narrower corpus.
 fn classify_module(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
+        return Some("zip");
+    }
     // Not a tracker format: `starplayer-model`'s flash-resident module image (M8-I2).
     if bytes.get(..4) == Some(b"SPMI") {
         return Some(MODULE_IMAGE_FORMAT);
