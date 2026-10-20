@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W11, branch `library-playlist`) |
-| Status | Specified 2026-10-21; not started |
+| Status | Implemented 2026-10-21 on `library-playlist`; owner check on the Hornet library outstanding |
 | Depends on | [W7](W7-task-library-index-and-member-lookup.md), [W8](W8-task-library-sources-and-resolver.md) |
 | Blocks | [W10](W10-task-playback-controller-and-playlist.md) |
 | Recommended model | gpt-6-astra |
@@ -123,3 +123,118 @@ track and hear it.
 
 Auto-advance, the playback controller, playlist editing UI and the Repeat interaction
 (W10); uploads, persistence and CSV import/export (W11).
+
+## Research-point results
+
+Measured in the real packaged page with Chrome 156.0.8078.4, using a generated
+37,674-row CSV served through `--library`. The headless scenario replaces its temp
+index and reopens Server library, so parsing, identity hashing and rendering all
+use the normal source-control path. Generated libraries live under this worktree's
+ignored `target/w9-verification/` and are removed after each scenario.
+
+| Transport | CSV loaded → first table paint boundary | Input → filtered paint, five successive inputs | Scroll frame mean / maximum | Maximum rendered track rows |
+|---|---:|---:|---:|---:|
+| Shared memory | 119.2 ms | 89.0, 88.3, 94.0, 84.2, 84.0 ms | 16.61 / 19.34 ms | 20 |
+| Forced postMessage | 120.8 ms | 90.2, 93.7, 85.9, 95.7, 84.1 ms | 16.62 / 21.94 ms | 20 |
+| No isolation | 119.6 ms | 88.6, 89.4, 94.0, 84.2, 83.7 ms | 16.62 / 21.00 ms | 20 |
+
+Timing starts when the CSV response's `arrayBuffer()` resolves, and ends at the
+next animation-frame boundary after the table DOM is populated. Filter timings
+start at each input event and include the 80 ms debounce, search, sorting and the
+next animation-frame boundary. The inputs are `T`, `TR`, `TRA`, `TRACK3`, and
+`TRACK37`, including queries matching the whole library. Scroll measurements use
+120 successive animation frames with 1,000-pixel scroll steps; the mean is near
+60 Hz with no observed long frame. These are headless frame-cadence measurements,
+not a substitute for subjective owner/device testing. All first-paint and filter
+measurements meet the 1.5 s and 100 ms targets.
+
+## Implementation results
+
+Implemented W9 without staging or committing. W7's index/source/locator contracts
+and W8's resolver are retained. The task header and other plans were left untouched
+as requested; only these results sections were appended.
+
+Files and responsibilities:
+
+* `www/library-view.js`: collapsible library browser wiring, debounced query and
+  format/unplayable filtering, lazy folder/ZIP/nested-ZIP expansion, folder scope,
+  sortable column headers, virtual grid, keyboard/mouse selection, play/add actions
+  and playing-row reveal/highlight.
+* `www/library-selection.js`: DOM-free selection transitions and bounded virtual
+  window arithmetic, shared by the UI and Node regression tests.
+* `www/playlist.js`: the complete W7 in-memory model interface, UUID entry ids,
+  library locator construction and the minimal visible name/count list.
+* `www/index.html`, `www/style.css`: Library disclosure, toolbar, hints, folder pane,
+  accessible grid and playlist shell. Track rows are fixed at 32 px, with five-row
+  overscan; horizontal table scrolling is contained inside the panel.
+* `www/library-controls.js`: optional `onLibrary` notification after successful
+  state replacement; existing callers and source state shape remain compatible.
+* `www/app.js`: small exported `playLibraryRow` seam, early revision claiming,
+  activation guards, current-row highlight updates and startup wiring. Library
+  keyboard navigation is excluded from the live-input music keyboard.
+* `test/library-view.test.mjs`: click/toggle/range/select-all, hidden selection
+  preservation, keyboard extension/contraction, empty and 37,674-row virtual
+  windows, plus playlist ordering, duplicates, navigation and subscriptions.
+* `test/headless.mjs`: each existing mode also exercises a generated library with
+  loose, ZIP and nested-ZIP REFLEX/PETRI fixtures and a missing member, plus the
+  scale measurements, sort/keyboard/ARIA checks and unplayable metadata controls.
+  It uses real DevTools double-clicks and checks the library at an actual 390 px
+  viewport, not just against a potentially widened mobile `innerWidth`.
+  `STARPLAYER_REQUIRE_CHROMIUM=1` makes missing Chromium fail. The known startup
+  404 for W8's optional `/library-index.csv` probe is excluded specifically from
+  console-error assertions; other console errors still fail. `--library-only`
+  permits a focused rerun without the existing timed audio scenarios.
+* `README.md`: query syntax, selection/keyboard actions, hidden-selection rule,
+  folder additions, playlist lifetime and required-Chromium switch.
+
+Design decisions:
+
+* Selection and anchor/focus use stable row ids, never rendered positions. Sorting,
+  filtering and scoping preserve selection. Add actions intersect it with the
+  current result and playable rows, retaining result order. Enter also refuses a
+  focused row that has become hidden. A row's **+** adds the visible selection,
+  selecting that row first if necessary. Folder additions ignore the query and
+  use recursive playable rows in folder/name order.
+* The grid is one focusable row-navigation widget. `aria-activedescendant` always
+  references a currently rendered row, and keyboard navigation reveals it. Click
+  selection updates existing DOM nodes so native double-clicks remain reliable.
+  Scroll rendering is coalesced to animation frames and capped at 200 rows even
+  for unusually large viewport inputs; the actual 320 px viewport rendered 20.
+* `playLibraryRow` claims `moduleRevision` before loader/resolver I/O and passes it
+  through activation rather than acquiring a later, misleading revision. Stale
+  resolves and errors cannot replace newer intent. A failed archive lookup never
+  activates bytes, so the previous module keeps playing. Changing library sources
+  also prevents the old request from publishing a highlight into the new view.
+* Playlist duplicates are deliberate. `current` is an entry or null; navigation
+  returns the adjacent entry (or null at a boundary), without wrapping. Removing
+  the current entry clears it; subscriptions return an unsubscribe function.
+  W10 owns playback/auto-advance/repeat policy, and W11 owns persistence.
+
+Final verification, with builds and headless runs executed sequentially:
+
+```text
+node --test apps/starplayer-web/test/*.test.mjs
+  28 passed, 0 failed, 0 skipped
+cargo xtask wasm && STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs
+  WASM package built; headless harness: all modes passed
+  sab, fallback, plain: existing audio checks and new library scenarios passed
+  missing-member error named MISSING.S3M; Petrified stayed loaded and advancing
+  strict library phone check: viewport 390 px, document width <= 390 px
+cargo xtask ci
+  xtask ci: 11 job(s) passed
+  host-tests, conformance, rt-safety, goldens, simd, fma-check,
+  trace-zero-cost, wasm-build, no-std-check, clippy, no-std-purity
+git diff --check
+  passed
+```
+
+Full verification logs are retained under `target/w9-verification/` (ignored).
+Only REFLEX.S3M and PETRI.S3M supply module bytes for the new scenarios; scale and
+unsupported-format rows are generated metadata, not additional module fixtures.
+The Hornet mirror and ModDNA were not modified. No formatting run, unsafe code,
+npm dependency, staged file or commit was introduced.
+
+No W9 implementation items remain open. The owner's interactive Hornet-library
+acceptance check remains outstanding. W10's playback controller, auto-advance,
+full playlist editing and Repeat behavior, and W11's persistence/import/export,
+remain intentionally out of scope.

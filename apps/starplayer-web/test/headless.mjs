@@ -19,7 +19,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, readFile, readdir } from 'node:fs/promises';
+import { access, readFile, readdir, mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -36,9 +36,10 @@ const PHONE_VIEWPORT = { width: 390, height: 844 };
 const options = parseArguments(process.argv.slice(2));
 
 function parseArguments(argv) {
-    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'] };
+    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false };
     for (let index = 0; index < argv.length; index += 1) {
-        if (argv[index] === '--seconds') {
+        if (argv[index] === '--library-only') parsed.libraryOnly = true;
+        else if (argv[index] === '--seconds') {
             parsed.seconds = Number(argv[index + 1]);
             index += 1;
         } else if (argv[index] === '--mode') {
@@ -174,10 +175,11 @@ function syntheticMod({ channels = 4, tag = 'M.K.', title = 'headphone test', sp
     return bytes;
 }
 
-async function startDevServer(isolate) {
+async function startDevServer(isolate, libraryDirectory = null) {
     const port = await freePort();
     const argv = [DEV_SERVER, '--port', String(port), '--root', DIST];
     if (!isolate) argv.push('--no-isolation');
+    if (libraryDirectory) argv.push('--library', libraryDirectory);
     const child = spawn(process.execPath, argv, { stdio: ['ignore', 'pipe', 'inherit'] });
     await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('the dev server did not start')), 10_000);
@@ -267,7 +269,10 @@ class Page {
             const details = message.params.exceptionDetails;
             this.consoleErrors.push(details.exception?.description ?? details.text);
         } else if (message.method === 'Log.entryAdded' && message.params.entry.level === 'error') {
-            this.consoleErrors.push(message.params.entry.text);
+            const entry = message.params.entry;
+            // W8 deliberately probes this optional route on startup (also on reload).
+            if (entry.url?.endsWith('/library-index.csv') && entry.text.includes('404')) return;
+            this.consoleErrors.push(entry.text);
         }
     }
 
@@ -1184,14 +1189,191 @@ async function run(executable, mode) {
     return report;
 }
 
+// W9 uses only the two owner-authored S3Ms. All generated files stay in this worktree.
+async function runLibrary(executable, mode) {
+    const artifacts = join(REPOSITORY_ROOT, 'target/w9-verification');
+    await mkdir(artifacts, { recursive: true });
+    const directory = await mkdtemp(join(artifacts, 'library-'));
+    let server;
+    let page;
+    try {
+        const reflex = await readFile(join(REPOSITORY_ROOT, 'crates/starplayer-s3m/tests/fixtures/REFLEX.S3M'));
+        const petri = await readFile(join(REPOSITORY_ROOT, 'crates/starplayer-s3m/tests/fixtures/PETRI.S3M'));
+        await mkdir(join(directory, 'loose'));
+        await mkdir(join(directory, 'disks'));
+        await writeFile(join(directory, 'loose/REFLEX.S3M'), reflex);
+        await writeFile(join(directory, 'disks/disk1.zip'), buildZip([{ name: 'PETRI.S3M', bytes: petri }, { name: 'REFLEX.S3M', bytes: reflex }]));
+        await writeFile(join(directory, 'disks/outer.zip'), buildZip([{ name: 'inner.zip', bytes: buildZip([{ name: 'PETRI.S3M', bytes: petri }]) }]));
+        const header = 'member_path,title,source_path,container_member\n';
+        await writeFile(join(directory, 'index.csv'), header + [
+            ',Loose Reflex,loose/REFLEX.S3M,',
+            'PETRI.S3M,Disk Petri,disks/disk1.zip,',
+            'REFLEX.S3M,Disk Reflex,disks/disk1.zip,',
+            'PETRI.S3M,Nested Petri,disks/outer.zip,inner.zip',
+            'MISSING.S3M,Missing member,disks/disk1.zip,',
+        ].join('\n'));
+        server = await startDevServer(mode !== 'plain', directory);
+        page = await Page.open(executable, `http://127.0.0.1:${server.port}/`);
+        await page.waitFor('library startup', "document.documentElement.dataset.playerReady === 'true'");
+        await page.evaluate(`
+            if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true;
+            document.getElementById('library-server').click();
+        `);
+        await page.waitFor('five library rows', "document.getElementById('library-count').textContent === '5 of 5'");
+        const filter = async (value, expected) => {
+            await page.evaluate(`const input = document.getElementById('library-search'); input.value = ${JSON.stringify(value)}; input.dispatchEvent(new Event('input'));`);
+            await page.waitFor('filtered library count', `document.getElementById('library-count').textContent === ${JSON.stringify(expected)}`);
+        };
+        const clickRow = (id, modifiers = {}) => page.evaluate(`document.querySelector('[data-row-id="${id}"]').dispatchEvent(new MouseEvent('click', { bubbles: true, ...${JSON.stringify(modifiers)} }));`);
+        await filter('title:Disk', '2 of 5');
+        await clickRow(1);
+        await clickRow(2, { shiftKey: true });
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.textContent);"), ['PETRI.S3M', 'REFLEX.S3M']);
+        await page.evaluate("document.querySelector('[data-row-id=\"1\"] button').click();");
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        await filter('', '5 of 5');
+        await clickRow(0, { ctrlKey: true });
+        await clickRow(2, { ctrlKey: true });
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        await page.evaluate("document.getElementById('library-browse').click(); document.querySelector('[data-scope=disks]').click();");
+        await page.waitFor('folder scope', "document.getElementById('library-count').textContent === '4 of 5'");
+        await page.evaluate("document.querySelector('[aria-label=\"Expand disks\"]').click(); document.querySelector('[data-scope=\"disks/disk1.zip\"]').click();");
+        await page.waitFor('ZIP scope', "document.getElementById('library-count').textContent === '3 of 5'");
+        await page.evaluate("document.querySelector('[aria-label=\"Add folder disks/disk1.zip\"]').click();");
+        assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '9');
+        // Real mouse clicks also prove that selection updates preserve the double-click target.
+        const doubleClick = async id => {
+            const point = await page.evaluate(`const row = document.querySelector('[data-row-id="${id}"]'); row.scrollIntoView({ block: 'center' }); const bounds = row.getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
+            for (const clickCount of [1, 2]) {
+                await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount, ...point });
+                await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount, ...point });
+            }
+        };
+        await doubleClick(2);
+        await page.waitFor('ZIP playback title', "document.getElementById('title').textContent.toLowerCase().includes('reflex') && document.getElementById('transport-chip').textContent === 'playing'");
+        await page.evaluate("document.getElementById('library-all').click();");
+        await doubleClick(3);
+        await page.waitFor('nested playback label', "document.getElementById('module-detail').textContent.includes('inner.zip') && document.getElementById('transport-chip').textContent === 'playing'");
+        const beforeMissing = await page.evaluate(READ_STATE);
+        assert.equal(beforeMissing.title, 'Petrified');
+        await doubleClick(4);
+        await page.waitFor('missing member diagnostic', "!document.getElementById('error').hidden && document.getElementById('error').textContent.includes('MISSING.S3M')");
+        const missing = await page.evaluate(READ_STATE);
+        assert.equal(missing.title, beforeMissing.title);
+        assert.equal(missing.chip, 'playing');
+        await page.waitFor('playback survives missing member', `document.getElementById('row').textContent !== ${JSON.stringify(missing.row)}`);
+        assert.equal(await page.evaluate("return document.querySelector('.library-track.playing').dataset.rowId;"), '3');
+        await page.send('Emulation.setDeviceMetricsOverride', { ...PHONE_VIEWPORT, deviceScaleFactor: 3, mobile: true });
+        const phoneLayout = await page.evaluate("return { width: innerWidth, scrollWidth: document.documentElement.scrollWidth, overflowing: [...document.querySelectorAll('main > *, .load-panel > *, .now-playing > *')].filter(element => element.getBoundingClientRect().right > 390).map(element => [element.className, element.getBoundingClientRect().width]) };");
+        assert.ok(phoneLayout.width === 390 && phoneLayout.scrollWidth <= 390, `library fits at 390px: ${JSON.stringify(phoneLayout)}`);
+        await page.send('Emulation.clearDeviceMetricsOverride');
+
+        // Measure the real CSV -> parser -> view route, then input -> filtered paint and
+        // animation-frame scroll cadence. No application-only benchmark shortcut.
+        await writeFile(join(directory, 'index.csv'), header + Array.from({ length: 37674 }, (_, index) => `,Track ${index},group${index % 100}/TRACK${String(index).padStart(5, '0')}.S3M,`).join('\n'));
+        await page.evaluate(`
+            const originalFetch = window.fetch;
+            window.fetch = async (...args) => {
+                const response = await originalFetch(...args);
+                if (args[0] === '/library-index.csv' && !args[1]?.method) {
+                    const originalBuffer = response.arrayBuffer.bind(response);
+                    response.arrayBuffer = async () => { const bytes = await originalBuffer(); window.csvLoadedAt = performance.now(); return bytes; };
+                }
+                return response;
+            };
+            window.firstPaint = new Promise(resolve => {
+                const observer = new MutationObserver(() => {
+                    if (document.getElementById('library-count').textContent === '37,674 of 37,674') {
+                        observer.disconnect();
+                        requestAnimationFrame(() => resolve(performance.now() - window.csvLoadedAt));
+                    }
+                });
+                observer.observe(document.getElementById('library-count'), { childList: true });
+            });
+            document.getElementById('library-server').click();
+        `);
+        const firstPaint = await page.evaluate('return await window.firstPaint;');
+        const filterMilliseconds = await page.evaluate(`
+            const results = [];
+            for (const value of ['T', 'TR', 'TRA', 'TRACK3', 'TRACK37']) {
+                const start = performance.now();
+                await new Promise(resolve => {
+                    const observer = new MutationObserver(() => { observer.disconnect(); requestAnimationFrame(resolve); });
+                    observer.observe(document.getElementById('library-count'), { childList: true });
+                    const input = document.getElementById('library-search');
+                    input.value = value;
+                    input.dispatchEvent(new Event('input'));
+                });
+                results.push(performance.now() - start);
+            }
+            return results;
+        `);
+        await filter('', '37,674 of 37,674');
+        const scroll = await page.evaluate(`
+            const viewport = document.getElementById('library-viewport');
+            const intervals = [];
+            let maximumRows = 0;
+            let previous = performance.now();
+            for (let index = 0; index < 120; index += 1) {
+                viewport.scrollTop = index * 1000;
+                await new Promise(requestAnimationFrame);
+                const now = performance.now();
+                intervals.push(now - previous);
+                previous = now;
+                maximumRows = Math.max(maximumRows, document.querySelectorAll('.library-track').length);
+            }
+            return { maximumRows, averageFrame: intervals.reduce((sum, value) => sum + value, 0) / intervals.length, maximumFrame: Math.max(...intervals) };
+        `);
+        assert.ok(firstPaint < 1500, `first paint: ${firstPaint}ms`);
+        assert.ok(scroll.maximumRows <= 200);
+        await page.evaluate("document.querySelector('[data-column=title] button').click();");
+        assert.equal(await page.evaluate("return document.querySelector('[data-column=title]').getAttribute('aria-sort');"), 'ascending');
+        await page.evaluate("document.querySelector('[data-column=title] button').click();");
+        assert.equal(await page.evaluate("return document.querySelector('[data-column=title]').getAttribute('aria-sort');"), 'descending');
+        await page.evaluate("document.getElementById('library-grid').focus(); document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));");
+        assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
+        await page.evaluate("const grid = document.getElementById('library-grid'); grid.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));");
+        assert.ok(await page.evaluate("return document.getElementById(document.getElementById('library-grid').getAttribute('aria-activedescendant')) !== null;"));
+        await page.evaluate("document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', shiftKey: true, bubbles: true }));");
+        assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
+        await filter('TRACK37673', '1 of 37,674');
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li:last-child').textContent;"), 'TRACK37673.S3M');
+        assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '10');
+        await writeFile(join(directory, 'index.csv'), header + ',Reflex,loose/REFLEX.S3M,\n,Unsupported,loose/SILENT.669,');
+        await page.evaluate("document.getElementById('library-server').click();");
+        await page.waitFor('unplayable hidden by default', "document.getElementById('library-count').textContent === '1 of 2'");
+        await page.evaluate("document.getElementById('library-unplayable').click();");
+        await page.waitFor('show unplayable', "document.getElementById('library-count').textContent === '2 of 2'");
+        await page.evaluate("const format = document.getElementById('library-format'); format.value = '669'; format.dispatchEvent(new Event('change'));");
+        await page.waitFor('format filter', "document.getElementById('library-count').textContent === '1 of 2'");
+        await clickRow(1);
+        assert.equal(await page.evaluate("return document.querySelector('.library-track button').disabled && document.getElementById('library-add-selected').disabled;"), true);
+        await doubleClick(1);
+        assert.equal((await page.evaluate(READ_STATE)).title, 'Petrified');
+        assert.deepEqual(page.consoleErrors, []);
+        return { firstPaint, filterMilliseconds, scroll, missing: missing.errorText, nestedTitle: beforeMissing.title };
+    } finally {
+        if (page) await page.close();
+        server?.stop();
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
 const executable = await findChromium();
 if (executable === null) {
-    console.log('headless: skipped — no Chromium found (set CHROME=/path/to/chrome to run it)');
-    process.exit(0);
+    const required = process.env.STARPLAYER_REQUIRE_CHROMIUM === '1';
+    console.log(`headless: ${required ? 'failed' : 'skipped'} — no Chromium found (set CHROME=/path/to/chrome to run it)`);
+    process.exit(required ? 1 : 0);
 }
 
 for (const mode of options.modes) {
-    const report = await run(executable, mode);
-    console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);
+    if (!options.libraryOnly) {
+        const report = await run(executable, mode);
+        console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);
+    }
+    console.log(`library[${mode}] ${JSON.stringify(await runLibrary(executable, mode))}`);
 }
 console.log('headless harness: all modes passed');

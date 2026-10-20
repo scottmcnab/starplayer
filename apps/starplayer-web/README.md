@@ -3,6 +3,25 @@
 The [library and playlist CSV contract](LIBRARY-CSV.md) describes indexes accepted
 by the library data layer and the locator format used by library/playlist work.
 
+The **Library** section browses a folder or the dev server's `--library` source.
+Search updates as you type (80 ms debounce); use `name:`, `title:`, `path:`,
+`format:`, `tracker:` and `ch:` prefixes, or quoted phrases. Sort with column
+headings, include unplayable formats with the checkbox, or browse directories,
+ZIPs and nested ZIPs using **Browse folders**. Turning browsing off restores the
+whole library. Only visible table rows are rendered, including for large indexes.
+
+Click selects one row, Ctrl/⌘-click toggles, and Shift-click selects a range in the
+current result order. Ctrl/⌘+A selects the entire filtered result, Escape clears,
+and arrows, Home/End and PageUp/Down move the focus (Shift extends the selection).
+Selections survive sorting, filtering and folder changes: **hidden rows remain
+selected, but actions use only playable rows in the current result**, in result
+order. Enter or double-click plays; `+`, Insert or **Add selected** adds to the
+in-memory playlist. A row's **+** adds the current selection (selecting that row
+first if it was not selected); **Add folder** adds all playable
+tracks beneath that folder, regardless of the current filter, in folder/name
+order. Unplayable rows cannot play or be added. Reloading clears this playlist;
+auto-advance and the full playlist controls are W10 work.
+
 Build and serve the player from the repository root:
 
 ```text
@@ -371,7 +390,8 @@ node apps/starplayer-web/test/headless.mjs --mode sab --seconds 5   # quick
 ```
 
 The headless check skips cleanly when no Chromium/Chrome executable is installed; set
-`CHROME=/path/to/chrome` to point it at one. It drives the browser over the DevTools
+`CHROME=/path/to/chrome` to point it at one. Set `STARPLAYER_REQUIRE_CHROMIUM=1`
+to fail instead of skipping when Chromium is missing. It drives the browser over the DevTools
 protocol with Node's built-in `WebSocket`, and runs the page three ways — cross-origin
 isolated on shared memory, isolated with the fallback forced, and served without COOP/COEP
 at all. Each run first loads a synthetic MOD and observes hard, 60%, then hard L-R-R-L

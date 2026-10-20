@@ -62,7 +62,6 @@
                 <input id="library-index" type="file" accept=".csv,text/csv" hidden>
                 <select id="library-choices" aria-label="Library index CSV" hidden></select>
             </div>
-            <p id="library-summary" role="status"></p>
             <form id="url-form" class="url-form">
                 <input id="url" type="url" inputmode="url" value="https://modland.com/pub/modules/Screamtracker%203/Purple%20Motion/unreal%20%5D%5B.s3m" placeholder="https://example.com/song.xm" aria-label="S3M, MOD, MTM, XM, IT, or ZIP URL">
                 <button type="submit">Load URL</button>
@@ -102,6 +101,40 @@
             <strong>Drop .s3m, .mod, .mtm, .xm, .it, or .zip here</strong>
             <span>The live graph survives a bad file.</span>
         </div>
+    </section>
+
+    <details id="library-panel" class="panel" open>
+        <summary>Library</summary>
+        <p id="library-summary" role="status">Open a library folder or server library to browse.</p>
+        <div id="library-browser" hidden>
+            <div class="library-toolbar">
+                <label>Search <input id="library-search" type="search" aria-describedby="library-query-hint"></label>
+                <select id="library-format" aria-label="Format"><option value="">All formats</option></select>
+                <label><input id="library-unplayable" type="checkbox"> Show unplayable</label>
+                <label><input id="library-browse" type="checkbox"> Browse folders</label>
+                <button id="library-add-selected" type="button" disabled>Add selected</button>
+                <output id="library-count" aria-live="polite"></output>
+            </div>
+            <p id="library-query-hint" class="library-hint">Search names, titles and paths; prefixes: name:, title:, path:, format:, tracker:, ch:8, ch:&gt;8. Use quotes for phrases.</p>
+            <div id="library-folders" hidden>
+                <button id="library-all" type="button">All</button> <span id="library-scope">All folders</span>
+                <ul id="library-tree" aria-label="Library folders"></ul>
+            </div>
+            <p id="library-selection-hint" class="library-hint">Click, Ctrl/⌘-click or Shift-click to select. Ctrl/⌘+A selects all results; Escape clears. Arrows, Home/End and PageUp/Down move; Shift extends. Enter plays; + or Insert adds. A row’s + adds the selection, selecting that row first if needed. Hidden rows stay selected; actions use only playable rows in the current result.</p>
+            <div id="library-grid" role="grid" tabindex="0" aria-label="Library tracks" aria-multiselectable="true" aria-colcount="8" aria-describedby="library-selection-hint">
+                <div class="library-horizontal">
+                    <div id="library-heading" class="library-columns" role="row" aria-rowindex="1"></div>
+                    <div id="library-viewport">
+                        <div id="library-spacer"><div id="library-rows" role="rowgroup"></div></div>
+                    </div>
+                </div>
+            </div>
+            <p id="library-selection-count" class="library-hint"></p>
+        </div>
+    </details>
+    <section class="panel" aria-label="Playlist">
+        <h2>Playlist · <span id="playlist-count">0</span></h2>
+        <ol id="playlist-list"></ol>
     </section>
 
     <section class="now-playing" aria-labelledby="now-heading">

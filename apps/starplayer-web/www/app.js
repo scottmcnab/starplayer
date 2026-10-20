@@ -1,3 +1,5 @@
+import { createLibraryView } from './library-view.js';
+import { createPlaylist, libraryLocator, wirePlaylistList } from './playlist.js';
 import { wireLibraryControls } from './library-controls.js';
 import initLoader, * as Loader from './starplayer_web.js';
 
@@ -591,6 +593,25 @@ function createNode(context, processorOptions, wasmBytes, channels) {
     }
 }
 
+// W10 replaces this seam with the playback controller. Claim before any I/O.
+export async function playLibraryRow(row) {
+    if (!row.playable || !state.library) return;
+    const revision = ++state.moduleRevision;
+    const context = state.library;
+    const label = `${row.name} — ${row.title} (${row.folder})`;
+    const audio = startAudio();
+    audio.catch(() => {});
+    clearError();
+    try {
+        await loaderReady;
+        const buffer = await context.resolver.resolve(libraryLocator(row, context.identity));
+        if (revision !== state.moduleRevision || context !== state.library) return;
+        if (await activateLoadedModule(buffer, label, audio, revision) && context === state.library) libraryView.setPlaying(row.id);
+    } catch (error) {
+        if (revision === state.moduleRevision && context === state.library) reportLoadFailure(label, error);
+    }
+}
+
 async function loadBuffer(buffer, label) {
     const audio = startAudio();
     const previousMessage = elements.message.textContent;
@@ -628,17 +649,19 @@ async function loadBuffer(buffer, label) {
 /// `loadBuffer` and the retained-archive dropdown are the two routes in, so a track
 /// loads identically whichever one the user took. Returns false when a later load has
 /// already claimed the module revision and this activation must be discarded.
-async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
+async function activateLoadedModule(moduleBuffer, moduleLabel, audio, revision = ++state.moduleRevision) {
+    if (revision !== state.moduleRevision) return false;
     Loader.inspect_s3m(new Uint8Array(moduleBuffer));
     loadEffectNames();
     const metadata = readMetadata(moduleLabel);
     await audio;
+    if (revision !== state.moduleRevision) return false;
     showMessage(`Activating ${moduleLabel}…`);
     const retainedBytes = moduleBuffer.slice(0);
-    const revision = ++state.moduleRevision;
     const loadOptions = loadOptionsFromControls();
     const result = await activateModuleOnNode(state.node, moduleBuffer, loadOptions);
     if (revision !== state.moduleRevision) return false;
+    libraryView.setPlaying(null);
     state.metadata = metadata;
     state.currentModuleBytes = retainedBytes;
     state.activeLoadOptions = {
@@ -1092,7 +1115,7 @@ function selectMidiInput() {
 
 /// Whether a key event is the page's to play, rather than something the person is typing.
 function keyboardIsListening(event) {
-    if (!elements.keyboardEnable.checked || !state.liveInputActive) return false;
+    if (!elements.keyboardEnable.checked || !state.liveInputActive || event.target.closest?.('#library-panel')) return false;
     if (event.ctrlKey || event.altKey || event.metaKey) return false;
     const target = event.target;
     if (target instanceof HTMLElement && target.isContentEditable) return false;
@@ -2260,7 +2283,10 @@ requestAnimationFrame(refresh);
 // The fixture menu is part of start-up, not a background nicety: the harness picks an
 // entry the moment `playerReady` appears, so the fetch has to have settled before it does.
 await populateFixtureMenu();
-await wireLibraryControls({ state, loader: Loader });
+const playlist = createPlaylist();
+wirePlaylistList(playlist);
+const libraryView = createLibraryView({ playlist, play: playLibraryRow });
+await wireLibraryControls({ state, loader: Loader, onLibrary: libraryView.setLibrary });
 
 // `app.js` is a module and therefore deferred. This is the one honest signal that its
 // listeners are attached, which is what the headless harness waits on before clicking.

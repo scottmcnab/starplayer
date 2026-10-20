@@ -2,8 +2,8 @@ import { parseLibraryCsv, libraryIdentity } from './library-index.js';
 import { createResolver } from './track-resolver.js';
 import { createFileListSource, createHttpSource, directoryPickerAvailable, openDirectorySource, reconnectDirectorySource, storedDirectoryHandle } from './library-source.js';
 
-// W8 source controls only; W9 consumes the resulting page state.
-export async function wireLibraryControls({ state, loader }) {
+// Optional notification keeps source state usable independently of the view.
+export async function wireLibraryControls({ state, loader, onLibrary = () => {} }) {
     const element = name => document.getElementById(`library-${name}`);
     const summary = element('summary');
     const folder = element('folder');
@@ -28,6 +28,7 @@ export async function wireLibraryControls({ state, loader }) {
         summary.textContent = `${library.rows.length.toLocaleString('en-US')} tracks, ${library.issues.length} issues, from ${source.label}`;
         if (library.issues.length) summary.textContent += ': ' + library.issues.slice(0, 3).map(issue => `line ${issue.line}: ${issue.reason}`).join('; ');
         if (source.kind === 'filelist') summary.textContent += '. Choose this folder again after reloading.';
+        onLibrary(state.library);
     }
     async function selectSource(source) {
         const currentRevision = ++revision;
