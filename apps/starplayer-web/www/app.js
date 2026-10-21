@@ -1,3 +1,4 @@
+import { createPlaylistControls } from './playlist-controls.js';
 import { createPlaybackController } from './playback-controller.js';
 import { createPlaylistPlayback } from './playlist-playback.js';
 import { createLibraryView } from './library-view.js';
@@ -2280,8 +2281,10 @@ requestAnimationFrame(refresh);
 // entry the moment `playerReady` appears, so the fetch has to have settled before it does.
 await populateFixtureMenu();
 const playlist = createPlaylist();
+const playlistControls = await createPlaylistControls({ playlist, state, loader: Loader, ready: () => loaderReady });
 const libraryResolver = {
     async resolve(locator, options) {
+        if (locator.kind === 'upload') return playlistControls.resolver.resolve(locator, options);
         const library = state.library;
         if (!library || library.identity.sha256 !== locator.libraryIdentity?.sha256) throw new Error('Library unavailable: reconnect its original index.');
         const buffer = await library.resolver.resolve(locator, options);
@@ -2289,7 +2292,8 @@ const libraryResolver = {
         return buffer;
     },
     prefetch(locator) {
-        if (state.library?.identity.sha256 === locator.libraryIdentity?.sha256) return state.library.resolver.prefetch(locator);
+        if (locator.kind === 'upload') return playlistControls.resolver.prefetch(locator);
+        if (state.library && state.library.identity.sha256 === locator.libraryIdentity?.sha256) return state.library.resolver.prefetch(locator);
     },
 };
 const playback = createPlaybackController({
@@ -2310,16 +2314,17 @@ const playback = createPlaybackController({
 const playlistPlayback = createPlaylistPlayback({
     playlist, controller: playback, resolver: libraryResolver,
     loop: () => byId('playlist-loop').checked, report: showError,
-    changed: () => playlistView.render(),
+    changed: () => playlistView.render(), available: entry => !playlistControls.availability(entry),
 });
-const playlistView = wirePlaylistList(playlist, { playback: playlistPlayback, available: entry => entry.locator.kind !== 'library' || state.library?.identity.sha256 === entry.locator.libraryIdentity?.sha256 });
+const playlistView = wirePlaylistList(playlist, { playback: playlistPlayback, availability: playlistControls.availability });
+playlistControls.setRender(() => playlistView.render());
 function userSeek(opcode, frame) {
     playlistPlayback.cancel();
     playback.userControl('seek');
     queueCommand(opcode, frame);
 }
 const libraryView = createLibraryView({ playlist, play: playLibraryRow });
-await wireLibraryControls({ state, loader: Loader, onLibrary: library => { libraryView.setLibrary(library); playlistView.render(); } });
+await wireLibraryControls({ state, loader: Loader, onLibrary: library => { libraryView.setLibrary(library); playlistControls.libraryChanged(library); } });
 
 // `app.js` is a module and therefore deferred. This is the one honest signal that its
 // listeners are attached, which is what the headless harness waits on before clicking.

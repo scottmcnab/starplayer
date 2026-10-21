@@ -1,3 +1,4 @@
+import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // End-to-end check of the packaged player in headless Chromium, over the DevTools
 // protocol, with Node's built-in `WebSocket` and `http` and nothing else installed.
 //
@@ -305,7 +306,7 @@ class Page {
             const satisfied = await this.evaluate(`return Boolean(${expression});`).catch(() => false);
             if (satisfied) return;
             if (Date.now() > deadline) {
-                const shown = await this.evaluate("return document.getElementById('message').textContent + ' | ' + document.getElementById('error').textContent;").catch((error) => `unreadable (${error.message})`);
+                const shown = await this.evaluate("return document.getElementById('message').textContent + ' | ' + document.getElementById('error').textContent + ' | playlist telemetry: ' + JSON.stringify(window.latestPlaylistSnapshot && { playing: window.latestPlaylistSnapshot.playing, frame: window.latestPlaylistSnapshot.songFrame, length: window.latestPlaylistSnapshot.songLengthFrames, generation: window.latestPlaylistSnapshot.moduleGeneration, progressMax: document.getElementById('progress').max });").catch((error) => `unreadable (${error.message})`);
                 throw new Error(`timed out waiting for ${description}\n  page says: ${shown}\n  console: ${this.consoleErrors.join(' / ') || 'quiet'}`);
             }
             await delay(100);
@@ -1411,6 +1412,7 @@ async function runLibrary(executable, mode) {
         await page.evaluate("document.getElementById('playlist-clear').click(); document.getElementById('library-format').value = ''; document.getElementById('library-server').click();");
         await page.waitFor('restored library', "document.getElementById('library-count').textContent === '5 of 5'");
         await filter('title:Loose', '1 of 5');
+        await page.waitFor('loose row painted', "document.querySelector('[data-row-id=\"0\"]') !== null");
         await clickRow(0);
         await page.evaluate("document.getElementById('library-add-selected').click();");
         await filter('title:Disk name:PETRI', '1 of 5');
@@ -1427,7 +1429,7 @@ async function runLibrary(executable, mode) {
         // fallback snapshots; its generation starts again at one.
         await page.evaluate("document.getElementById('sample-rate').value = '48000'; document.getElementById('apply-sample-rate').click();");
         await page.waitFor('playlist sample-rate rebuild', "document.getElementById('message').textContent.includes('Output rate rebuilt')");
-        await page.waitFor('playlist telemetry', "window.latestPlaylistSnapshot?.playing === true");
+        await page.waitFor('rebuilt playlist telemetry painted', "window.latestPlaylistSnapshot?.moduleGeneration === 1 && window.latestPlaylistSnapshot.playing === true && Number(document.getElementById('progress').max) === window.latestPlaylistSnapshot.songLengthFrames");
         const seekNearEnd = async seconds => {
             const rate = rateDigits((await page.evaluate(READ_STATE)).workletRate);
             await page.evaluate(`const progress = document.getElementById('progress'); progress.value = String(Number(progress.max) - ${rate * seconds}); progress.dispatchEvent(new Event('change'));`);
@@ -1473,6 +1475,47 @@ async function runLibrary(executable, mode) {
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '1');
         await page.evaluate("document.getElementById('playlist-clear').click();");
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '0');
+        const storeResults = await page.evaluate(`const { openPlaylistStore } = await import('./playlist-store.js'); return await (${verifyPlaylistStore.toString()})(openPlaylistStore);`);
+        console.log(`playlist-store[${mode}]: ${storeResults}`);
+        // W11: module and two-member ZIP uploads, persisted current id/loop and
+        // disconnected library state, then actual audio activation of every upload.
+        await filter('title:Loose', '1 of 5');
+        await page.waitFor('loose row painted', "document.querySelector('[data-row-id=\"0\"]') !== null");
+        await clickRow(0);
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        await page.evaluate(`
+            const files = new DataTransfer();
+            files.items.add(new File([await (await fetch('/library/loose/REFLEX.S3M')).arrayBuffer()], 'REFLEX.S3M'));
+            const input = document.getElementById('playlist-files'); input.files = files.files; input.dispatchEvent(new Event('change'));
+            const dropped = new DataTransfer();
+            dropped.items.add(new File([await (await fetch('/library/disks/disk1.zip')).arrayBuffer()], 'disk.zip'));
+            document.getElementById('playlist-panel').dispatchEvent(new DragEvent('drop', { dataTransfer: dropped, bubbles: true, cancelable: true }));
+        `);
+        await page.waitFor('three uploaded entries', "document.getElementById('playlist-count').textContent === '4' && document.getElementById('playlist-status').textContent.includes('disk.zip')");
+        await page.evaluate("document.getElementById('playlist-loop').checked = true; document.getElementById('playlist-loop').dispatchEvent(new Event('change')); document.querySelectorAll('#playlist-list li')[2].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));");
+        await page.waitFor('upload current', "document.querySelectorAll('#playlist-list li')[2].classList.contains('current')");
+        await page.waitFor('current entry persisted', "await (async () => { const { openPlaylistStore } = await import('./playlist-store.js'); const store = await openPlaylistStore(); const saved = store.state; store.close(); return saved.entries.length === 4 && saved.currentId === document.querySelectorAll('#playlist-list li')[2].dataset.entryId && saved.loop; })()");
+        await page.send('Page.reload');
+        await page.waitFor('restored playlist', "document.documentElement.dataset.playerReady === 'true' && document.getElementById('playlist-count').textContent === '4'");
+        assert.equal(await page.evaluate("return document.querySelectorAll('#playlist-list li')[2].classList.contains('current') && document.getElementById('playlist-loop').checked;"), true);
+        assert.match(await page.evaluate("return document.querySelector('#playlist-list .playlist-marker').textContent;"), /library not connected/);
+        await page.evaluate(`if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true;`);
+        for (const [index, title] of [[1, 'reflex'], [2, 'petrified'], [3, 'reflex']]) {
+            await page.evaluate(`document.querySelectorAll('#playlist-list li')[${index}].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));`);
+            await page.waitFor('restored upload plays', `document.querySelectorAll('#playlist-list li')[${index}].classList.contains('current') && document.getElementById('title').textContent.toLowerCase().includes('${title}') && document.getElementById('transport-chip').textContent === 'playing'`);
+        }
+        await page.evaluate("document.getElementById('library-server').click();");
+        await page.waitFor('library reconnected', "!document.querySelector('#playlist-list .playlist-marker').textContent.includes('library not connected')");
+        await page.evaluate(`
+            const dropped = new DataTransfer();
+            dropped.items.add(new File([await (await fetch('/library/disks/outer.zip')).arrayBuffer()], 'outer.zip'));
+            document.getElementById('playlist-panel').dispatchEvent(new DragEvent('drop', { dataTransfer: dropped, bubbles: true, cancelable: true }));
+        `);
+        await page.waitFor('nested upload added', "document.getElementById('playlist-count').textContent === '5' && document.getElementById('playlist-status').textContent.includes('outer.zip')");
+        await page.evaluate("document.querySelector('#playlist-list li:last-child').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));");
+        await page.waitFor('nested upload plays', "document.querySelector('#playlist-list li:last-child').classList.contains('current') && document.getElementById('title').textContent === 'Petrified'");
+
+
         assert.deepEqual(page.consoleErrors, []);
         return { playlistSnapshots, stoppedFade: { flags: stoppedFade.songFlags, frame: stoppedFade.songFrame }, firstPaint, filterMilliseconds, scroll, missing: missing.errorText, nestedTitle: beforeMissing.title };
     } finally {

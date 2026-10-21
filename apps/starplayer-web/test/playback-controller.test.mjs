@@ -228,3 +228,18 @@ test('W7 completion subscriptions remain stable when the first listener starts a
     fixture.controller.stop();
     assert.equal(stopped, 1);
 });
+
+test('unavailable entries are skipped without failure budget; looping all unavailable terminates', async () => {
+    const fixture = setup();
+    const playlist = createPlaylist();
+    const entries = playlist.add(Array.from({ length: 6 }, (_, index) => ({ locator: locator(String(index)), display: { name: String(index) } })));
+    let available = false;
+    const navigation = createPlaylistPlayback({ playlist, controller: fixture.controller, resolver: { prefetch() {} }, loop: () => true, available: entry => available && entry.id === entries[5].id });
+    await navigation.playEntry(entries[0]);
+    assert.equal(playlist.current, null);
+    assert.equal(navigation.failures.size, 0);
+    available = true;
+    await navigation.playEntry(entries[0]);
+    assert.equal(playlist.current.id, entries[5].id);
+    assert.equal(navigation.failures.size, 0);
+});

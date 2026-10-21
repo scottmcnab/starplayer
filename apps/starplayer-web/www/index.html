@@ -132,15 +132,22 @@
             <p id="library-selection-count" class="library-hint"></p>
         </div>
     </details>
-    <section class="panel" aria-label="Playlist">
+    <section id="playlist-panel" class="panel" aria-label="Playlist">
         <h2>Playlist · <span id="playlist-count">0</span></h2>
         <div class="playlist-controls">
             <button id="playlist-previous" type="button">Previous track</button>
             <button id="playlist-next" type="button">Next track</button>
+            <button id="playlist-add" type="button">Add files…</button>
+            <input id="playlist-files" type="file" multiple hidden>
+            <button id="playlist-export" type="button">Export playlist</button>
+            <button id="playlist-import" type="button">Import playlist</button>
+            <input id="playlist-csv" type="file" accept=".csv,text/csv" hidden>
+            <button id="playlist-rebind" type="button" hidden></button>
             <button id="playlist-clear" type="button">Clear</button>
             <label><input id="playlist-loop" type="checkbox"> Loop playlist</label>
         </div>
         <p class="library-hint">Double-click or Enter to play. Delete to remove. Drag or Alt+↑/↓ to reorder.</p>
+        <p id="playlist-status" role="status"></p>
         <ol id="playlist-list"></ol>
     </section>
 

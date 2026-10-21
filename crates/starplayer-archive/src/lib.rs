@@ -100,6 +100,21 @@ pub fn list_modules(bytes: &[u8]) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     }
 }
 
+/// List immediate ZIP containers by central-directory index without extracting them.
+/// A container this crate cannot extract is skipped, as `list_modules` skips modules.
+pub fn list_zip_containers(bytes: &[u8]) -> Result<Vec<usize>, ArchiveError> {
+    let mut archive = open_archive(bytes)?;
+    let mut containers = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index_raw(index).map_err(map_zip_error)?;
+        let name = entry.name().map_err(map_zip_error)?;
+        if !entry.is_dir() && !is_resource_fork(&name) && name.rsplit_once('.').is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("zip")) && ensure_supported(&entry).is_ok() {
+            containers.push(index);
+        }
+    }
+    Ok(containers)
+}
+
 /// Extract one supported, unencrypted central-directory entry.
 ///
 /// Stored, Deflate, Shrink, Implode and Reduce (factors 1–4) are supported.

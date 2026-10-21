@@ -245,7 +245,13 @@ mod exports {
     #[wasm_bindgen]
     pub fn is_archive(bytes: &[u8]) -> bool { is_zip(bytes) }
 
-    /// List the S3M, MOD, MTM and IT entries this web player can offer, one tab record per line.
+    /// List immediate inner ZIPs by central-directory index.
+    #[wasm_bindgen]
+    pub fn archive_containers(bytes: &[u8]) -> Result<Vec<u32>, JsValue> {
+        starplayer_archive::list_zip_containers(bytes).map(|indices| indices.into_iter().map(|index| index as u32).collect()).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// List playable modules, one tab record per line.
     #[wasm_bindgen]
     pub fn archive_modules(bytes: &[u8]) -> Result<String, JsValue> {
         archive_module_records(bytes).map_err(|error| JsValue::from_str(&error.to_string()))

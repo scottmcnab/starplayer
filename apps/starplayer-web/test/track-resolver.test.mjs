@@ -106,3 +106,24 @@ test('prefetch swallows source failures and leaves the queue usable', async () =
     source.readFile = async () => new Uint8Array([1, 2]).buffer;
     assert.deepEqual([...new Uint8Array(await resolver.resolve(locator()))], [2]);
 });
+
+test('uploads use numeric nested indices, enforce limits, abort and return independent bytes', async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const calls = [];
+    const blobStore = { getBlob: async () => ({ size: 3, bytes: new Blob([bytes]) }) };
+    const loader = { archive_extract_nested(input, container, member) { calls.push([container, member]); return input.subarray(1); } };
+    const resolver = createResolver({ blobStore, loader });
+    const upload = { kind: 'upload', blobId: 'id', containerIndex: 5, memberIndex: 9, memberPath: 'sanitised name' };
+    assert.deepEqual([...new Uint8Array(await resolver.resolve(upload))], [2, 3]);
+    assert.deepEqual(calls, [[5, 9]]);
+    const loose = { ...upload, containerIndex: -1, memberIndex: -1 };
+    const first = await resolver.resolve(loose);
+    new Uint8Array(first)[0] = 99;
+    assert.deepEqual([...new Uint8Array(await resolver.resolve(loose))], [1, 2, 3]);
+    await assert.rejects(createResolver({ blobStore, loader, maxFileBytes: 2 }).resolve(upload), /too large/);
+    const controller = new AbortController();
+    blobStore.getBlob = async () => { controller.abort(); return { size: 3, bytes: new Blob([bytes]) }; };
+    await assert.rejects(resolver.resolve(upload, { signal: controller.signal }), { name: 'AbortError' });
+    blobStore.getBlob = async () => null;
+    await assert.rejects(resolver.resolve(upload), /missing — re-add/);
+});

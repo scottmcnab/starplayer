@@ -1,10 +1,11 @@
-// In-memory W7 model. Navigation never wraps; W10 owns repeat and playback policy.
+// Observable ordered model. Navigation never wraps; W10 owns repeat and playback policy.
 export function createPlaylist() {
     let entries = [];
     let currentId = null;
     const listeners = new Set();
     const notify = () => { for (const listener of listeners) listener(model); };
     const model = {
+        restore(snapshot) { entries = snapshot.entries.map(entry => structuredClone(entry)); currentId = snapshot.currentId ?? null; notify(); },
         get entries() { return entries.slice(); },
         get current() { return entries.find(entry => entry.id === currentId) ?? null; },
         add(items, { at = entries.length } = {}) {
@@ -53,7 +54,7 @@ export function libraryLocator(row, libraryIdentity) {
     return { kind: 'library', libraryIdentity: { ...libraryIdentity }, sourcePath: row.sourcePath, containerMember: row.containerMember, memberPath: row.memberPath, rawHex: row.rawHex };
 }
 
-export function wirePlaylistList(playlist, { playback, available = () => true } = {}) {
+export function wirePlaylistList(playlist, { playback, available = () => true, availability = entry => available(entry) ? '' : 'unavailable' } = {}) {
     const list = document.getElementById('playlist-list');
     let draggedId = null;
     const render = () => {
@@ -68,16 +69,17 @@ export function wirePlaylistList(playlist, { playback, available = () => true } 
             item.classList.toggle('current', current);
             if (current) item.setAttribute('aria-current', 'true');
             const failure = playback?.failures.get(entry.id);
+            const unavailable = availability(entry);
             const marker = document.createElement('span');
             marker.className = 'playlist-marker';
-            marker.textContent = `${current ? '▶ ' : ''}${failure ? '⚠' : !available(entry) ? 'unavailable' : ''}`;
+            marker.textContent = `${current ? '▶ ' : ''}${failure ? '⚠ ' : ''}${unavailable}`;
             const name = document.createElement('strong');
             name.className = 'playlist-name';
             name.textContent = entry.display.name;
             const detail = document.createElement('span');
             detail.className = 'playlist-detail';
             detail.textContent = [entry.display.title, entry.display.format, entry.display.folder || entry.locator.sourcePath].filter(Boolean).join(' · ');
-            item.title = failure || detail.textContent;
+            item.title = [failure, unavailable, detail.textContent].filter(Boolean).join(' · ');
             const remove = document.createElement('button');
             remove.textContent = '×';
             remove.setAttribute('aria-label', `Remove ${entry.display.name}`);

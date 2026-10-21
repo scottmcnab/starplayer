@@ -437,3 +437,17 @@ fixture, renders ten seconds through the engine, exercises transport, confirms r
 collection, inspects synthetic MOD telemetry at both panning settings, proves two
 overlapping processors own independent memories and Rust hosts, and checks that a bad file
 is rejected with a readable message.
+
+Playlist files and state are saved in this browser. Use **Add files…** or drop onto
+the Playlist panel to add modules, ZIP members, or one nested ZIP level. Uploaded
+bytes share a 256 MiB storage cap; removing the last reference removes the file.
+When storage is unavailable the player reports session-only use. Missing uploads
+are marked **missing — re-add** and skipped. Reopen a library after reload to
+connect its saved entries. A changed index offers an explicit **Rebind** action
+for matching keys.
+
+**Export playlist** saves library locators as CSV in order, keeping duplicates and
+reporting omitted uploads. **Import playlist** appends CSV rows bound to the open
+library, keeping missing rows as unavailable for later rebinding. Exported CSV can
+also be opened as a small library. See [the CSV contract](LIBRARY-CSV.md#saving-and-exchanging-playlists)
+for storage, identity and exchange details.

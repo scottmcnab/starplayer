@@ -1,5 +1,5 @@
 // Navigation owns no audio state: all loads, including skips, claim controller intent.
-export function createPlaylistPlayback({ playlist, controller, resolver, loop = () => false, report = () => {}, changed = () => {}, clock = globalThis }) {
+export function createPlaylistPlayback({ playlist, controller, resolver, loop = () => false, report = () => {}, changed = () => {}, available = () => true, clock = globalThis }) {
     const failures = new Map();
     let revision = 0;
     let pendingId = null;
@@ -23,8 +23,17 @@ export function createPlaylistPlayback({ playlist, controller, resolver, loop = 
         async playEntry(entry) {
             if (!entry) return;
             const token = ++revision;
+            pendingId = null;
+            controller.cancel();
             let consecutiveFailures = 0;
+            const skipped = new Set();
             while (entry && token === revision) {
+                if (!available(entry)) {
+                    if (skipped.has(entry.id)) break;
+                    skipped.add(entry.id);
+                    entry = adjacent(entry.id, 1);
+                    continue;
+                }
                 pendingId = entry.id;
                 const result = await controller.play(entry.locator, { origin: 'playlist', entryId: entry.id, label: entry.display.name });
                 if (token !== revision || result.status === 'abandoned') return;

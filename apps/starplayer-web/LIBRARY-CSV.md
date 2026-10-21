@@ -127,3 +127,28 @@ For a local HTTP source, run `cargo xtask serve --library <directory>` and selec
 **Server library**. The default index is `<directory>/index.csv`; supply
 `--library-index <file>` when it lives elsewhere. Both options also work with
 `cargo xtask wasm --serve`. Without `--library`, the server source is hidden.
+
+## Saving and exchanging playlists
+
+**Export playlist** downloads the library entries in their current order, including
+repeats. `library` contains each entry's original library identity name. Uploaded
+files are omitted, and the status message reports the number skipped. The CSV
+contains locators, not module bytes. It can also be opened as a small library index.
+
+**Import playlist** appends rows bound to the currently open library. Missing keys
+are reported and retained as unavailable. Opening another index offers **Rebind N
+entries to …** when its keys match; clicking explicitly replaces those entries'
+identities. Rebinding never happens automatically.
+
+The browser saves ordered entries, current entry id, loop setting, known library
+identities and uploaded files in IndexedDB. Libraries must be reopened after reload;
+entries show **library not connected** with their identity name until then. Missing
+uploaded bytes show **missing — re-add**. Playback skips unavailable entries.
+
+Use **Add files…** or drop files onto the Playlist panel to keep modules and ZIP
+members across reloads. ZIP members use numeric directory indices, including one
+nested ZIP level. A shared ZIP is stored once and removed when its last entry is
+removed. Stored files are capped at 256 MiB, with only unreferenced files eligible
+for eviction. A refused file can still be opened once using the main file picker.
+Storage failure switches to session-only use with a notice. Browser storage may be
+cleared or evicted; CSV export does not back up uploaded bytes.

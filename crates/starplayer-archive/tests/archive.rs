@@ -318,3 +318,14 @@ fn lookup_does_not_inflate_legacy_streams() {
         assert_eq!(find_entry(&bytes, "broken.mod", None).unwrap(), 0);
     }
 }
+
+#[test]
+fn zip_container_indices_include_non_module_slots_and_skip_resources() {
+    let bytes = archive(&[
+        ("notes.txt", b"notes", CompressionMethod::Stored),
+        ("inner.ZIP", b"PK", CompressionMethod::Stored),
+        ("__MACOSX/hidden.zip", b"PK", CompressionMethod::Stored),
+        ("REFLEX.S3M", b"module", CompressionMethod::Stored),
+    ], &["directory.zip/"]);
+    assert_eq!(starplayer_archive::list_zip_containers(&bytes).unwrap(), vec![2]);
+}

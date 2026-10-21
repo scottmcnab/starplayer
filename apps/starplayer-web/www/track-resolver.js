@@ -1,6 +1,6 @@
 import { checkAbort } from './library-source.js';
 
-export function createResolver({ source, loader, cacheBytes = 64 * 1024 * 1024, maxFileBytes = 128 * 1024 * 1024 }) {
+export function createResolver({ source, loader, blobStore, cacheBytes = 64 * 1024 * 1024, maxFileBytes = 128 * 1024 * 1024 }) {
     const cache = new Map();
     let totalBytes = 0;
     let generation = 0;
@@ -14,6 +14,19 @@ export function createResolver({ source, loader, cacheBytes = 64 * 1024 * 1024, 
     async function execute(locator, signal, warmOnly) {
         try {
             checkAbort(signal);
+            if (locator.kind === 'upload' && blobStore) {
+                if (warmOnly) return;
+                const blob = await blobStore.getBlob(locator.blobId);
+                checkAbort(signal);
+                if (!blob) throw new Error('missing — re-add');
+                if (blob.size > maxFileBytes) throw new Error(`too large (${blob.size} bytes; limit ${maxFileBytes})`);
+                const bytes = new Uint8Array(await blob.bytes.arrayBuffer());
+                checkAbort(signal);
+                if (bytes.byteLength > maxFileBytes) throw new Error('too large');
+                const result = locator.memberIndex < 0 ? bytes : await loader.archive_extract_nested(bytes, locator.containerIndex, locator.memberIndex);
+                checkAbort(signal);
+                return copyBytes(result).buffer;
+            }
             if (locator.kind !== 'library') throw new Error(`${locator.kind} locator not supported by this resolver`);
             if (warmOnly && !locator.memberPath) return;
             const currentGeneration = generation;
