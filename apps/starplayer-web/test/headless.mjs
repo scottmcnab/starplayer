@@ -1438,7 +1438,7 @@ async function runLibrary(executable, mode) {
         // Rebuild while playlist mode owns at-end policy. The new node also captures
         // fallback snapshots; its generation starts again at one.
         await page.evaluate("document.getElementById('sample-rate').value = '48000'; document.getElementById('apply-sample-rate').click();");
-        await page.waitFor('playlist sample-rate rebuild', "document.getElementById('message').textContent.includes('Output rate rebuilt')");
+        await page.waitFor('playlist sample-rate rebuild', "document.getElementById('message').textContent.includes('rebuilt') && document.getElementById('message').textContent.includes('48,000 Hz')");
         await page.waitFor('rebuilt playlist telemetry painted', "window.latestPlaylistSnapshot?.moduleGeneration === 1 && window.latestPlaylistSnapshot.playing === true && Number(document.getElementById('progress').max) === window.latestPlaylistSnapshot.songLengthFrames");
         const seekNearEnd = async seconds => {
             const rate = rateDigits((await page.evaluate(READ_STATE)).workletRate);

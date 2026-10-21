@@ -227,3 +227,34 @@ are excluded from the live music keyboard, like library keys.
 
 Regression coverage includes replaying a completed activation, suppression across
 rebind, and Stop during a pending rate rebuild in all three browser transports.
+
+### W6 integration checkpoint (2026-10-21)
+
+A trial merge of `w6-resumable-module-load` (`8a8ac11`) into `library-playlist`
+(`e176ccd`) is kept on the scratch branch `library-w6-check` (`fd23cf0`, worktree
+`../starplayer-library-w6-check`) as the reference resolution. Conflicts: four hunks in
+`www/app.js`, three in `test/headless.mjs` and one in `plans/README.md`. Resolution,
+for whichever branch lands second:
+
+* `activateLoadedModule`: keep this branch's guarded tail (`context.isCurrent()`, node
+  check, `return null`) and add W6's `state.playbackChoices.clear()` before
+  `libraryView.setPlaying(null)`.
+* `applyLoadOptions`: take W6's `sendCommandsToCurrentGraph(playbackRestoreCommands())`
+  and keep `if (playback.stopped) queueCommand(Ring.OPCODE_STOP)`; the existing
+  `playback.rebind(node, activation.generation)` merges cleanly.
+* `rebuildAudioContext` / `rebuildOutputChannels`: take W6's unified `rebuildGraph()` retry
+  loop and add `playback.rebind(graph.node, activation.generation)` inside its
+  `if (activation)` block. The `controlRevision` guard is dropped: W6 rebuilds the
+  restore commands at install time from its recorded playback choices, which already
+  keeps a Stop issued during a pending rebuild (the library scenario's "Stop during
+  pending graph rebuild" step passes on the merge).
+* `headless.mjs`: union the `node:fs/promises` imports (`cp` and `mkdir`), keep W6's
+  `startDevServer` preamble with this branch's `libraryDirectory` parameter, and run the
+  library scenario inside W6's temp-`dist` `try` block.
+
+Results on the merge: archive/web/host-wasm/model cargo tests, 51 Node tests and the
+library scenario in all three modes pass. W6's own "rendering stalled during a load"
+assertion (`headless.mjs`, the 3,999,000-frame single-sample XM) fails at a 35–66 ms
+render gap against a ~31 ms bound, **and fails identically on `w6-resumable-module-load`
+alone** (44–64 ms, two runs) — a W6 issue on this machine, not a merge regression. The
+library rebuild wait now matches both message wordings, so it no longer conflicts.
