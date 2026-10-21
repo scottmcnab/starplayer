@@ -1269,7 +1269,10 @@ async function runLibrary(executable, mode) {
         assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
         await page.evaluate("document.getElementById('library-browse').click(); document.querySelector('[data-scope=disks]').click();");
         await page.waitFor('folder scope', "document.getElementById('library-count').textContent === '4 of 5'");
-        await page.evaluate("document.querySelector('[aria-label=\"Expand disks\"]').click(); document.querySelector('[data-scope=\"disks/disk1.zip\"]').click();");
+        await page.evaluate("document.querySelector('[aria-label=\"Expand disks\"]').focus(); document.activeElement.click();");
+        assert.equal(await page.evaluate("return document.activeElement.getAttribute('aria-label');"), 'Expand disks');
+        await page.evaluate("document.querySelector('[data-scope=\"disks/disk1.zip\"]').focus(); document.activeElement.click();");
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope;"), 'disks/disk1.zip');
         await page.waitFor('ZIP scope', "document.getElementById('library-count').textContent === '3 of 5'");
         await page.evaluate("document.querySelector('[aria-label=\"Add folder disks/disk1.zip\"]').click();");
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '9');
@@ -1425,6 +1428,13 @@ async function runLibrary(executable, mode) {
         `);
         await page.waitFor('first playlist track', "document.querySelector('#playlist-list li.current .playlist-name')?.textContent === 'REFLEX.S3M'");
         assert.equal(await page.evaluate("return document.getElementById('repeat').checked && document.getElementById('repeat').disabled;"), true);
+        // Stop in the same turn as starting a rebuild: its saved Play must not win.
+        await page.evaluate("document.getElementById('sample-rate').value = '32000'; document.getElementById('apply-sample-rate').click(); document.getElementById('stop').click();");
+        await page.waitFor('Stop during pending graph rebuild', "document.getElementById('transport-chip').textContent === 'stopped'");
+        await delay(1500);
+        assert.equal((await page.evaluate(READ_STATE)).chip, 'stopped');
+        await page.evaluate("document.getElementById('play').click();");
+        await page.waitFor('playlist resumed after cancelled rebuild', "document.getElementById('transport-chip').textContent === 'playing'");
         // Rebuild while playlist mode owns at-end policy. The new node also captures
         // fallback snapshots; its generation starts again at one.
         await page.evaluate("document.getElementById('sample-rate').value = '48000'; document.getElementById('apply-sample-rate').click();");

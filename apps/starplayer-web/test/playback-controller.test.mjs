@@ -243,3 +243,48 @@ test('unavailable entries are skipped without failure budget; looping all unavai
     assert.equal(playlist.current.id, entries[5].id);
     assert.equal(navigation.failures.size, 0);
 });
+
+
+test('Play after completion re-arms exactly one notification without a new activation', async () => {
+    const fixture = setup();
+    await fixture.controller.play(locator('song'), { origin: 'playlist', entryId: 'entry' });
+    fixture.tick(true);
+    fixture.tick(false, 5);
+    fixture.controller.userControl('play');
+    fixture.tick(false, 5);
+    fixture.tick(true);
+    fixture.tick(false, 5);
+    fixture.tick(false, 5);
+    assert.deepEqual(fixture.ended, ['entry', 'entry']);
+    assert.equal(fixture.activated.length, 1);
+});
+
+test('transport changes invalidate captured graph restoration and preserve Stop through rebind', async () => {
+    const fixture = setup();
+    await fixture.controller.play(locator('song'));
+    const revision = fixture.controller.controlRevision;
+    fixture.controller.stop();
+    fixture.controller.rebind('rebuilt', 1);
+    assert.notEqual(fixture.controller.controlRevision, revision);
+    assert.equal(fixture.controller.stopped, true);
+    fixture.controller.userControl('seek');
+    assert.equal(fixture.controller.stopped, true);
+    fixture.controller.userControl('play');
+    assert.equal(fixture.controller.stopped, false);
+});
+
+
+test('a large disconnected playlist traverses once without copying entries per skip', async () => {
+    const playlist = createPlaylist();
+    const entries = playlist.add(Array.from({ length: 37674 }, (_, index) => ({ locator: locator(index), display: { name: String(index) } })));
+    let reads = 0;
+    let checked = 0;
+    const observed = new Proxy(playlist, { get(target, key) { if (key === 'entries') reads += 1; return target[key]; } });
+    const fixture = setup();
+    const navigation = createPlaylistPlayback({ playlist: observed, controller: fixture.controller, resolver: {}, loop: () => true, available: () => { checked += 1; return false; } });
+    await navigation.playEntry(entries[0]);
+    assert.equal(checked, entries.length + 1);
+    assert.ok(reads < 10, `playlist copied ${reads} times`);
+    assert.equal(fixture.activated.length, 0);
+    navigation.dispose();
+});

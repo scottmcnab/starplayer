@@ -1,6 +1,6 @@
 import { openPlaylistStore } from './playlist-store.js';
 import { createResolver } from './track-resolver.js';
-import { exportPlaylist, importPlaylist, locatorKey, rebindCandidates, rebindEntries } from './playlist-transfer.js';
+import { exportPlaylist, importPlaylist, keysForLibrary, locatorKey, rebindCandidates, rebindEntries } from './playlist-transfer.js';
 
 export async function createPlaylistControls({ playlist, state, loader, ready = () => {} }) {
     const element = name => document.getElementById(`playlist-${name}`);
@@ -19,7 +19,7 @@ export async function createPlaylistControls({ playlist, state, loader, ready = 
         if (entry.locator.kind === 'upload') return store.hasBlob(entry.locator.blobId) ? '' : 'missing — re-add';
         const library = state.library;
         if (library?.identity.sha256 !== entry.locator.libraryIdentity?.sha256) return `library not connected — ${entry.locator.libraryIdentity?.name || 'unknown library'}`;
-        return library.library.rows.some(row => locatorKey(row) === locatorKey(entry.locator)) ? '' : 'track not in library';
+        return keysForLibrary(library.library).has(locatorKey(entry.locator)) ? '' : 'track not in library';
     }
     function updateRebind() {
         const candidates = rebindCandidates(playlist.entries, state.library);

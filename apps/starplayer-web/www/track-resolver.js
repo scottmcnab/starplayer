@@ -40,8 +40,8 @@ export function createResolver({ source, loader, blobStore, cacheBytes = 64 * 10
             } else {
                 const result = await source.readFile(locator.sourcePath, { signal });
                 checkAbort(signal);
+                if (result.byteLength > maxFileBytes) throw new Error(`too large (${result.byteLength} bytes; limit ${maxFileBytes})`);
                 bytes = copyBytes(result);
-                if (bytes.byteLength > maxFileBytes) throw new Error(`too large (${bytes.byteLength} bytes; limit ${maxFileBytes})`);
                 if (locator.memberPath && bytes.byteLength <= cacheBytes && currentGeneration === generation) {
                     while (totalBytes + bytes.byteLength > cacheBytes && cache.size) {
                         const oldest = cache.keys().next().value;

@@ -5,6 +5,7 @@ const SONG_FLAG_END_REACHED = 4; // ring.js snapshot ABI
 export function createPlaybackController({ resolver, activate, ready = () => {}, readSnapshot, flushCommands = () => {}, stop = () => {}, repeat = () => true, onIntent = () => {}, onTrackEnded = () => {}, clock = globalThis }) {
     const endedListeners = new Set([onTrackEnded]);
     let intent = 0;
+    let controlRevision = 0;
     let abort = null;
     let current = null;
     let playlistMode = false;
@@ -14,6 +15,8 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
     let sequence = -1;
     const controller = {
         get current() { return current; },
+        get controlRevision() { return controlRevision; },
+        get stopped() { return blocked; },
         get playlistMode() { return playlistMode; },
         effectiveAtEnd: () => !playlistMode && repeat(),
         cancel() { intent += 1; abort?.abort(); wasPlaying = false; },
@@ -53,7 +56,8 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
         // Stop suppresses completion until Play. A seek only needs a fresh playing ->
         // stopped edge: scrubbing a playlist track must not stop the playlist advancing.
         userControl(action) {
-            if (action === 'play') { blocked = false; wasPlaying = false; }
+            controlRevision += 1;
+            if (action === 'play') { blocked = false; wasPlaying = false; emitted = false; }
             else if (action === 'seek') { wasPlaying = false; }
             else { blocked = true; controller.cancel(); }
         },

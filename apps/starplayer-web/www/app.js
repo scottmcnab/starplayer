@@ -1099,7 +1099,7 @@ function selectMidiInput() {
 
 /// Whether a key event is the page's to play, rather than something the person is typing.
 function keyboardIsListening(event) {
-    if (!elements.keyboardEnable.checked || !state.liveInputActive || event.target.closest?.('#library-panel')) return false;
+    if (!elements.keyboardEnable.checked || !state.liveInputActive || event.target.closest?.('#library-panel, #playlist-panel')) return false;
     if (event.ctrlKey || event.altKey || event.metaKey) return false;
     const target = event.target;
     if (target instanceof HTMLElement && target.isContentEditable) return false;
@@ -1343,6 +1343,7 @@ async function applyLoadOptions(changedKey) {
         state.activationMemoryBytes = activation.memoryBytes;
         state.loadCount += 1;
         sendCommandsToCurrentGraph(restoreCommands);
+        if (playback.stopped) queueCommand(Ring.OPCODE_STOP);
         persistPreferences();
         const reduction = describeEnhancementReduction(requested.enhancementFlags, activation.appliedEnhancementFactor);
         showMessage(`${wording.applied}; playback restored at the sounding order.${reduction ? ` (${reduction}.)` : ''}`);
@@ -1377,6 +1378,7 @@ async function rebuildAudioContext() {
     const oldNode = state.node;
     const moduleBytes = state.currentModuleBytes;
     const revision = state.moduleRevision;
+    const controlRevision = playback.controlRevision;
     const oldSinkId = 'sinkId' in oldContext ? oldContext.sinkId : '';
     const restoreCommands = playbackRestoreCommands();
     const contextOptions = { latencyHint: 'interactive' };
@@ -1401,7 +1403,7 @@ async function rebuildAudioContext() {
             });
         }
         await unlock;
-        if (revision !== state.moduleRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
         graph.node.connect(candidateContext.destination);
         if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
         state.context = candidateContext;
@@ -1447,6 +1449,7 @@ async function rebuildOutputChannels() {
     const oldNode = state.node;
     const moduleBytes = state.currentModuleBytes;
     const revision = state.moduleRevision;
+    const controlRevision = playback.controlRevision;
     const restoreCommands = playbackRestoreCommands();
     let candidateNode = null;
     try {
@@ -1456,7 +1459,7 @@ async function rebuildOutputChannels() {
         const activation = state.currentModuleBytes === null
             ? null
             : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions);
-        if (revision !== state.moduleRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
         graph.node.connect(state.context.destination);
         if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
         installGraph(graph);

@@ -2,9 +2,14 @@ import { parsePlaylistCsv, toPlaylistCsv } from './library-index.js';
 import { libraryLocator } from './playlist.js';
 
 export const locatorKey = row => JSON.stringify([row.sourcePath || '', row.containerMember || '', row.memberPath || '']);
+const libraryKeys = new WeakMap();
+export function keysForLibrary(library) {
+    if (!libraryKeys.has(library)) libraryKeys.set(library, new Set(library.rows.map(locatorKey)));
+    return libraryKeys.get(library);
+}
 export function rebindCandidates(entries, library) {
     if (!library) return [];
-    const keys = new Set(library.library.rows.map(locatorKey));
+    const keys = keysForLibrary(library.library);
     return entries.filter(entry => entry.locator.kind === 'library' && entry.locator.libraryIdentity?.sha256 !== library.identity.sha256 && keys.has(locatorKey(entry.locator))).map(entry => entry.id);
 }
 export function rebindEntries(entries, ids, identity) {
@@ -18,7 +23,7 @@ export function exportPlaylist(entries) {
 export function importPlaylist(text, library) {
     if (!library) throw new Error('Open a library before importing a playlist.');
     const parsed = parsePlaylistCsv(text);
-    const keys = new Set(library.library.rows.map(locatorKey));
+    const keys = keysForLibrary(library.library);
     return {
         items: parsed.entries.map(row => ({ locator: libraryLocator(row, library.identity), display: { name: (row.memberPath || row.sourcePath).split(/[\\/]/).at(-1), title: row.title, format: row.format, folder: row.sourcePath } })),
         unavailable: parsed.entries.filter(row => !keys.has(locatorKey(row))).length,

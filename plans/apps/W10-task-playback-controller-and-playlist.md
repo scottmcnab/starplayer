@@ -64,12 +64,12 @@ reader) so it is unit-testable in Node without a DOM.
   it, the user's Repeat preference. Replace **all four** direct reads of
   `elements.repeat.checked` with it. In playlist mode the Repeat checkbox is disabled with
   a title explaining why, and **keeps** its stored value and `localStorage` preference.
-* **Natural completion.** Track per current module: whether a user Stop or a seek
-  (progress slider, order seek, previous/next order buttons) has been issued since the
-  last Play. A completion is the edge from a snapshot with `playing` to one with
-  `!playing && END_REACHED`, whose `moduleGeneration` and graph match the current
-  activation, with no user Stop/seek recorded. Emit `onTrackEnded(entryId)` exactly once
-  per activation.
+* **Natural completion.** Stop suppresses completion until Play; a seek clears the
+  playing edge without suppressing future completion. A completion is the edge from
+  a snapshot with `playing` to one with `!playing && END_REACHED`, whose
+  `moduleGeneration` and graph match the current activation. Emit
+  `onTrackEnded(entryId)` once per playback; explicit Play re-arms completion when
+  replaying the same activation.
 * **Control tick.** Run completion detection from a `setInterval` (~100 ms) that also
   flushes the fallback command batch, independent of `requestAnimationFrame`, so a
   background tab advances. Keep the rAF loop for drawing. (Chrome does not throttle
@@ -186,7 +186,7 @@ source, index and selection interfaces remain intact.
   reordering/wrapping, removal during pending advance, and completion subscriptions.
   The headless scenario covers real ending/fading telemetry, background-style
   advance with painting suspended, sample-rate rebuilding, and Stop during a fade.
-* README documents controls, seek/Stop suppression until Play, and the possible
+* README documents controls, Stop suppression until Play, and the possible
   one-second timer throttle in silent background tabs.
 
 Verification completed on 2026-10-21, with builds and browser harnesses run serially:
@@ -214,3 +214,16 @@ A user seek no longer suppresses completion: it only clears the playing edge, so
 scrubbed playlist track still advances when it ends. Only Stop suppresses advance until
 Play. The headless helper no longer clicks Play after seeking, so the scenario now
 exercises that path.
+
+
+### Final whole-branch review
+
+Explicit Play now re-arms completion after a previous natural end. Transport actions
+also increment a control revision: a pending sample-rate/channel graph rebuild is
+abandoned if Play, Stop or seek occurs before its commit. A load-option reload uses
+the same live node and cannot be discarded after activation, so it reapplies Stop
+after its saved restore commands when completion remains suppressed. Playlist keys
+are excluded from the live music keyboard, like library keys.
+
+Regression coverage includes replaying a completed activation, suppression across
+rebind, and Stop during a pending rate rebuild in all three browser transports.

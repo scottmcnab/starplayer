@@ -205,3 +205,28 @@ Hornet music disk and a dropped file, reload/reconnect and check playback, then
 export and re-import the playlist. Actual browser storage eviction and disk
 exhaustion are represented by deterministic missing-blob and injected quota tests,
 not by filling or clearing the owner's browser storage.
+
+
+### Final whole-branch review
+
+A synchronous IndexedDB write exception now explicitly aborts the transaction and
+observes its completion rejection before switching to session-only storage. Initial
+read requests and transaction completion are awaited together, avoiding an unhandled
+rejection on read failure. Uploads without references in the saved state are not
+written to disk. Real Chromium regressions reopen the database to check rollback
+and absence of orphan uploads.
+
+Immutable parsed libraries cache locator-key sets for availability/rebind checks;
+playlist rendering reads the current id once instead of scanning entries per row.
+Navigation keeps a position map updated on playlist changes, so skipping an entirely
+disconnected 37,674-entry playlist traverses it once without copying it per skip.
+Folder actions and playlist deletion/reordering preserve keyboard focus. The CSV
+contract now agrees with source adapters on empty/NUL path rejection, and DOS member
+separators are normalised only for browsing, preserving exact lookup locators.
+
+
+Final review verification (run sequentially): archive/web Rust tests passed
+(21 archive + 11 web, one existing ignored oracle test); Node tests passed (51);
+WASM packaging and the full Chromium harness passed in SAB, forced fallback and
+plain HTTP modes; `cargo xtask ci` passed all 11 jobs. `git diff --check` passed.
+Nothing was staged or committed. Logs are in `target/final-review-{rust,node,headless,ci}.log`.

@@ -51,6 +51,9 @@ test('library routes serve only mapped files and reject traversal, symlinks and 
         await symlink(join(root, 'music-other'), join(library, 'escape'));
         await symlink('/etc', join(root, 'document-escape'));
         server = await startServer(root, ['--library', library, '--library-index', join(root, 'chosen.csv')]);
+        assert.equal((await get(server.port, '/')).body, 'page');
+        assert.equal((await get(server.port, '/index.html')).body, 'page');
+        assert.equal((await get(server.port, '/index.html', 'HEAD')).headers['content-length'], '4');
         const served = await get(server.port, '/library/song.mod');
         assert.equal(served.status, 200);
         assert.equal(served.body, 'module');

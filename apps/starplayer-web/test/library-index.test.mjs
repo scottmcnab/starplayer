@@ -172,3 +172,14 @@ test('local Hornet CSV compatibility (read only)', async context => {
     assert.equal(parsed.rows.length, 9585);
     assert.deepEqual(parsed.issues, []);
 });
+
+
+test('source paths reject empty segments and NUL; DOS member names retain locators and get folders', () => {
+    const library = parseLibraryCsv('source_path,container_member,member_path\na//b.mod,,\na/, ,\na\0b.mod,,\npack.zip,bonus\\inner.zip,music\\song.s3m\n');
+    assert.equal(library.issues.length, 3);
+    assert.equal(library.rows[0].memberPath, 'music\\song.s3m');
+    assert.equal(library.rows[0].name, 'song.s3m');
+    assert.equal(library.rows[0].folder, 'pack.zip/bonus/inner.zip/music');
+    const tree = buildTree(library);
+    assert.equal(tree.children[0].children[0].children[0].kind, 'nested');
+});

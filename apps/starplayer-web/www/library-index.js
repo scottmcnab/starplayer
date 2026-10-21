@@ -59,7 +59,7 @@ function headers(records) {
 
 function invalidPath(path) {
     if (!path.trim()) return 'blank source_path';
-    if (path.startsWith('/') || /^[a-z]:/i.test(path) || path.includes('\\') || path.split('/').some(part => part === '.' || part === '..')) return `invalid relative path: ${path}`;
+    if (path.startsWith('/') || /^[a-z]:/i.test(path) || /[\\\0]/.test(path) || path.split('/').some(part => !part || part === '.' || part === '..')) return `invalid relative path: ${path}`;
     return null;
 }
 
@@ -84,8 +84,8 @@ function readRows(text, keepDuplicates) {
         if (!keepDuplicates && keys.has(key)) { issues.push({ line, reason: 'duplicate locator' }); continue; }
         keys.add(key);
         const innermost = memberPath || containerMember || sourcePath;
-        const name = innermost.slice(innermost.lastIndexOf('/') + 1);
-        const fullPath = [sourcePath, containerMember, memberPath].filter(Boolean).join('/');
+        const name = innermost.split(/[\\/]/).at(-1);
+        const fullPath = [sourcePath, containerMember, memberPath].filter(Boolean).join('/').replaceAll('\\', '/');
         const folder = fullPath.slice(0, fullPath.length - name.length).replace(/\/$/, '');
         const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
         const format = (get('format_detected').trim() || get('format_by_extension').trim() || extension).toLowerCase();
@@ -171,7 +171,7 @@ export function buildTree(library) {
     for (const row of library.rows) {
         let parent = root;
         const zipPath = row.memberPath || row.containerMember ? row.sourcePath : null;
-        const nestedPath = row.containerMember ? `${row.sourcePath}/${row.containerMember}` : null;
+        const nestedPath = row.containerMember ? `${row.sourcePath}/${row.containerMember.replaceAll('\\', '/')}` : null;
         let path = '';
         if (row.playable) root.trackCount += 1;
         for (const label of row.folder ? row.folder.split('/') : []) {

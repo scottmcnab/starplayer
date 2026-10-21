@@ -1,8 +1,7 @@
 # Library and playlist CSV contract
 
 A library index locates modules beneath a library root. Put it at the root as
-`index.csv` for automatic discovery, or open it separately (source selection and
-opening are implemented in W8). ModDNA's `hornet_index.py` output loads unchanged.
+`index.csv` for automatic discovery, or open it separately with **Open index CSV…**. ModDNA's `hornet_index.py` output loads unchanged.
 The index never requires a download URL or an absolute filesystem path.
 
 Use UTF-8 text, optionally starting with a UTF-8 BOM. CSV follows RFC 4180: a header
@@ -19,7 +18,7 @@ number, including newlines inside earlier quoted fields.
 `source_path` is the only required column. It names a file relative to the library
 root using `/` separators. It must be non-blank and relative: absolute paths,
 Windows drive prefixes such as `C:`, backslashes, and segments equal to `.` or `..`
-are rejected. Invalid rows are skipped and reported in `issues`. `member_path` and
+as well as empty segments and NUL characters are rejected. Invalid rows are skipped and reported in `issues`. `member_path` and
 `container_member` are names inside an archive, not filesystem paths, so they are
 not restricted this way (old DOS archives store `\` separators). Blank lines are
 ignored. Path spelling and case are preserved.
@@ -71,7 +70,7 @@ path if any, and member directories, treating each ZIP as another folder level.
 
 Library identity is `{sha256, name}`: SHA-256 of the exact CSV bytes followed by
 the UTF-8 bytes of its identity name, plus that name. BOM and line endings count.
-Editing the CSV changes identity; playlists will offer to rebind in W11.
+Editing the CSV changes identity; playlists offer explicit rebinding.
 
 ## Minimal example
 
@@ -108,7 +107,7 @@ source_path,container_member,member_path,member_path_raw_hex,title,format_detect
 
 An A–B–A list stays A–B–A on export/import. Non-ASCII names and raw hex survive,
 as do titles containing quotes, commas and newlines. The CSV records locators and
-library names; identity rebinding and persistence belong to W11.
+library names; identity rebinding and persistence are described below.
 
 ## Opening a library in the web player
 

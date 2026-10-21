@@ -4,14 +4,17 @@ export function createPlaylistPlayback({ playlist, controller, resolver, loop = 
     let revision = 0;
     let pendingId = null;
     let previousCurrent = playlist.current?.id;
+    let orderedEntries = playlist.entries;
+    let positions = new Map(orderedEntries.map((entry, index) => [entry.id, index]));
     function adjacent(id, direction) {
-        const entries = playlist.entries;
-        const index = entries.findIndex(entry => entry.id === id);
-        if (index < 0) return null;
-        return entries[index + direction] ?? (loop() ? entries[(index + direction + entries.length) % entries.length] : null);
+        const index = positions.get(id);
+        if (index === undefined) return null;
+        return orderedEntries[index + direction] ?? (loop() ? orderedEntries[(index + direction + orderedEntries.length) % orderedEntries.length] : null);
     }
     const unsubscribe = playlist.subscribe(() => {
-        if ((previousCurrent && !playlist.entries.some(entry => entry.id === previousCurrent)) || (pendingId && !playlist.entries.some(entry => entry.id === pendingId))) {
+        orderedEntries = playlist.entries;
+        positions = new Map(orderedEntries.map((entry, index) => [entry.id, index]));
+        if ((previousCurrent && !positions.has(previousCurrent)) || (pendingId && !positions.has(pendingId))) {
             navigation.cancel();
             controller.cancel();
         }

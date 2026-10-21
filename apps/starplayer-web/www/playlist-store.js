@@ -34,8 +34,8 @@ export async function openPlaylistStore({ indexedDB, name = 'starplayer-playlist
             requestValue(transaction.objectStore('state').get('playlist')),
             requestValue(transaction.objectStore('blobs').getAll()),
             requestValue(transaction.objectStore('libraries').getAll()),
+            done,
         ]);
-        await done;
         if (saved) state = saved;
         blobs = new Map(storedBlobs.map(blob => [blob.blobId, blob]));
         libraries = new Map(storedLibraries.map(library => [library.sha256, library]));
@@ -62,10 +62,16 @@ export async function openPlaylistStore({ indexedDB, name = 'starplayer-playlist
                     try {
                         const transaction = database.transaction(['state', 'blobs', 'libraries'], 'readwrite');
                         const done = completed(transaction);
-                        transaction.objectStore('state').put(snapshot, 'playlist');
-                        for (const blobId of blobs.keys()) if (!nextBlobs.has(blobId)) transaction.objectStore('blobs').delete(blobId);
-                        for (const blob of uploads) transaction.objectStore('blobs').put(blob, blob.blobId);
-                        for (const library of knownLibraries) transaction.objectStore('libraries').put(library, library.sha256);
+                        try {
+                            transaction.objectStore('state').put(snapshot, 'playlist');
+                            for (const blobId of blobs.keys()) if (!nextBlobs.has(blobId)) transaction.objectStore('blobs').delete(blobId);
+                            for (const blob of uploads) if (references.has(blob.blobId)) transaction.objectStore('blobs').put(blob, blob.blobId);
+                            for (const library of knownLibraries) transaction.objectStore('libraries').put(library, library.sha256);
+                        } catch (error) {
+                            transaction.abort();
+                            await done.catch(() => {});
+                            throw error;
+                        }
                         await done;
                     } catch (error) { fallback(error); }
                 }

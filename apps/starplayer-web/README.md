@@ -301,7 +301,8 @@ for. A 1994 S3M through `fixed · nearest · 8-bit · mono` at 11025 Hz is the p
 exercise.
 
 Every one of those choices is written to `localStorage` (in a try/catch — a
-storage-blocked page still works, it just forgets). The module is never persisted.
+storage-blocked page still works, it just forgets). One-off loads are not persisted;
+files added to the Playlist are stored as described below.
 
 ## Effects (M7-H7)
 

@@ -58,14 +58,19 @@ export function wirePlaylistList(playlist, { playback, available = () => true, a
     const list = document.getElementById('playlist-list');
     let draggedId = null;
     const render = () => {
-        const focusedId = document.activeElement?.closest('[data-entry-id]')?.dataset.entryId;
-        document.getElementById('playlist-count').textContent = String(playlist.entries.length);
-        list.replaceChildren(...playlist.entries.map(entry => {
+        const focusedItem = document.activeElement?.closest('[data-entry-id]');
+        const focusedId = focusedItem?.dataset.entryId;
+        const focusedIndex = [...list.children].indexOf(focusedItem);
+        const focusedRemove = document.activeElement?.tagName === 'BUTTON';
+        const entries = playlist.entries;
+        const currentId = playlist.current?.id;
+        document.getElementById('playlist-count').textContent = String(entries.length);
+        list.replaceChildren(...entries.map(entry => {
             const item = document.createElement('li');
             item.dataset.entryId = entry.id;
             item.tabIndex = 0;
             item.draggable = true;
-            const current = playlist.current?.id === entry.id;
+            const current = currentId === entry.id;
             item.classList.toggle('current', current);
             if (current) item.setAttribute('aria-current', 'true');
             const failure = playback?.failures.get(entry.id);
@@ -106,7 +111,11 @@ export function wirePlaylistList(playlist, { playback, available = () => true, a
             item.addEventListener('dragend', () => { draggedId = null; });
             return item;
         }));
-        if (focusedId) [...list.children].find(item => item.dataset.entryId === focusedId)?.focus();
+        if (focusedId) {
+            const item = [...list.children].find(item => item.dataset.entryId === focusedId) ?? list.children[Math.min(focusedIndex, list.children.length - 1)];
+            (focusedRemove ? item?.querySelector('button') : item)?.focus();
+            if (!item) document.getElementById('playlist-add').focus();
+        }
     };
     document.getElementById('playlist-clear').addEventListener('click', () => playlist.clear());
     document.getElementById('playlist-previous').addEventListener('click', () => playback?.previous());

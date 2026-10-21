@@ -117,6 +117,9 @@ export function createLibraryView({ playlist, play }) {
     }
     function renderTree() {
         const pane = element('tree');
+        const focused = pane.contains(document.activeElement) ? document.activeElement : null;
+        const focusPath = focused?.dataset.treePath;
+        const focusAction = focused?.dataset.treeAction;
         pane.replaceChildren();
         function append(parent, children) {
             for (const child of children) {
@@ -138,6 +141,10 @@ export function createLibraryView({ playlist, play }) {
                 addFolder.disabled = child.trackCount === 0;
                 addFolder.setAttribute('aria-label', `Add folder ${child.path}`);
                 addFolder.onclick = () => add(search(context.library, '', { scopeFolder: child.path, sort: { column: 'folder', descending: false } }));
+                for (const [action, button] of [['expand', expand], ['choose', choose], ['add', addFolder]]) {
+                    button.dataset.treePath = child.path;
+                    button.dataset.treeAction = action;
+                }
                 bar.append(expand, choose, addFolder);
                 item.append(bar);
                 if (expanded.has(child.path)) {
@@ -149,6 +156,7 @@ export function createLibraryView({ playlist, play }) {
             }
         }
         if (tree) append(pane, tree.children);
+        if (focused) [...pane.querySelectorAll('button')].find(button => button.dataset.treePath === focusPath && button.dataset.treeAction === focusAction)?.focus({ preventScroll: true });
     }
     for (const [column, label] of COLUMNS) {
         const header = node('div');

@@ -63,6 +63,39 @@ export async function verifyPlaylistStore(openPlaylistStore) {
     const quota = await openPlaylistStore({ indexedDB: quotaDB, name: `${name}-quota`, report: message => messages.push(message) });
     await quota.save(snapshot, { uploads: [blob] });
     check(quota.sessionOnly && quota.hasBlob('blob') && messages.length === 2, 'quota session fallback');
-    for (const databaseName of [name, upgradeName, `${name}-quota`]) indexedDB.deleteDatabase(databaseName);
+    // A synchronous put failure after the state put must abort the whole transaction.
+    const partialName = `${name}-partial`;
+    const partialDB = { open(...args) {
+        const request = realOpen(...args);
+        request.addEventListener('success', () => {
+            const database = request.result;
+            const transaction = database.transaction.bind(database);
+            database.transaction = (...args) => {
+                const result = transaction(...args);
+                if (args[1] === 'readwrite') {
+                    const objectStore = result.objectStore.bind(result);
+                    result.objectStore = name => {
+                        const store = objectStore(name);
+                        if (name === 'blobs') store.put = () => { throw new DOMException('Cannot clone blob', 'DataCloneError'); };
+                        return store;
+                    };
+                }
+                return result;
+            };
+        });
+        return request;
+    } };
+    const partial = await openPlaylistStore({ indexedDB: partialDB, name: partialName });
+    await partial.save(snapshot, { uploads: [blob] });
+    check(partial.sessionOnly && partial.hasBlob('blob'), 'synchronous write failure retains session data');
+    const reopened = await openPlaylistStore({ name: partialName });
+    check(reopened.state.entries.length === 0 && !reopened.hasBlob('blob'), 'synchronous write failure rolls back persistent state');
+    // Uploads absent from the new state must not leave persistent orphan bytes.
+    await reopened.save({ entries: [], currentId: null, loop: false }, { uploads: [blob] });
+    reopened.close();
+    const withoutOrphans = await openPlaylistStore({ name: partialName });
+    check(!withoutOrphans.hasBlob('blob'), 'unreferenced upload is not persisted');
+    withoutOrphans.close();
+    for (const databaseName of [name, upgradeName, `${name}-quota`, partialName]) indexedDB.deleteDatabase(databaseName);
     return 'round trip, refcounts, cap eviction/refusal, missing blobs, v1 upgrade, unavailable/open/quota fallback passed';
 }
