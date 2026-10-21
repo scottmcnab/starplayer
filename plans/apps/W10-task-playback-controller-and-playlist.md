@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W11, branch `library-playlist`) |
-| Status | Specified 2026-10-21; not started |
+| Status | Implemented 2026-10-21 on `library-playlist`; owner check with a Hornet disk in a background tab outstanding |
 | Depends on | [W9](W9-task-library-view.md) |
 | Blocks | [W11](W11-task-playlist-uploads-and-persistence.md) |
 | Recommended model | gpt-6-astra |
@@ -134,3 +134,83 @@ background, try Stop during a fade, reorder and remove entries while it plays.
 
 Uploads, persistence, CSV import/export and library rebinding (W11); gapless or crossfade
 transitions.
+
+## Research-point results
+
+Measured in Chromium using real worklet telemetry, on SAB, forced postMessage, and
+non-isolated HTTP transports. Both unmodified owner fixtures (REFLEX.S3M and PETRI.S3M)
+scan as ending songs (`songFlags = 1`), so the fade scenario derives an in-memory PETRI
+copy with a B00 on its final row. No fixture on disk is edited; no other music fixture
+is used by the new scenario.
+
+At the rebuilt 48,000 Hz rate:
+
+* REFLEX: `playing=true, flags=1` → `playing=false, flags=5`, at song frame
+  **6,635,520**. There is no fading state. This edge advanced to PETRI with Repeat
+  still checked and disabled, including with requestAnimationFrame suspended.
+* PETRI loop variant: `playing=true, flags=3` → `playing=true, flags=15` at loop
+  frame **1,974,856** → `playing=false, flags=7` at **2,214,856**. The difference is
+  **240,000 frames = 5 seconds**. Repeated stopped snapshots do not advance again.
+* Stop during that fade: a transient `playing=false, flags=15` can precede
+  `playing=false, flags=7`; the stopped frame remains near the loop point. Neither
+  snapshot is a natural completion because the user Stop suppresses detection.
+* The host's rewind is pending until the next Play: stopped telemetry retains the
+  end frame and END_REACHED, while the UI displays frame zero. On Play, telemetry
+  resumes near frame zero with `playing=true, flags=3` and END_REACHED cleared.
+  A rewind therefore cannot produce a second playing-to-stopped edge.
+* A fallback activation can briefly publish the previous stopped transport state
+  with the new generation before its first playing snapshot. Requiring a playing
+  snapshot from that generation before recognising completion handles this too.
+
+## Implementation results
+
+Implemented without staging or committing. The existing playlist model, resolver,
+source, index and selection interfaces remain intact.
+
+* `playback-controller.js` owns intent tokens, aborts, current graph/generation,
+  W7's play/stop/completion-subscription API, effective Repeat policy, and a 100 ms
+  completion/command timer independent of painting. The activation adapter checks
+  the intent after loader readiness, archive choice, audio readiness and activation.
+* `playlist-playback.js` owns ordered navigation, optional wrapping, cache-only
+  prefetch, cancellation on removal/manual loads, and visible failure skipping with
+  a three-failure limit. An abandoned load never increments that limit.
+* `playlist.js`, `index.html`, and `style.css` provide current/failed/unavailable
+  markers, metadata, removal, keyboard and drag reordering, Clear, Loop playlist,
+  and explicitly labelled Previous track / Next track controls.
+* `app.js` routes all load entry points through the controller before I/O and keeps
+  engine activation in the existing adapter. Graph/load-option rebuilds rebind the
+  generation while retaining completion suppression and effective at-end policy.
+  Repeat is stored without changing its checked value in playlist mode.
+* Node regressions cover intent races, completion and rewind, stale generations and
+  graphs, user Stop/seek, Repeat preservation, failure skipping/cancellation,
+  reordering/wrapping, removal during pending advance, and completion subscriptions.
+  The headless scenario covers real ending/fading telemetry, background-style
+  advance with painting suspended, sample-rate rebuilding, and Stop during a fade.
+* README documents controls, seek/Stop suppression until Play, and the possible
+  one-second timer throttle in silent background tabs.
+
+Verification completed on 2026-10-21, with builds and browser harnesses run serially:
+
+* `node --test apps/starplayer-web/test/*.test.mjs`: **42 passed, 0 failed, 0 skipped**.
+* `cargo xtask wasm`: passed; packaged the app and the two owner S3M fixtures.
+* `STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs`:
+  **all modes passed** (SAB, forced fallback, plain HTTP), including the existing
+  playback/UI regression suite. After the final review changes, rebuilt the package
+  and reran `--library-only` in all three modes: **all modes passed**, including
+  keyboard reorder/Delete and removal without stopping audio.
+* `cargo xtask ci`: **11 jobs passed**, exit 0; no new conformance failures.
+* `git diff --check`: passed. No files staged and no commit created.
+
+Full local logs are in `target/w10-node.log`, `target/w10-wasm.log`,
+`target/w10-headless.log`, `target/w10-library-final.log`, and `target/w10-ci.log`.
+
+Owner acceptance remains: play a full Hornet music disk in a background tab and
+exercise reordering/removal during playback. Uploads and playlist persistence remain
+W11 work.
+
+### Coordinator review (2026-10-21)
+
+A user seek no longer suppresses completion: it only clears the playing edge, so a
+scrubbed playlist track still advances when it ends. Only Stop suppresses advance until
+Play. The headless helper no longer clicks Play after seeking, so the scenario now
+exercises that path.

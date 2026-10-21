@@ -1189,6 +1189,35 @@ async function run(executable, mode) {
     return report;
 }
 
+// Both owner fixtures end naturally. Derive the looping case from PETRI in memory:
+// append B00 to its last row, preserving all sample/music bytes and the fixture on disk.
+function withFinalLoop(bytes) {
+    const orders = bytes.readUInt16LE(32);
+    const instruments = bytes.readUInt16LE(34);
+    const lastPattern = [...bytes.subarray(96, 96 + orders)].filter(order => order < 254).at(-1);
+    const pointerOffset = 96 + orders + instruments * 2 + lastPattern * 2;
+    const patternOffset = bytes.readUInt16LE(pointerOffset) * 16;
+    let cursor = patternOffset + 2;
+    let lastRowEnd = cursor;
+    for (let row = 0; row < 64; row += 1) {
+        while (bytes[cursor] !== 0) {
+            const token = bytes[cursor++];
+            if (token & 32) cursor += 2;
+            if (token & 64) cursor += 1;
+            if (token & 128) cursor += 2;
+        }
+        lastRowEnd = cursor++;
+    }
+    const pattern = Buffer.concat([bytes.subarray(patternOffset + 2, lastRowEnd), Buffer.from([128, 2, 0, 0])]);
+    const appendedOffset = Math.ceil(bytes.length / 16) * 16;
+    const result = Buffer.alloc(appendedOffset + 2 + pattern.length);
+    bytes.copy(result);
+    result.writeUInt16LE(appendedOffset / 16, pointerOffset);
+    result.writeUInt16LE(pattern.length, appendedOffset);
+    pattern.copy(result, appendedOffset + 2);
+    return result;
+}
+
 // W9 uses only the two owner-authored S3Ms. All generated files stay in this worktree.
 async function runLibrary(executable, mode) {
     const artifacts = join(REPOSITORY_ROOT, 'target/w9-verification');
@@ -1229,14 +1258,14 @@ async function runLibrary(executable, mode) {
         await clickRow(1);
         await clickRow(2, { shiftKey: true });
         await page.evaluate("document.getElementById('library-add-selected').click();");
-        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.textContent);"), ['PETRI.S3M', 'REFLEX.S3M']);
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M']);
         await page.evaluate("document.querySelector('[data-row-id=\"1\"] button').click();");
-        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
         await filter('', '5 of 5');
         await clickRow(0, { ctrlKey: true });
         await clickRow(2, { ctrlKey: true });
         await page.evaluate("document.getElementById('library-add-selected').click();");
-        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
         await page.evaluate("document.getElementById('library-browse').click(); document.querySelector('[data-scope=disks]').click();");
         await page.waitFor('folder scope', "document.getElementById('library-count').textContent === '4 of 5'");
         await page.evaluate("document.querySelector('[aria-label=\"Expand disks\"]').click(); document.querySelector('[data-scope=\"disks/disk1.zip\"]').click();");
@@ -1340,7 +1369,7 @@ async function runLibrary(executable, mode) {
         assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
         await filter('TRACK37673', '1 of 37,674');
         await page.evaluate("document.getElementById('library-add-selected').click();");
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li:last-child').textContent;"), 'TRACK37673.S3M');
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li:last-child .playlist-name').textContent;"), 'TRACK37673.S3M');
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '10');
         await writeFile(join(directory, 'index.csv'), header + ',Reflex,loose/REFLEX.S3M,\n,Unsupported,loose/SILENT.669,');
         await page.evaluate("document.getElementById('library-server').click();");
@@ -1353,8 +1382,99 @@ async function runLibrary(executable, mode) {
         assert.equal(await page.evaluate("return document.querySelector('.library-track button').disabled && document.getElementById('library-add-selected').disabled;"), true);
         await doubleClick(1);
         assert.equal((await page.evaluate(READ_STATE)).title, 'Petrified');
+        // W10: capture real engine snapshots on both transports without an app test API.
+        await page.evaluate(`
+            window.playlistSnapshots = [];
+            const capture = snapshot => {
+                if (!snapshot) return;
+                window.latestPlaylistSnapshot = snapshot;
+                const value = { playing: snapshot.playing, flags: snapshot.songFlags, frame: snapshot.songFrame, generation: snapshot.moduleGeneration };
+                const last = window.playlistSnapshots.at(-1);
+                if (!last || last.playing !== value.playing || last.flags !== value.flags || last.generation !== value.generation || (last.frame === 0) !== (value.frame === 0)) window.playlistSnapshots.push(value);
+            };
+            const read = StarPlayerRing.readTelemetry;
+            StarPlayerRing.readTelemetry = (...args) => { const snapshot = read(...args); capture(snapshot); return snapshot; };
+            const OriginalNode = AudioWorkletNode;
+            window.AudioWorkletNode = class extends OriginalNode {
+                constructor(...args) { super(...args); this.port.addEventListener('message', event => { if (event.data.type === 'telemetry') capture(event.data); }); }
+            };
+        `);
+        // Queue REFLEX -> a PETRI loop variant. The original fixture is unchanged.
+        await writeFile(join(directory, 'disks/loop.zip'), buildZip([{ name: 'PETRI.S3M', bytes: withFinalLoop(petri) }]));
+        await writeFile(join(directory, 'index.csv'), header + [
+            ',Loose Reflex,loose/REFLEX.S3M,',
+            'PETRI.S3M,Disk Petri,disks/loop.zip,',
+            'REFLEX.S3M,Disk Reflex,disks/disk1.zip,',
+            'PETRI.S3M,Nested Petri,disks/outer.zip,inner.zip',
+            'MISSING.S3M,Missing member,disks/disk1.zip,',
+        ].join('\n'));
+        await page.evaluate("document.getElementById('playlist-clear').click(); document.getElementById('library-format').value = ''; document.getElementById('library-server').click();");
+        await page.waitFor('restored library', "document.getElementById('library-count').textContent === '5 of 5'");
+        await filter('title:Loose', '1 of 5');
+        await clickRow(0);
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        await filter('title:Disk name:PETRI', '1 of 5');
+        await page.waitFor('filtered Petri row', "document.querySelector('[data-row-id=\"1\"]') !== null");
+        await clickRow(1);
+        await page.evaluate(`
+            document.getElementById('library-add-selected').click();
+            const repeat = document.getElementById('repeat'); repeat.checked = true; repeat.dispatchEvent(new Event('change'));
+            document.querySelector('#playlist-list li').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        `);
+        await page.waitFor('first playlist track', "document.querySelector('#playlist-list li.current .playlist-name')?.textContent === 'REFLEX.S3M'");
+        assert.equal(await page.evaluate("return document.getElementById('repeat').checked && document.getElementById('repeat').disabled;"), true);
+        // Rebuild while playlist mode owns at-end policy. The new node also captures
+        // fallback snapshots; its generation starts again at one.
+        await page.evaluate("document.getElementById('sample-rate').value = '48000'; document.getElementById('apply-sample-rate').click();");
+        await page.waitFor('playlist sample-rate rebuild', "document.getElementById('message').textContent.includes('Output rate rebuilt')");
+        await page.waitFor('playlist telemetry', "window.latestPlaylistSnapshot?.playing === true");
+        const seekNearEnd = async seconds => {
+            const rate = rateDigits((await page.evaluate(READ_STATE)).workletRate);
+            await page.evaluate(`const progress = document.getElementById('progress'); progress.value = String(Number(progress.max) - ${rate * seconds}); progress.dispatchEvent(new Event('change'));`);
+        };
+        await seekNearEnd(1);
+        await page.evaluate("window.savedAnimationFrame = requestAnimationFrame; window.requestAnimationFrame = callback => { window.pausedAnimationFrame = callback; return 0; };");
+        await page.waitFor('automatic second playlist track', "document.querySelector('#playlist-list li.current .playlist-name')?.textContent === 'PETRI.S3M' && document.getElementById('title').textContent === 'Petrified'", 15000);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li').classList.contains('current');"), false);
+        await page.evaluate("window.requestAnimationFrame = window.savedAnimationFrame; if (window.pausedAnimationFrame) requestAnimationFrame(window.pausedAnimationFrame);");
+        await page.waitFor('second playlist telemetry', "window.latestPlaylistSnapshot?.moduleGeneration === 2 && window.latestPlaylistSnapshot?.playing");
+        await delay(200);
+        assert.equal(await page.evaluate("return window.latestPlaylistSnapshot.songFlags & 2;"), 2);
+        await page.evaluate("document.getElementById('playlist-loop').checked = true;");
+        await seekNearEnd(4);
+        await page.waitFor('PETRI fade', "(window.latestPlaylistSnapshot?.songFlags & 8) !== 0", 15000);
+        await page.evaluate("document.getElementById('stop').click();");
+        await page.waitFor('manual stop in fade', "document.getElementById('transport-chip').textContent === 'stopped'");
+        await delay(5500);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
+        const stoppedFade = await page.evaluate("return window.latestPlaylistSnapshot;");
+        assert.equal(stoppedFade.playing, false);
+        // Re-arm and let the complete fade finish to measure the host rewind too.
+        await page.evaluate("document.getElementById('playlist-loop').checked = false; document.getElementById('play').click();");
+        await seekNearEnd(6);
+        await page.waitFor('rearmed looping playback', "document.getElementById('transport-chip').textContent === 'playing'");
+        await page.waitFor('natural looping stop', "document.getElementById('transport-chip').textContent === 'stopped'", 15000);
+        await delay(500);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
+        assert.equal((await page.evaluate(READ_STATE)).progressValue, 0);
+        assert.equal(await page.evaluate("return window.latestPlaylistSnapshot.songFlags;"), 7);
+        await page.evaluate("document.getElementById('play').click();");
+        await page.waitFor('host rewind on next Play', "window.latestPlaylistSnapshot?.playing && window.latestPlaylistSnapshot.songFrame < 48000 && window.latestPlaylistSnapshot.songFlags === 3");
+        const playlistSnapshots = await page.evaluate("return window.playlistSnapshots;");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
+        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', altKey: true, bubbles: true }));");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li').classList.contains('current');"), true);
+        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true }));");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li:last-child').classList.contains('current');"), true);
+        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));");
+        await delay(300);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current');"), null);
+        assert.equal((await page.evaluate(READ_STATE)).chip, 'playing');
+        assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '1');
+        await page.evaluate("document.getElementById('playlist-clear').click();");
+        assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '0');
         assert.deepEqual(page.consoleErrors, []);
-        return { firstPaint, filterMilliseconds, scroll, missing: missing.errorText, nestedTitle: beforeMissing.title };
+        return { playlistSnapshots, stoppedFade: { flags: stoppedFade.songFlags, frame: stoppedFade.songFrame }, firstPaint, filterMilliseconds, scroll, missing: missing.errorText, nestedTitle: beforeMissing.title };
     } finally {
         if (page) await page.close();
         server?.stop();

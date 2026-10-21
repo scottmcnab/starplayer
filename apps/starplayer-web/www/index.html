@@ -134,6 +134,13 @@
     </details>
     <section class="panel" aria-label="Playlist">
         <h2>Playlist · <span id="playlist-count">0</span></h2>
+        <div class="playlist-controls">
+            <button id="playlist-previous" type="button">Previous track</button>
+            <button id="playlist-next" type="button">Next track</button>
+            <button id="playlist-clear" type="button">Clear</button>
+            <label><input id="playlist-loop" type="checkbox"> Loop playlist</label>
+        </div>
+        <p class="library-hint">Double-click or Enter to play. Delete to remove. Drag or Alt+↑/↓ to reorder.</p>
         <ol id="playlist-list"></ol>
     </section>
 

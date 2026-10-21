@@ -116,6 +116,25 @@ follows it to `0:00`. The same command is resent whenever a module is (re)activa
 whenever a playback-restoring graph rebuild happens (a sample-rate or channel-count change,
 or the MOD panning reload), so the checkbox's choice survives all of them.
 
+The **Playlist** panel plays entries in order. Double-click or press Enter to start an
+entry; use Previous track / Next track to navigate, Clear or Delete to remove entries,
+and drag or Alt+↑/↓ to reorder. Loop playlist wraps at the last entry. Removing the
+current entry keeps the audio playing but cancels any pending advance. Failed entries
+show ⚠ with a diagnostic tooltip and are skipped; three consecutive failures stop the
+advance. Entries from an index that is no longer connected show “unavailable”.
+
+During playlist playback, Repeat is disabled and each song uses the end/fade policy
+above. Its saved preference is preserved and applies again when a file, URL, archive
+track or library row is played directly. Stop suppresses automatic advance until
+Play is pressed again; a seek does not, so a scrubbed track still advances when it
+ends. Completion requires a playing-to-stopped edge
+from the current audio graph and module generation, so a stale snapshot or host rewind
+cannot advance twice. Graph rebuilds preserve this policy.
+
+A 100 ms control timer detects completion and flushes fallback commands independently
+of animation frames. Audible background tabs can therefore advance without painting;
+a silent background tab may be throttled to 1 Hz, which only delays the advance.
+
 ## Architecture
 
 The A4 worklet bundle architecture is preserved: `wasm-bindgen --target no-modules`

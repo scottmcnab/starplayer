@@ -53,17 +53,63 @@ export function libraryLocator(row, libraryIdentity) {
     return { kind: 'library', libraryIdentity: { ...libraryIdentity }, sourcePath: row.sourcePath, containerMember: row.containerMember, memberPath: row.memberPath, rawHex: row.rawHex };
 }
 
-export function wirePlaylistList(playlist) {
+export function wirePlaylistList(playlist, { playback, available = () => true } = {}) {
     const list = document.getElementById('playlist-list');
+    let draggedId = null;
     const render = () => {
+        const focusedId = document.activeElement?.closest('[data-entry-id]')?.dataset.entryId;
         document.getElementById('playlist-count').textContent = String(playlist.entries.length);
         list.replaceChildren(...playlist.entries.map(entry => {
             const item = document.createElement('li');
-            item.textContent = entry.display.name;
-            item.title = `${entry.display.title} (${entry.display.folder})`;
+            item.dataset.entryId = entry.id;
+            item.tabIndex = 0;
+            item.draggable = true;
+            const current = playlist.current?.id === entry.id;
+            item.classList.toggle('current', current);
+            if (current) item.setAttribute('aria-current', 'true');
+            const failure = playback?.failures.get(entry.id);
+            const marker = document.createElement('span');
+            marker.className = 'playlist-marker';
+            marker.textContent = `${current ? '▶ ' : ''}${failure ? '⚠' : !available(entry) ? 'unavailable' : ''}`;
+            const name = document.createElement('strong');
+            name.className = 'playlist-name';
+            name.textContent = entry.display.name;
+            const detail = document.createElement('span');
+            detail.className = 'playlist-detail';
+            detail.textContent = [entry.display.title, entry.display.format, entry.display.folder || entry.locator.sourcePath].filter(Boolean).join(' · ');
+            item.title = failure || detail.textContent;
+            const remove = document.createElement('button');
+            remove.textContent = '×';
+            remove.setAttribute('aria-label', `Remove ${entry.display.name}`);
+            remove.addEventListener('click', event => { event.stopPropagation(); playlist.remove([entry.id]); });
+            item.append(marker, name, detail, remove);
+            item.addEventListener('dblclick', event => { if (!event.target.closest('button')) playback?.playEntry(entry); });
+            item.addEventListener('keydown', event => {
+                if (event.target !== item) return;
+                if (event.key === 'Delete') { event.preventDefault(); playlist.remove([entry.id]); }
+                else if (event.key === 'Enter') { event.preventDefault(); playback?.playEntry(entry); }
+                else if (event.altKey && ['ArrowUp', 'ArrowDown'].includes(event.key)) {
+                    event.preventDefault();
+                    playlist.move(entry.id, playlist.entries.findIndex(candidate => candidate.id === entry.id) + (event.key === 'ArrowUp' ? -1 : 1));
+                }
+            });
+            item.addEventListener('dragstart', event => { draggedId = entry.id; event.dataTransfer.setData('text/plain', entry.id); event.dataTransfer.effectAllowed = 'move'; });
+            item.addEventListener('dragover', event => { if (draggedId) event.preventDefault(); });
+            item.addEventListener('drop', event => {
+                if (!draggedId) return;
+                event.preventDefault();
+                playlist.move(draggedId, playlist.entries.findIndex(candidate => candidate.id === entry.id));
+                draggedId = null;
+            });
+            item.addEventListener('dragend', () => { draggedId = null; });
             return item;
         }));
+        if (focusedId) [...list.children].find(item => item.dataset.entryId === focusedId)?.focus();
     };
+    document.getElementById('playlist-clear').addEventListener('click', () => playlist.clear());
+    document.getElementById('playlist-previous').addEventListener('click', () => playback?.previous());
+    document.getElementById('playlist-next').addEventListener('click', () => playback?.next());
     render();
-    return playlist.subscribe(render);
+    const unsubscribe = playlist.subscribe(render);
+    return { render, dispose: unsubscribe };
 }

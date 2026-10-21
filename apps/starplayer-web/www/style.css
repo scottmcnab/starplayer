@@ -250,3 +250,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .library-folder-node.nested button[data-scope] { color: var(--accent); }
 .library-folder-node [aria-pressed=true] { border-color: var(--accent); }
 #playlist-list { max-height: 180px; overflow: auto; overflow-wrap: anywhere; }
+
+.playlist-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+#playlist-list { padding-left: 0; list-style: none; }
+#playlist-list li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 8px; padding: 8px; border-bottom: 1px solid var(--line); }
+#playlist-list li.current { background: var(--panel); outline: 1px solid var(--accent); }
+#playlist-list li:focus-visible { outline: 2px solid var(--accent); }
+.playlist-detail { grid-column: 2; font-size: 0.8rem; opacity: 0.75; }
+#playlist-list button { grid-column: 3; grid-row: 1 / 3; }
