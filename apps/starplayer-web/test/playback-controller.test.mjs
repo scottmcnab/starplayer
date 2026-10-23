@@ -25,6 +25,8 @@ function setup(overrides = {}) {
     });
     return { controller, clock, ended, activated, delays, get flushed() { return flushed; }, setRepeat(value) { repeat = value; },
         tick(playing, songFlags = 1, moduleGeneration = generation, observedGraph = graph) { graph = observedGraph; snapshot = { playing, songFlags, moduleGeneration, sequence: (snapshot?.sequence || 0) + 1 }; callback(); },
+        get snapshot() { return snapshot; },
+        setSnapshot(fields) { snapshot = { moduleGeneration: generation, ...fields }; callback(); },
     };
 }
 const locator = buffer => ({ kind: 'bytes', buffer });
@@ -50,6 +52,19 @@ for (const flags of [[1, 5], [3, 15, 7]]) test(`natural completion emits once th
     fixture.tick(false, 3); // Host rewind clears END_REACHED.
     assert.deepEqual(fixture.ended, ['entry']);
     assert.ok(fixture.flushed >= 3);
+});
+
+test('the stop at the end counts even when it repeats the engine sequence', async () => {
+    const fixture = setup();
+    await fixture.controller.play(locator('song'), { origin: 'playlist', entryId: 'entry' });
+    // The host packs `playing` and `engineFrame` live, so the engine sequence can stay put.
+    fixture.tick(true, 1);
+    const { sequence } = fixture.snapshot;
+    fixture.setSnapshot({ playing: true, songFlags: 1, sequence, engineFrame: 128 });
+    fixture.setSnapshot({ playing: true, songFlags: 1, sequence, engineFrame: 128 });
+    fixture.setSnapshot({ playing: false, songFlags: 5, sequence, engineFrame: 256 });
+    fixture.setSnapshot({ playing: false, songFlags: 5, sequence, engineFrame: 256 });
+    assert.deepEqual(fixture.ended, ['entry']);
 });
 
 test('a seek needs a fresh playing edge but does not suppress completion', async () => {

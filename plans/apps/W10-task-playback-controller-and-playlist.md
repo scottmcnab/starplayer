@@ -258,3 +258,25 @@ assertion (`headless.mjs`, the 3,999,000-frame single-sample XM) fails at a 35�
 render gap against a ~31 ms bound, **and fails identically on `w6-resumable-module-load`
 alone** (44–64 ms, two runs) — a W6 issue on this machine, not a merge regression. The
 library rebuild wait now matches both message wordings, so it no longer conflicts.
+
+## Intermittent missed auto-advance (2026-10-23)
+
+The headless step "automatic second playlist track" occasionally timed out: about one in
+six runs, seen in plain mode. With the controller's state captured at the time-out:
+`wasPlaying: true`, `emitted: false`, `blocked: false`, graph and generation matching. The
+newest snapshot said stopped with end reached (flags 5), yet the controller had already
+recorded that snapshot's sequence number, 70.
+
+**Cause.** In `starplayer-host-wasm`, `pack_telemetry` writes the engine's own publish
+counter as `sequence`. It writes `playing` (`is_playing()`) and `engineFrame`
+(`output_frame()`) live on every pack. When the transport stops at the song's end the engine
+publishes nothing new, so the stop often arrives under the sequence the controller had
+already seen. `tick()` dropped it with `snapshot.sequence <= sequence`, so the playlist never
+advanced. The same can happen in SharedArrayBuffer mode, which reads the same counter.
+
+**Fix.** A snapshot is new when its `sequence` **or** its `engineFrame` has changed since the
+last one processed. The check is inequality, not ordering, because `engineFrame` is an i32
+that wraps after about 12 hours. `play()` and `rebind()` reset both. Exact repeats are
+still skipped. The rule that a stale stopped snapshot after a seek or Play is not an edge
+is unchanged, because it relies on `wasPlaying`. A controller test now covers a stop that
+repeats the engine sequence.

@@ -13,6 +13,7 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
     let wasPlaying = false;
     let emitted = false;
     let sequence = -1;
+    let engineFrame = null;
     const controller = {
         get current() { return current; },
         get controlRevision() { return controlRevision; },
@@ -45,6 +46,7 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
                 wasPlaying = false;
                 emitted = false;
                 sequence = -1;
+                engineFrame = null;
                 return { status: 'played', current };
             } catch (error) {
                 if (!isCurrent() || error.name === 'AbortError') return { status: 'abandoned' };
@@ -67,13 +69,20 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
             if (current) current = { ...current, graph, generation };
             wasPlaying = false;
             sequence = -1;
+            engineFrame = null;
         },
         tick() {
             flushCommands();
             const observation = readSnapshot();
             const snapshot = observation?.snapshot;
-            if (!current || !snapshot || observation.graph !== current.graph || snapshot.moduleGeneration !== current.generation || snapshot.sequence <= sequence) return;
+            // `sequence` counts the engine's own publishes, but the host packs `playing` and
+            // `engineFrame` live every quantum: the stop at a song's end arrives under the
+            // sequence already seen. So a snapshot is new when either changed. Inequality,
+            // not ordering, because `engineFrame` is an i32 that wraps after ~12 h.
+            if (!current || !snapshot || observation.graph !== current.graph || snapshot.moduleGeneration !== current.generation) return;
+            if (snapshot.sequence === sequence && snapshot.engineFrame === engineFrame) return;
             sequence = snapshot.sequence;
+            engineFrame = snapshot.engineFrame;
             const ended = wasPlaying && !snapshot.playing && (snapshot.songFlags & SONG_FLAG_END_REACHED) !== 0;
             wasPlaying = snapshot.playing;
             if (ended && !blocked && !emitted) {
