@@ -61,6 +61,11 @@
                 <input id="library-comments" type="file" accept=".csv,text/csv" hidden>
                 <button id="library-server" type="button" hidden>Server library</button>
                 <input id="library-files" type="file" webkitdirectory multiple hidden>
+                <button id="library-stream" type="button" hidden>Stream from source URLs</button>
+                <button id="library-reopen" type="button" hidden>Reopen</button>
+                <label id="library-proxy-field" hidden>Proxy URL (blank: fetch directly)
+                    <input id="library-proxy" type="url" aria-label="Proxy URL (blank: fetch directly)">
+                </label>
                 <input id="library-index" type="file" accept=".csv,text/csv" hidden>
                 <select id="library-choices" aria-label="Library index CSV" hidden></select>
             </div>

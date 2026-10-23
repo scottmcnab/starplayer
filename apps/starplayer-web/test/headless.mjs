@@ -1,3 +1,4 @@
+import remoteWorker from '../remote-proxy/worker.js';
 import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // End-to-end check of the packaged player in headless Chromium, over the DevTools
 // protocol, with Node's built-in `WebSocket` and `http` and nothing else installed.
@@ -1593,6 +1594,119 @@ async function runLibrary(executable, mode) {
     }
 }
 
+async function runRemoteLibrary(executable, mode) {
+    let server, page, upstream, proxy;
+    let cors = true;
+    let upstreamRequests = 0, proxyRequests = 0, agentRequests = 0;
+    const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${server.address().port}/`)));
+    const close = server => server ? new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }) : Promise.resolve();
+    try {
+        const reflex = await readFile(join(REPOSITORY_ROOT, 'crates/starplayer-s3m/tests/fixtures/REFLEX.S3M'));
+        const petri = await readFile(join(REPOSITORY_ROOT, 'crates/starplayer-s3m/tests/fixtures/PETRI.S3M'));
+        const zip = buildZip([{ name: 'PETRI.S3M', bytes: petri }, { name: 'REFLEX.S3M', bytes: reflex }]);
+        upstream = createServer((request, response) => {
+            upstreamRequests += 1;
+            if (request.headers['user-agent']?.startsWith('StarPlayer-proxy')) agentRequests += 1;
+            if (cors) {
+                response.setHeader('Access-Control-Allow-Origin', '*');
+                response.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+            }
+            response.setHeader('Cache-Control', 'no-store');
+            const bytes = request.url === '/loose/REFLEX.S3M' ? reflex : request.url === '/disks/disk1.zip' ? zip : null;
+            response.writeHead(bytes ? 200 : 404, { 'Content-Length': bytes?.length ?? 0 });
+            response.end(bytes);
+        });
+        const base = await listen(upstream);
+        server = await startDevServer(mode !== 'plain');
+        const origin = `http://127.0.0.1:${server.port}`;
+        proxy = createServer(async (request, response) => {
+            proxyRequests += 1;
+            try {
+                const result = await remoteWorker.fetch(new Request(`http://${request.headers.host}${request.url}`, { method: request.method, headers: request.headers }), { UPSTREAM: base, ALLOWED_ORIGINS: origin });
+                response.writeHead(result.status, Object.fromEntries(result.headers));
+                response.end(Buffer.from(await result.arrayBuffer()));
+            } catch (error) { response.writeHead(500); response.end(error.message); }
+        });
+        const proxyBase = await listen(proxy);
+        page = await Page.open(executable, origin + '/');
+        await page.waitFor('remote startup', "document.documentElement.dataset.playerReady === 'true'");
+        // Exercise a genuine v1 -> v2 upgrade using the same database and public helpers.
+        await page.evaluate(`
+            await new Promise((resolve, reject) => { const request = indexedDB.deleteDatabase('starplayer-library'); request.onsuccess = resolve; request.onerror = () => reject(request.error); });
+            const database = await new Promise((resolve, reject) => { const request = indexedDB.open('starplayer-library', 1); request.onupgradeneeded = () => request.result.createObjectStore('handles'); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+            await new Promise(resolve => { const transaction = database.transaction('handles', 'readwrite'); transaction.objectStore('handles').put({ name: 'preserved root' }, 'root'); transaction.oncomplete = resolve; });
+            database.close();
+            const { storedDirectoryHandle } = await import('./library-source.js');
+            if ((await storedDirectoryHandle()).name !== 'preserved root') throw new Error('v1 handle lost');
+        `);
+        const csv = `source_path,member_path,title,source_url,sha256\nloose/REFLEX.S3M,,Loose Reflex,${base}loose/REFLEX.S3M,${'1'.repeat(64)}\ndisks/disk1.zip,PETRI.S3M,Disk Petri,${base}disks/disk1.zip,\ndisks/disk1.zip,REFLEX.S3M,Disk Reflex,${base}disks/disk1.zip,`;
+        await page.evaluate(`
+            if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true;
+            const transfer = new DataTransfer(); transfer.items.add(new File([${JSON.stringify(csv)}], 'remote-synthetic.csv'));
+            const input = document.getElementById('library-index'); input.files = transfer.files; input.dispatchEvent(new Event('change'));
+        `);
+        await page.waitFor('stream offered', "!document.getElementById('library-stream').hidden && !document.getElementById('library-proxy-field').hidden");
+        await page.evaluate("document.getElementById('library-stream').click();");
+        await page.waitFor('remote rows', "document.getElementById('library-count').textContent === '3 of 3' && document.getElementById('library-summary').textContent.includes('streaming 3 tracks from 127.0.0.1')");
+        const play = async (id, title) => {
+            await page.waitFor('remote row painted', `document.querySelector('[data-row-id="${id}"]') !== null`);
+            await page.evaluate(`document.querySelector('[data-row-id="${id}"]').dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));`);
+            await page.waitFor('remote playback', `document.getElementById('title').textContent.toLowerCase().includes(${JSON.stringify(title.toLowerCase())}) && document.getElementById('transport-chip').textContent === 'playing'`);
+        };
+        await play(0, 'reflex');
+        await play(1, 'petrified');
+        await page.evaluate(`
+            const transfer = new DataTransfer(); transfer.items.add(new File(['sha256,instrument_names\\n${'1'.repeat(64)},Remote composer'], 'remote-comments.csv'));
+            const input = document.getElementById('library-comments'); input.files = transfer.files; input.dispatchEvent(new Event('change'));
+            document.querySelector('[data-row-id="0"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            document.getElementById('library-add-selected').click();
+        `);
+        await page.waitFor('remote comments saved', "(await (await import('./library-source.js')).storedRemoteIndex())?.commentsName === 'remote-comments.csv'");
+        await page.waitFor('remote playlist saved', "await (async () => { const store = await (await import('./playlist-store.js')).openPlaylistStore(); const saved = store.state.entries.length; store.close(); return saved === 1; })()");
+        await page.evaluate(`
+            const { storedRemoteIndex } = await import('./library-source.js');
+            const record = await storedRemoteIndex();
+            await storedRemoteIndex({ ...record, proxy: 'http://127.0.0.1:1/' });
+            localStorage.setItem('starplayer.libraryProxy', '');
+        `);
+        await page.send('Page.reload');
+        await page.waitFor('remote reopen', "document.documentElement.dataset.playerReady === 'true' && !document.getElementById('library-reopen').hidden");
+        assert.equal(await page.evaluate("return document.getElementById('library-reopen').textContent;"), 'Reopen remote-synthetic.csv (streaming)');
+        await page.evaluate(`if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true; document.getElementById('library-reopen').click();`);
+        await page.waitFor('remote comments restored', "document.getElementById('library-summary').textContent.includes('1 tracks matched')");
+        await page.evaluate("document.querySelector('#playlist-list li').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));");
+        await page.waitFor('remote playlist plays', "document.getElementById('title').textContent.toLowerCase().includes('reflex') && document.getElementById('transport-chip').textContent === 'playing'");
+        cors = false;
+        await page.evaluate(`const input = document.getElementById('library-proxy'); input.value = ${JSON.stringify(proxyBase.slice(0, -1))}; input.dispatchEvent(new Event('change'));`);
+        await play(1, 'petrified');
+        assert.ok(proxyRequests > 0 && agentRequests === proxyRequests, 'proxy user agent reached upstream');
+        assert.ok(upstreamRequests > proxyRequests, 'direct requests also reached upstream');
+        await page.waitFor('proxy setting saved', `(await (await import('./library-source.js')).storedRemoteIndex())?.proxy === ${JSON.stringify(proxyBase)}`);
+        await page.evaluate("localStorage.removeItem('starplayer.libraryProxy');");
+        await page.send('Page.reload');
+        await page.waitFor('proxy reopen available', "document.documentElement.dataset.playerReady === 'true' && !document.getElementById('library-reopen').hidden");
+        await page.evaluate(`if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true; document.getElementById('library-reopen').click();`);
+        await page.waitFor('stored proxy restored', `document.getElementById('library-proxy').value === ${JSON.stringify(proxyBase)} && document.getElementById('library-count').textContent === '3 of 3'`);
+        await play(1, 'petrified');
+        // Clearing the proxy must also clear the ZIP cache: this member used to be cached.
+        await page.evaluate("const input = document.getElementById('library-proxy'); input.value = ''; input.dispatchEvent(new Event('change'));");
+        await page.evaluate("document.querySelector('[data-row-id=\"2\"]').dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));");
+        await page.waitFor('CORS failure diagnostic', "document.getElementById('error').textContent.includes('may not allow cross-origin requests — set a Proxy URL')");
+        const surviving = await page.evaluate(READ_STATE);
+        assert.equal(surviving.title, 'Petrified');
+        assert.equal(surviving.chip, 'playing');
+        await page.waitFor('remote playback survives CORS failure', `document.getElementById('row').textContent !== ${JSON.stringify(surviving.row)}`);
+        // Chromium logs the intentionally blocked CORS fetch. All other errors fail.
+        assert.deepEqual(page.consoleErrors.filter(error => !/CORS policy|net::ERR_FAILED/.test(error)), []);
+        return { upstreamRequests, proxyRequests, agentRequests, reopenedComments: true, upgradedHandle: true, failure: surviving.errorText };
+    } finally {
+        if (page) await page.close();
+        server?.stop();
+        await close(proxy);
+        await close(upstream);
+    }
+}
+
 const executable = await findChromium();
 if (executable === null) {
     const required = process.env.STARPLAYER_REQUIRE_CHROMIUM === '1';
@@ -1605,6 +1719,7 @@ for (const mode of options.modes) {
         const report = await run(executable, mode);
         console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);
     }
+    console.log(`remote-library[${mode}] ${JSON.stringify(await runRemoteLibrary(executable, mode))}`);
     console.log(`library[${mode}] ${JSON.stringify(await runLibrary(executable, mode))}`);
 }
 console.log('headless harness: all modes passed');

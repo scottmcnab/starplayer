@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library (follows W7–W12, branch `library-remote`) |
-| Status | Specified 2026-10-23 |
+| Status | Implemented and verified 2026-10-23; uncommitted, pending owner deployment/acceptance |
 | Depends on | [W8](complete/W8-task-library-sources-and-resolver.md), [W11](complete/W11-task-playlist-uploads-and-persistence.md), [W12](complete/W12-task-library-comment-search.md) |
 | Blocks | — |
 | Recommended model | gpt-6.1-sol |
@@ -205,6 +205,42 @@ Rules:
   site: open `hornet-modules.csv` (and optionally `hornet-comments.csv`), click **Stream
   from source URLs**, and use **Reopen** after a reload. Link to `remote-proxy/README.md`.
 
+## Implementation notes (2026-10-23)
+
+The implementation remains in the web source/resolver boundary; the engine and
+worklet are unchanged. The remote source omits credentials, validates proxy bases
+without credentials/query/fragment components, and clears archive caches when the
+proxy changes. Proxy and upstream bases must be usable absolute HTTP(S) bases.
+
+The Worker uses `redirect: 'manual'` in addition to the specified fetch options:
+redirect targets must not let it fetch outside its single configured upstream.
+Raw dot-segment probes are tested before WHATWG URL normalisation; a platform
+`Request` may already have normalised dot segments before the Worker sees them.
+The remaining path is still rebuilt beneath the configured upstream.
+
+The Pages shim forwards CORS-mode requests unchanged to `fetch`, then wraps a
+successful response to add isolation headers. It cannot repair missing upstream
+CORS. Browser verification uses native COOP/COEP and plain-mode headers; the
+published service-worker-controlled deployment remains an owner acceptance check.
+The default Hornet proxy stays blank until the owner deploys the Worker.
+
+### Verification evidence (2026-10-23)
+
+- `node --test apps/starplayer-web/test/*.test.mjs` from the repository root:
+  **64 passed, 0 failed**.
+- `cargo xtask wasm`: passed and packaged the final web sources.
+- `STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs`:
+  the full harness passed in **sab, fallback, plain** modes. After the final URL
+  acceptance and no-Origin OPTIONS edge-case fixes, the final
+  `--library-only` run (including `runRemoteLibrary`) also passed all three modes.
+- `CARGO_BUILD_JOBS=1 CARGO_NET_OFFLINE=true cargo xtask ci`:
+  **11 jobs passed**. The existing pinned libxmp cache was copied from the main
+  checkout into this worktree's ignored `target/conformance/corpora`; no corpus
+  acquisition or internet access was needed. Every new test peer was local or a
+  fetch stub.
+- `git diff --check`: passed. No staging, commits, deployment, npm dependencies,
+  formatting runs, or writes to the external music/ModDNA trees.
+
 ## Research points
 
 - Under COEP `require-corp`, a cross-origin `fetch()` in its default `cors` mode succeeds
@@ -280,3 +316,22 @@ Rules:
 - Fetching per-row `source_url`s that don't follow the derived base. They are reported as
   not streamable.
 - Changes to the dev server or xtask.
+
+## Coordinator review (2026-10-23)
+
+- **Worker.** Confinement is segment-wise decode and re-encode onto a fixed base, with
+  redirects disabled. A disallowed origin is refused before any upstream fetch. An encoded
+  `%2e%2e` is collapsed by the URL parser before the Worker sees it, so it maps under
+  `UPSTREAM`; it cannot escape the base.
+- **Live check.** The real `worker.js`, run under Node, fetched
+  `contests/20mc/20dcxmas.zip` from hornet.org: 200, ACAO and CORP set, 79,551 bytes with ZIP
+  magic. A disallowed origin got 403.
+- **Fixed.** `compatibility_date` was set to today's date; it is now `2025-06-01`, because
+  Wrangler rejects dates newer than its runtime supports.
+- **Fixed.** The prompt after **Open index CSV…** now mentions **Stream from source URLs**
+  when the CSV has `source_url`.
+- **Re-verified.** 64 Node tests, `cargo xtask wasm`, and the headless library and
+  remote-library scenarios in all three modes. The worker had run the full harness and
+  `cargo xtask ci` (11 jobs).
+- **Outstanding.** The owner deploys the Worker; the coordinator then sets its URL in
+  `www/remote-sources.js`.

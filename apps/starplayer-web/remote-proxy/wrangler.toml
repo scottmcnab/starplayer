@@ -1,0 +1,7 @@
+name = "starplayer-hornet-proxy"
+main = "worker.js"
+compatibility_date = "2025-06-01"
+
+[vars]
+UPSTREAM = "https://hornet.org/music/"
+ALLOWED_ORIGINS = "https://scottmcnab.github.io,http://localhost:8080,http://127.0.0.1:8080"

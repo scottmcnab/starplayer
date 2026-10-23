@@ -220,3 +220,23 @@ Lead",,
 2222222222222222222222222222222222222222222222222222222222222222,xm,Composer,Kick,
 3333333333333333333333333333333333333333333333333333333333333333,it,,,Greetings!
 ```
+
+## Streaming from `source_url`
+
+The optional `source_url` column lets an index stream files without a local mirror.
+Open the index and click **Stream from source URLs**. The player chooses the base
+prefix for which the most rows equal `base + source_path`, accepting either literal
+paths or paths encoded one segment at a time. Rows outside that base are reported
+as unmatched and cannot be streamed. Archive members still use the same ZIP resolver.
+
+Leave **Proxy URL (blank: fetch directly)** blank for direct mode when the archive
+server supports CORS. Servers without CORS, including Hornet, need the
+[remote proxy](remote-proxy/README.md); enter its absolute HTTP(S) URL. Requests
+remain in CORS mode, including on the cross-origin isolated published player.
+Changing the proxy clears cached archives for later reads.
+
+The browser stores the exact index CSV bytes and name, proxy setting, and any
+manually attached comments CSV in local IndexedDB. After a reload, **Reopen <name>
+(streaming)** reconnects it with the same library identity and saved playlist
+bindings. A saved Proxy URL overrides the record's proxy. Storage failure leaves
+streaming usable but reports that reopening will be unavailable after reload.
