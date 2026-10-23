@@ -13,6 +13,15 @@ one until reload. To serve the Hornet index and comments from their external pat
 cargo xtask serve --library /mnt/d/hornet-music --library-index ../moddna/index/hornet/hornet-modules.csv --library-comments ../moddna/index/hornet/hornet-comments.csv
 ```
 
+On the published site, open `hornet-modules.csv` with **Open index CSV…**, then
+click **Stream from source URLs**. Hornet needs a CORS proxy: **Proxy URL (blank:
+fetch directly)** is prefilled with the deployed Worker,
+`https://starplayer-hornet-proxy.starplayer-hornet-proxy.workers.dev/`; see
+[proxy setup](remote-proxy/README.md). Optionally open `hornet-comments.csv` with
+**Open comments CSV…**. Use **Reopen <name> (streaming)** after reloading to restore
+the library and comments and reconnect saved playlist entries. The CSV bytes stay
+in this browser; no CSV hosting is needed. Servers with CORS work directly.
+
 Search updates as you type (80 ms debounce); use `name:`, `title:`, `path:`,
 `format:`, `tracker:`, `text:` and `ch:` prefixes, quoted phrases, or a leading `-` to
 exclude matches (`oxygen -oxygene`). While a search matches comment text, a **Comment

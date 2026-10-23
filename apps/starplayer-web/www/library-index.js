@@ -90,7 +90,7 @@ function readRows(text, keepDuplicates) {
         const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
         const format = (get('format_detected').trim() || get('format_by_extension').trim() || extension).toLowerCase();
         const number = column => get(column).trim() && Number.isFinite(Number(get(column))) ? Number(get(column)) : null;
-        rows.push({ id: rows.length, sourcePath, containerMember, memberPath, rawHex: get('member_path_raw_hex'), name, folder,
+        rows.push({ id: rows.length, sourcePath, sourceUrl: get('source_url').trim(), containerMember, memberPath, rawHex: get('member_path_raw_hex'), name, folder,
             title: get('title'), format, playable: playableFormats.has(format), channels: number('channels'), size: number('size'),
             timestamp: get('timestamp'), tracker: get('tracker'), sha256: validSha256(get('sha256')),
             instrumentNames: get('instrument_names'), sampleNames: get('sample_names'), songMessage: get('song_message'), line, ...(keepDuplicates ? { library: get('library') } : {}) });
