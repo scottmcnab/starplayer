@@ -1,3 +1,9 @@
+import { createPlaylistControls } from './playlist-controls.js';
+import { createPlaybackController } from './playback-controller.js';
+import { createPlaylistPlayback } from './playlist-playback.js';
+import { createLibraryView } from './library-view.js';
+import { createPlaylist, libraryLocator, wirePlaylistList } from './playlist.js';
+import { wireLibraryControls } from './library-controls.js';
 import initLoader, * as Loader from './starplayer_web.js';
 
 const Ring = globalThis.StarPlayerRing;
@@ -65,6 +71,7 @@ const elements = {
 };
 
 const state = {
+    library: null,
     context: null,
     node: null,
     startPromise: null,
@@ -219,6 +226,7 @@ function restorePreferences() {
         selectStoredValue(elements.mixerInterpolator, saved.interpolator ?? 'linear');
         selectStoredValue(elements.mixerDepth, saved.depth ?? 'f32');
         selectStoredValue(elements.mixerDither, saved.dither ?? 'off');
+        if (typeof saved.repeat === 'boolean') elements.repeat.checked = saved.repeat;
         elements.modHeadphonePanning.checked = saved.headphoneFriendlyModPanning === true;
         // M10-W4: the enhancement checkboxes do not exist yet (they are built from the
         // worklet's first `ready` message), so the value is held until
@@ -240,6 +248,7 @@ function restorePreferences() {
 function persistPreferences() {
     try {
         localStorage.setItem(MIXER_STORAGE_KEY, JSON.stringify({
+            repeat: elements.repeat.checked,
             sampleRate: elements.sampleRate.value,
             sinkId: state.context?.sinkId ?? elements.outputDevice.value,
             channels: elements.outputChannels.value,
@@ -589,54 +598,57 @@ function createNode(context, processorOptions, wasmBytes, channels) {
     }
 }
 
-async function loadBuffer(buffer, label) {
-    const audio = startAudio();
-    const previousMessage = elements.message.textContent;
-    clearError();
-    showMessage(`Checking ${label}…`);
-    try {
-        await loaderReady;
-        const inputBytes = new Uint8Array(buffer);
-        if (Loader.is_archive(inputBytes)) {
-            const entries = parseArchiveModules(Loader.archive_modules(inputBytes));
-            if (entries.length === 0) {
-                throw new Error(`No supported modules were found inside ${label}.`);
-            }
+export async function playLibraryRow(row) {
+    if (!row.playable || !state.library) return;
+    const result = await playback.play(libraryLocator(row, state.library.identity), { origin: 'library', label: `${row.name} — ${row.title} (${row.folder})` });
+    if (result.status === 'played') libraryView.setPlaying(row.id);
+    else if (result.status === 'failed') reportLoadFailure(row.name, result.error);
+}
 
-            // Retained before the pick, so cancelling the modal still leaves this ZIP's
-            // other tracks one click away in the load panel.
-            const archive = retainArchive(label, inputBytes, entries);
-            const choice = entries.length === 1 ? entries[0] : await chooseArchiveEntry(entries, label);
-            if (choice === null) {
-                audio.catch(() => {});
-                showMessage(previousMessage);
-                return;
-            }
-            await playArchiveEntry(archive, choice, audio);
-            return;
-        }
-        await activateLoadedModule(buffer, label, audio);
-    } catch (error) {
-        reportLoadFailure(label, error);
+async function loadBuffer(buffer, label, origin = 'file') {
+    const result = await playback.play({ kind: 'bytes', ...(typeof buffer === 'function' ? { read: buffer } : { buffer }), label }, { origin });
+    if (result.status === 'failed') reportLoadFailure(label, result.error);
+}
+
+// Archive selection is part of the same intent as the file/URL read. A newer load
+// closes the old picker and the guard prevents its continuation from activating.
+async function preparePlayback(buffer, label, origin, context) {
+    clearError();
+    await loaderReady;
+    if (!context.isCurrent()) return null;
+    const inputBytes = new Uint8Array(buffer);
+    if (Loader.is_archive(inputBytes)) {
+        const entries = parseArchiveModules(Loader.archive_modules(inputBytes));
+        if (!entries.length) throw new Error(`No supported modules were found inside ${label}.`);
+        const archive = retainArchive(label, inputBytes, entries);
+        const choice = entries.length === 1 ? entries[0] : await chooseArchiveEntry(entries, label);
+        if (!context.isCurrent() || !choice) return null;
+        buffer = Uint8Array.from(Loader.archive_extract(archive.bytes, choice.index)).buffer;
+        label = `${choice.name} (from ${archive.label})`;
+        selectRetainedArchiveTrack(archive, choice);
     }
+    return activateLoadedModule(buffer, label, context);
 }
 
 /// Everything that happens once a module's own bytes are known: validate them on the
 /// page, refresh the format's effect-name table, then activate on the worklet and play.
-/// `loadBuffer` and the retained-archive dropdown are the two routes in, so a track
-/// loads identically whichever one the user took. Returns false when a later load has
-/// already claimed the module revision and this activation must be discarded.
-async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
+/// Every source arrives through the controller's guarded adapter. Returns null when a
+/// later intent or graph change has superseded this activation.
+async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
+    if (!context.isCurrent()) return null;
+    const revision = state.moduleRevision;
     Loader.inspect_s3m(new Uint8Array(moduleBuffer));
     loadEffectNames();
     const metadata = readMetadata(moduleLabel);
-    await audio;
+    await context.audio;
+    if (!context.isCurrent() || revision !== state.moduleRevision) return null;
     showMessage(`Activating ${moduleLabel}…`);
     const retainedBytes = moduleBuffer.slice(0);
-    const revision = ++state.moduleRevision;
     const loadOptions = loadOptionsFromControls();
-    const result = await activateModuleOnNode(state.node, moduleBuffer, loadOptions);
-    if (revision !== state.moduleRevision) return false;
+    const node = state.node;
+    const result = await activateModuleOnNode(node, moduleBuffer, loadOptions);
+    if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node) return null;
+    libraryView.setPlaying(null);
     state.metadata = metadata;
     state.currentModuleBytes = retainedBytes;
     state.activeLoadOptions = {
@@ -666,15 +678,13 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, audio) {
     // tab without turning garbage collection into a render-path poll.
     setTimeout(requestGarbageCollection, 100);
     setTimeout(requestGarbageCollection, 500);
-    return true;
+    return { graph: node, generation: result.generation };
 }
 
-async function playArchiveEntry(archive, choice, audio) {
-    showMessage(`Extracting ${choice.name} from ${archive.label}…`);
-    const extracted = Loader.archive_extract(archive.bytes, choice.index);
-    const moduleBuffer = Uint8Array.from(extracted).buffer;
-    const activated = await activateLoadedModule(moduleBuffer, `${choice.name} (from ${archive.label})`, audio);
-    if (activated) selectRetainedArchiveTrack(archive, choice);
+async function playArchiveEntry(archive, choice) {
+    const result = await playback.play({ kind: 'bytes', read: () => Uint8Array.from(Loader.archive_extract(archive.bytes, choice.index)).buffer }, { origin: 'archive', label: `${choice.name} (from ${archive.label})` });
+    if (result.status === 'played') selectRetainedArchiveTrack(archive, choice);
+    else if (result.status === 'failed') reportLoadFailure(archive.label, result.error);
 }
 
 function reportLoadFailure(label, error) {
@@ -781,9 +791,8 @@ function loadRetainedArchiveTrack() {
     // cancels it rather than resolving it a second time.
     if (state.archivePickerResolve !== null) finishArchivePicker(null);
     const choice = archive.entries[Number(selected)];
-    const audio = startAudio();
     clearError();
-    playArchiveEntry(archive, choice, audio).catch((error) => reportLoadFailure(archive.label, error));
+    playArchiveEntry(archive, choice).catch((error) => reportLoadFailure(archive.label, error));
 }
 
 function formatByteSize(bytes) {
@@ -1090,7 +1099,7 @@ function selectMidiInput() {
 
 /// Whether a key event is the page's to play, rather than something the person is typing.
 function keyboardIsListening(event) {
-    if (!elements.keyboardEnable.checked || !state.liveInputActive) return false;
+    if (!elements.keyboardEnable.checked || !state.liveInputActive || event.target.closest?.('#library-panel, #playlist-panel')) return false;
     if (event.ctrlKey || event.altKey || event.metaKey) return false;
     const target = event.target;
     if (target instanceof HTMLElement && target.isContentEditable) return false;
@@ -1187,9 +1196,9 @@ function repeatFadeFrames() {
 }
 
 /// Sent on `#repeat` `change`, on activating a module, and from `playbackRestoreCommands()`
-/// — the three moments the engine's at-end policy needs to (re)match the checkbox.
+/// — the three moments the engine needs the controller's effective at-end policy.
 function queueRepeatCommand() {
-    queueCommand(Ring.OPCODE_AT_END, elements.repeat.checked ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT, repeatFadeFrames());
+    queueCommand(Ring.OPCODE_AT_END, playback.effectiveAtEnd() ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT, repeatFadeFrames());
 }
 
 function flushFallbackCommands() {
@@ -1238,7 +1247,7 @@ function playbackRestoreCommands() {
     const commands = [
         Ring.OPCODE_MASTER_VOLUME, volume, 0,
         ...seek,
-        Ring.OPCODE_AT_END, elements.repeat.checked ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT, repeatFadeFrames(),
+        Ring.OPCODE_AT_END, playback.effectiveAtEnd() ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT, repeatFadeFrames(),
         playing ? Ring.OPCODE_PLAY : Ring.OPCODE_STOP, 0, 0,
     ];
     for (const [channel, snapshot] of (state.latest?.channels ?? []).entries()) {
@@ -1330,9 +1339,11 @@ async function applyLoadOptions(changedKey) {
             enhancementFlags: activation.appliedEnhancementFlags ?? requested.enhancementFlags,
             speedAdjust: requested.speedAdjust,
         };
+        playback.rebind(node, activation.generation);
         state.activationMemoryBytes = activation.memoryBytes;
         state.loadCount += 1;
         sendCommandsToCurrentGraph(restoreCommands);
+        if (playback.stopped) queueCommand(Ring.OPCODE_STOP);
         persistPreferences();
         const reduction = describeEnhancementReduction(requested.enhancementFlags, activation.appliedEnhancementFactor);
         showMessage(`${wording.applied}; playback restored at the sounding order.${reduction ? ` (${reduction}.)` : ''}`);
@@ -1365,6 +1376,9 @@ async function rebuildAudioContext() {
     const label = requested === '' ? 'device default' : formatRate(Number(requested));
     const oldContext = state.context;
     const oldNode = state.node;
+    const moduleBytes = state.currentModuleBytes;
+    const revision = state.moduleRevision;
+    const controlRevision = playback.controlRevision;
     const oldSinkId = 'sinkId' in oldContext ? oldContext.sinkId : '';
     const restoreCommands = playbackRestoreCommands();
     const contextOptions = { latencyHint: 'interactive' };
@@ -1389,6 +1403,7 @@ async function rebuildAudioContext() {
             });
         }
         await unlock;
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
         graph.node.connect(candidateContext.destination);
         if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
         state.context = candidateContext;
@@ -1396,6 +1411,7 @@ async function rebuildAudioContext() {
         state.latest = null;
         state.activeModeWire = mixerModeFromControls();
         if (activation) {
+            playback.rebind(graph.node, activation.generation);
             state.activationMemoryBytes = activation.memoryBytes;
             state.activeLoadOptions = {
                 headphoneFriendlyModPanning: state.metadata?.isMod ? loadOptions.headphoneFriendlyModPanning : state.activeLoadOptions.headphoneFriendlyModPanning,
@@ -1431,6 +1447,9 @@ async function rebuildOutputChannels() {
     }
     const channels = Number(elements.outputChannels.value) === 1 ? 1 : 2;
     const oldNode = state.node;
+    const moduleBytes = state.currentModuleBytes;
+    const revision = state.moduleRevision;
+    const controlRevision = playback.controlRevision;
     const restoreCommands = playbackRestoreCommands();
     let candidateNode = null;
     try {
@@ -1440,12 +1459,14 @@ async function rebuildOutputChannels() {
         const activation = state.currentModuleBytes === null
             ? null
             : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions);
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
         graph.node.connect(state.context.destination);
         if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
         installGraph(graph);
         state.latest = null;
         state.activeModeWire = mixerModeFromControls();
         if (activation) {
+            playback.rebind(graph.node, activation.generation);
             state.activationMemoryBytes = activation.memoryBytes;
             state.activeLoadOptions = {
                 headphoneFriendlyModPanning: state.metadata?.isMod ? loadOptions.headphoneFriendlyModPanning : state.activeLoadOptions.headphoneFriendlyModPanning,
@@ -1780,9 +1801,10 @@ function renderMetadata() {
 }
 
 function setControlsEnabled(enabled) {
-    for (const control of [elements.previous, elements.play, elements.stop, elements.next, elements.seekOrder, elements.volume, elements.progress, elements.repeat]) {
+    for (const control of [elements.previous, elements.play, elements.stop, elements.next, elements.seekOrder, elements.volume, elements.progress]) {
         control.disabled = !enabled;
     }
+    elements.repeat.disabled = !enabled || playback.playlistMode;
 }
 
 function ensureChannelRows(count) {
@@ -1983,7 +2005,7 @@ function updateProgress(snapshot) {
     // too and always represents one complete playback. A song that merely runs out of
     // order list does not loop and does not fade: the host stops it on its end frame, so
     // its displayed length is exactly one pass (task D2).
-    const fadesAtEnd = !elements.repeat.checked && (snapshot.songFlags & Ring.SONG_FLAG_LOOPS) !== 0;
+    const fadesAtEnd = !playback.effectiveAtEnd() && (snapshot.songFlags & Ring.SONG_FLAG_LOOPS) !== 0;
     const lengthFrames = lengthKnown ? Math.max(0, snapshot.songLengthFrames) + (fadesAtEnd ? repeatFadeFrames() : 0) : null;
     elements.progress.max = String(lengthFrames ?? 0);
     elements.progress.disabled = !lengthKnown;
@@ -2124,15 +2146,17 @@ async function loadFixture() {
         showError('Choose a bundled fixture first.');
         return;
     }
-    const response = await fetch(`modules/${name}`);
-    if (!response.ok) throw new Error(`Fixture request failed (${response.status}).`);
-    await loadBuffer(await response.arrayBuffer(), name);
+    await loadBuffer(async signal => {
+        const response = await fetch(`modules/${name}`, { signal });
+        if (!response.ok) throw new Error(`Fixture request failed (${response.status}).`);
+        return response.arrayBuffer();
+    }, name, 'fixture');
 }
 
 elements.startAudio.addEventListener('click', () => startAudio().catch(() => {}));
 elements.filePicker.addEventListener('change', () => {
     const file = elements.filePicker.files[0];
-    if (file) file.arrayBuffer().then((buffer) => loadBuffer(buffer, file.name)).catch(showError);
+    if (file) loadBuffer(() => file.arrayBuffer(), file.name).catch(showError);
     elements.filePicker.value = '';
 });
 elements.loadFixture.addEventListener('click', () => loadFixture().catch(showError));
@@ -2153,10 +2177,11 @@ elements.urlForm.addEventListener('submit', (event) => {
     event.preventDefault();
     const url = elements.url.value.trim();
     if (!url) return;
-    fetch(url).then((response) => {
+    loadBuffer(async signal => {
+        const response = await fetch(url, { signal });
         if (!response.ok) throw new Error(`URL request failed (${response.status} ${response.statusText}).`);
         return response.arrayBuffer();
-    }).then((buffer) => loadBuffer(buffer, url)).catch((error) => showError(`Could not fetch that URL. It may need CORS permission. ${error.message}`));
+    }, url, 'url').catch((error) => showError(`Could not fetch that URL. It may need CORS permission. ${error.message}`));
 });
 for (const type of ['dragenter', 'dragover']) {
     elements.dropZone.addEventListener(type, (event) => { event.preventDefault(); elements.dropZone.classList.add('over'); });
@@ -2166,16 +2191,16 @@ for (const type of ['dragleave', 'drop']) {
 }
 elements.dropZone.addEventListener('drop', (event) => {
     const file = event.dataTransfer.files[0];
-    if (file) file.arrayBuffer().then((buffer) => loadBuffer(buffer, file.name)).catch(showError);
+    if (file) loadBuffer(() => file.arrayBuffer(), file.name).catch(showError);
 });
 elements.dropZone.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') elements.filePicker.click();
 });
-elements.play.addEventListener('click', () => queueCommand(Ring.OPCODE_PLAY));
-elements.stop.addEventListener('click', () => queueCommand(Ring.OPCODE_STOP));
-elements.previous.addEventListener('click', () => queueCommand(Ring.OPCODE_SEEK_ORDER, Math.max(0, (state.latest?.order || 0) - 1)));
-elements.next.addEventListener('click', () => queueCommand(Ring.OPCODE_SEEK_ORDER, Math.min((state.metadata?.orders || 1) - 1, (state.latest?.order || 0) + 1)));
-elements.seekOrder.addEventListener('change', () => queueCommand(Ring.OPCODE_SEEK_ORDER, Number(elements.seekOrder.value)));
+elements.play.addEventListener('click', () => { playback.userControl('play'); queueCommand(Ring.OPCODE_PLAY); });
+elements.stop.addEventListener('click', () => { playlistPlayback.cancel(); playback.stop(); });
+elements.previous.addEventListener('click', () => userSeek(Ring.OPCODE_SEEK_ORDER, Math.max(0, (state.latest?.order || 0) - 1)));
+elements.next.addEventListener('click', () => userSeek(Ring.OPCODE_SEEK_ORDER, Math.min((state.metadata?.orders || 1) - 1, (state.latest?.order || 0) + 1)));
+elements.seekOrder.addEventListener('change', () => userSeek(Ring.OPCODE_SEEK_ORDER, Number(elements.seekOrder.value)));
 // Continuous `input` events while dragging never reach the command ring — it holds only
 // 64 entries and is drained once per render quantum — only the released `change` does.
 elements.progress.addEventListener('input', () => {
@@ -2184,12 +2209,12 @@ elements.progress.addEventListener('input', () => {
 });
 elements.progress.addEventListener('change', () => {
     const frame = Number(elements.progress.value);
-    queueCommand(Ring.OPCODE_SEEK_FRAME, frame);
+    userSeek(Ring.OPCODE_SEEK_FRAME, frame);
     state.pendingSeekFrame = frame;
     state.pendingSeekSequence = state.latest?.sequence ?? 0;
     state.scrubbing = false;
 });
-elements.repeat.addEventListener('change', queueRepeatCommand);
+elements.repeat.addEventListener('change', () => { queueRepeatCommand(); persistPreferences(); });
 elements.elapsed.addEventListener('click', toggleTimeDisplay);
 elements.duration.addEventListener('click', toggleTimeDisplay);
 elements.volume.addEventListener('input', () => {
@@ -2258,6 +2283,51 @@ requestAnimationFrame(refresh);
 // The fixture menu is part of start-up, not a background nicety: the harness picks an
 // entry the moment `playerReady` appears, so the fetch has to have settled before it does.
 await populateFixtureMenu();
+const playlist = createPlaylist();
+const playlistControls = await createPlaylistControls({ playlist, state, loader: Loader, ready: () => loaderReady });
+const libraryResolver = {
+    async resolve(locator, options) {
+        if (locator.kind === 'upload') return playlistControls.resolver.resolve(locator, options);
+        const library = state.library;
+        if (!library || library.identity.sha256 !== locator.libraryIdentity?.sha256) throw new Error('Library unavailable: reconnect its original index.');
+        const buffer = await library.resolver.resolve(locator, options);
+        if (library !== state.library) throw new DOMException('Library changed', 'AbortError');
+        return buffer;
+    },
+    prefetch(locator) {
+        if (locator.kind === 'upload') return playlistControls.resolver.prefetch(locator);
+        if (state.library && state.library.identity.sha256 === locator.libraryIdentity?.sha256) return state.library.resolver.prefetch(locator);
+    },
+};
+const playback = createPlaybackController({
+    resolver: libraryResolver, activate: preparePlayback, ready: startAudio,
+    repeat: () => elements.repeat.checked,
+    readSnapshot: () => ({ graph: state.node, snapshot: state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest }),
+    flushCommands: flushFallbackCommands, stop: () => queueCommand(Ring.OPCODE_STOP),
+    onIntent({ origin }) {
+        state.moduleRevision += 1;
+        finishArchivePicker(null);
+        if (origin !== 'playlist') { playlistPlayback.cancel(); playlist.setCurrent(null); }
+        elements.repeat.disabled = origin === 'playlist';
+        elements.repeat.title = origin === 'playlist' ? 'Playlist playback ends each song to advance; your Repeat preference is preserved.' : '';
+        queueRepeatCommand();
+    },
+    onTrackEnded: id => playlistPlayback.ended(id),
+});
+const playlistPlayback = createPlaylistPlayback({
+    playlist, controller: playback, resolver: libraryResolver,
+    loop: () => byId('playlist-loop').checked, report: showError,
+    changed: () => playlistView.render(), available: entry => !playlistControls.availability(entry),
+});
+const playlistView = wirePlaylistList(playlist, { playback: playlistPlayback, availability: playlistControls.availability });
+playlistControls.setRender(() => playlistView.render());
+function userSeek(opcode, frame) {
+    playlistPlayback.cancel();
+    playback.userControl('seek');
+    queueCommand(opcode, frame);
+}
+const libraryView = createLibraryView({ playlist, play: playLibraryRow });
+await wireLibraryControls({ state, loader: Loader, onLibrary: library => { libraryView.setLibrary(library); playlistControls.libraryChanged(library); }, onComments: () => libraryView.refreshComments() });
 
 // `app.js` is a module and therefore deferred. This is the one honest signal that its
 // listeners are attached, which is what the headless harness waits on before clicking.

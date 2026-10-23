@@ -1,5 +1,40 @@
 # StarPlayer web player
 
+The [library and playlist CSV contract](LIBRARY-CSV.md) describes indexes accepted
+by the library data layer and the locator format used by library/playlist work.
+
+The **Library** section browses a folder or the dev server's `--library` source.
+Optional comments CSVs add instrument/sample names and song messages to search,
+with `text:` for comments only, a Search comments toggle and a focused-track details
+pane. Folder sources discover a sidecar by its header; Open comments CSV… attaches
+one until reload. To serve the Hornet index and comments from their external paths:
+
+```sh
+cargo xtask serve --library /mnt/d/hornet-music --library-index ../moddna/index/hornet/hornet-modules.csv --library-comments ../moddna/index/hornet/hornet-comments.csv
+```
+
+Search updates as you type (80 ms debounce); use `name:`, `title:`, `path:`,
+`format:`, `tracker:`, `text:` and `ch:` prefixes, quoted phrases, or a leading `-` to
+exclude matches (`oxygen -oxygene`). While a search matches comment text, a **Comment
+match** column shows the matching instrument or message line, and hovering a row lists
+every matching line. Sort with column
+headings, include unplayable formats with the checkbox, or browse directories,
+ZIPs and nested ZIPs using **Browse folders**, which opens a folder tree beside the
+table: click a folder (or press Enter) to scope the table to it, use ▸ or →/← to
+expand and collapse, and ↑/↓/Home/End to move. Turning browsing off restores the
+whole library. Only visible table rows are rendered, including for large indexes.
+
+Click selects one row, Ctrl/⌘-click toggles, and Shift-click selects a range in the
+current result order. Ctrl/⌘+A selects the entire filtered result, Escape clears,
+and arrows, Home/End and PageUp/Down move the focus (Shift extends the selection).
+Selections survive sorting, filtering and folder changes: **hidden rows remain
+selected, but actions use only playable rows in the current result**, in result
+order. Enter or double-click plays; `+`, Insert or **Add selected** adds to the
+playlist. A row's **+** adds the current selection (selecting that row
+first if it was not selected); a folder's **+** in the tree (or `+` / Insert on a
+focused folder) adds all playable tracks beneath that folder, regardless of the
+current filter, in folder/name order. Unplayable rows cannot play or be added.
+
 Build and serve the player from the repository root:
 
 ```text
@@ -93,6 +128,26 @@ Either way the host rewinds the transport to song frame 0 once it stops, and the
 follows it to `0:00`. The same command is resent whenever a module is (re)activated and
 whenever a playback-restoring graph rebuild happens (a sample-rate or channel-count change,
 or the MOD panning reload), so the checkbox's choice survives all of them.
+
+The **Playlist** panel plays entries in order. Double-click or press Enter to start an
+entry; the ⏮ / ⏭ buttons at either end of the transport controls move to the previous or
+next playlist track (◀◀ / ▶▶ still seek by order), Clear or Delete removes entries,
+and drag or Alt+↑/↓ to reorder. Loop playlist wraps at the last entry. Removing the
+current entry keeps the audio playing but cancels any pending advance. Failed entries
+show ⚠ with a diagnostic tooltip and are skipped; three consecutive failures stop the
+advance. Entries from an index that is no longer connected show “unavailable”.
+
+During playlist playback, Repeat is disabled and each song uses the end/fade policy
+above. Its saved preference is preserved and applies again when a file, URL, archive
+track or library row is played directly. Stop suppresses automatic advance until
+Play is pressed again; a seek does not, so a scrubbed track still advances when it
+ends. Completion requires a playing-to-stopped edge
+from the current audio graph and module generation, so a stale snapshot or host rewind
+cannot advance twice. Graph rebuilds preserve this policy.
+
+A 100 ms control timer detects completion and flushes fallback commands independently
+of animation frames. Audible background tabs can therefore advance without painting;
+a silent background tab may be throttled to 1 Hz, which only delays the advance.
 
 ## Architecture
 
@@ -260,7 +315,8 @@ for. A 1994 S3M through `fixed · nearest · 8-bit · mono` at 11025 Hz is the p
 exercise.
 
 Every one of those choices is written to `localStorage` (in a try/catch — a
-storage-blocked page still works, it just forgets). The module is never persisted.
+storage-blocked page still works, it just forgets). One-off loads are not persisted;
+files added to the Playlist are stored as described below.
 
 ## Effects (M7-H7)
 
@@ -368,7 +424,8 @@ node apps/starplayer-web/test/headless.mjs --mode sab --seconds 5   # quick
 ```
 
 The headless check skips cleanly when no Chromium/Chrome executable is installed; set
-`CHROME=/path/to/chrome` to point it at one. It drives the browser over the DevTools
+`CHROME=/path/to/chrome` to point it at one. Set `STARPLAYER_REQUIRE_CHROMIUM=1`
+to fail instead of skipping when Chromium is missing. It drives the browser over the DevTools
 protocol with Node's built-in `WebSocket`, and runs the page three ways — cross-origin
 isolated on shared memory, isolated with the fallback forced, and served without COOP/COEP
 at all. Each run first loads a synthetic MOD and observes hard, 60%, then hard L-R-R-L
@@ -395,3 +452,17 @@ fixture, renders ten seconds through the engine, exercises transport, confirms r
 collection, inspects synthetic MOD telemetry at both panning settings, proves two
 overlapping processors own independent memories and Rust hosts, and checks that a bad file
 is rejected with a readable message.
+
+Playlist files and state are saved in this browser. Use **Add files…** or drop onto
+the Playlist panel to add modules, ZIP members, or one nested ZIP level. Uploaded
+bytes share a 256 MiB storage cap; removing the last reference removes the file.
+When storage is unavailable the player reports session-only use. Missing uploads
+are marked **missing — re-add** and skipped. Reopen a library after reload to
+connect its saved entries. A changed index offers an explicit **Rebind** action
+for matching keys.
+
+**Export playlist** saves library locators as CSV in order, keeping duplicates and
+reporting omitted uploads. **Import playlist** appends CSV rows bound to the open
+library, keeping missing rows as unavailable for later rebinding. Exported CSV can
+also be opened as a small library. See [the CSV contract](LIBRARY-CSV.md#saving-and-exchanging-playlists)
+for storage, identity and exchange details.

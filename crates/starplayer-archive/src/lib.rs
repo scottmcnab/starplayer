@@ -44,6 +44,8 @@ pub enum ArchiveError {
     NoModules,
     /// The requested central-directory index does not exist.
     NoSuchEntry,
+    /// More than one entry matches a normalised name.
+    AmbiguousEntry(String),
 }
 
 impl Display for ArchiveError {
@@ -54,6 +56,7 @@ impl Display for ArchiveError {
             ArchiveError::UnsupportedMethod(message) => write!(formatter, "unsupported ZIP method: {message}"),
             ArchiveError::TooLarge { name, size } => write!(formatter, "archive entry `{name}` is too large ({size} bytes)"),
             ArchiveError::NoModules => formatter.write_str("the archive contains no playable modules"),
+            ArchiveError::AmbiguousEntry(names) => write!(formatter, "ambiguous archive entry: {names}"),
             ArchiveError::NoSuchEntry => formatter.write_str("the archive entry does not exist"),
         }
     }
@@ -97,6 +100,21 @@ pub fn list_modules(bytes: &[u8]) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     }
 }
 
+/// List immediate ZIP containers by central-directory index without extracting them.
+/// A container this crate cannot extract is skipped, as `list_modules` skips modules.
+pub fn list_zip_containers(bytes: &[u8]) -> Result<Vec<usize>, ArchiveError> {
+    let mut archive = open_archive(bytes)?;
+    let mut containers = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index_raw(index).map_err(map_zip_error)?;
+        let name = entry.name().map_err(map_zip_error)?;
+        if !entry.is_dir() && !is_resource_fork(&name) && name.rsplit_once('.').is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("zip")) && ensure_supported(&entry).is_ok() {
+            containers.push(index);
+        }
+    }
+    Ok(containers)
+}
+
 /// Extract one supported, unencrypted central-directory entry.
 ///
 /// Stored, Deflate, Shrink, Implode and Reduce (factors 1–4) are supported.
@@ -125,6 +143,41 @@ pub fn extract(bytes: &[u8], index: usize) -> Result<Vec<u8>, ArchiveError> {
         return Err(ArchiveError::TooLarge { name, size: output.len() as u64 });
     }
     Ok(output)
+}
+
+/// Find a member without decompressing any entry. Exact raw names take precedence
+/// over UTF-8/CP437 candidates, then a unique case/separator-normalised match.
+pub fn find_entry(bytes: &[u8], name: &str, raw_name: Option<&[u8]>) -> Result<usize, ArchiveError> {
+    let mut archive = open_archive(bytes)?;
+    let encoded = encode_cp437(name);
+    let normalised = name.replace('\\', "/").to_lowercase();
+    let mut raw_match = None;
+    let mut encoded_match = None;
+    let mut fallback = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index_raw(index).map_err(map_zip_error)?;
+        let decoded = entry.name().map_err(map_zip_error)?;
+        if entry.is_dir() || is_resource_fork(&decoded.replace('\\', "/")) { continue; }
+        if raw_match.is_none() && raw_name.is_some_and(|raw| entry.name_raw() == raw) { raw_match = Some(index); }
+        if encoded_match.is_none() && (entry.name_raw() == name.as_bytes() || encoded.as_deref().is_some_and(|raw| entry.name_raw() == raw)) {
+            encoded_match = Some(index);
+        }
+        if decoded.replace('\\', "/").to_lowercase() == normalised { fallback.push((index, decoded.into_owned())); }
+    }
+    if let Some(index) = raw_match.or(encoded_match) { return Ok(index); }
+    match fallback.as_slice() {
+        [] => Err(ArchiveError::NoSuchEntry),
+        [(index, _)] => Ok(*index),
+        _ => Err(ArchiveError::AmbiguousEntry(fallback.into_iter().map(|(_, name)| name).collect::<Vec<_>>().join(", "))),
+    }
+}
+
+fn encode_cp437(name: &str) -> Option<Vec<u8>> {
+    const HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ";
+    name.chars().map(|character| {
+        if character.is_ascii() { Some(character as u8) }
+        else { HIGH.chars().position(|candidate| candidate == character).map(|index| (index + 128) as u8) }
+    }).collect()
 }
 
 fn open_archive(bytes: &[u8]) -> Result<ZipArchive<Cursor<&[u8]>>, ArchiveError> {

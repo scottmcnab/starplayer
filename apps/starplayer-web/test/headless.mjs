@@ -1,3 +1,4 @@
+import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // End-to-end check of the packaged player in headless Chromium, over the DevTools
 // protocol, with Node's built-in `WebSocket` and `http` and nothing else installed.
 //
@@ -19,7 +20,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, readFile, readdir } from 'node:fs/promises';
+import { access, readFile, readdir, mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -36,9 +37,10 @@ const PHONE_VIEWPORT = { width: 390, height: 844 };
 const options = parseArguments(process.argv.slice(2));
 
 function parseArguments(argv) {
-    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'] };
+    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false };
     for (let index = 0; index < argv.length; index += 1) {
-        if (argv[index] === '--seconds') {
+        if (argv[index] === '--library-only') parsed.libraryOnly = true;
+        else if (argv[index] === '--seconds') {
             parsed.seconds = Number(argv[index + 1]);
             index += 1;
         } else if (argv[index] === '--mode') {
@@ -174,10 +176,11 @@ function syntheticMod({ channels = 4, tag = 'M.K.', title = 'headphone test', sp
     return bytes;
 }
 
-async function startDevServer(isolate) {
+async function startDevServer(isolate, libraryDirectory = null) {
     const port = await freePort();
     const argv = [DEV_SERVER, '--port', String(port), '--root', DIST];
     if (!isolate) argv.push('--no-isolation');
+    if (libraryDirectory) argv.push('--library', libraryDirectory, '--library-comments', join(libraryDirectory, 'comments.csv'));
     const child = spawn(process.execPath, argv, { stdio: ['ignore', 'pipe', 'inherit'] });
     await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('the dev server did not start')), 10_000);
@@ -267,7 +270,10 @@ class Page {
             const details = message.params.exceptionDetails;
             this.consoleErrors.push(details.exception?.description ?? details.text);
         } else if (message.method === 'Log.entryAdded' && message.params.entry.level === 'error') {
-            this.consoleErrors.push(message.params.entry.text);
+            const entry = message.params.entry;
+            // W8 deliberately probes this optional route on startup (also on reload).
+            if (['/library-index.csv', '/library-comments.csv'].some(path => entry.url?.endsWith(path)) && entry.text.includes('404')) return;
+            this.consoleErrors.push(entry.text);
         }
     }
 
@@ -300,7 +306,7 @@ class Page {
             const satisfied = await this.evaluate(`return Boolean(${expression});`).catch(() => false);
             if (satisfied) return;
             if (Date.now() > deadline) {
-                const shown = await this.evaluate("return document.getElementById('message').textContent + ' | ' + document.getElementById('error').textContent;").catch((error) => `unreadable (${error.message})`);
+                const shown = await this.evaluate("return document.getElementById('message').textContent + ' | ' + document.getElementById('error').textContent + ' | playlist telemetry: ' + JSON.stringify(window.latestPlaylistSnapshot && { playing: window.latestPlaylistSnapshot.playing, frame: window.latestPlaylistSnapshot.songFrame, length: window.latestPlaylistSnapshot.songLengthFrames, generation: window.latestPlaylistSnapshot.moduleGeneration, progressMax: document.getElementById('progress').max });").catch((error) => `unreadable (${error.message})`);
                 throw new Error(`timed out waiting for ${description}\n  page says: ${shown}\n  console: ${this.consoleErrors.join(' / ') || 'quiet'}`);
             }
             await delay(100);
@@ -1184,14 +1190,421 @@ async function run(executable, mode) {
     return report;
 }
 
+// Both owner fixtures end naturally. Derive the looping case from PETRI in memory:
+// append B00 to its last row, preserving all sample/music bytes and the fixture on disk.
+function withFinalLoop(bytes) {
+    const orders = bytes.readUInt16LE(32);
+    const instruments = bytes.readUInt16LE(34);
+    const lastPattern = [...bytes.subarray(96, 96 + orders)].filter(order => order < 254).at(-1);
+    const pointerOffset = 96 + orders + instruments * 2 + lastPattern * 2;
+    const patternOffset = bytes.readUInt16LE(pointerOffset) * 16;
+    let cursor = patternOffset + 2;
+    let lastRowEnd = cursor;
+    for (let row = 0; row < 64; row += 1) {
+        while (bytes[cursor] !== 0) {
+            const token = bytes[cursor++];
+            if (token & 32) cursor += 2;
+            if (token & 64) cursor += 1;
+            if (token & 128) cursor += 2;
+        }
+        lastRowEnd = cursor++;
+    }
+    const pattern = Buffer.concat([bytes.subarray(patternOffset + 2, lastRowEnd), Buffer.from([128, 2, 0, 0])]);
+    const appendedOffset = Math.ceil(bytes.length / 16) * 16;
+    const result = Buffer.alloc(appendedOffset + 2 + pattern.length);
+    bytes.copy(result);
+    result.writeUInt16LE(appendedOffset / 16, pointerOffset);
+    result.writeUInt16LE(pattern.length, appendedOffset);
+    pattern.copy(result, appendedOffset + 2);
+    return result;
+}
+
+// W9 uses only the two owner-authored S3Ms. All generated files stay in this worktree.
+async function runLibrary(executable, mode) {
+    const artifacts = join(REPOSITORY_ROOT, 'target/w9-verification');
+    await mkdir(artifacts, { recursive: true });
+    const directory = await mkdtemp(join(artifacts, 'library-'));
+    let server;
+    let page;
+    try {
+        const reflex = await readFile(join(REPOSITORY_ROOT, 'crates/starplayer-s3m/tests/fixtures/REFLEX.S3M'));
+        const petri = await readFile(join(REPOSITORY_ROOT, 'crates/starplayer-s3m/tests/fixtures/PETRI.S3M'));
+        await mkdir(join(directory, 'loose'));
+        await mkdir(join(directory, 'disks'));
+        await writeFile(join(directory, 'loose/REFLEX.S3M'), reflex);
+        await writeFile(join(directory, 'disks/disk1.zip'), buildZip([{ name: 'PETRI.S3M', bytes: petri }, { name: 'REFLEX.S3M', bytes: reflex }]));
+        await writeFile(join(directory, 'disks/outer.zip'), buildZip([{ name: 'inner.zip', bytes: buildZip([{ name: 'PETRI.S3M', bytes: petri }]) }]));
+        const header = 'member_path,title,source_path,container_member,sha256\n';
+        await writeFile(join(directory, 'index.csv'), header + [
+            ',Loose Reflex,loose/REFLEX.S3M,',
+            'PETRI.S3M,Disk Petri,disks/disk1.zip,',
+            'REFLEX.S3M,Disk Reflex,disks/disk1.zip,',
+            'PETRI.S3M,Nested Petri,disks/outer.zip,inner.zip',
+            'MISSING.S3M,Missing member,disks/disk1.zip,',
+        ].map((row, index) => `${row},${index < 2 ? String(index + 1).repeat(64) : ''}`).join('\n'));
+        await writeFile(join(directory, 'comments.csv'), `sha256,instrument_names,song_message\n${'1'.repeat(64)},"Future-Crew\n\n<b>bold</b>","Hello\nMessage line two"\n${'2'.repeat(64)},Other group,`);
+        server = await startDevServer(mode !== 'plain', directory);
+        page = await Page.open(executable, `http://127.0.0.1:${server.port}/`);
+        await page.waitFor('library startup', "document.documentElement.dataset.playerReady === 'true'");
+        await page.evaluate(`
+            if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true;
+            document.getElementById('library-server').click();
+        `);
+        await page.waitFor('five library rows', "document.getElementById('library-count').textContent === '5 of 5'");
+        const filter = async (value, expected) => {
+            await page.evaluate(`await new Promise(resolve => { const observer = new MutationObserver(() => { observer.disconnect(); requestAnimationFrame(resolve); }); observer.observe(document.getElementById('library-count'), { childList: true }); const input = document.getElementById('library-search'); input.value = ${JSON.stringify(value)}; input.dispatchEvent(new Event('input')); });`);
+            await page.waitFor('filtered library count', `document.getElementById('library-count').textContent === ${JSON.stringify(expected)}`);
+        };
+        const clickRow = (id, modifiers = {}) => page.evaluate(`document.querySelector('[data-row-id="${id}"]').dispatchEvent(new MouseEvent('click', { bubbles: true, ...${JSON.stringify(modifiers)} }));`);
+        await page.waitFor('comments attached', "document.getElementById('library-summary').textContent.includes('2 tracks matched')");
+        await filter('text:futurecrew', '1 of 5');
+        await filter('futurecrew', '1 of 5');
+        await page.evaluate("document.getElementById('library-search-comments').click();");
+        await page.waitFor('comments excluded', "document.getElementById('library-count').textContent === '0 of 5'");
+        await filter('text:futurecrew', '1 of 5');
+        await page.evaluate("document.getElementById('library-search-comments').click();");
+        await filter('text:Future-Crew', '1 of 5');
+        await clickRow(0);
+        const details = await page.evaluate(`
+            const pane = document.getElementById('library-details');
+            return { hidden: pane.hidden, text: pane.textContent, instruments: pane.querySelector('pre').textContent, marks: [...pane.querySelectorAll('mark')].map(mark => mark.textContent), bold: pane.querySelectorAll('b').length };
+        `);
+        assert.equal(details.hidden, false);
+        assert.equal(details.instruments, '01  Future-Crew\n02  \n03  <b>bold</b>');
+        assert.deepEqual(details.marks, ['Future-Crew']);
+        assert.equal(details.bold, 0);
+        assert.ok(details.text.includes('Hello\nMessage line two'));
+        // The match column and a real hover's popover highlight the comment line the row matched on, as text only.
+        const matchCell = await page.evaluate("const cell = document.querySelector('.library-comment-cell'); return { visible: getComputedStyle(document.querySelector('.library-comment-heading')).display !== 'none', text: cell.textContent, marks: [...cell.querySelectorAll('mark')].map(mark => mark.textContent) };");
+        assert.deepEqual(matchCell, { visible: true, text: '#01Future-Crew', marks: ['Future-Crew'] });
+        const hoverPoint = await page.evaluate("const row = document.querySelector('#library-rows > div'); row.scrollIntoView({ block: 'center' }); const bounds = row.getBoundingClientRect(); return { x: bounds.x + 60, y: bounds.y + 16 };");
+        await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...hoverPoint });
+        await page.waitFor('comment match popover', "!document.getElementById('library-match-popover').hidden");
+        const popover = await page.evaluate("const popover = document.getElementById('library-match-popover'); return { text: popover.textContent, marks: [...popover.querySelectorAll('mark')].map(mark => mark.textContent), bold: popover.querySelectorAll('b').length };");
+        assert.ok(popover.text.includes('Instrument 01'), popover.text);
+        assert.deepEqual(popover.marks, ['Future-Crew']);
+        assert.equal(popover.bold, 0);
+        await filter('', '5 of 5');
+        assert.ok(await page.evaluate("return document.getElementById('library-match-popover').hidden && !document.querySelector('.library-comment-cell') && getComputedStyle(document.querySelector('.library-comment-heading')).display === 'none';"));
+        await clickRow(4);
+        await page.evaluate("window.paintedLibraryRow = document.querySelector('#library-rows > div'); document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));");
+        assert.ok(await page.evaluate("return document.getElementById('library-details').textContent.includes('Other group');"));
+        assert.ok(await page.evaluate("return window.paintedLibraryRow === document.querySelector('#library-rows > div');"), 'focus updates details without replacing grid rows');
+        await clickRow(2);
+        assert.ok(await page.evaluate("return document.getElementById('library-details').textContent.includes('No comment text');"));
+        await page.send('Emulation.setDeviceMetricsOverride', { ...PHONE_VIEWPORT, deviceScaleFactor: 3, mobile: true });
+        assert.ok(await page.evaluate("return document.documentElement.scrollWidth <= 390;"));
+        await page.send('Emulation.clearDeviceMetricsOverride');
+        await filter('title:Disk', '2 of 5');
+        await clickRow(1);
+        await clickRow(2, { shiftKey: true });
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M']);
+        await page.evaluate("document.querySelector('[data-row-id=\"1\"] button').click();");
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        await filter('', '5 of 5');
+        await clickRow(0, { ctrlKey: true });
+        await clickRow(2, { ctrlKey: true });
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        // A real Shift-click must select rows, not page text (Edge pops up a Copy/Search menu over a text selection).
+        const realClick = async (position, modifiers = 0) => {
+            const point = await page.evaluate(`const row = document.querySelector('#library-rows > :nth-child(${position})'); row.scrollIntoView({ block: 'center' }); const bounds = row.getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
+            for (const type of ['mousePressed', 'mouseReleased']) await page.send('Input.dispatchMouseEvent', { type, button: 'left', clickCount: 1, modifiers, ...point });
+        };
+        await realClick(1);
+        await realClick(3, 8);
+        assert.equal(await page.evaluate("return document.querySelectorAll('.library-track[aria-selected=true]').length;"), 3);
+        assert.equal(await page.evaluate("return getSelection().toString();"), '');
+        await page.evaluate("document.getElementById('library-browse').click(); document.querySelector('[data-scope=disks]').click();");
+        await page.waitFor('folder scope', "document.getElementById('library-count').textContent === '4 of 5'");
+        assert.equal(await page.evaluate("return document.querySelector('[role=tree] [aria-selected=true]').dataset.scope;"), 'disks');
+        await page.evaluate("document.querySelector('[data-scope=disks] [data-tree-toggle]').click();");
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope + ' ' + document.activeElement.getAttribute('aria-expanded');"), 'disks true');
+        const treeKey = key => page.evaluate(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true }));`);
+        await treeKey('ArrowLeft');
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope + ' ' + document.activeElement.getAttribute('aria-expanded');"), 'disks false');
+        await treeKey('ArrowRight');
+        await treeKey('ArrowRight');
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope;"), 'disks/disk1.zip');
+        await treeKey('ArrowLeft');
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope;"), 'disks');
+        await page.evaluate("document.querySelector('[data-scope=\"disks/disk1.zip\"]').focus(); document.activeElement.click();");
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope;"), 'disks/disk1.zip');
+        await page.waitFor('ZIP scope', "document.getElementById('library-count').textContent === '3 of 5'");
+        await page.evaluate("document.querySelector('[aria-label=\"Add folder disks/disk1.zip\"]').click();");
+        assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '9');
+        // Real mouse clicks also prove that selection updates preserve the double-click target.
+        const doubleClick = async id => {
+            const point = await page.evaluate(`const row = document.querySelector('[data-row-id="${id}"]'); row.scrollIntoView({ block: 'center' }); const bounds = row.getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
+            for (const clickCount of [1, 2]) {
+                await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount, ...point });
+                await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount, ...point });
+            }
+        };
+        await doubleClick(2);
+        await page.waitFor('ZIP playback title', "document.getElementById('title').textContent.toLowerCase().includes('reflex') && document.getElementById('transport-chip').textContent === 'playing'");
+        await page.evaluate("document.querySelector('[role=tree] [data-scope=\"\"]').click();");
+        await doubleClick(3);
+        await page.waitFor('nested playback label', "document.getElementById('module-detail').textContent.includes('inner.zip') && document.getElementById('transport-chip').textContent === 'playing'");
+        const beforeMissing = await page.evaluate(READ_STATE);
+        assert.equal(beforeMissing.title, 'Petrified');
+        await doubleClick(4);
+        await page.waitFor('missing member diagnostic', "!document.getElementById('error').hidden && document.getElementById('error').textContent.includes('MISSING.S3M')");
+        const missing = await page.evaluate(READ_STATE);
+        assert.equal(missing.title, beforeMissing.title);
+        assert.equal(missing.chip, 'playing');
+        await page.waitFor('playback survives missing member', `document.getElementById('row').textContent !== ${JSON.stringify(missing.row)}`);
+        assert.equal(await page.evaluate("return document.querySelector('.library-track.playing').dataset.rowId;"), '3');
+        await page.send('Emulation.setDeviceMetricsOverride', { ...PHONE_VIEWPORT, deviceScaleFactor: 3, mobile: true });
+        const phoneLayout = await page.evaluate("return { width: innerWidth, scrollWidth: document.documentElement.scrollWidth, overflowing: [...document.querySelectorAll('main > *, .load-panel > *, .now-playing > *')].filter(element => element.getBoundingClientRect().right > 390).map(element => [element.className, element.getBoundingClientRect().width]) };");
+        assert.ok(phoneLayout.width === 390 && phoneLayout.scrollWidth <= 390, `library fits at 390px: ${JSON.stringify(phoneLayout)}`);
+        await page.send('Emulation.clearDeviceMetricsOverride');
+
+        // Measure the real CSV -> parser -> view route, then input -> filtered paint and
+        // animation-frame scroll cadence. No application-only benchmark shortcut.
+        await writeFile(join(directory, 'index.csv'), header + Array.from({ length: 37674 }, (_, index) => `,Track ${index},group${index % 100}/TRACK${String(index).padStart(5, '0')}.S3M,`).join('\n'));
+        await page.evaluate(`
+            const originalFetch = window.fetch;
+            window.fetch = async (...args) => {
+                const response = await originalFetch(...args);
+                if (args[0] === '/library-index.csv' && !args[1]?.method) {
+                    const originalBuffer = response.arrayBuffer.bind(response);
+                    response.arrayBuffer = async () => { const bytes = await originalBuffer(); window.csvLoadedAt = performance.now(); return bytes; };
+                }
+                return response;
+            };
+            window.firstPaint = new Promise(resolve => {
+                const observer = new MutationObserver(() => {
+                    if (document.getElementById('library-count').textContent === '37,674 of 37,674') {
+                        observer.disconnect();
+                        requestAnimationFrame(() => resolve(performance.now() - window.csvLoadedAt));
+                    }
+                });
+                observer.observe(document.getElementById('library-count'), { childList: true });
+            });
+            document.getElementById('library-server').click();
+        `);
+        const firstPaint = await page.evaluate('return await window.firstPaint;');
+        const filterMilliseconds = await page.evaluate(`
+            const results = [];
+            for (const value of ['T', 'TR', 'TRA', 'TRACK3', 'TRACK37']) {
+                const start = performance.now();
+                await new Promise(resolve => {
+                    const observer = new MutationObserver(() => { observer.disconnect(); requestAnimationFrame(resolve); });
+                    observer.observe(document.getElementById('library-count'), { childList: true });
+                    const input = document.getElementById('library-search');
+                    input.value = value;
+                    input.dispatchEvent(new Event('input'));
+                });
+                results.push(performance.now() - start);
+            }
+            return results;
+        `);
+        await filter('', '37,674 of 37,674');
+        const scroll = await page.evaluate(`
+            const viewport = document.getElementById('library-viewport');
+            const intervals = [];
+            let maximumRows = 0;
+            let previous = performance.now();
+            for (let index = 0; index < 120; index += 1) {
+                viewport.scrollTop = index * 1000;
+                await new Promise(requestAnimationFrame);
+                const now = performance.now();
+                intervals.push(now - previous);
+                previous = now;
+                maximumRows = Math.max(maximumRows, document.querySelectorAll('.library-track').length);
+            }
+            return { maximumRows, averageFrame: intervals.reduce((sum, value) => sum + value, 0) / intervals.length, maximumFrame: Math.max(...intervals) };
+        `);
+        assert.ok(firstPaint < 1500, `first paint: ${firstPaint}ms`);
+        assert.ok(scroll.maximumRows <= 200);
+        await page.evaluate("document.querySelector('[data-column=title] button').click();");
+        assert.equal(await page.evaluate("return document.querySelector('[data-column=title]').getAttribute('aria-sort');"), 'ascending');
+        await page.evaluate("document.querySelector('[data-column=title] button').click();");
+        assert.equal(await page.evaluate("return document.querySelector('[data-column=title]').getAttribute('aria-sort');"), 'descending');
+        await page.evaluate("document.getElementById('library-grid').focus(); document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));");
+        assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
+        await page.evaluate("const grid = document.getElementById('library-grid'); grid.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));");
+        assert.ok(await page.evaluate("return document.getElementById(document.getElementById('library-grid').getAttribute('aria-activedescendant')) !== null;"));
+        await page.evaluate("document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', shiftKey: true, bubbles: true }));");
+        assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
+        await filter('TRACK37673', '1 of 37,674');
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li:last-child .playlist-name').textContent;"), 'TRACK37673.S3M');
+        assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '10');
+        await writeFile(join(directory, 'index.csv'), header + ',Reflex,loose/REFLEX.S3M,\n,Unsupported,loose/SILENT.669,');
+        await page.evaluate("document.getElementById('library-server').click();");
+        await page.waitFor('unplayable hidden by default', "document.getElementById('library-count').textContent === '1 of 2'");
+        await page.evaluate("document.getElementById('library-unplayable').click();");
+        await page.waitFor('show unplayable', "document.getElementById('library-count').textContent === '2 of 2'");
+        await page.evaluate("const format = document.getElementById('library-format'); format.value = '669'; format.dispatchEvent(new Event('change'));");
+        await page.waitFor('format filter', "document.getElementById('library-count').textContent === '1 of 2'");
+        await clickRow(1);
+        assert.equal(await page.evaluate("return document.querySelector('.library-track button').disabled && document.getElementById('library-add-selected').disabled;"), true);
+        await doubleClick(1);
+        assert.equal((await page.evaluate(READ_STATE)).title, 'Petrified');
+        // W10: capture real engine snapshots on both transports without an app test API.
+        await page.evaluate(`
+            window.playlistSnapshots = [];
+            const capture = snapshot => {
+                if (!snapshot) return;
+                window.latestPlaylistSnapshot = snapshot;
+                const value = { playing: snapshot.playing, flags: snapshot.songFlags, frame: snapshot.songFrame, generation: snapshot.moduleGeneration };
+                const last = window.playlistSnapshots.at(-1);
+                if (!last || last.playing !== value.playing || last.flags !== value.flags || last.generation !== value.generation || (last.frame === 0) !== (value.frame === 0)) window.playlistSnapshots.push(value);
+            };
+            const read = StarPlayerRing.readTelemetry;
+            StarPlayerRing.readTelemetry = (...args) => { const snapshot = read(...args); capture(snapshot); return snapshot; };
+            const OriginalNode = AudioWorkletNode;
+            window.AudioWorkletNode = class extends OriginalNode {
+                constructor(...args) { super(...args); this.port.addEventListener('message', event => { if (event.data.type === 'telemetry') capture(event.data); }); }
+            };
+        `);
+        // Queue REFLEX -> a PETRI loop variant. The original fixture is unchanged.
+        await writeFile(join(directory, 'disks/loop.zip'), buildZip([{ name: 'PETRI.S3M', bytes: withFinalLoop(petri) }]));
+        await writeFile(join(directory, 'index.csv'), header + [
+            ',Loose Reflex,loose/REFLEX.S3M,',
+            'PETRI.S3M,Disk Petri,disks/loop.zip,',
+            'REFLEX.S3M,Disk Reflex,disks/disk1.zip,',
+            'PETRI.S3M,Nested Petri,disks/outer.zip,inner.zip',
+            'MISSING.S3M,Missing member,disks/disk1.zip,',
+        ].join('\n'));
+        await page.evaluate("document.getElementById('playlist-clear').click(); document.getElementById('library-format').value = ''; document.getElementById('library-server').click();");
+        await page.waitFor('restored library', "document.getElementById('library-count').textContent === '5 of 5'");
+        await filter('title:Loose', '1 of 5');
+        await page.waitFor('loose row painted', "document.querySelector('[data-row-id=\"0\"]') !== null");
+        await clickRow(0);
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        await filter('title:Disk name:PETRI', '1 of 5');
+        await page.waitFor('filtered Petri row', "document.querySelector('[data-row-id=\"1\"]') !== null");
+        await clickRow(1);
+        await page.evaluate(`
+            document.getElementById('library-add-selected').click();
+            const repeat = document.getElementById('repeat'); repeat.checked = true; repeat.dispatchEvent(new Event('change'));
+            document.querySelector('#playlist-list li').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        `);
+        await page.waitFor('first playlist track', "document.querySelector('#playlist-list li.current .playlist-name')?.textContent === 'REFLEX.S3M'");
+        assert.equal(await page.evaluate("return document.getElementById('repeat').checked && document.getElementById('repeat').disabled;"), true);
+        // Stop in the same turn as starting a rebuild: its saved Play must not win.
+        await page.evaluate("document.getElementById('sample-rate').value = '32000'; document.getElementById('apply-sample-rate').click(); document.getElementById('stop').click();");
+        await page.waitFor('Stop during pending graph rebuild', "document.getElementById('transport-chip').textContent === 'stopped'");
+        await delay(1500);
+        assert.equal((await page.evaluate(READ_STATE)).chip, 'stopped');
+        await page.evaluate("document.getElementById('play').click();");
+        await page.waitFor('playlist resumed after cancelled rebuild', "document.getElementById('transport-chip').textContent === 'playing'");
+        // Rebuild while playlist mode owns at-end policy. The new node also captures
+        // fallback snapshots; its generation starts again at one.
+        await page.evaluate("document.getElementById('sample-rate').value = '48000'; document.getElementById('apply-sample-rate').click();");
+        await page.waitFor('playlist sample-rate rebuild', "document.getElementById('message').textContent.includes('rebuilt') && document.getElementById('message').textContent.includes('48,000 Hz')");
+        await page.waitFor('rebuilt playlist telemetry painted', "window.latestPlaylistSnapshot?.moduleGeneration === 1 && window.latestPlaylistSnapshot.playing === true && Number(document.getElementById('progress').max) === window.latestPlaylistSnapshot.songLengthFrames");
+        const seekNearEnd = async seconds => {
+            const rate = rateDigits((await page.evaluate(READ_STATE)).workletRate);
+            await page.evaluate(`const progress = document.getElementById('progress'); progress.value = String(Number(progress.max) - ${rate * seconds}); progress.dispatchEvent(new Event('change'));`);
+        };
+        await seekNearEnd(1);
+        await page.evaluate("window.savedAnimationFrame = requestAnimationFrame; window.requestAnimationFrame = callback => { window.pausedAnimationFrame = callback; return 0; };");
+        await page.waitFor('automatic second playlist track', "document.querySelector('#playlist-list li.current .playlist-name')?.textContent === 'PETRI.S3M' && document.getElementById('title').textContent === 'Petrified'", 15000);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li').classList.contains('current');"), false);
+        await page.evaluate("window.requestAnimationFrame = window.savedAnimationFrame; if (window.pausedAnimationFrame) requestAnimationFrame(window.pausedAnimationFrame);");
+        await page.waitFor('second playlist telemetry', "window.latestPlaylistSnapshot?.moduleGeneration === 2 && window.latestPlaylistSnapshot?.playing");
+        await delay(200);
+        assert.equal(await page.evaluate("return window.latestPlaylistSnapshot.songFlags & 2;"), 2);
+        await page.evaluate("document.getElementById('playlist-loop').checked = true;");
+        await seekNearEnd(4);
+        await page.waitFor('PETRI fade', "(window.latestPlaylistSnapshot?.songFlags & 8) !== 0", 15000);
+        await page.evaluate("document.getElementById('stop').click();");
+        await page.waitFor('manual stop in fade', "document.getElementById('transport-chip').textContent === 'stopped'");
+        await delay(5500);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
+        const stoppedFade = await page.evaluate("return window.latestPlaylistSnapshot;");
+        assert.equal(stoppedFade.playing, false);
+        // Re-arm and let the complete fade finish to measure the host rewind too.
+        await page.evaluate("document.getElementById('playlist-loop').checked = false; document.getElementById('play').click();");
+        await seekNearEnd(6);
+        await page.waitFor('rearmed looping playback', "document.getElementById('transport-chip').textContent === 'playing'");
+        await page.waitFor('natural looping stop', "document.getElementById('transport-chip').textContent === 'stopped'", 15000);
+        await delay(500);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
+        assert.equal((await page.evaluate(READ_STATE)).progressValue, 0);
+        assert.equal(await page.evaluate("return window.latestPlaylistSnapshot.songFlags;"), 7);
+        await page.evaluate("document.getElementById('play').click();");
+        await page.waitFor('host rewind on next Play', "window.latestPlaylistSnapshot?.playing && window.latestPlaylistSnapshot.songFrame < 48000 && window.latestPlaylistSnapshot.songFlags === 3");
+        const playlistSnapshots = await page.evaluate("return window.playlistSnapshots;");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
+        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', altKey: true, bubbles: true }));");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li').classList.contains('current');"), true);
+        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true }));");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li:last-child').classList.contains('current');"), true);
+        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));");
+        await delay(300);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current');"), null);
+        assert.equal((await page.evaluate(READ_STATE)).chip, 'playing');
+        assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '1');
+        await page.evaluate("document.getElementById('playlist-clear').click();");
+        assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '0');
+        const storeResults = await page.evaluate(`const { openPlaylistStore } = await import('./playlist-store.js'); return await (${verifyPlaylistStore.toString()})(openPlaylistStore);`);
+        console.log(`playlist-store[${mode}]: ${storeResults}`);
+        // W11: module and two-member ZIP uploads, persisted current id/loop and
+        // disconnected library state, then actual audio activation of every upload.
+        await filter('title:Loose', '1 of 5');
+        await page.waitFor('loose row painted', "document.querySelector('[data-row-id=\"0\"]') !== null");
+        await clickRow(0);
+        await page.evaluate("document.getElementById('library-add-selected').click();");
+        await page.evaluate(`
+            const files = new DataTransfer();
+            files.items.add(new File([await (await fetch('/library/loose/REFLEX.S3M')).arrayBuffer()], 'REFLEX.S3M'));
+            const input = document.getElementById('playlist-files'); input.files = files.files; input.dispatchEvent(new Event('change'));
+            const dropped = new DataTransfer();
+            dropped.items.add(new File([await (await fetch('/library/disks/disk1.zip')).arrayBuffer()], 'disk.zip'));
+            document.getElementById('playlist-panel').dispatchEvent(new DragEvent('drop', { dataTransfer: dropped, bubbles: true, cancelable: true }));
+        `);
+        await page.waitFor('three uploaded entries', "document.getElementById('playlist-count').textContent === '4' && document.getElementById('playlist-status').textContent.includes('disk.zip')");
+        await page.evaluate("document.getElementById('playlist-loop').checked = true; document.getElementById('playlist-loop').dispatchEvent(new Event('change')); document.querySelectorAll('#playlist-list li')[2].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));");
+        await page.waitFor('upload current', "document.querySelectorAll('#playlist-list li')[2].classList.contains('current')");
+        await page.waitFor('current entry persisted', "await (async () => { const { openPlaylistStore } = await import('./playlist-store.js'); const store = await openPlaylistStore(); const saved = store.state; store.close(); return saved.entries.length === 4 && saved.currentId === document.querySelectorAll('#playlist-list li')[2].dataset.entryId && saved.loop; })()");
+        await page.send('Page.reload');
+        await page.waitFor('restored playlist', "document.documentElement.dataset.playerReady === 'true' && document.getElementById('playlist-count').textContent === '4'");
+        assert.equal(await page.evaluate("return document.querySelectorAll('#playlist-list li')[2].classList.contains('current') && document.getElementById('playlist-loop').checked;"), true);
+        assert.match(await page.evaluate("return document.querySelector('#playlist-list .playlist-marker').textContent;"), /library not connected/);
+        await page.evaluate(`if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true;`);
+        for (const [index, title] of [[1, 'reflex'], [2, 'petrified'], [3, 'reflex']]) {
+            await page.evaluate(`document.querySelectorAll('#playlist-list li')[${index}].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));`);
+            await page.waitFor('restored upload plays', `document.querySelectorAll('#playlist-list li')[${index}].classList.contains('current') && document.getElementById('title').textContent.toLowerCase().includes('${title}') && document.getElementById('transport-chip').textContent === 'playing'`);
+        }
+        await page.evaluate("document.getElementById('library-server').click();");
+        await page.waitFor('library reconnected', "!document.querySelector('#playlist-list .playlist-marker').textContent.includes('library not connected')");
+        await page.evaluate(`
+            const dropped = new DataTransfer();
+            dropped.items.add(new File([await (await fetch('/library/disks/outer.zip')).arrayBuffer()], 'outer.zip'));
+            document.getElementById('playlist-panel').dispatchEvent(new DragEvent('drop', { dataTransfer: dropped, bubbles: true, cancelable: true }));
+        `);
+        await page.waitFor('nested upload added', "document.getElementById('playlist-count').textContent === '5' && document.getElementById('playlist-status').textContent.includes('outer.zip')");
+        await page.evaluate("document.querySelector('#playlist-list li:last-child').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));");
+        await page.waitFor('nested upload plays', "document.querySelector('#playlist-list li:last-child').classList.contains('current') && document.getElementById('title').textContent === 'Petrified'");
+
+
+        assert.deepEqual(page.consoleErrors, []);
+        return { playlistSnapshots, stoppedFade: { flags: stoppedFade.songFlags, frame: stoppedFade.songFrame }, firstPaint, filterMilliseconds, scroll, missing: missing.errorText, nestedTitle: beforeMissing.title };
+    } finally {
+        if (page) await page.close();
+        server?.stop();
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
 const executable = await findChromium();
 if (executable === null) {
-    console.log('headless: skipped — no Chromium found (set CHROME=/path/to/chrome to run it)');
-    process.exit(0);
+    const required = process.env.STARPLAYER_REQUIRE_CHROMIUM === '1';
+    console.log(`headless: ${required ? 'failed' : 'skipped'} — no Chromium found (set CHROME=/path/to/chrome to run it)`);
+    process.exit(required ? 1 : 0);
 }
 
 for (const mode of options.modes) {
-    const report = await run(executable, mode);
-    console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);
+    if (!options.libraryOnly) {
+        const report = await run(executable, mode);
+        console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);
+    }
+    console.log(`library[${mode}] ${JSON.stringify(await runLibrary(executable, mode))}`);
 }
 console.log('headless harness: all modes passed');

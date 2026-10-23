@@ -261,3 +261,71 @@ fn committed_archive_fuzz_seeds_extract() {
         assert_eq!(extract(&bytes, modules[0].index).unwrap(), legacy_encode::payload());
     }
 }
+
+// The writer cannot express unflagged CP437 bytes that also form valid UTF-8.
+fn unflagged_name(bytes: &mut [u8], original: &[u8], replacement: &[u8]) {
+    assert_eq!(original.len(), replacement.len());
+    for index in 0..bytes.len().saturating_sub(4) {
+        let (flag_offset, name_offset) = match &bytes[index..index + 4] {
+            b"PK\x03\x04" => (6, 30),
+            b"PK\x01\x02" => (8, 46),
+            _ => continue,
+        };
+        if bytes.get(index + name_offset..index + name_offset + original.len()) == Some(original) {
+            bytes[index + flag_offset + 1] &= !8;
+            bytes[index + name_offset..index + name_offset + replacement.len()].copy_from_slice(replacement);
+        }
+    }
+}
+
+#[test]
+fn lookup_prioritises_raw_and_encoded_names_before_unique_fallback() {
+    use starplayer_archive::find_entry;
+    let bytes = archive(&[
+        ("é.mod", b"utf8", CompressionMethod::Stored),
+        ("Music/Other.MOD", b"case", CompressionMethod::Deflated),
+        ("__MACOSX/skip.mod", b"fork", CompressionMethod::Stored),
+        ("A.MOD", b"upper", CompressionMethod::Stored),
+        ("a.mod", b"lower", CompressionMethod::Stored),
+        ("🎵.mod", b"unicode", CompressionMethod::Stored),
+    ], &["empty.mod/"]);
+    assert_eq!(find_entry(&bytes, "é.mod", None).unwrap(), 1);
+    assert_eq!(find_entry(&bytes, "🎵.mod", None).unwrap(), 6);
+    assert_eq!(find_entry(&bytes, "é.mod", Some(b"absent.mod")).unwrap(), 1);
+    assert_eq!(find_entry(&bytes, "music\\other.mod", None).unwrap(), 2);
+    assert_eq!(find_entry(&bytes, "A.MOD", None).unwrap(), 4);
+    assert_eq!(find_entry(&bytes, "A.MOD", Some(b"a.mod")).unwrap(), 5);
+    assert!(matches!(find_entry(&bytes, "a.Mod", None), Err(ArchiveError::AmbiguousEntry(names)) if names.contains("A.MOD") && names.contains("a.mod")));
+    for name in ["missing.mod", "empty.mod/", "__MACOSX/skip.mod"] {
+        assert!(matches!(find_entry(&bytes, name, None), Err(ArchiveError::NoSuchEntry)));
+    }
+}
+
+#[test]
+fn lookup_matches_unflagged_cp437_even_when_bytes_are_valid_utf8() {
+    use starplayer_archive::find_entry;
+    let mut bytes = archive(&[("xx.mod", b"module", CompressionMethod::Stored)], &[]);
+    unflagged_name(&mut bytes, b"xx.mod", b"\xc3\xa9.mod");
+    assert_eq!(find_entry(&bytes, "├⌐.mod", None).unwrap(), 0);
+    assert_eq!(find_entry(&bytes, "ignored", Some(b"\xc3\xa9.mod")).unwrap(), 0);
+}
+
+#[test]
+fn lookup_does_not_inflate_legacy_streams() {
+    use starplayer_archive::find_entry;
+    for method in [0, 1, 2, 3, 4, 5, 6, 8] {
+        let bytes = legacy_encode::archive(&[("broken.mod", b"module", method, 0, &[255])]);
+        assert_eq!(find_entry(&bytes, "broken.mod", None).unwrap(), 0);
+    }
+}
+
+#[test]
+fn zip_container_indices_include_non_module_slots_and_skip_resources() {
+    let bytes = archive(&[
+        ("notes.txt", b"notes", CompressionMethod::Stored),
+        ("inner.ZIP", b"PK", CompressionMethod::Stored),
+        ("__MACOSX/hidden.zip", b"PK", CompressionMethod::Stored),
+        ("REFLEX.S3M", b"module", CompressionMethod::Stored),
+    ], &["directory.zip/"]);
+    assert_eq!(starplayer_archive::list_zip_containers(&bytes).unwrap(), vec![2]);
+}

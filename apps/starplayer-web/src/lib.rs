@@ -16,7 +16,7 @@ use starplayer::mtm::PatternView as MtmPatternView;
 use starplayer::xm::PatternView as XmPatternView;
 use starplayer::it::PatternView as ItPatternView;
 use starplayer::s3m::PatternView as S3mPatternView;
-use starplayer_archive::{ArchiveError, extract, is_zip, list_modules};
+use starplayer_archive::{ArchiveError, extract, find_entry, is_zip, list_modules};
 
 const DISPLAY_CELL_BYTES: usize = 5;
 const NOTE_NONE: u8 = 255;
@@ -117,6 +117,41 @@ fn effect_name_records() -> String {
     })
 }
 
+fn nested_archive_bytes(bytes: &[u8], container_index: usize) -> Result<Vec<u8>, String> {
+    let inner = extract(bytes, container_index).map_err(|error| error.to_string())?;
+    if !is_zip(&inner) { return Err("nested container is not a ZIP archive".to_string()); }
+    Ok(inner)
+}
+
+fn extract_nested(bytes: &[u8], container_index: i32, member_index: u32) -> Result<Vec<u8>, String> {
+    let inner;
+    let archive = if container_index < 0 { bytes } else {
+        inner = nested_archive_bytes(bytes, container_index as usize)?;
+        &inner
+    };
+    extract(archive, member_index as usize).map_err(|error| error.to_string())
+}
+
+fn extract_path(bytes: &[u8], container_member: &str, member_path: &str, member_raw_hex: &str) -> Result<Vec<u8>, String> {
+    let raw_name = if member_raw_hex.is_empty() { None } else {
+        if !member_raw_hex.len().is_multiple_of(2) || !member_raw_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("member raw name must contain an even number of hexadecimal digits".to_string());
+        }
+        Some(member_raw_hex.as_bytes().chunks_exact(2).map(|pair| {
+            let digit = |byte: u8| if byte <= b'9' { byte - b'0' } else { byte.to_ascii_lowercase() - b'a' + 10 };
+            digit(pair[0]) * 16 + digit(pair[1])
+        }).collect::<Vec<_>>())
+    };
+    let inner;
+    let archive = if container_member.is_empty() { bytes } else {
+        let index = find_entry(bytes, container_member, None).map_err(|error| error.to_string())?;
+        inner = nested_archive_bytes(bytes, index)?;
+        &inner
+    };
+    let index = find_entry(archive, member_path, raw_name.as_deref()).map_err(|error| error.to_string())?;
+    extract(archive, index).map_err(|error| error.to_string())
+}
+
 fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
     let entries = match list_modules(bytes) {
         Ok(entries) => entries,
@@ -210,7 +245,13 @@ mod exports {
     #[wasm_bindgen]
     pub fn is_archive(bytes: &[u8]) -> bool { is_zip(bytes) }
 
-    /// List the S3M, MOD, MTM and IT entries this web player can offer, one tab record per line.
+    /// List immediate inner ZIPs by central-directory index.
+    #[wasm_bindgen]
+    pub fn archive_containers(bytes: &[u8]) -> Result<Vec<u32>, JsValue> {
+        starplayer_archive::list_zip_containers(bytes).map(|indices| indices.into_iter().map(|index| index as u32).collect()).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// List playable modules, one tab record per line.
     #[wasm_bindgen]
     pub fn archive_modules(bytes: &[u8]) -> Result<String, JsValue> {
         archive_module_records(bytes).map_err(|error| JsValue::from_str(&error.to_string()))
@@ -220,6 +261,18 @@ mod exports {
     #[wasm_bindgen]
     pub fn archive_extract(bytes: &[u8], index: u32) -> Result<Vec<u8>, JsValue> {
         extract(bytes, index as usize).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Resolve a CSV locator, optionally through one nested ZIP.
+    #[wasm_bindgen]
+    pub fn archive_extract_path(bytes: &[u8], container_member: &str, member_path: &str, member_raw_hex: &str) -> Result<Vec<u8>, JsValue> {
+        extract_path(bytes, container_member, member_path, member_raw_hex).map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Extract an upload member by central-directory indices.
+    #[wasm_bindgen]
+    pub fn archive_extract_nested(bytes: &[u8], container_index: i32, member_index: u32) -> Result<Vec<u8>, JsValue> {
+        extract_nested(bytes, container_index, member_index).map_err(|error| JsValue::from_str(&error))
     }
 
     #[wasm_bindgen]
@@ -431,5 +484,54 @@ mod tests {
         writer.write_all(b"notes").unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         assert_eq!(archive_module_records(&bytes).unwrap(), "0\tREFLEX.S3M\t3\n1\tnative.mod\t3\n2\tnative.mtm\t3\n");
+    }
+
+    fn test_archive(name: &str, content: &[u8]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file(name, SimpleFileOptions::default()).unwrap();
+        writer.write_all(content).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn patch_cp437_name(bytes: &mut [u8]) {
+        for index in 0..bytes.len().saturating_sub(4) {
+            let (flags, offset) = match &bytes[index..index + 4] {
+                b"PK\x03\x04" => (6, 30),
+                b"PK\x01\x02" => (8, 46),
+                _ => continue,
+            };
+            bytes[index + flags + 1] &= !8;
+            bytes[index + offset..index + offset + 2].copy_from_slice(&[0xC3, 0xA9]);
+        }
+    }
+
+    #[test]
+    fn archive_locators_resolve_plain_nested_and_cp437_names() {
+        let mut inner = test_archive("xx.mod", b"module");
+        patch_cp437_name(&mut inner);
+        let mut outer = test_archive("xx.zip", &inner);
+        patch_cp437_name(&mut outer);
+        assert_eq!(extract_path(&inner, "", "├⌐.mod", "").unwrap(), b"module");
+        assert_eq!(extract_path(&inner, "", "display.mod", "c3a92e6d6f64").unwrap(), b"module");
+        assert_eq!(extract_path(&outer, "├⌐.zip", "├⌐.mod", "C3A92E6D6F64").unwrap(), b"module");
+        assert_eq!(extract_nested(&outer, 0, 0).unwrap(), b"module");
+        assert_eq!(extract_nested(&inner, -1, 0).unwrap(), b"module");
+        assert_eq!(extract_nested(&inner, -8, 0).unwrap(), b"module");
+        assert!(extract_nested(&inner, -1, 1).is_err());
+        assert!(extract_path(&inner, "", "missing", "").is_err());
+        for invalid in ["a", "zz", "é"] {
+            assert!(extract_path(&inner, "", "├⌐.mod", invalid).unwrap_err().contains("hexadecimal"));
+        }
+    }
+
+    #[test]
+    fn archive_locators_reject_non_zip_and_oversized_containers() {
+        let mut bytes = test_archive("inner.zip", b"not a ZIP");
+        assert!(extract_path(&bytes, "inner.zip", "x.mod", "").unwrap_err().contains("not a ZIP"));
+        assert!(extract_nested(&bytes, 0, 0).unwrap_err().contains("not a ZIP"));
+        let central = bytes.windows(4).position(|window| window == b"PK\x01\x02").unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&((starplayer_archive::MAX_ENTRY_BYTES + 1) as u32).to_le_bytes());
+        assert!(extract_path(&bytes, "inner.zip", "x.mod", "").unwrap_err().contains("too large"));
+        assert!(extract_nested(&bytes, 0, 0).unwrap_err().contains("too large"));
     }
 }

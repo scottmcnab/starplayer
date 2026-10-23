@@ -52,6 +52,18 @@
                 <select id="archive-tracks" aria-label="Track from the last ZIP" hidden></select>
                 <button id="load-archive-track" hidden>Load from ZIP</button>
             </div>
+            <div class="load-actions" aria-label="Library sources">
+                <span>Library</span>
+                <button id="library-folder" type="button">Open library folder</button>
+                <button id="library-reconnect" type="button" hidden>Reconnect</button>
+                <button id="library-open-index" type="button">Open index CSV…</button>
+                <button id="library-open-comments" type="button" disabled>Open comments CSV…</button>
+                <input id="library-comments" type="file" accept=".csv,text/csv" hidden>
+                <button id="library-server" type="button" hidden>Server library</button>
+                <input id="library-files" type="file" webkitdirectory multiple hidden>
+                <input id="library-index" type="file" accept=".csv,text/csv" hidden>
+                <select id="library-choices" aria-label="Library index CSV" hidden></select>
+            </div>
             <form id="url-form" class="url-form">
                 <input id="url" type="url" inputmode="url" value="https://modland.com/pub/modules/Screamtracker%203/Purple%20Motion/unreal%20%5D%5B.s3m" placeholder="https://example.com/song.xm" aria-label="S3M, MOD, MTM, XM, IT, or ZIP URL">
                 <button type="submit">Load URL</button>
@@ -93,6 +105,60 @@
         </div>
     </section>
 
+    <details id="library-panel" class="panel" open>
+        <summary>Library</summary>
+        <p id="library-summary" role="status">Open a library folder or server library to browse.</p>
+        <div id="library-browser" hidden>
+            <div class="library-toolbar">
+                <label>Search <input id="library-search" type="search" aria-describedby="library-query-hint"></label>
+                <select id="library-format" aria-label="Format"><option value="">All formats</option></select>
+                <label id="library-comments-toggle" hidden><input id="library-search-comments" type="checkbox" checked> Search comments</label>
+                <label><input id="library-unplayable" type="checkbox"> Show unplayable</label>
+                <label><input id="library-browse" type="checkbox"> Browse folders</label>
+                <button id="library-add-selected" type="button" disabled>Add selected</button>
+                <output id="library-count" aria-live="polite"></output>
+            </div>
+            <p id="library-query-hint" class="library-hint">Search names, titles and paths; prefixes: name:, title:, path:, format:, tracker:, text:, ch:8, ch:&gt;8. Use quotes for phrases, e.g. "purple motion" or purplemotion; a leading - excludes, e.g. oxygen -oxygene.</p>
+            <p id="library-selection-hint" class="library-hint">Click, Ctrl/⌘-click or Shift-click to select. Ctrl/⌘+A selects all results; Escape clears. Arrows, Home/End and PageUp/Down move; Shift extends. Enter plays; + or Insert adds. A row’s + adds the selection, selecting that row first if needed. Hidden rows stay selected; actions use only playable rows in the current result.</p>
+            <div id="library-body" class="library-body">
+                <div id="library-folders" hidden>
+                    <p id="library-scope" class="library-tree-caption">All folders</p>
+                    <ul id="library-tree" role="tree" aria-label="Library folders" aria-describedby="library-tree-hint"></ul>
+                    <p id="library-tree-hint" class="library-hint">Click a folder to show its tracks; ▸ or →/← expands and collapses. + or Insert adds the folder.</p>
+                </div>
+                <div id="library-grid" role="grid" tabindex="0" aria-label="Library tracks" aria-multiselectable="true" aria-colcount="8" aria-describedby="library-selection-hint">
+                    <div class="library-horizontal">
+                        <div id="library-heading" class="library-columns" role="row" aria-rowindex="1"></div>
+                        <div id="library-viewport">
+                            <div id="library-spacer"><div id="library-rows" role="rowgroup"></div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <section id="library-details" role="region" aria-labelledby="library-details-title" hidden>
+                <h3 id="library-details-title"></h3>
+                <div id="library-details-content"></div>
+            </section>
+            <p id="library-selection-count" class="library-hint"></p>
+        </div>
+    </details>
+    <section id="playlist-panel" class="panel" aria-label="Playlist">
+        <h2>Playlist · <span id="playlist-count">0</span></h2>
+        <div class="playlist-controls">
+            <button id="playlist-add" type="button">Add files…</button>
+            <input id="playlist-files" type="file" multiple hidden>
+            <button id="playlist-export" type="button">Export playlist</button>
+            <button id="playlist-import" type="button">Import playlist</button>
+            <input id="playlist-csv" type="file" accept=".csv,text/csv" hidden>
+            <button id="playlist-rebind" type="button" hidden></button>
+            <button id="playlist-clear" type="button">Clear</button>
+            <label><input id="playlist-loop" type="checkbox"> Loop playlist</label>
+        </div>
+        <p class="library-hint">Double-click or Enter to play. Delete to remove. Drag or Alt+↑/↓ to reorder.</p>
+        <p id="playlist-status" role="status"></p>
+        <ol id="playlist-list"></ol>
+    </section>
+
     <section class="now-playing" aria-labelledby="now-heading">
         <div class="song-heading">
             <p class="section-label" id="now-heading">Now playing</p>
@@ -109,10 +175,12 @@
     </section>
 
     <section class="controls" aria-label="Transport controls">
+        <button id="playlist-previous" type="button" class="track-button" title="Previous playlist track" aria-label="Previous track" disabled><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h2v10H3zM13 3v10L6 8z"/></svg></button>
         <button id="previous" title="Previous order" disabled>◀◀</button>
         <button id="play" class="primary round" disabled>▶ Play</button>
         <button id="stop" class="round" disabled>■ Stop</button>
         <button id="next" title="Next order" disabled>▶▶</button>
+        <button id="playlist-next" type="button" class="track-button" title="Next playlist track" aria-label="Next track" disabled><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3h2v10h-2zM3 3v10l7-5z"/></svg></button>
         <div class="progress-row">
             <output id="elapsed" title="Click to switch between elapsed and remaining time">0:00</output>
             <input id="progress" type="range" min="0" max="0" step="1" value="0" disabled aria-label="Playback position">

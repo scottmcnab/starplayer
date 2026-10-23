@@ -93,6 +93,8 @@ button.primary { color: #071512; background: var(--accent); border-color: var(--
 .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px; margin: 14px 0; }
 .controls button { min-width: 50px; }
 .controls .round { min-width: 84px; }
+.controls .track-button { display: inline-flex; align-items: center; justify-content: center; }
+.track-button svg { width: 16px; height: 16px; fill: currentColor; }
 .seek-label, .volume-label { display: flex; align-items: center; gap: 9px; color: var(--muted); margin-left: 8px; }
 .seek-label input { width: 78px; }
 .volume-label { flex: 1; min-width: 220px; }
@@ -191,6 +193,7 @@ tbody tr:last-child td { border-bottom: 0; }
     .load-panel, .now-playing, .lower-grid { grid-template-columns: 1fr; }
     .position-grid { overflow-x: auto; }
     .controls { position: sticky; bottom: 8px; z-index: 5; box-shadow: 0 8px 30px #05080c; }
+    .library-body.browsing { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 520px) {
@@ -213,3 +216,84 @@ tbody tr:last-child td { border-bottom: 0; }
     .option-grid, .mixer-options { grid-template-columns: minmax(0, 1fr); }
     .option-grid .option-note, .mixer-options button { grid-column: 1; }
 }
+
+/* Library rows stay 32px high; only the table scrolls horizontally at phone width. */
+#library-panel > summary { cursor: pointer; font-weight: 700; }
+#library-summary { color: var(--muted); overflow-wrap: anywhere; margin: 8px 0; }
+.library-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0; }
+.library-toolbar label { display: flex; align-items: center; gap: 6px; min-width: 0; }
+#library-search { min-width: 0; width: 100%; padding: 8px; background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 7px; }
+.library-hint { color: var(--muted); font-size: 12px; margin: 8px 0; }
+#library-grid { overflow-x: auto; border: 1px solid var(--line); border-radius: 7px; }
+#library-grid:focus { outline: 2px solid var(--accent); }
+.library-horizontal { min-width: 900px; }
+.library-columns { display: grid; grid-template-columns: minmax(140px, 1.1fr) minmax(150px, 1.3fr) 65px 40px 75px 100px minmax(180px, 1.5fr) 44px; }
+#library-grid.comment-matches .library-horizontal { min-width: 1120px; }
+#library-grid.comment-matches .library-columns { grid-template-columns: minmax(140px, 1.1fr) minmax(150px, 1.3fr) 65px 40px 75px 100px minmax(140px, 1fr) minmax(220px, 1.6fr) 44px; }
+#library-heading .library-comment-heading { display: none; padding: 5px; color: var(--ink); }
+#library-grid.comment-matches .library-comment-heading { display: block; }
+.library-match-label { color: var(--muted); margin-right: 6px; }
+.library-match-more { color: var(--muted); }
+.library-track mark, .library-match-popover mark { background: #e6c66b; color: #10151b; border-radius: 2px; }
+.library-match-popover { position: fixed; z-index: 20; max-width: min(560px, calc(100vw - 16px)); max-height: 60vh; overflow: hidden; padding: 8px 10px; border: 1px solid #39485b; border-radius: 7px; background: var(--panel); box-shadow: 0 10px 30px rgba(0,0,0,.45); pointer-events: none; }
+.library-match-popover[hidden] { display: none; }
+.library-match-popover strong { display: block; margin-bottom: 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.library-match-line { font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.library-match-popover .library-hint { margin: 4px 0 0; }
+#library-heading { background: var(--panel); }
+#library-heading button { width: 100%; padding: 5px; text-align: left; border: 0; border-radius: 0; }
+#library-heading [aria-sort=ascending] button::after { content: ' ↑'; }
+#library-heading [aria-sort=descending] button::after { content: ' ↓'; }
+#library-viewport { height: 320px; overflow-y: auto; overflow-x: hidden; background: var(--panel-2); }
+#library-spacer { position: relative; }
+#library-rows { position: absolute; top: 0; left: 0; right: 0; }
+.library-track { height: 32px; font: 12px/32px ui-monospace, monospace; cursor: default; }
+.library-track > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 5px; border-bottom: 1px solid var(--line); }
+.library-track button { min-height: 24px; height: 24px; padding: 0 8px; line-height: 20px; }
+.library-track[aria-selected=true] { background: #263e51; }
+.library-track.focused { outline: 1px solid var(--accent); outline-offset: -1px; }
+.library-track.playing { color: var(--accent); box-shadow: inset 4px 0 var(--accent); }
+.library-track.unplayable { color: var(--muted); opacity: .6; }
+#library-rows, #library-tree, #playlist-list { user-select: none; -webkit-user-select: none; }
+/* Side by side while browsing; `contain: size` lets the grid row take the table's height,
+   so a long tree scrolls inside the pane instead of stretching the row. */
+.library-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.library-body.browsing { grid-template-columns: minmax(200px, 300px) minmax(0, 1fr); }
+#library-folders { display: flex; flex-direction: column; contain: size; min-height: 240px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
+#library-folders[hidden] { display: none; }
+.library-tree-caption { padding: 6px 10px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#library-folders .library-hint { margin: 0; padding: 6px 10px; border-top: 1px solid var(--line); }
+#library-tree { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 4px 0; }
+#library-tree, #library-tree ul { list-style: none; padding-left: 0; margin: 0; }
+#library-tree [role=treeitem] { outline: none; }
+.library-tree-row { display: flex; align-items: center; gap: 5px; height: 26px; padding: 0 6px 0 calc(6px + var(--level) * 16px); font-size: 13px; cursor: default; white-space: nowrap; }
+.library-tree-row:hover { background: #1c2733; }
+[role=treeitem][aria-selected=true] > .library-tree-row { background: #263e51; }
+[role=treeitem]:focus-visible > .library-tree-row { outline: 1px solid var(--accent); outline-offset: -1px; }
+.library-tree-caret { flex: none; width: 14px; text-align: center; color: var(--muted); cursor: pointer; transition: transform .1s; }
+[aria-expanded] > .library-tree-row > .library-tree-caret::before { content: '▸'; }
+[aria-expanded=true] > .library-tree-row > .library-tree-caret { transform: rotate(90deg); }
+.library-tree-icon { flex: none; width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linejoin: round; color: var(--muted); }
+.library-tree-row.zip .library-tree-icon { color: var(--accent-2); }
+.library-tree-row.nested .library-tree-icon { color: var(--accent); }
+.library-tree-label { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.library-tree-count { flex: none; color: var(--muted); font: 11px ui-monospace, monospace; }
+.library-tree-add { flex: none; min-height: 20px; height: 20px; padding: 0 6px; line-height: 16px; visibility: hidden; }
+.library-tree-row:hover .library-tree-add, [role=treeitem][aria-selected=true] > .library-tree-row .library-tree-add, [role=treeitem]:focus > .library-tree-row .library-tree-add { visibility: visible; }
+@media (hover: none) { .library-tree-add { visibility: visible; } }
+#playlist-list { max-height: 180px; overflow: auto; overflow-wrap: anywhere; }
+
+.playlist-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+#playlist-list { padding-left: 0; list-style: none; }
+#playlist-list li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 8px; padding: 8px; border-bottom: 1px solid var(--line); }
+#playlist-list li.current { background: var(--panel); outline: 1px solid var(--accent); }
+#playlist-list li:focus-visible { outline: 2px solid var(--accent); }
+.playlist-detail { grid-column: 2; font-size: 0.8rem; opacity: 0.75; }
+#playlist-list button { grid-column: 3; grid-row: 1 / 3; }
+
+#library-details { min-width: 0; max-height: 260px; overflow: auto; margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 7px; }
+#library-details h3 { margin: 0 0 8px; overflow-wrap: anywhere; }
+#library-details h4 { margin: 8px 0 4px; }
+#library-details pre { max-width: 100%; overflow-x: auto; white-space: pre; margin: 0; font: 12px/1.5 ui-monospace, monospace; }
+#library-details mark { background: #e6c66b; color: #10151b; }
+#library-comments-toggle[hidden] { display: none; }
