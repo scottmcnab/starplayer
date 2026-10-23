@@ -3,8 +3,8 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library (follows W7–W12, branch `library-remote`) |
-| Status | Implemented and verified 2026-10-23; uncommitted, pending owner deployment/acceptance |
-| Depends on | [W8](complete/W8-task-library-sources-and-resolver.md), [W11](complete/W11-task-playlist-uploads-and-persistence.md), [W12](complete/W12-task-library-comment-search.md) |
+| Status | **Complete** — landed 2026-10-23 (branch `library-remote`); Worker deployed at `https://starplayer-hornet-proxy.starplayer-hornet-proxy.workers.dev/`; owner acceptance on the published Pages site outstanding |
+| Depends on | [W8](W8-task-library-sources-and-resolver.md), [W11](W11-task-playlist-uploads-and-persistence.md), [W12](W12-task-library-comment-search.md) |
 | Blocks | — |
 | Recommended model | gpt-6.1-sol |
 | Verified by | agent (`node --test apps/starplayer-web/test/*.test.mjs` from the repo root, `cargo xtask wasm && STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs`, `cargo xtask ci`), then the owner on the published GitHub Pages site with the deployed Worker |
@@ -333,5 +333,19 @@ The default Hornet proxy stays blank until the owner deploys the Worker.
 - **Re-verified.** 64 Node tests, `cargo xtask wasm`, and the headless library and
   remote-library scenarios in all three modes. The worker had run the full harness and
   `cargo xtask ci` (11 jobs).
-- **Outstanding.** The owner deploys the Worker; the coordinator then sets its URL in
-  `www/remote-sources.js`.
+- **Deployed.** The owner deployed the Worker to
+  `https://starplayer-hornet-proxy.starplayer-hornet-proxy.workers.dev/`, and it is now the
+  hornet.org default in `www/remote-sources.js`. Wrangler's `.wrangler/` state is
+  git-ignored.
+- **Live checks on the deployed Worker.**
+  - `contests/20mc/20dcxmas.zip` with the Pages origin returns 200, with ACAO, `Vary`,
+    exposed Content-Length, CORP and the immutable cache header. The body matches the
+    mirror copy byte for byte.
+  - The localhost origin returns 200 and the preflight returns 204.
+  - A disallowed origin gets 403. `/../`, `%2e%2e` and `%5c` paths get 400 at the edge.
+  - POST gets 405, and a missing file gets 404.
+  - From the live Pages origin in headless Chromium (cross-origin isolated, controlled by
+    the shim), `fetch` through the Worker returned 200 and the full 79,551 bytes.
+- **Outstanding (owner).** On the published site, open `hornet-modules.csv` (and
+  `hornet-comments.csv`), choose **Stream from source URLs**, play
+  `songs/1994/brother.zip` and a playlist across two tracks, reload, and press **Reopen**.
