@@ -4,3 +4,5 @@
 /node_modules
 # Self-signed certificate for `dev-server.mjs --tls`.
 /.dev-tls
+# Wrangler's local state for `remote-proxy` deploys.
+/remote-proxy/.wrangler

@@ -14,8 +14,9 @@ cargo xtask serve --library /mnt/d/hornet-music --library-index ../moddna/index/
 ```
 
 On the published site, open `hornet-modules.csv` with **Open index CSV…**, then
-click **Stream from source URLs**. Hornet needs a CORS proxy: enter the deployed
-Worker URL in **Proxy URL (blank: fetch directly)**; see
+click **Stream from source URLs**. Hornet needs a CORS proxy: **Proxy URL (blank:
+fetch directly)** is prefilled with the deployed Worker,
+`https://starplayer-hornet-proxy.starplayer-hornet-proxy.workers.dev/`; see
 [proxy setup](remote-proxy/README.md). Optionally open `hornet-comments.csv` with
 **Open comments CSV…**. Use **Reopen <name> (streaming)** after reloading to restore
 the library and comments and reconnect saved playlist entries. The CSV bytes stay

@@ -8,6 +8,8 @@ From this directory run `npx wrangler login`, then `npx wrangler deploy`. Deploy
 prints `https://starplayer-hornet-proxy.<subdomain>.workers.dev`. No deployment is
 needed for direct streaming from a server that already supports CORS.
 
+The deployed instance is `https://starplayer-hornet-proxy.starplayer-hornet-proxy.workers.dev/`.
+
 Edit `ALLOWED_ORIGINS` in `wrangler.toml` to change the comma-separated page origins.
 Edit `UPSTREAM` to use another HTTP(S) archive base; it must end with `/`.
 
