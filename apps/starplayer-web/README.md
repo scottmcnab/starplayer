@@ -7,7 +7,9 @@ The **Library** section browses a folder or the dev server's `--library` source.
 Search updates as you type (80 ms debounce); use `name:`, `title:`, `path:`,
 `format:`, `tracker:` and `ch:` prefixes, or quoted phrases. Sort with column
 headings, include unplayable formats with the checkbox, or browse directories,
-ZIPs and nested ZIPs using **Browse folders**. Turning browsing off restores the
+ZIPs and nested ZIPs using **Browse folders**, which opens a folder tree beside the
+table: click a folder (or press Enter) to scope the table to it, use ▸ or →/← to
+expand and collapse, and ↑/↓/Home/End to move. Turning browsing off restores the
 whole library. Only visible table rows are rendered, including for large indexes.
 
 Click selects one row, Ctrl/⌘-click toggles, and Shift-click selects a range in the
@@ -16,11 +18,10 @@ and arrows, Home/End and PageUp/Down move the focus (Shift extends the selection
 Selections survive sorting, filtering and folder changes: **hidden rows remain
 selected, but actions use only playable rows in the current result**, in result
 order. Enter or double-click plays; `+`, Insert or **Add selected** adds to the
-in-memory playlist. A row's **+** adds the current selection (selecting that row
-first if it was not selected); **Add folder** adds all playable
-tracks beneath that folder, regardless of the current filter, in folder/name
-order. Unplayable rows cannot play or be added. Reloading clears this playlist;
-auto-advance and the full playlist controls are W10 work.
+playlist. A row's **+** adds the current selection (selecting that row
+first if it was not selected); a folder's **+** in the tree (or `+` / Insert on a
+focused folder) adds all playable tracks beneath that folder, regardless of the
+current filter, in folder/name order. Unplayable rows cannot play or be added.
 
 Build and serve the player from the repository root:
 
@@ -117,7 +118,8 @@ whenever a playback-restoring graph rebuild happens (a sample-rate or channel-co
 or the MOD panning reload), so the checkbox's choice survives all of them.
 
 The **Playlist** panel plays entries in order. Double-click or press Enter to start an
-entry; use Previous track / Next track to navigate, Clear or Delete to remove entries,
+entry; the ⏮ / ⏭ buttons at either end of the transport controls move to the previous or
+next playlist track (◀◀ / ▶▶ still seek by order), Clear or Delete removes entries,
 and drag or Alt+↑/↓ to reorder. Loop playlist wraps at the last entry. Removing the
 current entry keeps the audio playing but cancels any pending advance. Failed entries
 show ⚠ with a diagnostic tooltip and are skipped; three consecutive failures stop the

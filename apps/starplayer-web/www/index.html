@@ -116,16 +116,19 @@
                 <output id="library-count" aria-live="polite"></output>
             </div>
             <p id="library-query-hint" class="library-hint">Search names, titles and paths; prefixes: name:, title:, path:, format:, tracker:, ch:8, ch:&gt;8. Use quotes for phrases.</p>
-            <div id="library-folders" hidden>
-                <button id="library-all" type="button">All</button> <span id="library-scope">All folders</span>
-                <ul id="library-tree" aria-label="Library folders"></ul>
-            </div>
             <p id="library-selection-hint" class="library-hint">Click, Ctrl/⌘-click or Shift-click to select. Ctrl/⌘+A selects all results; Escape clears. Arrows, Home/End and PageUp/Down move; Shift extends. Enter plays; + or Insert adds. A row’s + adds the selection, selecting that row first if needed. Hidden rows stay selected; actions use only playable rows in the current result.</p>
-            <div id="library-grid" role="grid" tabindex="0" aria-label="Library tracks" aria-multiselectable="true" aria-colcount="8" aria-describedby="library-selection-hint">
-                <div class="library-horizontal">
-                    <div id="library-heading" class="library-columns" role="row" aria-rowindex="1"></div>
-                    <div id="library-viewport">
-                        <div id="library-spacer"><div id="library-rows" role="rowgroup"></div></div>
+            <div id="library-body" class="library-body">
+                <div id="library-folders" hidden>
+                    <p id="library-scope" class="library-tree-caption">All folders</p>
+                    <ul id="library-tree" role="tree" aria-label="Library folders" aria-describedby="library-tree-hint"></ul>
+                    <p id="library-tree-hint" class="library-hint">Click a folder to show its tracks; ▸ or →/← expands and collapses. + or Insert adds the folder.</p>
+                </div>
+                <div id="library-grid" role="grid" tabindex="0" aria-label="Library tracks" aria-multiselectable="true" aria-colcount="8" aria-describedby="library-selection-hint">
+                    <div class="library-horizontal">
+                        <div id="library-heading" class="library-columns" role="row" aria-rowindex="1"></div>
+                        <div id="library-viewport">
+                            <div id="library-spacer"><div id="library-rows" role="rowgroup"></div></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -135,8 +138,6 @@
     <section id="playlist-panel" class="panel" aria-label="Playlist">
         <h2>Playlist · <span id="playlist-count">0</span></h2>
         <div class="playlist-controls">
-            <button id="playlist-previous" type="button">Previous track</button>
-            <button id="playlist-next" type="button">Next track</button>
             <button id="playlist-add" type="button">Add files…</button>
             <input id="playlist-files" type="file" multiple hidden>
             <button id="playlist-export" type="button">Export playlist</button>
@@ -167,10 +168,12 @@
     </section>
 
     <section class="controls" aria-label="Transport controls">
+        <button id="playlist-previous" type="button" class="track-button" title="Previous playlist track" aria-label="Previous track" disabled><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h2v10H3zM13 3v10L6 8z"/></svg></button>
         <button id="previous" title="Previous order" disabled>◀◀</button>
         <button id="play" class="primary round" disabled>▶ Play</button>
         <button id="stop" class="round" disabled>■ Stop</button>
         <button id="next" title="Next order" disabled>▶▶</button>
+        <button id="playlist-next" type="button" class="track-button" title="Next playlist track" aria-label="Next track" disabled><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3h2v10h-2zM3 3v10l7-5z"/></svg></button>
         <div class="progress-row">
             <output id="elapsed" title="Click to switch between elapsed and remaining time">0:00</output>
             <input id="progress" type="range" min="0" max="0" step="1" value="0" disabled aria-label="Playback position">

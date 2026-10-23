@@ -5,6 +5,12 @@ import { libraryLocator } from './playlist.js';
 const ROW_HEIGHT = 32;
 const COLUMNS = [['name', 'Name'], ['title', 'Title'], ['format', 'Format'], ['channels', 'Ch'], ['size', 'Size'], ['timestamp', 'Date'], ['folder', 'Folder']];
 const element = name => document.getElementById(`library-${name}`);
+function icon(markup) {
+    const template = document.createElement('template');
+    template.innerHTML = `<svg class="library-tree-icon" viewBox="0 0 16 16" aria-hidden="true">${markup}</svg>`;
+    return template;
+}
+let FOLDER_ICON, ARCHIVE_ICON;
 function node(tag, text, className) {
     const result = document.createElement(tag);
     if (text !== undefined) result.textContent = text;
@@ -13,6 +19,8 @@ function node(tag, text, className) {
 }
 
 export function createLibraryView({ playlist, play }) {
+    FOLDER_ICON ??= icon('<path d="M1.5 3.5h4.2l1.5 1.6h7.3v7.4h-13z"/>');
+    ARCHIVE_ICON ??= icon('<path d="M2.5 1.5h11v13h-11z"/><path d="M8 1.5v2M8 4.5v2M8 7.5v1.5M6.8 9h2.4v3H6.8z"/>');
     const grid = element('grid');
     const viewport = element('viewport');
     const spacer = element('spacer');
@@ -25,6 +33,7 @@ export function createLibraryView({ playlist, play }) {
     let scopeFolder = '';
     let playing = null;
     let tree = null;
+    let treeFocus = '';
     let timer = null;
     let frame = null;
     const expanded = new Set();
@@ -108,56 +117,113 @@ export function createLibraryView({ playlist, play }) {
             scopeFolder, showUnplayable: element('unplayable').checked, format: element('format').value, sort,
         });
         element('count').textContent = `${order.length.toLocaleString('en-US')} of ${context.library.rows.length.toLocaleString('en-US')}`;
-        element('scope').textContent = scopeFolder || 'All folders';
+        element('scope').textContent = element('scope').title = scopeFolder || 'All folders';
         grid.setAttribute('aria-rowcount', String(order.length + 1));
         spacer.style.height = `${order.length * ROW_HEIGHT}px`;
         viewport.scrollTop = 0;
         for (const header of heading.querySelectorAll('[data-column]')) header.setAttribute('aria-sort', header.dataset.column === sort.column ? sort.descending ? 'descending' : 'ascending' : 'none');
         renderRows();
     }
+    // A WAI-ARIA tree with one tab stop: only expanded nodes are in the DOM, so document
+    // order is visible order and arrow keys walk the rendered items.
+    function treeItem(path) { return element('tree').querySelector(`[data-scope="${CSS.escape(path)}"]`); }
+    function treeItems() { return [...element('tree').querySelectorAll('[role=treeitem]')]; }
+    function focusTreeItem(item) {
+        if (!item) return;
+        for (const other of treeItems()) other.tabIndex = other === item ? 0 : -1;
+        treeFocus = item.dataset.scope;
+        item.focus({ preventScroll: true });
+        item.firstElementChild.scrollIntoView({ block: 'nearest' });
+    }
+    function chooseFolder(path) {
+        scopeFolder = path;
+        for (const item of treeItems()) item.setAttribute('aria-selected', String(item.dataset.scope === path));
+        refresh();
+    }
+    function addFolder(path) { add(search(context.library, '', { scopeFolder: path, sort: { column: 'folder', descending: false } })); }
+    function toggleFolder(path, open = !expanded.has(path)) {
+        if (open) expanded.add(path); else expanded.delete(path);
+        renderTree();
+    }
     function renderTree() {
         const pane = element('tree');
-        const focused = pane.contains(document.activeElement) ? document.activeElement : null;
-        const focusPath = focused?.dataset.treePath;
-        const focusAction = focused?.dataset.treeAction;
+        const hadFocus = pane.contains(document.activeElement);
         pane.replaceChildren();
-        function append(parent, children) {
-            for (const child of children) {
-                const item = node('li');
-                const bar = node('div', undefined, `library-folder-node ${child.kind}`);
-                const expand = node('button', expanded.has(child.path) ? '−' : '+');
-                expand.type = 'button';
-                expand.disabled = !child.children.length;
-                expand.setAttribute('aria-label', `Expand ${child.label}`);
-                if (child.children.length) expand.setAttribute('aria-expanded', String(expanded.has(child.path)));
-                expand.onclick = () => { if (expanded.has(child.path)) expanded.delete(child.path); else expanded.add(child.path); renderTree(); };
-                const choose = node('button', `${child.kind === 'nested' ? 'Nested ZIP' : child.kind === 'zip' ? 'ZIP' : 'Folder'}: ${child.label} (${child.trackCount})`);
-                choose.type = 'button';
-                choose.dataset.scope = child.path;
-                choose.setAttribute('aria-pressed', String(scopeFolder === child.path));
-                choose.onclick = () => { scopeFolder = child.path; refresh(); renderTree(); };
-                const addFolder = node('button', 'Add folder');
-                addFolder.type = 'button';
-                addFolder.disabled = child.trackCount === 0;
-                addFolder.setAttribute('aria-label', `Add folder ${child.path}`);
-                addFolder.onclick = () => add(search(context.library, '', { scopeFolder: child.path, sort: { column: 'folder', descending: false } }));
-                for (const [action, button] of [['expand', expand], ['choose', choose], ['add', addFolder]]) {
-                    button.dataset.treePath = child.path;
-                    button.dataset.treeAction = action;
-                }
-                bar.append(expand, choose, addFolder);
-                item.append(bar);
-                if (expanded.has(child.path)) {
-                    const list = node('ul');
-                    append(list, child.children);
-                    item.append(list);
-                }
-                parent.append(item);
+        if (!tree) return;
+        function append(parent, entry, level) {
+            const open = level === 1 || expanded.has(entry.path);
+            const item = node('li');
+            item.setAttribute('role', 'treeitem');
+            item.setAttribute('aria-level', String(level));
+            item.setAttribute('aria-selected', String(scopeFolder === entry.path));
+            item.setAttribute('aria-label', `${entry.label || 'All folders'}, ${entry.trackCount.toLocaleString('en-US')} tracks`);
+            if (entry.children.length && level > 1) item.setAttribute('aria-expanded', String(open));
+            item.dataset.scope = entry.path;
+            item.tabIndex = entry.path === treeFocus ? 0 : -1;
+            const row = node('div', undefined, `library-tree-row ${entry.kind}`);
+            row.style.setProperty('--level', String(level - 1));
+            const caret = node('span', undefined, 'library-tree-caret');
+            caret.dataset.treeToggle = 'true';
+            const icon = (entry.kind === 'dir' ? FOLDER_ICON : ARCHIVE_ICON).content.cloneNode(true);
+            const label = node('span', entry.label || 'All folders', 'library-tree-label');
+            label.title = entry.path || 'All folders';
+            const count = node('span', entry.trackCount.toLocaleString('en-US'), 'library-tree-count');
+            const addButton = node('button', '+', 'library-tree-add');
+            addButton.type = 'button';
+            addButton.tabIndex = -1;
+            addButton.disabled = entry.trackCount === 0;
+            addButton.dataset.treeAdd = 'true';
+            addButton.setAttribute('aria-label', `Add folder ${entry.path || 'All folders'}`);
+            addButton.title = 'Add this folder to the playlist';
+            row.append(caret, icon, label, count, addButton);
+            item.append(row);
+            if (entry.children.length && open) {
+                const group = node('ul');
+                group.setAttribute('role', 'group');
+                for (const child of entry.children) append(group, child, level + 1);
+                item.append(group);
             }
+            parent.append(item);
         }
-        if (tree) append(pane, tree.children);
-        if (focused) [...pane.querySelectorAll('button')].find(button => button.dataset.treePath === focusPath && button.dataset.treeAction === focusAction)?.focus({ preventScroll: true });
+        append(pane, tree, 1);
+        if (!treeItem(treeFocus)) treeFocus = scopeFolder && treeItem(scopeFolder) ? scopeFolder : '';
+        treeItem(treeFocus).tabIndex = 0;
+        if (hadFocus) focusTreeItem(treeItem(treeFocus));
     }
+    element('tree').addEventListener('mousedown', event => { if (event.detail > 1 || event.shiftKey) event.preventDefault(); });
+    element('tree').addEventListener('click', event => {
+        const item = event.target.closest('[role=treeitem]');
+        if (!item) return;
+        const path = item.dataset.scope;
+        focusTreeItem(item);
+        if (event.target.closest('[data-tree-add]')) addFolder(path);
+        else if (event.target.closest('[data-tree-toggle]')) { if (item.hasAttribute('aria-expanded')) toggleFolder(path); }
+        else chooseFolder(path);
+    });
+    element('tree').addEventListener('dblclick', event => {
+        const item = event.target.closest('[role=treeitem]');
+        if (item?.hasAttribute('aria-expanded') && !event.target.closest('[data-tree-add], [data-tree-toggle]')) toggleFolder(item.dataset.scope);
+    });
+    element('tree').addEventListener('keydown', event => {
+        const item = event.target.closest('[role=treeitem]');
+        if (!item || event.ctrlKey || event.metaKey || event.altKey) return;
+        const items = treeItems();
+        const index = items.indexOf(item);
+        const path = item.dataset.scope;
+        const expandable = item.hasAttribute('aria-expanded');
+        const open = item.getAttribute('aria-expanded') === 'true';
+        if (event.key === 'ArrowDown') focusTreeItem(items[index + 1]);
+        else if (event.key === 'ArrowUp') focusTreeItem(items[index - 1]);
+        else if (event.key === 'Home') focusTreeItem(items[0]);
+        else if (event.key === 'End') focusTreeItem(items.at(-1));
+        else if (event.key === 'ArrowRight') { if (expandable && !open) toggleFolder(path, true); else if (open) focusTreeItem(item.querySelector('[role=treeitem]')); }
+        else if (event.key === 'ArrowLeft') { if (open) toggleFolder(path, false); else if (path) focusTreeItem(treeItem(path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '')); }
+        else if (event.key === 'Enter' || event.key === ' ') chooseFolder(path);
+        else if (event.key === '+' || event.key === 'Insert') addFolder(path);
+        else return;
+        event.preventDefault();
+        event.stopPropagation();
+    });
     for (const [column, label] of COLUMNS) {
         const header = node('div');
         header.setAttribute('role', 'columnheader');
@@ -176,12 +242,15 @@ export function createLibraryView({ playlist, play }) {
     element('unplayable').addEventListener('change', refresh);
     element('browse').addEventListener('change', () => {
         element('folders').hidden = !element('browse').checked;
+        element('body').classList.toggle('browsing', element('browse').checked);
         scopeFolder = '';
-        if (element('browse').checked) { tree ??= buildTree(context.library); renderTree(); }
         refresh();
+        if (element('browse').checked) { tree ??= buildTree(context.library); renderTree(); }
     });
-    element('all').onclick = () => { scopeFolder = ''; refresh(); renderTree(); };
     element('add-selected').onclick = addSelected;
+    // Shift-click would otherwise extend a text selection across the rows (and Edge pops up
+    // its Copy/Search mini menu); the click handler still moves focus to the grid.
+    rows.addEventListener('mousedown', event => { if (event.shiftKey || event.ctrlKey || event.metaKey || event.detail > 1) event.preventDefault(); });
     rows.addEventListener('click', event => {
         const line = event.target.closest('[data-row-id]');
         if (!line) return;
@@ -223,9 +292,11 @@ export function createLibraryView({ playlist, play }) {
             playing = null;
             scopeFolder = '';
             tree = null;
+            treeFocus = '';
             expanded.clear();
             element('browse').checked = false;
             element('folders').hidden = true;
+            element('body').classList.remove('browsing');
             element('search').value = '';
             element('format').replaceChildren(new Option('All formats', ''), ...[...new Set(context.library.rows.map(row => row.format))].sort().map(format => new Option(format.toUpperCase(), format)));
             element('browser').hidden = false;

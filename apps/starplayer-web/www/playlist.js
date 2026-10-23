@@ -65,6 +65,7 @@ export function wirePlaylistList(playlist, { playback, available = () => true, a
         const entries = playlist.entries;
         const currentId = playlist.current?.id;
         document.getElementById('playlist-count').textContent = String(entries.length);
+        for (const id of ['playlist-previous', 'playlist-next']) document.getElementById(id).disabled = entries.length === 0;
         list.replaceChildren(...entries.map(entry => {
             const item = document.createElement('li');
             item.dataset.entryId = entry.id;

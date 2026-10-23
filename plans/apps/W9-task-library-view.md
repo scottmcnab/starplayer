@@ -238,3 +238,22 @@ No W9 implementation items remain open. The owner's interactive Hornet-library
 acceptance check remains outstanding. W10's playback controller, auto-advance,
 full playlist editing and Repeat behavior, and W11's persistence/import/export,
 remain intentionally out of scope.
+
+## Owner review follow-up (2026-10-23)
+
+First browser check against the Hornet mirror:
+
+- Shift-click in the track table extended a page text selection across the rows, and Edge
+  popped up its Copy/Search mini menu. Rows, the tree and the playlist are now
+  `user-select: none`, and a modified or repeated mousedown on a row is default-prevented
+  (the click handler still focuses the grid). The headless scenario Shift-clicks with real
+  CDP mouse input and asserts the page selection stays empty; it fails without the fix.
+- The folder pane rendered every node as three buttons. It is now a WAI-ARIA `tree` beside
+  the table (stacked below 820 px): one tab stop, ↑/↓/Home/End move, →/← expand, collapse
+  or go to the child or parent, Enter/Space/click scopes the table, ▸ or double-click
+  toggles, and `+`/Insert or the row's hover **+** adds the folder. An "All folders" root
+  item replaces the separate All button. Only expanded nodes are rendered (the Hornet tree
+  has 8,797 nodes, at most 306 under one folder).
+- Previous/next *track* moved from the playlist card to either end of the transport
+  controls as ⏮/⏭ icon buttons (keeping the `playlist-previous`/`playlist-next` ids); they
+  are disabled while the playlist is empty.

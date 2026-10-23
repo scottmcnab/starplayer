@@ -1267,10 +1267,28 @@ async function runLibrary(executable, mode) {
         await clickRow(2, { ctrlKey: true });
         await page.evaluate("document.getElementById('library-add-selected').click();");
         assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        // A real Shift-click must select rows, not page text (Edge pops up a Copy/Search menu over a text selection).
+        const realClick = async (position, modifiers = 0) => {
+            const point = await page.evaluate(`const row = document.querySelector('#library-rows > :nth-child(${position})'); row.scrollIntoView({ block: 'center' }); const bounds = row.getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
+            for (const type of ['mousePressed', 'mouseReleased']) await page.send('Input.dispatchMouseEvent', { type, button: 'left', clickCount: 1, modifiers, ...point });
+        };
+        await realClick(1);
+        await realClick(3, 8);
+        assert.equal(await page.evaluate("return document.querySelectorAll('.library-track[aria-selected=true]').length;"), 3);
+        assert.equal(await page.evaluate("return getSelection().toString();"), '');
         await page.evaluate("document.getElementById('library-browse').click(); document.querySelector('[data-scope=disks]').click();");
         await page.waitFor('folder scope', "document.getElementById('library-count').textContent === '4 of 5'");
-        await page.evaluate("document.querySelector('[aria-label=\"Expand disks\"]').focus(); document.activeElement.click();");
-        assert.equal(await page.evaluate("return document.activeElement.getAttribute('aria-label');"), 'Expand disks');
+        assert.equal(await page.evaluate("return document.querySelector('[role=tree] [aria-selected=true]').dataset.scope;"), 'disks');
+        await page.evaluate("document.querySelector('[data-scope=disks] [data-tree-toggle]').click();");
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope + ' ' + document.activeElement.getAttribute('aria-expanded');"), 'disks true');
+        const treeKey = key => page.evaluate(`document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true }));`);
+        await treeKey('ArrowLeft');
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope + ' ' + document.activeElement.getAttribute('aria-expanded');"), 'disks false');
+        await treeKey('ArrowRight');
+        await treeKey('ArrowRight');
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope;"), 'disks/disk1.zip');
+        await treeKey('ArrowLeft');
+        assert.equal(await page.evaluate("return document.activeElement.dataset.scope;"), 'disks');
         await page.evaluate("document.querySelector('[data-scope=\"disks/disk1.zip\"]').focus(); document.activeElement.click();");
         assert.equal(await page.evaluate("return document.activeElement.dataset.scope;"), 'disks/disk1.zip');
         await page.waitFor('ZIP scope', "document.getElementById('library-count').textContent === '3 of 5'");
@@ -1286,7 +1304,7 @@ async function runLibrary(executable, mode) {
         };
         await doubleClick(2);
         await page.waitFor('ZIP playback title', "document.getElementById('title').textContent.toLowerCase().includes('reflex') && document.getElementById('transport-chip').textContent === 'playing'");
-        await page.evaluate("document.getElementById('library-all').click();");
+        await page.evaluate("document.querySelector('[role=tree] [data-scope=\"\"]').click();");
         await doubleClick(3);
         await page.waitFor('nested playback label', "document.getElementById('module-detail').textContent.includes('inner.zip') && document.getElementById('transport-chip').textContent === 'playing'");
         const beforeMissing = await page.evaluate(READ_STATE);
