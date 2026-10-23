@@ -1,9 +1,9 @@
-import { parseLibraryCsv, libraryIdentity } from './library-index.js';
+import { parseLibraryCsv, libraryIdentity, parseCommentsCsv, attachComments } from './library-index.js';
 import { createResolver } from './track-resolver.js';
 import { createFileListSource, createHttpSource, directoryPickerAvailable, openDirectorySource, reconnectDirectorySource, storedDirectoryHandle } from './library-source.js';
 
 // Optional notification keeps source state usable independently of the view.
-export async function wireLibraryControls({ state, loader, onLibrary = () => {} }) {
+export async function wireLibraryControls({ state, loader, onLibrary = () => {}, onComments = () => {} }) {
     const element = name => document.getElementById(`library-${name}`);
     const summary = element('summary');
     const folder = element('folder');
@@ -12,10 +12,48 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {} 
     const server = element('server');
     const indexInput = element('index');
     const choices = element('choices');
+    const commentsInput = element('comments');
+    const commentsButton = element('open-comments');
+    let indexSummary = '';
+    let commentsRevision = 0;
+    const showComments = message => { summary.textContent = `${indexSummary}. Comments: ${message}`; };
+    async function loadComments(context, name, read, currentRevision, manual = false) {
+        const currentCommentsRevision = ++commentsRevision;
+        const current = () => currentRevision === revision && currentCommentsRevision === commentsRevision && context === state.library;
+        showComments(`loading ${name}…`);
+        try {
+            const bytes = await read();
+            if (!current()) return;
+            const parsed = parseCommentsCsv(new TextDecoder().decode(bytes));
+            const { joined, unmatched } = attachComments(context.library, parsed.comments);
+            showComments(`${parsed.comments.size.toLocaleString('en-US')} modules from ${name}, ${joined.toLocaleString('en-US')} tracks matched, ${parsed.issues.length} issues, ${unmatched} unmatched${manual ? '. This choice lasts until the page reloads' : ''}`);
+            onComments(context);
+        } catch (error) { if (current()) showComments(`not loaded (${error.message})`); }
+    }
+    async function autoComments(context, currentRevision) {
+        const source = context.source;
+        try {
+            if (source.kind === 'http') {
+                const response = await fetch('/library-comments.csv', { method: 'HEAD' });
+                if (currentRevision !== revision || context !== state.library) return;
+                // A manual attachment made during the probe takes precedence.
+                if (context.manualComments) return;
+                if (response.status !== 200) { showComments(response.status === 404 ? 'none on the server (start it with --library-comments FILE)' : `not loaded (HTTP ${response.status})`); return; }
+                await loadComments(context, 'library-comments.csv', async () => {
+                    const response = await fetch('/library-comments.csv');
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return response.arrayBuffer();
+                }, currentRevision);
+            } else if (source.commentsPath) {
+                await loadComments(context, source.commentsPath, () => source.readFile(source.commentsPath), currentRevision);
+            } else showComments(source.commentsCandidates.length > 1 ? 'not loaded (several comments CSVs; use Open comments CSV…)' : 'not loaded (no comments CSV found)');
+        } catch (error) { if (currentRevision === revision && context === state.library && !context.manualComments) showComments(`not loaded (${error.message})`); }
+    }
     let storedHandle = null;
     let pendingIndex = null;
     let selectedSource = null;
     let revision = 0;
+    let openingRevision = 0;
     let indexRevision = 0;
     const report = error => { summary.textContent = error.name === 'AbortError' ? 'Library selection cancelled.' : error.message; };
     async function loadIndex(source, index, currentRevision) {
@@ -28,9 +66,22 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {} 
         summary.textContent = `${library.rows.length.toLocaleString('en-US')} tracks, ${library.issues.length} issues, from ${source.label}`;
         if (library.issues.length) summary.textContent += ': ' + library.issues.slice(0, 3).map(issue => `line ${issue.line}: ${issue.reason}`).join('; ');
         if (source.kind === 'filelist') summary.textContent += '. Choose this folder again after reloading.';
+        indexSummary = summary.textContent.replace(/\.$/, '');
+        showComments('not loaded (checking for a sidecar)');
+        commentsButton.disabled = false;
         onLibrary(state.library);
+        // Let the table paint before even starting the optional sidecar read.
+        const context = state.library;
+        requestAnimationFrame(() => setTimeout(() => {
+            if (currentRevision === revision && context === state.library && !context.manualComments) autoComments(context, currentRevision);
+        }, 0));
     }
-    async function selectSource(source) {
+    async function selectSource(opening) {
+        // A picker that is cancelled or overtaken must not disturb the open library or its
+        // pending sidecar, so it has its own counter until it yields a source.
+        const currentOpening = ++openingRevision;
+        const source = await opening;
+        if (currentOpening !== openingRevision) return;
         const currentRevision = ++revision;
         selectedSource = source;
         choices.hidden = true;
@@ -60,10 +111,10 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {} 
     }
     folder.addEventListener('click', () => {
         // Do not insert an await before opening the picker.
-        if (directoryPickerAvailable()) openDirectorySource().then(selectSource).catch(report);
+        if (directoryPickerAvailable()) selectSource(openDirectorySource()).catch(report);
         else files.click();
     });
-    reconnect.addEventListener('click', () => reconnectDirectorySource(storedHandle).then(selectSource).catch(report));
+    reconnect.addEventListener('click', () => selectSource(reconnectDirectorySource(storedHandle)).catch(report));
     files.addEventListener('change', () => {
         if (files.files.length) selectSource(createFileListSource(files.files)).catch(report);
         files.value = '';
@@ -82,6 +133,14 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {} 
             choices.hidden = true;
             summary.textContent = `${file.name} selected. Click Open library folder to choose its root.`;
         } catch (error) { report(error); }
+    });
+    commentsButton.addEventListener('click', () => commentsInput.click());
+    commentsInput.addEventListener('change', () => {
+        const file = commentsInput.files[0];
+        commentsInput.value = '';
+        if (!file || !state.library) return;
+        state.library.manualComments = true;
+        loadComments(state.library, file.name, () => file.arrayBuffer(), revision, true);
     });
     choices.addEventListener('change', () => {
         const source = selectedSource;

@@ -37,6 +37,51 @@ export function createLibraryView({ playlist, play }) {
     let timer = null;
     let frame = null;
     const expanded = new Set();
+    let detailsKey = null;
+
+    function renderDetails() {
+        const pane = element('details');
+        pane.hidden = !context?.library.hasComments || selection.focus === null;
+        if (pane.hidden) { detailsKey = null; return; }
+        const key = `${selection.focus}\n${element('search').value}`;
+        if (key === detailsKey) return;
+        detailsKey = key;
+        const row = context.library.rows[selection.focus];
+        if (!row) { pane.hidden = true; return; }
+        element('details-title').textContent = [row.name, row.title].filter(Boolean).join(' — ');
+        const content = element('details-content');
+        content.replaceChildren();
+        const tokens = compileQuery(element('search').value).filter(token => !token.field || token.field === 'text').map(token => token.literal).filter(Boolean);
+        const escaped = tokens.sort((left, right) => right.length - left.length).map(token => token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        const pattern = escaped.length ? new RegExp(escaped.join('|'), 'giu') : null;
+        function highlighted(text) {
+            const fragment = document.createDocumentFragment();
+            let offset = 0;
+            if (pattern) for (const match of text.matchAll(pattern)) {
+                fragment.append(document.createTextNode(text.slice(offset, match.index)), node('mark', match[0]));
+                offset = match.index + match[0].length;
+            }
+            fragment.append(document.createTextNode(text.slice(offset)));
+            return fragment;
+        }
+        const comments = context.library.commentsFor(row.id);
+        for (const [field, title] of [['instrumentNames', 'Instrument names'], ['sampleNames', 'Sample names'], ['songMessage', 'Song message']]) {
+            const text = comments[field];
+            if (!text) continue;
+            content.append(node('h4', title));
+            const block = node('pre');
+            if (field === 'songMessage') block.append(highlighted(text));
+            else {
+                const lines = text.split('\n');
+                const digits = lines.length > 99 ? 3 : 2;
+                lines.forEach((line, index) => {
+                    block.append(document.createTextNode(`${String(index + 1).padStart(digits, '0')}  `), highlighted(line), document.createTextNode(index + 1 < lines.length ? '\n' : ''));
+                });
+            }
+            content.append(block);
+        }
+        if (!content.childNodes.length) content.append(node('p', 'No comment text'));
+    }
 
     function add(ids) {
         if (!context) return;
@@ -107,6 +152,7 @@ export function createLibraryView({ playlist, play }) {
         else grid.removeAttribute('aria-activedescendant');
         const selected = order.reduce((count, id) => count + Number(selection.selected.has(id) && context.library.rows[id].playable), 0);
         element('add-selected').disabled = selected === 0;
+        renderDetails();
         element('selection-count').textContent = `${selected.toLocaleString('en-US')} playable selected in this result`;
     }
     function scheduleRows() { if (frame === null) frame = requestAnimationFrame(renderRows); }
@@ -114,7 +160,7 @@ export function createLibraryView({ playlist, play }) {
         clearTimeout(timer);
         if (!context) return;
         order = search(context.library, compileQuery(element('search').value), {
-            scopeFolder, showUnplayable: element('unplayable').checked, format: element('format').value, sort,
+            scopeFolder, includeComments: element('search-comments').checked, showUnplayable: element('unplayable').checked, format: element('format').value, sort,
         });
         element('count').textContent = `${order.length.toLocaleString('en-US')} of ${context.library.rows.length.toLocaleString('en-US')}`;
         element('scope').textContent = element('scope').title = scopeFolder || 'All folders';
@@ -238,6 +284,7 @@ export function createLibraryView({ playlist, play }) {
     actionHeader.setAttribute('role', 'columnheader');
     heading.append(actionHeader);
     element('search').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(refresh, 80); });
+    element('search-comments').addEventListener('change', refresh);
     element('format').addEventListener('change', refresh);
     element('unplayable').addEventListener('change', refresh);
     element('browse').addEventListener('change', () => {
@@ -281,13 +328,18 @@ export function createLibraryView({ playlist, play }) {
         else return;
         event.preventDefault();
         event.stopPropagation();
-        renderRows();
+        // Focus and details updates keep painted rows intact; only virtualised-away
+        // targets require a new window of rows.
+        if (selection.focus === null || document.getElementById(`library-row-${selection.focus}`)) updateSelection();
+        else renderRows();
     });
     viewport.addEventListener('scroll', scheduleRows, { passive: true });
     new ResizeObserver(scheduleRows).observe(viewport);
     return {
         setLibrary(next) {
             context = next;
+            detailsKey = null;
+            element('comments-toggle').hidden = !context.library.hasComments;
             selection = createSelection();
             playing = null;
             scopeFolder = '';
@@ -303,6 +355,7 @@ export function createLibraryView({ playlist, play }) {
             element('panel').open = true;
             refresh();
         },
+        refreshComments() { detailsKey = null; element('comments-toggle').hidden = !context.library.hasComments; refresh(); },
         setPlaying(id) { playing = id; if (id !== null) reveal(id); renderRows(); },
     };
 }

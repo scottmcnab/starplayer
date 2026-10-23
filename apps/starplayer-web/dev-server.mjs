@@ -17,7 +17,7 @@
 // of the player is exercised: the page detects that `SharedArrayBuffer` is unavailable,
 // says so, and drives the worklet over batched `postMessage` instead.
 //
-// Usage: node apps/starplayer-web/dev-server.mjs [--port 8080] [--host 127.0.0.1] [--root <dir>] [--library <dir>] [--library-index <file>] [--no-isolation] [--tls [--tls-san IP,DNS,...]]
+// Usage: node apps/starplayer-web/dev-server.mjs [--port 8080] [--host 127.0.0.1] [--root <dir>] [--library <dir>] [--library-index <file>] [--library-comments <file>] [--no-isolation] [--tls [--tls-san IP,DNS,...]]
 //
 // `--host 0.0.0.0` exposes the server to the LAN (a phone, or another machine). Note that a
 // plain-http LAN origin is not a secure context, so the browser withholds
@@ -64,9 +64,9 @@ function parseArguments(argv) {
         } else if (argv[index] === '--root') {
             options.root = argv[index + 1];
             index += 1;
-        } else if (argv[index] === '--library' || argv[index] === '--library-index') {
+        } else if (argv[index] === '--library' || argv[index] === '--library-index' || argv[index] === '--library-comments') {
             if (!argv[index + 1] || argv[index + 1].startsWith('--')) throw new Error(`${argv[index]} needs a value`);
-            options[argv[index] === '--library' ? 'library' : 'libraryIndex'] = argv[++index];
+            options[argv[index] === '--library' ? 'library' : argv[index] === '--library-index' ? 'libraryIndex' : 'libraryComments'] = argv[++index];
         } else if (argv[index] === '--no-isolation') {
             options.isolate = false;
         } else if (argv[index] === '--tls') {
@@ -87,6 +87,7 @@ function parseArguments(argv) {
 const options = parseArguments(process.argv.slice(2));
 const documentRoot = await realpath(resolve(options.root));
 const libraryRoot = options.library ? await realpath(resolve(options.library)) : null;
+const libraryComments = options.libraryComments ? resolve(options.libraryComments) : null;
 const libraryIndex = libraryRoot ? resolve(options.libraryIndex ?? join(libraryRoot, 'index.csv')) : null;
 
 function applyCommonHeaders(response) {
@@ -147,7 +148,11 @@ const server = createServer(async (request, response) => {
         const urlPath = request.url.split('?')[0];
         let filePath;
         let isIndex = false;
-        if (urlPath === '/library-index.csv' || urlPath === '/library' || urlPath.startsWith('/library/')) {
+        if (urlPath === '/library-comments.csv') {
+            if (!libraryComments) throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+            isIndex = true;
+            filePath = libraryComments;
+        } else if (urlPath === '/library-index.csv' || urlPath === '/library' || urlPath.startsWith('/library/')) {
             if (!libraryRoot) throw Object.assign(new Error('not found'), { code: 'ENOENT' });
             isIndex = urlPath === '/library-index.csv';
             filePath = isIndex ? libraryIndex : await confinedPath(libraryRoot, urlPath.slice('/library/'.length));

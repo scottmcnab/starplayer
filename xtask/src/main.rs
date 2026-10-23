@@ -316,11 +316,11 @@ fn print_usage() {
     println!("  perceptual [--corpus PATH]... [--threshold-snr DB] [--offline]");
     println!("                     score the float render against libopenmpt's; nightly report, never a gate");
     println!("  trace <module> [--ticks N]   print a stable per-tick state trace");
-    println!("  wasm [--serve] [--pages] [--library DIR] [--library-index FILE]   build and package the web player into apps/starplayer-web/dist");
+    println!("  wasm [--serve] [--pages] [--library DIR] [--library-index FILE] [--library-comments FILE]   build and package the web player into apps/starplayer-web/dist");
     println!("                     --pages packages it for GitHub Pages: no bundled fixtures, and index.html");
     println!("                     loads the coi-serviceworker shim that supplies the COOP/COEP headers Pages cannot;");
     println!("                     it also stages the A4-N1 cast probe under dist/cast-probe/ (see `cast-probe` above)");
-    println!("  serve [--port N] [--host ADDR] [--library DIR] [--library-index FILE]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
+    println!("  serve [--port N] [--host ADDR] [--library DIR] [--library-index FILE] [--library-comments FILE]   serve that directory with the COOP/COEP headers SharedArrayBuffer needs");
     println!("                     --host 0.0.0.0 exposes it to the LAN; add --tls [--tls-san ip,ip] there, since AudioWorklet");
     println!("                     and SharedArrayBuffer only exist in a secure context (https or localhost)");
     println!();
@@ -2047,7 +2047,7 @@ fn run_wasm(arguments: &[String]) -> bool {
                 pages_build = true;
                 index += 1;
             }
-            "--library" | "--library-index" => {
+            "--library" | "--library-index" | "--library-comments" => {
                 let Some(value) = arguments.get(index + 1).filter(|value| !value.starts_with("--")) else {
                     eprintln!("xtask: `{}` needs a value", arguments[index]);
                     return false;
@@ -2557,7 +2557,7 @@ fn run_serve(arguments: &[String]) -> bool {
                 host = value.clone();
                 index += 2;
             }
-            "--library" | "--library-index" => {
+            "--library" | "--library-index" | "--library-comments" => {
                 let Some(value) = arguments.get(index + 1).filter(|value| !value.starts_with("--")) else {
                     eprintln!("xtask: `{}` needs a value", arguments[index]);
                     return false;

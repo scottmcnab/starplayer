@@ -52,7 +52,7 @@ All metadata columns are optional:
 | `size` | Uncompressed module size in bytes for display/sorting; blank or non-numeric becomes null. |
 | `timestamp` | Original timestamp text, sorted lexically; no timezone is inferred. |
 | `instruments`, `samples` | Accepted compatibility metadata, currently not retained in compact browse records. |
-| `sha256` | Accepted module checksum metadata, currently not used for lookup or library identity. |
+| `sha256` | Module checksum used to join comments; trimmed and lower-cased if 64 hex digits, otherwise empty. It does not set library identity. |
 
 The format is the first non-blank of `format_detected`, `format_by_extension`,
 then the lower-case extension of the innermost path (`member_path`, otherwise
@@ -112,7 +112,7 @@ library names; identity rebinding and persistence are described below.
 ## Opening a library in the web player
 
 Use **Open library folder** to select the root. The player prefers a root
-`index.csv` (case-insensitive), otherwise the only root CSV, or offers a choice
+`index.csv` (case-insensitive), otherwise the only root index candidate (excluding comments CSVs), or offers a choice
 when several exist. **Open index CSV…** selects an index stored elsewhere; then
 click **Open library folder** separately to grant access to its files.
 
@@ -151,3 +151,65 @@ removed. Stored files are capped at 256 MiB, with only unreferenced files eligib
 for eviction. A refused file can still be opened once using the main file picker.
 Storage failure switches to session-only use with a notice. Browser storage may be
 cleared or evicted; CSV export does not back up uploaded bytes.
+
+## Comments CSV (optional)
+
+A comments sidecar joins author text to index rows by `sha256`. Use UTF-8, RFC 4180
+quoting and LF record endings, including quoted multiline fields. The usual header
+is `sha256,format,instrument_names,sample_names,song_message`. Header names are
+trimmed and case-insensitive and can be reordered; unknown columns are ignored,
+duplicate headers are errors. Require `sha256` and at least one text column.
+
+Use one row per distinct module checksum, sorted by checksum. A checksum must be
+64 hexadecimal digits (case is ignored); invalid or duplicate checksums produce
+issues and the first occurrence wins. Modules without text may be omitted. Each
+checksum should occur in the index; several tracks may share it. `format` is
+informational. Text columns are:
+
+- `instrument_names`: one line per declared slot, preserving empty slots so line N
+  is slot N. Drop trailing empty lines. IT sample-mode names belong in `sample_names`.
+- `sample_names`: XM and IT sample names, with the same slot numbering convention.
+- `song_message`: IT song message or MTM comment, preserving line breaks.
+
+Decode legacy module text from CP437 before writing UTF-8. Convert CR/CRLF to LF,
+replace NUL and other control characters with spaces, and trim trailing spaces
+on each line. ASCII art is welcome. All text is untrusted and displayed literally.
+
+For a small hand-made index, put optional `instrument_names`, `sample_names` and
+`song_message` columns directly in the index instead. A sidecar entry overrides all
+three inline fields for a matching checksum, including empty fields. Without an
+entry, inline text remains available. Replacing the sidecar replaces its attachment;
+it never changes the library identity or playlist bindings.
+
+Folder sources sniff root CSV headers, separating comments files (checksum plus a
+text column, without `source_path`) from index candidates. They prefer `index.csv`,
+otherwise the only index candidate, otherwise offer a choice. Exactly one comments
+candidate loads automatically; with several, use **Open comments CSV…**. Failed
+header reads are ignored. That button can also attach an external sidecar to the
+open library; the choice lasts until reload. The table appears before comments load,
+and errors in comments do not prevent browsing.
+
+For HTTP, `cargo xtask serve` and `cargo xtask wasm --serve` accept
+`--library-comments FILE`, serving it at `/library-comments.csv`. The page probes
+that route after loading the index. There is no default comments location.
+
+Plain search includes comments by default; **Search comments** turns that off.
+`text:"purple motion"` searches comments only regardless of the checkbox. All text
+search lowercases and uses Unicode NFKD with combining marks removed, so `cafe`
+finds `Café`; box-drawing symbols survive. Plain and `text:` tokens also match a
+compact form with punctuation and spacing removed, when the compact token has at
+least four letters/digits: `purplemotion`, `purple-motion` and `"purple motion"`
+match `Purple Motion`; `p.motion` matches `P. Motion`. `fc` does not compact-match.
+Other field prefixes use folded substring matching without compaction. The details
+pane highlights literal, case-insensitive matches and preserves numbered empty slots.
+
+Three synthetic module rows (the first has a multiline field):
+
+```csv
+sha256,format,instrument_names,sample_names,song_message
+1111111111111111111111111111111111111111111111111111111111111111,mod,"Demo Group
+
+Lead",,
+2222222222222222222222222222222222222222222222222222222222222222,xm,Composer,Kick,
+3333333333333333333333333333333333333333333333333333333333333333,it,,,Greetings!
+```

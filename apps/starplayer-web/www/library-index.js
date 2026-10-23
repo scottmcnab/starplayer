@@ -1,5 +1,5 @@
 // Pure library/playlist data layer. No filesystem, DOM, or playback ownership.
-const knownColumns = new Set(('source_path container_member member_path entry_kind extension format_by_extension size compressed_size crc32 timestamp compression_method encrypted member_path_raw_hex source_url status error sha256 crc_verified format_detected format_variant channels title tracker instrument_slots instruments samples sample_bytes extended_status extended_error library').split(' '));
+const knownColumns = new Set(('source_path container_member member_path entry_kind extension format_by_extension size compressed_size crc32 timestamp compression_method encrypted member_path_raw_hex source_url status error sha256 crc_verified format_detected format_variant channels title tracker instrument_slots instruments samples sample_bytes extended_status extended_error library instrument_names sample_names song_message').split(' '));
 const playableFormats = new Set(['mod', 's3m', 'mtm', 'xm', 'it']);
 
 export function parseCsv(text) {
@@ -92,15 +92,88 @@ function readRows(text, keepDuplicates) {
         const number = column => get(column).trim() && Number.isFinite(Number(get(column))) ? Number(get(column)) : null;
         rows.push({ id: rows.length, sourcePath, containerMember, memberPath, rawHex: get('member_path_raw_hex'), name, folder,
             title: get('title'), format, playable: playableFormats.has(format), channels: number('channels'), size: number('size'),
-            timestamp: get('timestamp'), tracker: get('tracker'), line, ...(keepDuplicates ? { library: get('library') } : {}) });
+            timestamp: get('timestamp'), tracker: get('tracker'), sha256: validSha256(get('sha256')),
+            instrumentNames: get('instrument_names'), sampleNames: get('sample_names'), songMessage: get('song_message'), line, ...(keepDuplicates ? { library: get('library') } : {}) });
     }
     return { rows, issues, columns };
+}
+
+export function foldText(text) {
+    return text.toLowerCase().normalize('NFKD').replace(/\p{M}/gu, '');
+}
+
+function compactText(text) { return text.replace(/[^\p{L}\p{N}]/gu, ''); }
+function validSha256(text) { const value = text.trim().toLowerCase(); return /^[a-f0-9]{64}$/.test(value) ? value : ''; }
+const commentColumns = ['instrument_names', 'sample_names', 'song_message'];
+const commentKeys = ['instrumentNames', 'sampleNames', 'songMessage'];
+
+export function isCommentsCsvHeader(firstLine) {
+    try {
+        const columns = (parseCsv(firstLine)[0] || []).map(column => column.trim().toLowerCase());
+        return columns.includes('sha256') && commentColumns.some(column => columns.includes(column)) && !columns.includes('source_path');
+    } catch { return false; }
+}
+
+export function parseCommentsCsv(text) {
+    const records = parseCsv(text);
+    const positions = new Map();
+    (records[0] || []).forEach((column, index) => {
+        const name = column.trim().toLowerCase();
+        if (positions.has(name)) throw new Error(`Duplicate CSV header: ${name}`);
+        positions.set(name, index);
+    });
+    const missing = [];
+    if (!positions.has('sha256')) missing.push('sha256');
+    if (!commentColumns.some(column => positions.has(column))) missing.push('instrument_names, sample_names or song_message');
+    if (missing.length) throw new Error(`Missing CSV header: ${missing.join('; ')}`);
+    const comments = new Map(), issues = [];
+    for (let index = 1; index < records.length; index += 1) {
+        const fields = records[index];
+        if (fields.length === 1 && fields[0] === '') continue;
+        const sha256 = validSha256(fields[positions.get('sha256')] || '');
+        const reason = !sha256 ? 'invalid sha256' : comments.has(sha256) ? 'duplicate sha256' : '';
+        if (reason) { issues.push({ line: records.lines[index], reason }); continue; }
+        comments.set(sha256, Object.fromEntries(commentKeys.map((key, column) => [key, fields[positions.get(commentColumns[column])] || ''])));
+    }
+    return { comments, issues };
+}
+
+export function attachComments(library, comments) {
+    const shared = new Map();
+    const used = new Set();
+    const display = [];
+    library.commentHaystacks = [];
+    library.compactCommentHaystacks = [];
+    let joined = 0;
+    library.hasComments = false;
+    for (const row of library.rows) {
+        const sidecar = comments?.get(row.sha256);
+        if (sidecar) { joined += 1; used.add(row.sha256); }
+        const text = sidecar || row;
+        // Sidecar records share both folded strings and their original display object.
+        let stored = shared.get(text);
+        if (!stored) {
+            const original = Object.fromEntries(commentKeys.map(key => [key, text[key] || '']));
+            const haystack = foldText(commentKeys.map(key => original[key]).filter(Boolean).join('\n'));
+            stored = { original, haystack, compact: compactText(haystack) };
+            shared.set(text, stored);
+        }
+        display[row.id] = stored.original;
+        library.commentHaystacks[row.id] = stored.haystack;
+        library.compactCommentHaystacks[row.id] = stored.compact;
+        if (commentKeys.some(key => stored.original[key])) library.hasComments = true;
+    }
+    library.commentsFor = rowId => display[rowId];
+    return { joined, unmatched: (comments?.size || 0) - used.size };
 }
 
 export function parseLibraryCsv(text, { name = '' } = {}) {
     const library = readRows(text, false);
     library.identityName = name;
-    library.haystacks = library.rows.map(row => [row.name, row.title, row.folder, row.format, row.tracker].join('\n').toLowerCase());
+    library.haystacks = library.rows.map(row => [row.name, row.title, row.folder, row.format, row.tracker].join('\n')).map(foldText);
+    library.compactHaystacks = library.haystacks.map(compactText);
+    library.fieldHaystacks = library.rows.map(row => Object.fromEntries(['name', 'title', 'tracker', 'path'].map(field => [field, foldText(field === 'path' ? [row.sourcePath, row.containerMember, row.memberPath].filter(Boolean).join('/') : row[field])])));
+    attachComments(library, null);
     library.sortKeys = library.rows.map(row => Object.fromEntries(['name', 'title', 'format', 'timestamp', 'folder'].map(column => [column, row[column].toLowerCase()])));
     return library;
 }
@@ -117,24 +190,28 @@ export async function libraryIdentity(bytes, name) {
 export function compileQuery(text) {
     const tokens = [];
     // Quotes can follow a field prefix: title:"a phrase".
-    for (const match of text.toLowerCase().matchAll(/(?:[^\s"]|"[^"]*")+/g)) {
-        const token = match[0].replaceAll('"', '');
+    for (const match of text.matchAll(/(?:[^\s"]|"[^"]*")+/g)) {
+        const literal = match[0].replaceAll('"', '');
+        const token = foldText(literal);
         const colon = token.indexOf(':');
         const field = colon >= 0 ? token.slice(0, colon) : '';
-        tokens.push(['format', 'title', 'name', 'path', 'tracker', 'ch'].includes(field) ? { field, value: token.slice(colon + 1) } : { field: '', value: token });
+        tokens.push(['format', 'title', 'name', 'path', 'tracker', 'ch', 'text'].includes(field) ? { field, value: field === 'format' ? literal.slice(colon + 1).toLowerCase() : token.slice(colon + 1), literal: literal.slice(colon + 1), compact: compactText(token.slice(colon + 1)) } : { field: '', value: token, literal, compact: compactText(token) });
     }
     return tokens;
 }
 
-export function search(library, query = '', { scopeFolder = '', showUnplayable = false, format = '', sort } = {}) {
+export function search(library, query = '', { scopeFolder = '', showUnplayable = false, format = '', includeComments = true, sort } = {}) {
     const tokens = typeof query === 'string' ? compileQuery(query) : query;
     const matches = [];
     const scope = scopeFolder.replace(/\/$/, '');
     for (const row of library.rows) {
         if (!showUnplayable && !row.playable || format && row.format !== format.toLowerCase()) continue;
         if (scope && row.folder !== scope && !row.folder.startsWith(`${scope}/`)) continue;
-        if (!tokens.every(({ field, value }) => {
-            if (!field) return library.haystacks[row.id].includes(value);
+        if (!tokens.every(({ field, value, compact = compactText(value) }) => {
+            const contains = (haystack, compactHaystack) => haystack.includes(value) || compact.length >= 4 && compactHaystack.includes(compact);
+            if (field === 'text') return contains(library.commentHaystacks[row.id], library.compactCommentHaystacks[row.id]);
+            if (!field) return contains(library.haystacks[row.id], library.compactHaystacks[row.id]) || includeComments && contains(library.commentHaystacks[row.id], library.compactCommentHaystacks[row.id]);
+            if (field === 'format') return row.format.includes(value);
             if (field === 'ch') {
                 const comparison = /^(<=|>=|<|>|=)?(\d+)$/.exec(value);
                 if (!comparison || row.channels === null) return false;
@@ -147,8 +224,7 @@ export function search(library, query = '', { scopeFolder = '', showUnplayable =
                     default: return row.channels === expected;
                 }
             }
-            const text = field === 'path' ? [row.sourcePath, row.containerMember, row.memberPath].filter(Boolean).join('/') : row[field];
-            return text.toLowerCase().includes(value);
+            return library.fieldHaystacks[row.id][field].includes(value);
         })) continue;
         matches.push(row.id);
     }

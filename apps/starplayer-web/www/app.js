@@ -2327,7 +2327,7 @@ function userSeek(opcode, frame) {
     queueCommand(opcode, frame);
 }
 const libraryView = createLibraryView({ playlist, play: playLibraryRow });
-await wireLibraryControls({ state, loader: Loader, onLibrary: library => { libraryView.setLibrary(library); playlistControls.libraryChanged(library); } });
+await wireLibraryControls({ state, loader: Loader, onLibrary: library => { libraryView.setLibrary(library); playlistControls.libraryChanged(library); }, onComments: () => libraryView.refreshComments() });
 
 // `app.js` is a module and therefore deferred. This is the one honest signal that its
 // listeners are attached, which is what the headless harness waits on before clicking.

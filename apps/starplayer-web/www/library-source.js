@@ -1,3 +1,5 @@
+import { isCommentsCsvHeader } from './library-index.js';
+
 // Library roots expose bytes, never archive-member interpretation.
 export function checkAbort(signal) {
     if (signal?.aborted) throw new DOMException('Library request cancelled', 'AbortError');
@@ -9,9 +11,16 @@ function pathSegments(path) {
     return segments;
 }
 
-export function discoverIndex(paths) {
-    const candidates = [...paths].filter(path => !path.includes('/') && /\.csv$/i.test(path)).sort();
-    return { indexPath: candidates.find(path => path.toLowerCase() === 'index.csv') ?? (candidates.length === 1 ? candidates[0] : null), candidates };
+export async function discoverIndex(paths, readHead) {
+    const candidates = [], commentsCandidates = [];
+    for (const path of [...paths].filter(path => !path.includes('/') && /\.csv$/i.test(path)).sort()) {
+        try {
+            const header = (await readHead(path)).split('\n')[0].replace(/\r$/, '');
+            (isCommentsCsvHeader(header) ? commentsCandidates : candidates).push(path);
+        } catch { /* An unreadable header cannot take down the library. */ }
+    }
+    return { indexPath: candidates.find(path => path.toLowerCase() === 'index.csv') ?? (candidates.length === 1 ? candidates[0] : null), candidates,
+        commentsPath: commentsCandidates.length === 1 ? commentsCandidates[0] : null, commentsCandidates };
 }
 
 async function fileOperation(path, signal, operation) {
@@ -26,7 +35,7 @@ async function fileOperation(path, signal, operation) {
     }
 }
 
-export function createFileListSource(files) {
+export async function createFileListSource(files) {
     const entries = new Map();
     let label = 'library folder';
     for (const file of files) {
@@ -40,7 +49,8 @@ export function createFileListSource(files) {
         if (!entries.has(path)) throw new Error('file missing');
         return entries.get(path);
     };
-    return { kind: 'filelist', label, ...discoverIndex(entries.keys()),
+    const readHead = (path, bytes = 65536) => fileOperation(path, null, () => getFile(path).slice(0, bytes).text());
+    return { kind: 'filelist', label, readHead, ...await discoverIndex(entries.keys(), readHead),
         readFile: (path, { signal } = {}) => fileOperation(path, signal, () => getFile(path).arrayBuffer()),
         size: path => fileOperation(path, null, () => getFile(path).size) };
 }
@@ -54,7 +64,8 @@ export async function createDirectorySource(handle) {
         for (const segment of segments.slice(0, -1)) directory = await directory.getDirectoryHandle(segment);
         return (await directory.getFileHandle(segments.at(-1))).getFile();
     };
-    return { kind: 'directory', label: handle.name, handle, ...discoverIndex(paths),
+    const readHead = (path, bytes = 65536) => fileOperation(path, null, async () => (await getFile(path)).slice(0, bytes).text());
+    return { kind: 'directory', label: handle.name, handle, readHead, ...await discoverIndex(paths, readHead),
         readFile: (path, { signal } = {}) => fileOperation(path, signal, async () => (await getFile(path)).arrayBuffer()),
         size: path => fileOperation(path, null, async () => (await getFile(path)).size) };
 }

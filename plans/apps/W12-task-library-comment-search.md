@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W12, branch `library-playlist`) |
-| Status | Specified 2026-10-23 |
+| Status | Implemented 2026-10-23 on `library-playlist`; owner check on the Hornet mirror outstanding |
 | Depends on | [W7](W7-task-library-index-and-member-lookup.md), [W8](W8-task-library-sources-and-resolver.md), [W9](W9-task-library-view.md) |
 | Blocks | Landing `library-playlist` on `main` |
 | Recommended model | gpt-6.1-sol |
@@ -294,3 +294,60 @@ Rules for this task:
 - Ranking, fuzzy or edit-distance matching, stemming, an inverted index, Web Workers, and
   gzip input.
 - Persisting a manually chosen comments file across reloads.
+
+## Implementation evidence (2026-10-23)
+
+- Implemented checksum retention, optional inline text, sidecar parsing/attachment,
+  folded and compact search, and `text:`. Sidecar display and search strings are
+  shared for repeated checksums. Library identity continues to hash only index bytes
+  and the identity name.
+- Folder factories now finish asynchronous header discovery before returning their
+  sources. Header reads use bounded `File.slice().text()` and existing permissions.
+  HTTP uses the explicit comments mapping; optional sidecar loading starts after the
+  table paints, with stale-index and stale-attachment protection. A failed manual
+  replacement preserves the previous working attachment.
+- The focused-track region renders text nodes and literal-match marks, preserves
+  empty numbered slots and ASCII-art columns, and scrolls within its bounds. Visible
+  keyboard focus changes update selection and details without replacing grid rows.
+- Updated the existing phrase test because the requested compact matching now makes
+  `"blue sky"` match `Blue "Sky",` too. An additional `title:"blue sky"` assertion
+  preserves coverage of literal field-prefix matching.
+- `node --test apps/starplayer-web/test/*.test.mjs`: 58 passed, none skipped.
+  Generated 37,674-row comments CSV: 13,965,967 bytes including checksums and CSV
+  overhead. Parse + attach + tree: **772.7 ms**; plain comment search: **16.4 ms**;
+  `text:` search: **50.6 ms**. Existing index parse/search/title-sort/tree budgets
+  also passed (416.4 / 19.3 / 25.7 / 23.5 ms). Rough process heap: **306.5 MiB**,
+  **211.1 MiB** above the pre-parse reading, including fixture data and temporary
+  allocations; no heap assertion or forced GC.
+- Read-only Hornet check: 9,585 index rows, 9,204 comment entries, zero issues,
+  **9,286 joined tracks**, **0 unmatched entries**, **252** results for
+  `text:"purple motion"`. No real rows were copied into fixtures.
+- `cargo xtask wasm`: passed. The full required Chromium harness passed in `sab`,
+  `fallback` and `plain` modes. After the final UI adjustments, the rebuilt
+  library-only harness passed in all three modes too. `cargo xtask ci`: **11 jobs
+  passed**, including host tests, conformance, RT safety, goldens, SIMD, FMA policy,
+  trace zero cost, WASM, bare-metal no-std, clippy and no-std purity.
+- No staging, commits, other git-state changes, `cargo fmt`, or writes to either
+  external music/ModDNA tree. This task remains here until landing; the owner's
+  Hornet-browser and Windows folder-picker acceptance checks remain outstanding.
+
+## Coordinator review (2026-10-23)
+
+- Real Hornet data (Node, read-only): parse + comments + attach + tree **470 ms**, about
+  **79 MiB** retained after GC. Warm searches: `purplemotion` 252 rows in 7.8 ms;
+  `text:"future crew"` 88 rows in 5.1 ms; `skaven` 336 rows in 8.6 ms. Compact matching
+  runs over the joined slot lines, so a handle split across two instrument slots still
+  matches. That is deliberate, because authors often do it.
+- Fixed: `selectSource` bumped the library revision before the picker resolved, so
+  cancelling the picker while a sidecar loaded discarded it and left the summary on
+  "loading…". Picker attempts now have their own counter, and the library revision moves
+  only when a source arrives.
+- Fixed: a server without `--library-comments` reported "not loaded (HTTP 404)". It now
+  says there is none on the server and names the option.
+- Checked: no `innerHTML` with module text (the only `innerHTML` is the static tree icon
+  SVG). `dev-server.mjs --library-comments` served the real 6,603,346-byte file
+  byte-identical, matching ModDNA's SHA-256 `77f6b403…`.
+- Re-verified after the fixes: 58 Node tests, `cargo xtask wasm`, and the headless library
+  scenario in all three modes. The worker ran the full harness and `cargo xtask ci`
+  (11 jobs). My fixes touch only `library-controls.js`.
+

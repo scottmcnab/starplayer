@@ -180,7 +180,7 @@ async function startDevServer(isolate, libraryDirectory = null) {
     const port = await freePort();
     const argv = [DEV_SERVER, '--port', String(port), '--root', DIST];
     if (!isolate) argv.push('--no-isolation');
-    if (libraryDirectory) argv.push('--library', libraryDirectory);
+    if (libraryDirectory) argv.push('--library', libraryDirectory, '--library-comments', join(libraryDirectory, 'comments.csv'));
     const child = spawn(process.execPath, argv, { stdio: ['ignore', 'pipe', 'inherit'] });
     await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('the dev server did not start')), 10_000);
@@ -272,7 +272,7 @@ class Page {
         } else if (message.method === 'Log.entryAdded' && message.params.entry.level === 'error') {
             const entry = message.params.entry;
             // W8 deliberately probes this optional route on startup (also on reload).
-            if (entry.url?.endsWith('/library-index.csv') && entry.text.includes('404')) return;
+            if (['/library-index.csv', '/library-comments.csv'].some(path => entry.url?.endsWith(path)) && entry.text.includes('404')) return;
             this.consoleErrors.push(entry.text);
         }
     }
@@ -1234,14 +1234,15 @@ async function runLibrary(executable, mode) {
         await writeFile(join(directory, 'loose/REFLEX.S3M'), reflex);
         await writeFile(join(directory, 'disks/disk1.zip'), buildZip([{ name: 'PETRI.S3M', bytes: petri }, { name: 'REFLEX.S3M', bytes: reflex }]));
         await writeFile(join(directory, 'disks/outer.zip'), buildZip([{ name: 'inner.zip', bytes: buildZip([{ name: 'PETRI.S3M', bytes: petri }]) }]));
-        const header = 'member_path,title,source_path,container_member\n';
+        const header = 'member_path,title,source_path,container_member,sha256\n';
         await writeFile(join(directory, 'index.csv'), header + [
             ',Loose Reflex,loose/REFLEX.S3M,',
             'PETRI.S3M,Disk Petri,disks/disk1.zip,',
             'REFLEX.S3M,Disk Reflex,disks/disk1.zip,',
             'PETRI.S3M,Nested Petri,disks/outer.zip,inner.zip',
             'MISSING.S3M,Missing member,disks/disk1.zip,',
-        ].join('\n'));
+        ].map((row, index) => `${row},${index < 2 ? String(index + 1).repeat(64) : ''}`).join('\n'));
+        await writeFile(join(directory, 'comments.csv'), `sha256,instrument_names,song_message\n${'1'.repeat(64)},"Future-Crew\n\n<b>bold</b>","Hello\nMessage line two"\n${'2'.repeat(64)},Other group,`);
         server = await startDevServer(mode !== 'plain', directory);
         page = await Page.open(executable, `http://127.0.0.1:${server.port}/`);
         await page.waitFor('library startup', "document.documentElement.dataset.playerReady === 'true'");
@@ -1251,10 +1252,38 @@ async function runLibrary(executable, mode) {
         `);
         await page.waitFor('five library rows', "document.getElementById('library-count').textContent === '5 of 5'");
         const filter = async (value, expected) => {
-            await page.evaluate(`const input = document.getElementById('library-search'); input.value = ${JSON.stringify(value)}; input.dispatchEvent(new Event('input'));`);
+            await page.evaluate(`await new Promise(resolve => { const observer = new MutationObserver(() => { observer.disconnect(); requestAnimationFrame(resolve); }); observer.observe(document.getElementById('library-count'), { childList: true }); const input = document.getElementById('library-search'); input.value = ${JSON.stringify(value)}; input.dispatchEvent(new Event('input')); });`);
             await page.waitFor('filtered library count', `document.getElementById('library-count').textContent === ${JSON.stringify(expected)}`);
         };
         const clickRow = (id, modifiers = {}) => page.evaluate(`document.querySelector('[data-row-id="${id}"]').dispatchEvent(new MouseEvent('click', { bubbles: true, ...${JSON.stringify(modifiers)} }));`);
+        await page.waitFor('comments attached', "document.getElementById('library-summary').textContent.includes('2 tracks matched')");
+        await filter('text:futurecrew', '1 of 5');
+        await filter('futurecrew', '1 of 5');
+        await page.evaluate("document.getElementById('library-search-comments').click();");
+        await page.waitFor('comments excluded', "document.getElementById('library-count').textContent === '0 of 5'");
+        await filter('text:futurecrew', '1 of 5');
+        await page.evaluate("document.getElementById('library-search-comments').click();");
+        await filter('text:Future-Crew', '1 of 5');
+        await clickRow(0);
+        const details = await page.evaluate(`
+            const pane = document.getElementById('library-details');
+            return { hidden: pane.hidden, text: pane.textContent, instruments: pane.querySelector('pre').textContent, marks: [...pane.querySelectorAll('mark')].map(mark => mark.textContent), bold: pane.querySelectorAll('b').length };
+        `);
+        assert.equal(details.hidden, false);
+        assert.equal(details.instruments, '01  Future-Crew\n02  \n03  <b>bold</b>');
+        assert.deepEqual(details.marks, ['Future-Crew']);
+        assert.equal(details.bold, 0);
+        assert.ok(details.text.includes('Hello\nMessage line two'));
+        await filter('', '5 of 5');
+        await clickRow(4);
+        await page.evaluate("window.paintedLibraryRow = document.querySelector('#library-rows > div'); document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));");
+        assert.ok(await page.evaluate("return document.getElementById('library-details').textContent.includes('Other group');"));
+        assert.ok(await page.evaluate("return window.paintedLibraryRow === document.querySelector('#library-rows > div');"), 'focus updates details without replacing grid rows');
+        await clickRow(2);
+        assert.ok(await page.evaluate("return document.getElementById('library-details').textContent.includes('No comment text');"));
+        await page.send('Emulation.setDeviceMetricsOverride', { ...PHONE_VIEWPORT, deviceScaleFactor: 3, mobile: true });
+        assert.ok(await page.evaluate("return document.documentElement.scrollWidth <= 390;"));
+        await page.send('Emulation.clearDeviceMetricsOverride');
         await filter('title:Disk', '2 of 5');
         await clickRow(1);
         await clickRow(2, { shiftKey: true });

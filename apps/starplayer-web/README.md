@@ -4,6 +4,15 @@ The [library and playlist CSV contract](LIBRARY-CSV.md) describes indexes accept
 by the library data layer and the locator format used by library/playlist work.
 
 The **Library** section browses a folder or the dev server's `--library` source.
+Optional comments CSVs add instrument/sample names and song messages to search,
+with `text:` for comments only, a Search comments toggle and a focused-track details
+pane. Folder sources discover a sidecar by its header; Open comments CSV… attaches
+one until reload. To serve the Hornet index and comments from their external paths:
+
+```sh
+cargo xtask serve --library /mnt/d/hornet-music --library-index ../moddna/index/hornet/hornet-modules.csv --library-comments ../moddna/index/hornet/hornet-comments.csv
+```
+
 Search updates as you type (80 ms debounce); use `name:`, `title:`, `path:`,
 `format:`, `tracker:` and `ch:` prefixes, or quoted phrases. Sort with column
 headings, include unplayable formats with the checkbox, or browse directories,

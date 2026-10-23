@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, access } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
-import { parseCsv, parseLibraryCsv, compileQuery, search, buildTree, libraryIdentity, parsePlaylistCsv, toPlaylistCsv } from '../www/library-index.js';
+import { parseCsv, parseLibraryCsv, parseCommentsCsv, isCommentsCsvHeader, attachComments, foldText, compileQuery, search, buildTree, libraryIdentity, parsePlaylistCsv, toPlaylistCsv } from '../www/library-index.js';
 
 const hornetHeader = 'source_path,container_member,member_path,entry_kind,extension,format_by_extension,size,compressed_size,crc32,timestamp,compression_method,encrypted,member_path_raw_hex,source_url,status,error,sha256,crc_verified,format_detected,format_variant,channels,title,tracker,instrument_slots,instruments,samples,sample_bytes,extended_status,extended_error';
 const quote = value => /[",\r\n]/.test(String(value)) ? `"${String(value).replaceAll('"', '""')}"` : String(value);
@@ -78,7 +78,8 @@ test('first duplicate wins; row filtering and format fallback', () => {
 
 test('tokens, phrases, field prefixes, channel comparisons, scopes and formats', () => {
     assert.deepEqual(ids('BLUE sky'), [0, 1]);
-    assert.deepEqual(ids('"blue sky"'), [1]);
+    assert.deepEqual(ids('"blue sky"'), [0, 1], 'compact matching crosses punctuation');
+    assert.deepEqual(ids('title:"blue sky"'), [1], 'field prefixes retain substring matching');
     assert.deepEqual(ids('title:"green moon"'), [2]);
     assert.deepEqual(ids('format:XM name:beta tracker:FAST path:songs.zip'), [1]);
     assert.deepEqual(ids('ch:8'), [2]);
@@ -140,22 +141,40 @@ test('37,674 row scale budgets', () => {
     const random = () => { state = (Math.imul(state, 1664525) + 1013904223) >>> 0; return state; };
     const records = Array.from({ length: 37674 }, (_, index) => ({
         source_path: `music/${random() % 100}/pack${index % 200}.zip`, member_path: `track${index}.mod`,
+        sha256: index.toString(16).padStart(64, '0'),
         title: `${random() % 100000} blue sky${index % 31 === 0 ? ', "Moon"\nAgain' : ''}`, channels: 4 + random() % 16,
     }));
     const text = csv(records);
+    const commentsText = csv(records.map((record, index) => ({ sha256: record.sha256, instrument_names: `Purple Motion ${index}\n` + 'Synthetic sample greeting and ASCII art <===>. '.repeat(6) })), 'sha256,instrument_names');
+    const heapBefore = process.memoryUsage().heapUsed;
     let started = performance.now();
     const parsed = parseLibraryCsv(text);
-    const parseTime = performance.now() - started;
+    const indexParseTime = performance.now() - started;
+    attachComments(parsed, parseCommentsCsv(commentsText).comments);
+    const built = buildTree(parsed);
+    const combinedTime = performance.now() - started;
+    const parseTime = indexParseTime;
     assert.equal(parsed.rows.length, 37674);
     started = performance.now();
     assert.equal(search(parsed, 'blue sky').length, 37674);
     const searchTime = performance.now() - started;
+    started = performance.now();
+    assert.equal(search(parsed, 'text:purplemotion').length, 37674);
+    const commentsSearchTime = performance.now() - started;
+    started = performance.now();
+    assert.equal(search(parsed, 'purplemotion').length, 37674);
+    const plainCommentsTime = performance.now() - started;
     started = performance.now();
     search(parsed, '', { sort: { column: 'title' } });
     const sortTime = performance.now() - started;
     started = performance.now();
     assert.equal(buildTree(parsed).trackCount, 37674);
     const treeTime = performance.now() - started;
+    console.log(`Comments budget: ${Buffer.byteLength(commentsText)} bytes, parse + attach + tree ${combinedTime.toFixed(1)} ms, plain ${plainCommentsTime.toFixed(1)} ms, text ${commentsSearchTime.toFixed(1)} ms, heap ${(process.memoryUsage().heapUsed / 1048576).toFixed(1)} MiB (delta ${((process.memoryUsage().heapUsed - heapBefore) / 1048576).toFixed(1)} MiB)`);
+    assert.equal(built.trackCount, 37674);
+    assert.ok(combinedTime < 1500, `combined ${combinedTime} ms`);
+    assert.ok(plainCommentsTime < 60, `plain ${plainCommentsTime} ms`);
+    assert.ok(commentsSearchTime < 60, `text ${commentsSearchTime} ms`);
     console.log(`Scale timings: parse ${parseTime.toFixed(1)} ms, search ${searchTime.toFixed(1)} ms, title sort ${sortTime.toFixed(1)} ms, tree ${treeTime.toFixed(1)} ms`);
     assert.ok(parseTime < 1000, `parse ${parseTime} ms`);
     assert.ok(searchTime < 50, `search ${searchTime} ms`);
@@ -182,4 +201,74 @@ test('source paths reject empty segments and NUL; DOS member names retain locato
     assert.equal(library.rows[0].folder, 'pack.zip/bonus/inner.zip/music');
     const tree = buildTree(library);
     assert.equal(tree.children[0].children[0].children[0].kind, 'nested');
+});
+
+const firstSha = 'a'.repeat(64), secondSha = 'b'.repeat(64);
+test('comments CSV headers, multiline fields, invalid and duplicate hashes and blank records', () => {
+    const parsed = parseCommentsCsv(` SONG_MESSAGE ,SHA256,INSTRUMENT_NAMES,ignored\n"Hello\nWorld", ${firstSha.toUpperCase()} ,"One\n\nThree",x\n\nbad,nope,,\nsecond,${firstSha},ignored,`);
+    assert.equal(parsed.comments.size, 1);
+    assert.deepEqual(parsed.comments.get(firstSha), { instrumentNames: 'One\n\nThree', sampleNames: '', songMessage: 'Hello\nWorld' });
+    assert.deepEqual(parsed.issues, [{ line: 7, reason: 'invalid sha256' }, { line: 8, reason: 'duplicate sha256' }]);
+    assert.throws(() => parseCommentsCsv('instrument_names\nx'), /sha256/);
+    assert.throws(() => parseCommentsCsv('sha256,format\nx,it'), /instrument_names.*sample_names.*song_message/);
+    assert.throws(() => parseCommentsCsv('sha256,SHA256,song_message'), /Duplicate/);
+    assert.throws(() => parseCommentsCsv('sha256,song_message,unknown,UNKNOWN'), /Duplicate/);
+    assert.equal(isCommentsCsvHeader(hornetHeader), false);
+    assert.equal(isCommentsCsvHeader('sha256,format,instrument_names,sample_names,song_message'), true);
+    assert.equal(isCommentsCsvHeader('" SHA256 ","SONG_MESSAGE"'), true);
+    assert.equal(isCommentsCsvHeader('sha256,song_message,source_path'), false);
+    assert.equal(isCommentsCsvHeader('"unterminated'), false);
+});
+
+test('comment precedence, shared hashes, counts, replacement and detach retain inline text', () => {
+    const parsed = parseLibraryCsv(csv([
+        { source_path: 'a.mod', sha256: ` ${firstSha.toUpperCase()} `, instrument_names: 'Inline' },
+        { source_path: 'b.mod', sha256: firstSha, instrument_names: 'Inline' },
+        { source_path: 'c.mod', sha256: 'invalid', song_message: 'Standalone' },
+    ], 'source_path,sha256,instrument_names,song_message'));
+    assert.equal(parsed.rows[0].sha256, firstSha);
+    assert.equal(parsed.rows[2].sha256, '');
+    assert.equal(parsed.commentsFor(0).instrumentNames, 'Inline');
+    const sidecar = parseCommentsCsv(`sha256,instrument_names\n${firstSha},Sidecar\n${secondSha},Unused`).comments;
+    assert.deepEqual(attachComments(parsed, sidecar), { joined: 2, unmatched: 1 });
+    assert.ok(parsed.commentHaystacks[0] === parsed.commentHaystacks[1]);
+    assert.ok(parsed.compactCommentHaystacks[0] === parsed.compactCommentHaystacks[1]);
+    assert.ok(parsed.commentsFor(0) === parsed.commentsFor(1));
+    assert.equal(parsed.commentsFor(0).instrumentNames, 'Sidecar');
+    assert.equal(search(parsed, 'Inline').length, 0);
+    assert.deepEqual(attachComments(parsed, null), { joined: 0, unmatched: 0 });
+    assert.equal(parsed.commentsFor(0).instrumentNames, 'Inline');
+    assert.equal(search(parsed, 'Sidecar').length, 0);
+    assert.equal(search(parsed, 'Standalone').length, 1);
+});
+
+test('folding, compact matching and comment search options', () => {
+    assert.equal(foldText('Café ╬'), 'cafe ╬');
+    const parsed = parseLibraryCsv(csv([
+        { source_path: 'cafe.mod', title: 'Café', tracker: 'Träckér', instrument_names: 'Purple Motion\nP. Motion\nF.C. ╬' },
+        { source_path: 'purple-motion.mod', title: 'Other' },
+    ], 'source_path,title,tracker,instrument_names'));
+    for (const query of ['purplemotion', 'purple-motion', '"purple motion"', 'p.motion']) assert.ok(search(parsed, query).includes(0), query);
+    assert.equal(search(parsed, 'fc').length, 0);
+    assert.deepEqual([...search(parsed, 'cafe title:cafe tracker:tracker')], [0]);
+    assert.deepEqual([...search(parsed, 'text:purplemotion', { includeComments: false })], [0]);
+    assert.deepEqual([...search(parsed, 'purplemotion', { includeComments: false })], [1]);
+    assert.deepEqual([...search(parsed, 'purplemotion')], [0, 1]);
+    assert.equal(search(parsed, 'name:purplemotion').length, 0);
+    assert.equal(search(parsed, 'text:cafe').length, 0);
+});
+
+test('local Hornet comments compatibility (read only)', async context => {
+    const directory = '/home/scott/projects/moddna/index/hornet/';
+    try { await access(directory + 'hornet-modules.csv'); await access(directory + 'hornet-comments.csv'); }
+    catch { context.skip('Local Hornet CSVs are absent'); return; }
+    const library = parseLibraryCsv(await readFile(directory + 'hornet-modules.csv', 'utf8'));
+    const parsed = parseCommentsCsv(await readFile(directory + 'hornet-comments.csv', 'utf8'));
+    const counts = attachComments(library, parsed.comments);
+    const matches = search(library, 'text:"purple motion"').length;
+    console.log(`Hornet comments: ${parsed.comments.size} modules, ${parsed.issues.length} issues, joined ${counts.joined}, unmatched ${counts.unmatched}, Purple Motion ${matches}`);
+    assert.deepEqual(parsed.issues, []);
+    assert.equal(counts.unmatched, 0);
+    assert.ok(counts.joined > 9000);
+    assert.ok(matches >= 100);
 });

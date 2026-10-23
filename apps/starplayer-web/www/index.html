@@ -57,6 +57,8 @@
                 <button id="library-folder" type="button">Open library folder</button>
                 <button id="library-reconnect" type="button" hidden>Reconnect</button>
                 <button id="library-open-index" type="button">Open index CSV…</button>
+                <button id="library-open-comments" type="button" disabled>Open comments CSV…</button>
+                <input id="library-comments" type="file" accept=".csv,text/csv" hidden>
                 <button id="library-server" type="button" hidden>Server library</button>
                 <input id="library-files" type="file" webkitdirectory multiple hidden>
                 <input id="library-index" type="file" accept=".csv,text/csv" hidden>
@@ -110,12 +112,13 @@
             <div class="library-toolbar">
                 <label>Search <input id="library-search" type="search" aria-describedby="library-query-hint"></label>
                 <select id="library-format" aria-label="Format"><option value="">All formats</option></select>
+                <label id="library-comments-toggle" hidden><input id="library-search-comments" type="checkbox" checked> Search comments</label>
                 <label><input id="library-unplayable" type="checkbox"> Show unplayable</label>
                 <label><input id="library-browse" type="checkbox"> Browse folders</label>
                 <button id="library-add-selected" type="button" disabled>Add selected</button>
                 <output id="library-count" aria-live="polite"></output>
             </div>
-            <p id="library-query-hint" class="library-hint">Search names, titles and paths; prefixes: name:, title:, path:, format:, tracker:, ch:8, ch:&gt;8. Use quotes for phrases.</p>
+            <p id="library-query-hint" class="library-hint">Search names, titles and paths; prefixes: name:, title:, path:, format:, tracker:, text:, ch:8, ch:&gt;8. Use quotes for phrases, e.g. "purple motion" or purplemotion.</p>
             <p id="library-selection-hint" class="library-hint">Click, Ctrl/⌘-click or Shift-click to select. Ctrl/⌘+A selects all results; Escape clears. Arrows, Home/End and PageUp/Down move; Shift extends. Enter plays; + or Insert adds. A row’s + adds the selection, selecting that row first if needed. Hidden rows stay selected; actions use only playable rows in the current result.</p>
             <div id="library-body" class="library-body">
                 <div id="library-folders" hidden>
@@ -132,6 +135,10 @@
                     </div>
                 </div>
             </div>
+            <section id="library-details" role="region" aria-labelledby="library-details-title" hidden>
+                <h3 id="library-details-title"></h3>
+                <div id="library-details-content"></div>
+            </section>
             <p id="library-selection-count" class="library-hint"></p>
         </div>
     </details>

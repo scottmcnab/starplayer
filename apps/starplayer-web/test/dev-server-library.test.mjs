@@ -82,7 +82,38 @@ test('library routes serve only mapped files and reject traversal, symlinks and 
         assert.equal((await get(server.port, '/library-index.csv')).body, 'wrong index');
         await server.stop(); server = null;
         server = await startServer(root);
-        for (const path of ['/library/song.mod', '/library-index.csv']) assert.equal((await get(server.port, path)).status, 404);
+        for (const path of ['/library/song.mod', '/library-index.csv', '/library-comments.csv']) assert.equal((await get(server.port, path)).status, 404);
+    } finally {
+        if (server) await server.stop();
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test('comments mapping is explicit, supports GET/HEAD, and missing mapped files are 404', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'starplayer-comments-'));
+    let server;
+    try {
+        await writeFile(join(root, 'index.html'), 'page');
+        const path = join(root, 'sidecar.csv');
+        const text = 'sha256,song_message\n' + 'a'.repeat(64) + ',Hello';
+        await writeFile(path, text);
+        // A document-root file must never become an implicit mapping.
+        await writeFile(join(root, 'library-comments.csv'), 'private');
+        server = await startServer(root);
+        assert.equal((await get(server.port, '/library-comments.csv')).status, 404);
+        await server.stop(); server = null;
+        server = await startServer(root, ['--library-comments', path]);
+        const response = await get(server.port, '/library-comments.csv');
+        assert.equal(response.status, 200);
+        assert.equal(response.body, text);
+        assert.equal(response.headers['content-type'], 'text/csv; charset=utf-8');
+        const head = await get(server.port, '/library-comments.csv', 'HEAD');
+        assert.equal(head.status, 200);
+        assert.equal(head.body, '');
+        assert.equal(head.headers['content-length'], String(Buffer.byteLength(text)));
+        await rm(path);
+        assert.equal((await get(server.port, '/library-comments.csv')).status, 404);
+        assert.equal((await get(server.port, '/library-comments.csv', 'HEAD')).status, 404);
     } finally {
         if (server) await server.stop();
         await rm(root, { recursive: true, force: true });
