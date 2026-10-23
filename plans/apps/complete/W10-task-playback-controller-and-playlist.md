@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W11, branch `library-playlist`) |
-| Status | Implemented 2026-10-21 on `library-playlist`; owner check with a Hornet disk in a background tab outstanding |
+| Status | **Complete** — landed on `main` 2026-10-23; owner checked auto-advance and an imploded track (`songs/1994/brother.zip`) 2026-10-23 |
 | Depends on | [W9](W9-task-library-view.md) |
 | Blocks | [W11](W11-task-playlist-uploads-and-persistence.md) |
 | Recommended model | gpt-6-astra |

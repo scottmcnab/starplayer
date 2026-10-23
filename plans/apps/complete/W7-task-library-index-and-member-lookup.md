@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W11, branch `library-playlist`) |
-| Status | Implemented 2026-10-21 on `library-playlist` |
+| Status | **Complete** — landed on `main` 2026-10-23 (`library-playlist`); the Hornet index loads in the owner's browser check |
 | Depends on | B8/B10 (`starplayer-archive`, landed) |
 | Blocks | [W8](W8-task-library-sources-and-resolver.md), [W9](W9-task-library-view.md), [W10](W10-task-playback-controller-and-playlist.md), [W11](W11-task-playlist-uploads-and-persistence.md) |
 | Recommended model | gpt-6.1-sol |

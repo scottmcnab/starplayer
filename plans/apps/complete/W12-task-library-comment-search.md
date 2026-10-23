@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W12, branch `library-playlist`) |
-| Status | Implemented 2026-10-23 on `library-playlist`; owner check on the Hornet mirror outstanding |
+| Status | **Complete** — landed on `main` 2026-10-23; owner checked comment search and `-` exclusions on the Hornet mirror 2026-10-23 |
 | Depends on | [W7](W7-task-library-index-and-member-lookup.md), [W8](W8-task-library-sources-and-resolver.md), [W9](W9-task-library-view.md) |
 | Blocks | Landing `library-playlist` on `main` |
 | Recommended model | gpt-6.1-sol |

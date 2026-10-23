@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W11, branch `library-playlist`) |
-| Status | Implemented 2026-10-21 on `library-playlist`; owner check of the external folder picker and permission regrant outstanding |
+| Status | **Complete** — landed on `main` 2026-10-23; owner checked the server library and the Edge folder picker on `D:\hornet-music` 2026-10-23 (Reconnect after reload not separately reported) |
 | Depends on | [W7](W7-task-library-index-and-member-lookup.md) (interfaces, `library-index.js`, `archive_extract_path`) |
 | Blocks | [W9](W9-task-library-view.md), [W10](W10-task-playback-controller-and-playlist.md), [W11](W11-task-playlist-uploads-and-persistence.md) |
 | Recommended model | gpt-6.1-sol |

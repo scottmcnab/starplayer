@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library and playlist (W7–W11, branch `library-playlist`) |
-| Status | Implemented 2026-10-21 on `library-playlist`; owner check on the Hornet library outstanding |
+| Status | **Complete** — landed on `main` 2026-10-23; owner-checked on the Hornet mirror 2026-10-23 after the tree and selection follow-ups |
 | Depends on | [W7](W7-task-library-index-and-member-lookup.md), [W8](W8-task-library-sources-and-resolver.md) |
 | Blocks | [W10](W10-task-playback-controller-and-playlist.md) |
 | Recommended model | gpt-6-astra |
