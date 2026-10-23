@@ -351,3 +351,31 @@ Rules for this task:
   scenario in all three modes. The worker ran the full harness and `cargo xtask ci`
   (11 jobs). My fixes touch only `library-controls.js`.
 
+
+## Owner follow-ups (2026-10-23)
+
+- **Comment match column and hover popover.**
+  - **Column.** While a query can match comment text (free text with **Search comments**
+    ticked, or `text:`), the grid gains a **Comment match** column. It shows the best
+    matching line, labelled `#07` for an instrument slot, `smp 03` for a sample or `msg 2`
+    for a message line, starting near the match when the line is long, plus `+N` for more
+    matching lines.
+  - **Popover.** Hovering a row for 250 ms opens a mouse-only popover listing up to 12
+    matching lines. The details pane remains the keyboard and screen-reader route to the
+    same text.
+  - **Shared helpers.** `matchRanges` folds each code point on its own and keeps its source
+    span, so highlights follow the search's folding and compact rules exactly.
+    `commentMatchLines` falls back to adjacent line pairs when a compact match straddles
+    two slots. The details pane uses the same highlighter.
+- **Negation.** A leading `-` outside quotes excludes rows that the rest of the token
+  matches, under that token's usual rules (`oxygen -oxygene`, `-text:remix`, `-format:mod`,
+  `-ch:>8`). `"-=FC=-"` stays literal. An empty exclusion such as `-text:` is ignored,
+  because it would hide every row. Excluded tokens are never highlighted.
+- **Search cost.**
+  - **One scan.** A folded hit implies a compact hit, so a token whose compact form has at
+    least 4 characters scans only the compact haystack, halving the cost of a non-matching
+    row.
+  - **Budget methodology.** The first comment search after loading costs 40–60 ms of
+    one-off JIT and first-touch work, and warm keystrokes cost about 5 ms. The budget test
+    therefore warms up with other terms, logs that first search separately, and keeps its
+    60 ms limit for a keystroke.

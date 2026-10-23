@@ -88,6 +88,11 @@ keep phrases together. Prefixes are `format:`, `title:`, `name:`, `path:` and
 `tracker:`. `path:` includes archive and member paths. Examples: `blue sky`,
 `title:"night flight"`, `format:xm ch:>8`, `ch:<=4`. `ch:8` tests exact equality;
 `<`, `>`, `<=`, `>=` and `=` are supported. Missing channels never match `ch:`.
+A leading `-` excludes rows that the rest of the token matches, under the same rules
+(prefix, folding, compact matching, and the comments checkbox): `oxygen -oxygene`,
+`-text:remix`, `-format:mod`, `-ch:>8`, `-"some phrase"`. A dash inside quotes is
+literal (`"-=FC=-"` searches for that text), and an empty exclusion such as `-text:`
+is ignored.
 Folder scope includes that folder and its descendants. Sort columns are `name`,
 `title`, `format`, `channels`, `size`, `timestamp`, `folder`. Text sort keys are
 lower-case lexical strings, computed at parse time; ties use folder, then name,
@@ -201,7 +206,9 @@ compact form with punctuation and spacing removed, when the compact token has at
 least four letters/digits: `purplemotion`, `purple-motion` and `"purple motion"`
 match `Purple Motion`; `p.motion` matches `P. Motion`. `fc` does not compact-match.
 Other field prefixes use folded substring matching without compaction. The details
-pane highlights literal, case-insensitive matches and preserves numbered empty slots.
+pane, the **Comment match** column and the hover popover highlight what matched under
+these same rules (excluded tokens are never highlighted), and the pane preserves
+numbered empty slots.
 
 Three synthetic module rows (the first has a multiline field):
 

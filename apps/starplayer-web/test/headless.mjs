@@ -1274,7 +1274,18 @@ async function runLibrary(executable, mode) {
         assert.deepEqual(details.marks, ['Future-Crew']);
         assert.equal(details.bold, 0);
         assert.ok(details.text.includes('Hello\nMessage line two'));
+        // The match column and a real hover's popover highlight the comment line the row matched on, as text only.
+        const matchCell = await page.evaluate("const cell = document.querySelector('.library-comment-cell'); return { visible: getComputedStyle(document.querySelector('.library-comment-heading')).display !== 'none', text: cell.textContent, marks: [...cell.querySelectorAll('mark')].map(mark => mark.textContent) };");
+        assert.deepEqual(matchCell, { visible: true, text: '#01Future-Crew', marks: ['Future-Crew'] });
+        const hoverPoint = await page.evaluate("const row = document.querySelector('#library-rows > div'); row.scrollIntoView({ block: 'center' }); const bounds = row.getBoundingClientRect(); return { x: bounds.x + 60, y: bounds.y + 16 };");
+        await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...hoverPoint });
+        await page.waitFor('comment match popover', "!document.getElementById('library-match-popover').hidden");
+        const popover = await page.evaluate("const popover = document.getElementById('library-match-popover'); return { text: popover.textContent, marks: [...popover.querySelectorAll('mark')].map(mark => mark.textContent), bold: popover.querySelectorAll('b').length };");
+        assert.ok(popover.text.includes('Instrument 01'), popover.text);
+        assert.deepEqual(popover.marks, ['Future-Crew']);
+        assert.equal(popover.bold, 0);
         await filter('', '5 of 5');
+        assert.ok(await page.evaluate("return document.getElementById('library-match-popover').hidden && !document.querySelector('.library-comment-cell') && getComputedStyle(document.querySelector('.library-comment-heading')).display === 'none';"));
         await clickRow(4);
         await page.evaluate("window.paintedLibraryRow = document.querySelector('#library-rows > div'); document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));");
         assert.ok(await page.evaluate("return document.getElementById('library-details').textContent.includes('Other group');"));

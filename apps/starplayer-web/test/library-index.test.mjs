@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, access } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
-import { parseCsv, parseLibraryCsv, parseCommentsCsv, isCommentsCsvHeader, attachComments, foldText, compileQuery, search, buildTree, libraryIdentity, parsePlaylistCsv, toPlaylistCsv } from '../www/library-index.js';
+import { parseCsv, parseLibraryCsv, parseCommentsCsv, isCommentsCsvHeader, attachComments, foldText, compileQuery, commentTokens, matchRanges, commentMatchLines, search, buildTree, libraryIdentity, parsePlaylistCsv, toPlaylistCsv } from '../www/library-index.js';
 
 const hornetHeader = 'source_path,container_member,member_path,entry_kind,extension,format_by_extension,size,compressed_size,crc32,timestamp,compression_method,encrypted,member_path_raw_hex,source_url,status,error,sha256,crc_verified,format_detected,format_variant,channels,title,tracker,instrument_slots,instruments,samples,sample_bytes,extended_status,extended_error';
 const quote = value => /[",\r\n]/.test(String(value)) ? `"${String(value).replaceAll('"', '""')}"` : String(value);
@@ -158,6 +158,12 @@ test('37,674 row scale budgets', () => {
     started = performance.now();
     assert.equal(search(parsed, 'blue sky').length, 37674);
     const searchTime = performance.now() - started;
+    // The first comment search after loading pays one-off JIT and first-touch costs
+    // (about 40 ms); the budget is for a keystroke, so warm up with other terms first.
+    started = performance.now();
+    search(parsed, 'text:warmup');
+    const coldCommentsTime = performance.now() - started;
+    search(parsed, 'warmup');
     started = performance.now();
     assert.equal(search(parsed, 'text:purplemotion').length, 37674);
     const commentsSearchTime = performance.now() - started;
@@ -170,7 +176,7 @@ test('37,674 row scale budgets', () => {
     started = performance.now();
     assert.equal(buildTree(parsed).trackCount, 37674);
     const treeTime = performance.now() - started;
-    console.log(`Comments budget: ${Buffer.byteLength(commentsText)} bytes, parse + attach + tree ${combinedTime.toFixed(1)} ms, plain ${plainCommentsTime.toFixed(1)} ms, text ${commentsSearchTime.toFixed(1)} ms, heap ${(process.memoryUsage().heapUsed / 1048576).toFixed(1)} MiB (delta ${((process.memoryUsage().heapUsed - heapBefore) / 1048576).toFixed(1)} MiB)`);
+    console.log(`Comments budget: ${Buffer.byteLength(commentsText)} bytes, parse + attach + tree ${combinedTime.toFixed(1)} ms, first comment search ${coldCommentsTime.toFixed(1)} ms, plain ${plainCommentsTime.toFixed(1)} ms, text ${commentsSearchTime.toFixed(1)} ms, heap ${(process.memoryUsage().heapUsed / 1048576).toFixed(1)} MiB (delta ${((process.memoryUsage().heapUsed - heapBefore) / 1048576).toFixed(1)} MiB)`);
     assert.equal(built.trackCount, 37674);
     assert.ok(combinedTime < 1500, `combined ${combinedTime} ms`);
     assert.ok(plainCommentsTime < 60, `plain ${plainCommentsTime} ms`);
@@ -256,6 +262,43 @@ test('folding, compact matching and comment search options', () => {
     assert.deepEqual([...search(parsed, 'purplemotion')], [0, 1]);
     assert.equal(search(parsed, 'name:purplemotion').length, 0);
     assert.equal(search(parsed, 'text:cafe').length, 0);
+});
+
+test('match ranges and snippet lines follow the search rules', () => {
+    const tokens = query => commentTokens(compileQuery(query));
+    assert.deepEqual(commentTokens(compileQuery('xm title:foo text:bar baz text:')).map(token => token.value), ['xm', 'bar', 'baz']);
+    assert.deepEqual(commentTokens(compileQuery('xm text:bar'), { includeComments: false }).map(token => token.value), ['bar']);
+    // Compact, folded and literal hits map back to the original text, merged where they overlap.
+    assert.deepEqual(matchRanges('by Purple Motion / FC', tokens('purplemotion')), [[3, 16]]);
+    assert.deepEqual(matchRanges('Café Café', tokens('cafe')), [[0, 4], [5, 9]]);
+    assert.deepEqual(matchRanges('Future-Crew', tokens('future-crew')), [[0, 11]]);
+    assert.deepEqual(matchRanges('a.b.c fc', tokens('fc')), [[6, 8]]);
+    assert.deepEqual(matchRanges('😀 Skaven', tokens('skaven')), [[3, 9]]);
+    const comments = { instrumentNames: 'intro\nby Purple\nMotion of FC\n\ngreets', sampleNames: '', songMessage: 'Hello Purple Motion' };
+    assert.deepEqual(commentMatchLines(comments, tokens('purple-motion')), [
+        { section: 'instrumentNames', first: 1, last: 2, text: 'by Purple\nMotion of FC', ranges: [[3, 16]] },
+        { section: 'songMessage', first: 0, last: 0, text: 'Hello Purple Motion', ranges: [[6, 19]] },
+    ]);
+    assert.deepEqual(commentMatchLines(comments, tokens('greets')).map(hit => [hit.first, hit.ranges]), [[4, [[0, 6]]]]);
+    assert.deepEqual(commentMatchLines(comments, []), []);
+    assert.deepEqual(commentMatchLines(null, tokens('greets')), []);
+});
+
+test('a leading minus excludes rows the rest of the token matches', () => {
+    const library = parseLibraryCsv(`source_path,title,channels,sha256\na/ONE.S3M,Oxygen,4,${'1'.repeat(64)}\na/TWO.XM,Oxygene remix,12,\na/THREE.S3M,Air,,${'3'.repeat(64)}\n`);
+    attachComments(library, new Map([['1'.repeat(64), { instrumentNames: 'by oxy-gene', sampleNames: '', songMessage: '' }], ['3'.repeat(64), { instrumentNames: 'oxygen tank', sampleNames: '', songMessage: '' }]]));
+    const names = (query, options) => Array.from(search(library, query, options), id => library.rows[id].name);
+    assert.deepEqual(names('oxygen'), ['ONE.S3M', 'TWO.XM', 'THREE.S3M']);
+    // ONE.S3M is excluded by its comment, through compact matching, even though its title is "Oxygen".
+    assert.deepEqual(names('oxygen -oxygene'), ['THREE.S3M']);
+    assert.deepEqual(names('oxygen -oxygene', { includeComments: false }), ['ONE.S3M']);
+    assert.deepEqual(names('oxygen -text:oxygene'), ['TWO.XM', 'THREE.S3M']);
+    assert.deepEqual(names('oxygen -title:oxygene'), ['ONE.S3M', 'THREE.S3M']);
+    assert.deepEqual(names('-format:s3m -"oxygene remix"'), []);
+    assert.deepEqual(names('-ch:>8'), ['ONE.S3M', 'THREE.S3M']);
+    assert.deepEqual(names('-text:'), ['ONE.S3M', 'TWO.XM', 'THREE.S3M']);
+    assert.deepEqual(compileQuery('"-=FC=-" - -x').map(token => [token.value, token.negated]), [['-=fc=-', false], ['-', false], ['x', true]]);
+    assert.deepEqual(commentTokens(compileQuery('oxygen -oxygene')).map(token => token.value), ['oxygen']);
 });
 
 test('local Hornet comments compatibility (read only)', async context => {

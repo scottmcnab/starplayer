@@ -1,4 +1,4 @@
-import { buildTree, compileQuery, search } from './library-index.js';
+import { buildTree, commentMatchLines, commentTokens, compileQuery, matchRanges, search } from './library-index.js';
 import { createSelection, moveFocus, selectAll, selectRow, virtualWindow } from './library-selection.js';
 import { libraryLocator } from './playlist.js';
 
@@ -11,6 +11,34 @@ function icon(markup) {
     return template;
 }
 let FOLDER_ICON, ARCHIVE_ICON;
+const SECTION_LABELS = { instrumentNames: ['#', 'Instrument'], sampleNames: ['smp ', 'Sample'], songMessage: ['msg ', 'Message line'] };
+// Module text only ever reaches the page as text nodes; `ranges` come from `matchRanges`.
+function highlight(text, ranges, separator = null) {
+    const fragment = document.createDocumentFragment();
+    const piece = value => document.createTextNode(separator === null ? value : value.replaceAll('\n', separator));
+    let offset = 0;
+    for (const [start, end] of ranges) {
+        fragment.append(piece(text.slice(offset, start)));
+        const mark = document.createElement('mark');
+        mark.append(piece(text.slice(start, end)));
+        fragment.append(mark);
+        offset = end;
+    }
+    fragment.append(piece(text.slice(offset)));
+    return fragment;
+}
+function lineLabel(hit, long = false) {
+    const [short, title] = SECTION_LABELS[hit.section];
+    const number = value => String(value + 1).padStart(2, '0');
+    const lines = hit.first === hit.last ? number(hit.first) : `${number(hit.first)}–${number(hit.last)}`;
+    return long ? `${title} ${lines}` : `${short}${lines}`;
+}
+// Starts a long line near its first match, so the cell's ellipsis cannot hide it.
+function excerpt(hit) {
+    const cut = hit.ranges.length && hit.ranges[0][0] > 16 ? hit.ranges[0][0] - 8 : 0;
+    if (!cut) return hit;
+    return { ...hit, text: `…${hit.text.slice(cut)}`, ranges: hit.ranges.map(([start, end]) => [start - cut + 1, end - cut + 1]) };
+}
 function node(tag, text, className) {
     const result = document.createElement(tag);
     if (text !== undefined) result.textContent = text;
@@ -38,12 +66,49 @@ export function createLibraryView({ playlist, play }) {
     let frame = null;
     const expanded = new Set();
     let detailsKey = null;
+    let matchTokens = [];
+    const matchCache = new Map();
+    const popover = node('div', undefined, 'library-match-popover');
+    popover.id = 'library-match-popover';
+    popover.setAttribute('role', 'tooltip');
+    popover.hidden = true;
+    document.body.append(popover);
+    let popoverTimer = null;
+    let popoverRow = null;
+
+    function matchesFor(id) {
+        if (!matchCache.has(id)) matchCache.set(id, commentMatchLines(context.library.commentsFor(id), matchTokens));
+        return matchCache.get(id);
+    }
+    function hidePopover() {
+        clearTimeout(popoverTimer);
+        popoverRow = null;
+        popover.hidden = true;
+    }
+    function showPopover(line, pointerX) {
+        const hits = matchesFor(Number(line.dataset.rowId));
+        if (!hits.length) { hidePopover(); return; }
+        const row = context.library.rows[Number(line.dataset.rowId)];
+        const limit = 12;
+        popover.replaceChildren(node('strong', [row.name, row.title].filter(Boolean).join(' — ')));
+        for (const hit of hits.slice(0, limit)) {
+            const entry = node('div', undefined, 'library-match-line');
+            entry.append(node('span', lineLabel(hit, true), 'library-match-label'), highlight(hit.text, hit.ranges));
+            popover.append(entry);
+        }
+        if (hits.length > limit) popover.append(node('p', `${hits.length - limit} more matching lines; focus the row to see all comment text.`, 'library-hint'));
+        popover.hidden = false;
+        const bounds = line.getBoundingClientRect();
+        const width = popover.offsetWidth, height = popover.offsetHeight;
+        popover.style.left = `${Math.max(8, Math.min(pointerX - 24, innerWidth - width - 8))}px`;
+        popover.style.top = `${bounds.bottom + 4 + height > innerHeight ? Math.max(8, bounds.top - 4 - height) : bounds.bottom + 4}px`;
+    }
 
     function renderDetails() {
         const pane = element('details');
         pane.hidden = !context?.library.hasComments || selection.focus === null;
         if (pane.hidden) { detailsKey = null; return; }
-        const key = `${selection.focus}\n${element('search').value}`;
+        const key = `${selection.focus}\n${element('search').value}\n${element('search-comments').checked}`;
         if (key === detailsKey) return;
         detailsKey = key;
         const row = context.library.rows[selection.focus];
@@ -51,19 +116,7 @@ export function createLibraryView({ playlist, play }) {
         element('details-title').textContent = [row.name, row.title].filter(Boolean).join(' — ');
         const content = element('details-content');
         content.replaceChildren();
-        const tokens = compileQuery(element('search').value).filter(token => !token.field || token.field === 'text').map(token => token.literal).filter(Boolean);
-        const escaped = tokens.sort((left, right) => right.length - left.length).map(token => token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-        const pattern = escaped.length ? new RegExp(escaped.join('|'), 'giu') : null;
-        function highlighted(text) {
-            const fragment = document.createDocumentFragment();
-            let offset = 0;
-            if (pattern) for (const match of text.matchAll(pattern)) {
-                fragment.append(document.createTextNode(text.slice(offset, match.index)), node('mark', match[0]));
-                offset = match.index + match[0].length;
-            }
-            fragment.append(document.createTextNode(text.slice(offset)));
-            return fragment;
-        }
+        const highlighted = text => highlight(text, matchTokens.length ? matchRanges(text, matchTokens) : []);
         const comments = context.library.commentsFor(row.id);
         for (const [field, title] of [['instrumentNames', 'Instrument names'], ['sampleNames', 'Sample names'], ['songMessage', 'Song message']]) {
             const text = comments[field];
@@ -124,6 +177,17 @@ export function createLibraryView({ playlist, play }) {
                 cell.title = cell.textContent;
                 line.append(cell);
             }
+            if (matchTokens.length) {
+                const cell = node('span', undefined, 'library-comment-cell');
+                cell.setAttribute('role', 'gridcell');
+                const hits = matchesFor(row.id);
+                if (hits.length) {
+                    const first = excerpt(hits[0]);
+                    cell.append(node('span', lineLabel(first), 'library-match-label'), highlight(first.text, first.ranges, ' / '));
+                    if (hits.length > 1) cell.append(node('span', ` +${hits.length - 1}`, 'library-match-more'));
+                }
+                line.append(cell);
+            }
             const cell = node('span');
             cell.setAttribute('role', 'gridcell');
             const button = node('button', '+');
@@ -159,9 +223,17 @@ export function createLibraryView({ playlist, play }) {
     function refresh() {
         clearTimeout(timer);
         if (!context) return;
-        order = search(context.library, compileQuery(element('search').value), {
-            scopeFolder, includeComments: element('search-comments').checked, showUnplayable: element('unplayable').checked, format: element('format').value, sort,
+        const tokens = compileQuery(element('search').value);
+        const includeComments = element('search-comments').checked;
+        order = search(context.library, tokens, {
+            scopeFolder, includeComments, showUnplayable: element('unplayable').checked, format: element('format').value, sort,
         });
+        // The match column appears only while a query can match comment text.
+        matchTokens = context.library.hasComments ? commentTokens(tokens, { includeComments }) : [];
+        matchCache.clear();
+        hidePopover();
+        grid.classList.toggle('comment-matches', matchTokens.length > 0);
+        grid.setAttribute('aria-colcount', String(matchTokens.length ? 9 : 8));
         element('count').textContent = `${order.length.toLocaleString('en-US')} of ${context.library.rows.length.toLocaleString('en-US')}`;
         element('scope').textContent = element('scope').title = scopeFolder || 'All folders';
         grid.setAttribute('aria-rowcount', String(order.length + 1));
@@ -280,6 +352,9 @@ export function createLibraryView({ playlist, play }) {
         header.append(button);
         heading.append(header);
     }
+    const matchHeader = node('div', 'Comment match', 'library-comment-heading');
+    matchHeader.setAttribute('role', 'columnheader');
+    heading.append(matchHeader);
     const actionHeader = node('div', 'Add');
     actionHeader.setAttribute('role', 'columnheader');
     heading.append(actionHeader);
@@ -333,6 +408,18 @@ export function createLibraryView({ playlist, play }) {
         if (selection.focus === null || document.getElementById(`library-row-${selection.focus}`)) updateSelection();
         else renderRows();
     });
+    // Mouse-only preview of a row's matching comment lines; the details pane is the
+    // keyboard and screen-reader route to the same text.
+    rows.addEventListener('mouseover', event => {
+        const line = event.target.closest('[data-row-id]');
+        if (!matchTokens.length || !line || line === popoverRow) return;
+        hidePopover();
+        popoverRow = line;
+        const pointerX = event.clientX;
+        popoverTimer = setTimeout(() => { if (popoverRow === line && line.isConnected) showPopover(line, pointerX); }, 250);
+    });
+    rows.addEventListener('mouseleave', hidePopover);
+    viewport.addEventListener('scroll', hidePopover, { passive: true });
     viewport.addEventListener('scroll', scheduleRows, { passive: true });
     new ResizeObserver(scheduleRows).observe(viewport);
     return {

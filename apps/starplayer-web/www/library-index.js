@@ -189,43 +189,57 @@ export async function libraryIdentity(bytes, name) {
 
 export function compileQuery(text) {
     const tokens = [];
-    // Quotes can follow a field prefix: title:"a phrase".
+    // Quotes can follow a field prefix: title:"a phrase". A leading `-` outside quotes
+    // excludes rows the rest of the token matches; `"-=FC=-"` stays a literal search.
     for (const match of text.matchAll(/(?:[^\s"]|"[^"]*")+/g)) {
-        const literal = match[0].replaceAll('"', '');
+        const negated = match[0].length > 1 && match[0].startsWith('-');
+        const literal = (negated ? match[0].slice(1) : match[0]).replaceAll('"', '');
         const token = foldText(literal);
         const colon = token.indexOf(':');
         const field = colon >= 0 ? token.slice(0, colon) : '';
-        tokens.push(['format', 'title', 'name', 'path', 'tracker', 'ch', 'text'].includes(field) ? { field, value: field === 'format' ? literal.slice(colon + 1).toLowerCase() : token.slice(colon + 1), literal: literal.slice(colon + 1), compact: compactText(token.slice(colon + 1)) } : { field: '', value: token, literal, compact: compactText(token) });
+        const compiled = ['format', 'title', 'name', 'path', 'tracker', 'ch', 'text'].includes(field) ? { field, value: field === 'format' ? literal.slice(colon + 1).toLowerCase() : token.slice(colon + 1), literal: literal.slice(colon + 1), compact: compactText(token.slice(colon + 1)) } : { field: '', value: token, literal, compact: compactText(token) };
+        // An empty exclusion (`-text:`) would match, and so hide, every row.
+        if (negated && !compiled.value) continue;
+        tokens.push({ ...compiled, negated });
     }
     return tokens;
 }
 
+// A folded hit implies a compact hit (stripping the same characters from both keeps a
+// substring contiguous), so tokens long enough to compact-match need only one scan.
+function contains(haystack, compactHaystack, { value, compact }) {
+    return compact.length >= 4 ? compactHaystack.includes(compact) : haystack.includes(value);
+}
+
+function tokenMatches(library, row, token, includeComments) {
+    const { field, value } = token;
+    if (field === 'text') return contains(library.commentHaystacks[row.id], library.compactCommentHaystacks[row.id], token);
+    if (!field) return contains(library.haystacks[row.id], library.compactHaystacks[row.id], token) || includeComments && contains(library.commentHaystacks[row.id], library.compactCommentHaystacks[row.id], token);
+    if (field === 'format') return row.format.includes(value);
+    if (field === 'ch') {
+        const comparison = /^(<=|>=|<|>|=)?(\d+)$/.exec(value);
+        if (!comparison || row.channels === null) return false;
+        const expected = Number(comparison[2]);
+        switch (comparison[1]) {
+            case '<': return row.channels < expected;
+            case '>': return row.channels > expected;
+            case '<=': return row.channels <= expected;
+            case '>=': return row.channels >= expected;
+            default: return row.channels === expected;
+        }
+    }
+    return library.fieldHaystacks[row.id][field].includes(value);
+}
+
 export function search(library, query = '', { scopeFolder = '', showUnplayable = false, format = '', includeComments = true, sort } = {}) {
-    const tokens = typeof query === 'string' ? compileQuery(query) : query;
+    // Hand-built tokens may omit `compact`; compute it once, not per row.
+    const tokens = (typeof query === 'string' ? compileQuery(query) : query).map(token => token.compact === undefined ? { ...token, compact: compactText(token.value) } : token);
     const matches = [];
     const scope = scopeFolder.replace(/\/$/, '');
     for (const row of library.rows) {
         if (!showUnplayable && !row.playable || format && row.format !== format.toLowerCase()) continue;
         if (scope && row.folder !== scope && !row.folder.startsWith(`${scope}/`)) continue;
-        if (!tokens.every(({ field, value, compact = compactText(value) }) => {
-            const contains = (haystack, compactHaystack) => haystack.includes(value) || compact.length >= 4 && compactHaystack.includes(compact);
-            if (field === 'text') return contains(library.commentHaystacks[row.id], library.compactCommentHaystacks[row.id]);
-            if (!field) return contains(library.haystacks[row.id], library.compactHaystacks[row.id]) || includeComments && contains(library.commentHaystacks[row.id], library.compactCommentHaystacks[row.id]);
-            if (field === 'format') return row.format.includes(value);
-            if (field === 'ch') {
-                const comparison = /^(<=|>=|<|>|=)?(\d+)$/.exec(value);
-                if (!comparison || row.channels === null) return false;
-                const expected = Number(comparison[2]);
-                switch (comparison[1]) {
-                    case '<': return row.channels < expected;
-                    case '>': return row.channels > expected;
-                    case '<=': return row.channels <= expected;
-                    case '>=': return row.channels >= expected;
-                    default: return row.channels === expected;
-                }
-            }
-            return library.fieldHaystacks[row.id][field].includes(value);
-        })) continue;
+        if (!tokens.every(token => tokenMatches(library, row, token, includeComments) !== (token.negated === true))) continue;
         matches.push(row.id);
     }
     if (sort) {
@@ -239,6 +253,72 @@ export function search(library, query = '', { scopeFolder = '', showUnplayable =
         });
     }
     return Int32Array.from(matches);
+}
+
+// Tokens that can match comment text: `text:` always, free text unless comments are excluded.
+export function commentTokens(tokens, { includeComments = true } = {}) {
+    return tokens.filter(token => (token.field === 'text' || !token.field && includeComments) && token.value && !token.negated);
+}
+
+function lineMatches(text, tokens) {
+    const folded = foldText(text);
+    const compact = tokens.some(token => token.compact.length >= 4) ? compactText(folded) : '';
+    return tokens.some(token => folded.includes(token.value) || token.compact.length >= 4 && compact.includes(token.compact));
+}
+
+// Where tokens match, as merged [start, end) ranges of `text`, under the same folded and
+// compact rules as `search`, so a highlight never disagrees with why a row matched. Each
+// code point is folded on its own and remembers the source span it came from.
+export function matchRanges(text, tokens) {
+    let folded = '', compact = '';
+    const foldedSpans = [], compactSpans = [];
+    for (let start = 0; start < text.length;) {
+        const end = start + String.fromCodePoint(text.codePointAt(start)).length;
+        for (const point of foldText(text.slice(start, end))) {
+            folded += point;
+            for (let unit = 0; unit < point.length; unit += 1) foldedSpans.push([start, end]);
+            if (/[\p{L}\p{N}]/u.test(point)) {
+                compact += point;
+                for (let unit = 0; unit < point.length; unit += 1) compactSpans.push([start, end]);
+            }
+        }
+        start = end;
+    }
+    const ranges = [];
+    const collect = (haystack, spans, needle) => {
+        for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + 1)) ranges.push([spans[at][0], spans[at + needle.length - 1][1]]);
+    };
+    for (const token of tokens) {
+        collect(folded, foldedSpans, token.value);
+        if (token.compact.length >= 4) collect(compact, compactSpans, token.compact);
+    }
+    ranges.sort((left, right) => left[0] - right[0] || right[1] - left[1]);
+    const merged = [];
+    for (const range of ranges) {
+        if (merged.length && range[0] <= merged.at(-1)[1]) merged.at(-1)[1] = Math.max(merged.at(-1)[1], range[1]);
+        else merged.push([...range]);
+    }
+    return merged;
+}
+
+// The comment lines a row matched on, for snippets: `{ section, first, last, text, ranges }`,
+// with 0-based line numbers. A compact match can straddle two slots ("Purple" / "Motion"),
+// so a section with no single matching line falls back to adjacent pairs.
+export function commentMatchLines(comments, tokens) {
+    const hits = [];
+    if (!comments || !tokens.length) return hits;
+    for (const section of ['instrumentNames', 'sampleNames', 'songMessage']) {
+        if (!comments[section]) continue;
+        const lines = comments[section].split('\n');
+        const found = [];
+        lines.forEach((line, index) => { if (line && lineMatches(line, tokens)) found.push({ section, first: index, last: index, text: line }); });
+        if (!found.length) for (let index = 0; index + 1 < lines.length; index += 1) {
+            const text = `${lines[index]}\n${lines[index + 1]}`;
+            if (lineMatches(text, tokens)) found.push({ section, first: index, last: index + 1, text });
+        }
+        for (const hit of found) hits.push({ ...hit, ranges: matchRanges(hit.text, tokens) });
+    }
+    return hits;
 }
 
 export function buildTree(library) {

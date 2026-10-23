@@ -14,7 +14,10 @@ cargo xtask serve --library /mnt/d/hornet-music --library-index ../moddna/index/
 ```
 
 Search updates as you type (80 ms debounce); use `name:`, `title:`, `path:`,
-`format:`, `tracker:` and `ch:` prefixes, or quoted phrases. Sort with column
+`format:`, `tracker:`, `text:` and `ch:` prefixes, quoted phrases, or a leading `-` to
+exclude matches (`oxygen -oxygene`). While a search matches comment text, a **Comment
+match** column shows the matching instrument or message line, and hovering a row lists
+every matching line. Sort with column
 headings, include unplayable formats with the checkbox, or browse directories,
 ZIPs and nested ZIPs using **Browse folders**, which opens a folder tree beside the
 table: click a folder (or press Enter) to scope the table to it, use ▸ or →/← to
