@@ -289,8 +289,9 @@ the UI.
 
 Enable **Background playback** in Output to keep listening with the screen off and
 show Media Session title, play/pause, playlist next/previous and seek controls where
-supported. It defaults on for phones and tablets, and the choice is saved. Routing
-through a hidden audio element adds a little output latency; disable it for live playing.
+supported. It defaults on for phones and tablets, and the choice is saved. A hidden
+audio element loops a generated silent WAV to keep the media session alive; music
+continues directly through Web Audio.
 Android battery saver can still stop playback. iOS Safari support is best effort;
 start audio with a tap before locking the screen. Stop pauses the media element and
 Play resumes from the stopped position.
@@ -316,7 +317,7 @@ inferred.
   leaves the music running and the panel reports the refusal. Chromium 151 honours every
   rate in the menu exactly — see the table below.
 - **Output device** — populated from `navigator.mediaDevices.enumerateDevices()` and
-  applied with `AudioContext.setSinkId()` (or the media element’s `setSinkId()` when background playback is active). Labels stay blank until the browser grants
+  applied with `AudioContext.setSinkId()`. Labels stay blank until the browser grants
   output permission; the select and its Apply button hide themselves, with a note, on a
   browser without `setSinkId`. `navigator.mediaDevices.selectAudioOutput()` is offered as
   **Choose device…** where it exists (Firefox). `setSinkId` needs **no** Permissions-Policy

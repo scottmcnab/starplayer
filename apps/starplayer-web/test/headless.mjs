@@ -1173,7 +1173,7 @@ async function run(executable, mode) {
         report.monoMode = mono.engineMode;
         report.monoChannels = mono.channelStatus;
 
-        // A fresh graph tests background routing from the first audio gesture.
+        // A fresh graph starts the silent keep-alive in the first audio gesture.
         await page.send('Page.reload', { ignoreCache: true });
         await page.waitFor('background scenario startup', "document.documentElement.dataset.playerReady === 'true'");
         assert.equal(await page.evaluate("return document.getElementById('background-playback').checked;"), false, 'desktop background playback defaults off');
@@ -1185,11 +1185,11 @@ async function run(executable, mode) {
         `);
         await page.waitFor('background audio graph', "document.getElementById('transport-chip').textContent === 'audio ready'");
         await loadFixture(page, FIRST_MODULE);
-        await page.waitFor('background media playing', "document.querySelector('audio')?.srcObject instanceof MediaStream && !document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'playing'");
+        await page.waitFor('background media playing', "document.querySelector('audio')?.src.startsWith('blob:') && document.querySelector('audio').duration > 5 && document.querySelector('audio').srcObject === null && !document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'playing'");
         assert.equal(await page.evaluate("return document.querySelector('audio').hidden;"), true);
         const contextTime = await page.evaluate('return window.testAudioContext.currentTime;');
         await delay(300);
-        assert.ok(await page.evaluate(`return window.testAudioContext.currentTime > ${contextTime};`), 'stream-only context time advances');
+        assert.ok(await page.evaluate(`return window.testAudioContext.currentTime > ${contextTime};`), 'direct context time advances');
         await page.waitFor('background master peak', "parseFloat(document.getElementById('master-peak').style.width) > 0");
         assert.equal(await page.evaluate('return navigator.mediaSession.metadata.title;'), (await page.evaluate(READ_STATE)).title);
         await loadFixture(page, SECOND_MODULE);
@@ -1200,7 +1200,7 @@ async function run(executable, mode) {
         await page.waitFor('media resume', "navigator.mediaSession.playbackState === 'playing' && document.getElementById('transport-chip').textContent === 'playing' && !document.querySelector('audio').paused");
         await page.evaluate("document.getElementById('background-playback').click(); return true;");
         await page.waitFor('direct output after background toggle', "document.querySelector('audio').paused && document.querySelector('audio').srcObject === null && parseFloat(document.getElementById('master-peak').style.width) > 0 && navigator.mediaSession.playbackState === 'playing'");
-        report.backgroundPlayback = 'stream rendering, media metadata, pause/play, direct toggle passed';
+        report.backgroundPlayback = 'silent WAV, direct rendering, media metadata, pause/play, toggle passed';
 
         // ── phone width ─────────────────────────────────────────────────────────────
         await page.send('Emulation.setDeviceMetricsOverride', {
@@ -1503,6 +1503,7 @@ async function runLibrary(executable, mode) {
                 constructor(...args) { super(...args); this.port.addEventListener('message', event => { if (event.data.type === 'telemetry') capture(event.data); }); }
             };
         `);
+        await page.evaluate("document.getElementById('background-playback').checked = true; document.getElementById('background-playback').dispatchEvent(new Event('change'));");
         // Queue REFLEX -> a PETRI loop variant. The original fixture is unchanged.
         await writeFile(join(directory, 'disks/loop.zip'), buildZip([{ name: 'PETRI.S3M', bytes: withFinalLoop(petri) }]));
         await writeFile(join(directory, 'index.csv'), header + [
@@ -1550,6 +1551,7 @@ async function runLibrary(executable, mode) {
         assert.equal(await page.evaluate("return document.querySelector('#playlist-list li').classList.contains('current');"), false);
         await page.evaluate("window.requestAnimationFrame = window.savedAnimationFrame; if (window.pausedAnimationFrame) requestAnimationFrame(window.pausedAnimationFrame);");
         await page.waitFor('second playlist telemetry', "window.latestPlaylistSnapshot?.moduleGeneration === 2 && window.latestPlaylistSnapshot?.playing");
+        await page.waitFor('keep-alive through playlist advance', "!document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'playing'");
         await delay(200);
         assert.equal(await page.evaluate("return window.latestPlaylistSnapshot.songFlags & 2;"), 2);
         await page.evaluate("document.getElementById('playlist-loop').checked = true;");
@@ -1566,6 +1568,7 @@ async function runLibrary(executable, mode) {
         await seekNearEnd(6);
         await page.waitFor('rearmed looping playback', "document.getElementById('transport-chip').textContent === 'playing'");
         await page.waitFor('natural looping stop', "document.getElementById('transport-chip').textContent === 'stopped'", 15000);
+        await page.waitFor('keep-alive paused at playlist end', "document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'paused'");
         await delay(500);
         assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
         assert.equal((await page.evaluate(READ_STATE)).progressValue, 0);

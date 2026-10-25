@@ -239,35 +239,32 @@ intensive throttling, but not from the 1 s minimum.
   an animation frame. No step needed moving off rAF. Media Session state/handler
   refreshes use this same 100 ms controller path; visibility restoration ticks once
   and refreshes position without starting audio or resuming a stopped context.
-- **1 — Stream destination:** The [Web Audio specification](https://www.w3.org/TR/webaudio-1.1/#MediaStreamAudioDestinationNode)
-  defines a stream destination independent of the hardware destination. Chromium's
-  headless scenario checks advancing `currentTime` and non-zero master peaks with
-  only the stream destination connected, plus a playing hidden element. Every
-  graph creation/rebuild uses the same routing helper; streams are cached per
-  context and the element survives rebuilds.
-- **2 — iOS:** `playsinline` is set and `autoplay` is false. The real stream is created
-  synchronously beside `context.resume()`, before the first await, and `audio.play()`
-  is called in that gesture. No empty placeholder stream is needed. Rejected play
-  requests fall back to direct output with an Output-panel message. This follows
-  [WebKit's MediaStream gesture guidance](https://webkit.org/blog/7763/a-closer-look-into-webrtc/).
-  Physical iOS Safari gesture policy, screen-lock survival and latency were not
-  verified; Chromium automation explicitly permits autoplay.
-- **3 — Silence:** Stop pauses the element and snapshot transitions publish
-  `playbackState = 'paused'`. Play starts the same element synchronously and resumes
-  the context; the engine continues from the stopped position. Natural completion
-  pauses the element only outside playlist mode; a playlist advance keeps it playing
-  (silence) between tracks, because pausing it would let a phone drop the media session
-  and freeze the tab before the next track loads. Changing the route or rebuilding
-  channels while stopped preserves that pause. No silent keep-alive is used.
+- **Output and keep-alive:** Music always connects directly to `AudioContext.destination`.
+  Output selection uses only `AudioContext.setSinkId()`. One hidden, inline, looping
+  audio element survives context rebuilds and plays a generated Blob URL: 10 seconds
+  of 8-bit unsigned mono PCM silence at 8000 Hz. Its duration exceeds Chromium's
+  persistent-player threshold; it introduces no music output latency. No binary asset
+  or MediaStream is used. A play rejection reports a note without interrupting music.
+- **Gesture and lifecycle:** `audio.play()` runs synchronously beside `context.resume()`
+  before the first await. Stop pauses the element; Play restarts it. Natural completion
+  pauses it outside playlist mode. Playlist advances keep it running through resolve,
+  fetch and activation; after an advance settles without a newer activation or playing
+  engine, it pauses, including at the final entry and after three failures. Toggling
+  the option only starts or pauses the element.
 - **Metadata and position:** Library and playlist-library plays carry their folder;
   archive members carry their archive label; other inputs use StarPlayer. There is
-  no existing icon under `www/`, so artwork is omitted. Position updates happen on
-  activation (cleared until the new generation's snapshot arrives), transport controls,
-  seeks and visibility restoration. Optional relative-seek actions are omitted.
-- **Outstanding:** Owner Android Chrome check against the published Pages build:
-  screen-off continuation through playlist auto-advance and actual notification /
-  lock-screen controls. Physical output-device selection and iOS Safari remain
-  unverified; routing/device behaviour is covered with fakes.
+  no existing icon under `www/`, so artwork is omitted. Position refreshes on playback
+  transitions and after the new generation's first snapshot following activation,
+  load-option reload or graph rebuild. Frame seeks publish the requested position,
+  then replace it with the engine's row-aligned position. Visibility restoration
+  refreshes position; optional relative-seek actions are omitted.
+- **Verification limits:** Unit tests check the WAV, lifecycle and rejection handling;
+  Chromium headless checks the playing Blob source, direct output peaks, metadata,
+  controls, toggle and final playlist stop. Only the owner's Android Chrome check
+  against the published Pages build can prove actual lock-screen controls and
+  screen-off survival through playlist auto-advance. Physical output-device selection
+  and iOS Safari remain unverified; iOS support is best effort and Chromium automation
+  explicitly permits autoplay.
 
 ## Revision after review (2026-10-26): silent keep-alive element instead of a MediaStream route
 
