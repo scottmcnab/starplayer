@@ -248,15 +248,28 @@ intensive throttling, but not from the 1 s minimum.
 - **Gesture and lifecycle:** `audio.play()` runs synchronously beside `context.resume()`
   before the first await. Stop pauses the element; Play restarts it. Natural completion
   pauses it outside playlist mode. Playlist advances keep it running through resolve,
-  fetch and activation; after an advance settles without a newer activation or playing
-  engine, it pauses, including at the final entry and after three failures. Toggling
+  fetch and activation. Every other end of playback is handled by one rule on the
+  controller tick (second review): the element pauses once the engine has been idle for
+  1 s while neither the controller's newest intent (`loading`) nor a playlist advance
+  (`pending`) is in flight. That covers the final entry, three failures, failed or
+  cancelled loads from a stopped state, and a failed audio start. An abandoned advance
+  can't pause a newer load, because `loading` follows only the newest intent. Toggling
   the option only starts or pauses the element.
+- **Known limit, freezing between tracks:** Chromium's scheduler judges audibility from
+  the output, so the silent clip keeps the session controllable but doesn't stop a
+  hidden page from being frozen after it has been silent past the grace period. The music
+  is audible up to the end of each track, and the next playlist entry is prefetched
+  when the current one starts, so a normal transition is short. A slow or failed fetch
+  of an un-prefetched successor while the screen is off could still stall. The owner's
+  phone check is the evidence; making the clip audible was rejected (it would be heard).
 - **Metadata and position:** Library and playlist-library plays carry their folder;
   archive members carry their archive label; other inputs use StarPlayer. There is
   no existing icon under `www/`, so artwork is omitted. Position refreshes on playback
   transitions and after the new generation's first snapshot following activation,
   load-option reload or graph rebuild. Frame seeks publish the requested position,
-  then replace it with the engine's row-aligned position. Visibility restoration
+  then replace it with the engine's row-aligned position read 250 ms later. A fixed
+  delay, rather than the next tick, is used because the fallback transport's next tick
+  still reads telemetry from before the command. Visibility restoration
   refreshes position; optional relative-seek actions are omitted.
 - **Verification limits:** Unit tests check the WAV, lifecycle and rejection handling;
   Chromium headless checks the playing Blob source, direct output peaks, metadata,

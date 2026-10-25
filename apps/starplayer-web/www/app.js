@@ -15,6 +15,10 @@ const PROCESSOR_NAME = 'starplayer-player';
 const MIXER_STORAGE_KEY = 'starplayer.output-and-mixer.v1';
 const DEFAULT_MIXER_MODE = 0x0000_0202;
 const SONG_FADE_SECONDS = 5;
+/// How long the engine must sit idle, with no load pending, before the background keep-alive pauses.
+const KEEP_ALIVE_IDLE_MS = 1000;
+/// How long after a seek, reload or rebuild the Media Session position is read back from telemetry.
+const MEDIA_POSITION_SETTLE_MS = 250;
 const TIME_DISPLAY_STORAGE_KEY = 'starplayer.time-display.v1';
 const PATTERN_WINDOW_ROWS = 13;
 const PATTERN_CELL_BYTES = 5;
@@ -83,8 +87,8 @@ const state = {
     scope: null,
     latest: null,
     mediaWasPlaying: false,
-    mediaPositionPending: false,
-    mediaActivation: 0,
+    mediaPositionDue: null,
+    keepAliveIdleSince: null,
     /// The newest scope window on the `postMessage` fallback, where it rides the batched
     /// telemetry message rather than shared memory.
     latestScope: null,
@@ -673,8 +677,7 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
     renderMetadata();
     const entry = playlist.entries.find(entry => entry.id === context.entryId);
     mediaSession.metadata({ ...metadata, folder: context.folder || (entry?.locator.kind === 'library' ? entry.display.folder : null), archiveLabel: context.archiveLabel || (entry?.locator.kind === 'upload' && entry.locator.memberIndex >= 0 ? entry.display.folder : null) });
-    state.mediaPositionPending = true;
-    state.mediaActivation += 1;
+    scheduleMediaPosition();
     state.mediaWasPlaying = false;
     backgroundOutput.start();
     mediaSession.position({ lengthFrames: null });
@@ -1359,7 +1362,7 @@ async function applyLoadOptions(changedKey) {
             speedAdjust: requested.speedAdjust,
         };
         playback.rebind(node, activation.generation);
-        state.mediaPositionPending = true;
+        scheduleMediaPosition();
         state.activationMemoryBytes = activation.memoryBytes;
         state.loadCount += 1;
         sendCommandsToCurrentGraph(restoreCommands);
@@ -1432,7 +1435,7 @@ async function rebuildAudioContext() {
         state.activeModeWire = mixerModeFromControls();
         if (activation) {
             playback.rebind(graph.node, activation.generation);
-            state.mediaPositionPending = true;
+            scheduleMediaPosition();
             state.activationMemoryBytes = activation.memoryBytes;
             state.activeLoadOptions = {
                 headphoneFriendlyModPanning: state.metadata?.isMod ? loadOptions.headphoneFriendlyModPanning : state.activeLoadOptions.headphoneFriendlyModPanning,
@@ -1488,7 +1491,7 @@ async function rebuildOutputChannels() {
         state.activeModeWire = mixerModeFromControls();
         if (activation) {
             playback.rebind(graph.node, activation.generation);
-            state.mediaPositionPending = true;
+            scheduleMediaPosition();
             state.activationMemoryBytes = activation.memoryBytes;
             state.activeLoadOptions = {
                 headphoneFriendlyModPanning: state.metadata?.isMod ? loadOptions.headphoneFriendlyModPanning : state.activeLoadOptions.headphoneFriendlyModPanning,
@@ -2345,10 +2348,11 @@ const playback = createPlaybackController({
             // A playlist advance keeps the element playing silence: pausing it between tracks
             // would let a phone drop the media session, and freeze the tab, before the next load.
             if (state.mediaWasPlaying && !snapshot.playing && !playback.playlistMode) backgroundOutput.pause();
-            if (state.mediaWasPlaying !== snapshot.playing) state.mediaPositionPending = true;
+            const edge = state.mediaWasPlaying !== snapshot.playing;
             state.mediaWasPlaying = snapshot.playing;
-            if (state.mediaPositionPending) { refreshMediaPosition(snapshot.songFrame); state.mediaPositionPending = false; }
+            if (edge || (state.mediaPositionDue !== null && performance.now() >= state.mediaPositionDue)) { refreshMediaPosition(snapshot.songFrame); state.mediaPositionDue = null; }
         }
+        reconcileKeepAlive(snapshot);
         refreshMediaHandlers(snapshot);
         return { graph: state.node, snapshot };
     },
@@ -2361,15 +2365,7 @@ const playback = createPlaybackController({
         elements.repeat.title = origin === 'playlist' ? 'Playlist playback ends each song to advance; your Repeat preference is preserved.' : '';
         queueRepeatCommand();
     },
-    async onTrackEnded(id) {
-        const activation = state.mediaActivation;
-        await playlistPlayback.ended(id);
-        const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
-        if (activation === state.mediaActivation && !snapshot?.playing) {
-            backgroundOutput.pause();
-            mediaSession.playing(false);
-        }
-    },
+    onTrackEnded: id => playlistPlayback.ended(id),
 });
 const mediaSession = createMediaSession({
     mediaSession: navigator.mediaSession,
@@ -2387,6 +2383,22 @@ function mediaLengthFrames(snapshot = state.telemetry ? Ring.readTelemetry(state
 function refreshMediaPosition(frame) {
     const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
     mediaSession.position({ lengthFrames: mediaLengthFrames(snapshot), frame: frame ?? snapshot?.songFrame ?? 0, sampleRate: state.workletSampleRate });
+}
+/// Republish the position once the engine has had time to apply a seek, reload or rebuild:
+/// on the fallback transport the next tick still reads telemetry from before the command.
+function scheduleMediaPosition() { state.mediaPositionDue = performance.now() + MEDIA_POSITION_SETTLE_MS; }
+/// One rule pauses the keep-alive, whatever ended playback (a finished playlist, failed or
+/// cancelled loads, a failed audio start): the engine has been idle for a while and no load
+/// or playlist advance still owns playback. The grace covers a load that has just activated.
+function reconcileKeepAlive(snapshot) {
+    const busy = snapshot?.playing || playback.loading || playlistPlayback.pending !== null;
+    if (busy || backgroundOutput.audio.paused) { state.keepAliveIdleSince = null; return; }
+    const now = performance.now();
+    state.keepAliveIdleSince ??= now;
+    if (now - state.keepAliveIdleSince < KEEP_ALIVE_IDLE_MS) return;
+    state.keepAliveIdleSince = null;
+    backgroundOutput.pause();
+    mediaSession.playing(false);
 }
 function refreshMediaHandlers(snapshot) {
     mediaSession.refresh({ hasEntries: playlist.entries.length > 0, nextEnabled: !byId('playlist-next').disabled, previousEnabled: !byId('playlist-previous').disabled, lengthKnown: mediaLengthFrames(snapshot) !== null });
@@ -2407,7 +2419,7 @@ function userSeek(opcode, frame) {
     queueCommand(opcode, frame);
     const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
     refreshMediaPosition(opcode === Ring.OPCODE_SEEK_FRAME ? frame : snapshot?.songFrame);
-    state.mediaPositionPending = true;
+    scheduleMediaPosition();
 }
 const libraryView = createLibraryView({ playlist, play: playLibraryRow });
 await wireLibraryControls({ state, loader: Loader, onLibrary: library => { libraryView.setLibrary(library); playlistControls.libraryChanged(library); }, onComments: () => libraryView.refreshComments() });

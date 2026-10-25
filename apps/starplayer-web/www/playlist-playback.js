@@ -22,6 +22,7 @@ export function createPlaylistPlayback({ playlist, controller, resolver, loop = 
     });
     const navigation = {
         failures,
+        get pending() { return pendingId; },
         cancel() { revision += 1; pendingId = null; },
         async playEntry(entry) {
             if (!entry) return;

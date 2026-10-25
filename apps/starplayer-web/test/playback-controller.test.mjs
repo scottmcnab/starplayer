@@ -303,3 +303,45 @@ test('a large disconnected playlist traverses once without copying entries per s
     assert.equal(fixture.activated.length, 0);
     navigation.dispose();
 });
+
+test('loading covers only the newest intent, through success, failure and cancellation', async () => {
+    const slow = deferred();
+    const fixture = setup({ resolver: { resolve: () => slow.promise } });
+    const superseded = fixture.controller.play({ kind: 'library' }, { origin: 'playlist', entryId: 'first' });
+    assert.equal(fixture.controller.loading, true);
+    const manual = deferred();
+    const replacement = fixture.controller.play({ kind: 'bytes', read: () => manual.promise });
+    slow.resolve('late');
+    assert.equal((await superseded).status, 'abandoned');
+    assert.equal(fixture.controller.loading, true, 'the abandoned advance must not end the newer load');
+    manual.resolve('manual');
+    assert.equal((await replacement).status, 'played');
+    assert.equal(fixture.controller.loading, false);
+    const failing = setup({ resolver: { resolve: async () => { throw new Error('missing'); } } });
+    assert.equal((await failing.controller.play({ kind: 'library' })).status, 'failed');
+    assert.equal(failing.controller.loading, false);
+    const hanging = setup({ resolver: { resolve: () => new Promise(() => {}) } });
+    hanging.controller.play({ kind: 'library' });
+    assert.equal(hanging.controller.loading, true);
+    hanging.controller.cancel();
+    assert.equal(hanging.controller.loading, false, 'a cancel ends loading even while the old fetch hangs');
+});
+
+test('playlist pending covers an advance until it plays, is cancelled or runs out of entries', async () => {
+    const playlist = createPlaylist();
+    playlist.add([{ locator: locator('one'), display: { name: 'one' } }, { locator: locator('two'), display: { name: 'two' } }]);
+    const slow = deferred();
+    const fixture = setup({ resolver: { resolve: () => slow.promise } });
+    const navigation = createPlaylistPlayback({ playlist, controller: fixture.controller, resolver: { prefetch() {} }, clock: fixture.clock });
+    assert.equal(navigation.pending, null);
+    const advance = navigation.playEntry({ ...playlist.entries[0], locator: { kind: 'library' } });
+    assert.equal(navigation.pending, playlist.entries[0].id);
+    slow.resolve('one');
+    await advance;
+    assert.equal(navigation.pending, null);
+    await navigation.playEntry(null);
+    assert.equal(navigation.pending, null, 'an advance past the last entry leaves nothing pending');
+    navigation.playEntry({ ...playlist.entries[1], locator: { kind: 'library' } });
+    navigation.cancel();
+    assert.equal(navigation.pending, null);
+});

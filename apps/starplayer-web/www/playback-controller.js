@@ -14,17 +14,21 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
     let emitted = false;
     let sequence = -1;
     let engineFrame = null;
+    let loadingToken = null;
     const controller = {
         get current() { return current; },
         get controlRevision() { return controlRevision; },
         get stopped() { return blocked; },
         get playlistMode() { return playlistMode; },
+        // True while the newest intent is still resolving or activating; a cancel ends it.
+        get loading() { return loadingToken === intent; },
         effectiveAtEnd: () => !playlistMode && repeat(),
         cancel() { intent += 1; abort?.abort(); wasPlaying = false; },
         async play(locator, { origin = 'file', entryId = null, folder = null, archiveLabel = null, label = locator.label || locator.memberPath || locator.sourcePath || 'module' } = {}) {
             controller.cancel();
             current = null;
             const token = intent;
+            loadingToken = token;
             abort = new AbortController();
             const signal = abort.signal;
             const isCurrent = () => token === intent && !signal.aborted;
@@ -51,6 +55,8 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
             } catch (error) {
                 if (!isCurrent() || error.name === 'AbortError') return { status: 'abandoned' };
                 return { status: 'failed', error };
+            } finally {
+                if (loadingToken === token) loadingToken = null;
             }
         },
         stop() { controller.userControl('stop'); stop(); },

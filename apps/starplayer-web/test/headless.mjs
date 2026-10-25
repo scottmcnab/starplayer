@@ -1588,6 +1588,18 @@ async function runLibrary(executable, mode) {
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '1');
         await page.evaluate("document.getElementById('playlist-clear').click();");
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '0');
+        // A failed load from a stopped state starts the keep-alive in its gesture; nothing then
+        // plays, so the idle rule must pause it again rather than leave a silent session running.
+        await page.evaluate("document.getElementById('stop').click(); return true;");
+        await page.waitFor('keep-alive paused by Stop', "document.querySelector('audio').paused && document.getElementById('transport-chip').textContent === 'stopped'");
+        await page.evaluate(`
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([new Uint8Array(64).fill(0x41)], 'broken.s3m', { type: 'application/octet-stream' }));
+            document.getElementById('drop-zone').dispatchEvent(new DragEvent('drop', { dataTransfer: transfer, bubbles: true, cancelable: true }));
+            return true;
+        `);
+        await page.waitFor('failed load diagnostic', "!document.getElementById('error').hidden && document.getElementById('error').textContent.includes('broken.s3m')");
+        await page.waitFor('keep-alive paused after a failed load', "document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'paused'");
         const storeResults = await page.evaluate(`const { openPlaylistStore } = await import('./playlist-store.js'); return await (${verifyPlaylistStore.toString()})(openPlaylistStore);`);
         console.log(`playlist-store[${mode}]: ${storeResults}`);
         // W11: module and two-member ZIP uploads, persisted current id/loop and
