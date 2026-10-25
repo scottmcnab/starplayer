@@ -1,3 +1,5 @@
+import { createBackgroundOutput, backgroundPlaybackDefault } from './background-output.js';
+import { createMediaSession } from './media-session.js';
 import { createPlaylistControls } from './playlist-controls.js';
 import { createPlaybackController } from './playback-controller.js';
 import { createPlaylistPlayback } from './playlist-playback.js';
@@ -31,6 +33,7 @@ const NOTE_NAMES = ['C-', 'C#', 'D-', 'D#', 'E-', 'F-', 'F#', 'G-', 'G#', 'A-', 
 
 const byId = (id) => document.getElementById(id);
 const elements = {
+    backgroundPlayback: byId('background-playback'), backgroundNote: byId('background-playback-note'),
     startAudio: byId('start-audio'), filePicker: byId('file-picker'), fixturePicker: byId('fixture-picker'),
     loadFixture: byId('load-fixture'), urlForm: byId('url-form'), url: byId('url'), dropZone: byId('drop-zone'),
     error: byId('error'), message: byId('message'), transportChip: byId('transport-chip'), title: byId('title'),
@@ -79,6 +82,8 @@ const state = {
     telemetry: null,
     scope: null,
     latest: null,
+    mediaWasPlaying: false,
+    mediaPositionPending: false,
     /// The newest scope window on the `postMessage` fallback, where it rides the batched
     /// telemetry message rather than shared memory.
     latestScope: null,
@@ -226,6 +231,7 @@ function restorePreferences() {
         selectStoredValue(elements.mixerInterpolator, saved.interpolator ?? 'linear');
         selectStoredValue(elements.mixerDepth, saved.depth ?? 'f32');
         selectStoredValue(elements.mixerDither, saved.dither ?? 'off');
+        if (typeof saved.backgroundPlayback === 'boolean') elements.backgroundPlayback.checked = saved.backgroundPlayback;
         if (typeof saved.repeat === 'boolean') elements.repeat.checked = saved.repeat;
         elements.modHeadphonePanning.checked = saved.headphoneFriendlyModPanning === true;
         // M10-W4: the enhancement checkboxes do not exist yet (they are built from the
@@ -250,7 +256,8 @@ function persistPreferences() {
         localStorage.setItem(MIXER_STORAGE_KEY, JSON.stringify({
             repeat: elements.repeat.checked,
             sampleRate: elements.sampleRate.value,
-            sinkId: state.context?.sinkId ?? elements.outputDevice.value,
+            sinkId: state.context ? backgroundOutput.selectedSinkId : (elements.outputDevice.dataset.savedSinkId || elements.outputDevice.value),
+            backgroundPlayback: elements.backgroundPlayback.checked,
             channels: elements.outputChannels.value,
             path: elements.mixerPath.value,
             interpolator: elements.mixerInterpolator.value,
@@ -458,7 +465,7 @@ function updateOutputPanel() {
     elements.sampleRateStatus.textContent = state.rateReport || `${requested} / ${context ? formatRate(context.sampleRate) : '—'}`;
     elements.contextState.textContent = context?.state ?? '—';
     elements.baseLatency.textContent = context ? formatLatency(context.baseLatency) : '—';
-    elements.outputLatency.textContent = context ? formatLatency(context.outputLatency) : '—';
+    elements.outputLatency.textContent = context ? `${formatLatency(context.outputLatency)}${backgroundOutput.active ? ' + media element' : ''}` : '—';
     const channels = context ? state.outputChannelCount : (Number(elements.outputChannels.value) === 1 ? 1 : 2);
     elements.channelStatus.textContent = context ? `${channels === 1 ? 'mono' : 'stereo'} · destination ${context.destination.channelCount}` : (channels === 1 ? 'mono' : 'stereo');
     elements.maxChannelCount.textContent = context ? String(context.destination.maxChannelCount) : '—';
@@ -467,7 +474,7 @@ function updateOutputPanel() {
     elements.engineMode.textContent = description;
     elements.outputEngineMode.textContent = description;
     elements.outputStatus.textContent = context ? `${formatRate(context.sampleRate)} · ${context.state}` : 'audio asleep';
-    const sinkId = context && 'sinkId' in context ? context.sinkId : '';
+    const sinkId = backgroundOutput.sinkId;
     const device = state.outputDevices.get(sinkId);
     elements.sinkStatus.textContent = device?.label || (sinkId ? `device ${sinkId.slice(0, 8)}…` : 'default');
 }
@@ -513,8 +520,10 @@ async function prepareNode(context, channels, mixerMode, addModule) {
     return { context, node, commandRing, telemetry, scope, channels };
 }
 
-async function startAudio() {
+async function startAudio(playRequested = false) {
     if (state.node !== null) {
+        if (document.hidden && playback.stopped && !playRequested) return;
+        if (!playback.stopped || playRequested) backgroundOutput.start(state.context);
         await state.context.resume();
         return;
     }
@@ -529,6 +538,7 @@ async function startAudio() {
     if (state.requestedSampleRate !== '') contextOptions.sampleRate = Number(state.requestedSampleRate);
     state.context = new AudioContext(contextOptions);
     const unlock = state.context.resume();
+    backgroundOutput.start(state.context);
     state.startPromise = (async () => {
         clearError();
         elements.startAudio.disabled = true;
@@ -546,7 +556,7 @@ async function startAudio() {
         const channels = Number(elements.outputChannels.value) === 1 ? 1 : 2;
         const graph = await prepareNode(state.context, channels, mixerModeFromControls(), true);
         installGraph(graph);
-        state.node.connect(state.context.destination);
+        backgroundOutput.connectOutput(state.node, state.context);
         state.context.addEventListener('statechange', updateOutputPanel);
 
         elements.commandTransport.textContent = state.commandRing ? 'SharedArrayBuffer SPSC ring' : 'postMessage, batched once per frame';
@@ -561,8 +571,8 @@ async function startAudio() {
         state.rateReport = `${state.requestedSampleRate === '' ? 'device default' : formatRate(Number(state.requestedSampleRate))} / ${formatRate(state.context.sampleRate)}`;
         await refreshOutputDevices();
         const savedSinkId = elements.outputDevice.dataset.savedSinkId;
-        if (savedSinkId && typeof state.context.setSinkId === 'function') {
-            await state.context.setSinkId(savedSinkId).catch((error) => {
+        if (savedSinkId) {
+            await backgroundOutput.setSinkId(savedSinkId).catch((error) => {
                 elements.outputDeviceNote.textContent = `Saved output was not available (${error.name || error.message}).`;
             });
         }
@@ -600,7 +610,7 @@ function createNode(context, processorOptions, wasmBytes, channels) {
 
 export async function playLibraryRow(row) {
     if (!row.playable || !state.library) return;
-    const result = await playback.play(libraryLocator(row, state.library.identity), { origin: 'library', label: `${row.name} — ${row.title} (${row.folder})` });
+    const result = await playback.play(libraryLocator(row, state.library.identity), { origin: 'library', folder: row.folder, label: `${row.name} — ${row.title} (${row.folder})` });
     if (result.status === 'played') libraryView.setPlaying(row.id);
     else if (result.status === 'failed') reportLoadFailure(row.name, result.error);
 }
@@ -625,6 +635,7 @@ async function preparePlayback(buffer, label, origin, context) {
         if (!context.isCurrent() || !choice) return null;
         buffer = Uint8Array.from(Loader.archive_extract(archive.bytes, choice.index)).buffer;
         label = `${choice.name} (from ${archive.label})`;
+        context.archiveLabel = archive.label;
         selectRetainedArchiveTrack(archive, choice);
     }
     return activateLoadedModule(buffer, label, context);
@@ -659,6 +670,12 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
     state.activationMemoryBytes = result.memoryBytes;
     state.loadCount += 1;
     renderMetadata();
+    const entry = playlist.entries.find(entry => entry.id === context.entryId);
+    mediaSession.metadata({ ...metadata, folder: context.folder || (entry?.locator.kind === 'library' ? entry.display.folder : null), archiveLabel: context.archiveLabel || (entry?.locator.kind === 'upload' && entry.locator.memberIndex >= 0 ? entry.display.folder : null) });
+    state.mediaPositionPending = true;
+    state.mediaWasPlaying = false;
+    backgroundOutput.start(state.context);
+    mediaSession.position({ lengthFrames: null });
     setControlsEnabled(true);
     // Activating a module installs its own sequencer, which is what retires any live-input
     // source with it. The page's toggles are unchanged, so ask for it back.
@@ -682,7 +699,7 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
 }
 
 async function playArchiveEntry(archive, choice) {
-    const result = await playback.play({ kind: 'bytes', read: () => Uint8Array.from(Loader.archive_extract(archive.bytes, choice.index)).buffer }, { origin: 'archive', label: `${choice.name} (from ${archive.label})` });
+    const result = await playback.play({ kind: 'bytes', read: () => Uint8Array.from(Loader.archive_extract(archive.bytes, choice.index)).buffer }, { origin: 'archive', archiveLabel: archive.label, label: `${choice.name} (from ${archive.label})` });
     if (result.status === 'played') selectRetainedArchiveTrack(archive, choice);
     else if (result.status === 'failed') reportLoadFailure(archive.label, result.error);
 }
@@ -1379,7 +1396,7 @@ async function rebuildAudioContext() {
     const moduleBytes = state.currentModuleBytes;
     const revision = state.moduleRevision;
     const controlRevision = playback.controlRevision;
-    const oldSinkId = 'sinkId' in oldContext ? oldContext.sinkId : '';
+    const oldSinkId = backgroundOutput.sinkId;
     const restoreCommands = playbackRestoreCommands();
     const contextOptions = { latencyHint: 'interactive' };
     if (requested !== '') contextOptions.sampleRate = Number(requested);
@@ -1397,14 +1414,14 @@ async function rebuildAudioContext() {
         const activation = state.currentModuleBytes === null
             ? null
             : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions);
-        if (oldSinkId && typeof candidateContext.setSinkId === 'function') {
+        if (!backgroundOutput.active && oldSinkId && typeof candidateContext.setSinkId === 'function') {
             await candidateContext.setSinkId(oldSinkId).catch((error) => {
                 elements.outputDeviceNote.textContent = `The previous output device could not be restored (${error.name || error.message}).`;
             });
         }
         await unlock;
         if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
-        graph.node.connect(candidateContext.destination);
+        backgroundOutput.connectOutput(graph.node, candidateContext);
         if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
         state.context = candidateContext;
         installGraph(graph);
@@ -1460,7 +1477,7 @@ async function rebuildOutputChannels() {
             ? null
             : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions);
         if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
-        graph.node.connect(state.context.destination);
+        backgroundOutput.connectOutput(graph.node, state.context);
         if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
         installGraph(graph);
         state.latest = null;
@@ -1696,13 +1713,13 @@ function sendInsertMessage(action, target, slot, kind) {
 }
 
 async function refreshOutputDevices() {
-    const sinkSupported = typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype;
+    const sinkSupported = state.context ? backgroundOutput.sinkSupported : (backgroundOutput.active ? typeof backgroundOutput.audio.setSinkId === 'function' : typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype);
     const selectorSupported = navigator.mediaDevices && typeof navigator.mediaDevices.selectAudioOutput === 'function';
     elements.outputDeviceLabel.hidden = !sinkSupported;
     elements.applyOutputDevice.hidden = !sinkSupported;
     elements.chooseOutputDevice.hidden = !selectorSupported;
     if (!sinkSupported) {
-        elements.outputDeviceNote.textContent = 'This browser does not expose AudioContext.setSinkId(); the system default output is used.';
+        elements.outputDeviceNote.textContent = 'This browser does not expose output selection for this route; the system default output is used.';
         updateOutputPanel();
         return;
     }
@@ -1712,8 +1729,8 @@ async function refreshOutputDevices() {
     }
     try {
         const devices = (await navigator.mediaDevices.enumerateDevices()).filter((device) => device.kind === 'audiooutput');
-        const selected = state.context && 'sinkId' in state.context
-            ? state.context.sinkId
+        const selected = state.context
+            ? backgroundOutput.sinkId
             : (elements.outputDevice.dataset.savedSinkId || '');
         state.outputDevices.clear();
         elements.outputDevice.replaceChildren();
@@ -1741,9 +1758,9 @@ async function refreshOutputDevices() {
 
 async function applyOutputDevice() {
     await startAudio();
-    if (typeof state.context.setSinkId !== 'function') return;
+    if (!backgroundOutput.sinkSupported) return;
     try {
-        await state.context.setSinkId(elements.outputDevice.value);
+        await backgroundOutput.setSinkId(elements.outputDevice.value);
         persistPreferences();
         await refreshOutputDevices();
         updateOutputPanel();
@@ -2196,8 +2213,8 @@ elements.dropZone.addEventListener('drop', (event) => {
 elements.dropZone.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') elements.filePicker.click();
 });
-elements.play.addEventListener('click', () => { playback.userControl('play'); queueCommand(Ring.OPCODE_PLAY); });
-elements.stop.addEventListener('click', () => { playlistPlayback.cancel(); playback.stop(); });
+elements.play.addEventListener('click', () => { backgroundOutput.start(state.context); state.context?.resume().catch(showError); playback.userControl('play'); queueCommand(Ring.OPCODE_PLAY); refreshMediaPosition(); });
+elements.stop.addEventListener('click', () => { playlistPlayback.cancel(); playback.stop(); backgroundOutput.pause(); refreshMediaPosition(); });
 elements.previous.addEventListener('click', () => userSeek(Ring.OPCODE_SEEK_ORDER, Math.max(0, (state.latest?.order || 0) - 1)));
 elements.next.addEventListener('click', () => userSeek(Ring.OPCODE_SEEK_ORDER, Math.min((state.metadata?.orders || 1) - 1, (state.latest?.order || 0) + 1)));
 elements.seekOrder.addEventListener('change', () => userSeek(Ring.OPCODE_SEEK_ORDER, Number(elements.seekOrder.value)));
@@ -2272,7 +2289,20 @@ if (!sharedMemoryAvailable()) {
     elements.telemetryTransport.textContent = 'postMessage fallback (COOP/COEP unavailable)';
     elements.scopeTransport.textContent = 'postMessage fallback (COOP/COEP unavailable)';
 }
+elements.backgroundPlayback.checked = backgroundPlaybackDefault(navigator, window.matchMedia.bind(window));
 restorePreferences();
+const backgroundOutput = createBackgroundOutput({
+    enabled: elements.backgroundPlayback.checked,
+    createAudio: () => { const audio = document.createElement('audio'); document.body.append(audio); return audio; },
+    report: message => { elements.backgroundNote.textContent = message; refreshOutputDevices().catch(() => {}); updateOutputPanel(); },
+});
+elements.backgroundPlayback.addEventListener('change', () => {
+    const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
+    backgroundOutput.setEnabled(elements.backgroundPlayback.checked, state.node, state.context, !!snapshot?.playing && !playback.stopped);
+    persistPreferences();
+    refreshOutputDevices().catch(() => {});
+    updateOutputPanel();
+});
 renderLoadOptionsSummary();
 state.activeModeWire = mixerModeFromControls();
 updateOutputPanel();
@@ -2300,9 +2330,21 @@ const libraryResolver = {
     },
 };
 const playback = createPlaybackController({
-    resolver: libraryResolver, activate: preparePlayback, ready: startAudio,
+    resolver: libraryResolver, activate: preparePlayback, ready: () => startAudio(true),
     repeat: () => elements.repeat.checked,
-    readSnapshot: () => ({ graph: state.node, snapshot: state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest }),
+    readSnapshot: () => {
+        const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
+        if (snapshot && state.metadata && playback.current?.graph === state.node && snapshot.moduleGeneration === playback.current.generation) {
+            mediaSession.playing(snapshot.playing);
+            // A playlist advance keeps the element playing silence: pausing it between tracks
+            // would let a phone drop the media session, and freeze the tab, before the next load.
+            if (state.mediaWasPlaying && !snapshot.playing && !playback.playlistMode) backgroundOutput.pause();
+            state.mediaWasPlaying = snapshot.playing;
+            if (state.mediaPositionPending && snapshot.moduleGeneration === playback.current?.generation) { refreshMediaPosition(snapshot.songFrame); state.mediaPositionPending = false; }
+        }
+        refreshMediaHandlers(snapshot);
+        return { graph: state.node, snapshot };
+    },
     flushCommands: flushFallbackCommands, stop: () => queueCommand(Ring.OPCODE_STOP),
     onIntent({ origin }) {
         state.moduleRevision += 1;
@@ -2313,6 +2355,29 @@ const playback = createPlaybackController({
         queueRepeatCommand();
     },
     onTrackEnded: id => playlistPlayback.ended(id),
+});
+const mediaSession = createMediaSession({
+    mediaSession: navigator.mediaSession,
+    play: () => elements.play.click(), stop: () => elements.stop.click(),
+    next: () => byId('playlist-next').click(), previous: () => byId('playlist-previous').click(),
+    seek: seconds => {
+        const length = mediaLengthFrames();
+        if (length !== null && Number.isFinite(seconds)) userSeek(Ring.OPCODE_SEEK_FRAME, Math.round(Math.max(0, Math.min(length, seconds * state.workletSampleRate))));
+    },
+});
+function mediaLengthFrames(snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest) {
+    if (!snapshot || !(snapshot.songFlags & Ring.SONG_FLAG_LENGTH_KNOWN)) return null;
+    return Math.max(0, snapshot.songLengthFrames) + (!playback.effectiveAtEnd() && (snapshot.songFlags & Ring.SONG_FLAG_LOOPS) ? repeatFadeFrames() : 0);
+}
+function refreshMediaPosition(frame) {
+    const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
+    mediaSession.position({ lengthFrames: mediaLengthFrames(snapshot), frame: frame ?? snapshot?.songFrame ?? 0, sampleRate: state.workletSampleRate });
+}
+function refreshMediaHandlers(snapshot) {
+    mediaSession.refresh({ hasEntries: playlist.entries.length > 0, nextEnabled: !byId('playlist-next').disabled, previousEnabled: !byId('playlist-previous').disabled, lengthKnown: mediaLengthFrames(snapshot) !== null });
+}
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { playback.tick(); refreshMediaPosition(); }
 });
 const playlistPlayback = createPlaylistPlayback({
     playlist, controller: playback, resolver: libraryResolver,
@@ -2325,6 +2390,9 @@ function userSeek(opcode, frame) {
     playlistPlayback.cancel();
     playback.userControl('seek');
     queueCommand(opcode, frame);
+    const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
+    refreshMediaPosition(opcode === Ring.OPCODE_SEEK_FRAME ? frame : snapshot?.songFrame);
+    state.mediaPositionPending = opcode !== Ring.OPCODE_SEEK_FRAME;
 }
 const libraryView = createLibraryView({ playlist, play: playLibraryRow });
 await wireLibraryControls({ state, loader: Loader, onLibrary: library => { libraryView.setLibrary(library); playlistControls.libraryChanged(library); }, onComments: () => libraryView.refreshComments() });

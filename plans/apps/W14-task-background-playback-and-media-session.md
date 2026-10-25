@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: mobile listening (follows W13, branch `background-playback`) |
-| Status | **Specified** 2026-10-26 — not started |
+| Status | **Implemented** 2026-10-26 (branch `background-playback`) — owner phone check outstanding |
 | Depends on | [W10](complete/W10-task-playback-controller-and-playlist.md), [W13](complete/W13-task-library-remote-source.md) |
 | Blocks | — |
 | Recommended model | gpt-6.1-sol |
@@ -232,4 +232,138 @@ intensive throttling, but not from the 1 s minimum.
 
 ## Research resolution
 
-_To be filled in by the implementer._
+- **rAF audit:** `tick()` flushes fallback commands before reading SAB/fallback
+  snapshots. Completion calls `playlistPlayback.ended()` → `playEntry()` →
+  `controller.play()` → resolver → `preparePlayback()` → `activateLoadedModule()`.
+  Activation waits for loader/audio promises and the worklet port's load reply, never
+  an animation frame. No step needed moving off rAF. Media Session state/handler
+  refreshes use this same 100 ms controller path; visibility restoration ticks once
+  and refreshes position without starting audio or resuming a stopped context.
+- **1 — Stream destination:** The [Web Audio specification](https://www.w3.org/TR/webaudio-1.1/#MediaStreamAudioDestinationNode)
+  defines a stream destination independent of the hardware destination. Chromium's
+  headless scenario checks advancing `currentTime` and non-zero master peaks with
+  only the stream destination connected, plus a playing hidden element. Every
+  graph creation/rebuild uses the same routing helper; streams are cached per
+  context and the element survives rebuilds.
+- **2 — iOS:** `playsinline` is set and `autoplay` is false. The real stream is created
+  synchronously beside `context.resume()`, before the first await, and `audio.play()`
+  is called in that gesture. No empty placeholder stream is needed. Rejected play
+  requests fall back to direct output with an Output-panel message. This follows
+  [WebKit's MediaStream gesture guidance](https://webkit.org/blog/7763/a-closer-look-into-webrtc/).
+  Physical iOS Safari gesture policy, screen-lock survival and latency were not
+  verified; Chromium automation explicitly permits autoplay.
+- **3 — Silence:** Stop pauses the element and snapshot transitions publish
+  `playbackState = 'paused'`. Play starts the same element synchronously and resumes
+  the context; the engine continues from the stopped position. Natural completion
+  pauses the element only outside playlist mode; a playlist advance keeps it playing
+  (silence) between tracks, because pausing it would let a phone drop the media session
+  and freeze the tab before the next track loads. Changing the route or rebuilding
+  channels while stopped preserves that pause. No silent keep-alive is used.
+- **Metadata and position:** Library and playlist-library plays carry their folder;
+  archive members carry their archive label; other inputs use StarPlayer. There is
+  no existing icon under `www/`, so artwork is omitted. Position updates happen on
+  activation (cleared until the new generation's snapshot arrives), transport controls,
+  seeks and visibility restoration. Optional relative-seek actions are omitted.
+- **Outstanding:** Owner Android Chrome check against the published Pages build:
+  screen-off continuation through playlist auto-advance and actual notification /
+  lock-screen controls. Physical output-device selection and iOS Safari remain
+  unverified; routing/device behaviour is covered with fakes.
+
+## Revision after review (2026-10-26): silent keep-alive element instead of a MediaStream route
+
+The first implementation sends the worklet node through a `MediaStreamAudioDestinationNode`
+into the hidden `<audio>` element. A review showed, and Chromium's source confirms, that
+this can't produce Android lock-screen controls.
+
+**Why the route fails.**
+- **Chromium registers a `MediaStream` element as one-shot.** `WebMediaPlayerMS` registers
+  every `MediaStream` player as `MediaContentType::kOneShot`
+  (`third_party/blink/renderer/modules/mediastream/web_media_player_ms.cc`, "We use
+  OneShot focus type here…").
+- **A one-shot session isn't controllable.** `MediaSessionImpl::IsControllable()` returns
+  false when a session has only one-shot players
+  (`content/browser/media/session/media_session_impl.cc`).
+- **The result.** No media notification or lock-screen controls appear, whatever
+  metadata and handlers the page sets.
+- **What a controllable player needs.** Only a *persistent* player takes `kGain` focus
+  and is controllable. `media::DurationToMediaContentType`
+  (`media/base/media_content_type.cc`) classes as persistent only a duration that is
+  unknown (zero) or **longer than 5 s**. A shorter clip is transient
+  (`kGainTransientMayDuck`), and not controllable.
+
+**Revised design.** Replace the deliverables in section 1 as follows. Sections 2–4 stand,
+except where noted here.
+
+1. **Output is always direct.**
+   - **Routing.** The worklet node always connects to `context.destination`, exactly as
+     before W14.
+   - **Remove the stream route.** Remove `MediaStreamAudioDestinationNode`, the
+     per-context stream cache, and the `connectOutput` re-routing.
+   - **Output device.** Output-device selection goes back to `AudioContext.setSinkId`
+     only. Restore the pre-W14 sink code paths in `app.js`: `persistPreferences`,
+     `updateOutputPanel`, `startAudio`, `rebuildAudioContext`, `refreshOutputDevices`,
+     `applyOutputDevice`, and the "does not expose AudioContext.setSinkId()" note.
+   - **No latency cost.** Drop the " + media element" latency suffix, and the latency
+     wording in the option note and the README.
+2. **Keep-alive element.** `www/background-output.js` becomes a keep-alive for the
+   media session.
+   - **The element and its source.** It owns one hidden `<audio>` element (with
+     `playsinline` and `loop`). Its source is a **silent PCM WAV generated in JS** as a
+     `Blob`, with an object URL created once:
+     - 8-bit unsigned mono, so silence is `0x80`;
+     - a low sample rate such as 8000 Hz;
+     - **10 s** long, safely over Chromium's 5 s persistent threshold.
+
+     It is never a `MediaStream`, and the repo gets no binary asset.
+   - **`start()`** calls `audio.play()`. It is first called synchronously inside the
+     gesture that starts audio, beside `context.resume()` in `startAudio()`, as now.
+   - **`pause()`** pauses the element.
+   - **Rejection.** A rejected `play()` reports a short note in the Output panel. Audio
+     carries on regardless, because output never depended on the element.
+   - **The toggle.** It now only starts or stops the keep-alive element: start it if the
+     engine is playing, pause it otherwise. There is nothing to re-route.
+   - **Option note.** The Output-panel note becomes "Keeps playing with the screen off
+     and adds lock-screen controls".
+3. **When the element pauses** (this resolves review finding 2).
+   - **Running.** It runs while the engine plays, and **through a playlist advance**,
+     including resolving and fetching the next track. Pausing it between tracks would let
+     a phone drop the media session and freeze the tab.
+   - **When it pauses:**
+     - on Stop, or the media-session `pause`/`stop` actions;
+     - when a song ends naturally outside playlist mode;
+     - when a playlist advance **finishes without starting a track**: there is no
+       successor (the last entry without Loop), or the three-failures stop.
+   - **Detecting a dead advance.** In app.js, wrap `onTrackEnded` so that, after
+     `playlistPlayback.ended(id)` settles, it checks whether a newer activation began
+     (for example, by comparing a counter that `activateLoadedModule` bumps). If none
+     did, and the engine isn't playing, pause the element and set
+     `playbackState = 'paused'`.
+4. **Media position freshness** (review findings 3 and 4).
+   - **Playback edges.** Refresh `setPositionState` from the snapshot on every
+     playing-state transition. That makes Play after a natural end publish the rewound
+     position, not the old end.
+   - **Rebuilds and reloads.** Set `state.mediaPositionPending = true` wherever
+     `playback.rebind(...)` is called: the load-option / speed-adjust reload,
+     `rebuildAudioContext` and `rebuildOutputChannels`. The next snapshot of the new
+     generation then republishes duration and position.
+   - **Frame seeks.** These may keep publishing the requested frame at once, then also
+     set the pending flag so the engine's row-aligned frame replaces it.
+5. **Tests.**
+   - **Unit tests.** Rewrite `test/background-output.test.mjs` for the keep-alive:
+     - the WAV header and size, a duration over 5 s, and silent samples;
+     - `loop` and `playsinline` set;
+     - start and pause;
+     - the rejection note;
+     - no `MediaStream` or `createMediaStreamDestination` use;
+     - and that the module never touches the audio graph.
+   - **Headless.** The scenario asserts that:
+     - the hidden element plays the blob URL with `duration > 5` and is not paused;
+     - output peak telemetry is non-zero;
+     - metadata, `pause`/`play` handlers and `playbackState` behave as before;
+     - toggling off pauses the element while audio continues;
+     - a playlist of one or two short fixtures running to its natural end leaves the
+       element paused, with `playbackState === 'paused'`. If the fixtures are too long
+       for a test, drive it by seeking near the end.
+   - **What only the phone can prove.** The owner's Android check is the only evidence
+     for real lock-screen controls and screen-off survival. Say so in the Research
+     resolution.

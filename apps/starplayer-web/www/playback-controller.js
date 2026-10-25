@@ -21,7 +21,7 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
         get playlistMode() { return playlistMode; },
         effectiveAtEnd: () => !playlistMode && repeat(),
         cancel() { intent += 1; abort?.abort(); wasPlaying = false; },
-        async play(locator, { origin = 'file', entryId = null, label = locator.label || locator.memberPath || locator.sourcePath || 'module' } = {}) {
+        async play(locator, { origin = 'file', entryId = null, folder = null, archiveLabel = null, label = locator.label || locator.memberPath || locator.sourcePath || 'module' } = {}) {
             controller.cancel();
             current = null;
             const token = intent;
@@ -39,7 +39,7 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
                     ? await (locator.read ? locator.read(signal) : locator.buffer)
                     : await resolver.resolve(locator, { signal });
                 if (!isCurrent()) return { status: 'abandoned' };
-                const activation = await activate(buffer, label, origin, { isCurrent, audio: audioReady });
+                const activation = await activate(buffer, label, origin, { isCurrent, audio: audioReady, entryId, folder, archiveLabel });
                 if (!isCurrent() || !activation) return { status: 'abandoned' };
                 current = { ...activation, origin, entryId };
                 blocked = false;

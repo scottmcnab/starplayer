@@ -240,7 +240,7 @@ class Page {
             browser.kill('SIGKILL');
             throw new Error('Chromium never opened its DevTools endpoint');
         }
-        const target = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' })
+        const target = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent('about:blank')}`, { method: 'PUT' })
             .then((response) => response.json());
         const socket = new WebSocket(target.webSocketDebuggerUrl);
         await new Promise((resolve, reject) => {
@@ -253,6 +253,18 @@ class Page {
         await page.send('Runtime.enable');
         await page.send('Log.enable');
         await page.send('Page.enable');
+        await page.send('Page.addScriptToEvaluateOnNewDocument', { source: `
+            window.mediaHandlers = {};
+            if (navigator.mediaSession) {
+                const original = navigator.mediaSession.setActionHandler.bind(navigator.mediaSession);
+                navigator.mediaSession.setActionHandler = (action, callback) => { window.mediaHandlers[action] = callback; return original(action, callback); };
+            }
+            const OriginalContext = window.AudioContext;
+            window.AudioContext = class extends OriginalContext {
+                constructor(...options) { super(...options); window.testAudioContext = this; }
+            };
+        ` });
+        await page.send('Page.navigate', { url });
         await page.waitFor('the document', "document.readyState === 'complete'");
         return page;
     }
@@ -1160,6 +1172,35 @@ async function run(executable, mode) {
         assert.equal(afterMono.errorText, beforeRate.errorText, `the mono rebuild raised an error: ${afterMono.errorText}`);
         report.monoMode = mono.engineMode;
         report.monoChannels = mono.channelStatus;
+
+        // A fresh graph tests background routing from the first audio gesture.
+        await page.send('Page.reload', { ignoreCache: true });
+        await page.waitFor('background scenario startup', "document.documentElement.dataset.playerReady === 'true'");
+        assert.equal(await page.evaluate("return document.getElementById('background-playback').checked;"), false, 'desktop background playback defaults off');
+        await page.evaluate(`
+            document.getElementById('force-fallback').checked = ${mode === 'fallback'};
+            document.getElementById('background-playback').click();
+            document.getElementById('start-audio').click();
+            return true;
+        `);
+        await page.waitFor('background audio graph', "document.getElementById('transport-chip').textContent === 'audio ready'");
+        await loadFixture(page, FIRST_MODULE);
+        await page.waitFor('background media playing', "document.querySelector('audio')?.srcObject instanceof MediaStream && !document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'playing'");
+        assert.equal(await page.evaluate("return document.querySelector('audio').hidden;"), true);
+        const contextTime = await page.evaluate('return window.testAudioContext.currentTime;');
+        await delay(300);
+        assert.ok(await page.evaluate(`return window.testAudioContext.currentTime > ${contextTime};`), 'stream-only context time advances');
+        await page.waitFor('background master peak', "parseFloat(document.getElementById('master-peak').style.width) > 0");
+        assert.equal(await page.evaluate('return navigator.mediaSession.metadata.title;'), (await page.evaluate(READ_STATE)).title);
+        await loadFixture(page, SECOND_MODULE);
+        await page.waitFor('background track replacement', "document.getElementById('title').textContent === 'Petrified' && navigator.mediaSession.metadata.title === 'Petrified' && !document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'playing'");
+        await page.evaluate("window.mediaHandlers.pause(); return true;");
+        await page.waitFor('media pause', "navigator.mediaSession.playbackState === 'paused' && document.getElementById('transport-chip').textContent === 'stopped' && document.querySelector('audio').paused");
+        await page.evaluate("window.mediaHandlers.play(); return true;");
+        await page.waitFor('media resume', "navigator.mediaSession.playbackState === 'playing' && document.getElementById('transport-chip').textContent === 'playing' && !document.querySelector('audio').paused");
+        await page.evaluate("document.getElementById('background-playback').click(); return true;");
+        await page.waitFor('direct output after background toggle', "document.querySelector('audio').paused && document.querySelector('audio').srcObject === null && parseFloat(document.getElementById('master-peak').style.width) > 0 && navigator.mediaSession.playbackState === 'playing'");
+        report.backgroundPlayback = 'stream rendering, media metadata, pause/play, direct toggle passed';
 
         // ── phone width ─────────────────────────────────────────────────────────────
         await page.send('Emulation.setDeviceMetricsOverride', {
