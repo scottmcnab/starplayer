@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Implemented and verified on `w15-remediation` — owner acceptance and future main landing pending (2026-10-27)** |
+| Status | **Implemented, independently reviewed and verified on `w15-remediation` — manual owner acceptance and future main landing pending (2026-10-27)** |
 | Baseline | `48eee06`, `library-folder-plan` (feature baseline `b3faf9e`) |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Workers | GPT-6.1-sol, **high** effort |
@@ -71,11 +71,13 @@ cannot prove no future match. Documentation of both behaviors is in scope, not o
 | [R5a](W15-remediation-R5a-background-priority.md) | R5 (measured integration correction) | cooperative-yield.js and its unit tests after R5 handoff |
 | [R6a](W15-remediation-R6a-keyboard-selection.md) | R6 (retained browser regression) | keyboard selection recount before offscreen repaint in library-view.js |
 | [R7](W15-remediation-R7-integration-evidence.md) | R4b/R5/R5a/R6/R6a (transitively all) | headless/W15 browser harness, documentation, final evidence |
+| [R8](W15-remediation-R8-trap-cleanup.md) | R4b/R7 (post-integration review) | worker jobs and endpoint/group/browser trap-cleanup regressions |
+| [R9](W15-remediation-R9-playback-scan-status.md) | R2/R6/R7/R8 (post-integration review) | controller scan-phase logic and focused/browser view regressions |
 
 R1, R2, R3, R4a and R5 all start from the baseline and touch disjoint files; run up to
 three concurrently (R1 and R4a are small). R6 follows R2/R3/R5 and consumes R5's
 integrated yield helper. R4b follows R1/R2/R3/R4a (the #1–#3 gate) and owns
-runtime/controller files only after R1/R2 finish; R4b and R6 may overlap. R7 is last. Coordinator alone owns active
+runtime/controller files only after R1/R2 finish; R4b and R6 may overlap. R7 is last in the initial implementation graph; post-integration review corrections R8 then R9 follow its reviewed baseline. Coordinator alone owns active
 plan status, index and archive annotations. Workers own their module unit tests;
 R7 owns shared headless files. R3 hands index.html to R6, then R7 may edit only help
 text after explicit final handoff. R4a owns web Rust source-contract test maintenance;
@@ -172,7 +174,11 @@ metadata-error. Late messages from retired instances are ignored by instance/att
 job/generation. Ordinary loader Result errors, unsupported data and JSON validation
 errors remain job-failed and the queue continues on the same instance. Existing
 startup/transport fatal behavior and explicit Retry are preserved. No automatic
-crash/retry loop. Abort, dispose and stale errors never become corrupt-track errors.
+crash/retry loop. Abort, dispose and stale errors never become corrupt-track errors. After a trap,
+do not call back into WASM to free an archive session: wasm-bindgen may retain its
+mutable borrow, and a secondary ownership error would mask the original RuntimeError.
+Worker termination releases the poisoned instance. Healthy success/ordinary-error
+paths still free normally; a trap during otherwise-normal cleanup remains fatal.
 
 ### B. Eligible work, sidecars and change notifications (#2, #6)
 
@@ -203,6 +209,10 @@ indexed CSV comment semantics. Update prepareComments accounting, its previous-r
 snapshot and attach/replacement paths, not only discovery's countRow. UI names pending,
 failed and excluded separately; "scan complete" describes job completion, not proof
 that all tracks were valid. Empty/all-unplayable/mixed/error-only states are mandatory.
+Page-only playback refreshes preserve the idle/cancelled/previous completed scan phase
+and do not hide an otherwise actionable Scan button. Pending digests remain visible in
+their dedicated counters/hints. Genuine active scans wait for current eligible
+refreshes; explicitly requested row Retry reports its own inspection job phase.
 
 Extend existing onLibraryUpdate change with `rowChanges:[{id,added,fields}]`,
 `libraryRevision` and `issuesRevision`; retain changedRowIds/metadataUpdates for
@@ -575,6 +585,9 @@ timings remain labeled as such.
 
 ## Final reviewed delivery and verification (2026-10-27)
 
+This section records initial delivery through `1d40613`. Post-integration review
+corrections below supersede its source-equality statement and Node count.
+
 All remediation tasks and the two measured integration corrections are implemented,
 reviewed, committed and verified on `w15-remediation` in
 `/home/scott/projects/starplayer-w15-remediation`. Workers used GPT-6.1-sol at high
@@ -684,3 +697,84 @@ conservative/session-only; first raw ZIP duplicate wins; Rebind pending remains 
 by complete discovery. These documented decisions are preserved. Main landing requires
 future authorization and the repository's multi-commit `--no-ff` rule. No owner acceptance
 is represented as completed by synthetic automation.
+
+## Post-integration independent review (2026-10-27)
+
+The owner requested the original review session to inspect the implemented branch and
+iterate on findings. Round one reviewed `1d40613` and found two defects: fatal session
+cleanup could mask a trapped mutable borrow, and playback without a requested scan
+incorrectly changed metadataPhase to running/complete. Other reviewed contracts had no
+substantive findings. Two low-consequence cases were recorded: programming exceptions
+in a synchronous view callback can lose that flushed delta until a full refresh, and
+missing WebCrypto in an insecure context produces a raw path issue. These are retained
+edge cases, not silently claimed fixed.
+
+[R8](W15-remediation-R8-trap-cleanup.md) was reviewed and integrated as `6a89c0f`.
+The coordinator independently passed 102 focused tests and all three Chromium
+remediation modes, including the new poisonedSessionTrapCleanup gate. A separate
+minimal real wasm-bindgen 0.2.127 mutable-borrow panic probe reproduced the precise
+ownership error on baseline and worker-failed/wasm-trap after the fix; no repository
+Rust panic was injected. [R9](W15-remediation-R9-playback-scan-status.md) was reviewed
+and integrated as `a18d224`; coordinator focused 59 tests and full 309 Node tests passed.
+Both fixes were returned to the same reviewer session; round two closed both findings
+with no new substantive regressions. Final post-review verification passed as recorded
+below; original delivery evidence above remains historical. Artifacts: `/tmp/starplayer-w15-remediation-review/`.
+
+### Review closure and final post-review gates
+
+The original Claude CLI session `e80ca7f5-7ec4-43b0-9549-fcc7c76304f5`
+reviewed `1d40613`, then re-reviewed the fixes at `a18d224`. It explicitly closed both
+findings and found no new substantive regressions. It checked the actual pinned
+wasm-bindgen mutable-borrow probe and requested no further reproductions. The reviewer
+closed the code findings before the final integration run completed; the coordinator
+subsequently verified every result below. CLI version 2.1.311; resumed model reported
+claude-opus-5-5. Review was read-only; GPT-6.1-sol high workers implemented the fixes,
+and the coordinator reviewed, verified, committed and squash-integrated them.
+
+| Correction | Integration commit | Final behavior |
+|---|---|---|
+| R8 | `6a89c0f` | Never reenter poisoned WASM for session cleanup; preserve original fatal trap, completed progress, suspension and explicit healthy Retry |
+| R9 | `a18d224` | Playback refreshes preserve idle/cancelled/completed scan intent; actionable Scan remains visible; active Scan and explicit row Retry keep their actual job phases |
+
+Final production sources remain those reviewed at `a18d224`. One later harness edit
+only corrects a diagnostic limitation string that assumed the old playback completion
+flush; it changes no test logic/assertions. Both temporary review task branches and
+worktrees were removed after clean-status and integrated-patch checks, retaining
+`w15-remediation`. Main, historical assembly and committed AGENTS.md remain unchanged.
+No cargo fmt, attribution, push, deployment or main merge occurred.
+
+| Final verification | Result / artifact under `/tmp/starplayer-w15-remediation-review/` |
+|---|---|
+| Complete Node suite | 309 passed, zero failed/skipped; `final-node.log` |
+| Rust archive/web | 31 archive + 22 web passed; doc tests passed; one pre-existing manual archive generator ignored; `final-rust.log` |
+| WASM and Pages | Development/Pages packaging and local shipped-shim worker smoke passed; `final-wasm.log`, `final-pages-build.log`, `final-pages-smoke.log` |
+| Full Chromium | Unfiltered default 60-second SAB/fallback/plain suites passed, including both new evidence flags, retained 40k/indexed/remote/upload/reconnect/legacy assertions and archive matrices; `final-headless.log` |
+| Complete CI | All 11 jobs passed, including RT/no_std/conformance/goldens/SIMD/FMA/Clippy/feature purity; `final-ci.log` |
+| Real borrow-guard probe | Baseline emitted ordinary ownership error; fixed endpoint preserved worker-failed/wasm-trap after A delivered; `borrow-probe-result.log`, `borrow-probe/` |
+| Nonterminal visibility return | Genuine hidden tab, another digest held pending; DOM 135 ms / actual row-change notification 135 ms after return; `final-visibility.log` |
+| Repeated hidden/freeze-thaw | 390,193 ms genuinely hidden with normal throttling; early and after-five-minute 65,536-row walks and same-iterator freeze/thaw passed; timer control maximum gap about 50,797 ms; `final-background.log` |
+
+The hidden gates were repeated because R9 changes playback-only completion-flush
+behavior. They make no frozen-page or real-device throughput claim. The delta had not been published before return and reached the DOM 138 ms afterward;
+this records observed timing without assuming an immediate completion flush. The dedicated nonterminal visibility test measures
+actual debounce separately. The hidden run initially overlapped CI; it is not an
+isolated throughput benchmark. Earlier R7 100k-view/native-digest measurements remain
+historical evidence for the unchanged view/scheduler and native hashing design, not
+fresh timing claims after these corrections.
+
+The first extra visibility attempt used the Pages package, whose omitted development
+fixture produced a 404. It is retained as `visibility-pages-package-diagnostic.log`,
+not counted as passing evidence. Rebuilding the development package and rerunning the
+unchanged assertions passed. No test assertion was removed or relaxed.
+
+Exact commands, source/dist identities and artifact hashes are in
+`final-review-evidence.json`; `round-1-result.txt` and `round-2-result.txt` preserve the
+reviewer reports. Final plan/link/DAG/scope/attribution/clean-worktree/main-preservation
+checks are recorded by `validate-review.py`.
+
+Only two review edge cases remain: a programming exception in a synchronous view
+callback can lose that flushed delta until a full refresh; insecure HTTP without
+WebCrypto produces a raw path issue. Both were explicitly classified low-consequence
+by the reviewer. The already documented large-digest profiling follow-up remains
+separate. Native permission prompts, real collection/device and saved-playlist/
+reconnect/FileList/storage-denied/rebind checks remain manual owner acceptance.

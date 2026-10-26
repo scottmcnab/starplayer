@@ -207,6 +207,74 @@ test('scan cancellation ignores disposed/cancelled inspection and leaves archive
     h.jobs('catalog')[0].resolve({ entries: [], issues: [] }); await tick(); assert.equal(h.context.discoveryStatus.metadataPhase, 'complete');
 });
 
+for (const phase of ['idle', 'cancelled', 'complete']) test(`playback refresh preserves ${phase} scan phase without starting inspection`, async t => {
+    const h = harness({ records: [file('a.mod'), file('b.mod')] }); t.after(() => h.controller.dispose()); await tick();
+    if (phase !== 'idle') {
+        h.controller.scanMetadata();
+        if (phase === 'cancelled') h.controller.cancelMetadata();
+        else for (const job of h.jobs('member')) job.resolve({ metadata: metadata('scanned'), sha256: sha });
+        await tick();
+    }
+    assert.equal(h.context.discoveryStatus.metadataPhase, phase);
+    const inspectionCount = h.jobs('member').length;
+    h.controller.acceptPlaybackMetadata(locator('a.mod'), metadata('played'), new Uint8Array([1]));
+    assert.equal(h.context.discoveryStatus.metadataPhase, phase);
+    assert.equal(h.context.discoveryStatus.metadataCounts.refreshPending, 1); assert.equal(h.context.discoveryStatus.metadataCounts.hashesPending, 1);
+    assert.equal(h.context.discoveryStatus.metadataIncomplete, true);
+    assert.equal(h.context.discoveryStatus.metadataCounts.scanActionable, phase === 'complete' ? 0 : 1);
+    h.digests[0].resolve(sha); await tick(); h.publish();
+    assert.equal(h.context.discoveryStatus.metadataPhase, phase); assert.equal(h.jobs('member').length, inspectionCount);
+    assert.equal(h.context.discoveryStatus.metadataCounts.refreshPending, 0); assert.equal(h.context.discoveryStatus.metadataCounts.hashesPending, 0);
+    assert.equal(h.context.library.rows[0].title, 'played');
+    assert.equal(h.context.library.rows[1].metadataState, phase === 'complete' ? 'ready' : 'unknown');
+    assert.equal(h.context.discoveryStatus.metadataIncomplete, phase !== 'complete');
+});
+
+test('Cancel retains cancelled phase while a current playback digest survives and settles', async t => {
+    const h = harness({ records: [file('a.mod'), file('b.mod')] }); t.after(() => h.controller.dispose()); await tick();
+    h.controller.scanMetadata();
+    h.controller.acceptPlaybackMetadata(locator('a.mod'), metadata('played during scan'), new Uint8Array([1]));
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'running');
+    h.controller.cancelMetadata(); await tick();
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'cancelled');
+    assert.equal(h.context.discoveryStatus.metadataCounts.refreshPending, 1); assert.equal(h.context.discoveryStatus.metadataCounts.hashesPending, 1);
+    assert.equal(h.context.discoveryStatus.metadataCounts.scanActionable, 1);
+    for (const job of h.jobs('member')) job.resolve({ metadata: metadata('cancelled inspection'), sha256: secondSha });
+    h.digests[0].resolve(sha); await tick();
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'cancelled'); assert.equal(h.context.library.rows[0].title, 'played during scan');
+    assert.equal(h.context.library.rows[1].metadataState, 'unknown'); assert.equal(h.context.discoveryStatus.metadataCounts.hashesPending, 0);
+});
+
+test('active Scan waits for current playback refresh and discovery, but not stale physical digests', async t => {
+    const incoming = stream(), h = harness({ source: { label: 'root', enumerate: () => incoming } }); t.after(() => h.controller.dispose());
+    incoming.push(file('a.mod')); incoming.push(file('b.mod')); await tick();
+    h.controller.acceptPlaybackMetadata(locator('a.mod'), metadata('superseded'), new Uint8Array([1]));
+    h.controller.acceptPlaybackMetadata(locator('a.mod'), metadata('current'), new Uint8Array([2]));
+    h.controller.scanMetadata();
+    assert.equal(h.jobs('member').length, 1); assert.equal(h.jobs('member')[0].locator.sourcePath, 'b.mod');
+    h.jobs('member')[0].resolve({ metadata: metadata('scanned B'), sha256: sha }); await tick();
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'running'); assert.equal(h.context.discoveryStatus.metadataCounts.refreshPending, 1);
+    h.digests[1].resolve(sha); await tick();
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'waiting'); assert.equal(h.context.discoveryStatus.metadataCounts.hashesPending, 1);
+    incoming.end(); await tick();
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'complete'); assert.equal(h.context.discoveryStatus.metadataIncomplete, false);
+    assert.equal(h.context.discoveryStatus.metadataCounts.hashesPending, 1);
+    h.digests[0].resolve(secondSha); await tick();
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'complete'); assert.equal(h.context.library.rows[0].title, 'current');
+});
+
+test('explicit row Retry completes its inspection independently of unrelated playback refresh', async t => {
+    const h = harness({ records: [file('a.mod'), file('b.mod')] }); t.after(() => h.controller.dispose()); await tick();
+    h.controller.acceptPlaybackMetadata(locator('a.mod'), metadata('played A'), new Uint8Array([1]));
+    h.controller.retryMetadata(locator('b.mod'));
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'running'); assert.equal(h.jobs('member').length, 1);
+    h.jobs('member')[0].resolve({ metadata: metadata('retried B'), sha256: sha }); await tick();
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'complete'); assert.equal(h.context.discoveryStatus.metadataCounts.refreshPending, 1);
+    assert.equal(h.context.discoveryStatus.metadataIncomplete, true);
+    h.digests[0].resolve(sha); await tick();
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'complete'); assert.equal(h.context.discoveryStatus.metadataIncomplete, false);
+});
+
 test('playback before row arrival caches only completed coherent patches and joins latest sidecar', async t => {
     const incoming = stream(), h = harness({ source: { label: 'root', enumerate: () => incoming } }); t.after(() => h.controller.dispose());
     const where = { sourcePath: 'outer.zip', containerMember: 'inner.zip', memberPath: 'music.mod', rawHex: '61' };

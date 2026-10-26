@@ -203,3 +203,7 @@ Native-picker permissions, real collection/device responsiveness and real saved-
 reload/reconnect/FileList/storage-denied/rebind checks remain manual owner acceptance.
 The [master's final record](W15-remediation-master-plan.md#final-reviewed-delivery-and-verification-2026-10-27)
 is authoritative. No main merge, push or deployment occurred.
+
+## Post-integration review follow-up (2026-10-27)
+
+The owner-requested post-integration review produced [R8](W15-remediation-R8-trap-cleanup.md) and [R9](W15-remediation-R9-playback-scan-status.md), both closed on re-review at `a18d224`. The complete repeated Node suite is 309 tests; full three-mode Chromium, Rust/WASM/Pages, 11-job CI and repeated hidden/visibility checks passed. Initial R7 evidence above remains historical; see the [master final review record](W15-remediation-master-plan.md#review-closure-and-final-post-review-gates).

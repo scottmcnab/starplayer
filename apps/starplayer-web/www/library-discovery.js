@@ -50,15 +50,16 @@ export function createDiscoveryController({ context, generation = nextGeneration
     }
     function status() {
         const phase = paused ? 'paused' : !walkDone ? 'running' : rootFailed || (runtimeError && catalogs.size) ? 'failed' : catalogs.size ? 'running' : 'complete';
-        if (scanActive || inspected.size || refreshPending) {
-            if (runtimeError && (scanActive || inspected.size)) metadataPhase = 'suspended';
-            else if (inspected.size || refreshPending) metadataPhase = 'running';
+        // Playback refreshes affect counters independently; only requested inspection changes scan phase.
+        if (scanActive || inspected.size) {
+            if (runtimeError) metadataPhase = 'suspended';
+            else if (inspected.size || scanActive && refreshPending) metadataPhase = 'running';
             else if (phase !== 'complete') metadataPhase = 'waiting';
             else { scanActive = false; metadataPhase = 'complete'; }
         }
         let issueSnapshot;
         const issueLength = issues.length;
-        if (!scanActive && metadataPhase === 'running' && !inspected.size && !refreshPending) metadataPhase = 'complete';
+        if (!scanActive && metadataPhase === 'running' && !inspected.size) metadataPhase = 'complete';
         return Object.freeze({ phase, filesExamined: examined.size, archivesPending: catalogs.size, tracksFound: library.rows.length,
             issuesRevision, get issues() { return issueSnapshot ||= Object.freeze(issues.slice(0, issueLength)); }, issueCount: issues.length, metadataPhase, runtimeError,
             metadataCounts: Object.freeze({ ...counts, hashesPending: digests.size, refreshPending, scanActionable: actionableRows.size }),

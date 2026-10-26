@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Implementation authorized — reproduced post-integration review finding** |
+| Status | **Integrated — independently re-reviewed/closed; all final automated gates passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Integrated R4b and R7 |
@@ -36,3 +36,22 @@ Run `node --test --test-isolation=none apps/starplayer-web/test/library-inspecti
 ## Out of scope
 
 Changing page hashing, source acceptance, archive grouping/limits/duplicates, incremental view architecture or any reviewed withdrawn queue/ACK/fairness design; cargo fmt, owner collection scans, deployment/main merge. Temporary review worktree/branch will be removed after reviewed integration, retaining the main remediation branch.
+
+## Execution evidence (2026-10-27)
+
+Integrated as `6a89c0f`. Coordinator reviewed five production/test/comment paths,
+independently passed 102 focused tests, rebuilt the integration package and passed
+Chromium remediation SAB/fallback/plain with poisonedSessionTrapCleanup:true. Worker
+full Node suite passed 303 tests. Baseline regression suite produced five expected
+failures. An isolated actual wasm-bindgen 0.2.127 mutable-borrow panic probe also
+reproduced ordinary ownership error masking on baseline and fatal RuntimeError
+classification after the fix; this minimal ABI probe is not a malformed StarPlayer
+archive reproduction. Healthy ordinary-error/session cleanup assertions remain.
+Artifacts under `/tmp/starplayer-w15-remediation-review/`: r8-worker-baseline.log,
+r8-coordinator-focused.log, r8-worker-full-node.log, r8-wasm.log, r8-browser.log,
+borrow-probe-result.log; probe source/build inputs are in borrow-probe/.
+
+Final re-review at `a18d224` closed this finding. Full 309 Node tests, Rust/WASM, all
+three Chromium modes, Pages smoke, 11-job CI and repeated hidden/visibility checks
+passed; see the [master final review record](W15-remediation-master-plan.md#review-closure-and-final-post-review-gates).
+The temporary task branch/worktree was removed after clean integrated-patch checks.

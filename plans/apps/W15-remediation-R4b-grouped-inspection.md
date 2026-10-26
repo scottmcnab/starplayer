@@ -116,3 +116,7 @@ Integrated as `d23bb02`. Coordinator independently passed 99 focused worker/cont
 Final combined Node/Rust/WASM/CI, Chromium and Pages gates passed; see
 [R7 final evidence](W15-remediation-R7-integration-evidence.md#final-execution-evidence-2026-10-27).
 Native-picker, real-collection and device acceptance remain owner checks.
+
+## Post-integration review follow-up (2026-10-27)
+
+[R8](W15-remediation-R8-trap-cleanup.md) subsequently prevented poisoned-session cleanup from masking fatal traps; the post-integration reviewer closed the finding and all final gates passed.

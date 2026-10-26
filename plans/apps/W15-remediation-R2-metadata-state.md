@@ -119,3 +119,7 @@ Integrated as `cc68dac` after coordinator diff review and independent focused No
 Final combined Node/Rust/WASM/CI, Chromium and Pages gates passed; see
 [R7 final evidence](W15-remediation-R7-integration-evidence.md#final-execution-evidence-2026-10-27).
 Native-picker, real-collection and device acceptance remain owner checks.
+
+## Post-integration review follow-up (2026-10-27)
+
+[R9](W15-remediation-R9-playback-scan-status.md) subsequently corrected page-only refresh scan-phase transitions; the post-integration reviewer closed the finding and all final gates passed.

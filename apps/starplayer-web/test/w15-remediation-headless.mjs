@@ -90,7 +90,7 @@ export async function runBackground(options) {
         for(const run of final.runs)assert.equal(run.records,65536);
         const returnProbeLabel=await page.evaluate('return returnRun.label;');
         assert.deepEqual(page.consoleErrors,[]);
-        return {smoke,environment,hiddenMilliseconds, samples, final,returnProbeLabel,publicationBeforeReturn,notificationAfterReturnMilliseconds:publicationBeforeReturn?0:visibilityReturnMilliseconds,visibilityReturnDOMMilliseconds:visibilityReturnMilliseconds,freezeThawRecovery:true,limitation:'No frozen progress assertion; finite 65,536-row synthetic walks; no real-device throughput guarantee. The last-digest completion flush in this run is measured separately from the dedicated nonterminal debounce visibility case.'};
+        return {smoke,environment,hiddenMilliseconds, samples, final,returnProbeLabel,publicationBeforeReturn,notificationAfterReturnMilliseconds:publicationBeforeReturn?0:visibilityReturnMilliseconds,visibilityReturnDOMMilliseconds:visibilityReturnMilliseconds,freezeThawRecovery:true,limitation:'No frozen progress assertion; finite 65,536-row synthetic walks; no real-device throughput guarantee. publicationBeforeReturn records whether the final digest delta had already reached the view; do not infer a completion flush from that observation. The dedicated visibility case isolates nonterminal debounce publication.'};
     } finally {await page.close();server.stop();}
 }
 
@@ -111,11 +111,12 @@ export async function runRemediation(options){
         await page.waitFor('actual audio before gated regression work',"document.getElementById('title').textContent==='remediation group'&&document.getElementById('transport-chip').textContent==='playing'");
         const mixed=options.buildZip([{name:'good.mod',bytes:mod},{name:'broken.mod',bytes:Buffer.from([1,2,3])},{name:'encrypted.mod',bytes:mod,encrypted:true}]);
         const result=await page.evaluate(`return await (${regressionScenario.toString()})(${JSON.stringify([...mod])},${JSON.stringify([...zip])},${JSON.stringify([...mixed])});`);
+        const playbackScanView=await page.evaluate(`return await (${playbackScanViewScenario.toString()})(${JSON.stringify([...mod])});`);
         const matrix=await page.evaluate(`return await (${archiveMatrixScenario.toString()})(${JSON.stringify('http://127.0.0.1:'+fixtureServer.address().port+'/matrix')});`);
         const selection=await page.evaluate(`return await (${selectionScenario.toString()})(${JSON.stringify([...mod])});`);
         assert.equal(await page.evaluate("return document.getElementById('title').textContent==='remediation group'&&document.getElementById('transport-chip').textContent==='playing';"),true,'real active playback survives regression and pending source work');
         const commandTransport=await page.evaluate("return document.getElementById('command-transport').textContent;");assert.match(commandTransport,options.mode==='sab'?/SharedArrayBuffer/:/postMessage/);
-        assert.deepEqual(page.consoleErrors,[]);return {version:page.version,commandTransport,...result,matrix,selection,activePlaybackPreserved:true};
+        assert.deepEqual(page.consoleErrors,[]);return {version:page.version,commandTransport,...result,...playbackScanView,matrix,selection,activePlaybackPreserved:true};
     }finally{await page.close();server.stop();await new Promise(resolve=>{fixtureServer.close(resolve);fixtureServer.closeAllConnections();});}
 }
 
@@ -337,6 +338,53 @@ async function regressionScenario(modArray, zipArray, mixedArray) {
     const recycling=context({...source,size:()=>32*1024*1024,readFile:async()=>{const padded=new Uint8Array(32*1024*1024);padded.set(bytes);return padded;},async *enumerate(){for(const path of ['A.mod','B.mod'])yield {kind:'file',path,size:32*1024*1024,timestamp:''};}},'recycle');
     mode='delay';const recycleEvents=[];const recycleController=createDiscoveryController({context:recycling,digest,runtimeFactory:options=>createLibraryWorkerRuntime({...options,onMetric:event=>recycleEvents.push(event)})});recycleController.start();await wait(()=>recycling.discoveryStatus.phase==='complete');recycleController.acceptPlaybackMetadata(locate('A.mod'),metadata('survives recycle'),bytes);recycleController.scanMetadata();await wait(()=>recycleEvents.some(event=>event.event==='recycle'));check(recycling.discoveryStatus.metadataCounts.hashesPending===1,'recycling preserves page digest');gates.splice(0).forEach(gate=>gate.release());await wait(()=>recycling.library.rows[0].title==='survives recycle'&&!recycling.discoveryStatus.metadataCounts.hashesPending);recycleController.dispose();
     return {atomicReplay:true,firstPlayUnknown:true,snapshotMutation:true,independentABC:true,supersededPhysicalAccounting:true,staleAndDisposedCleanup:true,syncAsyncInvalidFailures:true,beforeRowVersions:true,nativeSubview:true,actualWasmEndpointTrap:true,poisonedSessionTrapCleanup:true,actualTrapSuspendsQueuedC:true,explicitRetryHealthyWorker:true,explicitRetryAndCancelDigest:true,sharedGroupABC:true,callbackResults,excludedOnly:true,mixedErrorSidecars:true,emptyLibrary:true,errorOnlyExplicitRetry:true,pageDigestAcrossRecycle:true,metrics};
+}
+
+async function playbackScanViewScenario(modArray) {
+    const {createDiscoveryController}=await import('./library-discovery.js');
+    const {createDiscoveredLibrary}=await import('./library-index.js');
+    const {createLibraryView}=await import('./library-view.js');
+    const panel=document.getElementById('library-panel');panel.replaceWith(panel.cloneNode(true));
+    document.getElementById('library-heading').replaceChildren();document.getElementById('library-match-popover')?.remove();
+    const el=name=>document.getElementById('library-'+name),check=(ok,why)=>{if(!ok)throw new Error(why);};
+    const wait=async predicate=>{const deadline=performance.now()+20000;while(!predicate()){if(performance.now()>deadline)throw new Error('playback scan view timeout');await new Promise(resolve=>setTimeout(resolve,5));}};
+    const bytes=Uint8Array.from(modArray),gates=[];
+    let notifications=0,reads=0;
+    const source={kind:'filelist',label:'playback scan controls',size:()=>bytes.length,readFile:async()=>{reads++;return bytes.slice();},
+        async *enumerate(){for(const path of ['played.mod','unknown.mod'])yield {kind:'file',path,size:bytes.length,timestamp:''};}};
+    const context={mode:'discovered',source,library:createDiscoveredLibrary({name:'playback scan controls'}),identity:{sha256:'d'.repeat(64),name:'playback scan controls'}};
+    const digest=input=>{
+        // Native WebCrypto snapshots the input at invocation; only publication is gated.
+        const native=crypto.subtle.digest('SHA-256',input);
+        let release;const gate=new Promise(resolve=>release=resolve);gates.push(release);
+        return native.then(result=>gate.then(()=>result));
+    };
+    const view=createLibraryView({playlist:{add(){}},play(){}});
+    const controller=createDiscoveryController({context,digest,onUpdate:(next,change)=>{notifications++;view.updateLibrary(next,change);}});
+    view.setLibrary(context);controller.start();
+    try {
+        await wait(()=>context.discoveryStatus.phase==='complete'&&context.library.rows.length===2);
+        for(const phase of ['idle','cancelled']) {
+            if(phase==='cancelled'){controller.scanMetadata();controller.cancelMetadata();}
+            const label=phase==='idle'?'Metadata not scanned':'Metadata scan cancelled';
+            await wait(()=>el('progress').textContent.includes(label));
+            const before=notifications;
+            controller.acceptPlaybackMetadata({sourcePath:'played.mod'},{title:'played while '+phase,format:'mod',channels:4},bytes);
+            await wait(()=>notifications>before);
+            check(context.discoveryStatus.metadataPhase===phase&&el('progress').textContent.includes(label),'pending playback retains '+phase+' scan label');
+            check(!el('scan-metadata').hidden&&!el('scan-metadata').disabled&&el('cancel-metadata').hidden,'pending playback keeps actionable Scan and hides Cancel in '+phase);
+            check(el('metadata-hint').textContent.includes('1 playback digests pending')&&el('metadata-hint').textContent.includes('1 current-version refreshes pending'),'pending playback remains visible through digest hints');
+            const pending=notifications;gates.shift()();
+            await wait(()=>!context.discoveryStatus.metadataCounts.hashesPending&&notifications>pending);
+            check(context.discoveryStatus.metadataPhase===phase&&el('progress').textContent.includes(label),'settled playback retains '+phase+' scan label');
+            check(!el('scan-metadata').hidden&&!el('scan-metadata').disabled&&el('cancel-metadata').hidden,'settled playback keeps actionable Scan and hides Cancel in '+phase);
+            check(context.library.rows.find(row=>row.sourcePath==='unknown.mod').metadataState==='unknown'&&context.discoveryStatus.metadataCounts.scanActionable===1&&context.discoveryStatus.metadataIncomplete,'other eligible unknown row still needs a real Scan');
+            check(!el('metadata-hint').textContent.includes('playback digests pending'),'settled playback hint clears independently');
+        }
+        check(reads===0,'playback status checks and immediately cancelled Scan do not read inspection bytes');
+        await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+        return {playbackRefreshPreservesScanControls:true};
+    } finally {controller.dispose();gates.splice(0).forEach(release=>release());}
 }
 
 async function archiveMatrixScenario(base) {
