@@ -1,6 +1,22 @@
 // Pure library/playlist data layer. No filesystem, DOM, or playback ownership.
 const knownColumns = new Set(('source_path container_member member_path entry_kind extension format_by_extension size compressed_size crc32 timestamp compression_method encrypted member_path_raw_hex source_url status error sha256 crc_verified format_detected format_variant channels title tracker instrument_slots instruments samples sample_bytes extended_status extended_error library instrument_names sample_names song_message').split(' '));
 const playableFormats = new Set(['mod', 's3m', 'mtm', 'xm', 'it']);
+const modelStates = new WeakMap();
+
+// This is the existing playlist membership tuple; rawHex selects bytes within a locator,
+// but is not part of its identity. Preserve spelling and case, including archive slashes.
+export function locatorKey({ sourcePath, containerMember = '', memberPath = '' }) {
+    return JSON.stringify([sourcePath, containerMember, memberPath]);
+}
+
+function rowPaths(sourcePath, containerMember, memberPath) {
+    const innermost = memberPath || containerMember || sourcePath;
+    const name = innermost.split(/[\\/]/).at(-1);
+    const fullPath = [sourcePath, containerMember, memberPath].filter(Boolean).join('/').replaceAll('\\', '/');
+    const folder = fullPath.slice(0, fullPath.length - name.length).replace(/\/$/, '');
+    const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
+    return { name, folder, extension };
+}
 
 export function parseCsv(text) {
     const rows = [];
@@ -80,14 +96,10 @@ function readRows(text, keepDuplicates) {
         // inside the archive, where DOS-era ZIPs legitimately use `\\` separators.
         const reason = invalidPath(sourcePath);
         if (reason) { issues.push({ line, reason }); continue; }
-        const key = JSON.stringify([sourcePath, containerMember, memberPath]);
+        const key = locatorKey({ sourcePath, containerMember, memberPath });
         if (!keepDuplicates && keys.has(key)) { issues.push({ line, reason: 'duplicate locator' }); continue; }
         keys.add(key);
-        const innermost = memberPath || containerMember || sourcePath;
-        const name = innermost.split(/[\\/]/).at(-1);
-        const fullPath = [sourcePath, containerMember, memberPath].filter(Boolean).join('/').replaceAll('\\', '/');
-        const folder = fullPath.slice(0, fullPath.length - name.length).replace(/\/$/, '');
-        const extension = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
+        const { name, folder, extension } = rowPaths(sourcePath, containerMember, memberPath);
         const format = (get('format_detected').trim() || get('format_by_extension').trim() || extension).toLowerCase();
         const number = column => get(column).trim() && Number.isFinite(Number(get(column))) ? Number(get(column)) : null;
         rows.push({ id: rows.length, sourcePath, sourceUrl: get('source_url').trim(), containerMember, memberPath, rawHex: get('member_path_raw_hex'), name, folder,
@@ -138,44 +150,176 @@ export function parseCommentsCsv(text) {
     return { comments, issues };
 }
 
-export function attachComments(library, comments) {
-    const shared = new Map();
-    const used = new Set();
-    const display = [];
-    library.commentHaystacks = [];
-    library.compactCommentHaystacks = [];
-    let joined = 0;
-    library.hasComments = false;
-    for (const row of library.rows) {
-        const sidecar = comments?.get(row.sha256);
-        if (sidecar) { joined += 1; used.add(row.sha256); }
-        const text = sidecar || row;
-        // Sidecar records share both folded strings and their original display object.
-        let stored = shared.get(text);
-        if (!stored) {
-            const original = Object.fromEntries(commentKeys.map(key => [key, text[key] || '']));
-            const haystack = foldText(commentKeys.map(key => original[key]).filter(Boolean).join('\n'));
-            stored = { original, haystack, compact: compactText(haystack) };
-            shared.set(text, stored);
-        }
-        display[row.id] = stored.original;
-        library.commentHaystacks[row.id] = stored.haystack;
-        library.compactCommentHaystacks[row.id] = stored.compact;
-        if (commentKeys.some(key => stored.original[key])) library.hasComments = true;
+function prepareRow(library, row) {
+    const haystack = foldText([row.name, row.title, row.folder, row.format, row.tracker].join('\n'));
+    library.haystacks[row.id] = haystack;
+    library.compactHaystacks[row.id] = compactText(haystack);
+    library.fieldHaystacks[row.id] = Object.fromEntries(['name', 'title', 'tracker', 'path'].map(field =>
+        [field, foldText(field === 'path' ? [row.sourcePath, row.containerMember, row.memberPath].filter(Boolean).join('/') : row[field])]));
+    library.sortKeys[row.id] = Object.fromEntries(['name', 'title', 'format', 'timestamp', 'folder'].map(column => [column, row[column].toLowerCase()]));
+}
+
+function countFormat(library, format, difference) {
+    const counts = modelStates.get(library).formatCounts;
+    const count = (counts.get(format) || 0) + difference;
+    if (count) { counts.set(format, count); library.formats.add(format); }
+    else { counts.delete(format); library.formats.delete(format); }
+}
+
+function countFolders(library, row) {
+    let path = '';
+    if (row.playable) library.folderCounts.set('', library.folderCounts.get('') + 1);
+    for (const label of row.folder ? row.folder.split('/') : []) {
+        path = path ? `${path}/${label}` : label;
+        library.folderCounts.set(path, (library.folderCounts.get(path) || 0) + (row.playable ? 1 : 0));
     }
-    library.commentsFor = rowId => display[rowId];
-    return { joined, unmatched: (comments?.size || 0) - used.size };
+}
+
+function prepareComments(library, row) {
+    const state = modelStates.get(library);
+    const previous = state.commentStates[row.id];
+    if (previous) {
+        if (!previous.sha256) state.unknownHashes -= 1;
+        if (previous.hasText) state.commentRows -= 1;
+        if (previous.joined) {
+            state.joined -= 1;
+            const count = state.usedHashes.get(previous.sha256) - 1;
+            if (count) state.usedHashes.set(previous.sha256, count);
+            else state.usedHashes.delete(previous.sha256);
+        }
+    }
+    const sidecar = library.comments?.get(row.sha256);
+    let stored = sidecar && state.shared.get(sidecar);
+    if (!stored) {
+        const original = Object.fromEntries(commentKeys.map(key => [key, typeof (sidecar || row)[key] === 'string' ? (sidecar || row)[key] : '']));
+        const haystack = foldText(commentKeys.map(key => original[key]).filter(Boolean).join('\n'));
+        stored = { original, haystack, compact: compactText(haystack) };
+        if (sidecar) state.shared.set(sidecar, stored);
+    }
+    const changed = !state.display[row.id] || commentKeys.some(key => state.display[row.id][key] !== stored.original[key]);
+    state.display[row.id] = stored.original;
+    library.commentHaystacks[row.id] = stored.haystack;
+    library.compactCommentHaystacks[row.id] = stored.compact;
+    const hasText = commentKeys.some(key => stored.original[key]);
+    state.commentStates[row.id] = { sha256: row.sha256, joined: Boolean(sidecar), hasText };
+    if (!row.sha256) state.unknownHashes += 1;
+    if (hasText) state.commentRows += 1;
+    if (sidecar) {
+        state.joined += 1;
+        state.usedHashes.set(row.sha256, (state.usedHashes.get(row.sha256) || 0) + 1);
+    }
+    library.hasComments = state.commentRows > 0;
+    library.commentCounts.joined = state.joined;
+    library.commentCounts.unmatched = (library.comments?.size || 0) - state.usedHashes.size;
+    library.commentCounts.awaitingHashes = library.comments ? state.unknownHashes : 0;
+    return changed;
+}
+
+function initializeLibrary(library, name) {
+    const state = { display: [], commentStates: [], shared: new WeakMap(), usedHashes: new Map(), formatCounts: new Map(), unknownHashes: 0, commentRows: 0, joined: 0 };
+    modelStates.set(library, state);
+    Object.assign(library, { identityName: name, revision: 0, locatorIds: new Map(), haystacks: [], compactHaystacks: [], fieldHaystacks: [], sortKeys: [],
+        commentHaystacks: [], compactCommentHaystacks: [], hasComments: false, comments: null, commentCounts: { joined: 0, unmatched: 0, awaitingHashes: 0 }, commentChangedRowIds: [],
+        formats: new Set(), folderCounts: new Map([['', 0]]), commentsFor: rowId => state.display[rowId] });
+    for (const row of library.rows) {
+        library.locatorIds.set(locatorKey(row), row.id);
+        prepareRow(library, row);
+        prepareComments(library, row);
+        countFormat(library, row.format, 1);
+        countFolders(library, row);
+    }
+    return library;
+}
+
+// Keep the original return shape for indexed-library callers. Discovered consumers can
+// read live commentCounts (including awaitingHashes) and commentChangedRowIds for a batch
+// notification. Sidecar replacement leaves intrinsic row text intact for later fallback.
+export function attachComments(library, comments) {
+    const replaced = library.comments !== comments;
+    library.comments = comments;
+    modelStates.get(library).shared = new WeakMap();
+    const changed = [];
+    for (const row of library.rows) if (prepareComments(library, row)) changed.push(row.id);
+    library.commentCounts.unmatched = (comments?.size || 0) - modelStates.get(library).usedHashes.size;
+    library.commentCounts.awaitingHashes = comments ? modelStates.get(library).unknownHashes : 0;
+    library.commentChangedRowIds = changed;
+    if (replaced || changed.length) library.revision += 1;
+    return { joined: library.commentCounts.joined, unmatched: library.commentCounts.unmatched };
 }
 
 export function parseLibraryCsv(text, { name = '' } = {}) {
-    const library = readRows(text, false);
-    library.identityName = name;
-    library.haystacks = library.rows.map(row => [row.name, row.title, row.folder, row.format, row.tracker].join('\n')).map(foldText);
-    library.compactHaystacks = library.haystacks.map(compactText);
-    library.fieldHaystacks = library.rows.map(row => Object.fromEntries(['name', 'title', 'tracker', 'path'].map(field => [field, foldText(field === 'path' ? [row.sourcePath, row.containerMember, row.memberPath].filter(Boolean).join('/') : row[field])])));
-    attachComments(library, null);
-    library.sortKeys = library.rows.map(row => Object.fromEntries(['name', 'title', 'format', 'timestamp', 'folder'].map(column => [column, row[column].toLowerCase()])));
-    return library;
+    return initializeLibrary(readRows(text, false), name);
+}
+
+// Discovered rows keep the CSV shape (line is null, sourceUrl is empty), with no
+// guessed title/channels. Each changed append/update batch advances revision once;
+// no-op batches and duplicate locators do not. IDs remain array positions forever.
+export function createDiscoveredLibrary({ name = '' } = {}) {
+    return initializeLibrary({ rows: [], issues: [], columns: [] }, typeof name === 'string' ? name : '');
+}
+
+const metadataTextKeys = ['title', 'tracker', 'instrumentNames', 'sampleNames', 'songMessage', 'error'];
+const metadataStates = new Set(['unknown', 'ready', 'error']);
+const textValue = value => typeof value === 'string' ? value : '';
+const channelValue = value => Number.isSafeInteger(value) && value > 0 ? value : null;
+const sizeValue = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+
+export function appendDiscoveredRows(library, records) {
+    const changed = [];
+    for (const record of records) {
+        const sourcePath = textValue(record?.sourcePath);
+        const containerMember = record?.containerMember ?? '', memberPath = record?.memberPath ?? '';
+        const reason = invalidPath(sourcePath) || (typeof containerMember !== 'string' || typeof memberPath !== 'string' ? 'invalid archive member path' : '');
+        if (reason) { library.issues.push({ path: sourcePath, reason }); continue; }
+        const key = locatorKey({ sourcePath, containerMember, memberPath });
+        if (library.locatorIds.has(key)) continue;
+        const { name, folder, extension } = rowPaths(sourcePath, containerMember, memberPath);
+        const format = textValue(record.format).trim().toLowerCase() || extension;
+        const row = { id: library.rows.length, sourcePath, sourceUrl: '', containerMember, memberPath, rawHex: textValue(record.rawHex), name, folder,
+            format, playable: record.playable === true && playableFormats.has(format), channels: channelValue(record.channels), size: sizeValue(record.size),
+            timestamp: textValue(record.timestamp), sha256: validSha256(textValue(record.sha256)), line: null,
+            metadataState: metadataStates.has(record.metadataState) ? record.metadataState : 'unknown',
+            ...Object.fromEntries(metadataTextKeys.map(field => [field, textValue(record[field])])) };
+        library.rows.push(row);
+        library.locatorIds.set(key, row.id);
+        prepareRow(library, row);
+        prepareComments(library, row);
+        countFormat(library, format, 1);
+        countFolders(library, row);
+        changed.push(row.id);
+    }
+    if (changed.length) library.revision += 1;
+    return changed;
+}
+
+export function updateDiscoveredRows(library, updates) {
+    const changed = new Set();
+    for (const { locator, patch } of updates) {
+        if (!locator || !patch || typeof patch !== 'object') continue;
+        const id = library.locatorIds.get(locatorKey(locator));
+        if (id === undefined) continue; // The discovery controller owns updates arriving before rows.
+        const row = library.rows[id], normalized = {};
+        for (const field of metadataTextKeys) if (Object.hasOwn(patch, field)) normalized[field] = textValue(patch[field]);
+        if (Object.hasOwn(patch, 'format')) normalized.format = textValue(patch.format).trim().toLowerCase();
+        if (Object.hasOwn(patch, 'channels')) normalized.channels = channelValue(patch.channels);
+        if (Object.hasOwn(patch, 'sha256')) normalized.sha256 = validSha256(textValue(patch.sha256));
+        if (metadataStates.has(patch.metadataState)) normalized.metadataState = patch.metadataState;
+        // A successful retry clears an inspection error; structural extraction failures
+        // remain attached to unplayable entries and are never repaired by metadata.
+        if (normalized.metadataState === 'ready' && row.playable) normalized.error = '';
+        if (!row.playable) delete normalized.error;
+        if (!Object.keys(normalized).some(field => row[field] !== normalized[field])) continue;
+        if (normalized.format !== undefined && normalized.format !== row.format) {
+            countFormat(library, row.format, -1);
+            countFormat(library, normalized.format, 1);
+        }
+        Object.assign(row, normalized);
+        prepareRow(library, row);
+        prepareComments(library, row);
+        changed.add(id);
+    }
+    if (changed.size) library.revision += 1;
+    return [...changed];
 }
 
 export async function libraryIdentity(bytes, name) {
@@ -231,6 +375,13 @@ function tokenMatches(library, row, token, includeComments) {
     return library.fieldHaystacks[row.id][field].includes(value);
 }
 
+function compareLocators(left, right) {
+    for (const field of ['sourcePath', 'containerMember', 'memberPath']) {
+        if (left[field] !== right[field]) return left[field] < right[field] ? -1 : 1;
+    }
+    return 0;
+}
+
 export function search(library, query = '', { scopeFolder = '', showUnplayable = false, format = '', includeComments = true, sort } = {}) {
     // Hand-built tokens may omit `compact`; compute it once, not per row.
     const tokens = (typeof query === 'string' ? compileQuery(query) : query).map(token => token.compact === undefined ? { ...token, compact: compactText(token.value) } : token);
@@ -249,7 +400,7 @@ export function search(library, query = '', { scopeFolder = '', showUnplayable =
         matches.sort((left, right) => {
             const leftKeys = library.sortKeys[left], rightKeys = library.sortKeys[right];
             const primary = compare(leftKeys[column] ?? library.rows[left][column], rightKeys[column] ?? library.rows[right][column]);
-            return primary * (sort.descending ? -1 : 1) || compare(leftKeys.folder, rightKeys.folder) || compare(leftKeys.name, rightKeys.name) || left - right;
+            return primary * (sort.descending ? -1 : 1) || compare(leftKeys.folder, rightKeys.folder) || compare(leftKeys.name, rightKeys.name) || compareLocators(library.rows[left], library.rows[right]);
         });
     }
     return Int32Array.from(matches);

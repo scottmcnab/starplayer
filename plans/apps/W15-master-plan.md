@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — no implementation started |
+| Status | Implementation in progress — A/B/C dispatched |
 | Coordinator | gpt-6.1-sol, **xhigh** effort |
 | Workers | gpt-6.1-sol, **high** effort for all tasks |
 | Planning branch | `library-folder-plan` |
@@ -222,3 +222,14 @@ source replacement races, stale metadata, scroll/focus stability, deferred rebin
 informational status that must not block playback. Record verification and remaining
 manual native-picker/real-library acceptance in this master. Planning-only validation
 is document links, ownership/dependency checks and external review, not feature tests.
+
+## Implementation evidence
+
+Execution started 2026-10-26 from planning commit `3c59350`. Integration is
+`w15-folder-library` in `../starplayer-w15-folder-library`; task worktrees follow
+the branch names above. The owner’s uncommitted GPT-6.1-sol edit to `AGENTS.md`
+is preserved in planning and execution worktrees and excluded from implementation
+commits. A/B/C are dispatched to GPT-6.1-sol workers at high effort.
+
+Manual native-picker permissions, a real large folder, and loose/nested playlist
+reconnect after reload remain owner acceptance, pending automated integration gates.

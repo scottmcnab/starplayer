@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — not started |
+| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library` |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | None; parallel with A and B |
@@ -63,3 +63,16 @@ rebuilds. F later tests actual WeakMap consumer invalidation.
 
 Source enumeration, DOM controls/view, worker scheduling, playlist-transfer edits,
 app bootstrapping and persistent catalog caching.
+
+## Verification evidence (2026-10-26)
+
+Worker: existing model tests 18/18, new incremental tests 8/8; full web Node
+suite 86/86 passed with localhost access. Coordinator independently reran both
+model test files successfully and reviewed the complete diff. `git diff --check`
+passed. The 40,000-record synthetic test verifies batched append/enrichment without
+whole-library traversal. The only old assertion update applies the required
+case-sensitive locator tie order.
+
+Handoff: `locatorIds` is a `Map<string, rowId>`; revision advances once per changed
+batch. `comments`, `commentCounts`, `commentChangedRowIds`, `formats` and
+`folderCounts` expose incremental state without changing `attachComments`’ return.
