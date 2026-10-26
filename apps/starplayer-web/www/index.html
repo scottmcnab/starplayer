@@ -124,14 +124,23 @@
         </div>
         <p id="library-progress" role="status" hidden></p>
         <p id="library-metadata-hint" class="library-hint" hidden></p>
-        <details id="library-issues" hidden></details>
+        <details id="library-issues" hidden>
+            <summary id="library-issues-summary">Library issues</summary>
+            <ul id="library-issues-list"></ul>
+            <nav class="library-issues-navigation" aria-label="Library issue pages">
+                <button id="library-issues-previous" type="button" aria-disabled="true" aria-controls="library-issues-list">Previous</button>
+                <span id="library-issues-page" role="status"></span>
+                <button id="library-issues-next" type="button" aria-disabled="true" aria-controls="library-issues-list">Next</button>
+            </nav>
+        </details>
         <details class="library-help">
             <summary>About folder libraries</summary>
             <p>Open a folder with or without an index CSV. A valid index is used first; Browse folder without an index discovers the folder directly. Server and streaming libraries require an index.</p>
             <p>Tracks appear progressively as directories and ZIP catalogs are read. You can search, play and add tracks immediately. Stop discovery keeps partial results; Resume continues. Folder + adds only the tracks discovered when clicked, including subfolders; later discoveries are never appended automatically.</p>
             <p>Titles, channels and instrument/sample text arrive on playback or with Scan metadata. Metadata searches remain incomplete until that information is available. Cancel metadata scan leaves discovery and playback available. Track errors appear in row tooltips and focused-row details, with Retry metadata for failed inspections. Show unplayable reveals known archive extraction failures. Song messages are searchable through comments sidecars only in this version; they are not extracted from module bytes.</p>
-            <p>ZIPs support one nested ZIP level, with a 128 MiB source-file limit and 64 MiB extracted-entry limit. Discovery reads no loose module contents; selecting or adding tracks reads no module contents.</p>
-            <p>Reconnect restores an accepted directory when browser storage and permissions permit, then discovers it again. Saved matching folder tracks can play before discovery reaches them. File-list folders and storage failures last for this session; choose the folder again and explicitly rebind after discovery completes. The fallback folder picker collects the entire file list before returning, so its initial browser-controlled delay cannot be removed.</p>
+            <p>Size and Date stay blank for loose files when browsing a folder directly. File-list selections and CSV indexes can supply those values.</p>
+            <p>ZIPs support one nested ZIP level, with a 128 MiB source-file limit and 64 MiB extracted-entry limit. Discovery reads no loose module contents; selecting or adding tracks reads no module contents. Duplicate ZIP paths use the first entry.</p>
+            <p>Reconnect restores an accepted directory when browser storage and permissions permit, then discovers it again. Saved matching folder tracks can play before discovery reaches them. File-list folders and storage failures last for this session; choose the folder again and explicitly rebind after discovery completes. If the browser cannot confirm a previously selected folder, this selection lasts for the session. Try Reconnect or select the folder again; otherwise use Rebind after discovery completes to reconnect matching saved tracks. Rebind pending means the matching set is not known yet, without promising matches. The fallback folder picker collects the entire file list before returning, so its initial browser-controlled delay cannot be removed.</p>
         </details>
         <div id="library-browser" hidden>
             <div class="library-toolbar">

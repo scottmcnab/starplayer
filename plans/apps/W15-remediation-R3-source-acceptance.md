@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — reviewed; focused verification passed** |
+| Status | **Integrated — reviewed; focused and final combined automated gates passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Baseline; parallel R1/R5 |
@@ -75,3 +75,7 @@ edits, other HTML/view redesign.
 Integrated as `4368b49` after coordinator diff review and independent focused Node verification.
 23 controls tests passed, including chooser alternatives, pending-root Browse, active callbacks and comments races; two Rust markup checks passed in the worker checkout.
 `git diff --check` passed. Browser verification remains R7.
+
+Final combined Node/Rust/WASM/CI, Chromium and Pages gates passed; see
+[R7 final evidence](W15-remediation-R7-integration-evidence.md#final-execution-evidence-2026-10-27).
+Native-picker, real-collection and device acceptance remain owner checks.

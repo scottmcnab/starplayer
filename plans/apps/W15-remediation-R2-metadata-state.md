@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — reviewed; focused verification passed** |
+| Status | **Integrated — reviewed; focused and final combined automated gates passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Baseline; parallel R1/R3/R4a/R5 |
@@ -115,3 +115,7 @@ changing playback availability for metadata failures.
 Integrated as `cc68dac` after coordinator diff review and independent focused Node verification.
 54 controller/model/index tests passed; native input-view mutation/detachment, physical vs current pending counts, falsy failures, eligible sidecars and delta regressions included.
 `git diff --check` passed. Browser verification remains R7.
+
+Final combined Node/Rust/WASM/CI, Chromium and Pages gates passed; see
+[R7 final evidence](W15-remediation-R7-integration-evidence.md#final-execution-evidence-2026-10-27).
+Native-picker, real-collection and device acceptance remain owner checks.

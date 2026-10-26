@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **In progress — implementation authorized 2026-10-27** |
+| Status | **Implemented and verified on `w15-remediation` — owner acceptance and future main landing pending (2026-10-27)** |
 | Baseline | `48eee06`, `library-folder-plan` (feature baseline `b3faf9e`) |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Workers | GPT-6.1-sol, **high** effort |
@@ -68,7 +68,9 @@ cannot prove no future match. Documentation of both behaviors is in scope, not o
 | [R4a](W15-remediation-R4a-archive-session.md) | Baseline | web Rust session bindings; narrow owned-buffer ZIP normalization helper and archive compatibility tests |
 | [R6](W15-remediation-R6-incremental-view.md) | R2/R3/R5 | library-view, view-state helper and HTML/CSS after R3 handoff |
 | [R4b](W15-remediation-R4b-grouped-inspection.md) | R1/R2/R3/R4a | runtime/jobs + discovery controller after R1/R2 handoff |
-| [R7](W15-remediation-R7-integration-evidence.md) | R4b/R5/R6 (transitively all) | headless/W15 browser harness, documentation, final evidence |
+| [R5a](W15-remediation-R5a-background-priority.md) | R5 (measured integration correction) | cooperative-yield.js and its unit tests after R5 handoff |
+| [R6a](W15-remediation-R6a-keyboard-selection.md) | R6 (retained browser regression) | keyboard selection recount before offscreen repaint in library-view.js |
+| [R7](W15-remediation-R7-integration-evidence.md) | R4b/R5/R5a/R6/R6a (transitively all) | headless/W15 browser harness, documentation, final evidence |
 
 R1, R2, R3, R4a and R5 all start from the baseline and touch disjoint files; run up to
 three concurrently (R1 and R4a are small). R6 follows R2/R3/R5 and consumes R5's
@@ -80,7 +82,7 @@ text after explicit final handoff. R4a owns web Rust source-contract test mainte
 if a later UI change requires updates, coordinator serializes that narrow handoff.
 
 Create `w15-remediation` from the reviewed planning tip, then
-`w15-remediation-r1`, `-r2`, `-r3`, `-r4a`, `-r4b`, `-r5`, `-r6`, `-r7` with matching
+`w15-remediation-r1`, `-r2`, `-r3`, `-r4a`, `-r4b`, `-r5`, `-r5a`, `-r6`, `-r6a`, `-r7` with matching
 sibling names `../starplayer-w15-remediation-r1`, etc., from integrated prerequisites;
 review producer APIs/tests before consumers start. Workers
 report diffs, verification and limitations; coordinator stages explicit paths only and
@@ -215,9 +217,10 @@ issuesRevision increments only when the append-only issues list changes; issues 
 stable insertion-index IDs within a context. Full-context replacement resets these.
 
 **Hidden pages (amended 2026-10-26).** No visibility listener or `flushUpdates()` is
-required. The 100 ms notification debounce is a single timeout, not a timer chain. Once
-R5 moves the walk's own yields off chained timers, a hidden page delivers pending
-deltas at the browser's normal (about 1 s) background alignment and promptly on return.
+required. The 100 ms notification debounce is a single timeout, not a timer chain.
+R5a runs native yields at background priority to avoid the observed boosted
+continuation starvation of ordinary publication/search timers. Hidden delivery alignment and return latency are
+measured by R7 for the actual browser configuration, with no universal throughput promise.
 Pending deltas are coalesced, never dropped, and R3's accepted-generation guard remains
 the final publication gate. If R7's hidden-page run shows deltas held for more than a
 few seconds after the page becomes visible again, the coordinator adds a flush as a
@@ -336,8 +339,11 @@ same-source member inspections expect ceil(130/64)=3 outer reads, not 130, inclu
 
 ### E. Scheduling and bounded view work (#5, #6)
 
-R5 exports `yieldCooperatively({signal})`: feature-detect scheduler.yield, otherwise
-MessageChannel task, finally setTimeout only where neither exists. Check abort before
+R5/R5a export `yieldCooperatively({signal})`: when scheduler.postTask AND
+scheduler.yield exist, call `scheduler.postTask(() => scheduler.yield(), {priority:
+'background'})` so the native continuation inherits background priority. Otherwise
+use a MessageChannel task, finally setTimeout only where neither native path nor
+MessageChannel exists. Never use a direct unprioritized native yield from the page task. Check abort before
 and after yielding and close per-operation ports/listeners. Enumeration/map construction
 checks a slice budget every 128 records or 8 ms, whichever first; yield is a real task,
 not a microtask loop or requestAnimationFrame. No requirement for progress in frozen/
@@ -466,7 +472,8 @@ Implementation authorized by the owner. Integration: `w15-remediation`,
 `1e79716`; coordinator independently passed 42 worker/runtime tests. R2 (`cc68dac`)
 and R3 (`4368b49`) are reviewed/integrated with 54 and 23 focused tests. The combined
 correctness integration passes all 230 web Node tests. R4a (`b0cf227`) and R5 (`f3fe09a`) are reviewed/integrated after their focused gates.
-R4b and R6 are now implementing from reviewed prerequisites; R7/final gates remain outstanding.
+R4b (`d23bb02`) and R6 (`3b8ebe4`) are reviewed/integrated with 99 and 50 focused
+tests. R7 subsequently completed the combined browser/performance/docs gate; final results below supersede these intermediate counts.
 
 ### R4a ownership clarification
 
@@ -492,3 +499,188 @@ traps remain RuntimeError. Native inner-decode/ownership statistics are cfg(test
 not browser exports. R5 exports `yieldCooperatively`, `createCooperativeYield` and
 `cooperativeYieldMethod` for consumer injection/diagnostics. R4b and R6 own their
 serialized production files; R7 takes shared harness/help ownership after both finish.
+
+### R6 producer handoff
+
+`createLibraryView` accepts optional `onOperation(name, amount)` instrumentation.
+`createIncrementalViewState` exposes full/update/order/tree/nodes/includes; its private
+tree uses keyed child Maps for affected-path pruning. Public model `buildTree()` is
+unchanged. Issue pagination is lazy and bounded to 100 DOM items, with status-only
+updates avoiding the producer's lazy full issue snapshot. R7 owns shared headless
+files, Pages smoke and help text now; further production fixes need serialized handoff.
+
+## Intermediate integrated verification (2026-10-27)
+
+Coordinator verification on the integrated feature passed:
+
+- `node --test --test-isolation=none apps/starplayer-web/test/*.test.mjs`: 296 passed.
+- `cargo test -p starplayer-archive -p starplayer-web`: 31 archive tests passed
+  (one pre-existing manual generator ignored), 22 web tests passed; doc tests passed.
+- `cargo xtask wasm`: passed.
+- `cargo xtask ci`: all 11 jobs passed, including conformance, render allocation/RT
+  safety, block-size independence, goldens, SIMD/FMA, trace, WASM, bare-metal no_std,
+  Clippy and feature purity. Existing checksum-pinned corpus cache was copied into
+  the integration target for the offline gate; no tests or exclusions were changed.
+- Existing Chromium SAB W15 view gate: all eight named DOM cases passed.
+- Additional deterministic review cross-check: 3,200 incremental batches across 32
+  query/sort/scope/comment scenarios matched full-model order and tree counts.
+
+Evidence: `/tmp/starplayer-w15-remediation-evidence/final-{node,rust,wasm,ci}.log`,
+`coordinator-view-browser.log`, `incremental-crosscheck.mjs`. These intermediate results were followed by the final correction and R7 gates recorded below.
+
+## Measured scheduling correction (2026-10-27)
+
+R7 found a production gap that the focused R5 unit tests did not establish: native
+boosted yield continuations starved both the publication and search debounce timers.
+Natural 40k walks published only completion; independent 400k walks blocked timers
+for about four seconds. Background postTask plus native yield restored partial
+updates and timers with the controller unchanged. [R5a](W15-remediation-R5a-background-priority.md)
+owns this narrow helper correction. R7 was notified and reran full/hidden/performance acceptance after reviewed integration. Existing natural
+40k assertions stay intact; no inline controller flush or visibility listener is added.
+See [Chrome priority inheritance](https://developer.chrome.com/blog/use-scheduler-yield#priority_inheritance)
+and the [scheduling specification](https://wicg.github.io/scheduling-apis/).
+
+### Priority correction reviewed and integrated
+
+R5a integrated as `9580cca` after coordinator diff review, 45 focused tests and an
+independent unchanged natural40k browser pass (partial rows, timer heartbeats, focus/
+scroll and zero reads). R7 task baseline advanced to this integrated version. Final
+Node/Rust/WASM/CI and full/hidden/performance browser gates passed after the correction; pre-correction artifacts remain explicitly labeled diagnostic evidence.
+
+## Retained keyboard-selection correction (2026-10-27)
+
+R7 retained the indexed-library 37,674-row Ctrl+A assertion and found a stale
+selectedPlayable cache when keyboard focus is virtualized away. [R6a](W15-remediation-R6a-keyboard-selection.md)
+owns the narrow user-selection recount before repaint. Ordinary renders keep their
+no-recount path; metadata/status operation bounds remain unchanged. R7 repeated final acceptance after this correction; no existing assertion was weakened.
+
+### Keyboard correction reviewed and integrated
+
+R6a integrated as `8519ff2` after diff review, 50 focused tests and independent
+37,674-row Chromium keyboard/Add selected checks. The correction only changes the
+keyboard repaint branch. R7 baseline advanced while preserving its uncommitted
+harness/docs work; final full/hidden/performance acceptance passed on this version.
+
+## R7 native-cost follow-up decision (2026-10-27)
+
+All native fixture correctness/cleanup gates passed, but large input invocation cost
+is material: 128 MiB p50 150.020 ms / p95=max 181.165 ms, with four physical promises
+and 512 MiB summed input bytes in the controlled burst. This is not measured total
+browser memory. [Separate profiling follow-up](W15-followup-large-digest-start-cost.md)
+records all sizes/distributions and requests diagnosis plus a reviewed recommendation.
+No queue/cap/recovery implementation is added here. Final isolated 100k user re-sort
+was 81.910 ms with an 88 ms overlapping long task, below the 100 ms slicing trigger; no sliced
+query/sort follow-up is opened on that final measurement. Earlier loaded/exploratory
+timings remain labeled as such.
+
+## Final reviewed delivery and verification (2026-10-27)
+
+All remediation tasks and the two measured integration corrections are implemented,
+reviewed, committed and verified on `w15-remediation` in
+`/home/scott/projects/starplayer-w15-remediation`. Workers used GPT-6.1-sol at high
+effort, did not stage/commit/merge, and reported bounded diffs/results. The coordinator
+reviewed each diff, independently verified focused gates, and squashed each single
+change from the integration checkout. No merge to main, push or deployment occurred.
+These plans remain active until the future authorized main landing, following the
+archive rule in [the plan index](../README.md).
+
+| Task / correction | Integration commit | Result |
+|---|---|---|
+| R1 | `1e79716` | Fatal WASM traps retire/suspend worker; explicit Retry |
+| R2 | `cc68dac` | Atomic page digest/metadata, eligible counters and row deltas |
+| R3 | `4368b49` | Accepted library remains live during candidate preparation |
+| R4a | `b0cf227` | Bounded owned archive session and duplicate compatibility |
+| R5 | `f3fe09a` | Bounded cooperative source enumeration |
+| R4b | `d23bb02` | Streamed groups of at most 64; one source read per group |
+| R6 | `3b8ebe4` | Incremental view updates and bounded issue pagination |
+| R5a | `9580cca` | Background-priority native yields preserve timer/input progress |
+| R6a | `8519ff2` | Offscreen keyboard selection recount before repaint |
+| R7 | `beafb22` | Combined browser/performance gates, packaging checks and help |
+
+All automated gates passed. The final production tree includes R5a/R6a; the
+integration app/archive sources are identical to the R7 tested branch. The coordinator
+also rebuilt and ran remediation/Pages smoke directly in the integration checkout
+following R7 integration. No worker result is substituted for an unexecuted required gate.
+
+| Verification | Final result / evidence artifact |
+|---|---|
+| Complete Node suite | 300 passed, zero failed/skipped; `coordinator-final-node.log` and `final-node.log` |
+| Rust archive/web | 31 archive + 22 web passed; doc tests passed; one pre-existing manual archive-generator test ignored; `final-rust.log` |
+| WASM packaging | Development and Pages builds passed; `coordinator-final-wasm.log`, `coordinator-final-pages-build.log` |
+| Full CI | All 11 jobs passed, including conformance, RT allocation/safety, block-size independence, goldens, SIMD/FMA, trace, WASM, bare-metal no_std, Clippy and feature purity; `final-ci.log` |
+| Full Chromium regression | Unfiltered default-duration SAB, forced postMessage fallback and plain modes passed; retained indexed/remote/upload/playlist/reconnect/legacy/40k assertions; `r7-full-headless.log` |
+| Remediation regressions | All three modes plus independent final integration SAB passed; real WASM endpoint trap/Retry, snapshot/version/atomic replay, eligible sidecars, pending candidate, shared groups and callback cleanup; `r7-regressions-all-modes.log`, `coordinator-final-remediation.log` |
+| Archive matrices | All 12 ordinary/nested, small/above-32-MiB, 3/64/130-member cases per mode passed; measured source reads 1/1/3, recycling between groups, latest bytes on later group/playback; `r7-full-headless.log` |
+| Native session ownership/cache | Rust cfg(test) proves one-inner reuse/invalidation, exact 128 MiB source ownership and freeing; browser does not export native inner-decode counters; `final-rust.log`, `r4a-session-evidence.log` |
+| Hidden/freeze-thaw | 390,195 ms genuinely hidden with normal throttling; early and after-five-minute 65,536-row walks completed; same active iterator resumed safely; chained-timer gap about 60,000 ms; `r7-background.log` |
+| Nonterminal visibility return | Pending row reached DOM about 121 ms and actual debounced row-change notification about 122 ms after return with another digest still pending; `r7-visibility-return.log` |
+| Incremental view workload | 100,101 final rows / 10,000 issues; operation bounds, input, anchor/focus and 100-item issue DOM passed; `r7-performance.log` |
+| Native digest fixtures | Valid loose 1/32/64/128 MiB and extracted 64 MiB inputs; native snapshot, atomic publication and complete promise cleanup passed; `r7-digest.log` |
+| Local Pages subpath | Shipped isolation shim and actual nested catalog/metadata worker under `/starplayer/`; required assets 200; optional missing resources specifically accounted; `r7-pages-smoke.log`, `coordinator-final-pages-smoke.log` |
+
+Artifacts are under `/tmp/starplayer-w15-remediation-evidence/`. The exact R7 commands,
+launch flags, source/dist and artifact SHA-256 values, measurements and limitations are
+in `r7-evidence.json`, with a short `r7-evidence.txt`. R7 task records reproducible
+commands. All manifest artifact hashes were independently checked after handoff.
+A permanent headless preflight compares ten critical source/dist JS files before
+launch; this rejects stale packages, including foreign-worktree xtask-cache mistakes.
+Pre-correction, stale-cache and smoke-only runs remain labeled diagnostic/nonfinal.
+
+### Performance evidence and practical limits
+
+Environment: Chromium 156.0.8078.4, Node 24.14.0, Rust 1.97.1, WSL2 Linux
+6.6.87.2 x86_64, AMD Ryzen 9 5950X, 32 logical CPUs, approximately 25.4 GiB RAM.
+Hidden runs used a real second tab and normal throttling, no fake audio/activity and
+no disable-background-throttling flags. The observed native scheduling branch was
+`scheduler.postTask(background) + scheduler.yield`.
+
+For 20 display-only batches of 100 rows, revised work was 2,000 row evaluations,
+zero full sorts/tree builds and no issue materialization. Fifty status ticks performed
+zero row evaluations/full sorts/tree builds or additional issue getter reads. Adding
+100 rows evaluated/contributed those 100 rows and merged once over 100,000 existing
+rows. Five sort-key batches each evaluated 100 rows and merged once over 100,100;
+unchanged rows were not fully sorted. The earlier full-rebuild strategy would evaluate
+2,000,000 rows, sort/rebuild 20 times and render 10,000 issues for those display batches;
+these baseline counts are derived from that strategy, not timed baseline executions.
+
+With 20 visible rows and 100 issue DOM items, update latency p50/p95/max was
+33.120/33.275/33.275 ms and handled-input latency 33.140/33.235/33.235 ms (20 samples,
+including two animation frames). Full user re-sort was 81.910 ms synchronous with
+88 ms overlapping longest task: below the 100 ms follow-up threshold. The workload's
+overall longest task, including initial full construction, was 654 ms; the claim is
+bounded incremental updates, not that all page work is short. No sliced query task
+is opened. Headless results are specific to this machine and fixture.
+
+The six-minute hidden run proves this configuration's scheduling and safe resumption,
+not throughput for frozen/discarded pages. Its terminal digest probe had already
+flushed before visibility returned, so it is not debounce evidence. The separate
+quick, genuinely hidden nonterminal test above measures actual debounce publication;
+it is not a six-minute hidden pending-delta measurement. No visibility listener or
+forced flush was added. No observed result triggered a visibility-flush follow-up.
+
+Native large-input invocation cost triggered the separate
+[profiling follow-up](W15-followup-large-digest-start-cost.md), committed as `9a098a2`.
+For 128 MiB, invocation p50/p95=max was 150.020/181.165 ms. A deliberate four-request
+controller burst had four physical promises and a 512 MiB summed input-byte estimate;
+this is not measured total browser memory or an upper bound on native overhead.
+Each size had three repeats of four synchronous digest calls followed by one separately
+measured real app activation. This does not establish natural playback concurrency,
+statistical confidence or a universal device budget. The follow-up profiles the cost
+and requests a recommendation; it does not authorize queues/caps/recovery machinery.
+
+### Remaining owner acceptance and landing
+
+- Exercise native directory-picker grant/deny/cancel and reconnect permission prompts
+  in the target browser.
+- Use an approved real large index-free collection on owner devices: browse/search,
+  play/add during discovery, Stop/Resume, and loose/outer/nested playlist playback.
+- Reload/reconnect saved entries before rediscovery; verify FileList/storage-denied
+  reselection and explicit complete-scan rebind with the owner's environment.
+- Review the separate measured large-digest profiling follow-up before choosing any
+  later responsiveness/memory policy change.
+
+Directory Size/Date remain unknown without stat enrichment; uncertain identity remains
+conservative/session-only; first raw ZIP duplicate wins; Rebind pending remains gated
+by complete discovery. These documented decisions are preserved. Main landing requires
+future authorization and the repository's multi-commit `--no-ff` rule. No owner acceptance
+is represented as completed by synthetic automation.

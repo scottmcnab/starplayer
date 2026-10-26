@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — reviewed; focused verification passed** |
+| Status | **Integrated — reviewed; focused and final combined automated gates passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Baseline; parallel R1/R2/R3/R5 (pure Rust, disjoint files) |
@@ -82,3 +82,7 @@ retained outer/inner buffers. No outward session contract change.
 
 Integrated as `b0cf227` after coordinator diff review. Coordinator independently passed 31 archive tests (one pre-existing manual generator ignored), 22 web Rust tests and cargo xtask wasm. Worker actual Node/WASM ABI smoke passed. Native cfg(test) statistics establish inner-cache reuse, pointer stability, exact source cap and drop release; browser adapter counts are separate evidence.
 `git diff --check` passed. Logs: `/tmp/starplayer-w15-remediation-evidence/`.
+
+Final combined Node/Rust/WASM/CI, Chromium and Pages gates passed; see
+[R7 final evidence](W15-remediation-R7-integration-evidence.md#final-execution-evidence-2026-10-27).
+Native-picker, real-collection and device acceptance remain owner checks.

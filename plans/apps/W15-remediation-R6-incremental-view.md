@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **In progress — worker implementing; coordinator review pending** |
+| Status | **Integrated — reviewed; focused and final combined automated gates passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | R2/R3/R5 |
@@ -75,3 +75,22 @@ while updates arrive and performance instrumentation. Shared headless remains R7
 
 Playback/source selection/model counter policy changes, runtime scheduling changes,
 metadata eager reads, removing search/keyboard/ARIA behavior, production framework swap.
+
+## Execution evidence (2026-10-27)
+
+Integrated as `3b8ebe4`. Coordinator independently passed all 50 focused index/model/view tests after final pruning/focus review. Operation evidence proves no global work on unchanged status or irrelevant title batches, one merge for relevant sort-key changes and 100 issue items per page. Actual DOM/browser gates remain R7.
+`git diff --check` passed. Logs: `/tmp/starplayer-w15-remediation-evidence/`.
+
+## Retained browser follow-up (2026-10-27)
+
+The full indexed-library suite found offscreen keyboard selection skipped the
+selectedPlayable recount. [R6a](W15-remediation-R6a-keyboard-selection.md) owns the
+narrow keyboard-path fix; regular paints remain bounded. Existing Ctrl+A/Shift-range
+assertions remain required, with explicit count regressions added by R7.
+
+R6a is integrated as `8519ff2`; coordinator independently verified keyboard counts
+in Chromium and all 50 focused tests. Final combined R7 acceptance remains pending.
+
+Final combined Node/Rust/WASM/CI, Chromium and Pages gates passed; see
+[R7 final evidence](W15-remediation-R7-integration-evidence.md#final-execution-evidence-2026-10-27).
+Native-picker, real-collection and device acceptance remain owner checks.

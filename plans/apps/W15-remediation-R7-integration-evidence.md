@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| Status | **Specified / outstanding — reviewed plan, amended 2026-10-26** |
+| Status | **Integrated — reviewed; all automated gates passed, manual owner acceptance pending** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
-| Depends on | R4b/R5/R6; all prerequisites integrated |
+| Depends on | R4b/R5/R5a/R6/R6a; measured corrections must integrate before final acceptance |
 | Ownership | w15-headless.mjs/headless harness, LIBRARY-CSV.md, help text after R6 handoff |
 | Branch / sibling worktree | `w15-remediation-r7` / `../starplayer-w15-remediation-r7` |
 | Authorization now | Implementation authorized; worker must not stage, commit or merge |
@@ -109,11 +109,97 @@ Run focused new tests then `node --test --test-isolation=none apps/starplayer-we
 and local subpath worker smoke, `cargo xtask ci`. Run dedicated background/performance
 harness and record its exact command, flags and artifacts. Retain prior all-format/
 remote/upload/reconnect/legacy tests, and add trap-through-actual-endpoint coverage.
-No implementation tests are claimed passed by this planning document. Coordinator
-reviews all gates; native picker/real collection owner acceptance stays pending.
+Execution results are recorded below and in the master. Coordinator reviewed all
+gates; native picker/real collection owner acceptance stays pending.
 
 ## Out of scope
 
 Deployment/main merge, scans of owner collection, weakening tests to meet timings,
 identity-record deletion, changing duplicate policy, claiming frozen-page throughput,
 changes in other owners' production files without explicit serialized handoff.
+
+## Scheduling gate correction (2026-10-27)
+
+R7 reproduced native timer starvation in natural 40k walks; this was a production
+failure. R5a corrected the helper and its integration passed the final gates. Preserve
+existing natural40k assertions and rerun full browser/hidden/performance gates after
+reviewed integration. Pre-correction results remain labeled as diagnostic evidence.
+
+## Retained keyboard gate (2026-10-27)
+
+The original indexed-library Ctrl+A count failed after R6. R6a corrects the virtualized
+keyboard recount; preserve existing assertions and add End/Shift+Home/Escape counts.
+R6a was reviewed/integrated before the passing final full-browser run.
+
+## Final execution evidence (2026-10-27)
+
+Integrated as `beafb22` after coordinator diff/evidence review. All required automated
+gates passed on production baseline `8519ff2` plus the six owned harness/help/docs
+files. The integration app/archive sources match the tested R7 branch. The coordinator
+then independently rebuilt the integration package and passed the new SAB remediation
+and local Pages smoke cases. The complete final Node suite passed all 300 tests.
+
+Reproducible commands (from the integration checkout, Chromium required):
+
+```sh
+node --test --test-isolation=none apps/starplayer-web/test/*.test.mjs
+cargo test -p starplayer-archive -p starplayer-web
+cargo xtask wasm
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --w15-case remediation
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --w15-case enumeration --mode sab
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --w15-case background --mode sab
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --w15-case visibility --mode sab
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --w15-case performance --mode sab
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --w15-case digest --mode sab
+cargo xtask wasm --pages
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --pages-smoke
+cargo xtask ci
+```
+
+Full Chromium runs passed SAB/fallback/plain, existing indexed 37,674-row and natural
+40k regressions, actual WASM trap/Retry, all 12 ordinary/nested archive matrices per
+mode and callback cleanup. Native inner-cache/owned-byte counters are Rust cfg(test)
+evidence only; JS adapter calls are not reported as native decompression counts.
+31 archive tests and 22 web tests plus doc tests passed; one pre-existing manual archive
+generator remains ignored. All 11 CI jobs passed. Pages smoke used the shipped
+service worker under a local `/starplayer/` path; nothing was deployed.
+
+The dedicated background run was genuinely hidden for 390,195 ms, silent, with normal
+throttling. Early and after-five-minute walks completed, and the same frozen iterator
+resumed safely. A separate quick nonterminal hidden/visible test measured actual
+row-change notification about 122 ms after return while another digest stayed pending.
+The six-minute terminal probe is not claimed as pending debounce proof. No forced
+flush, simulated visibility or background-throttling disable flags were used.
+
+The isolated 100k/10k workload passed operation/DOM/input/anchor bounds. User full
+re-sort was 81.910 ms synchronous / 88 ms overlapping long task, below the 100 ms
+follow-up trigger. Its overall longest task, including initial construction, was
+654 ms; no universal latency claim is made. Native loose 1/32/64/128 MiB and extracted
+64 MiB fixtures all passed correctness/cleanup. Large-input cost and all distributions
+are preserved in the [separate profiling task](W15-followup-large-digest-start-cost.md).
+No queue/cap/recovery design was introduced.
+
+Evidence directory: `/tmp/starplayer-w15-remediation-evidence/`.
+`r7-evidence.json` records exact commands/flags, per-artifact SHA-256 values, source/dist
+identity, distributions, derived baseline counts, manual checks and rejected/stale
+runs. All listed artifact hashes were independently checked. The permanent package
+preflight checks ten source/dist JS files before launching. The corrected yield helper
+SHA-256 is `c4eb5884fe93719d933f8b9cf55702d4d1a82759e3ab535e0958836d2784d297`;
+the final view is `0308e7f6bc460040d4abbcfeb2b05e40e7ebdcb73aee7b9693d19d25274908d8`.
+Build xtask in the intended checkout: its compiled workspace root can make a reused
+foreign-worktree target package the wrong tree. Final coordinator builds used their
+own integration target and confirmed the output destination.
+
+Environment: Chromium 156.0.8078.4, Node 24.14.0, Rust 1.97.1, WSL2 Linux 6.6.87.2
+x86_64, AMD Ryzen 9 5950X, 32 logical CPUs, approximately 25.4 GiB RAM. Hidden launch
+flags were `--headless=new`, `--remote-debugging-port=<ephemeral>`,
+`--remote-allow-origins=*`, `--no-sandbox`, `--disable-gpu`, `--disable-dev-shm-usage`,
+`--autoplay-policy=no-user-gesture-required`, `--mute-audio`,
+`--user-data-dir=<temporary-profile>`, `about:blank`. Actual generated ports/profile
+paths for each run are in the manifest; no throttling-disabling flag was present.
+
+Native-picker permissions, real collection/device responsiveness and real saved-playlist
+reload/reconnect/FileList/storage-denied/rebind checks remain manual owner acceptance.
+The [master's final record](W15-remediation-master-plan.md#final-reviewed-delivery-and-verification-2026-10-27)
+is authoritative. No main merge, push or deployment occurred.

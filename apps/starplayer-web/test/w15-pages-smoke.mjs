@@ -33,12 +33,12 @@ export async function runPagesSmoke({ Page, executable, dist, syntheticMod, buil
             const runtime = createLibraryWorkerRuntime({ source: { size: () => bytes.length, readFile: async () => bytes.slice() } });
             try {
                 const catalog = await runtime.enqueue({ generation: 1, kind: 'catalog', sourcePath: 'synthetic.zip' }).result;
-                const inspect = await runtime.enqueue({ generation: 1, kind: 'inspect', locator: { sourcePath: 'synthetic.zip', containerMember: 'inner.zip', memberPath: 'song.mod', rawHex: '' } }).result;
-                if (catalog.payload.entries.length !== 1 || inspect.payload.metadata.title !== 'Pages worker smoke') throw new Error('Pages real-worker catalog/metadata failed');
-                return { isolated: crossOriginIsolated, serviceWorker: navigator.serviceWorker.controller?.scriptURL, catalog: catalog.payload.entries.length, title: inspect.payload.metadata.title };
+                let inspect; await runtime.enqueue({ generation: 1, kind: 'inspect-group', sourcePath: 'synthetic.zip', members: [{ token: 'pages', version: 0, locator: { sourcePath: 'synthetic.zip', containerMember: 'inner.zip', memberPath: 'song.mod', rawHex: '' } }], purpose: 'scan' }, { onMember: frame => { inspect = frame.payload; } }).result;
+                if (catalog.payload.entries.length !== 1 || inspect.metadata.title !== 'Pages worker smoke') throw new Error('Pages real-worker catalog/metadata failed');
+                return { isolated: crossOriginIsolated, serviceWorker: navigator.serviceWorker.controller?.scriptURL, catalog: catalog.payload.entries.length, title: inspect.metadata.title };
             } finally { runtime.dispose(); }
         `);
-        const required = ['coi-serviceworker.js', 'library-worker.js', 'library-worker-jobs.js', 'starplayer_web.js', 'starplayer_web_bg.wasm'].map(name => prefix + name);
+        const required = ['coi-serviceworker.js', 'library-worker.js', 'library-worker-jobs.js', 'cooperative-yield.js', 'starplayer_web.js', 'starplayer_web_bg.wasm'].map(name => prefix + name);
         for (const path of required) {
             assert.ok(requests.includes(path), `${path} requested under Pages subpath`);
             assert.ok(responses.some(response => response.path === path && response.status === 200), `${path} served successfully`);

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — reviewed; focused verification passed** |
+| Status | **Integrated — reviewed; focused and final combined automated gates passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Baseline; parallel R2/R3/R4a/R5 |
@@ -77,3 +77,7 @@ Integrated as `1e79716` after coordinator diff review and independent focused ru
 42 worker/runtime tests passed, including actual WASM unreachable at the endpoint,
 realm fallback, repeated traps, exact-once settlement, stale-frame suppression and
 ordinary-error continuity. `git diff --check` passed. Browser verification remains R7.
+
+Final combined Node/Rust/WASM/CI, Chromium and Pages gates passed; see
+[R7 final evidence](W15-remediation-R7-integration-evidence.md#final-execution-evidence-2026-10-27).
+Native-picker, real-collection and device acceptance remain owner checks.

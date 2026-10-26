@@ -15,10 +15,11 @@ This document retains the reviewed product behavior. The [master plan](W15-maste
 splits execution into eight tasks, fixes ownership and shared interfaces, and defines
 coordinator review gates. Do not delegate this entire specification as one worker task.
 
-> Follow-up (2026-10-26): independent review identified correctness, performance and
+> Follow-up (updated 2026-10-27): independent review identified correctness, performance and
 > hardening work after this delivery. See the active [W15 remediation master](../W15-remediation-master-plan.md).
 > The delivery/evidence below remains historical; the new master explicitly supersedes
-> affected contracts. Remediation is specified/outstanding, not implemented or verified.
+> affected contracts. Remediation is implemented and verified on `w15-remediation`;
+> manual owner acceptance and future main landing remain pending. No deployment occurred.
 
 ## Context for a fresh agent
 

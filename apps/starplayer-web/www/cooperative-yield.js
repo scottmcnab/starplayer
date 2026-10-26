@@ -4,7 +4,7 @@ function checkAbort(signal) {
 
 // Also usable by worker consumers and browser evidence without touching page visibility.
 export function cooperativeYieldMethod({ scheduler = globalThis.scheduler, MessageChannel = globalThis.MessageChannel } = {}) {
-    if (typeof scheduler?.yield === 'function') return 'scheduler.yield';
+    if (typeof scheduler?.postTask === 'function' && typeof scheduler?.yield === 'function') return 'scheduler.postTask(background) + scheduler.yield';
     return typeof MessageChannel === 'function' ? 'MessageChannel' : 'setTimeout';
 }
 
@@ -33,8 +33,12 @@ export function createCooperativeYield({ scheduler = globalThis.scheduler, Messa
             try {
                 // Recheck after subscribing, before opening any task resources.
                 checkAbort(signal);
-                if (typeof scheduler?.yield === 'function') {
-                    Promise.resolve(scheduler.yield()).then(() => finish(), error => finish(error, true));
+                if (typeof scheduler?.postTask === 'function' && typeof scheduler?.yield === 'function') {
+                    // Inherit background priority so boosted yield continuations leave UI timers runnable.
+                    Promise.resolve(scheduler.postTask(() => {
+                        checkAbort(signal);
+                        return scheduler.yield();
+                    }, { priority: 'background' })).then(() => finish(), error => finish(error, true));
                 } else if (typeof MessageChannel === 'function') {
                     channel = new MessageChannel();
                     channel.port1.onmessage = () => finish();

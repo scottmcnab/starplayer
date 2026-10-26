@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **In progress — worker implementing; coordinator review pending** |
+| Status | **Integrated — reviewed; focused and final combined automated gates passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | R1, R2, R3 (the #1–#3 gate) and R4a |
@@ -107,3 +107,12 @@ recycle/Cancel metadata independent of page digests, and dispose with frames in 
 
 New source selection semantics, changing R1/R2 guards, shared headless edits,
 unbounded or cross-group archive caches, changed ZIP duplicate interpretation.
+
+## Execution evidence (2026-10-27)
+
+Integrated as `d23bb02`. Coordinator independently passed 99 focused worker/controller/group tests after full diff review. Worker full Node 262 passed; archive31/web22 tests and WASM packaging passed. Actual generated-WASM smoke passed all 12 ordinary/nested x small/large x 3/64/130 matrices with 1/1/3 reads. Inner-decode adapter counts are modeled; native Rust tests establish cache reuse.
+`git diff --check` passed. Logs: `/tmp/starplayer-w15-remediation-evidence/`.
+
+Final combined Node/Rust/WASM/CI, Chromium and Pages gates passed; see
+[R7 final evidence](W15-remediation-R7-integration-evidence.md#final-execution-evidence-2026-10-27).
+Native-picker, real-collection and device acceptance remain owner checks.

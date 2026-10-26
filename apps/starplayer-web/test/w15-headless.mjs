@@ -78,7 +78,7 @@ export async function runW15({ Page, executable, mode, startDevServer, synthetic
         assert.equal(await page.evaluate("return document.getElementById('library-count').textContent;"), '2 of 2');
         await page.evaluate("document.getElementById('library-resume-discovery').click();");
         await page.waitFor('real nested catalog complete', "document.getElementById('library-summary').textContent.includes('discovery complete') && document.getElementById('library-count').textContent === '4 of 4'");
-        await page.waitFor('sidecar rejoined after worker hash', "document.getElementById('library-summary').textContent.includes('2 tracks matched')");
+        await page.waitFor('sidecar rejoined after playback digest', "document.getElementById('library-summary').textContent.includes('2 tracks matched')");
         await page.evaluate("document.getElementById('library-scan-metadata').click();");
         await page.waitFor('real metadata scan error and nested metadata', "document.getElementById('library-progress').textContent.includes('Metadata scan complete') && document.querySelector('.metadata-error')", 40000);
         assert.equal(await page.evaluate("return document.getElementById('title').textContent;"), 'W15 actual metadata');
@@ -151,22 +151,24 @@ async function workerScenarios(page, mod, flatZip) {
         try {
             const listed = await runtime.enqueue({generation:991, kind:'catalog', sourcePath:'packs/nested.zip'}).result;
             if (listed.payload.entries.length !== 1 || listed.payload.entries[0].containerMember !== 'inner.zip') throw new Error('real nested catalog');
-            const inspected = await runtime.enqueue({generation:991, kind:'inspect', locator:{sourcePath:'packs/nested.zip',containerMember:'inner.zip',memberPath:'nested.mod',rawHex:''}}).result;
-            if (inspected.payload.metadata.title !== 'W15 actual metadata' || inspected.payload.metadata.format !== 'mod' || inspected.payload.sha256.length !== 64) throw new Error('real nested metadata');
+            let inspected;
+            const group = (generation, locator) => ({generation,kind:'inspect-group',sourcePath:locator.sourcePath,members:[{token:'one',locator,version:0}],purpose:'scan'});
+            await runtime.enqueue(group(991,{sourcePath:'packs/nested.zip',containerMember:'inner.zip',memberPath:'nested.mod',rawHex:''}),{onMember:frame=>{inspected=frame.payload;}}).result;
+            if (inspected.metadata.title !== 'W15 actual metadata' || inspected.metadata.format !== 'mod' || inspected.sha256.length !== 64) throw new Error('real nested metadata');
             const bytes = Uint8Array.from(${JSON.stringify([...mod])});
-            const hashed = await runtime.enqueue({generation:991,kind:'hash',bytes}).result;
-            if (!bytes.byteLength || hashed.payload.sha256 !== inspected.payload.sha256) throw new Error('borrowed hash bytes');
-            const cancelled = runtime.enqueue({generation:991,kind:'inspect',locator:{sourcePath:'loose/early.mod'}}); cancelled.cancel();
+            const sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(value=>value.toString(16).padStart(2,'0')).join('');
+            if (!bytes.byteLength || sha256 !== inspected.sha256) throw new Error('native borrowed hash bytes');
+            const cancelled = runtime.enqueue(group(991,{sourcePath:'loose/early.mod'})); cancelled.cancel();
             const error = await cancelled.result.catch(error => error);
             if (error.code !== 'aborted') throw new Error('real worker cancellation');
             const flatBytes = Uint8Array.from(${JSON.stringify([...flatZip])});
             const flatRuntime = createLibraryWorkerRuntime({source:{size:()=>flatBytes.length,readFile:async()=>flatBytes.slice()}});
             try {
                 const flatCatalog = await flatRuntime.enqueue({generation:992,kind:'catalog',sourcePath:'flat.zip'}).result;
-                const flatMetadata = await flatRuntime.enqueue({generation:992,kind:'inspect',locator:{sourcePath:'flat.zip',containerMember:'',memberPath:'flat.mod',rawHex:''}}).result;
-                if (flatCatalog.payload.entries.length !== 1 || flatCatalog.payload.entries[0].containerMember !== '' || flatMetadata.payload.metadata.title !== 'W15 actual metadata') throw new Error('real ordinary ZIP catalog/metadata');
+                let flatMetadata; await flatRuntime.enqueue(group(992,{sourcePath:'flat.zip',containerMember:'',memberPath:'flat.mod',rawHex:''}),{onMember:frame=>{flatMetadata=frame.payload;}}).result;
+                if (flatCatalog.payload.entries.length !== 1 || flatCatalog.payload.entries[0].containerMember !== '' || flatMetadata.metadata.title !== 'W15 actual metadata') throw new Error('real ordinary ZIP catalog/metadata');
             } finally {flatRuntime.dispose();}
-            return {ordinaryCatalogAndMetadata:true,nestedCatalog:true, nestedMetadata:true, sha256:hashed.payload.sha256, cancellation:true};
+            return {ordinaryCatalogAndMetadata:true,nestedCatalog:true, nestedMetadata:true, sha256, cancellation:true};
         } finally { runtime.dispose(); }
     `);
 }
@@ -199,8 +201,8 @@ export async function runW15View({ Page, executable, mode, startDevServer }) {
             const record = (path, extra={}) => ({sourcePath:path,containerMember:'',memberPath:'',rawHex:'',format:'mod',size:null,timestamp:'',playable:true,error:'',...extra});
             let ctx;
             const set = async records => { ctx=context(records); view.setLibrary(ctx); await tick(); };
-            const update = async records => { const ids=model.appendDiscoveredRows(ctx.library,records); view.updateLibrary(ctx,{changedRowIds:ids}); await tick(); };
-            const patch = async updates => { const ids=model.updateDiscoveredRows(ctx.library,updates); view.updateLibrary(ctx,{changedRowIds:ids,metadataUpdates:updates}); await tick(); };
+            const update = async records => { const ids=model.appendDiscoveredRows(ctx.library,records); view.updateLibrary(ctx,{changedRowIds:ids,rowChanges:ctx.library.lastRowChanges}); await tick(); };
+            const patch = async updates => { const ids=model.updateDiscoveredRows(ctx.library,updates); view.updateLibrary(ctx,{changedRowIds:ids,rowChanges:ctx.library.lastRowChanges,metadataUpdates:updates}); await tick(); };
             const filter = async value => { el('search').value=value; el('search').dispatchEvent(new Event('input')); await new Promise(resolve=>setTimeout(resolve,100)); await tick(); };
             const format = async value => {el('format').value=value;el('format').dispatchEvent(new Event('change'));await tick();};
             const row = id => document.querySelector('[data-row-id="'+id+'"]');
@@ -325,7 +327,8 @@ export async function runW15Stress({Page, executable, mode, startDevServer}) {
                     const mappedBeats=beats-startBeats;
                     if(kind==='filelist')check(mappedBeats>0,'FileList map construction yields');
                     const ctx={mode:'discovered',source,library:createDiscoveredLibrary({name:kind}),identity:{sha256:'d'.repeat(64),name:kind}};
-                    createDiscoveryController({context:ctx,onUpdate:(context,change)=>view.updateLibrary(context,change)});
+                    const enumerationStarted=performance.now(),publications=[];
+                    createDiscoveryController({context:ctx,onUpdate:(context,change)=>{publications.push({milliseconds:performance.now()-enumerationStarted,rows:context.library.rows.length,phase:context.discoveryStatus.phase});view.updateLibrary(context,change);}});
                     view.setLibrary(ctx);ctx.discovery.start();
                     await wait(()=>ctx.library.rows.length>0&&ctx.library.rows.length<40000&&el('rows').children.length>0);
                     const first=ctx.library.rows.length;
@@ -347,7 +350,7 @@ export async function runW15Stress({Page, executable, mode, startDevServer}) {
                     check(document.activeElement===el('grid'),'stress grid focus retained');
                     check(el('viewport').scrollTop===100,'stress scroll retained');
                     check(reads===0,'40k discovery/select/add has zero loose contents reads');
-                    summary.push({kind,rows:ctx.library.rows.length,firstUsable:first,heartbeatTicks:beats-startBeats,mapHeartbeatTicks:mappedBeats,visibleRows:el('rows').children.length,looseReads:reads});
+                    summary.push({kind,rows:ctx.library.rows.length,firstUsable:first,heartbeatTicks:beats-startBeats,mapHeartbeatTicks:mappedBeats,visibleRows:el('rows').children.length,looseReads:reads,enumerationMilliseconds:performance.now()-enumerationStarted,publications});
                     ctx.discovery.dispose();
                 }
                 // A deterministic source-read barrier keeps a real archive job pending.
@@ -453,12 +456,12 @@ export async function runW15Runtime({Page,executable,mode,startDevServer,synthet
             const source={kind:'filelist',label:'runtime',size:()=>bytes.length,readFile:async()=>bytes.slice(),async *enumerate(){yield {kind:'file',path:'retry.mod',size:bytes.length,timestamp:''};}};
             const runtime=createLibraryWorkerRuntime({source,workerFactory:()=>worker=new Worker(blobURL,{type:'module'})});
             try {
-                await runtime.enqueue({generation:1,kind:'hash',bytes}).result;
+                await runtime.enqueue({generation:1,kind:'inspect-group',sourcePath:'retry.mod',members:[{token:'one',locator:{sourcePath:'retry.mod'},version:0}],purpose:'scan'}).result;
                 runtime.pauseCatalog();
                 const crash=new Promise(resolve=>worker.addEventListener('error',resolve,{once:true}));worker.postMessage({testCrash:true});await crash;
                 const first=runtime.enqueue({generation:1,kind:'catalog',sourcePath:'paused.zip'});
                 const error=await first.result.catch(error=>error);check(error.code==='worker-failed','idle crash reported to paused next promise');
-                let settled=false;const next=runtime.enqueue({generation:1,kind:'hash',bytes});next.result.then(()=>settled=true,()=>settled=true);
+                let settled=false;const next=runtime.enqueue({generation:1,kind:'inspect-group',sourcePath:'retry.mod',members:[{token:'two',locator:{sourcePath:'retry.mod'},version:0}],purpose:'scan'});next.result.then(()=>settled=true,()=>settled=true);
                 await new Promise(r=>setTimeout(r,60));check(!settled,'remaining jobs suspended after idle crash');runtime.dispose();await next.result.catch(()=>{});
             } finally {runtime.dispose();URL.revokeObjectURL(blobURL);}
             // Genuine startup failure in a worker, followed by the controller's Retry

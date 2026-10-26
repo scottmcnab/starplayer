@@ -41,7 +41,10 @@ Archive resolution first tries the supplied raw bytes, then exact UTF-8 or CP437
 encodings of the path, then case-insensitive decoded names with slash/backslash
 normalisation. That final fallback must identify exactly one entry. Ambiguity is
 an error naming the candidates. Directories and `__MACOSX` resources are skipped.
-Inner ZIPs and modules use the archive extractor's 64 MiB per-entry bound.
+Inner ZIPs and modules use the archive extractor's 64 MiB per-entry bound. When
+raw ZIP directory entries repeat the same filename bytes, the first raw entry wins
+consistently in discovery catalogs and legacy upload/playback extraction, including
+classic ZIP and ZIP64 archives. Distinct names remain subject to the ambiguity check.
 
 ## Metadata and filtering
 
@@ -145,8 +148,15 @@ uploaded to a server.
 **Stop discovery** pauses walking and archive jobs; **Resume discovery** continues
 without duplicating rows. Partial folder-tree **+** actions say **Add discovered
 tracks in …** and add the click-time snapshot. Later discoveries are never appended
-to the playlist automatically. Source replacement cancels old work; cancelling the
-picker preserves the current library.
+to the playlist automatically. A pending chooser or invalid index leaves the current
+library usable. Old work is cancelled when a replacement is accepted; cancelling
+the picker preserves the current library.
+
+Directory-handle discovery leaves **Size** and **Date** unknown for loose files: it
+does not call `getFile()` just to stat every entry, and later metadata inspection
+does not enrich these fields. FileList selections already supply size and last-modified
+time; CSV indexes supply their own optional values. ZIP catalogs can supply extracted
+member sizes, but do not invent timestamps.
 
 Filename results initially have unknown title, channel count and comments. Playback
 reads only its selected module and enriches its matching row and playlist entries.
@@ -155,6 +165,18 @@ updates search/filter results without replacing the playing module. **Cancel met
 stops that optional work. Known-row inspection continues while discovery is paused;
 scan completion waits
 until discovery finishes and the inspection queue is empty.
+Playback metadata and SHA publish together after page WebCrypto finishes. A successful
+replay keeps the previous coherent metadata/comments snapshot while its refresh is
+pending; that old SHA does not verify the newer bytes. First playback remains unknown
+until hashing succeeds. Hash failure clears SHA and adds a path issue. Worker Retry
+and Cancel metadata scan do not cancel page hashes.
+
+Metadata totals count eligible playable rows; excluded archive entries are shown
+separately. Scan metadata acts on uninspected rows or rows missing SHA, while failed
+inspections need explicit Retry metadata. Comments distinguish pending, failed and
+excluded missing hashes. Scan complete describes finished work, not validity of every
+track. Issues are browsable in pages of 100.
+
 Inspection failures remain playable, show error details/tooltips and offer **Retry
 metadata**. Worker failures have a separate **Retry** control. Known unextractable
 archive members remain visible through **Show unplayable** and its live count.
@@ -184,12 +206,24 @@ Opening another index or folder offers **Rebind N
 entries to …** when its keys match; clicking explicitly replaces those entries'
 identities. Rebinding never happens automatically. For a discovered folder it stays disabled
 while discovery is running, paused or failed and becomes available only after a
-complete scan, so one click rebinds the complete matching set.
+complete scan, so one click rebinds the complete matching set. **Rebind pending**
+means the matching set is not known yet; it does not promise that matches exist.
+A paused or failed scan must finish before that set can be offered.
 
 Discovered folders keep an opaque random identity alongside the directory handle in
 IndexedDB, reused when `isSameEntry` confirms a reconnect or reselection. Identical
 display names do not identify folders, and adding/removing files does not change the
-identity. Reconnect re-enumerates the folder; there is no persistent catalog or
+identity. If a stored handle comparison fails or is unavailable, equality is uncertain:
+the player conservatively uses a session identity rather than asserting a different
+persistent folder identity. A confirmed match later in the registry still works.
+Uncertain records are preserved, with no automatic eviction. Reconnect/reselection
+can recover a confirmed match when comparisons work again; otherwise choose the
+folder and explicitly rebind matching relative locators after a complete scan. This
+cannot prove that same-named folders are identical or recover missing files, and
+FileList identities cannot survive reload. A registry repair UI remains deferred;
+clearing all browser storage is not a routine recovery step.
+
+Reconnect re-enumerates the folder; there is no persistent catalog or
 folder metadata cache and no filesystem watcher. FileList selections and unavailable
 storage use session identities; after
 reselection, explicitly rebind relative locators. If a folder gains an index, opening
