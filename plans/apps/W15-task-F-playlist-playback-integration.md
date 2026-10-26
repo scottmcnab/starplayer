@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — not started |
+| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library`; browser gate assigned to G |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | D2 integrated; parallel with E; final app check after E |
@@ -80,3 +80,19 @@ Source/worker/control/view production files owned by A–E; engine/audio renderi
 shared headless harness; unrelated playlist/UI features. After B lands, only the
 web Rust #[cfg(test)] app/HTML source-contract tests transfer to F; preserve production
 bindings and assertion intent. Incorporate E-provided HTML contract updates serially.
+
+## Verification evidence (2026-10-26)
+
+Worker passed combined E/F full web Node suite 200/200, web Rust tests 15/15 plus
+docs, `cargo xtask wasm` and `git diff --check` after updating to integrated E.
+Coordinator independently passed playlist/playback/app-metadata tests 51/51 and
+reviewed all production, Rust source-contract and store-helper changes. Existing
+assertions remain intact. Generated view/discovery/worker modules are packaged.
+
+Playback captures an originating locator and optional `captureContext` result
+before resolution; activation snapshots structured metadata before any await and
+publishes it only after commit/context/identity guards. Enrichment is optional and
+borrows retained playback bytes. Partial before-row patches update all matching
+legacy/unknown entries without no-op saves. Informational discovery statuses never
+gate matching-folder playback; rebind waits for complete discovery. G must run
+the extended real IndexedDB store helper and explicit/advance/reconnect scenarios.

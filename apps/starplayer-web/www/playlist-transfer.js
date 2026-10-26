@@ -1,14 +1,15 @@
-import { parsePlaylistCsv, toPlaylistCsv } from './library-index.js';
+import { parsePlaylistCsv, toPlaylistCsv, locatorKey } from './library-index.js';
 import { libraryLocator } from './playlist.js';
 
-export const locatorKey = row => JSON.stringify([row.sourcePath || '', row.containerMember || '', row.memberPath || '']);
+export { locatorKey };
 const libraryKeys = new WeakMap();
 export function keysForLibrary(library) {
-    if (!libraryKeys.has(library)) libraryKeys.set(library, new Set(library.rows.map(locatorKey)));
-    return libraryKeys.get(library);
+    const cached = libraryKeys.get(library);
+    if (!cached || cached.revision !== library.revision) libraryKeys.set(library, { revision: library.revision, keys: new Set(library.rows.map(locatorKey)) });
+    return libraryKeys.get(library).keys;
 }
 export function rebindCandidates(entries, library) {
-    if (!library) return [];
+    if (!library || (library.mode === 'discovered' && library.discoveryStatus?.phase !== 'complete')) return [];
     const keys = keysForLibrary(library.library);
     return entries.filter(entry => entry.locator.kind === 'library' && entry.locator.libraryIdentity?.sha256 !== library.identity.sha256 && keys.has(locatorKey(entry.locator))).map(entry => entry.id);
 }
@@ -18,15 +19,27 @@ export function rebindEntries(entries, ids, identity) {
 }
 export function exportPlaylist(entries) {
     const rows = entries.filter(entry => entry.locator.kind === 'library');
-    return { csv: toPlaylistCsv(rows.map(entry => ({ ...entry.locator, title: entry.display.title, format: entry.display.format, library: entry.locator.libraryIdentity.name }))), skipped: entries.length - rows.length };
+    return { csv: toPlaylistCsv(rows.map(entry => ({ ...entry.locator, title: entry.display.title, format: entry.display.metadataState === undefined || entry.display.metadataState === 'ready' ? entry.display.format : '', library: entry.locator.libraryIdentity.name }))), skipped: entries.length - rows.length };
 }
 export function importPlaylist(text, library) {
     if (!library) throw new Error('Open a library before importing a playlist.');
     const parsed = parsePlaylistCsv(text);
     const keys = keysForLibrary(library.library);
+    const discovered = library.mode === 'discovered';
+    const missing = parsed.entries.filter(row => !keys.has(locatorKey(row))).length;
+    const pending = discovered && library.discoveryStatus?.phase !== 'complete' ? missing : 0;
+    const rows = new Map(library.library.rows.map(row => [locatorKey(row), row]));
     return {
-        items: parsed.entries.map(row => ({ locator: libraryLocator(row, library.identity), display: { name: (row.memberPath || row.sourcePath).split(/[\\/]/).at(-1), title: row.title, format: row.format, folder: row.sourcePath } })),
-        unavailable: parsed.entries.filter(row => !keys.has(locatorKey(row))).length,
+        items: parsed.entries.map(row => {
+            const verified = discovered && rows.get(locatorKey(row))?.metadataState === 'ready' ? rows.get(locatorKey(row)) : null;
+            return { locator: libraryLocator(row, library.identity), display: {
+                name: (row.memberPath || row.sourcePath).split(/[\\/]/).at(-1), title: verified ? verified.title : row.title,
+                format: verified ? verified.format : row.format, folder: row.sourcePath,
+                ...(discovered ? { metadataState: verified ? 'ready' : 'unknown' } : {}),
+            } };
+        }),
+        unavailable: missing - pending,
+        pending,
         issues: parsed.issues,
     };
 }

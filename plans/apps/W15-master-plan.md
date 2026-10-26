@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation in progress — E reviewed and integrated; F combined verification pending |
+| Status | Implementation in progress — A through F reviewed and integrated; G final acceptance running |
 | Coordinator | gpt-6.1-sol, **xhigh** effort |
 | Workers | gpt-6.1-sol, **high** effort for all tasks |
 | Planning branch | `library-folder-plan` |
@@ -256,3 +256,10 @@ integrated lifecycle; G remains gated on both reviewed UI/app changes.
 E is reviewed and integrated: 173/173 web Node tests, 12/12 view/helper tests and
 14/14 web Rust tests passed. Browser scroll/focus and the eight named DOM scenarios
 remain explicitly with G. F now verifies against integrated E before its landing.
+
+F is reviewed and integrated after the combined E/F gate: 200/200 Node tests,
+15/15 web Rust tests and WASM packaging passed. Coordinator independently passed
+51 playlist/playback/app tests and reviewed snapshot timing, same-identity source
+replacement, partial metadata patches, persistence and informational playback gates.
+G now verifies the fully integrated feature with actual Chromium workers/handles,
+Pages packaging and complete repository CI; no deployment/main merge is authorized.

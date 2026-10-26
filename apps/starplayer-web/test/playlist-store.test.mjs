@@ -10,6 +10,11 @@ export async function verifyPlaylistStore(openPlaylistStore) {
     store.close();
     store = await openPlaylistStore({ name, maxBytes: 4 });
     check(JSON.stringify(store.state) === JSON.stringify(snapshot), 'state/current id round trip');
+    const enriched = { ...snapshot, entries: snapshot.entries.map(entry => ({ ...entry, display: { ...entry.display, title: '', format: 's3m', metadataState: 'ready' } })) };
+    await store.save(enriched);
+    store.close();
+    store = await openPlaylistStore({ name, maxBytes: 4 });
+    check(JSON.stringify(store.state) === JSON.stringify(enriched), 'metadata provenance/display/current/order round trip');
     check(await (await store.getBlob('blob')).bytes.text() === 'test', 'blob bytes round trip');
     await store.save({ ...snapshot, entries: [entry], currentId: 'a' });
     check(store.hasBlob('blob'), 'shared reference retained');
@@ -97,5 +102,5 @@ export async function verifyPlaylistStore(openPlaylistStore) {
     check(!withoutOrphans.hasBlob('blob'), 'unreferenced upload is not persisted');
     withoutOrphans.close();
     for (const databaseName of [name, upgradeName, `${name}-quota`, partialName]) indexedDB.deleteDatabase(databaseName);
-    return 'round trip, refcounts, cap eviction/refusal, missing blobs, v1 upgrade, unavailable/open/quota fallback passed';
+    return 'round trip, metadata provenance, refcounts, cap eviction/refusal, missing blobs, v1 upgrade, unavailable/open/quota fallback passed';
 }

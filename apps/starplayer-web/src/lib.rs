@@ -470,6 +470,27 @@ mod tests {
     }
 
     #[test]
+    fn browser_enriches_only_the_committed_playback_with_a_synchronous_metadata_snapshot() {
+        let app = include_str!("../www/app.js");
+        let activate = app.split_once("async function activateLoadedModule").unwrap().1.split_once("async function playArchiveEntry").unwrap().0;
+        let inspect = activate.find("Loader.inspect_s3m(new Uint8Array(moduleBuffer));").unwrap();
+        let snapshot = activate.find("JSON.parse(Loader.module_metadata())").expect("structured snapshot parsed immediately");
+        let audio = activate.find("await context.audio;").unwrap();
+        let commit = activate.find("if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node) return null;").unwrap();
+        let enrich = activate.find("acceptPlaybackMetadata(context.locator, libraryMetadata, retainedBytes)").unwrap();
+        assert!(inspect < snapshot && snapshot < audio && audio < commit && commit < enrich);
+        assert!(activate.contains("catch {}"), "optional metadata failures preserve playback");
+        assert!(activate.contains("library === state.library"), "same identity in a newer source context must not receive old metadata");
+        assert!(activate.contains("context.locator.libraryIdentity?.sha256"));
+        assert!(app.contains("captureContext: locator => ({ libraryContext: locator.kind === 'library' ? state.library : null })"));
+        assert!(app.contains("available: playlistControls.canPlay"), "discovery status text is not a playback gate");
+        assert!(app.contains("onLibraryUpdate: (library, change) => { libraryView.updateLibrary(library, change); playlistControls.libraryUpdated(library, change); }"));
+        assert!(app.contains("onComments: () => libraryView.refreshComments()"), "indexed comments retain their existing refresh path");
+        assert!(app.contains("reconnect its library."));
+        assert!(!app.contains("reconnect its original index."));
+    }
+
+    #[test]
     fn browser_visible_loader_copy_accepts_and_advertises_every_playable_format() {
         let index = include_str!("../www/index.html");
         assert!(index.contains("S3M, MOD, MTM, XM and IT modules"));
