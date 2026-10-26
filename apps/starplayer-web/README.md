@@ -285,6 +285,17 @@ than by which promise settles first; the reload also claims a module revision of
 exactly as the load path does, so whichever of the two claimed last is the one that paints
 the UI.
 
+## Phones: background playback and lock-screen controls
+
+Enable **Background playback** in Output to keep listening with the screen off and
+show Media Session title, play/pause, playlist next/previous and seek controls where
+supported. It defaults on for phones and tablets, and the choice is saved. A hidden
+audio element loops a generated silent WAV to keep the media session alive; music
+continues directly through Web Audio.
+Android battery saver can still stop playback. iOS Safari support is best effort;
+start audio with a tap before locking the screen. Stop pauses the media element and
+Play resumes from the stopped position.
+
 ## Output and mixer options
 
 Two panels beside the Engine panel expose what the browser is actually doing and what the
