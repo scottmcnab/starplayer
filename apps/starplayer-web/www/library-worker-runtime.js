@@ -41,17 +41,19 @@ export function createLibraryWorkerRuntime({ source, workerFactory = defaultWork
         try { previous.worker.terminate(); } catch { /* Already stopped. */ }
     }
     function workerFailed(error) {
+        const failure = libraryWorkerError('worker-failed', error?.message ?? error);
+        if (error?.cause !== undefined) failure.cause = error.cause;
         suspended = true;
         if (active) {
             const job = active;
             active = null;
             job.attempt += 1;
             job.controller?.abort();
-            settle(job, libraryWorkerError('worker-failed', error?.message ?? error));
+            settle(job, failure);
         } else {
             // An idle worker has no active promise through which to notify the controller.
             // Keep one failure until a queued or future job can report it, even while paused.
-            unreportedWorkerFailure = libraryWorkerError('worker-failed', error?.message ?? error);
+            unreportedWorkerFailure = failure;
         }
         stopWorker();
         schedule();
@@ -77,7 +79,8 @@ export function createLibraryWorkerRuntime({ source, workerFactory = defaultWork
             let error;
             let payload;
             if (message.type === 'error') {
-                // Worker execution errors never suspend unrelated jobs.
+                if (message.error?.code === 'worker-failed') { workerFailed(message.error); return; }
+                // Ordinary data errors settle only this job and keep the instance usable.
                 const code = message.error?.code === 'source-too-large' ? 'source-too-large' : 'job-failed';
                 error = libraryWorkerError(code, message.error?.message ?? 'Library worker job failed');
             } else {

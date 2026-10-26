@@ -11,6 +11,11 @@
 | Behavioral specification | [Folder library specification](W15-task-folder-library-discovery.md) |
 | Deliverable | Progressive local folder/ZIP libraries, lazy metadata, usable saved playlists |
 
+> Follow-up (2026-10-26): independent review identified correctness, performance and
+> hardening work after this delivery. See the active [W15 remediation master](../W15-remediation-master-plan.md).
+> The delivery/evidence below remains historical; the new master explicitly supersedes
+> affected contracts. Remediation is specified/outstanding, not implemented or verified.
+
 ## Context for a fresh coordinator
 
 Read `AGENTS.md` and the linked behavioral specification in full. That specification
@@ -197,10 +202,8 @@ consumer. Do not leave parallel workers to invent incompatible APIs.
 
 ## Execution and review procedure
 
-1. Start from the committed planning branch and ensure the user's GPT-6.1-sol policy
-   in `AGENTS.md` is present in execution worktrees. Do not silently revert or stage
-   unrelated owner edits. The owner model choice here takes precedence over stale
-   policy text in another checkout.
+1. Start from the committed planning branch and follow `AGENTS.md` in every execution
+   worktree.
 2. Create an integration branch `w15-folder-library` from the planning tip, then task
    branches `w15-a`, `w15-b`, `w15-c`, `w15-d1`, `w15-d2`, `w15-e`, `w15-f`, `w15-g` with sibling worktrees `../starplayer-w15-a`, etc.
    Branch dependent tasks from the integrated prerequisites, not the original tip.
@@ -282,9 +285,6 @@ or unexpected diagnostics. Coordinator reviewed all task diffs and final logs;
 the final integration source matches G's tested implementation. Logs are retained
 locally under `/tmp/starplayer-w15-g-evidence/`; the independent integration Node
 run is `/tmp/w15-integration-final-node.log`.
-
-The owner's `AGENTS.md` model-selection edit is byte-preserved, unstaged and
-excluded from every implementation commit, in planning and execution worktrees.
 
 ## Commit summary
 

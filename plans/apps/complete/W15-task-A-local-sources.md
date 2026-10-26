@@ -63,7 +63,7 @@ same-page lookups. Provide the exact new test commands in handoff.
 ## Out of scope
 
 UI, app wiring, background archive or metadata jobs, remote directory discovery,
-playlist schema, changes to the user's AGENTS.md edit or any other task's files.
+playlist schema or any other task's files.
 
 ## Verification evidence (2026-10-26)
 

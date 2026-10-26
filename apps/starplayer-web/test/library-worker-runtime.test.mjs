@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createLibraryWorkerRuntime } from '../www/library-worker-runtime.js';
 import { executeLibraryJob, startLibraryWorker, MAX_SOURCE_BYTES, MAX_EXTRACTED_BYTES } from '../www/library-worker-jobs.js';
 import { webcrypto } from 'node:crypto';
+import { runInNewContext } from 'node:vm';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
@@ -478,4 +479,138 @@ test('dispose before deferred idle-failure delivery rejects queued work once as 
     await expectCode(next.result, 'disposed');
     await tick(); assert.equal(settlements, 1);
     await expectCode(enqueue({ kind: 'catalog', sourcePath: 'later.zip' }).result, 'disposed');
+});
+
+
+function wasmUnreachable() {
+    // () -> () export containing WASM unreachable: the same engine error as an aborting Rust panic.
+    const module = new WebAssembly.Module(new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x08, 0x01, 0x04, 0x74, 0x72, 0x61, 0x70, 0x00, 0x00,
+        0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
+    ]));
+    new WebAssembly.Instance(module).exports.trap();
+}
+
+for (const binding of ['archive_catalog', 'archive_extract_path', 'inspect_s3m', 'module_metadata']) {
+    test(`worker endpoint classifies an actual WASM unreachable in ${binding} as a fatal trap`, async () => {
+        const messages = [];
+        const scope = { postMessage: message => messages.push(message) };
+        const { loader } = bindings({ [binding]: wasmUnreachable });
+        await startLibraryWorker({ scope, loadLoader: async () => loader });
+        assert.deepEqual(messages.shift(), { type: 'ready' });
+        const tag = { id: 42, generation: 9, kind: binding === 'archive_catalog' ? 'catalog' : 'inspect' };
+        await scope.onmessage({ data: { ...tag, locator: locator('trap.zip'), bytes: new ArrayBuffer(1) } });
+        assert.deepEqual(messages, [{ type: 'error', ...tag, error: { name: 'Error', code: 'worker-failed', message: 'unreachable', cause: 'wasm-trap' } }]);
+    });
+}
+
+test('worker endpoint recognizes a RuntimeError from another realm', async () => {
+    const error = runInNewContext("new WebAssembly.RuntimeError('cross-realm trap')");
+    assert.equal(error instanceof WebAssembly.RuntimeError, false);
+    const messages = [];
+    const scope = { postMessage: message => messages.push(message) };
+    const { loader } = bindings({ archive_catalog: () => { throw error; } });
+    await startLibraryWorker({ scope, loadLoader: async () => loader });
+    const tag = { id: 2, generation: 7, kind: 'catalog' };
+    await scope.onmessage({ data: { ...tag, bytes: new ArrayBuffer(1) } });
+    assert.deepEqual(messages.at(-1), { type: 'error', ...tag, error: { name: 'Error', code: 'worker-failed', message: 'cross-realm trap', cause: 'wasm-trap' } });
+});
+
+function endpointFixture(loader, workers) {
+    return fixture({ workerFactory() {
+        const scope = { postMessage: message => worker.onmessage?.({ data: structuredClone(message) }) };
+        const worker = {
+            jobs: [], terminated: false,
+            postMessage(message, transfer) { this.jobs.push(structuredClone(message, { transfer })); },
+            run() { return scope.onmessage({ data: this.jobs.at(-1) }); },
+            terminate() { this.terminated = true; },
+        };
+        workers.push(worker);
+        void startLibraryWorker({ scope, loadLoader: async () => loader });
+        return worker;
+    } });
+}
+
+test('endpoint trap retires its runtime once, leaves row callbacks untouched and requires explicit recreation after each trap', async () => {
+    const workers = [];
+    let trap = true;
+    const { loader } = bindings({ inspect_s3m: () => { if (trap) wasmUnreachable(); } });
+    const first = endpointFixture(loader, workers);
+    const updates = [];
+    const active = first.enqueue({ kind: 'inspect', locator: locator('trap.zip') });
+    let rejections = 0;
+    active.result.then(result => updates.push(result), () => { rejections += 1; });
+    await tick();
+    const waiting = first.enqueue({ kind: 'inspect', locator: locator('waiting.zip') });
+    const catalogJob = first.enqueue({ kind: 'catalog', sourcePath: 'waiting-catalog.zip' });
+    waiting.result.then(result => updates.push(result), () => {});
+    let queuedSettlements = 0;
+    for (const job of [waiting, catalogJob]) job.result.then(() => { queuedSettlements += 1; }, () => { queuedSettlements += 1; });
+    const staleMessage = workers[0].onmessage;
+    const tag = workers[0].jobs[0];
+    await workers[0].run();
+    await assert.rejects(active.result, error => error.code === 'worker-failed' && error.cause === 'wasm-trap' && error.message === 'unreachable');
+    assert.equal(workers[0].terminated, true);
+    staleMessage({ data: { ...tag, type: 'error', error: { code: 'worker-failed', message: 'late trap', cause: 'wasm-trap' } } });
+    staleMessage({ data: { ...tag, type: 'result', payload: { metadata, sha256 } } });
+    active.cancel();
+    first.runtime.resumeCatalog();
+    await tick();
+    assert.equal(rejections, 1);
+    assert.deepEqual(updates, []);
+    assert.equal(queuedSettlements, 0);
+    assert.equal(workers.length, 1);
+    assert.equal(workers[0].jobs.length, 1);
+    assert.deepEqual(first.reads, ['trap.zip']);
+
+    // Explicit Retry is controller-owned: dispose and recreate, then resubmit unfinished work.
+    first.runtime.dispose();
+    await Promise.all([waiting, catalogJob].map(job => expectCode(job.result, 'disposed')));
+    trap = false;
+    const retry = endpointFixture(loader, workers);
+    const recovered = retry.enqueue({ kind: 'catalog', sourcePath: 'waiting-catalog.zip' });
+    await tick();
+    await workers[1].run();
+    assert.deepEqual(await recovered.result, { generation: 7, kind: 'catalog', payload: catalog });
+    assert.equal(workers[1].terminated, false);
+
+    trap = true;
+    const secondTrap = retry.enqueue({ kind: 'inspect', locator: locator('trap-again.zip') });
+    await tick();
+    const stillWaiting = retry.enqueue({ kind: 'catalog', sourcePath: 'still-waiting.zip' });
+    await workers[1].run();
+    await assert.rejects(secondTrap.result, error => error.code === 'worker-failed' && error.cause === 'wasm-trap');
+    retry.runtime.resumeCatalog();
+    await tick();
+    assert.equal(workers[1].terminated, true);
+    assert.equal(workers.length, 2);
+    assert.deepEqual(retry.reads, ['waiting-catalog.zip', 'trap-again.zip']);
+    retry.runtime.dispose();
+    await expectCode(stillWaiting.result, 'disposed');
+});
+
+test('ordinary wasm-bindgen Result throws and endpoint payload errors keep the same worker usable', async () => {
+    const workers = [];
+    const { loader } = bindings({ archive_catalog: () => { throw 'unsupported module data'; } });
+    const { runtime, enqueue } = endpointFixture(loader, workers);
+    const badFile = enqueue({ kind: 'catalog', sourcePath: 'bad.zip' });
+    const invalidPayload = enqueue({ kind: 'catalog', sourcePath: 'invalid.zip' });
+    const goodFile = enqueue({ kind: 'catalog', sourcePath: 'good.zip' });
+    await tick();
+    await workers[0].run();
+    await assert.rejects(badFile.result, error => error.code === 'job-failed' && error.message === 'unsupported module data' && !Object.hasOwn(error, 'cause'));
+    loader.archive_catalog = () => '{}';
+    await tick();
+    await workers[0].run();
+    await expectCode(invalidPayload.result, 'job-failed');
+    loader.archive_catalog = () => JSON.stringify(catalog);
+    await tick();
+    await workers[0].run();
+    assert.deepEqual((await goodFile.result).payload, catalog);
+    assert.equal(workers.length, 1);
+    assert.equal(workers[0].terminated, false);
+    runtime.dispose();
 });

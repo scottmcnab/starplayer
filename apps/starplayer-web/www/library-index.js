@@ -179,7 +179,7 @@ function prepareComments(library, row) {
     const state = modelStates.get(library);
     const previous = state.commentStates[row.id];
     if (previous) {
-        if (!previous.sha256) state.unknownHashes -= 1;
+        if (previous.hashBucket) state[previous.hashBucket] -= 1;
         if (previous.hasText) state.commentRows -= 1;
         if (previous.joined) {
             state.joined -= 1;
@@ -201,8 +201,9 @@ function prepareComments(library, row) {
     library.commentHaystacks[row.id] = stored.haystack;
     library.compactCommentHaystacks[row.id] = stored.compact;
     const hasText = commentKeys.some(key => stored.original[key]);
-    state.commentStates[row.id] = { sha256: row.sha256, joined: Boolean(sidecar), hasText };
-    if (!row.sha256) state.unknownHashes += 1;
+    const hashBucket = row.sha256 ? '' : !state.discovered || row.playable && row.metadataState !== 'error' ? 'unknownHashes' : row.playable ? 'failedHashes' : 'excludedHashes';
+    state.commentStates[row.id] = { sha256: row.sha256, joined: Boolean(sidecar), hasText, hashBucket };
+    if (hashBucket) state[hashBucket] += 1;
     if (hasText) state.commentRows += 1;
     if (sidecar) {
         state.joined += 1;
@@ -212,14 +213,18 @@ function prepareComments(library, row) {
     library.commentCounts.joined = state.joined;
     library.commentCounts.unmatched = (library.comments?.size || 0) - state.usedHashes.size;
     library.commentCounts.awaitingHashes = library.comments ? state.unknownHashes : 0;
+    if (state.discovered) {
+        library.commentCounts.failedHashes = library.comments ? state.failedHashes : 0;
+        library.commentCounts.excludedHashes = library.comments ? state.excludedHashes : 0;
+    }
     return changed;
 }
 
-function initializeLibrary(library, name) {
-    const state = { display: [], commentStates: [], shared: new WeakMap(), usedHashes: new Map(), formatCounts: new Map(), unknownHashes: 0, commentRows: 0, joined: 0 };
+function initializeLibrary(library, name, discovered = false) {
+    const state = { discovered, failedHashes: 0, excludedHashes: 0, display: [], commentStates: [], shared: new WeakMap(), usedHashes: new Map(), formatCounts: new Map(), unknownHashes: 0, commentRows: 0, joined: 0 };
     modelStates.set(library, state);
-    Object.assign(library, { identityName: name, revision: 0, locatorIds: new Map(), haystacks: [], compactHaystacks: [], fieldHaystacks: [], sortKeys: [],
-        commentHaystacks: [], compactCommentHaystacks: [], hasComments: false, comments: null, commentCounts: { joined: 0, unmatched: 0, awaitingHashes: 0 }, commentChangedRowIds: [],
+    Object.assign(library, { identityName: name, revision: 0, lastRowChanges: [], locatorIds: new Map(), haystacks: [], compactHaystacks: [], fieldHaystacks: [], sortKeys: [],
+        commentHaystacks: [], compactCommentHaystacks: [], hasComments: false, comments: null, commentCounts: { joined: 0, unmatched: 0, awaitingHashes: 0, ...(discovered ? { failedHashes: 0, excludedHashes: 0 } : {}) }, commentChangedRowIds: [],
         formats: new Set(), folderCounts: new Map([['', 0]]), commentsFor: rowId => state.display[rowId] });
     for (const row of library.rows) {
         library.locatorIds.set(locatorKey(row), row.id);
@@ -243,6 +248,7 @@ export function attachComments(library, comments) {
     library.commentCounts.unmatched = (comments?.size || 0) - modelStates.get(library).usedHashes.size;
     library.commentCounts.awaitingHashes = comments ? modelStates.get(library).unknownHashes : 0;
     library.commentChangedRowIds = changed;
+    library.lastRowChanges = changed.map(id => ({ id, added: false, fields: ['comments'] }));
     if (replaced || changed.length) library.revision += 1;
     return { joined: library.commentCounts.joined, unmatched: library.commentCounts.unmatched };
 }
@@ -255,7 +261,7 @@ export function parseLibraryCsv(text, { name = '' } = {}) {
 // guessed title/channels. Each changed append/update batch advances revision once;
 // no-op batches and duplicate locators do not. IDs remain array positions forever.
 export function createDiscoveredLibrary({ name = '' } = {}) {
-    return initializeLibrary({ rows: [], issues: [], columns: [] }, typeof name === 'string' ? name : '');
+    return initializeLibrary({ rows: [], issues: [], columns: [] }, typeof name === 'string' ? name : '', true);
 }
 
 const metadataTextKeys = ['title', 'tracker', 'instrumentNames', 'sampleNames', 'songMessage', 'error'];
@@ -288,12 +294,15 @@ export function appendDiscoveredRows(library, records) {
         countFolders(library, row);
         changed.push(row.id);
     }
+    library.lastRowChanges = changed.map(id => ({ id, added: true, fields: ['*'] }));
     if (changed.length) library.revision += 1;
     return changed;
 }
 
+const publicRowFields = ['name', 'folder', 'format', 'title', 'channels', 'size', 'timestamp', 'tracker', 'playable', 'metadataState', 'error', 'sha256'];
+
 export function updateDiscoveredRows(library, updates) {
-    const changed = new Set();
+    const changed = new Set(), before = new Map();
     for (const { locator, patch } of updates) {
         if (!locator || !patch || typeof patch !== 'object') continue;
         const id = library.locatorIds.get(locatorKey(locator));
@@ -309,6 +318,7 @@ export function updateDiscoveredRows(library, updates) {
         if (normalized.metadataState === 'ready' && row.playable) normalized.error = '';
         if (!row.playable) delete normalized.error;
         if (!Object.keys(normalized).some(field => row[field] !== normalized[field])) continue;
+        if (!before.has(id)) before.set(id, { row: { ...row }, comments: library.commentsFor(id) });
         if (normalized.format !== undefined && normalized.format !== row.format) {
             countFormat(library, row.format, -1);
             countFormat(library, normalized.format, 1);
@@ -317,6 +327,13 @@ export function updateDiscoveredRows(library, updates) {
         prepareRow(library, row);
         prepareComments(library, row);
         changed.add(id);
+    }
+    library.lastRowChanges = [];
+    for (const id of changed) {
+        const previous = before.get(id), row = library.rows[id];
+        const fields = publicRowFields.filter(field => previous.row[field] !== row[field]);
+        if (commentKeys.some(field => previous.comments[field] !== library.commentsFor(id)[field])) fields.push('comments');
+        if (fields.length) library.lastRowChanges.push({ id, added: false, fields });
     }
     if (changed.size) library.revision += 1;
     return [...changed];
@@ -382,27 +399,35 @@ function compareLocators(left, right) {
     return 0;
 }
 
-export function search(library, query = '', { scopeFolder = '', showUnplayable = false, format = '', includeComments = true, sort } = {}) {
-    // Hand-built tokens may omit `compact`; compute it once, not per row.
+// Compile once for an active query, then reuse for only rows changed by discovery.
+export function createRowPredicate(library, query = '', { scopeFolder = '', showUnplayable = false, format = '', includeComments = true } = {}) {
     const tokens = (typeof query === 'string' ? compileQuery(query) : query).map(token => token.compact === undefined ? { ...token, compact: compactText(token.value) } : token);
-    const matches = [];
     const scope = scopeFolder.replace(/\/$/, '');
-    for (const row of library.rows) {
-        if (!showUnplayable && !row.playable || format && row.format !== format.toLowerCase()) continue;
-        if (scope && row.folder !== scope && !row.folder.startsWith(`${scope}/`)) continue;
-        if (!tokens.every(token => tokenMatches(library, row, token, includeComments) !== (token.negated === true))) continue;
-        matches.push(row.id);
-    }
-    if (sort) {
-        const compare = (left, right) => left === right ? 0 : left === null ? -1 : right === null ? 1 : left < right ? -1 : 1;
-        const column = sort.column;
-        if (!['name', 'title', 'format', 'channels', 'size', 'timestamp', 'folder'].includes(column)) throw new Error(`Unknown sort column: ${column}`);
-        matches.sort((left, right) => {
-            const leftKeys = library.sortKeys[left], rightKeys = library.sortKeys[right];
-            const primary = compare(leftKeys[column] ?? library.rows[left][column], rightKeys[column] ?? library.rows[right][column]);
-            return primary * (sort.descending ? -1 : 1) || compare(leftKeys.folder, rightKeys.folder) || compare(leftKeys.name, rightKeys.name) || compareLocators(library.rows[left], library.rows[right]);
-        });
-    }
+    const expectedFormat = format ? format.toLowerCase() : '';
+    return row => {
+        if (!showUnplayable && !row.playable || expectedFormat && row.format !== expectedFormat) return false;
+        if (scope && row.folder !== scope && !row.folder.startsWith(`${scope}/`)) return false;
+        return tokens.every(token => tokenMatches(library, row, token, includeComments) !== (token.negated === true));
+    };
+}
+
+// IDs and plain comparison keys preserve indexed CSV ordering and locator tie breaks.
+export function createRowComparator(library, sort) {
+    const compare = (left, right) => left === right ? 0 : left === null ? -1 : right === null ? 1 : left < right ? -1 : 1;
+    const column = sort.column;
+    if (!['name', 'title', 'format', 'channels', 'size', 'timestamp', 'folder'].includes(column)) throw new Error(`Unknown sort column: ${column}`);
+    return (left, right) => {
+        const leftKeys = library.sortKeys[left], rightKeys = library.sortKeys[right];
+        const primary = compare(leftKeys[column] ?? library.rows[left][column], rightKeys[column] ?? library.rows[right][column]);
+        return primary * (sort.descending ? -1 : 1) || compare(leftKeys.folder, rightKeys.folder) || compare(leftKeys.name, rightKeys.name) || compareLocators(library.rows[left], library.rows[right]);
+    };
+}
+
+export function search(library, query = '', options = {}) {
+    const predicate = createRowPredicate(library, query, options);
+    const matches = [];
+    for (const row of library.rows) if (predicate(row)) matches.push(row.id);
+    if (options.sort) matches.sort(createRowComparator(library, options.sort));
     return Int32Array.from(matches);
 }
 

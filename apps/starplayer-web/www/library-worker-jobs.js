@@ -53,7 +53,7 @@ async function hash(bytes, digest) {
 
 // Keep the browser entry point thin; the same endpoint is exercised with controlled bindings.
 export async function startLibraryWorker({ scope, loadLoader }) {
-    const failure = (error, code) => ({ name: 'Error', code, message: String(error?.message ?? error) });
+    const failure = (error, code, cause) => ({ name: 'Error', code, message: String(error?.message ?? error), ...(cause === undefined ? {} : { cause }) });
     let loader;
     try {
         loader = await loadLoader();
@@ -69,7 +69,9 @@ export async function startLibraryWorker({ scope, loadLoader }) {
             const payload = await executeLibraryJob(job, { loader });
             scope.postMessage({ type: 'result', ...tag, payload });
         } catch (error) {
-            scope.postMessage({ type: 'error', ...tag, error: failure(error, error?.code === 'source-too-large' ? 'source-too-large' : 'job-failed') });
+            const wasmTrap = error instanceof WebAssembly.RuntimeError || error?.name === 'RuntimeError';
+            const code = wasmTrap ? 'worker-failed' : error?.code === 'source-too-large' ? 'source-too-large' : 'job-failed';
+            scope.postMessage({ type: 'error', ...tag, error: failure(error, code, wasmTrap ? 'wasm-trap' : undefined) });
         }
     };
 }

@@ -12,7 +12,8 @@ const metadataPatch = metadata => ({ format: metadata.format, title: metadata.ti
 // All mutable lifecycle state belongs to one accepted context. Runtime epochs distinguish
 // requeued attempts; locator versions keep older inspections from replacing playback.
 export function createDiscoveryController({ context, generation = nextGeneration++, onUpdate = () => {},
-    runtimeFactory = createLibraryWorkerRuntime, schedule = setTimeout, unschedule = clearTimeout }) {
+    runtimeFactory = createLibraryWorkerRuntime, schedule = setTimeout, unschedule = clearTimeout,
+    digest = bytes => globalThis.crypto.subtle.digest('SHA-256', bytes), onDigestMetric = () => {}, now = () => performance.now() }) {
     const { source, library } = context;
     let runtime = runtimeFactory({ source });
     let runtimeEpoch = 1;
@@ -21,45 +22,65 @@ export function createDiscoveryController({ context, generation = nextGeneration
     let runtimeError = '';
     let scanActive = false, metadataPhase = 'idle';
     let timer = null;
-    const catalogs = new Map(), inspected = new Map(), hashes = new Map();
+    const catalogs = new Map(), inspected = new Map(), digests = new Map(), refreshes = new Map();
     const examined = new Set(), cataloged = new Set(), cache = new Map(), versions = new Map();
     const issues = [], issueKeys = new Set();
-    const changedRows = new Set(), metadataUpdates = new Map();
-    const counts = { ready: 0, unknown: 0, error: 0 };
-    let missingHashes = 0;
+    const changedRows = new Set(), rowChanges = new Map(), metadataUpdates = new Map();
+    const counts = { ready: 0, unknown: 0, error: 0, excluded: 0 };
+    const actionableRows = new Set();
+    let missingHashes = 0, refreshPending = 0, pendingInputBytes = 0, nextDigestId = 1, issuesRevision = 0;
     let lastPhase = 'running', lastMetadataPhase = 'idle';
 
     function rowFor(locator) { return library.rows[library.locatorIds.get(locatorKey(locator))]; }
     function countRow(row, direction) {
+        if (!row.playable) { counts.excluded += direction; return; }
         counts[row.metadataState] += direction;
         if (!row.sha256) missingHashes += direction;
+        if (direction < 0) actionableRows.delete(row.id);
+        else if (isScanActionable(row)) actionableRows.add(row.id);
+    }
+    function isScanActionable(row) {
+        const key = locatorKey(row);
+        return row.playable && row.metadataState !== 'error' && (row.metadataState !== 'ready' || !row.sha256)
+            && !inspected.has(key) && !refreshes.has(key);
+    }
+    function refreshActionable(locator) {
+        const row = rowFor(locator);
+        if (row) { actionableRows.delete(row.id); if (isScanActionable(row)) actionableRows.add(row.id); }
     }
     function status() {
         const phase = paused ? 'paused' : !walkDone ? 'running' : rootFailed || (runtimeError && catalogs.size) ? 'failed' : catalogs.size ? 'running' : 'complete';
-        if (scanActive || inspected.size) {
-            if (runtimeError) metadataPhase = 'suspended';
-            else if (inspected.size || hashes.size) metadataPhase = 'running';
+        if (scanActive || inspected.size || refreshPending) {
+            if (runtimeError && (scanActive || inspected.size)) metadataPhase = 'suspended';
+            else if (inspected.size || refreshPending) metadataPhase = 'running';
             else if (phase !== 'complete') metadataPhase = 'waiting';
             else { scanActive = false; metadataPhase = 'complete'; }
         }
         let issueSnapshot;
         const issueLength = issues.length;
-        if (!scanActive && metadataPhase === 'running' && !inspected.size) metadataPhase = 'complete';
+        if (!scanActive && metadataPhase === 'running' && !inspected.size && !refreshPending) metadataPhase = 'complete';
         return Object.freeze({ phase, filesExamined: examined.size, archivesPending: catalogs.size, tracksFound: library.rows.length,
-            get issues() { return issueSnapshot ||= Object.freeze(issues.slice(0, issueLength)); }, issueCount: issues.length, metadataPhase, runtimeError,
-            metadataCounts: Object.freeze({ ...counts, hashesPending: hashes.size }), metadataIncomplete: counts.unknown + counts.error > 0 || missingHashes > 0,
+            issuesRevision, get issues() { return issueSnapshot ||= Object.freeze(issues.slice(0, issueLength)); }, issueCount: issues.length, metadataPhase, runtimeError,
+            metadataCounts: Object.freeze({ ...counts, hashesPending: digests.size, refreshPending, scanActionable: actionableRows.size }),
+            metadataIncomplete: counts.unknown + counts.error > 0 || missingHashes > 0 || refreshPending > 0,
             sidecarCounts: Object.freeze({ ...library.commentCounts }) });
     }
     function flush() {
         if (disposed) return;
         if (timer !== null) { unschedule(timer); timer = null; }
-        const change = { changedRowIds: [...changedRows], statusChanged: true, metadataUpdates: [...metadataUpdates.values()] };
-        changedRows.clear(); metadataUpdates.clear();
+        const change = { changedRowIds: [...changedRows], statusChanged: true, metadataUpdates: [...metadataUpdates.values()],
+            rowChanges: [...rowChanges.values()].map(change => ({ ...change, fields: [...change.fields] })), libraryRevision: library.revision, issuesRevision };
+        changedRows.clear(); rowChanges.clear(); metadataUpdates.clear();
         onUpdate(context, change);
     }
-    function changed(ids = [], updates = [], immediate = false) {
+    function changed(ids = [], updates = [], immediate = false, deltas = []) {
         if (disposed) return;
         for (const id of ids) changedRows.add(id);
+        for (const delta of deltas) {
+            const previous = rowChanges.get(delta.id);
+            const added = Boolean(previous?.added || delta.added);
+            rowChanges.set(delta.id, { id: delta.id, added, fields: new Set(added ? ['*'] : [...(previous?.fields || []), ...delta.fields]) });
+        }
         for (const update of updates) {
             const key = locatorKey(update.locator), previous = metadataUpdates.get(key);
             metadataUpdates.set(key, { locator: { ...update.locator }, patch: { ...previous?.patch, ...update.patch } });
@@ -73,7 +94,7 @@ export function createDiscoveryController({ context, generation = nextGeneration
     }
     function addIssue(path, reason) {
         const key = JSON.stringify([path, reason]);
-        if (!issueKeys.has(key)) { issueKeys.add(key); issues.push(Object.freeze({ path, reason })); }
+        if (!issueKeys.has(key)) { issueKeys.add(key); issues.push(Object.freeze({ id: issues.length, path, reason })); issuesRevision += 1; }
     }
     function patchRow(locator, patch) {
         const key = locatorKey(locator);
@@ -82,18 +103,21 @@ export function createDiscoveryController({ context, generation = nextGeneration
         if (row) countRow(row, -1);
         const ids = updateDiscoveredRows(library, [{ locator, patch }]);
         if (row) countRow(row, 1);
-        changed(ids, [{ locator, patch }]);
+        changed(ids, [{ locator, patch }], false, library.lastRowChanges);
     }
     function append(records) {
         const ids = appendDiscoveredRows(library, records.map(record => ({ ...record, ...cache.get(locatorKey(record)), ...(record.playable === false ? { error: record.error } : {}) })));
-        for (const id of ids) countRow(library.rows[id], 1);
+        const deltas = library.lastRowChanges;
+        for (const id of ids) {
+            const row = library.rows[id];
+            if (!row.playable && refreshes.has(locatorKey(row))) refreshPending -= 1;
+            countRow(row, 1);
+        }
         for (const id of ids) queueInspection(library.rows[id]);
-        changed(ids);
+        changed(ids, [], false, deltas);
     }
     function failRuntime(error) {
         runtimeError = error.message || String(error);
-        for (const item of hashes.values()) item.job.cancel();
-        hashes.clear();
         changed();
     }
     function enqueueCatalog(item) {
@@ -120,9 +144,10 @@ export function createDiscoveryController({ context, generation = nextGeneration
     function queueInspection(row, force = false) {
         if (disposed || !row?.playable || (!scanActive && !force) || runtimeError) return;
         const key = locatorKey(row);
-        if (inspected.has(key) || hashes.has(key) || !force && (row.metadataState === 'error' || row.metadataState === 'ready' && row.sha256)) return;
+        if (inspected.has(key) || refreshes.has(key) || !force && (row.metadataState === 'error' || row.metadataState === 'ready' && row.sha256)) return;
         const item = { locator: { sourcePath: row.sourcePath, containerMember: row.containerMember, memberPath: row.memberPath, rawHex: row.rawHex }, version: versions.get(key) || 0, job: null };
         inspected.set(key, item);
+        refreshActionable(row);
         enqueueInspection(key, item);
     }
     function enqueueInspection(key, item) {
@@ -140,8 +165,37 @@ export function createDiscoveryController({ context, generation = nextGeneration
             item.job = null;
             if (error.code === 'worker-failed') { failRuntime(error); return; }
             inspected.delete(key);
+            refreshActionable(item.locator);
             if (!controlFlow(error)) patchRow(item.locator, { metadataState: 'error', error: error.message || String(error) });
             else changed();
+        });
+    }
+    function emitDigestMetric(event, item, extra = {}) {
+        // Optional instrumentation contains scalars only; never retain or expose input bytes.
+        try { onDigestMetric({ event, id: item.id, byteLength: item.byteLength, timestamp: now(), pending: digests.size, pendingInputBytes, ...extra }); }
+        catch (error) { console.error('Playback digest metric callback failed', error); }
+    }
+    function finishDigest(item, sha256, error, failed = false) {
+        const current = !disposed && item.generation === generation && refreshes.get(item.key) === item && versions.get(item.key) === item.version;
+        if (refreshes.get(item.key) === item) {
+            refreshes.delete(item.key);
+            if (rowFor(item.locator)?.playable !== false) refreshPending -= 1;
+            refreshActionable(item.locator);
+        }
+        if (!current) return;
+        if (failed) addIssue(joinedPath(item.locator), error?.message || String(error));
+        patchRow(item.locator, { ...item.patch, sha256: failed ? '' : sha256 });
+    }
+    function watchDigest(item, promise) {
+        // This closure receives the promise and scalar/snapshot record, never caller bytes.
+        Promise.resolve(promise).then(result => {
+            if (!(result instanceof ArrayBuffer) || result.byteLength !== 32) throw new Error('Invalid SHA-256 digest result');
+            const sha256 = Array.from(new Uint8Array(result), byte => byte.toString(16).padStart(2, '0')).join('');
+            finishDigest(item, sha256, null);
+        }).catch(error => finishDigest(item, null, error, true)).finally(() => {
+            digests.delete(item.id); pendingInputBytes -= item.byteLength;
+            emitDigestMetric('settle', item, { latency: now() - item.started });
+            changed();
         });
     }
     async function waitForResume() {
@@ -204,7 +258,6 @@ export function createDiscoveryController({ context, generation = nextGeneration
             if (runtimeError) {
                 runtimeEpoch += 1;
                 runtime.dispose();
-                hashes.clear(); // Owned bytes die with the failed runtime; do not retain/replay them.
                 runtime = runtimeFactory({ source }); runtimeError = '';
                 if (paused) runtime.pauseCatalog();
                 for (const item of catalogs.values()) { item.job = null; enqueueCatalog(item); }
@@ -223,7 +276,10 @@ export function createDiscoveryController({ context, generation = nextGeneration
         cancelMetadata() {
             if (disposed) return;
             scanActive = false; metadataPhase = 'cancelled';
-            inspected.clear(); runtime.cancelMetadata(); changed();
+            const cancelled = [...inspected.values()];
+            inspected.clear(); runtime.cancelMetadata();
+            for (const item of cancelled) refreshActionable(item.locator);
+            changed();
         },
         retryMetadata(locator) {
             if (disposed) return;
@@ -233,38 +289,31 @@ export function createDiscoveryController({ context, generation = nextGeneration
         },
         acceptPlaybackMetadata(locator, metadata, bytes) {
             if (disposed) return;
-            locator = { ...locator };
-            const key = locatorKey(locator), version = (versions.get(key) || 0) + 1;
+            const capturedLocator = Object.fromEntries(['sourcePath', 'containerMember', 'memberPath', 'rawHex'].map(field => [field, typeof locator[field] === 'string' ? locator[field] : '']));
+            const capturedMetadata = Object.fromEntries(['format', 'title', 'instrumentNames', 'sampleNames', 'songMessage'].map(field => [field, typeof metadata[field] === 'string' ? metadata[field] : '']));
+            capturedMetadata.channels = Number.isSafeInteger(metadata.channels) && metadata.channels > 0 ? metadata.channels : null;
+            const key = locatorKey(capturedLocator), version = (versions.get(key) || 0) + 1;
             versions.set(key, version);
             const previousInspection = inspected.get(key);
             inspected.delete(key); previousInspection?.job?.cancel();
-            const previousHash = hashes.get(key);
-            hashes.delete(key); previousHash?.job.cancel();
-            // Publish a ready patch even before enumeration reaches this locator.
-            if (runtimeError) { patchRow(locator, { ...metadataPatch(metadata), sha256: '' }); return; }
-            const epoch = runtimeEpoch;
-            const job = runtime.enqueue({ generation, kind: 'hash', bytes });
-            const item = { job, version };
-            hashes.set(key, item);
-            patchRow(locator, { ...metadataPatch(metadata), sha256: '' });
-            const current = () => !disposed && epoch === runtimeEpoch && hashes.get(key) === item && version === versions.get(key);
-            job.result.then(result => {
-                if (!current() || result.generation !== generation) return;
-                hashes.delete(key); patchRow(locator, { sha256: result.payload.sha256 });
-            }, error => {
-                if (!current()) return;
-                hashes.delete(key);
-                if (error.code === 'worker-failed') failRuntime(error);
-                else if (!controlFlow(error)) addIssue(joinedPath(locator), error.message || String(error));
-                if (controlFlow(error)) queueInspection(rowFor(locator));
-                changed();
-            });
+            // R4b must invalidate only this descriptor/member, never cancel a shared group.
+            if (!refreshes.has(key) && rowFor(capturedLocator)?.playable !== false) refreshPending += 1;
+            const item = { id: nextDigestId++, key, locator: capturedLocator, patch: metadataPatch(capturedMetadata), version, generation,
+                byteLength: bytes.byteLength, started: now() };
+            refreshes.set(key, item);
+            refreshActionable(capturedLocator);
+            let promise;
+            try { promise = digest(bytes); }
+            catch (error) { finishDigest(item, null, error, true); changed(); return; }
+            digests.set(item.id, item); pendingInputBytes += item.byteLength;
+            emitDigestMetric('start', item, { startCost: now() - item.started });
+            watchDigest(item, promise);
             changed();
         },
         attachComments(comments) {
             if (disposed) return;
             const result = attachComments(library, comments);
-            changed(library.commentChangedRowIds);
+            changed(library.commentChangedRowIds, [], false, library.lastRowChanges);
             return result;
         },
         dispose() {
@@ -273,11 +322,12 @@ export function createDiscoveryController({ context, generation = nextGeneration
             walkController?.abort(); wakeWalk?.(); wakeWalk = null;
             // Do not await an outstanding directory read in order to dispose the context.
             try { Promise.resolve(iterator?.return?.()).catch(() => {}); } catch { /* Cleanup must remain silent. */ }
-            runtime.dispose(); catalogs.clear(); inspected.clear(); hashes.clear(); cache.clear();
+            runtime.dispose(); catalogs.clear(); inspected.clear(); cache.clear();
             if (timer !== null) unschedule(timer);
-            changedRows.clear(); metadataUpdates.clear();
+            changedRows.clear(); rowChanges.clear(); metadataUpdates.clear();
         },
     };
+    for (const row of library.rows) countRow(row, 1);
     context.discovery = controller;
     context.discoveryStatus = status();
     return controller;
