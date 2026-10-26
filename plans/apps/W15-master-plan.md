@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation in progress — A/B/C reviewed and integrated; D1 dispatched |
+| Status | Implementation in progress — A/B/C/D1/D2 reviewed and integrated; E/F dispatched |
 | Coordinator | gpt-6.1-sol, **xhigh** effort |
 | Workers | gpt-6.1-sol, **high** effort for all tasks |
 | Planning branch | `library-folder-plan` |
@@ -133,7 +133,9 @@ consumer. Do not leave parallel workers to invent incompatible APIs.
   its copy is owned by D1, never transferred from the caller. Ordinary pending jobs
   store locators, not buffers. `cancelMetadata` cancels inspect jobs only; disposal
   cancels everything. Worker startup errors reject the active job and leave queued
-  jobs suspended until D2 explicitly retries by recreating the runtime.
+  jobs suspended until D2 explicitly retries by recreating the runtime. An idle
+  worker failure is reported once through a queued or next-enqueued job promise,
+  including paused catalogs, so later work cannot hang without a Retry state.
 - **Context/runtime (D2):** discovered contexts retain existing
   `{source,library,identity,resolver}` and add `mode:'discovered'`, `discovery`, and
   `discoveryStatus`. Indexed contexts default to indexed mode and have no discovery
@@ -237,3 +239,16 @@ permissions (the sandbox-only dev-server failure was environmental).
 
 Manual native-picker permissions, a real large folder, and loose/nested playlist
 reconnect after reload remain owner acceptance, pending automated integration gates.
+
+D1 is reviewed and integrated after an independent 37/37 runtime/resolver test
+run. Worker assets and actual generated-WASM endpoint smoke checks passed. D2
+starts from all integrated prerequisites; E/F remain gated on its review.
+
+Coordinator review found and fixed idle-worker failure reporting before D2
+integration. The producer follow-up and independent runtime/resolver rerun pass
+43/43 tests; queued/next work reports one failure and remaining jobs stay suspended.
+
+D2 is reviewed and integrated with 165/165 web Node tests and WASM/import checks
+passed. Coordinator review repaired stale SHA/sidecar summary handling and found
+the producer idle-crash follow-up above. E/F now run concurrently from this
+integrated lifecycle; G remains gated on both reviewed UI/app changes.

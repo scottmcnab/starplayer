@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — not started |
+| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library` |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | B integrated; can overlap unfinished A/C |
@@ -75,3 +75,24 @@ worker/Pages integration and performance acceptance.
 
 Source enumeration/identity, library-controls.js, discovery/model/UI, app/playlist
 wiring, Rust binding changes without coordinator handoff, shared headless harness.
+
+## Verification evidence (2026-10-26)
+
+Worker and coordinator independently passed runtime/resolver tests 37/37. Worker
+passed `cargo xtask wasm`, verified all flat worker assets are packaged, and ran
+a generated-WASM metadata/SHA and corrupt-ZIP endpoint smoke check. Full diff
+review and `git diff --check` passed. Real Chromium/Pages loading remains with G.
+
+Runtime uses one active job and FIFO Maps for hash/catalog/inspect priorities,
+retains locators for queued source work, preserves caller hash bytes, requeues
+paused catalogs with the same promise, and suspends only on `worker-failed`.
+All public request/result/error schemas match the master. Internal transport uses
+ready/startup-error and tagged job/result/error messages; test fakes are in
+`library-worker-runtime.test.mjs`.
+
+Coordinator follow-up: idle transport/crash failure now rejects one queued or
+next-enqueued job with `worker-failed`, including paused catalogs; other jobs stay
+suspended for explicit recreation. Six new regressions cover all job kinds,
+cancellation/supersession and disposal. Worker and coordinator runtime/resolver
+verification passed 43/43; WASM packaging passed again. This fixes a silent hang
+without changing the public API.

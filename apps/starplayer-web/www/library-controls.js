@@ -1,10 +1,12 @@
-import { parseCsv, parseLibraryCsv, libraryIdentity, parseCommentsCsv, attachComments } from './library-index.js';
+import { parseCsv, parseLibraryCsv, libraryIdentity, parseCommentsCsv, attachComments, createDiscoveredLibrary } from './library-index.js';
 import { defaultProxyFor } from './remote-sources.js';
 import { createResolver } from './track-resolver.js';
-import { createFileListSource, createHttpSource, createRemoteSource, normalizeProxy, storedRemoteIndex, directoryPickerAvailable, openDirectorySource, reconnectDirectorySource, storedDirectoryHandle } from './library-source.js';
+import { createFileListSource, createHttpSource, createRemoteSource, normalizeProxy, storedRemoteIndex, directoryPickerAvailable, openDirectorySource, reconnectDirectorySource, storedDirectoryHandle, folderIdentity } from './library-source.js';
+import { createDiscoveryController } from './library-discovery.js';
 
 // Optional notification keeps source state usable independently of the view.
-export async function wireLibraryControls({ state, loader, onLibrary = () => {}, onComments = () => {} }) {
+export async function wireLibraryControls({ state, loader, onLibrary = () => {}, onComments = () => {}, onLibraryUpdate = () => {},
+    createDiscovery = createDiscoveryController, identityForFolder = folderIdentity }) {
     const element = name => document.getElementById(`library-${name}`);
     const summary = element('summary');
     const folder = element('folder');
@@ -21,11 +23,26 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {},
     const reopen = element('reopen');
     const savedProxy = () => { try { return localStorage.getItem('starplayer.libraryProxy'); } catch { return null; } };
     proxyInput.value = savedProxy() ?? '';
+    const browse = element('browse-folder');
+    const local = source => source?.kind === 'directory' || source?.kind === 'filelist';
     let restored = null;
     let storageQueue = Promise.resolve();
     let indexSummary = '';
     let commentsSummary = '';
-    const renderSummary = () => { summary.textContent = indexSummary + (commentsSummary ? `. Comments: ${commentsSummary}` : '') + (state.library?.storageFailed ? ". This library won't be offered after a reload (browser storage unavailable)." : ''); };
+    function describeComments(context) {
+        const info = context.commentsInfo;
+        const { joined, unmatched, awaitingHashes } = context.library.commentCounts;
+        return `${info.size.toLocaleString('en-US')} modules from ${info.name}, ${joined.toLocaleString('en-US')} tracks matched, ${info.issues} issues, ${unmatched} unmatched${awaitingHashes ? `, ${awaitingHashes} awaiting metadata/hashes` : ''}${info.manual ? '. This choice lasts until the page reloads' : ''}`;
+    }
+    const renderSummary = () => {
+        const context = state.library;
+        if (context?.mode === 'discovered') {
+            const status = context.discoveryStatus;
+            indexSummary = `${status.tracksFound.toLocaleString('en-US')} tracks found, discovery ${status.phase}, ${status.filesExamined.toLocaleString('en-US')} files examined, ${status.archivesPending} archives pending, ${status.issueCount} issues, from ${context.source.label}`;
+            if (context.commentsInfo && !context.commentsLoading && !context.commentsError) commentsSummary = describeComments(context);
+            if (context.source.kind === 'filelist') indexSummary += '. Choose this folder again after reloading';
+        }
+        summary.textContent = indexSummary + (commentsSummary ? `. Comments: ${commentsSummary}` : '') + (state.library?.storageFailed ? ". This library won't be offered after a reload (browser storage unavailable)." : ''); };
     const remoteControls = offered => {
         stream.hidden = !offered;
         proxyField.hidden = !offered && state.library?.source.kind !== 'remote';
@@ -51,19 +68,22 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {},
     async function loadComments(context, name, read, currentRevision, manual = false) {
         const currentCommentsRevision = ++commentsRevision;
         const current = () => currentRevision === revision && currentCommentsRevision === commentsRevision && context === state.library;
+        context.commentsLoading = true; context.commentsError = '';
         showComments(`loading ${name}…`);
         try {
             const bytes = await read();
             if (!current()) return;
             const parsed = parseCommentsCsv(new TextDecoder().decode(bytes));
-            const { joined, unmatched } = attachComments(context.library, parsed.comments);
+            const { joined, unmatched } = context.discovery ? context.discovery.attachComments(parsed.comments) : attachComments(context.library, parsed.comments);
+            context.commentsLoading = false;
+            if (context.discovery) context.commentsInfo = { name, size: parsed.comments.size, issues: parsed.issues.length, manual };
             showComments(`${parsed.comments.size.toLocaleString('en-US')} modules from ${name}, ${joined.toLocaleString('en-US')} tracks matched, ${parsed.issues.length} issues, ${unmatched} unmatched${manual && context.source.kind !== 'remote' ? '. This choice lasts until the page reloads' : ''}`);
             if (context.record) {
                 context.record = { ...context.record, commentsName: name, commentsBytes: bytes };
                 saveRemote(context);
             }
-            onComments(context);
-        } catch (error) { if (current()) showComments(`not loaded (${error.message})`); }
+            if (!context.discovery) onComments(context);
+        } catch (error) { if (current()) { context.commentsLoading = false; context.commentsError = error.message; showComments(`not loaded (${error.message})`); } }
     }
     async function autoComments(context, currentRevision) {
         const source = context.source;
@@ -91,7 +111,40 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {},
     let revision = 0;
     let openingRevision = 0;
     let indexRevision = 0;
-    const report = error => { summary.textContent = error.name === 'AbortError' ? 'Library selection cancelled.' : error.message; };
+    const report = error => { if (error.name !== 'AbortError') summary.textContent = error.message; };
+    const updateBrowse = source => { if (browse) browse.hidden = !local(source); };
+    function disposeCurrent() { state.library?.discovery?.dispose(); state.library?.resolver.clear(); }
+    function deferComments(context, currentRevision) {
+        requestAnimationFrame(() => setTimeout(() => {
+            if (currentRevision === revision && context === state.library && !context.manualComments) autoComments(context, currentRevision);
+        }, 0));
+    }
+    async function discover(source, currentRevision) {
+        let folder;
+        try { folder = await identityForFolder(source); }
+        catch (error) { if (currentRevision === revision) report(error); return; }
+        const { identity, storageFailed } = folder;
+        if (currentRevision !== revision) return;
+        disposeCurrent();
+        const context = { mode: 'discovered', source, library: createDiscoveredLibrary({ name: source.label }), identity, storageFailed, resolver: createResolver({ source, loader }) };
+        createDiscovery({ context, generation: currentRevision, onUpdate(updated, change) {
+            if (currentRevision !== revision || updated !== state.library) return;
+            renderSummary(); onLibraryUpdate(updated, change);
+        } });
+        state.library = context;
+        remoteControls(false); choices.hidden = true; updateBrowse(source);
+        commentsSummary = 'not loaded (checking for a sidecar)'; renderSummary();
+        commentsButton.disabled = false; onLibrary(context);
+        context.discovery.start(); deferComments(context, currentRevision);
+    }
+    function browseFolder() {
+        const source = selectedSource || state.library?.source;
+        if (!local(source)) return;
+        ++openingRevision; ++indexRevision; ++commentsRevision; pendingIndex = null;
+        indexInput.value = ''; remoteControls(false); choices.hidden = true;
+        disposeCurrent();
+        discover(source, ++revision).catch(report);
+    }
     function describeIndex({ source, library, streaming }) {
         let text = `${library.rows.length.toLocaleString('en-US')} tracks, ${library.issues.length} issues`;
         if (streaming) text += `; streaming ${streaming.streamable.toLocaleString('en-US')} tracks from ${source.label}${streaming.unmatched ? `; ${streaming.unmatched} rows have no matching source_url` : ''}`;
@@ -101,38 +154,47 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {},
         return text.replace(/\.$/, '');
     }
     async function loadIndex(source, index, currentRevision) {
-        const bytes = await index.bytes();
-        const library = parseLibraryCsv(new TextDecoder().decode(bytes), { name: index.name });
-        const identity = await libraryIdentity(bytes, index.name);
-        if (currentRevision !== revision) return;
-        const streaming = source.kind === 'remote' ? source.attach(library) : null;
-        if (streaming) {
-            if (!source.proxy && !proxyInput.value && savedProxy() === null) source.setProxy(defaultProxyFor(streaming.base));
-            proxyInput.value = source.proxy;
+        try {
+            const bytes = await index.bytes();
+            if (currentRevision !== revision) return;
+            const library = parseLibraryCsv(new TextDecoder().decode(bytes), { name: index.name });
+            const identity = await libraryIdentity(bytes, index.name);
+            if (currentRevision !== revision) return;
+            const streaming = source.kind === 'remote' ? source.attach(library) : null;
+            if (streaming) {
+                if (!source.proxy && !proxyInput.value && savedProxy() === null) source.setProxy(defaultProxyFor(streaming.base));
+                proxyInput.value = source.proxy;
+            }
+            disposeCurrent();
+            state.library = { mode: 'indexed', source, library, identity, resolver: createResolver({ source, loader }),
+                ...(streaming ? { streaming, record: { kind: 'remote', name: index.name, bytes, proxy: source.proxy } } : {}) };
+            if (pendingIndex === index) pendingIndex = null;
+            remoteControls(false); updateBrowse(source);
+            indexSummary = describeIndex(state.library);
+            showComments('not loaded (checking for a sidecar)');
+            commentsButton.disabled = false;
+            onLibrary(state.library);
+            if (streaming) saveRemote(state.library);
+            deferComments(state.library, currentRevision);
+        } catch (error) {
+            if (currentRevision !== revision) return;
+            updateBrowse(source);
+            summary.textContent = `${error.message}${local(source) ? '. Choose Browse folder instead to continue without this index.' : ''}`;
         }
-        state.library?.resolver.clear();
-        state.library = { source, library, identity, resolver: createResolver({ source, loader }),
-            ...(streaming ? { streaming, record: { kind: 'remote', name: index.name, bytes, proxy: source.proxy } } : {}) };
-        remoteControls(false);
-        indexSummary = describeIndex(state.library);
-        showComments('not loaded (checking for a sidecar)');
-        commentsButton.disabled = false;
-        onLibrary(state.library);
-        if (streaming) saveRemote(state.library);
-        // Let the table paint before even starting the optional sidecar read.
-        const context = state.library;
-        requestAnimationFrame(() => setTimeout(() => {
-            if (currentRevision === revision && context === state.library && !context.manualComments) autoComments(context, currentRevision);
-        }, 0));
     }
     async function selectSource(opening) {
         // A picker that is cancelled or overtaken must not disturb the open library or its
         // pending sidecar, so it has its own counter until it yields a source.
         const currentOpening = ++openingRevision;
-        const source = await opening;
+        let source;
+        try { source = await opening; }
+        catch (error) { if (currentOpening === openingRevision) report(error); return; }
         if (currentOpening !== openingRevision) return;
         const currentRevision = ++revision;
         selectedSource = source;
+        ++commentsRevision;
+        disposeCurrent();
+        updateBrowse(source);
         choices.hidden = true;
         if (source.handle) {
             storedHandle = source.handle;
@@ -144,19 +206,23 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {},
         if (pendingIndex) {
             const index = pendingIndex;
             await loadIndex(source, index, currentRevision);
-            if (pendingIndex === index) pendingIndex = null;
         } else if (source.indexPath) {
             await loadIndex(source, { name: source.indexPath, bytes: () => source.kind === 'http' ? fetchIndex() : source.readFile(source.indexPath) }, currentRevision);
         } else if (source.candidates?.length) {
-            choices.replaceChildren(new Option('Choose index CSV…', ''), ...source.candidates.map(path => new Option(path, path)));
+            choices.replaceChildren(new Option('Choose index CSV…', ''), ...source.candidates.map(path => new Option(path, path)), new Option('Browse folder without an index', '__browse__'));
             choices.hidden = false;
             summary.textContent = 'Choose a root index CSV.';
-        } else summary.textContent = 'No root CSV found. Use Open index CSV…, then choose the library folder again.';
+        } else if (local(source)) await discover(source, currentRevision);
+        else summary.textContent = 'No root CSV found. Use Open index CSV…';
     }
     async function fetchIndex() {
         const response = await fetch('/library-index.csv');
         if (!response.ok) throw new Error(`Library index: HTTP ${response.status}`);
         return response.arrayBuffer();
+    }
+    browse?.addEventListener('click', browseFolder);
+    for (const [name, method] of [['stop-discovery', 'pause'], ['resume-discovery', 'resume'], ['retry-discovery', 'retry'], ['scan-metadata', 'scanMetadata'], ['cancel-metadata', 'cancelMetadata']]) {
+        element(name)?.addEventListener('click', () => state.library?.discovery?.[method]());
     }
     folder.addEventListener('click', () => {
         // Do not insert an await before opening the picker.
@@ -184,8 +250,9 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {},
             const header = new TextDecoder().decode(bytes).split('\n')[0].replace(/\r$/, '');
             const streamable = (parseCsv(header)[0] || []).some(column => column.trim().toLowerCase() === 'source_url');
             remoteControls(streamable);
+            updateBrowse(selectedSource || state.library?.source);
             summary.textContent = `${file.name} selected. Click Open library folder to choose its root${streamable ? ', or Stream from source URLs to fetch each track over the network' : ''}.`;
-        } catch (error) { report(error); }
+        } catch (error) { if (currentIndexRevision === indexRevision) report(error); }
     });
     stream.addEventListener('click', () => {
         if (pendingIndex) {
@@ -234,9 +301,10 @@ export async function wireLibraryControls({ state, loader, onLibrary = () => {},
     choices.addEventListener('change', () => {
         const source = selectedSource;
         const path = choices.value;
+        if (path === '__browse__') { browseFolder(); return; }
         if (path) loadIndex(source, { name: path, bytes: () => source.readFile(path) }, ++revision).catch(report);
     });
-    server.addEventListener('click', () => { pendingIndex = null; selectSource(createHttpSource()).catch(report); });
+    server.addEventListener('click', () => { ++indexRevision; pendingIndex = null; selectSource(createHttpSource()).catch(report); });
     await Promise.allSettled([
         storedRemoteIndex().then(record => {
             if (record?.kind === 'remote') {

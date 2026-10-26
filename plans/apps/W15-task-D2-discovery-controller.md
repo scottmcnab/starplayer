@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — not started |
+| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library` |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | A, C and D1 integrated (D1 includes B) |
@@ -96,3 +96,20 @@ Run `cargo xtask wasm` for packaged module imports. Hand E/F status/schema examp
 
 D1 worker/runtime internals, app.js, library-view.js, HTML/CSS, playlist files, shared
 headless harness, producer contract changes without coordinator review.
+
+## Verification evidence (2026-10-26)
+
+Worker final full Node suite passed 165/165 after the reviewed D1 idle-failure fix.
+`cargo xtask wasm`, all ten recursively checked packaged module imports, and
+`git diff --check` passed. Coordinator reviewed the complete controller/control
+and test diffs, independently passed an earlier full suite 154/154 and the final
+focused controller/control/source/model gate 78/78; subsequent added regressions
+cover dropped hash payloads and row-only retries.
+
+Context/status/notification schemas match the master. Status uses immutable
+snapshots and `sidecarCounts:{joined,unmatched,awaitingHashes}`. Epoch and locator
+versions gate stale results; playback clears old SHA before hashing new bytes.
+Root/worker retry preserves pause and avoids resubmitting completed locators.
+Before-row metadata notifications remain partial patches for F. E must retain
+D2-controlled Browse folder visibility for indexed local contexts, never write
+`library-summary`, and render separate progress/issues/per-row retry surfaces.
