@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: mobile listening (follows W13, branch `background-playback`) |
-| Status | **Implemented** 2026-10-26 (branch `background-playback`) — owner phone check outstanding |
+| Status | **Complete** — landed 2026-10-26 (branch `background-playback`); owner confirmed lock-screen controls on an Android phone against the local dev server; screen-off playlist advance (and lock-screen skip to a non-prefetched track) on Pages outstanding |
 | Depends on | [W10](complete/W10-task-playback-controller-and-playlist.md), [W13](complete/W13-task-library-remote-source.md) |
 | Blocks | — |
 | Recommended model | gpt-6.1-sol |
