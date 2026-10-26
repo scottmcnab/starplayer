@@ -517,6 +517,29 @@ fn duplicate_raw_names_keep_first_payload_in_classic_and_zip64_catalog_and_legac
 }
 
 #[test]
+fn owned_duplicate_preparation_compacts_in_place_and_preserves_legacy_first_entry_policy() {
+    use starplayer_archive::{find_entry, prepare_owned_archive};
+    let bytes = legacy_encode::archive(&[("same.mod", b"first", 0, 0, b"first"), ("same.mod", b"last", 0, 0, b"last")]);
+    for bytes in [bytes.clone(), zip64_footer(bytes)] {
+        let original_pointer = bytes.as_ptr();
+        let original_capacity = bytes.capacity();
+        let original_length = bytes.len();
+        let prepared = prepare_owned_archive(bytes).unwrap();
+        assert_eq!(prepared.as_ptr(), original_pointer);
+        assert_eq!(prepared.capacity(), original_capacity);
+        assert!(prepared.len() < original_length);
+        let modules = list_modules(&prepared).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].size, 5);
+        assert_eq!(extract(&prepared, find_entry(&prepared, "same.mod", Some(b"same.mod")).unwrap()).unwrap(), b"first");
+        let again = prepare_owned_archive(prepared).unwrap();
+        assert_eq!(again.as_ptr(), original_pointer);
+        assert_eq!(again.capacity(), original_capacity);
+    }
+    assert!(matches!(prepare_owned_archive(vec![0; starplayer_archive::MAX_SOURCE_BYTES as usize + 1]), Err(ArchiveError::SourceTooLarge { .. })));
+}
+
+#[test]
 fn duplicate_directory_mutations_return_errors_without_panics() {
     use starplayer_archive::catalog;
     let bytes = legacy_encode::archive(&[("same.mod", b"first", 0, 0, b"first"), ("same.mod", b"last", 0, 0, b"last")]);

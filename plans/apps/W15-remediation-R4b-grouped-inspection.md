@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Specified / outstanding — reviewed plan, amended 2026-10-26** |
+| Status | **In progress — worker implementing; coordinator review pending** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | R1, R2, R3 (the #1–#3 gate) and R4a |

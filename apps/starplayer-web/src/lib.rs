@@ -133,6 +133,18 @@ fn extract_nested(bytes: &[u8], container_index: i32, member_index: u32) -> Resu
 }
 
 fn extract_path(bytes: &[u8], container_member: &str, member_path: &str, member_raw_hex: &str) -> Result<Vec<u8>, String> {
+    let raw_name = decode_member_raw_hex(member_raw_hex)?;
+    let inner;
+    let archive = if container_member.is_empty() { bytes } else {
+        let index = find_entry(bytes, container_member, None).map_err(|error| error.to_string())?;
+        inner = nested_archive_bytes(bytes, index)?;
+        &inner
+    };
+    let index = find_entry(archive, member_path, raw_name.as_deref()).map_err(|error| error.to_string())?;
+    extract(archive, index).map_err(|error| error.to_string())
+}
+
+fn decode_member_raw_hex(member_raw_hex: &str) -> Result<Option<Vec<u8>>, String> {
     let raw_name = if member_raw_hex.is_empty() { None } else {
         if !member_raw_hex.len().is_multiple_of(2) || !member_raw_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err("member raw name must contain an even number of hexadecimal digits".to_string());
@@ -142,14 +154,104 @@ fn extract_path(bytes: &[u8], container_member: &str, member_path: &str, member_
             digit(pair[0]) * 16 + digit(pair[1])
         }).collect::<Vec<_>>())
     };
-    let inner;
-    let archive = if container_member.is_empty() { bytes } else {
-        let index = find_entry(bytes, container_member, None).map_err(|error| error.to_string())?;
-        inner = nested_archive_bytes(bytes, index)?;
-        &inner
-    };
-    let index = find_entry(archive, member_path, raw_name.as_deref()).map_err(|error| error.to_string())?;
-    extract(archive, index).map_err(|error| error.to_string())
+    Ok(raw_name)
+}
+
+struct CachedInspectionArchive {
+    index: usize,
+    bytes: Vec<u8>,
+}
+
+/// One immutable group snapshot, independent of the page's retained playback module.
+/// Source ownership enters once; lookups borrow it and only one inner archive survives
+/// between calls. Returned member bytes belong to the caller, never to this session.
+struct ArchiveSession {
+    source: Vec<u8>,
+    inner: Option<CachedInspectionArchive>,
+    #[cfg(test)]
+    statistics: std::rc::Rc<RefCell<SessionStatistics>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SessionStatistics {
+    source_bytes: usize,
+    inner_bytes: usize,
+    source_capacity: usize,
+    inner_capacity: usize,
+    peak_owned_capacity: usize,
+    peak_owned_bytes: usize,
+    inner_extractions: usize,
+}
+
+impl ArchiveSession {
+    fn new(bytes: Vec<u8>) -> Result<Self, String> {
+        let source = starplayer_archive::prepare_owned_archive(bytes).map_err(|error| error.to_string())?;
+        let session = Self {
+            source, inner: None,
+            #[cfg(test)]
+            statistics: Default::default(),
+        };
+        #[cfg(test)]
+        session.record_owned_bytes();
+        Ok(session)
+    }
+
+    fn extract_member(&mut self, container_member: &str, member_path: &str, member_raw_hex: &str) -> Result<Vec<u8>, String> {
+        let raw_name = decode_member_raw_hex(member_raw_hex)?;
+        let archive = if container_member.is_empty() {
+            self.clear_inner();
+            &self.source
+        } else {
+            let index = match find_entry(&self.source, container_member, None) {
+                Ok(index) => index,
+                Err(error) => { self.clear_inner(); return Err(error.to_string()); },
+            };
+            if !self.inner.as_ref().is_some_and(|inner| inner.index == index) {
+                // Release before decompression: switching must never retain two inners,
+                // including when a replacement container is corrupt or too large.
+                self.clear_inner();
+                #[cfg(test)]
+                { self.statistics.borrow_mut().inner_extractions += 1; }
+                let bytes = nested_archive_bytes(&self.source, index)?;
+                let bytes = starplayer_archive::prepare_owned_archive(bytes).map_err(|error| error.to_string())?;
+                self.inner = Some(CachedInspectionArchive { index, bytes });
+                #[cfg(test)]
+                self.record_owned_bytes();
+            }
+            &self.inner.as_ref().ok_or_else(|| "no nested archive is cached".to_string())?.bytes
+        };
+        let index = find_entry(archive, member_path, raw_name.as_deref()).map_err(|error| error.to_string())?;
+        extract(archive, index).map_err(|error| error.to_string())
+    }
+
+    fn clear_inner(&mut self) {
+        self.inner = None;
+        #[cfg(test)]
+        self.record_owned_bytes();
+    }
+
+    #[cfg(test)]
+    fn record_owned_bytes(&self) {
+        let mut statistics = self.statistics.borrow_mut();
+        statistics.source_bytes = self.source.len();
+        statistics.inner_bytes = self.inner.as_ref().map_or(0, |inner| inner.bytes.len());
+        statistics.source_capacity = self.source.capacity();
+        statistics.inner_capacity = self.inner.as_ref().map_or(0, |inner| inner.bytes.capacity());
+        statistics.peak_owned_capacity = statistics.peak_owned_capacity.max(statistics.source_capacity + statistics.inner_capacity);
+        statistics.peak_owned_bytes = statistics.peak_owned_bytes.max(statistics.source_bytes + statistics.inner_bytes);
+    }
+}
+
+#[cfg(test)]
+impl Drop for ArchiveSession {
+    fn drop(&mut self) {
+        let mut statistics = self.statistics.borrow_mut();
+        statistics.source_bytes = 0;
+        statistics.inner_bytes = 0;
+        statistics.source_capacity = 0;
+        statistics.inner_capacity = 0;
+    }
 }
 
 fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
@@ -266,6 +368,29 @@ fn append_display(output: &mut Vec<u8>, display: PatternCell) {
 mod exports {
     use super::*;
     use wasm_bindgen::prelude::{JsValue, wasm_bindgen};
+
+    /// Bounded archive snapshot for one metadata-inspection group. Call `free()` in
+    /// the worker's finally block; wasm-bindgen drops the source and cached inner.
+    #[wasm_bindgen]
+    pub struct ArchiveInspectionSession {
+        session: ArchiveSession,
+    }
+
+    #[wasm_bindgen]
+    impl ArchiveInspectionSession {
+        /// Copy the JS source into one Rust-owned Vec, transferred into the session
+        /// without another source copy. Size and ZIP validation precede retention.
+        #[wasm_bindgen(constructor)]
+        pub fn new(bytes: Vec<u8>) -> Result<ArchiveInspectionSession, JsValue> {
+            ArchiveSession::new(bytes).map(|session| Self { session }).map_err(|error| JsValue::from_str(&error))
+        }
+
+        /// Resolve existing locator fields and return one copied JS Uint8Array.
+        /// Ordinary archive errors throw JS values; WASM traps remain RuntimeError.
+        pub fn extract_member(&mut self, container_member: &str, member_path: &str, member_raw_hex: &str) -> Result<Vec<u8>, JsValue> {
+            self.session.extract_member(container_member, member_path, member_raw_hex).map_err(|error| JsValue::from_str(&error))
+        }
+    }
 
     /// Validate and retain a supported native module. The previous valid module survives
     /// an error. The legacy export name is retained for the existing page glue.
@@ -557,6 +682,211 @@ mod tests {
         writer.start_file(name, SimpleFileOptions::default()).unwrap();
         writer.write_all(content).unwrap();
         writer.finish().unwrap().into_inner()
+    }
+
+    fn test_archive_members(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, content) in entries {
+            writer.start_file(*name, SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)).unwrap();
+            writer.write_all(content).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn replace_test_name(bytes: &mut [u8], old: &[u8], replacement: &[u8]) {
+        assert_eq!(old.len(), replacement.len());
+        let positions: Vec<_> = bytes.windows(old.len()).enumerate().filter_map(|(index, window)| (window == old).then_some(index)).collect();
+        for position in positions { bytes[position..position + old.len()].copy_from_slice(replacement); }
+    }
+
+    fn test_zip64_footer(mut bytes: Vec<u8>) -> Vec<u8> {
+        let end = bytes.len() - 22;
+        let mut footer = bytes[end..].to_vec();
+        let count = u16::from_le_bytes(footer[10..12].try_into().unwrap()) as u64;
+        let size = u32::from_le_bytes(footer[12..16].try_into().unwrap()) as u64;
+        let offset = u32::from_le_bytes(footer[16..20].try_into().unwrap()) as u64;
+        bytes.truncate(end);
+        bytes.extend_from_slice(b"PK\x06\x06");
+        bytes.extend_from_slice(&44u64.to_le_bytes());
+        bytes.extend_from_slice(&[45, 0, 45, 0]);
+        bytes.extend_from_slice(&[0; 8]);
+        for value in [count, count, size, offset] { bytes.extend_from_slice(&value.to_le_bytes()); }
+        bytes.extend_from_slice(b"PK\x06\x07");
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&(end as u64).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        footer[8..20].fill(255);
+        bytes.extend_from_slice(&footer);
+        bytes
+    }
+
+    #[test]
+    fn archive_session_reuses_one_inner_replaces_it_and_releases_all_owned_bytes() {
+        inspect(FIXTURE).unwrap();
+        let metadata = module_metadata_json().unwrap();
+        let first = test_archive_members(&[("first.mod", b"first"), ("second.it", b"second")]);
+        let second = test_archive_members(&[("third.xm", b"third")]);
+        let bytes = test_archive_members(&[("one.zip", &first), ("two.zip", &second), ("direct.s3m", b"direct")]);
+        let source_pointer = bytes.as_ptr();
+        let source_length = bytes.len();
+        let mut session = ArchiveSession::new(bytes).unwrap();
+        let statistics = session.statistics.clone();
+        assert_eq!(session.source.as_ptr(), source_pointer, "constructor transfers the original allocation");
+        let mut member = session.extract_member("one.zip", "first.mod", "").unwrap();
+        member[0] = b'X';
+        assert_eq!(session.extract_member("one.zip", "second.it", "").unwrap(), b"second");
+        assert_eq!(session.extract_member("ONE.ZIP", "first.mod", "").unwrap(), b"first");
+        assert_eq!(statistics.borrow().inner_extractions, 1, "aliases resolving to the same inner reuse it");
+        assert_eq!(statistics.borrow().inner_bytes, first.len());
+        assert!(session.extract_member("one.zip", "missing.mod", "").is_err());
+        assert_eq!(statistics.borrow().inner_extractions, 1);
+        assert_eq!(session.extract_member("two.zip", "third.xm", "").unwrap(), b"third");
+        assert_eq!(statistics.borrow().inner_extractions, 2);
+        assert_eq!(statistics.borrow().inner_bytes, second.len());
+        assert_eq!(statistics.borrow().peak_owned_bytes, source_length + first.len().max(second.len()));
+        assert_eq!(session.extract_member("", "direct.s3m", "").unwrap(), b"direct");
+        assert_eq!(statistics.borrow().inner_bytes, 0);
+        assert_eq!(session.extract_member("one.zip", "first.mod", "").unwrap(), b"first");
+        assert_eq!(statistics.borrow().inner_extractions, 3, "direct extraction invalidates the inner cache");
+        assert_eq!(session.source.as_ptr(), source_pointer, "extracts never replace or clone source ownership");
+        assert_eq!(statistics.borrow().source_bytes, source_length);
+        assert_eq!(module_metadata_json().unwrap(), metadata, "session extraction never changes playback inspection");
+        eprintln!("synthetic group ownership/cache evidence: {:?}", statistics.borrow());
+        drop(session); // wasm-bindgen's generated .free() drops this owned session.
+        assert_eq!(statistics.borrow().source_bytes, 0);
+        assert_eq!(statistics.borrow().inner_bytes, 0);
+        assert_eq!(statistics.borrow().source_capacity, 0);
+        assert_eq!(statistics.borrow().inner_capacity, 0);
+    }
+
+    #[test]
+    fn archive_session_isolates_bad_members_and_invalidates_failed_container_switches() {
+        let mut inner = test_archive_members(&[("good.mod", b"good"), ("large.mod", b"small"), ("crypt.mod", b"secret"), ("broken.it", b"broken")]);
+        let central: Vec<_> = inner.windows(4).enumerate().filter_map(|(index, bytes)| (bytes == b"PK\x01\x02").then_some(index)).collect();
+        inner[central[1] + 24..central[1] + 28].copy_from_slice(&((starplayer_archive::MAX_ENTRY_BYTES + 1) as u32).to_le_bytes());
+        inner[central[2] + 8] |= 1;
+        inner[central[3] + 16..central[3] + 20].copy_from_slice(&0u32.to_le_bytes()); // Wrong CRC is discovered while reading.
+        let bytes = test_archive_members(&[("inner.zip", &inner), ("bad.zip", b"not a zip"), ("direct.mod", b"direct")]);
+        let mut session = ArchiveSession::new(bytes).unwrap();
+        for (member, reason) in [("large.mod", "too large"), ("crypt.mod", "encrypted"), ("broken.it", "corrupt")] {
+            assert!(session.extract_member("inner.zip", member, "").unwrap_err().contains(reason));
+            assert_eq!(session.extract_member("inner.zip", "good.mod", "").unwrap(), b"good");
+        }
+        assert_eq!(session.statistics.borrow().inner_extractions, 1);
+        for invalid in ["a", "zz", "é"] { assert!(session.extract_member("inner.zip", "good.mod", invalid).unwrap_err().contains("hexadecimal")); }
+        assert!(session.extract_member("bad.zip", "good.mod", "").unwrap_err().contains("not a ZIP"));
+        assert_eq!(session.statistics.borrow().inner_bytes, 0);
+        assert_eq!(session.extract_member("inner.zip", "good.mod", "").unwrap(), b"good");
+        assert!(session.extract_member("missing.zip", "good.mod", "").is_err());
+        assert_eq!(session.statistics.borrow().inner_bytes, 0);
+        assert_eq!(session.extract_member("", "direct.mod", "").unwrap(), b"direct");
+    }
+
+    #[test]
+    fn archive_session_enforces_source_and_container_caps_before_retention() {
+        assert!(ArchiveSession::new(vec![0; starplayer_archive::MAX_SOURCE_BYTES as usize + 1]).err().unwrap().contains("source is too large"));
+        assert!(ArchiveSession::new(b"not a zip".to_vec()).err().unwrap().contains("not a ZIP"));
+        assert!(ArchiveSession::new(b"PK\x03\x04broken".to_vec()).is_err());
+        let empty = ZipWriter::new(Cursor::new(Vec::new())).finish().unwrap().into_inner();
+        let mut session = ArchiveSession::new(empty).unwrap();
+        assert!(session.extract_member("", "missing.mod", "").is_err());
+        assert_eq!(session.statistics.borrow().inner_extractions, 0);
+        let mut bytes = test_archive("large.zip", b"small");
+        let central = bytes.windows(4).position(|window| window == b"PK\x01\x02").unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&((starplayer_archive::MAX_ENTRY_BYTES + 1) as u32).to_le_bytes());
+        let mut session = ArchiveSession::new(bytes).unwrap();
+        assert!(session.extract_member("large.zip", "x.mod", "").unwrap_err().contains("too large"));
+        assert_eq!(session.statistics.borrow().inner_bytes, 0);
+        assert!(session.statistics.borrow().peak_owned_bytes <= starplayer_archive::MAX_SOURCE_BYTES as usize);
+    }
+
+    #[test]
+    fn archive_session_accepts_exact_source_cap_without_another_owned_source_copy() {
+        let mut bytes = test_archive("small.mod", b"small");
+        let central = bytes.windows(4).position(|window| window == b"PK\x01\x02").unwrap();
+        let mut directory = bytes.split_off(central);
+        let source_limit = starplayer_archive::MAX_SOURCE_BYTES as usize;
+        let new_central = source_limit - directory.len();
+        let footer = directory.len() - 22;
+        directory[footer + 16..footer + 20].copy_from_slice(&(new_central as u32).to_le_bytes());
+        bytes.reserve_exact(source_limit - bytes.len());
+        bytes.resize(new_central, 0);
+        bytes.extend_from_slice(&directory);
+        assert_eq!(bytes.len(), source_limit);
+        let original_pointer = bytes.as_ptr();
+        let original_capacity = bytes.capacity();
+        let mut session = ArchiveSession::new(bytes).unwrap();
+        assert_eq!(session.source.as_ptr(), original_pointer);
+        assert_eq!(session.statistics.borrow().source_bytes, source_limit);
+        assert_eq!(session.statistics.borrow().source_capacity, original_capacity);
+        assert_eq!(session.extract_member("", "small.mod", "").unwrap(), b"small");
+        assert_eq!(session.statistics.borrow().peak_owned_bytes, source_limit);
+        assert_eq!(session.statistics.borrow().peak_owned_capacity, original_capacity);
+        eprintln!("exact source-cap evidence: {:?}", session.statistics.borrow());
+    }
+
+    #[test]
+    fn archive_session_bounds_misdeclared_deflate_output_while_reading() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file("bomb.mod", SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)).unwrap();
+        let chunk = [0; 8192];
+        for _ in 0..starplayer_archive::MAX_ENTRY_BYTES / chunk.len() as u64 { writer.write_all(&chunk).unwrap(); }
+        writer.write_all(b"x").unwrap();
+        writer.start_file("good.it", SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"good").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let central = bytes.windows(4).position(|window| window == b"PK\x01\x02").unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        let mut session = ArchiveSession::new(bytes).unwrap();
+        let error = session.extract_member("", "bomb.mod", "").unwrap_err();
+        assert!(error.contains("larger than its declared uncompressed size"), "{error}");
+        assert_eq!(session.extract_member("", "good.it", "").unwrap(), b"good");
+        assert_eq!(session.statistics.borrow().inner_bytes, 0);
+    }
+
+    #[test]
+    fn archive_session_preserves_raw_encoded_exact_and_ambiguous_name_precedence() {
+        let bytes = test_archive_members(&[("folder/Same.mod", b"upper"), ("folder/same.mod", b"lower"), ("other.mod", b"raw")]);
+        let mut session = ArchiveSession::new(bytes).unwrap();
+        assert_eq!(session.extract_member("", "folder/Same.mod", "").unwrap(), b"upper");
+        assert_eq!(session.extract_member("", "folder/same.mod", "").unwrap(), b"lower");
+        assert_eq!(session.extract_member("", "folder/Same.mod", "6F746865722E6D6F64").unwrap(), b"raw");
+        assert!(session.extract_member("", "FOLDER/SAME.MOD", "").unwrap_err().contains("ambiguous"));
+        let mut inner = test_archive("xx.mod", b"cp437");
+        patch_cp437_name(&mut inner);
+        let mut outer = test_archive("xx.zip", &inner);
+        patch_cp437_name(&mut outer);
+        let mut session = ArchiveSession::new(outer).unwrap();
+        assert_eq!(session.extract_member("├⌐.zip", "├⌐.mod", "").unwrap(), b"cp437");
+        assert_eq!(session.extract_member("├⌐.zip", "display.mod", "c3a92e6d6f64").unwrap(), b"cp437");
+        assert_eq!(session.statistics.borrow().inner_extractions, 1);
+    }
+
+    #[test]
+    fn archive_session_and_legacy_upload_keep_first_raw_duplicate_in_classic_and_zip64() {
+        let mut inner = test_archive_members(&[("same.it", b"first inner"), ("last.it", b"last inner")]);
+        replace_test_name(&mut inner, b"last.it", b"same.it");
+        let last_inner = test_archive("last.mod", b"last container");
+        let mut outer = test_archive_members(&[("same.mod", b"first"), ("last.mod", b"last"), ("inner.zip", &inner), ("other.zip", &last_inner)]);
+        replace_test_name(&mut outer, b"last.mod", b"same.mod");
+        replace_test_name(&mut outer, b"other.zip", b"inner.zip");
+        // Intentional existing compatibility: catalog and uploaded ZIP listing/index
+        // extraction select the same first raw-name entry as the new session API.
+        for bytes in [outer.clone(), test_zip64_footer(outer)] {
+            assert_eq!(archive_module_records(&bytes).unwrap(), "0\tsame.mod\t5\n");
+            assert_eq!(extract_nested(&bytes, -1, 0).unwrap(), b"first");
+            assert_eq!(extract_nested(&bytes, 1, 0).unwrap(), b"first inner");
+            assert_eq!(extract_path(&bytes, "inner.zip", "same.it", "").unwrap(), b"first inner");
+            let pointer = bytes.as_ptr();
+            let capacity = bytes.capacity();
+            let mut session = ArchiveSession::new(bytes).unwrap();
+            assert_eq!(session.source.as_ptr(), pointer, "duplicate compaction preserves source allocation");
+            assert_eq!(session.source.capacity(), capacity);
+            assert_eq!(session.extract_member("", "same.mod", "73616d652e6d6f64").unwrap(), b"first");
+            assert_eq!(session.extract_member("inner.zip", "same.it", "").unwrap(), b"first inner");
+            assert_eq!(session.extract_member("inner.zip", "same.it", "73616d652e6974").unwrap(), b"first inner");
+            assert_eq!(session.statistics.borrow().inner_extractions, 1);
+        }
     }
 
     fn patch_cp437_name(bytes: &mut [u8]) {

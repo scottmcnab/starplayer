@@ -465,8 +465,8 @@ Implementation authorized by the owner. Integration: `w15-remediation`,
 `/home/scott/projects/starplayer-w15-remediation`. R1 reviewed and integrated as
 `1e79716`; coordinator independently passed 42 worker/runtime tests. R2 (`cc68dac`)
 and R3 (`4368b49`) are reviewed/integrated with 54 and 23 focused tests. The combined
-correctness integration passes all 230 web Node tests. R4a/R5 are in progress;
-R4b/R6/R7 and final gates remain outstanding.
+correctness integration passes all 230 web Node tests. R4a (`b0cf227`) and R5 (`f3fe09a`) are reviewed/integrated after their focused gates.
+R4b and R6 are now implementing from reviewed prerequisites; R7/final gates remain outstanding.
 
 ### R4a ownership clarification
 
@@ -483,3 +483,12 @@ a row and `createRowComparator(library, sort)` comparing row IDs. `search()` reu
 these preserving existing indexed ordering. Typed deltas and pending/eligible counters
 follow sections A/B. R4b must replace independent inspection cancellation with
 member-only invalidation; R6 consumes these helpers without rewriting the model.
+
+### R4a/R5 producer handoffs
+
+`new Loader.ArchiveInspectionSession(bytes)` / `extract_member(...)` / `.free()`
+passed actual generated-binding smoke. Rust `Result` errors throw ordinary strings;
+traps remain RuntimeError. Native inner-decode/ownership statistics are cfg(test) only,
+not browser exports. R5 exports `yieldCooperatively`, `createCooperativeYield` and
+`cooperativeYieldMethod` for consumer injection/diagnostics. R4b and R6 own their
+serialized production files; R7 takes shared harness/help ownership after both finish.

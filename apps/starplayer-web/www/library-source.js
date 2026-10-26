@@ -1,5 +1,6 @@
 import { isCommentsCsvHeader, parseCsv } from './library-index.js';
 import { storedLibraryValue } from './library-identity.js';
+import { yieldCooperatively } from './cooperative-yield.js';
 export { folderIdentity } from './library-identity.js';
 
 // Library roots expose bytes, never archive-member interpretation.
@@ -14,7 +15,33 @@ function pathSegments(path) {
 }
 
 const SOURCE_BATCH_SIZE = 128;
-const yieldToBrowser = () => new Promise(resolve => setTimeout(resolve, 0));
+const SOURCE_SLICE_MS = 8;
+const sourceClock = () => globalThis.performance?.now() ?? Date.now();
+
+function sourceSlice({ signal, yieldTask = yieldCooperatively, now = sourceClock } = {}) {
+    let records = 0, started = now();
+    return {
+        due() { checkAbort(signal); return ++records >= SOURCE_BATCH_SIZE || now() - started >= SOURCE_SLICE_MS; },
+        async yield() { await yieldTask({ signal }); checkAbort(signal); records = 0; started = now(); },
+    };
+}
+
+// Keep deterministic candidate order without an unbounded native sort on a large root.
+async function sortPaths(paths, slice) {
+    let sorted = paths, buffer = new Array(paths.length);
+    for (let width = 1; width < paths.length; width *= 2) {
+        for (let start = 0; start < paths.length; start += width * 2) {
+            const middle = Math.min(start + width, paths.length), end = Math.min(start + width * 2, paths.length);
+            let left = start, right = middle;
+            for (let index = start; index < end; index += 1) {
+                buffer[index] = left < middle && (right >= end || sorted[left] <= sorted[right]) ? sorted[left++] : sorted[right++];
+                if (slice.due()) await slice.yield();
+            }
+        }
+        [sorted, buffer] = [buffer, sorted];
+    }
+    return sorted;
+}
 
 // Read only the first logical CSV record: malformed bodies still reach the index error UI.
 function csvHeader(text) {
@@ -28,20 +55,40 @@ function csvHeader(text) {
     return text;
 }
 
-export async function discoverIndex(paths, readHead) {
-    const candidates = [], commentsCandidates = [];
-    let examined = 0;
-    for (const path of [...paths].filter(path => !path.includes('/') && /\.csv$/i.test(path)).sort()) {
+export function discoverIndex(paths, readHead, options = {}) {
+    return discoverSourceIndex(paths, readHead, options, sourceSlice(options));
+}
+
+async function discoverSourceIndex(paths, readHead, options, slice) {
+    const { signal } = options;
+    checkAbort(signal);
+    const candidates = [], commentsCandidates = [], rootPaths = [];
+    let preferredIndex = null;
+    for (const path of paths) {
+        checkAbort(signal);
+        if (!path.includes('/') && /\.csv$/i.test(path)) rootPaths.push(path);
+        if (slice.due()) await slice.yield();
+    }
+    for (const path of await sortPaths(rootPaths, slice)) {
         try {
             pathSegments(path);
-            const header = csvHeader(await readHead(path));
+            checkAbort(signal);
+            const head = await readHead(path);
+            checkAbort(signal);
+            const header = csvHeader(head);
             const columns = (parseCsv(header)[0] || []).map(column => column.trim().toLowerCase());
             if (isCommentsCsvHeader(header)) commentsCandidates.push(path);
-            else if (columns.includes('source_path') && !columns.includes('library')) candidates.push(path);
-        } catch { /* An unreadable or invalid header cannot take down the library. */ }
-        if (++examined % SOURCE_BATCH_SIZE === 0) await yieldToBrowser();
+            else if (columns.includes('source_path') && !columns.includes('library')) {
+                candidates.push(path);
+                if (preferredIndex === null && path.toLowerCase() === 'index.csv') preferredIndex = path;
+            }
+        } catch (error) {
+            if (error.name === 'AbortError') throw error;
+            /* An unreadable or invalid header cannot take down the library. */
+        }
+        if (slice.due()) await slice.yield();
     }
-    return { indexPath: candidates.find(path => path.toLowerCase() === 'index.csv') ?? (candidates.length === 1 ? candidates[0] : null), candidates,
+    return { indexPath: preferredIndex ?? (candidates.length === 1 ? candidates[0] : null), candidates,
         commentsPath: commentsCandidates.length === 1 ? commentsCandidates[0] : null, commentsCandidates };
 }
 
@@ -69,11 +116,14 @@ function timestamp(lastModified) {
 
 // Local enumerate({signal}) yields all files or path issues, reads no contents, and throws
 // AbortError on cancellation. Keep its iterator to pause/resume without restarting.
-export async function createFileListSource(files) {
-    const entries = new Map(), issues = [];
-    let label = 'library folder', root = null, processed = 0;
+export async function createFileListSource(files, options = {}) {
+    const { signal } = options;
+    checkAbort(signal);
+    const entries = new Map(), issues = [], slice = sourceSlice(options);
+    let label = 'library folder', root = null;
     // The browser finishes its picker before delivering FileList. Application mapping yields separately.
     for (const file of files) {
+        checkAbort(signal);
         let path = '';
         try {
             const relativePath = file.webkitRelativePath;
@@ -88,7 +138,7 @@ export async function createFileListSource(files) {
             if (entries.has(path)) throw new Error('duplicate library path');
             entries.set(path, file);
         } catch (error) { issues.push(issue(path, error)); }
-        if (++processed % SOURCE_BATCH_SIZE === 0) await yieldToBrowser();
+        if (slice.due()) await slice.yield();
     }
     const getFile = path => {
         pathSegments(path);
@@ -96,13 +146,14 @@ export async function createFileListSource(files) {
         return entries.get(path);
     };
     const readHead = (path, bytes = 65536) => fileOperation(path, null, () => getFile(path).slice(0, bytes).text());
-    return { kind: 'filelist', label, readHead, ...await discoverIndex(entries.keys(), readHead),
+    return { kind: 'filelist', label, readHead, ...await discoverSourceIndex(entries.keys(), readHead, options, slice),
         async *enumerate({ signal } = {}) {
-            let examined = 0;
+            checkAbort(signal);
+            const slice = sourceSlice({ ...options, signal });
             for (const entryIssue of issues) {
                 checkAbort(signal);
                 yield entryIssue;
-                if (++examined % SOURCE_BATCH_SIZE === 0) { checkAbort(signal); await yieldToBrowser(); checkAbort(signal); }
+                if (slice.due()) await slice.yield();
             }
             for (const [path, file] of entries) {
                 checkAbort(signal);
@@ -113,23 +164,29 @@ export async function createFileListSource(files) {
                 }
                 catch (error) { record = issue(path, error); }
                 yield record;
-                if (++examined % SOURCE_BATCH_SIZE === 0) { checkAbort(signal); await yieldToBrowser(); checkAbort(signal); }
+                if (slice.due()) await slice.yield();
             }
         },
         readFile: (path, { signal } = {}) => fileOperation(path, signal, () => getFile(path).arrayBuffer()),
         size: path => fileOperation(path, null, () => getFile(path).size) };
 }
 
-export async function createDirectorySource(handle) {
-    const paths = [];
-    let examined = 0;
+export async function createDirectorySource(handle, options = {}) {
+    const { signal } = options;
+    checkAbort(signal);
+    const paths = [], slice = sourceSlice(options);
     try {
         for await (const [name, entry] of handle.entries()) {
+            checkAbort(signal);
             try { pathSegments(name); if (name.includes('/')) throw new Error('invalid path segment'); if (entry.kind === 'file') paths.push(name); }
             catch { /* enumerate reports invalid root entries; candidate discovery remains best effort. */ }
-            if (++examined % SOURCE_BATCH_SIZE === 0) await yieldToBrowser();
+            if (slice.due()) await slice.yield();
         }
-    } catch { /* Keep permission-denied roots usable for the discovery retry UI. */ }
+    } catch (error) {
+        if (error.name === 'AbortError') throw error;
+        /* Keep permission-denied roots usable for the discovery retry UI. */
+    }
+    checkAbort(signal);
     const getFile = async (path, signal) => {
         const segments = pathSegments(path);
         let directory = handle;
@@ -146,10 +203,10 @@ export async function createDirectorySource(handle) {
         return file;
     };
     const readHead = (path, bytes = 65536) => fileOperation(path, null, async () => (await getFile(path)).slice(0, bytes).text());
-    return { kind: 'directory', label: handle.name, handle, readHead, ...await discoverIndex(paths, readHead),
+    return { kind: 'directory', label: handle.name, handle, readHead, ...await discoverSourceIndex(paths, readHead, options, slice),
         async *enumerate({ signal } = {}) {
             const stack = [{ directory: handle, path: '', iterator: null }];
-            let examined = 0;
+            const slice = sourceSlice({ ...options, signal });
             try {
                 while (stack.length) {
                     checkAbort(signal);
@@ -160,22 +217,24 @@ export async function createDirectorySource(handle) {
                         checkAbort(signal);
                         const next = await current.iterator.next();
                         checkAbort(signal);
-                        if (next.done) { stack.pop(); continue; }
-                        const [name, entry] = next.value;
-                        const path = current.path ? `${current.path}/${name}` : name;
-                        try {
-                            pathSegments(path);
-                            if (name.includes('/')) throw new Error('invalid library path segment');
-                            if (entry.kind === 'file') record = { kind: 'file', path, size: null, timestamp: '' };
-                            else if (entry.kind === 'directory') {
-                                checkAbort(signal);
-                                const directory = typeof entry.entries === 'function' ? entry : await current.directory.getDirectoryHandle(name);
-                                checkAbort(signal);
-                                stack.push({ directory, path, iterator: null });
+                        if (next.done) stack.pop();
+                        else {
+                            const [name, entry] = next.value;
+                            const path = current.path ? `${current.path}/${name}` : name;
+                            try {
+                                pathSegments(path);
+                                if (name.includes('/')) throw new Error('invalid library path segment');
+                                if (entry.kind === 'file') record = { kind: 'file', path, size: null, timestamp: '' };
+                                else if (entry.kind === 'directory') {
+                                    checkAbort(signal);
+                                    const directory = typeof entry.entries === 'function' ? entry : await current.directory.getDirectoryHandle(name);
+                                    checkAbort(signal);
+                                    stack.push({ directory, path, iterator: null });
+                                }
+                            } catch (error) {
+                                if (error.name === 'AbortError') throw error;
+                                record = issue(path, error);
                             }
-                        } catch (error) {
-                            if (error.name === 'AbortError') throw error;
-                            record = issue(path, error);
                         }
                     } catch (error) {
                         if (error.name === 'AbortError') throw error;
@@ -184,7 +243,7 @@ export async function createDirectorySource(handle) {
                         record = issue(current.path, error);
                     }
                     if (record) yield record;
-                    if (++examined % SOURCE_BATCH_SIZE === 0) { checkAbort(signal); await yieldToBrowser(); checkAbort(signal); }
+                    if (slice.due()) await slice.yield();
                 }
             } finally {
                 for (const current of stack.reverse()) {

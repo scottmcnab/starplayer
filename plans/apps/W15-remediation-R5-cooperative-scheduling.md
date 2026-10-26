@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **In progress — worker implementing; coordinator review pending** |
+| Status | **Integrated — reviewed; focused verification passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Baseline; parallel R1/R3 |
@@ -58,3 +58,8 @@ assertion counts as real background coverage. Hand R6 the helper.
 
 Notification UI throttling redesign, playback keepalive, claiming universal hidden-tab
 throughput, source/identity schema change, browser harness edits.
+
+## Execution evidence (2026-10-27)
+
+Integrated as `f3fe09a` after coordinator diff review. Coordinator independently passed all 41 focused source/scheduler tests, including count/time budgets, deep unwind, falsy failures, cancellation and cleanup. Browser hidden-page behavior remains R7.
+`git diff --check` passed. Logs: `/tmp/starplayer-w15-remediation-evidence/`.

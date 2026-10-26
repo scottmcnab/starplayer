@@ -351,15 +351,46 @@ fn put_directory_field(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<
     Ok(())
 }
 
-/// zip's name map replaces identical raw names with the last payload. Keep the first
-/// central record instead. Local data and its offsets remain untouched; only archives
-/// actually containing raw duplicates acquire an owned directory-normalized buffer.
-/// The ordinary classic/ZIP64 footer (plus optional directory signature) is supported;
-/// unknown duplicate-bearing footer layouts fail explicitly rather than being guessed.
+/// Normalize duplicate raw names once in a caller-owned archive buffer.
+///
+/// This intentionally shares the legacy listing/extraction policy: the first central
+/// directory entry wins. Compaction changes only directory/footer bytes, preserves the
+/// allocation and local data offsets, and lets subsequent borrowed lookups avoid a
+/// source-sized compatibility copy. No entry is decompressed here.
+pub fn prepare_owned_archive(mut bytes: Vec<u8>) -> Result<Vec<u8>, ArchiveError> {
+    if bytes.len() as u64 > MAX_SOURCE_BYTES { return Err(ArchiveError::SourceTooLarge { size: bytes.len() as u64 }); }
+    if !is_zip(&bytes) { return Err(ArchiveError::NotAnArchive); }
+    let archive = ZipArchive::new(Cursor::new(Cow::Borrowed(bytes.as_slice()))).map_err(map_zip_error)?;
+    if archive.offset() != 0 { return Err(ArchiveError::Corrupt("central directory does not describe the outer ZIP".into())); }
+    let directory = duplicate_directory(&bytes, &archive)?;
+    drop(archive);
+    if let Some(directory) = directory { compact_duplicate_directory(&mut bytes, &directory)?; }
+    Ok(bytes)
+}
+
+struct DuplicateDirectory {
+    directory_start: usize,
+    records: Vec<std::ops::Range<usize>>,
+    position: usize,
+    duplicates: Vec<Vec<u8>>,
+}
+
+/// zip's name map replaces identical raw names with the last payload. Preserve the
+/// first central record for both legacy and session callers. Unknown duplicate-bearing
+/// footer layouts fail explicitly rather than being guessed.
 fn open_archive_with_duplicates(bytes: &[u8]) -> Result<OpenArchive<'_>, ArchiveError> {
     if !is_zip(bytes) { return Err(ArchiveError::NotAnArchive); }
     let archive = ZipArchive::new(Cursor::new(Cow::Borrowed(bytes))).map_err(map_zip_error)?;
-    if archive.is_empty() { return Ok((archive, Vec::new())); }
+    let Some(directory) = duplicate_directory(bytes, &archive)? else { return Ok((archive, Vec::new())); };
+    drop(archive);
+    let mut normalized = bytes.to_vec();
+    compact_duplicate_directory(&mut normalized, &directory)?;
+    let archive = ZipArchive::new(Cursor::new(Cow::Owned(normalized))).map_err(map_zip_error)?;
+    Ok((archive, directory.duplicates))
+}
+
+fn duplicate_directory(bytes: &[u8], archive: &ZipArchive<Cursor<Cow<'_, [u8]>>>) -> Result<Option<DuplicateDirectory>, ArchiveError> {
+    if archive.is_empty() { return Ok(None); }
     let directory_start = usize::try_from(archive.central_directory_start()).map_err(|_| directory_error())?;
     let last_header = (0..archive.len()).try_fold(0u64, |last, index| archive.by_index_data(index).map(|entry| last.max(entry.central_header_start()))).map_err(map_zip_error)?;
     let last_header = usize::try_from(last_header).map_err(|_| directory_error())?;
@@ -376,43 +407,54 @@ fn open_archive_with_duplicates(bytes: &[u8]) -> Result<OpenArchive<'_>, Archive
         let record_length = 46usize.checked_add(name_length).and_then(|length| length.checked_add(extra_length)).and_then(|length| length.checked_add(comment_length)).ok_or_else(directory_error)?;
         let record = checked_range(bytes, position, record_length)?;
         let name = checked_range(record, 46, name_length)?;
-        if seen.insert(name) { records.push(record); } else { duplicates.push(name.to_vec()); }
+        if seen.insert(name) { records.push(position..position + record_length); } else { duplicates.push(name.to_vec()); }
         position = position.checked_add(record_length).ok_or_else(directory_error)?;
     }
-    if duplicates.is_empty() { return Ok((archive, duplicates)); }
+    if duplicates.is_empty() { return Ok(None); }
+    Ok(Some(DuplicateDirectory { directory_start, records, position, duplicates }))
+}
+
+fn compact_duplicate_directory(bytes: &mut Vec<u8>, directory: &DuplicateDirectory) -> Result<(), ArchiveError> {
+    let DuplicateDirectory { directory_start, records, position, .. } = directory;
+    let (directory_start, position) = (*directory_start, *position);
     let directory_size = records.iter().try_fold(0usize, |size, record| size.checked_add(record.len())).ok_or_else(directory_error)?;
     let removed = position.checked_sub(directory_start).and_then(|size| size.checked_sub(directory_size)).ok_or_else(directory_error)?;
-    let mut footer = bytes.get(position..).ok_or_else(directory_error)?.to_vec();
+    let footer = bytes.get_mut(position..).ok_or_else(directory_error)?;
     let mut footer_position = 0usize;
     if footer.starts_with(b"PK\x05\x05") {
-        footer_position = 6usize.checked_add(directory_word(&footer, 4)? as usize).ok_or_else(directory_error)?;
+        footer_position = 6usize.checked_add(directory_word(footer, 4)? as usize).ok_or_else(directory_error)?;
     }
-    if checked_range(&footer, footer_position, 4)? == b"PK\x06\x06" {
-        checked_range(&footer, footer_position, 56)?;
-        let zip64_length = usize::try_from(directory_qword(&footer, footer_position + 4)?).map_err(|_| directory_error())?;
+    if checked_range(footer, footer_position, 4)? == b"PK\x06\x06" {
+        checked_range(footer, footer_position, 56)?;
+        let zip64_length = usize::try_from(directory_qword(footer, footer_position + 4)?).map_err(|_| directory_error())?;
         if zip64_length < 44 { return Err(directory_error()); }
-        put_directory_field(&mut footer, footer_position + 24, &(records.len() as u64).to_le_bytes())?;
-        put_directory_field(&mut footer, footer_position + 32, &(records.len() as u64).to_le_bytes())?;
-        put_directory_field(&mut footer, footer_position + 40, &(directory_size as u64).to_le_bytes())?;
+        put_directory_field(footer, footer_position + 24, &(records.len() as u64).to_le_bytes())?;
+        put_directory_field(footer, footer_position + 32, &(records.len() as u64).to_le_bytes())?;
+        put_directory_field(footer, footer_position + 40, &(directory_size as u64).to_le_bytes())?;
         footer_position = footer_position.checked_add(12).and_then(|offset| offset.checked_add(zip64_length)).ok_or_else(directory_error)?;
-        if checked_range(&footer, footer_position, 4)? != b"PK\x06\x07" { return Err(directory_error()); }
-        checked_range(&footer, footer_position, 20)?;
-        let zip64_offset = directory_qword(&footer, footer_position + 8)?.checked_sub(removed as u64).ok_or_else(directory_error)?;
-        put_directory_field(&mut footer, footer_position + 8, &zip64_offset.to_le_bytes())?;
+        if checked_range(footer, footer_position, 4)? != b"PK\x06\x07" { return Err(directory_error()); }
+        checked_range(footer, footer_position, 20)?;
+        let zip64_offset = directory_qword(footer, footer_position + 8)?.checked_sub(removed as u64).ok_or_else(directory_error)?;
+        put_directory_field(footer, footer_position + 8, &zip64_offset.to_le_bytes())?;
         footer_position = footer_position.checked_add(20).ok_or_else(directory_error)?;
     }
-    if checked_range(&footer, footer_position, 4)? != b"PK\x05\x06" { return Err(directory_error()); }
-    checked_range(&footer, footer_position, 22)?;
+    if checked_range(footer, footer_position, 4)? != b"PK\x05\x06" { return Err(directory_error()); }
+    checked_range(footer, footer_position, 22)?;
     let count = u16::try_from(records.len()).unwrap_or(u16::MAX);
-    put_directory_field(&mut footer, footer_position + 8, &count.to_le_bytes())?;
-    put_directory_field(&mut footer, footer_position + 10, &count.to_le_bytes())?;
-    put_directory_field(&mut footer, footer_position + 12, &u32::try_from(directory_size).map_err(|_| directory_error())?.to_le_bytes())?;
-    let mut normalized = Vec::with_capacity(bytes.len().checked_sub(removed).ok_or_else(directory_error)?);
-    normalized.extend_from_slice(bytes.get(..directory_start).ok_or_else(directory_error)?);
-    for record in records { normalized.extend_from_slice(record); }
-    normalized.extend_from_slice(&footer);
-    let archive = ZipArchive::new(Cursor::new(Cow::Owned(normalized))).map_err(map_zip_error)?;
-    Ok((archive, duplicates))
+    put_directory_field(footer, footer_position + 8, &count.to_le_bytes())?;
+    put_directory_field(footer, footer_position + 10, &count.to_le_bytes())?;
+    put_directory_field(footer, footer_position + 12, &u32::try_from(directory_size).map_err(|_| directory_error())?.to_le_bytes())?;
+    // Move retained directory records and the patched footer forward in the original
+    // allocation. Local payload data is untouched and no second source buffer exists.
+    let mut destination = directory_start;
+    for record in records {
+        bytes.copy_within(record.clone(), destination);
+        destination += record.len();
+    }
+    let footer_length = bytes.len() - position;
+    bytes.copy_within(position.., destination);
+    bytes.truncate(destination + footer_length);
+    Ok(())
 }
 
 fn format_from_name(name: &str) -> Option<ModuleFormat> {

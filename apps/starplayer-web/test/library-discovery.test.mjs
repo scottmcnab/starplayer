@@ -43,15 +43,36 @@ function harness({ records = [], source, autoStart = true, digest, nativeDigest 
     const runtimeFactory = () => {
         const jobs = [];
         const runtime = { jobs, paused: false, disposed: false,
-            enqueue(request) {
+            enqueue(request, callbacks = {}) {
                 const pending = deferred();
                 const job = { ...request, ...(request.bytes ? { bytes: new Uint8Array(request.bytes).slice() } : {}),
                     result: pending.promise, id: jobs.length + 1, resolve(payload, generation = request.generation) { pending.resolve({ generation, kind: request.kind, payload }); },
                     reject: pending.reject, cancel() { pending.reject(failure('aborted')); } };
+                if (request.kind === 'inspect-group') {
+                    const completed = new Set();
+                    const progress = () => ({ completedTokens: request.members.filter(member => completed.has(member.token)).map(member => member.token) });
+                    job.memberJobs = request.members.map(member => ({ ...member,
+                        resolve(payload, generation = request.generation) {
+                            if (completed.has(member.token)) return;
+                            completed.add(member.token);
+                            callbacks.onMember?.({ ...member, generation, id: job.id, payload });
+                            if (completed.size === request.members.length) job.resolve(progress(), generation);
+                        },
+                        reject(error) {
+                            if (['worker-failed', 'read-failed', 'source-too-large', 'aborted', 'disposed'].includes(error.code)) {
+                                job.reject(Object.assign(error, { progress: progress() })); return;
+                            }
+                            completed.add(member.token);
+                            callbacks.onMember?.({ ...member, generation: request.generation, id: job.id, error });
+                            if (completed.size === request.members.length) job.resolve(progress());
+                        },
+                        cancel: job.cancel,
+                    }));
+                }
                 jobs.push(job); return job;
             },
             pauseCatalog() { runtime.paused = true; }, resumeCatalog() { runtime.paused = false; },
-            cancelMetadata() { for (const job of jobs.filter(job => job.kind === 'inspect')) job.cancel(); },
+            cancelMetadata() { for (const job of jobs.filter(job => job.kind === 'inspect-group')) job.cancel(); },
             dispose() { runtime.disposed = true; for (const job of jobs) job.reject(failure('disposed')); },
         };
         runtimes.push(runtime); return runtime;
@@ -61,7 +82,7 @@ function harness({ records = [], source, autoStart = true, digest, nativeDigest 
         schedule(callback, delay) { assert.equal(delay, 100); timers.set(++timerId, callback); return timerId; }, unschedule(id) { timers.delete(id); } });
     if (autoStart) controller.start();
     return { context, controller, runtimes, notifications, timers, digests, metrics, get reads() { return reads; },
-        jobs(kind, runtime = runtimes.at(-1)) { return runtime.jobs.filter(job => job.kind === kind); },
+        jobs(kind, runtime = runtimes.at(-1)) { return kind === 'member' ? runtime.jobs.flatMap(job => job.memberJobs || []) : runtime.jobs.filter(job => job.kind === kind); },
         publish() { for (const [id, callback] of [...timers]) { timers.delete(id); callback(); } } };
 }
 
@@ -107,8 +128,8 @@ test('Stop holds an outstanding next result and resumes without duplicates; insp
     h.controller.scanMetadata(); h.controller.pause();
     incoming.push(file('held.mod')); await tick();
     assert.equal(h.context.discoveryStatus.phase, 'paused'); assert.equal(h.context.library.rows.length, 1); assert.equal(incoming.calls, 3);
-    assert.equal(h.runtimes[0].paused, true); assert.equal(h.jobs('inspect').length, 1);
-    h.jobs('inspect')[0].resolve({ metadata: metadata('known'), sha256: sha }); await tick();
+    assert.equal(h.runtimes[0].paused, true); assert.equal(h.jobs('member').length, 1);
+    h.jobs('member')[0].resolve({ metadata: metadata('known'), sha256: sha }); await tick();
     assert.equal(h.context.library.rows[0].title, 'known'); assert.equal(h.context.discoveryStatus.metadataPhase, 'waiting');
     h.controller.resume(); await tick(); assert.equal(h.context.library.rows.length, 2); assert.equal(h.runtimes[0].paused, false);
     h.controller.cancelMetadata(); assert.equal(h.context.discoveryStatus.metadataPhase, 'cancelled');
@@ -133,7 +154,7 @@ test('worker failure allows loose walking and fails only when unfinished archive
         const incoming = stream(), h = harness({ source: { label: 'root', enumerate: () => incoming } }); t.after(() => h.controller.dispose());
         incoming.push(file(archive ? 'pending.zip' : 'known.mod')); await tick();
         if (!archive) h.controller.scanMetadata();
-        h.jobs(archive ? 'catalog' : 'inspect')[0].reject(failure('worker-failed')); await tick();
+        h.jobs(archive ? 'catalog' : 'member')[0].reject(failure('worker-failed')); await tick();
         assert.equal(h.context.discoveryStatus.phase, 'running'); assert.match(h.context.discoveryStatus.runtimeError, /worker-failed/);
         incoming.push(file('later.mod')); incoming.end(); await tick();
         assert.equal(h.context.library.rows.at(-1).sourcePath, 'later.mod');
@@ -149,12 +170,12 @@ test('paused worker retry preserves pause and resubmits each unfinished job once
     h.controller.resume(); assert.equal(h.runtimes[0].paused, true, 'Resume cannot restart failed runtime');
     h.controller.pause(); h.controller.retry(); await tick();
     assert.equal(h.runtimes.length, 2); assert.equal(h.runtimes[0].disposed, true); assert.equal(h.runtimes[1].paused, true);
-    assert.equal(h.jobs('catalog').length, 1); assert.equal(h.jobs('inspect').length, 2);
+    assert.equal(h.jobs('catalog').length, 1); assert.equal(h.jobs('member').length, 2);
     assert.equal(h.context.discoveryStatus.phase, 'paused'); assert.equal(h.context.discoveryStatus.runtimeError, '');
     assert.equal(h.context.library.rows[0].metadataState, 'unknown', 'old dispose errors are silent');
     h.controller.retry(); assert.equal(h.runtimes.length, 2); assert.equal(h.jobs('catalog').length, 1);
     h.jobs('catalog')[0].resolve({ entries: [], issues: [] });
-    for (const job of h.jobs('inspect')) job.resolve({ metadata: metadata('inspected'), sha256: sha });
+    for (const job of h.jobs('member')) job.resolve({ metadata: metadata('inspected'), sha256: sha });
     await tick(); assert.equal(h.context.discoveryStatus.phase, 'paused'); assert.equal(h.context.discoveryStatus.metadataPhase, 'waiting');
     h.controller.resume(); assert.equal(h.context.discoveryStatus.phase, 'complete'); assert.equal(h.context.discoveryStatus.metadataPhase, 'complete');
 });
@@ -162,14 +183,14 @@ test('paused worker retry preserves pause and resubmits each unfinished job once
 test('metadata scan includes arrivals, waits for discovery, and retries errors only explicitly', async t => {
     const incoming = stream(), h = harness({ source: { label: 'root', enumerate: () => incoming } }); t.after(() => h.controller.dispose());
     incoming.push(file('bad.mod')); await tick(); h.controller.scanMetadata();
-    h.jobs('inspect')[0].reject(failure('job-failed')); await tick();
+    h.jobs('member')[0].reject(failure('job-failed')); await tick();
     assert.equal(h.context.library.rows[0].playable, true); assert.equal(h.context.library.rows[0].metadataState, 'error');
     assert.equal(h.context.discoveryStatus.metadataCounts.error, 1); assert.equal(h.context.discoveryStatus.metadataPhase, 'waiting');
-    incoming.push(file('late.mod')); await tick(); assert.equal(h.jobs('inspect').length, 2);
-    h.jobs('inspect')[1].resolve({ metadata: metadata('late title'), sha256: sha }); await tick();
-    h.controller.scanMetadata(); assert.equal(h.jobs('inspect').length, 2, 'new scans do not retry row errors');
-    h.controller.retryMetadata(locator('bad.mod')); assert.equal(h.jobs('inspect').length, 3);
-    h.jobs('inspect')[2].resolve({ metadata: metadata('recovered'), sha256: sha }); incoming.end(); await tick();
+    incoming.push(file('late.mod')); await tick(); assert.equal(h.jobs('member').length, 2);
+    h.jobs('member')[1].resolve({ metadata: metadata('late title'), sha256: sha }); await tick();
+    h.controller.scanMetadata(); assert.equal(h.jobs('member').length, 2, 'new scans do not retry row errors');
+    h.controller.retryMetadata(locator('bad.mod')); assert.equal(h.jobs('member').length, 3);
+    h.jobs('member')[2].resolve({ metadata: metadata('recovered'), sha256: sha }); incoming.end(); await tick();
     assert.equal(h.context.discoveryStatus.metadataPhase, 'complete'); assert.equal(h.context.library.rows[0].error, '');
     assert.deepEqual(h.context.discoveryStatus.metadataCounts, { ready: 2, unknown: 0, error: 0, excluded: 0, hashesPending: 0, refreshPending: 0, scanActionable: 0 });
     assert.equal(h.context.discoveryStatus.metadataIncomplete, false);
@@ -177,11 +198,11 @@ test('metadata scan includes arrivals, waits for discovery, and retries errors o
 
 test('scan cancellation ignores disposed/cancelled inspection and leaves archive discovery running', async t => {
     const h = harness({ records: [file('a.mod'), file('pending.zip')] }); t.after(() => h.controller.dispose()); await tick();
-    h.controller.scanMetadata(); const old = h.jobs('inspect')[0];
+    h.controller.scanMetadata(); const old = h.jobs('member')[0];
     h.controller.cancelMetadata(); await tick(); assert.equal(h.context.library.rows[0].metadataState, 'unknown');
-    h.controller.scanMetadata(); assert.equal(h.jobs('inspect').length, 2);
+    h.controller.scanMetadata(); assert.equal(h.jobs('member').length, 2);
     old.resolve({ metadata: metadata('stale'), sha256: sha });
-    h.jobs('inspect')[1].resolve({ metadata: metadata('fresh'), sha256: sha }); await tick();
+    h.jobs('member')[1].resolve({ metadata: metadata('fresh'), sha256: sha }); await tick();
     assert.equal(h.context.library.rows[0].title, 'fresh'); assert.equal(h.context.discoveryStatus.metadataPhase, 'waiting');
     h.jobs('catalog')[0].resolve({ entries: [], issues: [] }); await tick(); assert.equal(h.context.discoveryStatus.metadataPhase, 'complete');
 });
@@ -214,7 +235,7 @@ test('A/B/C successful replays retain coherent metadata/SHA/sidecars until each 
     const h = harness({ records: ['a.mod', 'b.mod', 'c.mod'].map(path => file(path)) }); t.after(() => h.controller.dispose()); await tick();
     const names = ['a.mod', 'b.mod', 'c.mod'];
     h.controller.scanMetadata();
-    for (const [index, job] of h.jobs('inspect').entries()) job.resolve({ metadata: metadata(`seed ${index}`), sha256: sha });
+    for (const [index, job] of h.jobs('member').entries()) job.resolve({ metadata: metadata(`seed ${index}`), sha256: sha });
     await tick(); h.publish();
     h.controller.attachComments(new Map([[sha, { instrumentNames: 'seed sidecar' }]])); h.publish();
     const mutable = new Uint8Array([8, 0, 1, 255, 9]), view = mutable.subarray(1, 4);
@@ -248,7 +269,7 @@ test('A/B/C successful replays retain coherent metadata/SHA/sidecars until each 
 
 test('first play stays unknown; playback invalidates older inspection, then publishes complete tuple', async t => {
     const h = harness({ records: [file('a.mod')] }); t.after(() => h.controller.dispose()); await tick();
-    h.controller.scanMetadata(); const stale = h.jobs('inspect')[0];
+    h.controller.scanMetadata(); const stale = h.jobs('member')[0];
     h.controller.acceptPlaybackMetadata(locator('a.mod'), metadata('playback'), new Uint8Array([1]));
     stale.resolve({ metadata: metadata('stale'), sha256: sha }); await tick();
     assert.equal(h.context.library.rows[0].title, ''); assert.equal(h.context.library.rows[0].metadataState, 'unknown');
@@ -277,8 +298,8 @@ test('stale-only physical digest does not block Scan for latest failed refresh',
     h.controller.acceptPlaybackMetadata(locator('a.mod'), metadata('latest'), new Uint8Array([2]));
     h.digests[1].reject(new Error('digest failed')); await tick();
     assert.equal(h.context.discoveryStatus.metadataCounts.hashesPending, 1); assert.equal(h.context.discoveryStatus.metadataCounts.scanActionable, 1);
-    h.controller.scanMetadata(); assert.equal(h.jobs('inspect').length, 1);
-    h.jobs('inspect')[0].resolve({ metadata: metadata('scanned'), sha256: sha }); await tick();
+    h.controller.scanMetadata(); assert.equal(h.jobs('member').length, 1);
+    h.jobs('member')[0].resolve({ metadata: metadata('scanned'), sha256: sha }); await tick();
     assert.equal(h.context.discoveryStatus.metadataIncomplete, false);
     h.digests[0].reject(new Error('obsolete')); await tick();
     assert.equal(h.context.library.rows[0].title, 'scanned'); assert.equal(h.context.discoveryStatus.issueCount, 1);
@@ -306,7 +327,7 @@ test('sync throw, async rejection and malformed digest share failure patch and j
         assert.equal(h.context.discoveryStatus.metadataCounts.scanActionable, 1);
         assert.equal(h.context.discoveryStatus.issues[0].path, 'outer.zip/inner.zip/song.mod');
         assert.equal(h.context.discoveryStatus.sidecarCounts.awaitingHashes, 1);
-        h.controller.scanMetadata(); assert.equal(h.jobs('inspect').length, 1);
+        h.controller.scanMetadata(); assert.equal(h.jobs('member').length, 1);
     }
 });
 
@@ -349,22 +370,22 @@ test('eligible counters and useful Scan exclude encrypted rows and metadata erro
         h.controller.attachComments(new Map([[sha, { instrumentNames: 'sidecar' }]]));
         assert.equal(h.context.discoveryStatus.metadataCounts.scanActionable, eligible);
         assert.equal(h.context.discoveryStatus.metadataIncomplete, eligible > 0);
-        h.controller.scanMetadata(); h.controller.scanMetadata(); assert.equal(h.jobs('inspect').length, eligible);
+        h.controller.scanMetadata(); h.controller.scanMetadata(); assert.equal(h.jobs('member').length, eligible);
         assert.equal(h.context.discoveryStatus.metadataCounts.scanActionable, 0);
-        for (const [index, job] of h.jobs('inspect').entries()) {
+        for (const [index, job] of h.jobs('member').entries()) {
             if (!index) job.reject(failure('job-failed')); else job.resolve({ metadata: metadata('ready'), sha256: sha });
         }
-        await tick(); h.controller.scanMetadata(); assert.equal(h.jobs('inspect').length, eligible);
+        await tick(); h.controller.scanMetadata(); assert.equal(h.jobs('member').length, eligible);
         assert.equal(h.context.discoveryStatus.metadataPhase, 'complete');
         assert.equal(h.context.discoveryStatus.metadataIncomplete, eligible > 0);
         assert.deepEqual(h.context.discoveryStatus.sidecarCounts, { joined: eligible > 1 ? 1 : 0, unmatched: eligible > 1 ? 0 : 1, awaitingHashes: 0, failedHashes: eligible ? 1 : 0, excludedHashes: 1 });
-        if (eligible) { h.controller.retryMetadata({ sourcePath: 'outer.zip', memberPath: '0.mod' }); assert.equal(h.jobs('inspect').length, eligible + 1); }
+        if (eligible) { h.controller.retryMetadata({ sourcePath: 'outer.zip', memberPath: '0.mod' }); assert.equal(h.jobs('member').length, eligible + 1); }
     }
 });
 
 test('catalog and inspection errors retain distinct paths and row playability', async t => {
     const h = harness({ records: [file('bad.zip'), file('known.mod')] }); t.after(() => h.controller.dispose()); await tick();
-    h.jobs('catalog')[0].reject(failure('read-failed')); h.controller.scanMetadata(); h.jobs('inspect')[0].reject(failure('source-too-large')); await tick();
+    h.jobs('catalog')[0].reject(failure('read-failed')); h.controller.scanMetadata(); h.jobs('member')[0].reject(failure('source-too-large')); await tick();
     assert.equal(h.context.discoveryStatus.phase, 'complete'); assert.equal(h.context.library.rows[0].playable, true);
     assert.equal(h.context.library.rows[0].metadataState, 'error');
     assert.deepEqual(h.context.discoveryStatus.issues.map(issue => issue.path), ['bad.zip']);
@@ -372,11 +393,11 @@ test('catalog and inspection errors retain distinct paths and row playability', 
 
 test('worker failure after complete discovery remains visible and retry resumes metadata', async t => {
     const h = harness({ records: [file('known.mod')] }); t.after(() => h.controller.dispose()); await tick();
-    h.controller.scanMetadata(); h.jobs('inspect')[0].reject(failure('worker-failed')); await tick();
+    h.controller.scanMetadata(); h.jobs('member')[0].reject(failure('worker-failed')); await tick();
     assert.equal(h.context.discoveryStatus.phase, 'complete'); assert.equal(h.context.discoveryStatus.metadataPhase, 'suspended');
     assert.match(h.context.discoveryStatus.runtimeError, /worker-failed/); assert.equal(h.context.library.rows[0].error, '');
-    h.controller.retry(); assert.equal(h.jobs('inspect').length, 1);
-    h.jobs('inspect')[0].resolve({ metadata: metadata('retry'), sha256: sha }); await tick();
+    h.controller.retry(); assert.equal(h.jobs('member').length, 1);
+    h.jobs('member')[0].resolve({ metadata: metadata('retry'), sha256: sha }); await tick();
     assert.equal(h.context.discoveryStatus.metadataPhase, 'complete'); assert.equal(h.context.discoveryStatus.runtimeError, '');
 });
 

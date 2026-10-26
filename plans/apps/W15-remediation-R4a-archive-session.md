@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **In progress — worker implementing; coordinator review pending** |
+| Status | **Integrated — reviewed; focused verification passed** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Baseline; parallel R1/R2/R3/R5 (pure Rust, disjoint files) |
@@ -77,3 +77,8 @@ directory records in an already owned buffer once at session/inner construction,
 avoiding a whole-source copy for every lookup/extraction. Preserve legacy APIs and
 first-entry semantics. Record temporary construction allocation separately from
 retained outer/inner buffers. No outward session contract change.
+
+## Execution evidence (2026-10-27)
+
+Integrated as `b0cf227` after coordinator diff review. Coordinator independently passed 31 archive tests (one pre-existing manual generator ignored), 22 web Rust tests and cargo xtask wasm. Worker actual Node/WASM ABI smoke passed. Native cfg(test) statistics establish inner-cache reuse, pointer stability, exact source cap and drop release; browser adapter counts are separate evidence.
+`git diff --check` passed. Logs: `/tmp/starplayer-w15-remediation-evidence/`.
