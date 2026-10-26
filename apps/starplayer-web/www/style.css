@@ -297,3 +297,13 @@ tbody tr:last-child td { border-bottom: 0; }
 #library-details pre { max-width: 100%; overflow-x: auto; white-space: pre; margin: 0; font: 12px/1.5 ui-monospace, monospace; }
 #library-details mark { background: #e6c66b; color: #10151b; }
 #library-comments-toggle[hidden] { display: none; }
+
+/* Discovery status is separate from source summaries and focused track errors. */
+#library-progress, #library-issues { font-size: 13px; overflow-wrap: anywhere; margin: 8px 0; }
+#library-progress[hidden], #library-metadata-hint[hidden], #library-issues[hidden] { display: none; }
+#library-issues summary, .library-help summary { cursor: pointer; }
+#library-issues ul { max-height: 200px; overflow: auto; padding-left: 24px; }
+.library-help { color: var(--muted); font-size: 12px; margin: 8px 0; }
+.library-help p { margin: 8px 0; }
+.library-track.metadata-error { box-shadow: inset -3px 0 #e6c66b; }
+.library-track-error { color: #e6c66b; white-space: pre-wrap; overflow-wrap: anywhere; }

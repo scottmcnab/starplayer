@@ -1,6 +1,6 @@
 import { buildTree, commentMatchLines, commentTokens, compileQuery, matchRanges, search } from './library-index.js';
 import { createSelection, moveFocus, selectAll, selectRow, virtualWindow } from './library-selection.js';
-import { libraryLocator } from './playlist.js';
+import { captureAnchor, restoreAnchor, formatOptions, unplayableCount, folderAddLabel, selectedSnapshot, folderSnapshot, progressText, metadataHint } from './library-view-state.js';
 
 const ROW_HEIGHT = 32;
 const COLUMNS = [['name', 'Name'], ['title', 'Title'], ['format', 'Format'], ['channels', 'Ch'], ['size', 'Size'], ['timestamp', 'Date'], ['folder', 'Folder']];
@@ -55,6 +55,7 @@ export function createLibraryView({ playlist, play }) {
     const rows = element('rows');
     const heading = element('heading');
     let context = null;
+    let renderedRevision = -1;
     let order = new Int32Array();
     let selection = createSelection();
     let sort = { column: 'name', descending: false };
@@ -106,18 +107,33 @@ export function createLibraryView({ playlist, play }) {
 
     function renderDetails() {
         const pane = element('details');
-        pane.hidden = !context?.library.hasComments || selection.focus === null;
+        const row = context?.library.rows[selection.focus];
+        pane.hidden = !row || (!context.library.hasComments && !row.error);
         if (pane.hidden) { detailsKey = null; return; }
-        const key = `${selection.focus}\n${element('search').value}\n${element('search-comments').checked}`;
+        const comments = context.library.commentsFor(row.id);
+        const key = JSON.stringify([row.id, row.error, row.metadataState, row.name, row.title, comments, element('search').value, element('search-comments').checked]);
         if (key === detailsKey) return;
         detailsKey = key;
-        const row = context.library.rows[selection.focus];
-        if (!row) { pane.hidden = true; return; }
         element('details-title').textContent = [row.name, row.title].filter(Boolean).join(' — ');
         const content = element('details-content');
+        const retryFocused = content.contains(document.activeElement);
         content.replaceChildren();
         const highlighted = text => highlight(text, matchTokens.length ? matchRanges(text, matchTokens) : []);
-        const comments = context.library.commentsFor(row.id);
+        if (row.error) {
+            content.append(node('h4', row.metadataState === 'error' ? 'Metadata error' : 'Track unavailable'));
+            content.append(node('p', row.error, 'library-track-error'));
+            if (row.metadataState === 'error' && row.playable && context.discovery) {
+                const retry = node('button', 'Retry metadata');
+                retry.type = 'button';
+                retry.dataset.retryMetadata = String(row.id);
+                retry.setAttribute('aria-label', `Retry metadata for ${row.name}`);
+                const retryContext = context;
+                retry.onclick = () => {
+                    if (context === retryContext) retryContext.discovery.retryMetadata({ sourcePath: row.sourcePath, containerMember: row.containerMember, memberPath: row.memberPath });
+                };
+                content.append(retry);
+            }
+        }
         for (const [field, title] of [['instrumentNames', 'Instrument names'], ['sampleNames', 'Sample names'], ['songMessage', 'Song message']]) {
             const text = comments[field];
             if (!text) continue;
@@ -134,16 +150,12 @@ export function createLibraryView({ playlist, play }) {
             content.append(block);
         }
         if (!content.childNodes.length) content.append(node('p', 'No comment text'));
+        if (retryFocused) (content.querySelector('[data-retry-metadata]') ?? grid).focus({ preventScroll: true });
     }
 
-    function add(ids) {
-        if (!context) return;
-        playlist.add(Array.from(ids, id => context.library.rows[id]).filter(row => row.playable).map(row => ({
-            locator: libraryLocator(row, context.identity),
-            display: { name: row.name, title: row.title, format: row.format, folder: row.folder },
-        })));
+    function addSelected() {
+        if (context) playlist.add(selectedSnapshot(context.library, order, selection.selected, context.identity));
     }
-    function addSelected() { add(order.filter(id => selection.selected.has(id))); }
     function playRow(id) {
         const row = context?.library.rows[id];
         if (row?.playable && order.includes(id)) play(row);
@@ -156,8 +168,10 @@ export function createLibraryView({ playlist, play }) {
         else if (top + ROW_HEIGHT > viewport.scrollTop + viewport.clientHeight) viewport.scrollTop = top + ROW_HEIGHT - viewport.clientHeight;
     }
     function renderRows() {
+        if (frame !== null) cancelAnimationFrame(frame);
         frame = null;
         if (!context) return;
+        const focusedAdd = rows.contains(document.activeElement) ? document.activeElement.closest('[data-row-id]')?.dataset.rowId : null;
         const window = virtualWindow(viewport.scrollTop, viewport.clientHeight, order.length, ROW_HEIGHT);
         const fragment = document.createDocumentFragment();
         for (let index = window.first; index < window.last; index += 1) {
@@ -169,12 +183,14 @@ export function createLibraryView({ playlist, play }) {
             line.setAttribute('aria-rowindex', String(index + 2));
             line.setAttribute('aria-selected', String(selection.selected.has(row.id)));
             line.classList.toggle('unplayable', !row.playable);
+            line.classList.toggle('metadata-error', row.metadataState === 'error');
+            if (row.error) line.title = row.error;
             line.classList.toggle('playing', row.id === playing);
             line.classList.toggle('focused', row.id === selection.focus);
             for (const [column] of COLUMNS) {
                 const cell = node('span', row[column] ?? '—');
                 cell.setAttribute('role', 'gridcell');
-                cell.title = cell.textContent;
+                cell.title = row.error ? `${cell.textContent}\n${row.error}` : cell.textContent;
                 line.append(cell);
             }
             if (matchTokens.length) {
@@ -202,6 +218,10 @@ export function createLibraryView({ playlist, play }) {
         }
         rows.style.transform = `translateY(${window.first * ROW_HEIGHT}px)`;
         rows.replaceChildren(fragment);
+        if (focusedAdd !== null) {
+            const replacement = document.getElementById(`library-row-${focusedAdd}`)?.querySelector('[data-add]');
+            (replacement ?? grid).focus({ preventScroll: true });
+        }
         updateSelection();
     }
     function updateSelection() {
@@ -220,9 +240,11 @@ export function createLibraryView({ playlist, play }) {
         element('selection-count').textContent = `${selected.toLocaleString('en-US')} playable selected in this result`;
     }
     function scheduleRows() { if (frame === null) frame = requestAnimationFrame(renderRows); }
-    function refresh() {
+    function refresh(preserveAnchor = false) {
         clearTimeout(timer);
         if (!context) return;
+        const previousOrder = order;
+        const anchor = preserveAnchor ? captureAnchor(previousOrder, viewport.scrollTop, ROW_HEIGHT) : null;
         const tokens = compileQuery(element('search').value);
         const includeComments = element('search-comments').checked;
         order = search(context.library, tokens, {
@@ -238,7 +260,7 @@ export function createLibraryView({ playlist, play }) {
         element('scope').textContent = element('scope').title = scopeFolder || 'All folders';
         grid.setAttribute('aria-rowcount', String(order.length + 1));
         spacer.style.height = `${order.length * ROW_HEIGHT}px`;
-        viewport.scrollTop = 0;
+        viewport.scrollTop = anchor ? restoreAnchor(anchor, previousOrder, order, viewport.clientHeight, ROW_HEIGHT) : 0;
         for (const header of heading.querySelectorAll('[data-column]')) header.setAttribute('aria-sort', header.dataset.column === sort.column ? sort.descending ? 'descending' : 'ascending' : 'none');
         renderRows();
     }
@@ -258,14 +280,16 @@ export function createLibraryView({ playlist, play }) {
         for (const item of treeItems()) item.setAttribute('aria-selected', String(item.dataset.scope === path));
         refresh();
     }
-    function addFolder(path) { add(search(context.library, '', { scopeFolder: path, sort: { column: 'folder', descending: false } })); }
+    function addFolder(path) { if (context) playlist.add(folderSnapshot(context.library, path, context.identity)); }
     function toggleFolder(path, open = !expanded.has(path)) {
         if (open) expanded.add(path); else expanded.delete(path);
         renderTree();
     }
-    function renderTree() {
+    function renderTree(preserveScroll = false) {
         const pane = element('tree');
         const hadFocus = pane.contains(document.activeElement);
+        const focusedAdd = hadFocus && !!document.activeElement.closest('[data-tree-add]');
+        const scrollTop = pane.scrollTop;
         pane.replaceChildren();
         if (!tree) return;
         function append(parent, entry, level) {
@@ -274,9 +298,12 @@ export function createLibraryView({ playlist, play }) {
             item.setAttribute('role', 'treeitem');
             item.setAttribute('aria-level', String(level));
             item.setAttribute('aria-selected', String(scopeFolder === entry.path));
-            item.setAttribute('aria-label', `${entry.label || 'All folders'}, ${entry.trackCount.toLocaleString('en-US')} tracks`);
+            const incomplete = context.discoveryStatus && context.discoveryStatus.phase !== 'complete';
+            item.setAttribute('aria-label', `${entry.label || 'All folders'}, ${entry.trackCount.toLocaleString('en-US')} ${incomplete ? 'discovered ' : ''}tracks`);
             if (entry.children.length && level > 1) item.setAttribute('aria-expanded', String(open));
             item.dataset.scope = entry.path;
+            item.dataset.trackCount = String(entry.trackCount);
+            item.dataset.label = entry.label || 'All folders';
             item.tabIndex = entry.path === treeFocus ? 0 : -1;
             const row = node('div', undefined, `library-tree-row ${entry.kind}`);
             row.style.setProperty('--level', String(level - 1));
@@ -291,8 +318,8 @@ export function createLibraryView({ playlist, play }) {
             addButton.tabIndex = -1;
             addButton.disabled = entry.trackCount === 0;
             addButton.dataset.treeAdd = 'true';
-            addButton.setAttribute('aria-label', `Add folder ${entry.path || 'All folders'}`);
-            addButton.title = 'Add this folder to the playlist';
+            addButton.setAttribute('aria-label', folderAddLabel(entry.path, context.discoveryStatus));
+            addButton.title = folderAddLabel(entry.path, context.discoveryStatus);
             row.append(caret, icon, label, count, addButton);
             item.append(row);
             if (entry.children.length && open) {
@@ -306,7 +333,12 @@ export function createLibraryView({ playlist, play }) {
         append(pane, tree, 1);
         if (!treeItem(treeFocus)) treeFocus = scopeFolder && treeItem(scopeFolder) ? scopeFolder : '';
         treeItem(treeFocus).tabIndex = 0;
-        if (hadFocus) focusTreeItem(treeItem(treeFocus));
+        if (hadFocus) {
+            const item = treeItem(treeFocus);
+            if (preserveScroll) (focusedAdd ? item.querySelector('[data-tree-add]') : item).focus({ preventScroll: true });
+            else focusTreeItem(item);
+        }
+        if (preserveScroll) pane.scrollTop = scrollTop;
     }
     element('tree').addEventListener('mousedown', event => { if (event.detail > 1 || event.shiftKey) event.preventDefault(); });
     element('tree').addEventListener('click', event => {
@@ -359,9 +391,9 @@ export function createLibraryView({ playlist, play }) {
     actionHeader.setAttribute('role', 'columnheader');
     heading.append(actionHeader);
     element('search').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(refresh, 80); });
-    element('search-comments').addEventListener('change', refresh);
-    element('format').addEventListener('change', refresh);
-    element('unplayable').addEventListener('change', refresh);
+    element('search-comments').addEventListener('change', () => refresh());
+    element('format').addEventListener('change', () => refresh());
+    element('unplayable').addEventListener('change', () => refresh());
     element('browse').addEventListener('change', () => {
         element('folders').hidden = !element('browse').checked;
         element('body').classList.toggle('browsing', element('browse').checked);
@@ -422,6 +454,59 @@ export function createLibraryView({ playlist, play }) {
     viewport.addEventListener('scroll', hidePopover, { passive: true });
     viewport.addEventListener('scroll', scheduleRows, { passive: true });
     new ResizeObserver(scheduleRows).observe(viewport);
+    function renderOptions() {
+        const select = element('format');
+        const selected = select.value;
+        const options = formatOptions(context.library, selected);
+        const key = options.map(option => option.value).join('|');
+        if (select.dataset.options !== key) {
+            select.replaceChildren(new Option('All formats', ''), ...options.map(option => new Option(option.label, option.value)));
+            select.dataset.options = key;
+            select.value = selected;
+        }
+        element('comments-toggle').hidden = !context.library.hasComments;
+        element('unplayable-count').textContent = unplayableCount(context.library).toLocaleString('en-US');
+    }
+    function renderProgress() {
+        const status = context.discoveryStatus;
+        const discovered = context.mode === 'discovered' && !!status;
+        element('progress').hidden = !discovered;
+        element('metadata-hint').hidden = !discovered;
+        // Source controls own Browse folder visibility, including indexed local sources.
+        for (const name of ['stop-discovery', 'resume-discovery', 'retry-discovery', 'scan-metadata', 'cancel-metadata']) element(name).hidden = !discovered;
+        const issues = discovered ? status.issues : context.library.issues ?? [];
+        const issuePane = element('issues');
+        const issuesKey = JSON.stringify(issues);
+        issuePane.hidden = !issues.length;
+        if (issuePane.dataset.issues !== issuesKey) {
+            issuePane.dataset.issues = issuesKey;
+            const summary = node('summary', `${issues.length.toLocaleString('en-US')} library issues`);
+            const list = node('ul');
+            for (const issue of issues) list.append(node('li', `${issue.path ?? `Line ${issue.line}`}: ${issue.reason}`));
+            issuePane.replaceChildren(summary, list);
+        }
+        if (!discovered) return;
+        element('progress').textContent = progressText(status);
+        const hint = metadataHint(status);
+        element('metadata-hint').textContent = hint;
+        element('metadata-hint').hidden = !hint;
+        element('stop-discovery').hidden = status.phase !== 'running';
+        element('resume-discovery').hidden = status.phase !== 'paused';
+        element('retry-discovery').hidden = status.phase !== 'failed' && !status.runtimeError;
+        element('retry-discovery').title = status.runtimeError ? 'Retry failed background worker jobs' : 'Retry discovery';
+        const scanning = ['running', 'waiting', 'suspended'].includes(status.metadataPhase);
+        element('scan-metadata').hidden = scanning;
+        element('scan-metadata').disabled = !status.metadataIncomplete;
+        element('cancel-metadata').hidden = !scanning;
+    }
+    function incremental() {
+        renderOptions();
+        // Use the model's deterministic locator tie-break through search().
+        tree = buildTree(context.library);
+        if (element('browse').checked) renderTree(true);
+        refresh(true);
+        renderedRevision = context.library.revision;
+    }
     return {
         setLibrary(next) {
             context = next;
@@ -437,12 +522,31 @@ export function createLibraryView({ playlist, play }) {
             element('folders').hidden = true;
             element('body').classList.remove('browsing');
             element('search').value = '';
-            element('format').replaceChildren(new Option('All formats', ''), ...[...new Set(context.library.rows.map(row => row.format))].sort().map(format => new Option(format.toUpperCase(), format)));
+            element('format').value = '';
+            delete element('format').dataset.options;
+            renderOptions();
+            renderProgress();
+            renderedRevision = context.library.revision;
             element('browser').hidden = false;
             element('panel').open = true;
             refresh();
         },
-        refreshComments() { detailsKey = null; element('comments-toggle').hidden = !context.library.hasComments; refresh(); },
+        updateLibrary(next, change = {}) {
+            if (next !== context) return;
+            if (change.changedRowIds?.length || context.library.revision !== renderedRevision || change.metadataUpdates?.length) incremental();
+            renderProgress();
+            // Discovery state changes also update snapshot labels without rebuilding the tree.
+            for (const item of treeItems()) {
+                const incomplete = context.discoveryStatus && context.discoveryStatus.phase !== 'complete';
+                item.setAttribute('aria-label', `${item.dataset.label}, ${Number(item.dataset.trackCount).toLocaleString('en-US')} ${incomplete ? 'discovered ' : ''}tracks`);
+            }
+            for (const button of element('tree').querySelectorAll('[data-tree-add]')) {
+                const path = button.closest('[data-scope]').dataset.scope;
+                button.title = folderAddLabel(path, context.discoveryStatus);
+                button.setAttribute('aria-label', button.title);
+            }
+        },
+        refreshComments() { if (context) { incremental(); renderProgress(); } },
         setPlaying(id) { playing = id; if (id !== null) reveal(id); renderRows(); },
     };
 }

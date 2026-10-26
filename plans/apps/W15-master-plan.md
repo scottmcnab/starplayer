@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation in progress — A/B/C/D1/D2 reviewed and integrated; E/F dispatched |
+| Status | Implementation in progress — E reviewed and integrated; F combined verification pending |
 | Coordinator | gpt-6.1-sol, **xhigh** effort |
 | Workers | gpt-6.1-sol, **high** effort for all tasks |
 | Planning branch | `library-folder-plan` |
@@ -252,3 +252,7 @@ D2 is reviewed and integrated with 165/165 web Node tests and WASM/import checks
 passed. Coordinator review repaired stale SHA/sidecar summary handling and found
 the producer idle-crash follow-up above. E/F now run concurrently from this
 integrated lifecycle; G remains gated on both reviewed UI/app changes.
+
+E is reviewed and integrated: 173/173 web Node tests, 12/12 view/helper tests and
+14/14 web Rust tests passed. Browser scroll/focus and the eight named DOM scenarios
+remain explicitly with G. F now verifies against integrated E before its landing.

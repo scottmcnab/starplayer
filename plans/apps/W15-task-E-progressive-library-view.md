@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — not started |
+| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library`; DOM gate assigned to G |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | D2 integrated; parallel with F |
@@ -74,3 +74,16 @@ rerun Rust tests after F integrates it.
 
 app.js/playlist-controls wiring, source controls logic, worker lifecycle, producer
 model changes, headless harness, unrelated UI redesign.
+
+## Verification evidence (2026-10-26)
+
+Worker passed full web Node suite 173/173, view/helper tests 12/12, web Rust tests
+14/14 plus docs, JS syntax checks and `git diff --check`. Coordinator independently
+passed the 12 view/helper tests and reviewed the full production/help/test diff.
+No Rust HTML assertion changes were needed; only F edits source-contract tests.
+
+`updateLibrary` preserves view state and ignores obsolete contexts; progress and
+issues remain separate from D2-owned summary text. Live unplayable count excludes
+playable metadata errors. Retry callbacks capture their originating context.
+G must execute all eight mandatory Chromium scenarios above, with the live count
+in E-error-details. Helper tests establish calculations only, not DOM acceptance.
