@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation in progress — A/B/C dispatched |
+| Status | Implementation in progress — A/B/C reviewed and integrated; D1 dispatched |
 | Coordinator | gpt-6.1-sol, **xhigh** effort |
 | Workers | gpt-6.1-sol, **high** effort for all tasks |
 | Planning branch | `library-folder-plan` |
@@ -229,7 +229,11 @@ Execution started 2026-10-26 from planning commit `3c59350`. Integration is
 `w15-folder-library` in `../starplayer-w15-folder-library`; task worktrees follow
 the branch names above. The owner’s uncommitted GPT-6.1-sol edit to `AGENTS.md`
 is preserved in planning and execution worktrees and excluded from implementation
-commits. A/B/C are dispatched to GPT-6.1-sol workers at high effort.
+commits. All tasks use GPT-6.1-sol workers at high effort. A and C have been reviewed and
+integrated as single-change squash commits (`72c15ea`, `f9fc9ec`). Their focused
+tests also pass together in the integration checkout. B is reviewed and integrated; its archive/web Rust tests were independently
+rerun by the coordinator. D1 now starts from the integrated producer contracts. Baseline web Node tests passed 78/78 with localhost
+permissions (the sandbox-only dev-server failure was environmental).
 
 Manual native-picker permissions, a real large folder, and loose/nested playlist
 reconnect after reload remain owner acceptance, pending automated integration gates.

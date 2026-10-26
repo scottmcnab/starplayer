@@ -166,6 +166,39 @@ fn archive_module_records(bytes: &[u8]) -> Result<String, ArchiveError> {
     Ok(records)
 }
 
+fn format_token(format: ModuleFormat) -> &'static str {
+    match format { ModuleFormat::Mod => "mod", ModuleFormat::S3m => "s3m", ModuleFormat::Mtm => "mtm", ModuleFormat::Xm => "xm", ModuleFormat::It => "it" }
+}
+
+fn archive_catalog_json(bytes: &[u8]) -> Result<String, String> {
+    let catalog = starplayer_archive::catalog(bytes).map_err(|error| error.to_string())?;
+    let entries: Vec<_> = catalog.entries.into_iter().map(|entry| {
+        let starplayer_archive::CatalogKind::Module(format) = entry.member.kind else { unreachable!("catalog contains only modules") };
+        let raw_hex: String = entry.member.raw_name.iter().map(|byte| format!("{byte:02x}")).collect();
+        serde_json::json!({
+            "containerMember": entry.container_member, "memberPath": entry.member.name,
+            "rawHex": raw_hex, "size": entry.member.size, "format": format_token(format),
+            "playable": entry.member.error.is_empty(), "error": entry.member.error,
+        })
+    }).collect();
+    let issues: Vec<_> = catalog.issues.into_iter().map(|issue| serde_json::json!({"path": issue.path, "reason": issue.reason})).collect();
+    serde_json::to_string(&serde_json::json!({"entries": entries, "issues": issues})).map_err(|error| error.to_string())
+}
+
+fn module_metadata_json() -> Result<String, String> {
+    MODULE.with(|cell| {
+        let slot = cell.try_borrow().map_err(|_| String::from("the page-side loader is busy"))?;
+        let module = slot.as_ref().ok_or_else(|| String::from("no module has been inspected"))?;
+        let instrument_names = module.instruments().iter().map(|instrument| instrument.name.as_ref()).collect::<Vec<_>>().join("\n");
+        let sample_names = module.samples().iter().map(|sample| sample.name()).collect::<Vec<_>>().join("\n");
+        serde_json::to_string(&serde_json::json!({
+            "format": format_token(module.header().format), "title": module.header().title.as_ref(),
+            "channels": module.header().channel_count, "instrumentNames": instrument_names,
+            "sampleNames": sample_names, "songMessage": "",
+        })).map_err(|error| error.to_string())
+    })
+}
+
 fn pattern_window_bytes(pattern: u16, first_row: u16, row_count: u16) -> Vec<u8> {
     with_module(Vec::new(), |module| {
         let mut output = Vec::new();
@@ -255,6 +288,18 @@ mod exports {
     #[wasm_bindgen]
     pub fn archive_modules(bytes: &[u8]) -> Result<String, JsValue> {
         archive_module_records(bytes).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Catalog module locators and issues through one inner ZIP level as JSON.
+    #[wasm_bindgen]
+    pub fn archive_catalog(bytes: &[u8]) -> Result<String, JsValue> {
+        archive_catalog_json(bytes).map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Metadata for the retained inspected module, without parsing it again.
+    #[wasm_bindgen]
+    pub fn module_metadata() -> Result<String, JsValue> {
+        module_metadata_json().map_err(|error| JsValue::from_str(&error))
     }
 
     /// Extract one central-directory entry into page-owned module bytes.
@@ -534,4 +579,116 @@ mod tests {
         assert!(extract_path(&bytes, "inner.zip", "x.mod", "").unwrap_err().contains("too large"));
         assert!(extract_nested(&bytes, 0, 0).unwrap_err().contains("too large"));
     }
+
+    fn minimal_xm_metadata() -> Vec<u8> {
+        let mut bytes = vec![0; 336];
+        bytes[..17].copy_from_slice(b"Extended Module: ");
+        bytes[17..26].copy_from_slice(b"native xm");
+        bytes[37] = 0x1A;
+        bytes[38..58].copy_from_slice(b"FastTracker v2.00   ");
+        for (offset, value) in [(58, 0x0104u16), (64, 1), (68, 4), (70, 1), (72, 2), (76, 6), (78, 125)] {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[60..64].copy_from_slice(&276u32.to_le_bytes());
+        bytes.extend_from_slice(&[9, 0, 0, 0, 0, 64, 0, 0, 0]);
+        let mut empty_instrument = vec![0; 33];
+        empty_instrument[..4].copy_from_slice(&33u32.to_le_bytes());
+        bytes.extend_from_slice(&empty_instrument);
+        let mut instrument = vec![0; 263];
+        instrument[..4].copy_from_slice(&263u32.to_le_bytes());
+        instrument[4..9].copy_from_slice(b"lead\"");
+        instrument[27..29].copy_from_slice(&2u16.to_le_bytes());
+        instrument[29..33].copy_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&instrument);
+        bytes.extend_from_slice(&[0; 40]);
+        let mut sample = [0; 40];
+        sample[18..25].copy_from_slice(b"sample\"");
+        bytes.extend_from_slice(&sample);
+        bytes
+    }
+
+    fn minimal_it_metadata() -> Vec<u8> {
+        let mut bytes = vec![0; 192 + 1 + 4 * 6];
+        bytes[..4].copy_from_slice(b"IMPM");
+        bytes[4..13].copy_from_slice(b"native it");
+        for (offset, value) in [(32, 1u16), (34, 3), (36, 3), (40, 0x0214), (42, 0x0214), (44, 5)] {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[48..52].copy_from_slice(&[128, 48, 6, 125]);
+        bytes[192] = 255;
+        let instrument_offset = bytes.len() as u32;
+        bytes[197..201].copy_from_slice(&instrument_offset.to_le_bytes());
+        let mut instrument = vec![0; 554];
+        instrument[..4].copy_from_slice(b"IMPI");
+        instrument[24] = 128;
+        instrument[32..37].copy_from_slice(b"lead\"");
+        bytes.extend_from_slice(&instrument);
+        let sample_offset = bytes.len() as u32;
+        bytes[209..213].copy_from_slice(&sample_offset.to_le_bytes());
+        let mut sample = vec![0; 80];
+        sample[..4].copy_from_slice(b"IMPS");
+        sample[17] = 64;
+        sample[19] = 48;
+        sample[20..27].copy_from_slice(b"sample\"");
+        sample[60..64].copy_from_slice(&22050u32.to_le_bytes());
+        bytes.extend_from_slice(&sample);
+        bytes
+    }
+
+    #[test]
+    fn structured_module_metadata_requires_an_inspected_module_and_reports_busy_state() {
+        MODULE.with(|cell| *cell.borrow_mut() = None);
+        assert!(module_metadata_json().unwrap_err().contains("no module"));
+        MODULE.with(|cell| {
+            let _borrow = cell.borrow_mut();
+            assert!(module_metadata_json().unwrap_err().contains("busy"));
+        });
+    }
+
+    #[test]
+    fn structured_module_metadata_reports_all_native_formats_and_preserves_empty_slots() {
+        let mut mod_bytes = minimal_mod();
+        mod_bytes[20..25].copy_from_slice(b"lead\"");
+        let mod_names = format!("lead\"{}", "\n".repeat(30));
+        let cases = [
+            (mod_bytes, "mod", "native mod", 4, mod_names.as_str(), mod_names.as_str()),
+            (minimal_mtm(), "mtm", "native mtm", 1, "sample", "sample"),
+            (minimal_xm_metadata(), "xm", "native xm", 4, "\nlead\"", "\nsample\""),
+            (minimal_it_metadata(), "it", "native it", 1, "\nlead\"\n", "\nsample\"\n"),
+        ];
+        for (bytes, format, title, channels, instrument_names, sample_names) in cases {
+            inspect(&bytes).unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(&module_metadata_json().unwrap()).unwrap();
+            assert_eq!(metadata, serde_json::json!({"format": format, "title": title, "channels": channels, "instrumentNames": instrument_names, "sampleNames": sample_names, "songMessage": ""}));
+        }
+        inspect(FIXTURE).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&module_metadata_json().unwrap()).unwrap();
+        assert_eq!(metadata["format"], "s3m");
+        assert_eq!(metadata["title"], "Reflex");
+        assert_eq!(metadata["channels"], 3);
+        assert!(metadata["instrumentNames"].as_str().unwrap().ends_with("  jedi@tartarus.uwa.edu.au"));
+        assert!(metadata["sampleNames"].as_str().unwrap().starts_with("This module started almost\n"));
+        assert_eq!(metadata["songMessage"], "");
+        let before = module_metadata_json().unwrap();
+        assert!(inspect(b"invalid").is_err());
+        assert_eq!(module_metadata_json().unwrap(), before);
+    }
+
+    #[test]
+    fn archive_catalog_json_preserves_exact_names_and_legacy_raw_bytes() {
+        let mut inner = test_archive("xx.mod", b"module");
+        patch_cp437_name(&mut inner);
+        let outer = test_archive("quotes\"\n.zip", &inner);
+        let json = archive_catalog_json(&outer).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, serde_json::json!({"entries": [{"containerMember": "quotes\"\n.zip", "memberPath": "é.mod", "rawHex": "c3a92e6d6f64", "size": 6, "format": "mod", "playable": true, "error": ""}], "issues": []}));
+        assert_eq!(extract_path(&outer, "quotes\"\n.zip", "├⌐.mod", "c3a92e6d6f64").unwrap(), b"module");
+        let direct = test_archive("quotes\"\n.it", b"abc");
+        let parsed: serde_json::Value = serde_json::from_str(&archive_catalog_json(&direct).unwrap()).unwrap();
+        assert_eq!(parsed["entries"][0]["memberPath"], "quotes\"\n.it");
+        assert_eq!(parsed["entries"][0]["format"], "it");
+        assert_eq!(parsed["entries"][0]["containerMember"], "");
+        assert!(archive_catalog_json(b"not a zip").unwrap_err().contains("not a ZIP"));
+    }
+
 }

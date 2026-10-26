@@ -2237,6 +2237,7 @@ dependencies = [
 name = "starplayer-web"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "starplayer",
  "starplayer-archive",
  "wasm-bindgen",

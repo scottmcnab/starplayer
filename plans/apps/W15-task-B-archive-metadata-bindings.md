@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — not started |
+| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library` |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | None; parallel with A and C |
@@ -69,3 +69,19 @@ wasm` to verify bindings; hand D1 the exact JSON field contract and failure beha
 
 Worker JS, app/view wiring, metadata hashing, engine DSP/timing, new song-message
 model fields, changed ZIP upload APIs, unrelated Rust formatting, historical assembly.
+
+## Verification evidence (2026-10-26)
+
+Worker and coordinator independently ran archive/web Rust tests: archive 30 passed,
+one existing ignored; web 14 passed; doc tests passed. Worker also passed
+`cargo xtask wasm`, scoped all-target clippy with warnings denied, and
+`git diff --check`. Generated bindings contain both specified exports.
+
+Cataloging reads central-directory metadata without inflating modules, traverses
+one inner ZIP level, and preserves valid results around inner errors. Classic and
+ZIP64 duplicate records retain the first payload consistently through catalog,
+lookup and extraction; malformed-directory mutations are tested for panic freedom.
+The normal archive path borrows bytes. Duplicate-bearing archives normalize their
+directory/footer while preserving local-data offsets; unknown duplicate footer
+layouts fail explicitly. Metadata covers all five formats, original empty name
+slots and no-inspected-module/busy errors. Shared JSON schemas are unchanged.
