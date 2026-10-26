@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library`; DOM gate assigned to G |
+| Status | Complete — reviewed and integrated on `w15-folder-library`; final automated acceptance passed |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | D2 integrated; parallel with F |
@@ -85,5 +85,11 @@ No Rust HTML assertion changes were needed; only F edits source-contract tests.
 `updateLibrary` preserves view state and ignores obsolete contexts; progress and
 issues remain separate from D2-owned summary text. Live unplayable count excludes
 playable metadata errors. Retry callbacks capture their originating context.
-G must execute all eight mandatory Chromium scenarios above, with the live count
-in E-error-details. Helper tests establish calculations only, not DOM acceptance.
+G executed all eight mandatory Chromium scenarios above in SAB/fallback/plain,
+including the live count in E-error-details. Helper tests establish calculations
+only; G supplies the actual DOM acceptance.
+
+Final integrated automated acceptance passed in G, including all three browser
+modes and full 11-job repository CI. Remaining manual owner acceptance is recorded
+in the [master](W15-master-plan.md). This task is archived with the completed
+integration deliverable; `main` was not merged or deployed.

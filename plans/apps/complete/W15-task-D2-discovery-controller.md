@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library` |
+| Status | Complete — reviewed and integrated on `w15-folder-library`; final automated acceptance passed |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | A, C and D1 integrated (D1 includes B) |
@@ -113,3 +113,8 @@ Root/worker retry preserves pause and avoids resubmitting completed locators.
 Before-row metadata notifications remain partial patches for F. E must retain
 D2-controlled Browse folder visibility for indexed local contexts, never write
 `library-summary`, and render separate progress/issues/per-row retry surfaces.
+
+Final integrated automated acceptance passed in G, including all three browser
+modes and full 11-job repository CI. Remaining manual owner acceptance is recorded
+in the [master](W15-master-plan.md). This task is archived with the completed
+integration deliverable; `main` was not merged or deployed.

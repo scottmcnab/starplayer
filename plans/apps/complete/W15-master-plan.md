@@ -2,10 +2,12 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation in progress — A through F reviewed and integrated; G final acceptance running |
+| Status | Complete on `library-folder-plan` — automated gates passed; manual owner acceptance pending |
 | Coordinator | gpt-6.1-sol, **xhigh** effort |
 | Workers | gpt-6.1-sol, **high** effort for all tasks |
 | Planning branch | `library-folder-plan` |
+| Integration branch / worktree | `w15-folder-library` / `../starplayer-w15-folder-library` |
+| Completed history branch / worktree | `library-folder-plan` / `../starplayer-library-folder-plan` |
 | Behavioral specification | [Folder library specification](W15-task-folder-library-discovery.md) |
 | Deliverable | Progressive local folder/ZIP libraries, lazy metadata, usable saved playlists |
 
@@ -225,41 +227,104 @@ informational status that must not block playback. Record verification and remai
 manual native-picker/real-library acceptance in this master. Planning-only validation
 is document links, ownership/dependency checks and external review, not feature tests.
 
-## Implementation evidence
+## Final implementation and verification evidence (2026-10-26)
 
-Execution started 2026-10-26 from planning commit `3c59350`. Integration is
-`w15-folder-library` in `../starplayer-w15-folder-library`; task worktrees follow
-the branch names above. The owner’s uncommitted GPT-6.1-sol edit to `AGENTS.md`
-is preserved in planning and execution worktrees and excluded from implementation
-commits. All tasks use GPT-6.1-sol workers at high effort. A and C have been reviewed and
-integrated as single-change squash commits (`72c15ea`, `f9fc9ec`). Their focused
-tests also pass together in the integration checkout. B is reviewed and integrated; its archive/web Rust tests were independently
-rerun by the coordinator. D1 now starts from the integrated producer contracts. Baseline web Node tests passed 78/78 with localhost
-permissions (the sandbox-only dev-server failure was environmental).
+All eight task deliverables are reviewed, committed and integrated on
+`w15-folder-library` in `/home/scott/projects/starplayer-w15-folder-library`.
+At the owner's request, the completed history was cleaned up and rebased onto
+`library-folder-plan` in `/home/scott/projects/starplayer-library-folder-plan`;
+both branches retain the same completed history. The rebased tree was verified
+byte-identical to the tested tree before updating this plan and the plan index.
+The authorized implementation deliverable is complete; only the manual owner
+acceptance below remains. This archive records completion on the integration
+branch, not a merge into `main` or a deployment. Nothing was pushed or deployed.
 
-Manual native-picker permissions, a real large folder, and loose/nested playlist
-reconnect after reload remain owner acceptance, pending automated integration gates.
+A/B/C ran concurrently; D1 followed reviewed B, D2 followed all prerequisites,
+E/F ran concurrently, and G verified the combined feature. Each worker used
+GPT-6.1-sol at high effort and left commits/integration to the coordinator.
+All single-change task branches were integrated as explicit single-change squash
+commits. Coordinator review also found and fixed idle-worker crash reporting:
+queued or next work now exposes one `worker-failed` result for explicit Retry.
+No producer JSON schema changed.
 
-D1 is reviewed and integrated after an independent 37/37 runtime/resolver test
-run. Worker assets and actual generated-WASM endpoint smoke checks passed. D2
-starts from all integrated prerequisites; E/F remain gated on its review.
+| Verification gate | Final result |
+|---|---|
+| `node --test apps/starplayer-web/test/*.test.mjs` | 200 passed; independently repeated in the final integration checkout |
+| `cargo test -p starplayer-archive` | 30 passed; one pre-existing manual archive-writer generator ignored; doc tests passed |
+| `cargo test -p starplayer-web` | 15 passed; doc tests passed |
+| `cargo xtask wasm` | Passed; all flat worker/discovery/view imports packaged |
+| `STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs` | Frozen, unfiltered SAB, forced postMessage fallback and plain suites passed |
+| `cargo xtask wasm --pages` | Passed; no deployment |
+| `STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --pages-smoke` | Shipped isolation shim and real nested catalog/metadata worker passed under local `/starplayer/` without server isolation headers |
+| `cargo xtask ci` | All 11 jobs passed: host tests, conformance, RT safety, goldens, SIMD, FMA checks, zero-cost trace, WASM, bare-metal no_std, Clippy and feature purity |
+| Final diff, scope and policy checks | Passed; historical assembly untouched, no cargo fmt, attribution or broad staging |
 
-Coordinator review found and fixed idle-worker failure reporting before D2
-integration. The producer follow-up and independent runtime/resolver rerun pass
-43/43 tests; queued/next work reports one failure and remaining jobs stay suspended.
+Every browser mode passed all eight named E DOM cases, real OPFS/isSameEntry and
+IndexedDB reload, A–B–A identity, CSV gain/bypass, ordinary/nested ZIP worker
+catalog/metadata/hash, natural playlist advance before discovery and after a
+complete scan has not listed a saved locator, rebind and display provenance,
+worker crash/startup failure/Retry, metadata cancellation, scan arrivals while
+walking is paused, and stale source results. Existing indexed, remote, upload,
+playback and store regressions remain enabled and passed.
 
-D2 is reviewed and integrated with 165/165 web Node tests and WASM/import checks
-passed. Coordinator review repaired stale SHA/sidecar summary handling and found
-the producer idle-crash follow-up above. E/F now run concurrently from this
-integrated lifecycle; G remains gated on both reviewed UI/app changes.
+The directory and FileList stress cases each discovered 40,000 tracks in every
+mode. Usable rows appeared before completion, heartbeats interleaved, visible row
+DOM stayed at 18 elements, focus/scroll survived, and discovery/selection/add read
+zero loose module contents. A delayed archive barrier proved input and add actions
+worked before the archive read was released. These are coordinated progress
+checks, not hardware-specific latency promises.
 
-E is reviewed and integrated: 173/173 web Node tests, 12/12 view/helper tests and
-14/14 web Rust tests passed. Browser scroll/focus and the eight named DOM scenarios
-remain explicitly with G. F now verifies against integrated E before its landing.
+The first CI attempt lacked G's local pinned conformance corpus. Copying the
+approved prepared cache into its own target and rerunning the entire CI gate
+passed; no assertion or job was disabled. Pages smoke accounts explicitly for
+optional fixture-manifest/library-probe 404s and rejects missing required assets
+or unexpected diagnostics. Coordinator reviewed all task diffs and final logs;
+the final integration source matches G's tested implementation. Logs are retained
+locally under `/tmp/starplayer-w15-g-evidence/`; the independent integration Node
+run is `/tmp/w15-integration-final-node.log`.
 
-F is reviewed and integrated after the combined E/F gate: 200/200 Node tests,
-15/15 web Rust tests and WASM packaging passed. Coordinator independently passed
-51 playlist/playback/app tests and reviewed snapshot timing, same-identity source
-replacement, partial metadata patches, persistence and informational playback gates.
-G now verifies the fully integrated feature with actual Chromium workers/handles,
-Pages packaging and complete repository CI; no deployment/main merge is authorized.
+The owner's `AGENTS.md` model-selection edit is byte-preserved, unstaged and
+excluded from every implementation commit, in planning and execution worktrees.
+
+## Commit summary
+
+Implementation/review commits from the original planning tip are below. The
+kickoff/review-gate record is folded into the model commit, and the idle-worker
+failure correction is folded into the worker-runtime commit. The final plan
+archive/status change is recorded in the following documentation commit.
+
+| Commit | Change |
+|---|---|
+| `8db48c4` | Add incremental discovered-library rows and metadata indexes; record kickoff and review gates |
+| `4e3f4a4` | Discover local folder files and preserve folder identities |
+| `015c52d` | Expose structured ZIP catalogs and inspected module metadata |
+| `a40cad2` | Run library catalog and metadata jobs in an isolated worker, including idle failure reporting |
+| `2dd5cdd` | Discover folder libraries progressively and manage lazy metadata |
+| `c18aff4` | Preserve library view state during progressive discovery |
+| `5815147` | Keep saved playlists playable during folder discovery and enrichment |
+| `8543d91` | Verify folder libraries in Chromium and document usage |
+
+## Material limits
+
+- Recognition remains extension-based MOD/S3M/MTM/XM/IT plus ZIP; one inner ZIP
+  level, 128 MiB source files and 64 MiB extracted entries. Deeper or unusable
+  containers/entries retain issues. Unknown duplicate-bearing ZIP footer layouts
+  fail explicitly; classic/ZIP64 first-entry handling is tested.
+- Catalog and folder metadata stay in memory. Reconnect enumerates again; there
+  is no persistent catalog, filesystem watcher or automatic disk write.
+- Module inspection supplies instrument/sample names, not song messages. Messages
+  remain searchable through sidecars or inline indexed CSV fields.
+- Handle/identity persistence depends on browser storage and permission support.
+  FileList and storage-denied selections use session identities; the fallback
+  picker's initial browser-controlled enumeration delay remains.
+
+## Remaining manual owner acceptance
+
+- [ ] Exercise the native directory picker and real grant/deny/reconnect permission
+  prompts; confirm cancelling a picker preserves the active library.
+- [ ] Open a real large index-free folder, browse/search/play/add during discovery,
+  and use Stop/Resume while ZIP discovery is pending.
+- [ ] Build and replay a playlist containing loose, outer-ZIP and nested-ZIP tracks;
+  reload and reconnect the real folder, including playback before rows reappear.
+- [ ] Exercise the target browser's native FileList fallback or storage-denied path,
+  reselect the folder and explicitly rebind after discovery completes.

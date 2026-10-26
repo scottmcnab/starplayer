@@ -3,12 +3,12 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library |
-| Status | Specified — implementation not started |
-| Depends on | W7–W13 library, resolver, view and playlist work (in `complete/`) |
+| Status | Complete on `w15-folder-library` — automated gates passed; manual owner acceptance pending |
+| Depends on | W7–W13 library, resolver, view and playlist work (alongside this archive) |
 | Role | Behavioral specification; execute through [W15 master](W15-master-plan.md) |
 | Coordinator | gpt-6.1-sol, xhigh effort |
 | Workers | gpt-6.1-sol, high effort; eight tasks in master |
-| Branch | `library-folder-plan` (planning only) |
+| Branch | `w15-folder-library` (integration; not merged to `main`) |
 | Verification | Web unit/headless tests, archive/web Rust tests, WASM packaging, repository CI |
 
 This document retains the reviewed product behavior. The [master plan](W15-master-plan.md)
@@ -300,3 +300,10 @@ Implementation in this planning commit; HTTP directory discovery; extracting son
 or metadata caching; filesystem watching; archive formats/depths beyond existing ZIP
 support; sniffing extensionless/misnamed files; automatically writing an index to disk;
 engine/audio-path changes; deployment or merge to main.
+
+## Delivery evidence
+
+The complete implementation and all automated gates passed on the integration
+branch. See [W15 master](W15-master-plan.md) for commit summary, exact verification
+results, material limits and the remaining manual owner checks. No main merge,
+push or deployment was performed.

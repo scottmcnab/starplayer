@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library`; browser gate assigned to G |
+| Status | Complete — reviewed and integrated on `w15-folder-library`; final automated acceptance passed |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | D2 integrated; parallel with E; final app check after E |
@@ -94,5 +94,10 @@ before resolution; activation snapshots structured metadata before any await and
 publishes it only after commit/context/identity guards. Enrichment is optional and
 borrows retained playback bytes. Partial before-row patches update all matching
 legacy/unknown entries without no-op saves. Informational discovery statuses never
-gate matching-folder playback; rebind waits for complete discovery. G must run
-the extended real IndexedDB store helper and explicit/advance/reconnect scenarios.
+gate matching-folder playback; rebind waits for complete discovery. G passed the extended real IndexedDB store helper and the
+explicit/advance/reconnect scenarios in all three browser modes.
+
+Final integrated automated acceptance passed in G, including all three browser
+modes and full 11-job repository CI. Remaining manual owner acceptance is recorded
+in the [master](W15-master-plan.md). This task is archived with the completed
+integration deliverable; `main` was not merged or deployed.

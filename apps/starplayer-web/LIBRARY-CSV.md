@@ -1,5 +1,11 @@
 # Library and playlist CSV contract
 
+A local library folder can be opened without an index. Directory handles discover
+files progressively; loose MOD/S3M/MTM/XM/IT entries appear by filename without
+reading module contents. ZIP files are catalogued automatically in a background
+worker, including one inner ZIP level. Results are usable while discovery continues.
+Selecting tracks or adding them to a playlist reads no module contents.
+
 A library index locates modules beneath a library root. Put it at the root as
 `index.csv` for automatic discovery, or open it separately with **Open index CSV…**. ModDNA's `hornet_index.py` output loads unchanged.
 The index never requires a download URL or an absolute filesystem path.
@@ -96,7 +102,8 @@ is ignored.
 Folder scope includes that folder and its descendants. Sort columns are `name`,
 `title`, `format`, `channels`, `size`, `timestamp`, `folder`. Text sort keys are
 lower-case lexical strings, computed at parse time; ties use folder, then name,
-then original row order. Null numeric values sort first in ascending order.
+then the case-sensitive full locator tuple. Null numeric values sort first in
+ascending order.
 `buildTree` returns a root node at path `''`, with nested `children`; each node has
 `path`, `label`, `kind` (`dir`, `zip`, `nested`) and recursive playable `trackCount`.
 
@@ -118,14 +125,43 @@ library names; identity rebinding and persistence are described below.
 
 Use **Open library folder** to select the root. The player prefers a root
 `index.csv` (case-insensitive), otherwise the only root index candidate (excluding comments CSVs), or offers a choice
-when several exist. **Open index CSV…** selects an index stored elsewhere; then
+when several exist. Candidates require a `source_path` header; playlist-shaped CSVs
+with a `library` column are excluded from automatic selection, even if named
+`index.csv`. A folder without an index enters discovery directly. **Browse folder
+without an index** bypasses a valid or pending index; a malformed index reports its
+error and offers **Browse folder instead** rather than silently switching modes.
+**Open index CSV…** selects an index stored elsewhere; then
 click **Open library folder** separately to grant access to its files.
 
 Chromium's directory picker requires a secure context (localhost or HTTPS). Its
 read-only handle is stored in IndexedDB when available; after reloading, click
 **Reconnect <name>** to request read permission again. Other browsers use a folder
 file input: this selection cannot be restored, so choose the folder again after
-every reload. No library files are uploaded to a server.
+every reload. Its picker finishes enumerating the folder before delivering the
+FileList; that initial browser-controlled wait cannot be removed. Application
+processing afterward yields to keep controls responsive. No library files are
+uploaded to a server.
+
+**Stop discovery** pauses walking and archive jobs; **Resume discovery** continues
+without duplicating rows. Partial folder-tree **+** actions say **Add discovered
+tracks in …** and add the click-time snapshot. Later discoveries are never appended
+to the playlist automatically. Source replacement cancels old work; cancelling the
+picker preserves the current library.
+
+Filename results initially have unknown title, channel count and comments. Playback
+reads only its selected module and enriches its matching row and playlist entries.
+**Scan metadata** explicitly reads eligible modules in a worker, computes hashes and
+updates search/filter results without replacing the playing module. **Cancel metadata scan**
+stops that optional work. Known-row inspection continues while discovery is paused;
+scan completion waits
+until discovery finishes and the inspection queue is empty.
+Inspection failures remain playable, show error details/tooltips and offer **Retry
+metadata**. Worker failures have a separate **Retry** control. Known unextractable
+archive members remain visible through **Show unplayable** and its live count.
+Each source file read is limited to 128 MiB. ZIP member extraction is limited to
+64 MiB; unsupported/encrypted members and
+container failures retain explanations. Invalid paths and unreadable folders are
+skipped with a path-based issue list; a root failure offers discovery retry.
 
 For a local HTTP source, run `cargo xtask serve --library <directory>` and select
 **Server library**. The default index is `<directory>/index.csv`; supply
@@ -140,9 +176,29 @@ files are omitted, and the status message reports the number skipped. The CSV
 contains locators, not module bytes. It can also be opened as a small library index.
 
 **Import playlist** appends rows bound to the currently open library. Missing keys
-are reported and retained as unavailable. Opening another index offers **Rebind N
+are reported and retained. For a matching discovered folder, **not yet discovered**
+and, after completion, **not found in scan** are informational: explicit playback
+and advance still try the saved locator. Actual read/extraction errors decide whether
+it plays. Indexed-library entries absent from their index remain unavailable.
+Opening another index or folder offers **Rebind N
 entries to …** when its keys match; clicking explicitly replaces those entries'
-identities. Rebinding never happens automatically.
+identities. Rebinding never happens automatically. For a discovered folder it stays disabled
+while discovery is running, paused or failed and becomes available only after a
+complete scan, so one click rebinds the complete matching set.
+
+Discovered folders keep an opaque random identity alongside the directory handle in
+IndexedDB, reused when `isSameEntry` confirms a reconnect or reselection. Identical
+display names do not identify folders, and adding/removing files does not change the
+identity. Reconnect re-enumerates the folder; there is no persistent catalog or
+folder metadata cache and no filesystem watcher. FileList selections and unavailable
+storage use session identities; after
+reselection, explicitly rebind relative locators. If a folder gains an index, opening
+it chooses the CSV identity; bypassing that index restores its folder identity.
+
+Playlist export leaves `format_detected` blank for unknown or failed discovered
+metadata and writes the actual parsed format after enrichment. Legacy entries keep
+their previous behavior until enriched. Provisional imported titles/formats can be
+displayed, but do not count as verified metadata.
 
 The browser saves ordered entries, current entry id, loop setting, known library
 identities and uploaded files in IndexedDB. Libraries must be reopened after reload;
@@ -159,7 +215,11 @@ cleared or evicted; CSV export does not back up uploaded bytes.
 
 ## Comments CSV (optional)
 
-A comments sidecar joins author text to index rows by `sha256`. Use UTF-8, RFC 4180
+A comments sidecar joins author text to library rows by `sha256`. Discovery does
+not hash loose modules: sidecar counts show awaiting metadata/hashes until playback
+or an explicit scan supplies them. Sidecars take precedence over extracted names.
+Module inspection extracts instrument/sample names; song messages are available
+only from a sidecar or inline CSV, not from module inspection. Use UTF-8, RFC 4180
 quoting and LF record endings, including quoted multiline fields. The usual header
 is `sha256,format,instrument_names,sample_names,song_message`. Header names are
 trimmed and case-insensitive and can be reordered; unknown columns are ignored,

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library` |
+| Status | Complete — reviewed and integrated on `w15-folder-library`; final automated acceptance passed |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | None; parallel with B and C |
@@ -70,7 +70,7 @@ playlist schema, changes to the user's AGENTS.md edit or any other task's files.
 Worker: source/enumeration/identity tests 25/25 and full web Node suite 96/96
 passed with localhost access; `git diff --check` passed. Coordinator reviewed all
 production and new test files and independently reran the three focused test files
-successfully. Real OPFS/IndexedDB reload verification remains assigned to G.
+successfully. Real OPFS/IndexedDB reload verification passed in G; native picker prompts remain manual.
 
 Handoff: abort throws `AbortError`; retain the async iterator for pause/resume.
 An issue at path `''` is a retryable root-walk failure. Directory enumeration
@@ -78,3 +78,8 @@ uses `size:null`, `timestamp:''` without metadata/content I/O. FileList mapping
 and enumeration yield every 128 entries; its complete map resolves saved locators
 before discovery. `folderIdentity` is exported by both source and identity modules.
 Valid-header/malformed-body CSVs remain candidates for the explicit D2 error UI.
+
+Final integrated automated acceptance passed in G, including all three browser
+modes and full 11-job repository CI. Remaining manual owner acceptance is recorded
+in the [master](W15-master-plan.md). This task is archived with the completed
+integration deliverable; `main` was not merged or deployed.

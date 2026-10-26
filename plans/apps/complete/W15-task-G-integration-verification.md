@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — not started |
+| Status | Complete — reviewed and integrated on `w15-folder-library`; final automated acceptance passed |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | E and F integrated |
@@ -73,3 +73,43 @@ prompts, a real large folder and loose/nested playlist reconnect after reload.
 Deployment, main-branch merge without authorization, actual owner collection scans,
 new product scope, marking unperformed manual tests passed, implementation changes
 outside assigned ownership without coordinator handoff.
+
+## Verification evidence (2026-10-26)
+
+All mandatory commands passed on the fully integrated implementation:
+
+| Gate | Result |
+|---|---|
+| `node --test apps/starplayer-web/test/*.test.mjs` | 200 passed |
+| `cargo test -p starplayer-archive` | 30 passed; one existing manual generator ignored |
+| `cargo test -p starplayer-web` | 15 passed; doc tests passed |
+| `cargo xtask wasm` | Passed; all worker/view/discovery imports packaged |
+| `STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs` | Frozen unfiltered SAB/fallback/plain suites passed |
+| `cargo xtask wasm --pages` | Passed |
+| `STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --pages-smoke` | Shipped shim isolates `/starplayer/`; real nested catalog/metadata and required assets passed |
+| `cargo xtask ci` | All 11 jobs passed, including conformance, RT safety and no_std |
+
+All eight named E DOM scenarios passed in every mode. Real OPFS/isSameEntry and
+IndexedDB reload, A–B–A identity, CSV gain/bypass, natural playlist advance before
+discovery and after complete-not-found, legacy/unknown display provenance, real
+worker crash/startup failure/retry, cancellation, arrivals and stale-source guards
+passed. Both 40,000-row source paths per mode produced usable partial results,
+interleaved heartbeats, 18 visible rows and zero loose-content reads during
+discovery/selection/add; the delayed archive barrier retained responsiveness.
+
+The first CI attempt lacked the worktree-local pinned corpus. Copying the approved
+cache and rerunning the entire CI gate passed; no tests were disabled. Pages smoke
+accounts explicitly for only optional manifest/library-probe 404s while requiring
+worker/loader/WASM/shim assets and rejecting unexpected diagnostics.
+
+Coordinator reviewed all four G paths and exact final logs under
+`/tmp/starplayer-w15-g-evidence/`, checked frozen source hashes and final
+`git diff --check`, and independently ran the E/F real-Chromium library/store
+regression. No production or packaging repair was needed during G. Native picker
+permissions, a real large folder, and real loose/nested playlist reconnect remain
+manual owner acceptance. Nothing was pushed, deployed or merged into main.
+
+Final integrated automated acceptance passed in G, including all three browser
+modes and full 11-job repository CI. Remaining manual owner acceptance is recorded
+in the [master](W15-master-plan.md). This task is archived with the completed
+integration deliverable; `main` was not merged or deployed.

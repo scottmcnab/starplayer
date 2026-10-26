@@ -1,4 +1,6 @@
 import remoteWorker from '../remote-proxy/worker.js';
+import { runW15, runW15View, runW15Stress, runW15Playlist, runW15Runtime } from './w15-headless.mjs';
+import { runPagesSmoke } from './w15-pages-smoke.mjs';
 import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // End-to-end check of the packaged player in headless Chromium, over the DevTools
 // protocol, with Node's built-in `WebSocket` and `http` and nothing else installed.
@@ -16,6 +18,8 @@ import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // a regression in the display is as visible here as a regression in the engine.
 //
 // Usage: node apps/starplayer-web/test/headless.mjs [--seconds 60] [--mode sab|fallback|plain]
+// W15-only: --w15-only, or --w15-case app|view|stress|playlist|runtime.
+// After cargo xtask wasm --pages: --pages-smoke serves a local repository subpath.
 //
 // Exits 0 and prints `headless: skipped` when no Chromium is installed.
 
@@ -38,9 +42,12 @@ const PHONE_VIEWPORT = { width: 390, height: 844 };
 const options = parseArguments(process.argv.slice(2));
 
 function parseArguments(argv) {
-    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false };
+    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false };
     for (let index = 0; index < argv.length; index += 1) {
-        if (argv[index] === '--library-only') parsed.libraryOnly = true;
+        if (argv[index] === '--pages-smoke') parsed.pagesSmoke = true;
+        else if (argv[index] === '--w15-only') parsed.w15Only = true;
+        else if (argv[index] === '--w15-case') { parsed.w15Case = argv[++index]; parsed.w15Only = true; }
+        else if (argv[index] === '--library-only') parsed.libraryOnly = true;
         else if (argv[index] === '--seconds') {
             parsed.seconds = Number(argv[index + 1]);
             index += 1;
@@ -51,6 +58,8 @@ function parseArguments(argv) {
             throw new Error(`unexpected argument \`${argv[index]}\``);
         }
     }
+    if (parsed.w15Case !== null && !['app', 'view', 'stress', 'playlist', 'runtime'].includes(parsed.w15Case)) throw new Error('invalid --w15-case');
+    if (!parsed.modes.every(mode => ['sab', 'fallback', 'plain'].includes(mode))) throw new Error('invalid --mode');
     return parsed;
 }
 
@@ -250,6 +259,7 @@ class Page {
         const page = new Page(socket);
         page.browser = browser;
         page.version = version.Browser;
+        page.profileDirectory = join(process.env.TMPDIR ?? '/tmp', `starplayer-cdp-${port}`);
         await page.send('Runtime.enable');
         await page.send('Log.enable');
         await page.send('Page.enable');
@@ -331,6 +341,7 @@ class Page {
         this.browser.kill('SIGTERM');
         await delay(200);
         this.browser.kill('SIGKILL');
+        await rm(this.profileDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
 }
 
@@ -1770,12 +1781,19 @@ if (executable === null) {
     process.exit(required ? 1 : 0);
 }
 
-for (const mode of options.modes) {
-    if (!options.libraryOnly) {
+if (options.pagesSmoke) {
+    console.log(`pages-smoke ${JSON.stringify(await runPagesSmoke({ Page, executable, dist: DIST, syntheticMod, buildZip }))}`);
+} else for (const mode of options.modes) {
+    if (!options.libraryOnly && !options.w15Only) {
         const report = await run(executable, mode);
         console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);
     }
-    console.log(`remote-library[${mode}] ${JSON.stringify(await runRemoteLibrary(executable, mode))}`);
-    console.log(`library[${mode}] ${JSON.stringify(await runLibrary(executable, mode))}`);
+    if (!options.w15Case || options.w15Case === 'app') console.log(`w15[${mode}] ${JSON.stringify(await runW15({ Page, executable, mode, startDevServer, syntheticMod, buildZip, verifyPlaylistStore }))}`);
+    if (!options.w15Case || options.w15Case === 'view') console.log(`w15-dom[${mode}] ${JSON.stringify(await runW15View({ Page, executable, mode, startDevServer }))}`);
+    if (!options.w15Case || options.w15Case === 'stress') console.log(`w15-stress[${mode}] ${JSON.stringify(await runW15Stress({ Page, executable, mode, startDevServer }))}`);
+    if (!options.w15Case || options.w15Case === 'playlist') console.log(`w15-playlist[${mode}] ${JSON.stringify(await runW15Playlist({ Page, executable, mode, startDevServer, syntheticMod }))}`);
+    if (!options.w15Case || options.w15Case === 'runtime') console.log(`w15-runtime[${mode}] ${JSON.stringify(await runW15Runtime({ Page, executable, mode, startDevServer, syntheticMod }))}`);
+    if (!options.w15Only) console.log(`remote-library[${mode}] ${JSON.stringify(await runRemoteLibrary(executable, mode))}`);
+    if (!options.w15Only) console.log(`library[${mode}] ${JSON.stringify(await runLibrary(executable, mode))}`);
 }
-console.log('headless harness: all modes passed');
+console.log(options.pagesSmoke ? 'headless harness: Pages smoke passed' : 'headless harness: all requested modes passed');
