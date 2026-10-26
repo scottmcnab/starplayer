@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Specified — not started |
+| Status | Implemented and coordinator-reviewed — integrated into `w15-folder-library` |
 | Recommended model | gpt-6.1-sol |
 | Recommended effort | **high** |
 | Depends on | None; parallel with B and C |
@@ -64,3 +64,17 @@ same-page lookups. Provide the exact new test commands in handoff.
 
 UI, app wiring, background archive or metadata jobs, remote directory discovery,
 playlist schema, changes to the user's AGENTS.md edit or any other task's files.
+
+## Verification evidence (2026-10-26)
+
+Worker: source/enumeration/identity tests 25/25 and full web Node suite 96/96
+passed with localhost access; `git diff --check` passed. Coordinator reviewed all
+production and new test files and independently reran the three focused test files
+successfully. Real OPFS/IndexedDB reload verification remains assigned to G.
+
+Handoff: abort throws `AbortError`; retain the async iterator for pause/resume.
+An issue at path `''` is a retryable root-walk failure. Directory enumeration
+uses `size:null`, `timestamp:''` without metadata/content I/O. FileList mapping
+and enumeration yield every 128 entries; its complete map resolves saved locators
+before discovery. `folderIdentity` is exported by both source and identity modules.
+Valid-header/malformed-body CSVs remain candidates for the explicit D2 error UI.
