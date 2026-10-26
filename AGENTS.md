@@ -83,7 +83,7 @@ direction. Task files record *how*; foundation docs record *what and why*.
    to conversation history can execute it from the file alone.
 2. Create a branch and a **sibling worktree** (`../starplayer-<branch>`) so features
    proceed independently.
-3. Delegate implementation to a **GPT-5.6-sol** worker against the task file. The task
+3. Delegate implementation to a **GPT-6.1-sol** worker against the task file. The task
    file's header table names the least-capable model tier safe to hand it to.
 4. Review the diff and run the task's Verification section before committing.
 5. Merge the branch from the target branch's own checkout. A branch carrying more than
