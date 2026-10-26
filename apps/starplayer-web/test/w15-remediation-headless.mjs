@@ -256,6 +256,60 @@ async function regressionScenario(modArray, zipArray, mixedArray) {
     const trappedController=createDiscoveryController({context:trapped,digest,onDigestMetric:metric=>trapMetrics.push(metric),runtimeFactory:options=>createLibraryWorkerRuntime({...options,workerFactory:()=>{const url=first?trapURL:new URL('./library-worker.js',location.href);first=false;return new Worker(url,{type:'module'});}})});
     trappedController.start();await wait(()=>trapped.library.rows.length===3);trappedController.acceptPlaybackMetadata(locate('B.mod'),metadata('survives trap retry cancel'),bytes);trappedController.scanMetadata();await wait(()=>!!trapped.discoveryStatus.runtimeError);check(trapped.library.rows[0].metadataState==='unknown'&&trapped.discoveryStatus.metadataPhase==='suspended','actual trap suspends without corrupt row');
     check(trapped.discoveryStatus.metadataCounts.hashesPending===1,'digest physically spans actual trap');await new Promise(resolve=>setTimeout(resolve,60));check(trapped.library.rows[2].metadataState==='unknown','queued C remains suspended after actual trap');trappedController.retry();await wait(()=>trapped.library.rows[0].metadataState==='ready'&&trapped.library.rows[2].metadataState==='ready');trappedController.cancelMetadata();check(trapped.discoveryStatus.metadataCounts.hashesPending===1,'digest survives actual fatal endpoint and explicit retry');gates.splice(0).forEach(gate=>gate.release());await wait(()=>trapped.library.rows[1].title==='survives trap retry cancel'&&!trapped.discoveryStatus.metadataCounts.hashesPending);check(!trapped.discoveryStatus.runtimeError,'explicit retry clears fatal state');trappedController.dispose();URL.revokeObjectURL(trapURL);
+    // A real archive session delivers A before a trap in B; poisoned cleanup must never mask it.
+    const cleanupCode=`import {startLibraryWorker} from ${JSON.stringify(endpoint)};
+        import * as Loader from ${JSON.stringify(bindings)};
+        await Loader.default({module_or_path:${JSON.stringify(wasm)}});
+        const trap=new WebAssembly.Instance(new WebAssembly.Module(Uint8Array.from(${JSON.stringify(trapModule)}))).exports.trap;
+        class Session {
+            constructor(bytes){this.session=new Loader.ArchiveInspectionSession(bytes);}
+            extract_member(...args){if(args[1]==='B.mod'){this.poisoned=true;trap();}return this.session.extract_member(...args);}
+            free(){if(this.poisoned){self.postMessage({type:'poisoned-free-probe'});throw new Error('recursive use of an object detected which would lead to unsafe aliasing in rust');}this.session.free();}
+        }
+        startLibraryWorker({scope:self,loadLoader:async()=>({...Loader,ArchiveInspectionSession:Session})});`;
+    const cleanupURL=URL.createObjectURL(new Blob([cleanupCode],{type:'text/javascript'}));
+    const cleanupWorkers=[],cleanupReads=[],cleanupDeliveries=[];
+    let cleanupTerminal,cleanupProgress,poisonedFrees=0;
+    const cleanup=context({kind:'filelist',label:'trap cleanup',size:path=>path==='cleanup.zip'?zip.length:bytes.length,
+        readFile:async path=>{cleanupReads.push(path);return path==='cleanup.zip'?zip.slice():bytes.slice();},
+        async *enumerate(){yield {kind:'file',path:'cleanup.zip',size:zip.length,timestamp:''};yield {kind:'file',path:'queued.mod',size:bytes.length,timestamp:''};}},'trap cleanup');
+    const cleanupController=createDiscoveryController({context:cleanup,runtimeFactory:options=>{
+        const runtime=createLibraryWorkerRuntime({...options,workerFactory:()=>{
+            const worker=new Worker(cleanupWorkers.length?new URL('./library-worker.js',location.href):cleanupURL,{type:'module'});
+            const record={terminated:false,jobs:[]};cleanupWorkers.push(record);
+            worker.addEventListener('message',event=>{if(event.data.type==='poisoned-free-probe')poisonedFrees++;if(event.data.type==='error')cleanupTerminal=event.data;});
+            const terminate=worker.terminate.bind(worker),post=worker.postMessage.bind(worker);
+            worker.terminate=()=>{record.terminated=true;terminate();};
+            worker.postMessage=(job,transfer)=>{record.jobs.push({kind:job.kind,members:job.members});post(job,transfer);};
+            return worker;
+        }});
+        return {...runtime,enqueue:(job,hooks)=>{
+            const handle=runtime.enqueue(job,job.kind==='inspect-group'?{...hooks,onMember:frame=>{cleanupDeliveries.push(frame.locator);hooks.onMember(frame);}}:hooks);
+            handle.result.catch(error=>{if(error.code==='worker-failed')cleanupProgress=error.progress.completedTokens;});
+            return handle;
+        }};
+    }});
+    try {
+        cleanupController.start();await wait(()=>cleanup.discoveryStatus.phase==='complete'&&cleanup.library.rows.length===4);
+        cleanupController.scanMetadata();await wait(()=>!!cleanupTerminal||cleanup.discoveryStatus.metadataPhase==='complete');
+        await wait(()=>!!cleanup.discoveryStatus.runtimeError||cleanup.discoveryStatus.metadataPhase==='complete');
+        check(cleanupTerminal?.error.code==='worker-failed'&&cleanupTerminal.error.cause==='wasm-trap'&&cleanupTerminal.error.message==='unreachable','cleanup preserves original fatal endpoint classification');
+        const firstWorker=cleanupWorkers[0],firstGroup=firstWorker.jobs.find(job=>job.kind==='inspect-group');
+        check(poisonedFrees===0&&firstWorker.terminated,'poisoned session is retired without free');
+        check(JSON.stringify(cleanupProgress)===JSON.stringify([firstGroup.members[0].token]),'terminal progress retains only delivered A');
+        const archiveRows=()=>cleanup.library.rows.filter(row=>row.sourcePath==='cleanup.zip');
+        const completedA=archiveRows().find(row=>row.memberPath==='A.mod');
+        check(completedA.metadataState==='ready'&&completedA.sha256===seedSha,'A retains coherent completed metadata');
+        check(archiveRows().filter(row=>row.memberPath!=='A.mod').every(row=>row.metadataState==='unknown'),'B/C remain unclassified after fatal trap');
+        check(cleanup.library.rows.find(row=>row.sourcePath==='queued.mod').metadataState==='unknown'&&cleanup.discoveryStatus.metadataCounts.error===0&&cleanup.discoveryStatus.metadataPhase==='suspended','separate queued loose row remains suspended');
+        cleanupController.resume();cleanupController.scanMetadata();await new Promise(resolve=>setTimeout(resolve,60));
+        check(cleanupWorkers.length===1&&firstWorker.jobs.length===2&&JSON.stringify(cleanupReads)===JSON.stringify(['cleanup.zip','cleanup.zip']),'queued work cannot reuse trapped instance or resume automatically');
+        cleanupController.retry();await wait(()=>cleanup.discoveryStatus.metadataPhase==='complete'&&cleanup.discoveryStatus.metadataCounts.ready===4);
+        check(cleanupWorkers.length===2&&!cleanupWorkers[1].terminated&&!cleanup.discoveryStatus.runtimeError,'explicit Retry creates a healthy default worker');
+        check(cleanupDeliveries.filter(where=>where.sourcePath==='cleanup.zip'&&where.memberPath==='A.mod').length===1,'Retry never resubmits delivered A');
+        check(JSON.stringify(cleanupWorkers[1].jobs[0].members.map(item=>item.locator.memberPath))===JSON.stringify(['B.mod','C.mod']),'Retry submits only undelivered archive members');
+        check(cleanup.library.rows.every(row=>row.sha256===seedSha)&&cleanupDeliveries.length===4&&poisonedFrees===0,'Retry completes B/C and queued loose row once');
+    } finally {cleanupController.dispose();URL.revokeObjectURL(cleanupURL);}
     // Frozen immutable real group: playback invalidates only A; B/C continue exactly once.
     let gated=false,readStarted=false,releaseRead;const readGate=new Promise(resolve=>releaseRead=resolve);let cancels=0,deliveries=[];
     const grouped=context({kind:'filelist',label:'group',size:()=>zip.length,readFile:async()=>{if(gated){readStarted=true;await readGate;}return zip.slice();},async *enumerate(){yield {kind:'file',path:'group.zip',size:zip.length,timestamp:''};}},'group');
@@ -282,7 +336,7 @@ async function regressionScenario(modArray, zipArray, mixedArray) {
     // A page digest is independent of a real group-boundary worker recycle.
     const recycling=context({...source,size:()=>32*1024*1024,readFile:async()=>{const padded=new Uint8Array(32*1024*1024);padded.set(bytes);return padded;},async *enumerate(){for(const path of ['A.mod','B.mod'])yield {kind:'file',path,size:32*1024*1024,timestamp:''};}},'recycle');
     mode='delay';const recycleEvents=[];const recycleController=createDiscoveryController({context:recycling,digest,runtimeFactory:options=>createLibraryWorkerRuntime({...options,onMetric:event=>recycleEvents.push(event)})});recycleController.start();await wait(()=>recycling.discoveryStatus.phase==='complete');recycleController.acceptPlaybackMetadata(locate('A.mod'),metadata('survives recycle'),bytes);recycleController.scanMetadata();await wait(()=>recycleEvents.some(event=>event.event==='recycle'));check(recycling.discoveryStatus.metadataCounts.hashesPending===1,'recycling preserves page digest');gates.splice(0).forEach(gate=>gate.release());await wait(()=>recycling.library.rows[0].title==='survives recycle'&&!recycling.discoveryStatus.metadataCounts.hashesPending);recycleController.dispose();
-    return {atomicReplay:true,firstPlayUnknown:true,snapshotMutation:true,independentABC:true,supersededPhysicalAccounting:true,staleAndDisposedCleanup:true,syncAsyncInvalidFailures:true,beforeRowVersions:true,nativeSubview:true,actualWasmEndpointTrap:true,actualTrapSuspendsQueuedC:true,explicitRetryHealthyWorker:true,explicitRetryAndCancelDigest:true,sharedGroupABC:true,callbackResults,excludedOnly:true,mixedErrorSidecars:true,emptyLibrary:true,errorOnlyExplicitRetry:true,pageDigestAcrossRecycle:true,metrics};
+    return {atomicReplay:true,firstPlayUnknown:true,snapshotMutation:true,independentABC:true,supersededPhysicalAccounting:true,staleAndDisposedCleanup:true,syncAsyncInvalidFailures:true,beforeRowVersions:true,nativeSubview:true,actualWasmEndpointTrap:true,poisonedSessionTrapCleanup:true,actualTrapSuspendsQueuedC:true,explicitRetryHealthyWorker:true,explicitRetryAndCancelDigest:true,sharedGroupABC:true,callbackResults,excludedOnly:true,mixedErrorSidecars:true,emptyLibrary:true,errorOnlyExplicitRetry:true,pageDigestAcrossRecycle:true,metrics};
 }
 
 async function archiveMatrixScenario(base) {

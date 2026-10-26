@@ -483,11 +483,17 @@ for (const binding of ['archive_catalog', 'archive_extract_path', 'inspect_s3m',
         const messages = [];
         const scope = { postMessage: message => messages.push(message) };
         const { loader } = bindings({ [binding]: wasmUnreachable });
+        let frees = 0;
+        loader.ArchiveInspectionSession.prototype.free = () => {
+            frees += 1;
+            throw new Error('recursive use of an object detected which would lead to unsafe aliasing in rust');
+        };
         await startLibraryWorker({ scope, loadLoader: async () => loader });
         assert.deepEqual(messages.shift(), { type: 'ready' });
         const tag = { instanceId: 1, attempt: 1, id: 42, generation: 9, kind: binding === 'archive_catalog' ? 'catalog' : 'inspect-group' };
         await scope.onmessage({ data: grouped({ ...tag, locator: locator('trap.zip'), bytes: new ArrayBuffer(1) }) });
         assert.deepEqual(messages, [{ type: 'error', ...tag, error: { name: 'Error', code: 'worker-failed', message: 'unreachable', cause: 'wasm-trap' } }]);
+        assert.equal(frees, 0, 'fatal trap must reach the endpoint without reentering WASM to free');
     });
 }
 

@@ -145,6 +145,50 @@ test('partial trap Retry resubmits only undelivered members while page digest sp
     assert.equal(h.context.discoveryStatus.metadataCounts.scanActionable, 0); assert.equal(h.context.discoveryStatus.metadataPhase, 'complete');
 });
 
+test('actual extraction trap skips poisoned free, suspends later groups and Retry preserves completed rows', async t => {
+    const records = Array.from({ length: 65 }, (_, index) => locator(`${String(index).padStart(3, '0')}.mod`));
+    const h = harness({ records }), Base = h.binding.loader.ArchiveInspectionSession;
+    t.after(() => h.dispose());
+    let trap = true, poisonedFrees = 0;
+    h.binding.loader.ArchiveInspectionSession = class extends Base {
+        extract_member(...args) {
+            if (trap && args[1] === '001.mod') { this.poisoned = true; wasmUnreachable(); }
+            return super.extract_member(...args);
+        }
+        free() {
+            if (this.poisoned) {
+                poisonedFrees += 1;
+                throw new Error('recursive use of an object detected which would lead to unsafe aliasing in rust');
+            }
+            super.free();
+        }
+    };
+    h.controller.start(); await tick(); h.controller.scanMetadata(); await tick();
+    const worker = h.workers[0];
+    await worker.run(); await tick();
+    assert.equal(h.context.discoveryStatus.runtimeError, 'unreachable');
+    assert.equal(h.context.discoveryStatus.metadataPhase, 'suspended');
+    assert.deepEqual(h.context.library.rows.map(row => row.metadataState), ['ready', ...Array(64).fill('unknown')]);
+    assert.equal(h.context.discoveryStatus.metadataCounts.error, 0);
+    assert.equal(h.binding.counts.sessions, 1); assert.equal(h.binding.counts.frees, 0); assert.equal(poisonedFrees, 0);
+    assert.equal(worker.terminated, true);
+    h.controller.resume(); h.controller.scanMetadata(); await tick();
+    assert.equal(h.workers.length, 1); assert.equal(worker.jobs.length, 1);
+    assert.equal(h.metrics.filter(metric => metric.event === 'read').length, 1);
+
+    trap = false;
+    h.controller.retry(); await tick();
+    assert.equal(h.workers.length, 2);
+    const retry = h.workers[1], sent = retry.jobs[0];
+    assert.deepEqual(sent.members.map(item => item.locator.memberPath), records.slice(1).map(item => item.memberPath));
+    await retry.run(); await tick();
+    assert.equal(retry.terminated, false); assert.equal(retry.jobs.length, 1);
+    assert.equal(h.binding.counts.sessions, 2); assert.equal(h.binding.counts.frees, 1); assert.equal(poisonedFrees, 0);
+    assert.equal(h.context.discoveryStatus.metadataCounts.ready, 65);
+    assert.equal(h.context.discoveryStatus.metadataCounts.scanActionable, 0);
+    assert.equal(h.context.discoveryStatus.runtimeError, ''); assert.equal(h.context.discoveryStatus.metadataPhase, 'complete');
+});
+
 test('Stop preserves executing group; Cancel metadata terminates it and never requeues undispatched groups', async t => {
     const h = harness({ records: Array.from({ length: 130 }, (_, index) => locator(`${index}.mod`)) }); t.after(() => h.dispose());
     h.controller.start(); await tick(); h.controller.scanMetadata(); await tick(); const worker = h.workers[0]; worker.frame(worker.jobs[0].members[0].token);
@@ -232,18 +276,28 @@ function wasmUnreachable() {
     new WebAssembly.Instance(module).exports.trap();
 }
 
-for (const stage of ['constructor', 'extract_member', 'free']) test(`actual WASM trap in session ${stage} retires the worker and preserves delivered progress`, async t => {
+for (const stage of ['constructor', 'extract_member', 'inspect_s3m', 'module_metadata', 'free']) test(`actual WASM trap in ${stage} retires the worker and preserves delivered progress`, async t => {
     const h = harness(), Base = h.binding.loader.ArchiveInspectionSession; t.after(() => h.dispose());
+    let currentMember = '';
     h.binding.loader.ArchiveInspectionSession = class extends Base {
         constructor(bytes) { super(bytes); if (stage === 'constructor') wasmUnreachable(); }
-        extract_member(...args) { if (stage === 'extract_member' && args[1] === 'b.mod') wasmUnreachable(); return super.extract_member(...args); }
-        free() { super.free(); if (stage === 'free') wasmUnreachable(); }
+        extract_member(...args) { currentMember = args[1]; if (stage === 'extract_member' && currentMember === 'b.mod') wasmUnreachable(); return super.extract_member(...args); }
+        free() {
+            super.free();
+            if (stage === 'free') wasmUnreachable();
+            throw new Error('recursive use of an object detected which would lead to unsafe aliasing in rust');
+        }
     };
+    for (const binding of ['inspect_s3m', 'module_metadata']) {
+        const original = h.binding.loader[binding];
+        h.binding.loader[binding] = (...args) => { if (stage === binding && currentMember === 'b.mod') wasmUnreachable(); return original(...args); };
+    }
     const delivered = [], job = h.enqueue(group(['a', 'b', 'c'].map(token => member(token, locator(`${token}.mod`)))), { onMember: result => delivered.push(result.token) });
     await tick(); await h.workers[0].run();
-    const expected = stage === 'constructor' ? [] : stage === 'extract_member' ? ['a'] : ['a', 'b', 'c'];
+    const expected = stage === 'constructor' ? [] : stage === 'free' ? ['a', 'b', 'c'] : ['a'];
     await assert.rejects(job.result, error => { assert.equal(error.code, 'worker-failed'); assert.equal(error.cause, 'wasm-trap'); assert.deepEqual(error.progress.completedTokens, expected); return true; });
     assert.deepEqual(delivered, expected); assert.equal(h.workers[0].terminated, true);
+    assert.equal(h.binding.counts.frees, stage === 'free' ? 1 : 0);
 });
 
 test('invalid group descriptors reject before reading or constructing a worker', async t => {

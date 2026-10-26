@@ -369,8 +369,9 @@ mod exports {
     use super::*;
     use wasm_bindgen::prelude::{JsValue, wasm_bindgen};
 
-    /// Bounded archive snapshot for one metadata-inspection group. Call `free()` in
-    /// the worker's finally block; wasm-bindgen drops the source and cached inner.
+    /// Bounded archive snapshot for one metadata-inspection group. On healthy cleanup,
+    /// call `free()` to drop the source and cached inner. After a WASM trap, retire the
+    /// worker instead of reentering the poisoned instance to free the session.
     #[wasm_bindgen]
     pub struct ArchiveInspectionSession {
         session: ArchiveSession,

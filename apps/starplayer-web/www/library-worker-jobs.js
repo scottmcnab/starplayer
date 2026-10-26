@@ -36,6 +36,7 @@ export async function executeLibraryJob(job, { loader, digest = bytes => globalT
     if (job.kind === 'catalog') return validateLibraryPayload('catalog', JSON.parse(loader.archive_catalog(bytes)));
     if (job.kind !== 'inspect-group') throw libraryWorkerError('job-failed', 'Unknown library worker job');
     let session;
+    let trapped = false;
     try {
         if (job.members.some(member => member.locator.memberPath)) {
             session = new loader.ArchiveInspectionSession(bytes);
@@ -59,8 +60,12 @@ export async function executeLibraryJob(job, { loader, digest = bytes => globalT
             onMember(result);
         }
         return {};
+    } catch (error) {
+        trapped = wasmTrap(error);
+        throw error;
     } finally {
-        session?.free();
+        // A trap can poison wasm-bindgen's borrow guard. Worker retirement releases the instance.
+        if (!trapped) session?.free();
     }
 }
 
