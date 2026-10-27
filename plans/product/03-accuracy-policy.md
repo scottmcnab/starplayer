@@ -714,8 +714,8 @@ written down here is a defect, not a decision.
 The [NO master plan](../engine/NO-master-plan.md) defines an optional creative playback
 layer, not a new interpretation of canonical tracker effects. NO-01 implements its
 contract types, optional preparation and bounded lane routing. NO-02/03 add native
-articulation/interactive transport; NO-04 adds opt-in MOD/S3M/MTM overlap. XM/IT overlap
-and faithful audition remain dependent work. No canonical effect behavior changes.
+articulation/interactive transport; NO-04 adds opt-in MOD/S3M/MTM overlap. NO-05 adds
+XM/IT overlap; faithful live audition remains NO-06 work. No canonical effect behavior changes.
 Unchecked/global-bypassed and feature-disabled renders must retain existing golden output.
 Custom overlap preserves non-looping sample tails and may override IT NNA/duplicate
 actions explicitly; authored IT behavior remains the default, including looping NNA.
@@ -742,8 +742,8 @@ NO-01 identity APIs preserve raw MOD periods and native base-volume integer valu
 than a rendered gain or rounded identity-only conversion. Passive finalization does not
 consult checkbox/global state, and native release does not erase identity; retiring slots
 are excluded from matching. NO-04 wires MOD/S3M/MTM capture after onset-tick processing
-and proves canonical equivalence in the three reviewed configurations; NO-05 still owes
-the corresponding XM/IT integration. NO-06 must resolve live
+and proves canonical equivalence in the three reviewed configurations; NO-05 extends
+the same capture and equivalence contract to XM/IT. NO-06 must resolve live
 velocity before CC7 and test collisions from each format's existing volume resolution.
 Those behavioral/equivalence tests are not satisfied by NO-01's seam-level contract tests.
 
@@ -769,3 +769,27 @@ not canonical fast-flag fidelity. Supported onset fine slides and Qxy tick-zero 
 operations are tested separately. Repair needs a separate source/oracle-backed accuracy
 change and regression coverage; NO-04 preserves the current effect ordering/output and
 does not weaken canonical comparisons or update goldens to conceal it.
+
+
+NO-05 captures XM `real_volume` (0–64) and IT `note_volume` (0–256) after all
+onset-tick channel processing, including fine slides and delayed volume columns.
+Envelope/tremolo/tremor/random/global-gain output is not the identity. For each IT
+candidate, current sounding sample eligibility and instrument checkbox decide whether
+to use the custom rule or authored NNA/DCT/DCA. Native candidate processing stays early;
+custom preservation happens there and exact duplicate replacement happens after effects,
+before mixing. Native-created backgrounds never migrate to the custom budget; checkbox
+changes do not rewrite provenance. Turning a custom tail's checkbox off makes subsequent
+native DCT/DCA apply to it. Runtime S7x background commands remain native. The bounded
+64-tail custom budget can provide fewer tails than authored 256-voice IT NNA.
+
+**Recorded pre-existing accuracy follow-up (NO-05, 2026-10-28): IT note-only after
+native NNA.** A synthetic instrument-mode Continue note followed by a note with no
+instrument column detaches the old foreground in `check_new_note_action`, then
+`note_change` resolves the missing instrument through the now-empty foreground and maps
+instrument zero. The incoming note does not sound. The named NO-05 regression pins this
+baseline separately; the custom migration path preserves its resolved incoming instrument
+without reapplying defaults, but this task does not change authored native NNA output.
+`conformance/known-failures.md` G6-IT-002 records broader voice-set discrepancies, not this
+specific cause; no exclusion is reclassified here and no canonical golden is changed.
+A separate accuracy task should repair native remembered-instrument resolution against
+the existing format reference/conformance fixtures.

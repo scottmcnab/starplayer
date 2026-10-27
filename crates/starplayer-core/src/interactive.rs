@@ -69,7 +69,7 @@ pub enum OriginalNote {
 /// Immutable identity finalized after the channel's actual onset-tick effects.
 ///
 /// `onset_volume` is the exact native base field, with no identity-only scaling:
-/// MOD/MTM/S3M `current_volume`, IT `note_volume`, XM's base field (NO-05), or the
+/// MOD/MTM/S3M `current_volume`, IT `note_volume`, XM `real_volume`, or the
 /// live format's resolved velocity/default base volume before CC7. Simple PCM live
 /// input uses the existing resolved Q0.16 bits. Different native domains never mix
 /// within one instrument. Tremolo/tremor/envelopes/random swing and separate gains

@@ -1829,8 +1829,8 @@ instrument-only note overlap and faithful instrument audition for all five forma
 has completed external review and corrections (see the NO review log), and implementation
 was authorised on 2026-10-27. NO-01 supplies the contracts/preparation described below;
 NO-02 adds concrete native articulation, NO-03 adds interactive transport, and NO-04
-implements opt-in MOD/S3M/MTM overlap. XM/IT overlap and faithful native audition remain
-planned.
+implements opt-in MOD/S3M/MTM overlap. NO-05 implements XM/IT overlap; faithful native
+live audition remains NO-06 work.
 Each instrument has a Let notes ring boolean, with a separate Enable note overlap global
 bypass preserving selections. There are no channel overrides, inheritance or custom modes.
 Enabled eligible voices continue except when instrument, original note, exact onset base
@@ -1915,7 +1915,7 @@ rejects rewrites, invalid IDs, stale voices and retiring voices; identity surviv
 key-off/fade/NNA release until slot reclamation/reuse. `TriggerKind` distinguishes actual
 musical onset from effect retrigger/sample replacement; the allocation helper alone does
 not decide this. NO-04/05 wire the format-specific post-effects capture and duplicate
-replacement, including delayed starts. NO-05 names XM's exact base field. NO-06 wires live
+replacement, including delayed starts. NO-05 captures XM `real_volume` after onset-tick effects. NO-06 wires live
 native resolution; `NoteParams::raw_velocity` already preserves event velocity separately
 from CC7-scaled playback velocity. Existing format-resolution velocity collisions need
 format-native tests there, without identity-only quantization.
@@ -2005,3 +2005,32 @@ Prepared loads defer as a whole, in order, when retirement or engine-command roo
 unavailable. One pending command and one prepared load per quantum bound ownership;
 one retirement entry is reserved for the old module after engine dispatch. Control-side
 garbage collection unblocks installation without any callback allocation or drop.
+
+
+### NO-05 XM/IT overlap integration
+
+XM retains its per-channel effects → foreground articulation → flush ordering. The old
+voice's slot snapshot is independent of incoming channel effects; after that flush,
+custom backgrounds advance once in slot order for their originating channel, before the
+next channel. Thus two Gxx commands in a row expose each channel's current global volume
+to its own backgrounds. Native unbound stop ramps are not custom backgrounds and receive
+no new articulation writes. Detached trace records use the voice seam, not extra channel
+events. XM's immutable onset base is `real_volume`; IT's is `note_volume`.
+
+IT preserves the native early NNA/DCT seam. Each candidate's current actual sample and
+checkbox decide its rule independently of ownership. Eligible outgoing foregrounds move
+N→C before instrument defaults; exact matching waits for the new generation's post-effects
+base volume. Original trigger notes remain independent of transpose maps. Note-only and
+pending mapped-instrument resolution survive custom detachment without replaying defaults.
+Native quota/victim decisions consult authoritative N ownership and exclude C, L and
+retiring generations. Native-created backgrounds stay N across checkbox changes.
+
+Context-free processor reset/public sequencer seek resets channels immediately and marks
+slot cleanup pending. Before the next row/tick/control callback can advance retained
+storage, the format queries PlaybackState and keeps only still-valid C generations;
+native and stale snapshots are discarded. This retains sounding custom articulation
+without changing canonical native legacy-reset behavior or adding a provenance table.
+Interactive seek/Stop/bypass already retire their scopes through NO-03, so their slots
+receive no further effects/articulation writes. At native quota an existing authoritative
+N foreground remains a net-zero replacement after its runtime snapshot was reset.
+The pre-existing native IT note-only/NNA mapping gap is documented in the accuracy policy.

@@ -277,7 +277,7 @@ impl PlaybackState {
     /// Native effect retriggers replace a mixer generation without a musical onset.
     /// Transfer the original immutable identity; do not run custom duplicate actions.
     #[cfg(feature = "note-overlap")]
-    pub(crate) fn inherit_onset(&mut self, voice: VoiceId, identity: TriggerIdentity, voices: &VoicePool) -> Result<bool, PlaybackStateError> {
+    pub fn inherit_onset(&mut self, voice: VoiceId, identity: TriggerIdentity, voices: &VoicePool) -> Result<bool, PlaybackStateError> {
         if !self.configuration.capabilities.contains(PlaybackCapabilities::NOTE_OVERLAP) { return Ok(false); }
         self.store_onset(voice, identity, voices)
     }

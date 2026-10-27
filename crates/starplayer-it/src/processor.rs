@@ -456,6 +456,8 @@ pub struct ItChannel {
     /// Whether a note was triggered this tick, which is the only moment IT lets the filter
     /// be switched off.
     pub triggered: bool,
+    #[cfg(feature = "note-overlap")]
+    pending_onset: Option<VoiceId>,
     /// `Oxx`'s resolved sample offset in frames.
     pub sample_offset: u32,
     /// The frequency this tick's oscillators produced, which is what the voice sounds at.
@@ -537,6 +539,8 @@ impl ItChannel {
             command: 0,
             command_parameter: 0,
             triggered: false,
+            #[cfg(feature = "note-overlap")]
+            pending_onset: None,
             sample_offset: 0,
             output_frequency_hz: 0,
             output_frequency_set: false,
@@ -844,6 +848,8 @@ impl ItArticulationRuntime {
 
 /// Impulse Tracker's stateful effect processor.
 pub struct ItProcessor {
+    #[cfg(feature = "note-overlap")]
+    pending_articulation_reset: bool,
     module: Arc<Module>,
     channels: Box<[ItChannel]>,
     /// One entry per persistent-host pool slot, allocated once. IT owns at most
@@ -872,6 +878,16 @@ pub struct ItProcessor {
 }
 
 impl ItProcessor {
+    // Public context-free seeks reset channels immediately. Resolve retained slot
+    // storage against the sole ownership authority before any callback can advance it.
+    #[cfg(feature = "note-overlap")]
+    fn resolve_articulation_reset(&mut self, context: &TickContext<'_>) {
+        if !core::mem::take(&mut self.pending_articulation_reset) { return; }
+        for state in self.articulation.voices.iter_mut() {
+            if !state.voice.is_some_and(|voice| context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.domain == starplayer_engine::VoiceDomain::Custom)) { state.release(); }
+        }
+    }
+
     /// An IT processor whose quirks come from the dialect the loader detected.
     pub fn new(module: Arc<Module>, sample_rate_hz: u32) -> ItProcessor {
         ItProcessor::with_quirks(module, sample_rate_hz, QuirkSelection::FromDialect)
@@ -907,6 +923,8 @@ impl ItProcessor {
             last_order: None,
             module,
             last_moved_voice: None,
+            #[cfg(feature = "note-overlap")]
+            pending_articulation_reset: false,
         }
     }
 
@@ -960,6 +978,8 @@ impl ItProcessor {
             last_order: None,
             module,
             last_moved_voice: None,
+            #[cfg(feature = "note-overlap")]
+            pending_articulation_reset: false,
         })
     }
 
@@ -1290,6 +1310,10 @@ impl ItProcessor {
         let mut note = cell.note;
         let mut instrument = cell.instrument;
         let tone_portamento = self.channels[channel_index].tone_portamento;
+        #[cfg(feature = "note-overlap")]
+        let preceding_voice = self.channels[channel_index].voice;
+        #[cfg(feature = "note-overlap")]
+        let preceding_instrument = self.foreground_instrument(channel_index);
 
         // IT compatibility (`NoteOffInstr.it`, `noteoff2.it`): a note cut, note off or note
         // fade ignores the instrument number, except that it still recalls the sample's
@@ -1347,7 +1371,9 @@ impl ItProcessor {
             }
         }
         if note != NOTE_NONE {
-            self.note_change(context, channel_index, note, instrument, tone_portamento);
+            #[cfg(feature = "note-overlap")]
+            let preserved_instrument = if self.channels[channel_index].voice.is_none() && preceding_voice.is_some_and(|voice| context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.domain == starplayer_engine::VoiceDomain::Custom)) { preceding_instrument } else { 0 };
+            self.note_change(context, channel_index, note, instrument, tone_portamento, #[cfg(feature = "note-overlap")] preserved_instrument);
         }
         self.volume_column_set(channel_index);
     }
@@ -1416,7 +1442,7 @@ impl ItProcessor {
     }
 
     /// OpenMPT's `NoteChange`: the note-off family, then the note itself.
-    fn note_change(&mut self, context: &mut TickContext<'_>, channel_index: usize, note: u8, instrument: u8, tone_portamento: bool) {
+    fn note_change(&mut self, context: &mut TickContext<'_>, channel_index: usize, note: u8, instrument: u8, tone_portamento: bool, #[cfg(feature = "note-overlap")] preserved_instrument: u16) {
         match note {
             NOTE_OFF => {
                 if let Some(voice) = self.channels[channel_index].voice {
@@ -1449,7 +1475,12 @@ impl ItProcessor {
 
         let instrument_number = match self.instrument_mode {
             true => {
-                if instrument != INSTRUMENT_NONE { instrument as u16 } else { self.foreground_instrument(channel_index) }
+                if instrument != INSTRUMENT_NONE { instrument as u16 } else {
+                    #[cfg(feature = "note-overlap")]
+                    if preserved_instrument != 0 { preserved_instrument } else { self.foreground_instrument(channel_index) }
+                    #[cfg(not(feature = "note-overlap"))]
+                    self.foreground_instrument(channel_index)
+                }
             }
             false => {
                 if instrument != INSTRUMENT_NONE { instrument as u16 } else { self.channels[channel_index].last_instrument as u16 }
@@ -1554,6 +1585,9 @@ impl ItProcessor {
             channel.pan = (channel.pan as i32 + delta).clamp(0, MAX_PAN) as i16;
         }
 
+        #[cfg(feature = "note-overlap")]
+        let previous_identity = context.channels.foreground(channel_id)
+            .and_then(|voice| context.channels.playback().and_then(|playback| playback.get(voice, context.voices))).and_then(|owned| owned.identity());
         let params = VoiceParams { dirty: DirtyBits::SAMPLE | DirtyBits::VOLUME | DirtyBits::PITCH | DirtyBits::PAN, ..VoiceParams::SILENT };
         let Some(voice) = self.allocate_voice(context, channel_id, tag, region, params, offset) else { return };
         let carry = match self.instrument_mode {
@@ -1607,6 +1641,17 @@ impl ItProcessor {
                 state.set_position(0);
             }
         }
+        #[cfg(feature = "note-overlap")]
+        {
+            let musical_start = !keep_position && self.channels[channel_index].row.note <= MAX_NOTE;
+            if musical_start && region.length_frames() != 0 && (offset < region.length_frames() || region.loop_span().is_some()) {
+                self.channels[channel_index].pending_onset = Some(voice);
+            } else if !musical_start && let Some(identity) = previous_identity && let Some(playback) = context.channels.playback_mut() {
+                // Native replacements continue a musical identity; an actual new note
+                // with an invalid initial offset is not a continuation of the old one.
+                let _ = playback.inherit_onset(voice, identity, context.voices);
+            }
+        }
         self.channels[channel_index].voice = Some(voice);
         self.channels[channel_index].frequency_hz = frequency;
         self.channels[channel_index].triggered = true;
@@ -1656,6 +1701,10 @@ impl ItProcessor {
         // Replacing this channel's own foreground voice is net-zero — `trigger_channel`
         // releases it before allocating — so it is always allowed and costs a lane read.
         let replaces_owned_foreground = context.channels.foreground(channel).is_some_and(|voice| {
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            if let Some(playback) = context.channels.playback() {
+                return playback.get(voice, context.voices).is_some_and(|owned| owned.domain == starplayer_engine::VoiceDomain::Native && owned.lifecycle == starplayer_engine::VoiceLifecycle::Foreground);
+            }
             context.voices.get(voice).is_some()
                 && self.articulation.voices.get(voice.index() as usize).is_some_and(|state| state.owns(voice) && state.foreground)
         });
@@ -1681,6 +1730,10 @@ impl ItProcessor {
     /// compare is the answer on every module short of a saturated IT, so the walk over
     /// the pool is not on the ordinary trigger path.
     fn within_voice_quota(&self, context: &TickContext<'_>) -> bool {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(playback) = context.channels.playback() {
+            return playback.active_count(starplayer_engine::VoiceDomain::Native, context.voices) < VIRTUAL_CHANNELS.min(playback.configuration().capacity.native);
+        }
         if context.voices.voices_active() < VIRTUAL_CHANNELS {
             return true;
         }
@@ -1699,6 +1752,8 @@ impl ItProcessor {
     fn choose_victim(&self, context: &TickContext<'_>) -> Option<VoiceId> {
         let mut best: Option<(VoiceId, i64)> = None;
         for (voice, _) in context.voices.iter() {
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            if context.channels.playback().is_some_and(|playback| !playback.get(voice, context.voices).is_some_and(|owned| owned.domain == starplayer_engine::VoiceDomain::Native && owned.lifecycle != starplayer_engine::VoiceLifecycle::Retiring)) { continue; }
             let Some(state) = self.articulation.voices.get(voice.index() as usize) else { continue };
             if !state.owns(voice) || state.retiring || state.foreground {
                 continue;
@@ -1723,17 +1778,34 @@ impl ItProcessor {
     /// `CheckNNA`: the duplicate check first, then the New Note Action that detaches the
     /// channel's sounding voice.
     fn check_new_note_action(&mut self, context: &mut TickContext<'_>, channel_index: usize, instrument: u8, note: u8) {
-        if !self.instrument_mode {
-            // Sample mode has no New Note Action: the old voice is simply replaced, which
-            // `trigger_channel` already does.
-            return;
-        }
         let instrument_number = match instrument != INSTRUMENT_NONE {
             true => instrument as u16,
             false => self.foreground_instrument(channel_index),
         };
         let (sample, _) = self.map_note(instrument_number, note);
-        self.duplicate_check(context, channel_index, instrument_number, sample, note);
+        #[cfg(feature = "note-overlap")]
+        let musical_start = {
+            let pending = self.channels[channel_index].pending_instrument;
+            let selected = if instrument == INSTRUMENT_NONE && pending != 0 { pending as u16 } else { instrument_number };
+            let (sample, _) = self.map_note(selected, note);
+            self.channels[channel_index].row.note <= MAX_NOTE && self.sample_index(sample).is_some_and(|sample| {
+                sample.length_frames() != 0 && (self.channels[channel_index].sample_offset < sample.length_frames() || sample.loop_mode().is_looping() || sample.sustain_loop().is_some())
+            })
+        };
+        if self.instrument_mode { self.duplicate_check(context, channel_index, instrument_number, sample, note, #[cfg(feature = "note-overlap")] musical_start); }
+        #[cfg(feature = "note-overlap")]
+        if musical_start
+            && context.channels.prepare_note_overlap(ChannelId(channel_index as u16), &self.module, context.voices) {
+            if let Some(voice) = self.channels[channel_index].voice.take() {
+                if let Some(state) = self.articulation.voice_mut(voice) { state.foreground = false; }
+                self.last_moved_voice = Some(voice);
+            }
+            return;
+        }
+        #[cfg(feature = "note-overlap")]
+        if musical_start
+            && self.channels[channel_index].voice.is_some_and(|voice| context.channels.custom_overlap_candidate(voice, &self.module, context.voices)) { return; }
+        if !self.instrument_mode { return; }
 
         let Some(voice) = self.channels[channel_index].voice else { return };
         let Some(state) = self.articulation.voices.get(voice.index() as usize) else { return };
@@ -1769,7 +1841,7 @@ impl ItProcessor {
 
     /// `DCT`/`DCA`: every voice rooted on this channel whose instrument's duplicate check
     /// matches is cut, released or faded before the new note starts.
-    fn duplicate_check(&mut self, context: &mut TickContext<'_>, channel_index: usize, instrument: u16, sample: u16, note: u8) {
+    fn duplicate_check(&mut self, context: &mut TickContext<'_>, channel_index: usize, instrument: u16, sample: u16, note: u8, #[cfg(feature = "note-overlap")] musical_start: bool) {
         self.targets.fill(None);
         let mut count = 0usize;
         for (voice, _) in context.voices.iter() {
@@ -1777,6 +1849,8 @@ impl ItProcessor {
             if !state.owns(voice) || state.retiring || state.root_channel as usize != channel_index {
                 continue;
             }
+            #[cfg(feature = "note-overlap")]
+            if musical_start && context.channels.custom_overlap_candidate(voice, &self.module, context.voices) { continue; }
             let Some(definition) = self.instrument_def(state.instrument) else { continue };
             let duplicate = match definition.duplicate_check {
                 DuplicateCheck::Off => false,
@@ -2738,6 +2812,8 @@ impl ItProcessor {
                 self.targets.fill(None);
                 let mut count = 0usize;
                 for (voice, _) in context.voices.iter() {
+                    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+                    if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) { continue; }
                     let Some(state) = self.articulation.voices.get(voice.index() as usize) else { continue };
                     if state.owns(voice) && !state.retiring && !state.foreground && state.root_channel as usize == channel_index && count < self.targets.len() {
                         self.targets[count] = Some(voice);
@@ -2927,7 +3003,21 @@ impl ItProcessor {
             self.apply_tremolo_and_tremor(channel_index);
             self.run_note_cut(channel_index, tick_in_repeat);
             self.sync_foreground(channel_index);
+            #[cfg(feature = "note-overlap")]
+            if let Some(voice) = self.channels[channel_index].pending_onset.take()
+                && let Some(state) = self.articulation.voice(voice) {
+                let identity = starplayer_core::TriggerIdentity {
+                    instrument: InstrumentId(state.instrument.wrapping_sub(1)),
+                    note: starplayer_core::OriginalNote::Note(starplayer_core::Note::new(state.trigger_note)),
+                    channel: ChannelId(channel_index as u16),
+                    onset_volume: self.channels[channel_index].note_volume as u16,
+                };
+                if context.finalize_onset(voice, starplayer_core::TriggerKind::NewNote, identity).ok() == Some(true) {
+                    context.channels.replace_note_overlap_duplicates(voice, &self.module, context.voices);
+                }
+            }
         }
+        self.sync_retirement(context);
 
         outcome.speed = self.song_speed.saturating_add(self.frame_delay);
         outcome.jump = self.flow.jump();
@@ -3185,12 +3275,16 @@ impl TrackerProcessor for ItProcessor {
     }
 
     fn control_step(&mut self, context: &mut TickContext<'_>) {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         self.sync_retirement(context);
         for channel in self.channels.iter_mut() { channel.triggered = false; }
         self.advance_voices(context);
     }
 
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, MAX_GLOBAL_VOLUME as u32));
         let mut outcome = context.outcome();
         if self.last_order.is_some_and(|position| position != (row.order, row.pattern)) {
@@ -3208,6 +3302,8 @@ impl TrackerProcessor for ItProcessor {
     /// Every `SEx` repeat is another first tick in IT, so the row's tick-zero effects run
     /// again — without re-latching its notes, which keep sounding from the first pass.
     fn row_repeat(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         let _ = row;
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, MAX_GLOBAL_VOLUME as u32));
         let mut outcome = context.outcome();
@@ -3217,6 +3313,8 @@ impl TrackerProcessor for ItProcessor {
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, MAX_GLOBAL_VOLUME as u32));
         let mut outcome = context.outcome();
         self.run_tick(context, &mut outcome, false);
@@ -3234,9 +3332,10 @@ impl TrackerProcessor for ItProcessor {
             let (pan, surround) = default_pan(&self.module, channel_index as u8);
             self.channels[channel_index] = ItChannel::new(channel_index as u8, pan, surround, default_channel_volume(&self.module, channel_index as u8));
         }
-        for state in self.articulation.voices.iter_mut() {
-            state.release();
-        }
+        #[cfg(not(feature = "note-overlap"))]
+        for state in self.articulation.voices.iter_mut() { state.release(); }
+        #[cfg(feature = "note-overlap")]
+        { self.pending_articulation_reset = true; }
         self.flow.reset();
         self.last_order = None;
         self.last_moved_voice = None;
@@ -3682,7 +3781,7 @@ mod tests {
             processor.articulation.start(voice, ItVoiceState { instrument: 1, sample: 1, playing: true, ..ItVoiceState::default() }, &voices);
         }
         let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
-        processor.duplicate_check(&mut context, 0, 1, 1, 60);
+        processor.duplicate_check(&mut context, 0, 1, 1, 60, #[cfg(feature = "note-overlap")] true);
         assert!(processor.articulation.voices.iter().all(|state| state.note_fade));
         processor.note_and_envelope_control(&mut context, 0, 0);
         assert!(processor.articulation.voices.iter().all(|state| state.fadeout == 0));

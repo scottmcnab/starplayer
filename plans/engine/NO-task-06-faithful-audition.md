@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Authorised; pending dependencies |
+| Status | In progress on task/no-06-faithful-audition; NO-01–05 integrated |
 | Depends on | NO-03 and NO-05 |
 | Blocks | NO-W1 |
 | Parallel with | None in shared live-input/runtime code |

@@ -216,6 +216,8 @@ pub struct XmChannel {
     // ── what the flush has to do ────────────────────────────────────────────────────
     /// `CS_TRIGGER_VOICE` — start the sample from [`XmChannel::sample_start_frame`].
     pub trigger_voice: bool,
+    #[cfg(feature = "note-overlap")]
+    onset_note: Option<u8>,
     /// Stop the voice outright. FastTracker 2 has exactly one of these: a `9xx` past the
     /// end of the sample (`kFT2ST3OffsetOutOfRange`).
     pub stop_voice: bool,
@@ -304,6 +306,8 @@ impl XmChannel {
 
 
             trigger_voice: false,
+            #[cfg(feature = "note-overlap")]
+            onset_note: None,
             stop_voice: false,
 
             sounding_instrument: 0,
@@ -670,6 +674,8 @@ pub fn step_for_period(period: u16, sample_rate_hz: u32, linear_periods: bool) -
 
 /// The stateful FastTracker 2 effect processor.
 pub struct XmProcessor {
+    #[cfg(feature = "note-overlap")]
+    pending_articulation_reset: bool,
     module: Arc<Module>,
     channels: Box<[XmChannel]>,
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
@@ -696,6 +702,17 @@ pub struct XmProcessor {
 }
 
 impl XmProcessor {
+    // Public context-free seeks reset channels immediately. Resolve retained slot
+    // storage against the sole ownership authority before any callback can advance it.
+    #[cfg(feature = "note-overlap")]
+    fn resolve_articulation_reset(&mut self, context: &TickContext<'_>) {
+        if !core::mem::take(&mut self.pending_articulation_reset) { return; }
+        let Some(runtime) = &mut self.articulation else { return };
+        for slot in runtime.slots.iter_mut() {
+            if !slot.voice.is_some_and(|voice| context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.domain == starplayer_engine::VoiceDomain::Custom)) { slot.voice = None; }
+        }
+    }
+
     /// A FastTracker 2 processor whose quirks come from the dialect the loader detected.
     pub fn new(module: Arc<Module>, sample_rate_hz: u32) -> XmProcessor {
         XmProcessor::with_quirks(module, sample_rate_hz, QuirkSelection::FromDialect)
@@ -718,6 +735,8 @@ impl XmProcessor {
             #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
             articulation: None,
             sample_rate_hz,
+            #[cfg(feature = "note-overlap")]
+            pending_articulation_reset: false,
             quirks,
             flow: PatternFlowState::new(quirks.xm_pattern_loop.flow(), channel_count),
             carried_break_row: 0,
@@ -751,6 +770,8 @@ impl XmProcessor {
             #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
             articulation: None,
             sample_rate_hz,
+            #[cfg(feature = "note-overlap")]
+            pending_articulation_reset: false,
             quirks,
             flow,
             carried_break_row: 0,
@@ -985,6 +1006,8 @@ impl XmProcessor {
             self.key_off(channel_index);
             return;
         }
+        #[cfg(feature = "note-overlap")]
+        let musical_note = (note != 0).then_some(note);
         // `Rxy` and `EDx` reach here with no note of their own and replay the last one.
         let note = match note {
             0 => match self.channels[channel_index].note_number {
@@ -1047,6 +1070,8 @@ impl XmProcessor {
         }
 
         self.channels[channel_index].trigger_voice = true;
+        #[cfg(feature = "note-overlap")]
+        { self.channels[channel_index].onset_note = musical_note; }
 
         if effect == 9 {
             if parameter > 0 {
@@ -1889,6 +1914,8 @@ impl XmProcessor {
     /// Turn one channel's state into voice writes.
     fn flush_channel(&mut self, context: &mut TickContext<'_>, channel_index: usize) {
         let channel_id = ChannelId(channel_index as u16);
+        #[cfg(feature = "note-overlap")]
+        let onset_note = self.channels[channel_index].onset_note.take();
         if core::mem::take(&mut self.channels[channel_index].stop_voice) {
             self.channels[channel_index].trigger_voice = false;
             context.stop_channel(channel_id);
@@ -1936,6 +1963,21 @@ impl XmProcessor {
                     sample: sample_id.0.saturating_add(1),
                     note: state.sounding_note,
                 };
+                #[cfg(feature = "note-overlap")]
+                {
+                    // real_volume is the exact base after setters/fine slides, before
+                    // tremolo/tremor, envelopes and global gain. Runtime snapshots still
+                    // hold the outgoing voice's previous boundary, independent of this
+                    // channel's incoming effects and articulation.
+                    let onset = onset_note.and_then(|note| state.instrument_number.checked_sub(1).map(|instrument| starplayer_core::TriggerIdentity {
+                        instrument: InstrumentId(instrument as u16),
+                        note: starplayer_core::OriginalNote::Note(Note::new(note - 1)),
+                        channel: channel_id,
+                        onset_volume: state.real_volume as u16,
+                    }));
+                    context.trigger_legacy_overlap(tag, sample_region(sample), params, offset, onset, &self.module);
+                }
+                #[cfg(not(feature = "note-overlap"))]
                 context.trigger_channel(channel_id, tag, sample_region(sample), params, offset);
                 self.channels[channel_index].sounding_instrument = self.channels[channel_index].instrument_number;
                 return;
@@ -1970,11 +2012,43 @@ impl XmProcessor {
         }
     }
 
+    #[cfg(feature = "note-overlap")]
+    fn step_backgrounds(&mut self, context: &mut TickContext<'_>, channel_index: usize) {
+        let Some(runtime) = &mut self.articulation else { return };
+        let channel = ChannelId(channel_index as u16);
+        for index in 0..runtime.slots.len() {
+            let slot = &runtime.slots[index];
+            if slot.root_channel != channel { continue; }
+            let Some(voice) = slot.voice else { continue };
+            if context.channels.foreground(channel) == Some(voice) { continue; }
+            // Native stop ramps also unbind their foreground. They are not detached
+            // articulation and must retain canonical stop parameters.
+            if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_none_or(|owned| owned.domain != starplayer_engine::VoiceDomain::Custom) { runtime.discard(voice); continue; }
+            if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) { runtime.retire(voice); }
+            runtime.control_step(&self.module, voice, self.global_volume, self.sample_rate_hz, self.linear_periods, context.voices);
+        }
+    }
+
     /// Feed the diagnostic per-tick trace.
     #[cfg(feature = "trace")]
     fn report_trace_channels(&self, context: &mut TickContext<'_>) {
         for channel_index in 0..self.channels.len() {
             context.report_trace_channel(ChannelId(channel_index as u16), self.trace_channel_state(channel_index));
+        }
+        #[cfg(feature = "note-overlap")]
+        if let Some(runtime) = &self.articulation {
+            for slot in runtime.slots.iter() {
+                let Some(voice) = slot.voice else { continue };
+                if slot.retiring || context.voices.get(voice).is_none() || context.channels.foreground(slot.root_channel) == Some(voice) { continue; }
+                if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_none_or(|owned| owned.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) { continue; }
+                let state = &slot.state;
+                context.report_trace_voice(voice, TraceChannelState {
+                    note: context.voices.get(voice).map(|voice| voice.tag.note), instrument: context.voices.get(voice).map_or(0, |voice| voice.tag.instrument as u16),
+                    sample: state.sample.map_or(0, |sample| sample.0.saturating_add(1)),
+                    volume: (((state.final_volume >> 6) + 8) / 16) as u16,
+                    period: state.final_period as u32, pan: state.final_pan as u16,
+                });
+            }
         }
     }
 
@@ -2189,6 +2263,8 @@ impl TrackerProcessor for XmProcessor {
 
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     fn control_step(&mut self, context: &mut TickContext<'_>) {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         let Some(runtime) = &mut self.articulation else { return };
         for channel_index in 0..self.channels.len() {
             for index in 0..runtime.slots.len() {
@@ -2207,6 +2283,8 @@ impl TrackerProcessor for XmProcessor {
     }
 
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         context.report_global_volume(starplayer_core::fixed::unit_from_ratio(self.global_volume as u32, 64));
         let mut outcome = context.outcome();
         self.flow.begin_row();
@@ -2225,6 +2303,8 @@ impl TrackerProcessor for XmProcessor {
                 && let Some(voice) = context.channels.foreground(ChannelId(channel_index as u16)) {
                 runtime.snapshot(voice, ChannelId(channel_index as u16), &self.channels[channel_index].articulation, context.voices);
             }
+            #[cfg(feature = "note-overlap")]
+            self.step_backgrounds(context, channel_index);
         }
         outcome.jump = self.carried_jump(self.flow.jump(), row);
         #[cfg(feature = "trace")]
@@ -2233,6 +2313,8 @@ impl TrackerProcessor for XmProcessor {
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         context.report_global_volume(starplayer_core::fixed::unit_from_ratio(self.global_volume as u32, 64));
         let outcome = context.outcome();
         let speed = context.row_clock.speed;
@@ -2252,6 +2334,8 @@ impl TrackerProcessor for XmProcessor {
                 && let Some(voice) = context.channels.foreground(ChannelId(channel_index as u16)) {
                 runtime.snapshot(voice, ChannelId(channel_index as u16), &self.channels[channel_index].articulation, context.voices);
             }
+            #[cfg(feature = "note-overlap")]
+            self.step_backgrounds(context, channel_index);
         }
         #[cfg(feature = "trace")]
         self.report_trace_channels(context);
@@ -2263,7 +2347,12 @@ impl TrackerProcessor for XmProcessor {
     fn reset(&mut self) {
         self.global_volume = 64;
         #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
-        if let Some(runtime) = &mut self.articulation { runtime.reset(); }
+        if let Some(runtime) = &mut self.articulation {
+            #[cfg(not(feature = "note-overlap"))]
+            runtime.reset();
+            #[cfg(feature = "note-overlap")]
+            { let _ = runtime; self.pending_articulation_reset = true; }
+        }
         for channel in self.channels.iter_mut() {
             *channel = XmChannel::new();
         }

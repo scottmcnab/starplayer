@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation authorised 2026-10-27; NO-01–04 integrated; NO-05 in progress; reviewed instrument-only/onset-volume contract unchanged |
+| Status | Implementation authorised 2026-10-27; NO-01–05 integrated; NO-06 in progress; reviewed instrument-only/onset-volume contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -94,8 +94,8 @@ selects duplicates. Use existing bounded cut/release ramps for replacement.
 Finalize onset identity on the actual start tick (including delayed starts), after all
 of that channel’s processing for that tick, using its exact base, unmodulated note volume.
 Include defaults, volume setters and any fine/fast slides executed on that onset tick.
-MOD/MTM/S3M use `current_volume`, not `actual_volume`; IT uses `note_volume`; NO-05 must
-name and document the corresponding XM base field before implementing its capture seam. Do not compare current audible loudness
+MOD/MTM/S3M use `current_volume`, not `actual_volume`; IT uses `note_volume`; XM uses
+`real_volume`, as documented and verified by NO-05. Do not compare current audible loudness
 or introduce rounding/tolerance buckets. Exclude tremolo/tremor, envelopes, later-tick slides, separate channel/global/master
 gains, random gain modulation and DSP. Live identity uses the resolved base note gain
 from event velocity and applicable note defaults **before CC7** or other separate gains,
@@ -567,3 +567,11 @@ planning handoff. External review findings, corrections and final disposition ar
   coordinator regression passed. Pre-existing S3M fast-slide flag gap is documented,
   with no effect repair or golden changes. See NO-04 for evidence and dependent APIs.
 - NO-05 starts after NO-04, using Astra medium as the sole active task worker.
+
+- NO-05 integrated by reviewed single-change squash (task commit `b460c9b`): native-order
+  XM/IT overlap, late exact onset capture, current-candidate/native provenance policy,
+  full domain pressure and context-free seek/reset retention. All24 real-format fixtures,
+  native policy cross product, six-size canonical pairs, independent features, RT,
+  no_std/WASM, all8 goldens and baseline conformance passed; coordinator regression
+  passed. The existing authored IT NNA note-only mapping defect is recorded separately.
+- NO-06 starts after NO-05, using Astra medium as the sole active task worker.

@@ -857,3 +857,16 @@ passed, with independent worker feature/no_std/WASM/RT and canonical evidence in
 Prepared load backpressure covers both optional runtime configurations, including
 audition-only sources. NO-05 is next; one task worker/build stream at a time.
 No main merge, deployment, hardware check or listening acceptance claimed.
+
+### NO-05 coordinator landing — 2026-10-28
+
+Task `b460c9b` reviewed against current master/task contracts and integrated by
+single-change squash on the feature branch. XM original-note/base-volume capture and
+per-origin articulation order, IT early native versus late custom decisions, authoritative
+N/C/L pressure, native fallback and public seek/reset retention were reviewed. Final
+coordinator regression passed; detailed24-seam/policy-matrix/canonical/RT/feature evidence
+is in NO-05. A retained-offset non-start regression failed before the identity-inheritance
+fix and passes with unchanged native voice state. The pre-existing native IT note-only
+NNA mapping gap is documented in the accuracy policy without reclassifying conformance.
+NO-06 is next; one worker/build stream at a time. No main merge/deployment or owner
+hardware/listening acceptance claimed.
