@@ -161,6 +161,14 @@ pub struct EngineSettings {
 }
 
 impl EngineSettings {
+    /// Runtime opt-in, independent of which consumer enabled the Cargo capability.
+    pub fn playback_configuration(&self) -> Option<crate::playback::PlaybackConfiguration> {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        { self.playback }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        { None }
+    }
+
     /// Prepare optional budgets without changing legacy constructors. This only enables
     /// capability/identity storage: overlap policy and interactive transport land later.
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
@@ -337,7 +345,8 @@ where
 
     /// Validate interactive layout/capacity before playback. Legacy constructors keep
     /// their historical channel clamping and pool defaults. Allocation of legacy engine
-    /// components remains infallible as before; NO-02 owns wider constructor plumbing.
+    /// components other than the voice pool remains infallible as before. Format and
+    /// optional ownership storage use fallible preparation before playback.
     pub fn try_with_settings(settings: EngineSettings) -> Result<Engine<Path, Interp, Out, Module>, crate::playback::PlaybackConfigError> {
         #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
         let channels = if let Some(configuration) = settings.playback {
@@ -373,7 +382,7 @@ where
         let (scope_taps, scope_readers) = crate::scope::ScopeTaps::new(if settings.scope_taps { channels.layout().tracker_channels().min(ChannelTable::MAX_CHANNELS) } else { 0 });
 
         Ok(Engine {
-            voices: VoicePool::new(settings.voice_capacity),
+            voices: VoicePool::try_new(settings.voice_capacity).map_err(|_| crate::playback::PlaybackConfigError::AllocationFailed)?,
             channels,
             control: ControlClock::new(settings.sample_rate_hz, Frame::ZERO),
             pcm: Vec::new(),

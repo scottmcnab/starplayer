@@ -271,13 +271,27 @@ pub fn build_source(
     cached_scan: Option<Arc<ScannedSong>>,
     speed_adjust: i8,
 ) -> Result<BuiltSource, Error> {
+    let settings = starplayer::engine::EngineSettings { sample_rate_hz, voice_capacity: starplayer::MAX_VOICE_CAPACITY, ..starplayer::engine::EngineSettings::default() };
+    build_source_with_settings(module, start, frame, handles, cached_scan, speed_adjust, settings)
+}
+
+/// Use the same actual pool size and runtime opt-in as HostEngine::build_with_settings.
+/// Song scanning stays canonical and needs no optional slot storage.
+pub fn build_source_with_settings(
+    module: RtArc<Module>, start: SeekKind, frame: Frame,
+    handles: &SourceHandles, cached_scan: Option<Arc<ScannedSong>>, speed_adjust: i8, settings: starplayer::engine::EngineSettings,
+) -> Result<BuiltSource, Error> {
+    let voice_capacity = settings.voice_capacity;
+    let sample_rate_hz = settings.sample_rate_hz;
     let scanned = match cached_scan {
         Some(scanned) => scanned,
         None => Arc::new(scan_module_with_speed_adjust(&module, sample_rate_hz, speed_adjust)?),
     };
     let at_end = handles.at_end.get();
     let quirks = QuirkSelection::Override(scanned.quirks);
-    let mut sequencer = NativeSequencer::new(module, sample_rate_hz, quirks)?;
+    let mut sequencer = if settings.playback_configuration().is_some() {
+        NativeSequencer::new_with_articulation(module, sample_rate_hz, quirks, voice_capacity)?
+    } else { NativeSequencer::new_with_voice_capacity(module, sample_rate_hz, quirks, voice_capacity)? };
     // Before the timeline, and before any seek: a seek restores the timing the scan
     // recorded, which is already biased, and the sequencer needs the bias to read it back.
     sequencer.set_speed_adjust(speed_adjust);

@@ -802,3 +802,15 @@ Task commit `5d191ac` integrated by single-change squash. No overlap/transport/a
 execution is claimed at this stage; exact dependent obligations remain in NO-01.
 Baseline at `844dac8`: eight goldens passed; offline conformance 261 total, 179 pass,
 0 unexpected fail, 16 accepted deviations, 66 known failures; serial web suite 315 pass.
+
+### NO-02 coordinator acceptance
+
+Reviewed native arithmetic/update order, live pool generation checks, native256 quota,
+actual physical storage, optional XM allocation exclusion and configured host/facade
+plumbing. Corrected implementation drafts before acceptance: stale RNG/initialization
+operations, native/live background retirement, unconfigured XM table allocation, feature-
+unified source preparation and stale start/snapshot admission. These are implementations
+of the reviewed contract, with no contract substitution. Task `bbf57f4` is integrated by
+single-change squash. Conformance remains261/179/0/16/66; eight goldens unchanged;
+six-size prepared PCM, allocation hooks, independent features, no_std and final coordinator
+regressions passed. Held scheduling, overlap and live runtime remain dependent tasks.

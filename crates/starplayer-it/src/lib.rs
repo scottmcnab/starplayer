@@ -89,7 +89,7 @@ pub use header::{
 pub use instrument::{ItEnvelope, ItInstrument};
 pub use loader::{load, load_from, probe, probe_reader};
 pub use processor::{
-    ItChannel, ItEnvelopeState, ItProcessor, ItVoiceState, VIRTUAL_CHANNELS, recommended_voice_capacity,
+    ItArticulationRuntime, ItArticulationOutput, ItChannel, ItEnvelopeState, ItProcessor, ItVoiceState, VIRTUAL_CHANNELS, recommended_voice_capacity,
     sequencer_for, sequencer_with_quirks,
 };
 pub use pattern::{

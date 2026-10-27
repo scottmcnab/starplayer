@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Authorised; pending dependencies |
+| Status | In progress on task/no-03-transport; NO-02 integrated |
 | Depends on | NO-02 |
 | Blocks | NO-06, NO-W1 |
 | Parallel with | NO-04 only in isolated worktrees; serialize shared engine integration |

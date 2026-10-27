@@ -210,6 +210,8 @@ pub struct ItVoiceState {
     /// The voice this entry describes. The generation is what makes a recycled pool slot
     /// safe: an entry whose id does not match the pool's is not ours.
     pub voice: Option<VoiceId>,
+    /// A retiring generation remains owned but receives no articulation or effects.
+    pub retiring: bool,
     /// The pattern channel the note started on — `VoiceTag::channel`, and what `S7x` and
     /// the duplicate check match against.
     pub root_channel: u8,
@@ -288,6 +290,7 @@ impl Default for ItVoiceState {
     fn default() -> ItVoiceState {
         ItVoiceState {
             voice: None,
+            retiring: false,
             root_channel: 0,
             foreground: false,
             instrument: 0,
@@ -542,6 +545,303 @@ impl ItChannel {
     }
 }
 
+/// Concrete IT articulation shared by song processing and the future live rack.
+/// One runtime covers every prepared pool slot, never one allocation per program.
+/// Song effects draw from this same RNG to preserve their historical ordering; a live
+/// rack constructs a separate runtime and therefore cannot perturb the song stream.
+pub struct ItArticulationRuntime {
+    voices: Box<[ItVoiceState]>,
+    random: Xorshift32,
+}
+
+/// One tick's mixer result. The adapter preserves native trace/write semantics and
+/// decides how to unbind a silent foreground versus reclaim a background.
+pub struct ItArticulationOutput {
+    pub params: VoiceParams,
+    pub previous: VoiceParams,
+    pub has_previous: bool,
+    pub silent: bool,
+    pub filter_written: bool,
+}
+
+impl ItArticulationRuntime {
+    pub fn try_new(voice_capacity: usize) -> Result<Self, alloc::collections::TryReserveError> {
+        let mut voices = alloc::vec::Vec::new();
+        voices.try_reserve_exact(voice_capacity)?;
+        voices.resize(voice_capacity, ItVoiceState::default());
+        Ok(Self { voices: voices.into_boxed_slice(), random: Xorshift32::new(0x1D_F0_5A_C7) })
+    }
+
+    pub fn capacity(&self) -> usize { self.voices.len() }
+    pub fn voice(&self, voice: VoiceId) -> Option<&ItVoiceState> { self.voices.get(voice.index() as usize).filter(|state| state.owns(voice)) }
+    pub fn voice_mut(&mut self, voice: VoiceId) -> Option<&mut ItVoiceState> { self.voices.get_mut(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring) }
+    pub fn reset(&mut self) {
+        for state in self.voices.iter_mut() { state.release(); }
+        self.random = Xorshift32::new(0x1D_F0_5A_C7);
+    }
+    /// Drop stale state without touching a replacement generation in the mixer.
+    pub fn discard(&mut self, voice: VoiceId) {
+        if let Some(state) = self.voices.get_mut(voice.index() as usize).filter(|state| state.owns(voice)) { state.release(); }
+    }
+    /// Retain the generation while a mixer release ramp completes, with no more updates.
+    pub fn retire(&mut self, voice: VoiceId) {
+        if let Some(state) = self.voice_mut(voice) { state.retiring = true; }
+    }
+    pub fn cut(&mut self, voice: VoiceId) {
+        if let Some(state) = self.voice_mut(voice) { state.key_off = true; state.note_volume = 0; state.fadeout = 0; state.note_fade = true; }
+    }
+    /// Install a caller-resolved native onset (including carry), before its first step.
+    /// Mapping/NNA admission belongs to the caller; no pool allocation occurs here.
+    pub fn start(&mut self, voice: VoiceId, mut state: ItVoiceState, voices: &starplayer_mixer::VoicePool) -> bool {
+        if voices.get(voice).is_none() { return false; }
+        let Some(entry) = self.voices.get_mut(voice.index() as usize) else { return false };
+        if entry.owns(voice) && entry.retiring { return false; }
+        state.voice = Some(voice);
+        state.retiring = false;
+        *entry = state;
+        true
+    }
+
+    pub fn release(&mut self, module: &Module, instrument_mode: bool, voices: &mut starplayer_mixer::VoicePool, voice: VoiceId) {
+        let Some(state) = self.voices.get_mut(voice.index() as usize) else { return };
+        if !state.owns(voice) || state.retiring {
+            return;
+        }
+        let first_release = !state.key_off;
+        state.key_off = true;
+        let instrument = state.instrument;
+        let sample = state.sample;
+        // Only an instrument can fade: a sample-mode note-off releases the sustain loop
+        // and nothing else (OpenMPT `KeyOff` tests `pModInstrument` before every
+        // `CHN_NOTEFADE` it sets).
+        let definition = match instrument_mode {
+            true => module.instrument(InstrumentId(instrument.wrapping_sub(1))),
+            false => None,
+        };
+        let starts_fade = definition.is_some_and(|definition| match definition.volume_envelope.as_ref() {
+            None => true,
+            Some(envelope) => envelope.loop_span.is_some() && definition.fadeout != 0,
+        });
+        if starts_fade && let Some(state) = self.voices.get_mut(voice.index() as usize) {
+            state.note_fade = true;
+        }
+        // The sustain loop is released here: the sample's normal loop comes back, or the
+        // sample stops looping altogether (`SusAfterLoop.it`).
+        if first_release
+            && let Some(sample_index) = module.sample(SampleId(sample.wrapping_sub(1)))
+            && sample_index.sustain_loop().is_some()
+            && let Some(slot) = voices.get_mut(voice)
+        {
+            let region = sample_region(sample_index, false);
+            let position = slot.position() >> 32;
+            slot.set_region(region);
+            let loop_end = sample_index.loop_end() as u64;
+            let loop_start = sample_index.loop_start() as u64;
+            // A bidirectional main loop keeps both the position and the direction: a voice
+            // the sustain loop left running backwards past the loop end plays on in
+            // reverse until it reaches the loop (libxmp `libxmp_mixer_release`,
+            // `it_sus_after_loop_bidi.it`).
+            if sample_index.loop_mode() != LoopMode::PingPong {
+                // Any other main loop cancels a reversed sustain loop, and a position past
+                // the loop end folds back into it.
+                slot.set_reversed(false);
+                if sample_index.loop_mode().is_looping() && loop_end > loop_start && position > loop_end {
+                    let wrapped = loop_start + (position - loop_start) % (loop_end - loop_start);
+                    slot.set_position(wrapped << 32);
+                } else {
+                    slot.set_position(position << 32);
+                }
+            }
+        }
+    }
+
+    pub fn roll_swing(&mut self, module: &Module, instrument_mode: bool, voice: VoiceId, instrument: u16) {
+        if !instrument_mode || self.voice_mut(voice).is_none() {
+            return;
+        }
+        let Some(definition) = module.instrument(InstrumentId(instrument.wrapping_sub(1))) else { return };
+        let volume_variation = definition.random_volume_variation;
+        let pan_variation = definition.random_pan_variation;
+        let (volume_random, pan_random) = (self.next_signed_byte(), self.next_signed_byte());
+        let Some(entry) = self.voices.get_mut(voice.index() as usize) else { return };
+        if volume_variation != 0 {
+            // OpenMPT: `((rand * RV) / 64 + 1) * insVol / 199`, applied to the instrument
+            // volume rather than to the note volume (`kITSwingBehaviour`).
+            entry.volume_swing = ((volume_random as i32 * volume_variation as i32 / 64 + 1) * entry.instrument_volume as i32 / 199) as i16;
+        }
+        if pan_variation != 0 {
+            entry.pan_swing = (pan_random as i32 * pan_variation as i32 * 4 / 128) as i16;
+        }
+    }
+
+    fn next_signed_byte(&mut self) -> i8 { (self.random.next_u32() >> 16) as u8 as i8 }
+
+    /// Copy the instrument's envelope enable flags onto the voice, which is what undoes an
+    /// earlier `S77`-style pause.
+    pub fn apply_envelope_flags(&mut self, module: &Module, instrument_mode: bool, voice: VoiceId, instrument: u16) {
+        if self.voice_mut(voice).is_none() { return; }
+        let enabled = match instrument_mode {
+            true => module.instrument(InstrumentId(instrument.wrapping_sub(1))).map(|definition| {
+                (
+                    definition.volume_envelope.is_some(),
+                    definition.panning_envelope.is_some(),
+                    definition.pitch_envelope.is_some(),
+                )
+            }),
+            false => None,
+        };
+        let Some((volume, panning, pitch)) = enabled else { return };
+        let Some(entry) = self.voices.get_mut(voice.index() as usize) else { return };
+        entry.volume_envelope.enabled = volume;
+        entry.panning_envelope.enabled = panning;
+        entry.pitch_envelope.enabled = pitch;
+    }
+
+    /// IT order: advance/evaluate volume, pan and pitch/filter envelopes; fadeout;
+    /// volume product; pitch envelope; sample auto-vibrato; pan; filter and mixer values.
+    /// `trigger_note` is true only for the original onset step, never a held control step.
+    pub fn control_step(&mut self, module: &Module, voice: VoiceId, instrument_mode: bool, global_volume: u8, sample_rate_hz: u32, trigger_note: bool) -> Option<ItArticulationOutput> {
+        let state = self.voices.get_mut(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring)?;
+        let definition = match instrument_mode {
+            true => module.instrument(InstrumentId(state.instrument.wrapping_sub(1))),
+            false => None,
+        };
+
+        let mut volume = state.note_volume.clamp(0, MAX_NOTE_VOLUME) << 6;
+        let mut pan = (state.pan as i32 + state.pan_swing as i32).clamp(0, MAX_PAN);
+        let mut filter_modifier = 256i32;
+
+        if let Some(definition) = definition {
+            // IT increments the position before it evaluates, so an envelope disabled
+            // on the very tick its note triggers is not processed at all.
+            let key_off_previous = state.key_off_previous;
+            let mut fade = false;
+            if let Some(envelope) = definition.volume_envelope.as_ref() {
+                fade |= advance_envelope(&mut state.volume_envelope, envelope, key_off_previous);
+                let position = state.volume_envelope.position.saturating_sub(1);
+                if state.volume_envelope.position != 0 {
+                    state.volume_envelope.value = envelope_value(envelope, position, 4, 0).clamp(0, MAX_NOTE_VOLUME);
+                    volume = volume * state.volume_envelope.value / 256;
+                }
+                if fade {
+                    state.note_fade = true;
+                    if envelope.points.last().is_some_and(|point| point.value == 0) {
+                        state.fadeout = 0;
+                        volume = 0;
+                    }
+                }
+            }
+            if let Some(envelope) = definition.panning_envelope.as_ref() {
+                advance_envelope(&mut state.panning_envelope, envelope, key_off_previous);
+                if state.panning_envelope.position != 0 {
+                    let position = state.panning_envelope.position.saturating_sub(1);
+                    let value = envelope_value(envelope, position, 1, 32).clamp(-32, 32);
+                    state.panning_envelope.value = value;
+                    // The envelope's reach is proportional to the distance to the
+                    // nearer edge, so a hard-panned voice barely moves outward.
+                    pan += if pan >= 128 { value * (MAX_PAN - pan) / 32 } else { value * pan / 32 };
+                }
+            }
+            if let Some(envelope) = definition.pitch_envelope.as_ref() {
+                advance_envelope(&mut state.pitch_envelope, envelope, key_off_previous);
+                if state.pitch_envelope.position != 0 {
+                    let position = state.pitch_envelope.position.saturating_sub(1);
+                    let value = envelope_value(envelope, position, 8, 32).clamp(-256, 256);
+                    state.pitch_envelope.value = value;
+                    if state.pitch_envelope_is_filter {
+                        filter_modifier = value;
+                    }
+                }
+            }
+            // The fadeout, once note-fade is set: ITTECH.TXT's `NFC` loses the raw
+            // `FadeOut` from a count of 1024 every tick, so a fadeout of 10 is silent
+            // after 103 ticks. OpenMPT stores `fadeout << 5` and subtracts twice that
+            // from the same 65536 scale.
+            if state.note_fade {
+                let fadeout = definition.fadeout as i32;
+                if fadeout != 0 {
+                    state.fadeout = (state.fadeout - fadeout * FADEOUT_STEP_SCALE).max(0);
+                }
+                volume = (volume as i64 * state.fadeout as i64 / FADEOUT_FULL as i64) as i32;
+            }
+        } else if state.note_fade {
+            state.fadeout = 0;
+            volume = 0;
+        }
+
+        // The mixing chain: `Vol · VEV · NFC · CV · SV · IV · GV`.
+        let instrument_volume = (state.instrument_volume as i32 + state.volume_swing as i32).clamp(0, MAX_CHANNEL_VOLUME as i32);
+        let real_volume = muldiv(
+            volume as i64 * (global_volume as i64 * 2),
+            state.channel_volume as i64 * instrument_volume as i64,
+            1 << 20,
+        )
+        .clamp(0, 1 << 14) as i32;
+        state.real_volume = real_volume;
+
+        // Pitch: the channel's frequency, the pitch envelope, then auto-vibrato.
+        let mut frequency = state.frequency_hz;
+        if !state.pitch_envelope_is_filter && state.pitch_envelope.position != 0 {
+            let value = state.pitch_envelope.value;
+            let magnitude = value.unsigned_abs().min(255) as u8;
+            frequency = match value >= 0 {
+                true => apply_slide_ratio(frequency, linear_slide_up_q16(magnitude)),
+                false => apply_slide_ratio(frequency, linear_slide_down_q16(magnitude)),
+            };
+        }
+        frequency = advance_auto_vibrato(state, module.sample(SampleId(state.sample.wrapping_sub(1))), frequency, &mut self.random);
+
+        if state.surround {
+            // Accuracy policy D66: StarPlayer has no rear bus, so surround is centre.
+            pan = 128;
+        }
+        state.real_pan = pan.clamp(0, MAX_PAN) as i16;
+
+        // The filter. `SetupChannelFilter` filters whenever the cutoff is not fully
+        // open or the resonance is set; otherwise it returns `-1` and *leaves the
+        // coefficients alone*, and only a note trigger on the same tick clears
+        // `CHN_FILTER` and so silences the filter (OpenMPT `Snd_flt.cpp`
+        // `SetupChannelFilter`, the `kITFilterBehaviour` branch; libxmp spells the
+        // same rule as `cutoff < 0xfe || resonance > 0 || xc->filter.can_disable`,
+        // `src/player.c:1330`). Test cases `filter-reset.it`, `filter-reset-carry.it`,
+        // `filter-nna.it`.
+        let computed_cutoff = (state.cutoff as i32 * (filter_modifier + 256) / 256).clamp(0, 255) as u8;
+        let filter = if state.resonance == 0 && computed_cutoff >= 254 {
+            match state.filter_active && !trigger_note {
+                // Still filtering with the coefficients it already has.
+                true => None,
+                false => {
+                    state.filter_active = false;
+                    Some(FilterParams::BYPASS)
+                }
+            }
+        } else {
+            state.filter_active = true;
+            Some(FilterParams::from_it_scaled(computed_cutoff, state.resonance))
+        };
+
+        // `SCx` zeroes the increment outright (OpenMPT `Snd_fx.cpp` `NoteCut` under
+        // `kITSCxStopsSample`); the note itself stays on the channel.
+        let step = match state.playing {
+            true => Step::from_ratio(frequency as u64, sample_rate_hz.max(1) as u64),
+            false => Step::ZERO,
+        };
+        let volume_unit = unit_from_ratio(real_volume as u32, 1 << 14);
+        let pan_unit = pan_to_bipolar_position(state.real_pan);
+        let written = state.written;
+        let has_written = state.has_written;
+        let held_filter = match has_written {
+            true => written.filter,
+            false => FilterParams::BYPASS,
+        };
+        state.written = VoiceParams { step, volume: volume_unit, pan: pan_unit, filter: filter.unwrap_or(held_filter), dirty: DirtyBits::empty() };
+        state.has_written = true;
+        let silent = state.note_fade && state.fadeout == 0 && real_volume == 0 && !(state.foreground && state.cut_by_scx);
+        state.key_off_previous = state.key_off;
+        Some(ItArticulationOutput { params: state.written, previous: written, has_previous: has_written, silent, filter_written: filter.is_some() })
+    }
+}
+
 /// Impulse Tracker's stateful effect processor.
 pub struct ItProcessor {
     module: Arc<Module>,
@@ -549,7 +849,8 @@ pub struct ItProcessor {
     /// One entry per persistent-host pool slot, allocated once. IT owns at most
     /// [`VIRTUAL_CHANNELS`] of them; the extra entries let live MIDI occupy arbitrary
     /// global voice IDs without making an IT voice untracked.
-    voices: Box<[ItVoiceState]>,
+    articulation: ItArticulationRuntime,
+    targets: Box<[Option<VoiceId>]>,
     sample_rate_hz: u32,
     /// `GV`, 0..=128.
     global_volume: u8,
@@ -565,9 +866,6 @@ pub struct ItProcessor {
     quirks: QuirkSet,
     flow: PatternFlowState,
     last_order: Option<(u16, u16)>,
-    /// The random stream every per-note swing and every random oscillator waveform draws
-    /// from. Seeded from a constant so a render is reproducible.
-    random: Xorshift32,
     /// `m_lastMovedChannel`: the voice the last New Note Action moved, which IT's
     /// envelope-carry quirk reads back from.
     last_moved_voice: Option<VoiceId>,
@@ -593,7 +891,8 @@ impl ItProcessor {
         }
         ItProcessor {
             channels: channels.into_boxed_slice(),
-            voices: vec![ItVoiceState::default(); MAX_VOICE_CAPACITY].into_boxed_slice(),
+            articulation: ItArticulationRuntime { voices: vec![ItVoiceState::default(); MAX_VOICE_CAPACITY].into_boxed_slice(), random: Xorshift32::new(0x1D_F0_5A_C7) },
+            targets: vec![None; MAX_VOICE_CAPACITY].into_boxed_slice(),
             sample_rate_hz,
             global_volume,
             song_speed: header.initial_speed,
@@ -606,7 +905,6 @@ impl ItProcessor {
             quirks,
             flow: PatternFlowState::new(quirks.it_pattern_loop.flow(), channel_count),
             last_order: None,
-            random: Xorshift32::new(0x1D_F0_5A_C7),
             module,
             last_moved_voice: None,
         }
@@ -639,14 +937,15 @@ impl ItProcessor {
             let (pan, surround) = default_pan(&module, index as u8);
             channels.push(ItChannel::new(index as u8, pan, surround, default_channel_volume(&module, index as u8)));
         }
-        let mut voices = alloc::vec::Vec::new();
-        let voice_capacity = voice_capacity.min(MAX_VOICE_CAPACITY);
-        voices.try_reserve_exact(voice_capacity)?;
-        voices.resize(voice_capacity, ItVoiceState::default());
+        let articulation = ItArticulationRuntime::try_new(voice_capacity)?;
+        let mut targets = alloc::vec::Vec::new();
+        targets.try_reserve_exact(voice_capacity)?;
+        targets.resize(voice_capacity, None);
         let flow = PatternFlowState::try_new(quirks.it_pattern_loop.flow(), channel_count)?;
         Ok(ItProcessor {
             channels: channels.into_boxed_slice(),
-            voices: voices.into_boxed_slice(),
+            articulation,
+            targets: targets.into_boxed_slice(),
             sample_rate_hz,
             global_volume,
             song_speed: header.initial_speed,
@@ -659,7 +958,6 @@ impl ItProcessor {
             quirks,
             flow,
             last_order: None,
-            random: Xorshift32::new(0x1D_F0_5A_C7),
             module,
             last_moved_voice: None,
         })
@@ -676,17 +974,20 @@ impl ItProcessor {
     /// The pattern-loop and break/jump bookkeeping, for inspection by a host or a test.
     pub const fn pattern_flow(&self) -> &PatternFlowState { &self.flow }
 
+    /// Physical state capacity, distinct from the native 256-voice admission quota.
+    pub fn articulation_capacity(&self) -> usize { self.articulation.capacity() }
+
     pub fn channels(&self) -> &[ItChannel] { &self.channels }
     pub fn channel(&self, channel: u8) -> Option<&ItChannel> { self.channels.get(channel as usize) }
 
     /// The articulation of one voice, if this processor owns it.
     pub fn voice(&self, voice: VoiceId) -> Option<&ItVoiceState> {
-        self.voices.get(voice.index() as usize).filter(|state| state.owns(voice))
+        self.articulation.voices.get(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring)
     }
 
     /// How many voices are sounding, foreground and background together — what the peak
     /// voice count on a dense module is measured from.
-    pub fn active_voices(&self) -> usize { self.voices.iter().filter(|state| state.voice.is_some()).count() }
+    pub fn active_voices(&self) -> usize { self.articulation.voices.iter().filter(|state| state.voice.is_some() && !state.retiring).count() }
 
     // ── module lookups ───────────────────────────────────────────────────────────────
 
@@ -1054,21 +1355,21 @@ impl ItProcessor {
     fn foreground_playing(&self, channel_index: usize) -> bool {
         self.channels[channel_index]
             .voice
-            .and_then(|voice| self.voices.get(voice.index() as usize).filter(|state| state.owns(voice)))
+            .and_then(|voice| self.articulation.voices.get(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring))
             .is_some_and(|state| state.playing)
     }
 
     fn foreground_instrument(&self, channel_index: usize) -> u16 {
         self.channels[channel_index]
             .voice
-            .and_then(|voice| self.voices.get(voice.index() as usize).filter(|state| state.owns(voice)))
+            .and_then(|voice| self.articulation.voices.get(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring))
             .map(|state| state.instrument)
             .unwrap_or(0)
     }
 
     fn foreground_state_mut(&mut self, channel_index: usize) -> Option<&mut ItVoiceState> {
         let voice = self.channels[channel_index].voice?;
-        self.voices.get_mut(voice.index() as usize).filter(|state| state.owns(voice))
+        self.articulation.voices.get_mut(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring)
     }
 
     /// `RestorePanAndFilter`: a note puts back the channel pan an instrument's or sample's
@@ -1184,7 +1485,7 @@ impl ItProcessor {
     fn foreground_sample(&self, channel_index: usize) -> u16 {
         self.channels[channel_index]
             .voice
-            .and_then(|voice| self.voices.get(voice.index() as usize).filter(|state| state.owns(voice)))
+            .and_then(|voice| self.articulation.voices.get(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring))
             .map(|state| state.sample)
             .unwrap_or(0)
     }
@@ -1266,8 +1567,7 @@ impl ItProcessor {
             let channel = &self.channels[channel_index];
             (channel.note_volume, channel.channel_volume, channel.pan, channel.surround, channel.cutoff, channel.resonance)
         };
-        let Some(entry) = self.voices.get_mut(voice.index() as usize) else { return };
-        *entry = ItVoiceState {
+        let mut state = ItVoiceState {
             voice: Some(voice),
             root_channel: channel_index as u8,
             foreground: true,
@@ -1291,10 +1591,11 @@ impl ItProcessor {
             ..ItVoiceState::default()
         };
         if let Some((volume, panning, pitch)) = carried_envelopes {
-            entry.volume_envelope = volume;
-            entry.panning_envelope = panning;
-            entry.pitch_envelope = pitch;
+            state.volume_envelope = volume;
+            state.panning_envelope = panning;
+            state.pitch_envelope = pitch;
         }
+        if !self.articulation.start(voice, state, context.voices) { return; }
         // `kITNNAReset`: the New Note Action is reset by a note, not by an instrument
         // number, so an `S73`..`S76` override survives a lone instrument (`s7xinsnum.it`).
         self.channels[channel_index].new_note_action = carry.map(|(_, action)| action).unwrap_or(NewNoteAction::Cut);
@@ -1310,8 +1611,8 @@ impl ItProcessor {
         self.channels[channel_index].frequency_hz = frequency;
         self.channels[channel_index].triggered = true;
         self.channels[channel_index].sample_offset = 0;
-        self.roll_swing(voice, instrument);
-        self.apply_envelope_flags(voice, instrument);
+        self.articulation.roll_swing(&self.module, self.instrument_mode, voice, instrument);
+        self.articulation.apply_envelope_flags(&self.module, self.instrument_mode, voice, instrument);
     }
 
     /// Envelope Carry copies the preceding voice's counters into a newly allocated
@@ -1320,7 +1621,7 @@ impl ItProcessor {
     fn carried_envelopes(&self, channel_index: usize, instrument: u16) -> Option<(ItEnvelopeState, ItEnvelopeState, ItEnvelopeState)> {
         let definition = self.instrument_def(instrument)?;
         let source_voice = self.channels[channel_index].voice.or(self.last_moved_voice)?;
-        let source = self.voices.get(source_voice.index() as usize).filter(|state| state.owns(source_voice))?;
+        let source = self.articulation.voices.get(source_voice.index() as usize).filter(|state| state.owns(source_voice))?;
         let mut volume = ItEnvelopeState::default();
         let mut panning = ItEnvelopeState::default();
         let mut pitch = ItEnvelopeState::default();
@@ -1356,7 +1657,7 @@ impl ItProcessor {
         // releases it before allocating — so it is always allowed and costs a lane read.
         let replaces_owned_foreground = context.channels.foreground(channel).is_some_and(|voice| {
             context.voices.get(voice).is_some()
-                && self.voices.get(voice.index() as usize).is_some_and(|state| state.owns(voice) && state.foreground)
+                && self.articulation.voices.get(voice.index() as usize).is_some_and(|state| state.owns(voice) && state.foreground)
         });
         if (replaces_owned_foreground || self.within_voice_quota(context))
             && let Some(voice) = context.trigger_channel(channel, tag, region, params, offset)
@@ -1364,7 +1665,7 @@ impl ItProcessor {
             return Some(voice);
         }
         let victim = self.choose_victim(context)?;
-        if let Some(entry) = self.voices.get_mut(victim.index() as usize) {
+        if let Some(entry) = self.articulation.voices.get_mut(victim.index() as usize) {
             entry.release();
         }
         context.voices.record_steal();
@@ -1386,7 +1687,7 @@ impl ItProcessor {
         let owned_voice_count = context
             .voices
             .iter()
-            .filter(|(voice, _)| self.voices.get(voice.index() as usize).is_some_and(|state| state.owns(*voice)))
+            .filter(|(voice, _)| self.articulation.voices.get(voice.index() as usize).is_some_and(|state| state.owns(*voice) && !state.retiring))
             .count();
         owned_voice_count < VIRTUAL_CHANNELS
     }
@@ -1398,8 +1699,8 @@ impl ItProcessor {
     fn choose_victim(&self, context: &TickContext<'_>) -> Option<VoiceId> {
         let mut best: Option<(VoiceId, i64)> = None;
         for (voice, _) in context.voices.iter() {
-            let Some(state) = self.voices.get(voice.index() as usize) else { continue };
-            if !state.owns(voice) || state.foreground {
+            let Some(state) = self.articulation.voices.get(voice.index() as usize) else { continue };
+            if !state.owns(voice) || state.retiring || state.foreground {
                 continue;
             }
             if state.fadeout == 0 {
@@ -1419,47 +1720,6 @@ impl ItProcessor {
     }
 
     /// The per-note random volume and pan variation, rolled once at note-on.
-    fn roll_swing(&mut self, voice: VoiceId, instrument: u16) {
-        if !self.instrument_mode {
-            return;
-        }
-        let Some(definition) = self.module.instrument(InstrumentId(instrument.wrapping_sub(1))) else { return };
-        let volume_variation = definition.random_volume_variation;
-        let pan_variation = definition.random_pan_variation;
-        let (volume_random, pan_random) = (self.next_signed_byte(), self.next_signed_byte());
-        let Some(entry) = self.voices.get_mut(voice.index() as usize) else { return };
-        if volume_variation != 0 {
-            // OpenMPT: `((rand * RV) / 64 + 1) * insVol / 199`, applied to the instrument
-            // volume rather than to the note volume (`kITSwingBehaviour`).
-            entry.volume_swing = ((volume_random as i32 * volume_variation as i32 / 64 + 1) * entry.instrument_volume as i32 / 199) as i16;
-        }
-        if pan_variation != 0 {
-            entry.pan_swing = (pan_random as i32 * pan_variation as i32 * 4 / 128) as i16;
-        }
-    }
-
-    fn next_signed_byte(&mut self) -> i8 { (self.random.next_u32() >> 16) as u8 as i8 }
-
-    /// Copy the instrument's envelope enable flags onto the voice, which is what undoes an
-    /// earlier `S77`-style pause.
-    fn apply_envelope_flags(&mut self, voice: VoiceId, instrument: u16) {
-        let enabled = match self.instrument_mode {
-            true => self.module.instrument(InstrumentId(instrument.wrapping_sub(1))).map(|definition| {
-                (
-                    definition.volume_envelope.is_some(),
-                    definition.panning_envelope.is_some(),
-                    definition.pitch_envelope.is_some(),
-                )
-            }),
-            false => None,
-        };
-        let Some((volume, panning, pitch)) = enabled else { return };
-        let Some(entry) = self.voices.get_mut(voice.index() as usize) else { return };
-        entry.volume_envelope.enabled = volume;
-        entry.panning_envelope.enabled = panning;
-        entry.pitch_envelope.enabled = pitch;
-    }
-
     /// `CheckNNA`: the duplicate check first, then the New Note Action that detaches the
     /// channel's sounding voice.
     fn check_new_note_action(&mut self, context: &mut TickContext<'_>, channel_index: usize, instrument: u8, note: u8) {
@@ -1476,7 +1736,7 @@ impl ItProcessor {
         self.duplicate_check(context, channel_index, instrument_number, sample, note);
 
         let Some(voice) = self.channels[channel_index].voice else { return };
-        let Some(state) = self.voices.get(voice.index() as usize) else { return };
+        let Some(state) = self.articulation.voices.get(voice.index() as usize) else { return };
         if !state.owns(voice) || !state.playing {
             return;
         }
@@ -1491,7 +1751,7 @@ impl ItProcessor {
         }
         let Some(detached) = context.detach_channel(ChannelId(channel_index as u16)) else { return };
         self.channels[channel_index].voice = None;
-        let Some(entry) = self.voices.get_mut(detached.index() as usize) else { return };
+        let Some(entry) = self.articulation.voices.get_mut(detached.index() as usize) else { return };
         entry.foreground = false;
         match action {
             NewNoteAction::Continue => {}
@@ -1510,11 +1770,11 @@ impl ItProcessor {
     /// `DCT`/`DCA`: every voice rooted on this channel whose instrument's duplicate check
     /// matches is cut, released or faded before the new note starts.
     fn duplicate_check(&mut self, context: &mut TickContext<'_>, channel_index: usize, instrument: u16, sample: u16, note: u8) {
-        let mut affected: [Option<VoiceId>; VIRTUAL_CHANNELS] = [None; VIRTUAL_CHANNELS];
+        self.targets.fill(None);
         let mut count = 0usize;
         for (voice, _) in context.voices.iter() {
-            let Some(state) = self.voices.get(voice.index() as usize) else { continue };
-            if !state.owns(voice) || state.root_channel as usize != channel_index {
+            let Some(state) = self.articulation.voices.get(voice.index() as usize) else { continue };
+            if !state.owns(voice) || state.retiring || state.root_channel as usize != channel_index {
                 continue;
             }
             let Some(definition) = self.instrument_def(state.instrument) else { continue };
@@ -1526,13 +1786,14 @@ impl ItProcessor {
                 DuplicateCheck::Sample => sample != 0 && state.sample == sample && state.instrument == instrument,
                 DuplicateCheck::Instrument => state.instrument == instrument,
             };
-            if duplicate && count < affected.len() {
-                affected[count] = Some(voice);
+            if duplicate && count < self.targets.len() {
+                self.targets[count] = Some(voice);
                 count += 1;
             }
         }
-        for voice in affected.iter().flatten().copied() {
-            let Some(state) = self.voices.get_mut(voice.index() as usize) else { continue };
+        for index in 0..count {
+            let Some(voice) = self.targets[index] else { continue };
+            let Some(state) = self.articulation.voices.get_mut(voice.index() as usize) else { continue };
             let Some(definition) = self.module.instrument(InstrumentId(state.instrument.wrapping_sub(1))) else { continue };
             match definition.duplicate_action {
                 DuplicateAction::Cut => {
@@ -1550,56 +1811,7 @@ impl ItProcessor {
     /// `===`, `S71` and NNA note-off: release the sustain loop, and start the fadeout when
     /// there is no volume envelope or the envelope loops.
     fn key_off_voice(&mut self, context: &mut TickContext<'_>, voice: VoiceId) {
-        let Some(state) = self.voices.get_mut(voice.index() as usize) else { return };
-        if !state.owns(voice) {
-            return;
-        }
-        let first_release = !state.key_off;
-        state.key_off = true;
-        let instrument = state.instrument;
-        let sample = state.sample;
-        // Only an instrument can fade: a sample-mode note-off releases the sustain loop
-        // and nothing else (OpenMPT `KeyOff` tests `pModInstrument` before every
-        // `CHN_NOTEFADE` it sets).
-        let definition = match self.instrument_mode {
-            true => self.module.instrument(InstrumentId(instrument.wrapping_sub(1))),
-            false => None,
-        };
-        let starts_fade = definition.is_some_and(|definition| match definition.volume_envelope.as_ref() {
-            None => true,
-            Some(envelope) => envelope.loop_span.is_some() && definition.fadeout != 0,
-        });
-        if starts_fade && let Some(state) = self.voices.get_mut(voice.index() as usize) {
-            state.note_fade = true;
-        }
-        // The sustain loop is released here: the sample's normal loop comes back, or the
-        // sample stops looping altogether (`SusAfterLoop.it`).
-        if first_release
-            && let Some(sample_index) = self.sample_index(sample)
-            && sample_index.sustain_loop().is_some()
-            && let Some(slot) = context.voices.get_mut(voice)
-        {
-            let region = sample_region(sample_index, false);
-            let position = slot.position() >> 32;
-            slot.set_region(region);
-            let loop_end = sample_index.loop_end() as u64;
-            let loop_start = sample_index.loop_start() as u64;
-            // A bidirectional main loop keeps both the position and the direction: a voice
-            // the sustain loop left running backwards past the loop end plays on in
-            // reverse until it reaches the loop (libxmp `libxmp_mixer_release`,
-            // `it_sus_after_loop_bidi.it`).
-            if sample_index.loop_mode() != LoopMode::PingPong {
-                // Any other main loop cancels a reversed sustain loop, and a position past
-                // the loop end folds back into it.
-                slot.set_reversed(false);
-                if sample_index.loop_mode().is_looping() && loop_end > loop_start && position > loop_end {
-                    let wrapped = loop_start + (position - loop_start) % (loop_end - loop_start);
-                    slot.set_position(wrapped << 32);
-                } else {
-                    slot.set_position(position << 32);
-                }
-            }
-        }
+        self.articulation.release(&self.module, self.instrument_mode, context.voices, voice);
     }
 
     /// `^^^` and `SCx`: IT really stops the sample rather than muting it
@@ -2042,7 +2254,7 @@ impl ItProcessor {
         };
         let position = self.channels[channel_index].vibrato_position.wrapping_add(speed);
         self.channels[channel_index].vibrato_position = position;
-        let sample = oscillator_sample(waveform, position, &mut self.random);
+        let sample = oscillator_sample(waveform, position, &mut self.articulation.random);
         self.channels[channel_index].last_vibrato = sample;
         self.apply_vibrato(channel_index, sample);
     }
@@ -2299,7 +2511,7 @@ impl ItProcessor {
         };
         let position = self.channels[channel_index].tremolo_position.wrapping_add(speed);
         self.channels[channel_index].tremolo_position = position;
-        let sample = oscillator_sample(waveform, position, &mut self.random);
+        let sample = oscillator_sample(waveform, position, &mut self.articulation.random);
         self.channels[channel_index].last_tremolo = sample;
     }
 
@@ -2329,7 +2541,7 @@ impl ItProcessor {
             channel.panbrello_position = channel.panbrello_position.wrapping_sub(1);
             if (channel.panbrello_position as i8) <= 0 {
                 channel.panbrello_position = speed;
-                let value = (self.random.next_u32() & 127) as i32 - 64;
+                let value = (self.articulation.random.next_u32() & 127) as i32 - 64;
                 self.channels[channel_index].panbrello_random = value;
                 value
             } else {
@@ -2338,7 +2550,7 @@ impl ItProcessor {
         } else {
             let position = self.channels[channel_index].panbrello_position.wrapping_add(speed);
             self.channels[channel_index].panbrello_position = position;
-            oscillator_sample(waveform, position, &mut self.random)
+            oscillator_sample(waveform, position, &mut self.articulation.random)
         };
         let depth = self.channels[channel_index].panbrello_depth as i32;
         self.channels[channel_index].panbrello_offset = ((sample * depth) * 4 + 128) >> 8;
@@ -2371,7 +2583,7 @@ impl ItProcessor {
             false => data.and_then(|data| data.parametered_macro(self.channels[channel_index].active_macro as usize)),
         };
         let channel = &self.channels[channel_index];
-        let voice = channel.voice.and_then(|voice| self.voices.get(voice.index() as usize).filter(|state| state.owns(voice)));
+        let voice = channel.voice.and_then(|voice| self.articulation.voices.get(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring));
         let substitutions = MacroSubstitutions {
             parameter,
             note: channel.last_note & 0x7F,
@@ -2523,25 +2735,26 @@ impl ItProcessor {
     fn note_and_envelope_control(&mut self, context: &mut TickContext<'_>, channel_index: usize, argument: u8) {
         match argument {
             0x0..=0x2 => {
-                let mut targets: [Option<VoiceId>; VIRTUAL_CHANNELS] = [None; VIRTUAL_CHANNELS];
+                self.targets.fill(None);
                 let mut count = 0usize;
                 for (voice, _) in context.voices.iter() {
-                    let Some(state) = self.voices.get(voice.index() as usize) else { continue };
-                    if state.owns(voice) && !state.foreground && state.root_channel as usize == channel_index && count < targets.len() {
-                        targets[count] = Some(voice);
+                    let Some(state) = self.articulation.voices.get(voice.index() as usize) else { continue };
+                    if state.owns(voice) && !state.retiring && !state.foreground && state.root_channel as usize == channel_index && count < self.targets.len() {
+                        self.targets[count] = Some(voice);
                         count += 1;
                     }
                 }
-                for voice in targets.iter().flatten().copied() {
+                for index in 0..count {
+                    let Some(voice) = self.targets[index] else { continue };
                     match argument {
                         0x1 => self.key_off_voice(context, voice),
                         0x2 => {
-                            if let Some(state) = self.voices.get_mut(voice.index() as usize) {
+                            if let Some(state) = self.articulation.voices.get_mut(voice.index() as usize) {
                                 state.note_fade = true;
                             }
                         }
                         _ => {
-                            if let Some(state) = self.voices.get_mut(voice.index() as usize) {
+                            if let Some(state) = self.articulation.voices.get_mut(voice.index() as usize) {
                                 state.note_fade = true;
                                 state.fadeout = 0;
                             }
@@ -2666,8 +2879,20 @@ fn parse_filter_macro(bytes: &[u8], substitutions: MacroSubstitutions) -> (Optio
 // ── the tick ─────────────────────────────────────────────────────────────────────────
 
 impl ItProcessor {
+    fn sync_retirement(&mut self, context: &TickContext<'_>) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(playback) = context.channels.playback() {
+            for state in self.articulation.voices.iter_mut() {
+                if let Some(voice) = state.voice
+                    && playback.get(voice, context.voices).is_some_and(|ownership| ownership.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) { state.retiring = true; }
+            }
+        }
+        let _ = context;
+    }
+
     /// One tick of every channel, then one pass over every voice.
     fn run_tick(&mut self, context: &mut TickContext<'_>, outcome: &mut TickOutcome, row_start: bool) {
+        self.sync_retirement(context);
         let row_length = (self.song_speed as u16 + self.frame_delay as u16).max(1);
         let absolute_tick = context.row_clock.tick_in_row;
         let tick_in_repeat = absolute_tick % row_length;
@@ -2767,153 +2992,27 @@ impl ItProcessor {
         let instrument_mode = self.instrument_mode;
         let global_volume = self.global_volume;
         let sample_rate_hz = self.sample_rate_hz;
-        for index in 0..self.voices.len() {
-            let Some(voice) = self.voices[index].voice else { continue };
+        for index in 0..self.articulation.voices.len() {
+            let Some(voice) = self.articulation.voices[index].voice else { continue };
             if context.voices.get(voice).is_none() {
-                self.voices[index].release();
+                self.articulation.voices[index].release();
                 continue;
+            }
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|state| state.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) {
+                self.articulation.retire(voice);
             }
             // `chn.triggerNote`: the note that started this voice landed on this very
             // tick, which is the only moment IT is allowed to *disengage* a filter.
             let trigger_note = {
-                let state = &self.voices[index];
+                let state = &self.articulation.voices[index];
                 state.foreground && self.channels.get(state.root_channel as usize).is_some_and(|channel| channel.triggered)
             };
-            let state = &mut self.voices[index];
-            let definition = match instrument_mode {
-                true => module.instrument(InstrumentId(state.instrument.wrapping_sub(1))),
-                false => None,
-            };
-
-            let mut volume = state.note_volume.clamp(0, MAX_NOTE_VOLUME) << 6;
-            let mut pan = (state.pan as i32 + state.pan_swing as i32).clamp(0, MAX_PAN);
-            let mut filter_modifier = 256i32;
-
-            if let Some(definition) = definition {
-                // IT increments the position before it evaluates, so an envelope disabled
-                // on the very tick its note triggers is not processed at all.
-                let key_off_previous = state.key_off_previous;
-                let mut fade = false;
-                if let Some(envelope) = definition.volume_envelope.as_ref() {
-                    fade |= advance_envelope(&mut state.volume_envelope, envelope, key_off_previous);
-                    let position = state.volume_envelope.position.saturating_sub(1);
-                    if state.volume_envelope.position != 0 {
-                        state.volume_envelope.value = envelope_value(envelope, position, 4, 0).clamp(0, MAX_NOTE_VOLUME);
-                        volume = volume * state.volume_envelope.value / 256;
-                    }
-                    if fade {
-                        state.note_fade = true;
-                        if envelope.points.last().is_some_and(|point| point.value == 0) {
-                            state.fadeout = 0;
-                            volume = 0;
-                        }
-                    }
-                }
-                if let Some(envelope) = definition.panning_envelope.as_ref() {
-                    advance_envelope(&mut state.panning_envelope, envelope, key_off_previous);
-                    if state.panning_envelope.position != 0 {
-                        let position = state.panning_envelope.position.saturating_sub(1);
-                        let value = envelope_value(envelope, position, 1, 32).clamp(-32, 32);
-                        state.panning_envelope.value = value;
-                        // The envelope's reach is proportional to the distance to the
-                        // nearer edge, so a hard-panned voice barely moves outward.
-                        pan += if pan >= 128 { value * (MAX_PAN - pan) / 32 } else { value * pan / 32 };
-                    }
-                }
-                if let Some(envelope) = definition.pitch_envelope.as_ref() {
-                    advance_envelope(&mut state.pitch_envelope, envelope, key_off_previous);
-                    if state.pitch_envelope.position != 0 {
-                        let position = state.pitch_envelope.position.saturating_sub(1);
-                        let value = envelope_value(envelope, position, 8, 32).clamp(-256, 256);
-                        state.pitch_envelope.value = value;
-                        if state.pitch_envelope_is_filter {
-                            filter_modifier = value;
-                        }
-                    }
-                }
-                // The fadeout, once note-fade is set: ITTECH.TXT's `NFC` loses the raw
-                // `FadeOut` from a count of 1024 every tick, so a fadeout of 10 is silent
-                // after 103 ticks. OpenMPT stores `fadeout << 5` and subtracts twice that
-                // from the same 65536 scale.
-                if state.note_fade {
-                    let fadeout = definition.fadeout as i32;
-                    if fadeout != 0 {
-                        state.fadeout = (state.fadeout - fadeout * FADEOUT_STEP_SCALE).max(0);
-                    }
-                    volume = (volume as i64 * state.fadeout as i64 / FADEOUT_FULL as i64) as i32;
-                }
-            } else if state.note_fade {
-                state.fadeout = 0;
-                volume = 0;
-            }
-
-            // The mixing chain: `Vol · VEV · NFC · CV · SV · IV · GV`.
-            let instrument_volume = (state.instrument_volume as i32 + state.volume_swing as i32).clamp(0, MAX_CHANNEL_VOLUME as i32);
-            let real_volume = muldiv(
-                volume as i64 * (global_volume as i64 * 2),
-                state.channel_volume as i64 * instrument_volume as i64,
-                1 << 20,
-            )
-            .clamp(0, 1 << 14) as i32;
-            state.real_volume = real_volume;
-
-            // Pitch: the channel's frequency, the pitch envelope, then auto-vibrato.
-            let mut frequency = state.frequency_hz;
-            if !state.pitch_envelope_is_filter && state.pitch_envelope.position != 0 {
-                let value = state.pitch_envelope.value;
-                let magnitude = value.unsigned_abs().min(255) as u8;
-                frequency = match value >= 0 {
-                    true => apply_slide_ratio(frequency, linear_slide_up_q16(magnitude)),
-                    false => apply_slide_ratio(frequency, linear_slide_down_q16(magnitude)),
-                };
-            }
-            frequency = advance_auto_vibrato(state, module.sample(SampleId(state.sample.wrapping_sub(1))), frequency, &mut self.random);
-
-            if state.surround {
-                // Accuracy policy D66: StarPlayer has no rear bus, so surround is centre.
-                pan = 128;
-            }
-            state.real_pan = pan.clamp(0, MAX_PAN) as i16;
-
-            // The filter. `SetupChannelFilter` filters whenever the cutoff is not fully
-            // open or the resonance is set; otherwise it returns `-1` and *leaves the
-            // coefficients alone*, and only a note trigger on the same tick clears
-            // `CHN_FILTER` and so silences the filter (OpenMPT `Snd_flt.cpp`
-            // `SetupChannelFilter`, the `kITFilterBehaviour` branch; libxmp spells the
-            // same rule as `cutoff < 0xfe || resonance > 0 || xc->filter.can_disable`,
-            // `src/player.c:1330`). Test cases `filter-reset.it`, `filter-reset-carry.it`,
-            // `filter-nna.it`.
-            let computed_cutoff = (state.cutoff as i32 * (filter_modifier + 256) / 256).clamp(0, 255) as u8;
-            let filter = if state.resonance == 0 && computed_cutoff >= 254 {
-                match state.filter_active && !trigger_note {
-                    // Still filtering with the coefficients it already has.
-                    true => None,
-                    false => {
-                        state.filter_active = false;
-                        Some(FilterParams::BYPASS)
-                    }
-                }
-            } else {
-                state.filter_active = true;
-                Some(FilterParams::from_it_scaled(computed_cutoff, state.resonance))
-            };
-
-            // `SCx` zeroes the increment outright (OpenMPT `Snd_fx.cpp` `NoteCut` under
-            // `kITSCxStopsSample`); the note itself stays on the channel.
-            let step = match state.playing {
-                true => Step::from_ratio(frequency as u64, sample_rate_hz.max(1) as u64),
-                false => Step::ZERO,
-            };
-            let volume_unit = unit_from_ratio(real_volume as u32, 1 << 14);
-            let pan_unit = pan_to_bipolar_position(state.real_pan);
-            let written = state.written;
-            let has_written = state.has_written;
-            let held_filter = match has_written {
-                true => written.filter,
-                false => FilterParams::BYPASS,
-            };
-            state.written = VoiceParams { step, volume: volume_unit, pan: pan_unit, filter: filter.unwrap_or(held_filter), dirty: DirtyBits::empty() };
-            state.has_written = true;
+            let Some(output) = self.articulation.control_step(&module, voice, instrument_mode, global_volume, sample_rate_hz, trigger_note) else { continue };
+            let VoiceParams { step, volume: volume_unit, pan: pan_unit, .. } = output.params;
+            let written = output.previous;
+            let has_written = output.has_previous;
+            let filter = output.filter_written.then_some(output.params.filter);
             // A silent voice — the fadeout reached zero, or `SCx` zeroed the increment.
             // Impulse Tracker frees the pool slot only for a *background* voice: libxmp
             // reclaims a zero-volume voice only when its channel index is past the
@@ -2921,20 +3020,19 @@ impl ItProcessor {
             // OpenMPT's `NoteCut` leaves the note, the instrument and the sample on the
             // channel with `nFadeOutVol` at zero. A foreground channel therefore keeps
             // reporting its silent note until another note replaces it.
-            let silent = state.note_fade && state.fadeout == 0 && real_volume == 0;
-            if silent && !(state.foreground && state.cut_by_scx) {
-                if state.foreground {
+            if output.silent {
+                if self.articulation.voices[index].foreground {
                     if let Some(slot) = context.voices.get_mut(voice) {
                         slot.stop();
                     }
                 } else {
                     context.voices.release(voice);
                 }
-                let root = self.voices[index].root_channel as usize;
-                if self.voices[index].foreground && self.channels.get(root).is_some_and(|channel| channel.voice == Some(voice)) {
+                let root = self.articulation.voices[index].root_channel as usize;
+                if self.articulation.voices[index].foreground && self.channels.get(root).is_some_and(|channel| channel.voice == Some(voice)) {
                     self.channels[root].voice = None;
                 }
-                self.voices[index].release();
+                self.articulation.voices[index].release();
                 continue;
             }
             // The channel's macro inputs, for the *next* tick's `u` and `y` letters. Only
@@ -2942,9 +3040,9 @@ impl ItProcessor {
             // `process_volume` for a channel whose voice is still active
             // (`src/player.c:1633` returns early otherwise), so a cut or faded-out note
             // leaves the last sounding values in place.
-            if self.voices[index].foreground {
-                let (real_volume, real_pan) = (self.voices[index].real_volume, self.voices[index].real_pan);
-                let root = self.voices[index].root_channel as usize;
+            if self.articulation.voices[index].foreground {
+                let (real_volume, real_pan) = (self.articulation.voices[index].real_volume, self.articulation.voices[index].real_pan);
+                let root = self.articulation.voices[index].root_channel as usize;
                 if let Some(channel) = self.channels.get_mut(root) {
                     channel.macro_real_volume = real_volume;
                     channel.macro_real_pan = real_pan;
@@ -2964,7 +3062,7 @@ impl ItProcessor {
             {
                 context.write_voice_param(voice, VoiceParam::Filter(filter));
             }
-            self.voices[index].key_off_previous = self.voices[index].key_off;
+            self.articulation.voices[index].key_off_previous = self.articulation.voices[index].key_off;
         }
     }
 
@@ -2975,11 +3073,11 @@ impl ItProcessor {
         for channel_index in 0..self.channels.len() {
             let state = self.channels[channel_index]
                 .voice
-                .and_then(|voice| self.voices.get(voice.index() as usize).filter(|state| state.owns(voice)));
+                .and_then(|voice| self.articulation.voices.get(voice.index() as usize).filter(|state| state.owns(voice) && !state.retiring));
             context.report_trace_channel(ChannelId(channel_index as u16), self.trace_state(state));
         }
-        for index in 0..self.voices.len() {
-            let state = &self.voices[index];
+        for index in 0..self.articulation.voices.len() {
+            let state = &self.articulation.voices[index];
             let Some(voice) = state.voice else { continue };
             if state.foreground {
                 continue;
@@ -3075,6 +3173,12 @@ fn advance_auto_vibrato(state: &mut ItVoiceState, sample: Option<&SampleIndex>, 
 // ── the TrackerProcessor seam ────────────────────────────────────────────────────────
 
 impl TrackerProcessor for ItProcessor {
+    fn control_step(&mut self, context: &mut TickContext<'_>) {
+        self.sync_retirement(context);
+        for channel in self.channels.iter_mut() { channel.triggered = false; }
+        self.advance_voices(context);
+    }
+
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, MAX_GLOBAL_VOLUME as u32));
         let mut outcome = context.outcome();
@@ -3119,18 +3223,18 @@ impl TrackerProcessor for ItProcessor {
             let (pan, surround) = default_pan(&self.module, channel_index as u8);
             self.channels[channel_index] = ItChannel::new(channel_index as u8, pan, surround, default_channel_volume(&self.module, channel_index as u8));
         }
-        for state in self.voices.iter_mut() {
+        for state in self.articulation.voices.iter_mut() {
             state.release();
         }
         self.flow.reset();
         self.last_order = None;
         self.last_moved_voice = None;
-        self.random = Xorshift32::new(0x1D_F0_5A_C7);
+        self.articulation.random = Xorshift32::new(0x1D_F0_5A_C7);
     }
 
     /// Canonical processors hold all virtual channels; a bounded host constructor holds
     /// exactly the number its fixed voice pool can address.
-    fn recommended_voice_capacity(&self, _channel_count: usize) -> usize { self.voices.len().min(VIRTUAL_CHANNELS) }
+    fn recommended_voice_capacity(&self, _channel_count: usize) -> usize { self.articulation.voices.len().min(VIRTUAL_CHANNELS) }
 }
 
 /// How many voices an IT module wants in the pool, without building a processor.
@@ -3383,12 +3487,12 @@ mod tests {
         // Three background voices with descending volume, and a foreground one.
         for (index, volume) in [4096i32, 1024, 8192].into_iter().enumerate() {
             let voice = voices.allocate(tag, region, VoiceParams::SILENT, 0).expect("the pool has room");
-            let entry = &mut processor.voices[voice.index() as usize];
+            let entry = &mut processor.articulation.voices[voice.index() as usize];
             *entry = ItVoiceState { voice: Some(voice), foreground: false, real_volume: volume, note_volume: 0, fadeout: FADEOUT_FULL, ..ItVoiceState::default() };
             let _ = index;
         }
         let foreground = voices.allocate(tag, region, VoiceParams::SILENT, 0).expect("the pool has room");
-        processor.voices[foreground.index() as usize] = ItVoiceState { voice: Some(foreground), foreground: true, real_volume: 1, fadeout: FADEOUT_FULL, ..ItVoiceState::default() };
+        processor.articulation.voices[foreground.index() as usize] = ItVoiceState { voice: Some(foreground), foreground: true, real_volume: 1, fadeout: FADEOUT_FULL, ..ItVoiceState::default() };
 
         let context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
         let victim = processor.choose_victim(&context).expect("a full pool still yields a victim");
@@ -3502,31 +3606,100 @@ mod tests {
     /// IT still recommends 256 owned voices, while a persistent jam host carries sixteen
     /// extra global slots and enough parallel state to track IT voices at high IDs.
     #[test]
+    fn runtime_generation_checks_do_not_consume_randomness_and_retirement_is_inert() {
+        let module = module_with_instrument(&[], NewNoteAction::Continue, |instrument| { instrument.random_volume_variation = 64; instrument.random_pan_variation = 64; instrument.volume_envelope = Some(looping_volume_envelope()); });
+        let mut runtime = ItArticulationRuntime::try_new(339).unwrap();
+        let mut voices = VoicePool::new(339);
+        let tag = VoiceTag { channel: 0, instrument: 1, sample: 1, note: 60 };
+        for _ in 0..338 { voices.allocate(tag, SampleRegion::one_shot(0, 64), VoiceParams::SILENT, 0).unwrap(); }
+        let old = voices.allocate(tag, SampleRegion::one_shot(0, 64), VoiceParams::SILENT, 0).unwrap();
+        voices.release(old);
+        let new = voices.allocate(tag, SampleRegion::one_shot(0, 64), VoiceParams::SILENT, 0).unwrap();
+        assert!(runtime.start(new, ItVoiceState { instrument: 1, sample: 1, playing: true, note_volume: 256, ..ItVoiceState::default() }, &voices));
+        let before = runtime.voice(new).unwrap().clone();
+        let random = runtime.random;
+        assert!(!runtime.start(old, before.clone(), &voices));
+        runtime.roll_swing(&module, true, old, 1);
+        runtime.apply_envelope_flags(&module, true, old, 1);
+        runtime.cut(old); runtime.retire(old); runtime.discard(old);
+        assert!(runtime.control_step(&module, old, true, 128, 44_100, false).is_none());
+        assert_eq!(runtime.voice(new), Some(&before));
+        assert_eq!(runtime.random, random);
+        runtime.roll_swing(&module, true, new, 1);
+        runtime.apply_envelope_flags(&module, true, new, 1);
+        assert_ne!(runtime.random, random);
+        runtime.retire(new);
+        let before = runtime.voice(new).unwrap().clone();
+        let random = runtime.random;
+        runtime.roll_swing(&module, true, new, 1); runtime.apply_envelope_flags(&module, true, new, 1); runtime.cut(new);
+        assert!(runtime.control_step(&module, new, true, 128, 44_100, false).is_none());
+        assert_eq!(runtime.voice(new), Some(&before));
+        assert_eq!(runtime.random, random);
+    }
+
+    #[test]
+    fn duplicate_and_past_note_scratch_cover_all_prepared_slots() {
+        let module = module_with_instrument(&[], NewNoteAction::Continue, |instrument| { instrument.duplicate_check = DuplicateCheck::Instrument; instrument.duplicate_action = DuplicateAction::NoteFade; });
+        let mut processor = ItProcessor::try_with_quirks_and_voice_capacity(module, 44_100, QuirkSelection::FromDialect, 339).unwrap();
+        assert_eq!(processor.articulation.capacity(), 339);
+        assert_eq!(processor.recommended_voice_capacity(2), 256);
+        let mut voices = VoicePool::new(339);
+        let mut channels = ChannelTable::new(2);
+        for _ in 0..339 {
+            let voice = voices.allocate(VoiceTag { channel: 0, instrument: 1, sample: 1, note: 60 }, SampleRegion::one_shot(0, 64), VoiceParams::SILENT, 0).unwrap();
+            processor.articulation.start(voice, ItVoiceState { instrument: 1, sample: 1, playing: true, ..ItVoiceState::default() }, &voices);
+        }
+        let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+        processor.duplicate_check(&mut context, 0, 1, 1, 60);
+        assert!(processor.articulation.voices.iter().all(|state| state.note_fade));
+        processor.note_and_envelope_control(&mut context, 0, 0);
+        assert!(processor.articulation.voices.iter().all(|state| state.fadeout == 0));
+    }
+
+    #[test]
+    fn held_control_advances_envelopes_without_running_volume_slides() {
+        let module = module_with_instrument(&[ItCell { command: COMMAND_VOLUME_SLIDE, info: 1, ..note_cell(60, 1) }], NewNoteAction::Continue, |instrument| instrument.volume_envelope = Some(looping_volume_envelope()));
+        let (mut processor, mut voices, mut channels) = play(module, 1, 2);
+        let voice = processor.channels[0].voice.unwrap();
+        let base = processor.channels[0].note_volume;
+        let before = processor.voice(voice).unwrap().volume_envelope.position;
+        let mut context = TickContext::new(Frame(999), &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+        processor.control_step(&mut context);
+        assert_eq!(processor.channels[0].note_volume, base);
+        assert_ne!(processor.voice(voice).unwrap().volume_envelope.position, before);
+    }
+
+    #[test]
     fn the_recommended_capacity_and_wider_parallel_state_have_distinct_limits() {
         let module = module_with(&[note_cell(60, 1)], NewNoteAction::Cut);
         let processor = ItProcessor::new(module, 44_100);
         assert_eq!(processor.recommended_voice_capacity(CHANNELS as usize), VIRTUAL_CHANNELS);
         assert_eq!(recommended_voice_capacity(CHANNELS as usize), VIRTUAL_CHANNELS);
-        assert_eq!(processor.voices.len(), MAX_VOICE_CAPACITY);
+        assert_eq!(processor.articulation.voices.len(), MAX_VOICE_CAPACITY);
         assert!(processor.voice(VoiceId::new(MAX_VOICE_CAPACITY as u16, 1)).is_none(), "a voice id past the array is skipped");
     }
 
     #[test]
     fn midi_low_slots_do_not_push_it_past_its_state_or_let_it_consume_the_reserve() {
+        exercise_native_quota(MAX_VOICE_CAPACITY);
+        exercise_native_quota(339);
+    }
+
+    fn exercise_native_quota(capacity: usize) {
         let module = module_with(&[note_cell(60, 1)], NewNoteAction::Continue);
-        let mut processor = ItProcessor::new(module, 44_100);
-        let mut voices = VoicePool::new(MAX_VOICE_CAPACITY);
+        let mut processor = ItProcessor::try_with_quirks_and_voice_capacity(module, 44_100, QuirkSelection::FromDialect, capacity).unwrap();
+        let mut voices = VoicePool::new(capacity);
         let mut channels = ChannelTable::new(ChannelTable::MAX_CHANNELS);
         let region = SampleRegion::one_shot(0, 64);
         let midi_tag = VoiceTag { channel: 48, instrument: 1, sample: 1, note: 60 };
-        for _ in 0..16 {
+        for _ in 0..capacity - VIRTUAL_CHANNELS {
             voices.allocate(midi_tag, region, VoiceParams::SILENT, 0).expect("the MIDI reserve has room");
         }
         let tracker_tag = VoiceTag { channel: 0, instrument: 1, sample: 1, note: 60 };
         let mut highest = None;
         for index in 0..VIRTUAL_CHANNELS {
             let voice = voices.allocate(tracker_tag, region, VoiceParams::SILENT, 0).expect("all IT virtual channels fit");
-            processor.voices[voice.index() as usize] = ItVoiceState {
+            processor.articulation.voices[voice.index() as usize] = ItVoiceState {
                 voice: Some(voice),
                 foreground: false,
                 real_volume: 1_024,
@@ -3538,11 +3711,11 @@ mod tests {
             highest = Some(voice);
         }
         let highest = highest.expect("there is a highest IT voice");
-        assert_eq!(highest.index() as usize, MAX_VOICE_CAPACITY - 1, "sixteen low MIDI IDs push the last IT state to slot 271");
+        assert_eq!(highest.index() as usize, capacity - 1, "sixteen low MIDI IDs push the last IT state to slot 271");
 
         let first_midi = voices.iter().next().map(|(voice, _)| voice).expect("a MIDI voice exists");
         voices.release(first_midi);
-        assert_eq!(voices.voices_active(), MAX_VOICE_CAPACITY - 1, "one global reserve slot is free");
+        assert_eq!(voices.voices_active(), capacity - 1, "one global reserve slot is free");
         let allocated = {
             let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
             processor
@@ -3551,8 +3724,8 @@ mod tests {
         };
         assert_eq!(allocated.index(), highest.index(), "the fully faded high-ID IT background slot is reused first");
         assert_ne!(allocated.generation(), highest.generation(), "the reused slot has a fresh generation");
-        assert_eq!(voices.voices_active(), MAX_VOICE_CAPACITY - 1, "quota replacement keeps the pool at 271 before the caller records the new IT state");
-        processor.voices[allocated.index() as usize] = ItVoiceState {
+        assert_eq!(voices.voices_active(), capacity - 1, "quota replacement keeps the pool at 271 before the caller records the new IT state");
+        processor.articulation.voices[allocated.index() as usize] = ItVoiceState {
             voice: Some(allocated),
             foreground: false,
             fadeout: FADEOUT_FULL,
@@ -3561,13 +3734,13 @@ mod tests {
         };
         let owned_voice_count = voices
             .iter()
-            .filter(|(voice, _)| processor.voices.get(voice.index() as usize).is_some_and(|state| state.owns(*voice)))
+            .filter(|(voice, _)| processor.articulation.voices.get(voice.index() as usize).is_some_and(|state| state.owns(*voice)))
             .count();
         assert_eq!(owned_voice_count, VIRTUAL_CHANNELS, "the replacement restores exactly 256 IT-owned voices");
         let replacement_midi = voices.allocate(midi_tag, region, VoiceParams::SILENT, 0).expect("the freed MIDI reserve slot remains available");
         assert_eq!(replacement_midi.index(), first_midi.index());
-        assert_eq!(voices.voices_active(), MAX_VOICE_CAPACITY, "sixteen MIDI and 256 IT voices fit together");
-        for (voice, state) in voices.iter().take(16) {
+        assert_eq!(voices.voices_active(), capacity, "sixteen MIDI and 256 IT voices fit together");
+        for (voice, state) in voices.iter().take(capacity - VIRTUAL_CHANNELS) {
             assert_eq!(state.tag.channel, midi_tag.channel, "low slot {} remains MIDI-owned", voice.index());
         }
     }

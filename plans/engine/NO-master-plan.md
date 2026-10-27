@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation authorised 2026-10-27; NO-01 integrated; NO-02 in progress; reviewed instrument-only/onset-volume contract unchanged |
+| Status | Implementation authorised 2026-10-27; NO-01/02 integrated; NO-03 in progress; reviewed instrument-only/onset-volume contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -525,3 +525,10 @@ planning handoff. External review findings, corrections and final disposition ar
   dependent capture/behavior obligations are in NO-01. Plans stay here pending main landing.
 - NO-02 starts after NO-01; worker Astra medium per explicit owner assignment. Only one
   task agent and one heavy Cargo workload run at a time (owner OOM constraint).
+
+- NO-02 integrated as a reviewed single-change squash (task commit `bbf57f4`): concrete
+  XM/IT runtimes, prepared capacity plumbing and generation-safe control operations.
+  Canonical conformance baseline and all eight goldens unchanged; prepared PCM agrees
+  at all six required sizes. Allocation hooks, optional combinations, no_std and Clippy
+  passed; coordinator affected-package regression passed. See NO-02 for exact evidence.
+- NO-03 starts after NO-02, using Astra medium as the sole active task worker.

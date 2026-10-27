@@ -42,7 +42,7 @@ use std::vec::Vec;
 use starplayer::core::{AtEnd, ChannelId, Command, Event, Frame, U0F16};
 use starplayer::dsp::{InsertKind, ParamId};
 use starplayer::engine::{
-    EngineHandle, EngineWarnings, EventSource, ExternalEventProducer, InsertTarget, InstrumentRack, MAX_INSERTS_PER_CHAIN,
+    EngineHandle, EngineSettings, EngineWarnings, EventSource, ExternalEventProducer, InsertTarget, InstrumentRack, MAX_INSERTS_PER_CHAIN,
     MidiSource, MixerMode, RENDER_QUANTUM, SourceMux, external_event_channel,
 };
 use starplayer::model::Module;
@@ -56,7 +56,7 @@ use crate::backend::{AudioBackend, AudioSpec, HostError, Stream, StreamHealth};
 use crate::engine::HostEngine;
 use crate::events::{EVENT_QUEUE_CAPACITY, EventClock, EventSender};
 use crate::insert::{HostInsertControl, InsertLayout};
-use crate::source::{SeekKind, SeekRequest, SourceHandles, build_source};
+use crate::source::{SeekKind, SeekRequest, SourceHandles, build_source_with_settings};
 use crate::transport::Transport;
 
 /// Commands the control side may have outstanding before it starts getting refusals.
@@ -379,12 +379,13 @@ struct ControlSide {
 ///
 /// The engine is stopped and the transport silent, so a stream may be started immediately
 /// without the song advancing under it: nothing sounds until [`Player::play`].
-fn build_sides(mode: MixerMode, spec: AudioSpec) -> Result<(RenderState, ControlSide), HostError> {
+fn build_sides(mode: MixerMode, spec: AudioSpec, mut settings: EngineSettings) -> Result<(RenderState, ControlSide), HostError> {
     if mode.channels as u16 != spec.channels {
         let reason = std::format!("the engine renders {} channels, the device wants {}", mode.channels, spec.channels);
         return Err(HostError::UnsupportedSpec { requested: spec, reason });
     }
-    let (mut engine, mut control, insert_control, telemetry) = HostEngine::build(mode, spec.sample_rate_hz)?;
+    settings.sample_rate_hz = spec.sample_rate_hz;
+    let (mut engine, mut control, insert_control, telemetry) = HostEngine::build_with_settings(mode, settings)?;
     let scopes = engine.scope_readers();
     // Freeze the musical clock until the first Play. Without this a stream that is started
     // as soon as it is open plays the song silently while the caller is still deciding.
@@ -445,6 +446,7 @@ struct Rebuild {
 
 /// The backend-neutral player: one engine, one stream, one module at a time.
 pub struct Player {
+    engine_settings: EngineSettings,
     stream: Stream,
     spec: AudioSpec,
     mode: MixerMode,
@@ -497,8 +499,16 @@ impl Player {
     /// transport is at zero — so telemetry flows and [`Player::play`] is a 64-frame glide
     /// rather than a device round trip.
     pub fn open(backend: &mut dyn AudioBackend, device: Option<&str>, requested: AudioSpec, mode: MixerMode) -> Result<Player, HostError> {
+        let settings = EngineSettings { voice_capacity: starplayer::MAX_VOICE_CAPACITY, channel_count: starplayer::engine::ChannelTable::MAX_CHANNELS, ..EngineSettings::default() };
+        Self::open_with_settings(backend, device, requested, mode, settings)
+    }
+
+    /// Open with explicit prepared capacities. Rebuilds and every module-source builder
+    /// retain these settings; the negotiated output rate replaces settings.sample_rate_hz.
+    pub fn open_with_settings(backend: &mut dyn AudioBackend, device: Option<&str>, requested: AudioSpec, mode: MixerMode, mut settings: EngineSettings) -> Result<Player, HostError> {
         let negotiated = backend.negotiate(device, requested)?;
-        let (mut render, control) = build_sides(mode, negotiated)?;
+        settings.sample_rate_hz = negotiated.sample_rate_hz;
+        let (mut render, control) = build_sides(mode, negotiated, settings)?;
         let stream = backend.open(device, negotiated, Box::new(move |output: &mut [f32]| render.render(output)))?;
         if stream.spec() != negotiated {
             return Err(HostError::UnsupportedSpec {
@@ -508,6 +518,7 @@ impl Player {
         }
         stream.play()?;
         Ok(Player {
+            engine_settings: settings,
             stream,
             spec: negotiated,
             mode,
@@ -594,7 +605,7 @@ impl Player {
         // layout lives in `Player`), replayed into the freshly built engine below — a new
         // engine's insert graph starts empty, exactly as a new engine's module does.
         let insert_layout = self.insert_layout.clone();
-        let mut rebuilt = Player::open(backend, device, requested, plan.mode)?;
+        let mut rebuilt = Player::open_with_settings(backend, device, requested, plan.mode, self.engine_settings)?;
         // Carried, not restarted: the count is what a caller reports as "modules dropped on
         // this thread since start-up", and a rebuild is not a fresh start-up.
         rebuilt.collected = collected;
@@ -701,7 +712,7 @@ impl Player {
         let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
         // A seek asked for against the outgoing module means nothing to the incoming one.
         self.handles.seek.clear();
-        let built = build_source(RtArc::clone(&module), self.spec.sample_rate_hz, start, frame, &self.handles, cached_scan, self.speed_adjust)?;
+        let built = build_source_with_settings(RtArc::clone(&module), start, frame, &self.handles, cached_scan, self.speed_adjust, self.engine_settings)?;
         let (source, events) = if self.live_input == LiveInputMode::Jam {
             let (source, producer) = self.build_jam_source(&module, frame, built.source)?;
             (source, Some(EventSender::new(producer, Arc::clone(&self.event_clock))))
@@ -891,14 +902,14 @@ impl Player {
         let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
         let song_frame = self.telemetry.read().transport.song_frame;
         self.handles.seek.clear();
-        let built = build_source(
+        let built = build_source_with_settings(
             RtArc::clone(&module),
-            self.spec.sample_rate_hz,
             SeekKind::Frame(song_frame),
             frame,
             &self.handles,
             self.scan.clone(),
             self.speed_adjust,
+            self.engine_settings,
         )?;
         let (source, events) = if enabled {
             let (source, producer) = self.build_jam_source(&module, frame, built.source)?;

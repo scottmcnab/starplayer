@@ -71,3 +71,9 @@ fn every_metadata_allocation_is_fallible() {
     }
     assert!(completed, "the test passed every real metadata allocation before its bound");
 }
+
+#[test]
+fn optional_articulation_preparation_reports_allocation_failure() {
+    assert!(failing_after(0, || starplayer_xm::XmArticulationRuntime::try_new(339)).is_err());
+    assert!(starplayer_xm::XmArticulationRuntime::try_new(usize::MAX).is_err());
+}

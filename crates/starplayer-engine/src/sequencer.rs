@@ -536,6 +536,10 @@ pub trait TrackerProcessor {
     /// unless the format overrides [`TrackerProcessor::row_repeat`].
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome;
 
+    /// Advance held voice articulation only: no row/effect/flow or row-trace events.
+    /// The caller must not also dispatch a tracker tick at this boundary.
+    fn control_step(&mut self, _context: &mut TickContext<'_>) {}
+
     /// Drop every piece of replay state a seek must not carry across the discontinuity:
     /// deferred tempo commands, LFO random streams, effect memories, pattern-loop
     /// counters and per-channel command state.

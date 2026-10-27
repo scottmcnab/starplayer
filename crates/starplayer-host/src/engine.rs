@@ -46,17 +46,17 @@ pub const MAX_FRAMES_PER_RENDER: usize = 4_096;
 type BuiltEngine<Path, Interp, Out> =
     (Engine<Path, Interp, Out, Arc<Module>>, EngineHandle<Arc<Module>>, InsertHandle<<Path as MixPath>::Mono>, TelemetryReader);
 
-fn build_engine_arm<Path, Interp, Out>(settings: EngineSettings) -> BuiltEngine<Path, Interp, Out>
+fn build_engine_arm<Path, Interp, Out>(settings: EngineSettings) -> Result<BuiltEngine<Path, Interp, Out>, HostError>
 where
     Path: MixPath,
     Interp: Interpolate,
     Out: OutputFormat<Accumulator = Path::Accumulator>,
 {
-    let mut engine = Engine::<Path, Interp, Out, Arc<Module>>::with_settings(settings);
+    let mut engine = Engine::<Path, Interp, Out, Arc<Module>>::try_with_settings(settings).map_err(HostError::EngineConfiguration)?;
     let control = engine.take_control().expect("a new engine owns its control handle");
     let insert_control = engine.take_insert_control().expect("a new engine owns its insert control handle");
     let telemetry = engine.telemetry_reader().expect("telemetry is enabled for the native host");
-    (engine, control, insert_control, telemetry)
+    Ok((engine, control, insert_control, telemetry))
 }
 
 /// Wrap an arm's own `InsertHandle<Path::Mono>` in the runtime enum a `Player` can hold
@@ -93,7 +93,7 @@ macro_rules! define_arms {
             fn build(mode: MixerMode, settings: EngineSettings) -> Result<(EngineArm, EngineHandle<Arc<Module>>, HostInsertControl, TelemetryReader), HostError> {
                 match (mode.path, mode.interpolator, mode.channels) {
                     $(($path_kind, $interpolator_kind, $channels) => {
-                        let (engine, control, insert_control, telemetry) = build_engine_arm::<$path, $interpolator, $output>(settings);
+                        let (engine, control, insert_control, telemetry) = build_engine_arm::<$path, $interpolator, $output>(settings)?;
                         let insert_control = insert_control_variant!($buffer, insert_control);
                         Ok((EngineArm::$variant(engine), control, insert_control, telemetry))
                     },)+
@@ -181,6 +181,12 @@ impl HostEngine {
             channel_count: ChannelTable::MAX_CHANNELS,
             ..EngineSettings::default()
         };
+        Self::build_with_settings(mode, settings)
+    }
+
+    /// Explicit runtime opt-in, including N+C+L+R physical capacity and lane layout.
+    /// Merely compiling optional features does not change `build`'s legacy defaults.
+    pub fn build_with_settings(mode: MixerMode, settings: EngineSettings) -> Result<BuiltHost, HostError> {
         let (arm, control, insert_control, telemetry) = EngineArm::build(mode, settings)?;
         let samples = MAX_FRAMES_PER_RENDER * mode.channels as usize;
         let engine = HostEngine {
@@ -284,3 +290,33 @@ pub fn supported_modes() -> String {
 /// Every depth a host can ask for on any arm.
 pub const SUPPORTED_DEPTHS: [OutputDepth; 5] =
     [OutputDepth::F32, OutputDepth::I32, OutputDepth::I24, OutputDepth::I16, OutputDepth::I8];
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_host_keeps_its_272_slot_pool() {
+        let (host, _, _, _) = HostEngine::build(MixerMode::default(), 44_100).unwrap();
+        match &host.arm {
+            EngineArm::FloatLinearStereo(engine) => assert_eq!(engine.voices().capacity(), MAX_VOICE_CAPACITY),
+            _ => panic!("default mixer mode changed"),
+        }
+    }
+
+    #[cfg(all(feature = "note-overlap", feature = "interactive-audition"))]
+    #[test]
+    fn configured_host_prepares_339_slots_and_81_lanes() {
+        let settings = EngineSettings::interactive_web(Default::default(), 128).unwrap();
+        let (host, _, _, _) = HostEngine::build_with_settings(MixerMode::default(), settings).unwrap();
+        match &host.arm {
+            EngineArm::FloatLinearStereo(engine) => {
+                assert_eq!(engine.voices().capacity(), 339);
+                assert_eq!(engine.channels().len(), 81);
+            }
+            _ => panic!("default mixer mode changed"),
+        }
+        let invalid = EngineSettings { voice_capacity: 338, ..settings };
+        assert!(matches!(HostEngine::build_with_settings(MixerMode::default(), invalid), Err(HostError::EngineConfiguration(_))));
+    }
+}

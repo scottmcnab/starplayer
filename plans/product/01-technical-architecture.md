@@ -620,7 +620,8 @@ unsupported: the tracker vocabulary is a **peer** of the musical one (§2.4), ne
 lowering of it.
 
 Neither implementation runs envelopes, fadeout, NNA or auto-vibrato. Giving a MIDI-driven
-XM or IT instrument its format's own articulation is M11's deliverable, and Q4 — whether
+XM or IT instrument its format's own articulation is NO-06's loaded-module deliverable;
+M11 still owns extraction/library work, and Q4 — whether
 this surface survives a non-sample instrument — is still M10's to settle.
 
 **Owner decision, 2026-09-03** (the history this replaced) (`plans/engine/M3-M6-concurrency-plan.md`, delivered by
@@ -640,11 +641,14 @@ Until then the division is:
   the channel table and the foreground binding, `ChannelTable::detach_foreground` (the
   NNA primitive), `VoicePool::iter_mut` (the per-tick walk), and the trace.
 - **Format-owned, in each format crate** — all per-voice articulation: envelope
-  positions, fadeout level, key-off flag, auto-vibrato phase. Each format keeps it in a
-  **parallel array indexed by `VoiceId::index()` and validated by the id's generation**,
-  and advances it from inside its own `TrackerProcessor::tick()` by walking
-  `VoicePool::iter_mut()`. A slot the format did not allocate shows an id that does not
-  match the one it stored, so it is skipped rather than adopted.
+  positions, fadeout level, key-off flag, auto-vibrato phase. NO-02 extracts concrete
+  `XmArticulationRuntime` and `ItArticulationRuntime`; neither implements a speculative
+  live trait. IT keeps its native slot array and shared song RNG. XM keeps a foreground
+  working `XmVoiceState` beside channel effect memories; explicitly prepared optional
+  hosts also keep generational slot snapshots after native flush. Neither-feature and
+  compiled-but-legacy XM constructors allocate no slot table. Admission validates the
+  actual pool generation; subsequent operations reject stale generations, and retiring
+  entries receive no further articulation writes.
 
 `TrackerProcessor::recommended_voice_capacity(channel_count)` is how the pool and that
 parallel array are sized from one number. Its default is the channel count — MOD, S3M and
@@ -652,11 +656,15 @@ MTM sound one voice per channel and never detach — and a format with a paralle
 sizes its answer from the format's limit. A pool **larger** than the answer is legal, and
 is what a persistent host builds: `MAX_VOICE_CAPACITY` is 272 after M4-E7, IT's 256
 virtual channels plus sixteen reserved for MIDI jam voices. IT's ID-indexed articulation
-array covers all 272 global slots while its allocator still caps IT-owned voices at 256,
+array defaults to 272 global slots while its allocator still caps IT-owned voices at 256,
 so MIDI occupying a low slot cannot push an IT voice beyond its state and IT cannot
 consume the reserve. A pool **smaller** is legal too — fewer voices sound.
 
-**Planned NO amendment (not implemented):** loaded-module audition will use one mutable
+**NO-02 extraction and remaining planned NO integration:** configured HostEngine/Player,
+source builders and facade constructors now thread the actual N+C+L+R capacity to format
+storage, with preparation failures returned before dispatch. Capacity-only constructors
+preserve legacy behavior; explicit articulation preparation is separate. Loaded-module
+audition will use one mutable
 live format runtime per rack, with pool-indexed state for all its programs and independent
 RNG. Immutable program definitions keep sample/map data. A rack-level mutable interface
 lands only together with real XM and IT implementations; format crates retain ownership
@@ -680,7 +688,9 @@ render loop; a provided post-source EventSource hook, forwarded by SourceMux, di
 live articulation after due source events at the exact frame. At equal frames native
 sequenced processing precedes live events and one live articulation step; held song
 articulation advances on control-only steps. Resume rejoins the saved tracker deadline
-once. NO-02 provides the tracker control hook, NO-03 the cadence, NO-06 the live consumer.
+once. NO-02 now provides `TrackerProcessor::control_step` (default no-op), with real
+XM/IT implementations that run no row/effect/flow/trace-row events. NO-03 still owns its
+non-sequencing dispatch and cadence; NO-06 owns the live consumer.
 The historical/current behavior described below remains until these tasks land.
 
 XM and IT envelopes, auto-vibrato, fadeout and NNA advance **exactly once per tracker
@@ -1867,7 +1877,12 @@ is `None` by default; `with_playback` explicitly prepares budgets, and `interact
 provides the persistent web configuration (256 native + 64 custom + 16 shared live + 3
 retirement = 339 slots). `Engine::try_with_settings` rejects mismatched pool capacity and
 unsupported interactive widths before playback. NO-02 threads the prepared capacity and
-configuration through concrete format/host constructors and sizes their articulation.
+configuration through concrete format/host constructors and sizes their articulation;
+that preparation plumbing is implemented in NO-02. `HostEngine::build_with_settings`,
+`Player::open_with_settings` and `build_source_with_settings` preserve runtime settings
+through module installation/rebuilds; plain `build`/`open` remain legacy. An unconditional
+settings query prevents feature unification from silently dropping a configured source's
+articulation; a facade without that support rejects explicit preparation.
 
 One optional `PlaybackState` on `ChannelTable` owns per-generation age/provenance/lifecycle
 records. It compiles with either feature, is absent with neither, and allocates only at

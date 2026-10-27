@@ -18,28 +18,36 @@ It works best on XM and IT, and that is not a coincidence: those formats already
 volume and panning envelopes, key-off and fadeout, auto-vibrato, and a note→sample map.
 An XM or IT instrument **is** a synthesiser patch in everything but name.
 
-## Why the engine is already most of the way there
+## Current engine support and the remaining articulation work
 
-Very little synthesis work is needed, because the architecture already separates the
-pieces:
+The engine already supplies sample mapping and a shared voice pool, but MIDI mapping
+alone does not supply native instrument articulation.
 
-- **Format semantics travel with the instrument.** `Instrument` is a trait (extracted in
-  M4) and each format owns its own implementation, which is why loader and effect
-  processor live in one crate per format. An `ItInstrument` bound to a MIDI channel runs
-  **IT's** envelopes, NNA and resonant filter; an `XmInstrument` runs FT2's. Nothing has
-  to be reimplemented or averaged into a lowest common denominator.
+- **Current live instruments are sample players.** M4's `SampleInstrument` and
+  `MappedInstrument` live in the engine. The latter maps XM/IT samples and tuning, but
+  does not run native envelopes, fadeout, auto-vibrato, IT NNA or the IT filter lifecycle.
+- **NO-02 extracts the existing format computations.** Concrete `XmArticulationRuntime`
+  and `ItArticulationRuntime` remain in their format crates and can address the full
+  prepared pool. Tracker playback uses the same computations in its original order.
+  The provided tracker control-step hook advances articulation without row effects;
+  NO-03 must supply its held cadence. These are concrete runtimes, not live `Instrument`
+  implementations or one runtime per program.
+- **NO-06 still owes faithful loaded-module audition.** It must install a rack-level
+  mutable interface together with its two real XM/IT implementations, native mapping/
+  release/NNA and separate live random state. M11's extraction, library and bank design
+  remain unimplemented and outside the NO feature's scope.
 - **The event vocabulary is already a MIDI superset.** `Event::NoteOn`/`NoteOff`/
   `Program`/`Controller` exist, MIDI parsing is a codec rather than the internal
   representation, and velocity is `U0F16` rather than 7 bits
   (`plans/product/01-technical-architecture.md` §2.3).
 - **Voices are format-agnostic.** One global pool, generational handles, background
-  voices for NNA. A MIDI-driven IT instrument gets IT's voice behaviour for free.
+  voices for NNA. Native tracker IT already uses this; live IT lifecycle integration remains NO-06 work.
 - **`Module` is already position-independent** — blob plus u32 offsets — so extracting
   and re-packing sample data is a mechanical transform, not a redesign.
 
 ## The five real problems
 
-The synthesis is free. These are not.
+Beyond the loaded-module articulation subset in NO, the library still needs the following work.
 
 ### 1. An instrument is not self-contained
 
