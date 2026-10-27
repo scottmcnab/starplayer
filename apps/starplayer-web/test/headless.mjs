@@ -492,10 +492,33 @@ async function run(executable, mode) {
         const modBytes = syntheticMod();
         await page.waitFor('the page module to attach its listeners', "document.documentElement.dataset.playerReady === 'true'");
         assert.equal(await page.evaluate("return document.getElementById('mod-headphone-panning').checked;"), false, 'the MOD preference is initially unchecked');
+        const speedChooser = await page.evaluate(`
+            const option = document.getElementById('speed-adjust');
+            return { tag: option.tagName, multiple: option.multiple, value: option.value,
+                options: [...option.options].map((entry) => [entry.value, entry.textContent]),
+                defaults: [...option.options].filter((entry) => entry.defaultSelected).map((entry) => entry.value) };
+        `);
+        assert.equal(speedChooser.tag, 'SELECT', 'speed adjustment uses a native select');
+        assert.equal(speedChooser.multiple, false, 'only one speed adjustment can be selected');
+        assert.equal(speedChooser.value, '0', 'a fresh visit uses canonical playback');
+        assert.deepEqual(speedChooser.defaults, ['0'], 'zero is the selected HTML default');
+        assert.deepEqual(speedChooser.options, Array.from({ length: 13 }, (_, index) => {
+            const value = index - 6;
+            return [String(value), value === 0 ? '0 (default)' : value > 0 ? `+${value}` : String(value)];
+        }), 'the chooser offers exactly -6 through +6, with explicit positive signs');
         await page.evaluate("localStorage.setItem('starplayer.output-and-mixer.v1', JSON.stringify({ path: 'float' })); return true;");
         await page.send('Page.reload', { ignoreCache: true });
         await page.waitFor('the reloaded page module', "document.documentElement.dataset.playerReady === 'true'");
         assert.equal(await page.evaluate("return document.getElementById('mod-headphone-panning').checked;"), false, 'an older v1 preference object restores as unchecked');
+        assert.equal(await page.evaluate("return document.getElementById('speed-adjust').value;"), '0', 'an absent saved adjustment restores canonical playback');
+        // Restore checks happen before audio starts, keeping each transport mode's
+        // existing worklet setup and fallback choice intact.
+        for (const [saved, expected] of [[3, '3'], [-8, '-6'], [-7, '-6'], [7, '6'], [8, '6'], ['invalid', '0']]) {
+            await page.evaluate(`localStorage.setItem('starplayer.output-and-mixer.v1', JSON.stringify({ speedAdjust: ${JSON.stringify(saved)} })); return true;`);
+            await page.send('Page.reload', { ignoreCache: true });
+            await page.waitFor('the restored speed chooser', "document.documentElement.dataset.playerReady === 'true'");
+            assert.equal(await page.evaluate("return document.getElementById('speed-adjust').value;"), expected, `saved adjustment ${saved} restores as ${expected}`);
+        }
 
         // ── M10-W4: a persisted enhancement choice restores onto the checkboxes ─────
         //
@@ -660,9 +683,19 @@ async function run(executable, mode) {
             /speed \+2/,
             'a non-default option is named in the closed disclosure summary'
         );
+        const speedDisabledDuringReload = await page.evaluate("const option = document.getElementById('speed-adjust'); option.value = '-6'; option.dispatchEvent(new Event('change')); return option.disabled;");
+        assert.equal(speedDisabledDuringReload, true, 'the speed chooser is unavailable during a load');
+        await page.waitFor('the negative adjustment to apply', "document.getElementById('speed-adjust').disabled === false && document.getElementById('message').textContent.includes('Speed adjustment of -6 applied')");
+        await page.waitFor('the clamped speed to sound', "document.getElementById('speed').textContent === '1' && document.getElementById('transport-chip').textContent === 'playing'");
+        const negativeSpeed = await page.evaluate("return document.getElementById('speed').textContent;");
+        const negativePosition = await page.evaluate("return document.getElementById('order').textContent + ':' + document.getElementById('row').textContent;");
+        await page.waitFor('playback to advance at the one-tick minimum', `document.getElementById('transport-chip').textContent === 'playing' && document.getElementById('speed').textContent === '1' && (document.getElementById('order').textContent + ':' + document.getElementById('row').textContent) !== ${JSON.stringify(negativePosition)}`);
+        assert.equal(negativeSpeed, '1', 'a -6 adjustment to speed 5 clamps at one tick per row');
+        assert.match(await page.evaluate("return localStorage.getItem('starplayer.output-and-mixer.v1');"), /"speedAdjust":-6/, 'the negative adjustment is persisted');
+        assert.match(await page.evaluate("return document.getElementById('load-options-summary').textContent;"), /speed -6/, 'the summary names the negative adjustment');
         await page.evaluate("const option = document.getElementById('speed-adjust'); option.value = '0'; option.dispatchEvent(new Event('change')); return true;");
         await page.waitFor('the canonical reload', "document.getElementById('speed-adjust').disabled === false && document.getElementById('speed').textContent === '5'");
-        report.speedAdjust = `${canonicalSpeed} \u2192 ${biasedSpeed} \u2192 ${await page.evaluate("return document.getElementById('speed').textContent;")}`;
+        report.speedAdjust = `${canonicalSpeed} \u2192 ${biasedSpeed} \u2192 ${negativeSpeed} (advancing) \u2192 ${await page.evaluate("return document.getElementById('speed').textContent;")}`;
 
         await loadFixture(page, FIRST_MODULE);
         await page.waitFor('the first module', "document.getElementById('title').textContent !== 'No module loaded'");
@@ -1235,6 +1268,7 @@ async function run(executable, mode) {
         report.backgroundPlayback = 'silent WAV, direct rendering, media metadata, pause/play, toggle passed';
 
         // ── phone width ─────────────────────────────────────────────────────────────
+        await page.evaluate("document.getElementById('load-options-disclosure').open = true; return true;");
         await page.send('Emulation.setDeviceMetricsOverride', {
             ...PHONE_VIEWPORT, deviceScaleFactor: 3, mobile: true,
         });
@@ -1245,11 +1279,13 @@ async function run(executable, mode) {
                 innerWidth: window.innerWidth,
                 bodyScrollWidth: document.body.scrollWidth,
                 controlsVisible: document.getElementById('play').getBoundingClientRect().width > 0,
+                speedChooserVisible: document.getElementById('speed-adjust').getBoundingClientRect().width > 0,
             };
         `);
         assert.ok(layout.scrollWidth <= layout.innerWidth, `the document overflows at ${PHONE_VIEWPORT.width}px: ${layout.scrollWidth} > ${layout.innerWidth}`);
         assert.ok(layout.bodyScrollWidth <= layout.innerWidth, `the body overflows at ${PHONE_VIEWPORT.width}px: ${layout.bodyScrollWidth}`);
         assert.ok(layout.controlsVisible, 'the transport controls are still laid out at phone width');
+        assert.ok(layout.speedChooserVisible, 'the speed chooser is visible in the open options at phone width');
         report.phone = `${layout.scrollWidth} <= ${layout.innerWidth}`;
         await page.send('Emulation.clearDeviceMetricsOverride');
 

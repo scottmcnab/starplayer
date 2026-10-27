@@ -59,10 +59,14 @@ In `index.html` every load option moved inside
 `<details id="load-options-disclosure">`, whose `<summary>` carries a one-line summary of
 whatever is not at its default (`renderLoadOptionsSummary`), so an option that is on can
 never be invisible. The open/closed state is remembered with the rest of the preferences.
-The new **Adjust speed** number input (−8…+8) is a load option like the others: it goes
+The **Adjust speed** native chooser (−6…+6, default 0) is a load option like the others: it goes
 through `loadOptionsFromControls`, `applyLoadOptions`, the availability lock and the
 `starplayer.output-and-mixer.v1` record. `applyLoadOptions`'s three messages moved into
 one `describeLoadOptionChange` table rather than growing a third ternary each.
+[W5a](complete/W5a-task-speed-adjust-chooser.md) replaces the original number input with the
+bounded chooser, retains saved choices (clamping older endpoints), and explains that
+negative adjustments play faster and positive adjustments play slower, at a minimum of
+1 tick per row.
 
 It is a **load** option rather than a live command for one reason: the timeline is
 measured by the scan that runs during the load, and biasing playback without rescanning
@@ -86,14 +90,16 @@ else.
 * `cargo xtask wasm && node apps/starplayer-web/test/headless.mjs` — the page loads a
   synthetic MOD with `F05` on every row 0, reads Speed 5, sets the control to +2, and
   reads Speed 7 (deliberately neither 5 nor the MOD's own initial 6), then checks the
-  persisted record and the disclosure summary before resetting to 0.
+  persisted record and the disclosure summary. The [W5a follow-up](complete/W5a-task-speed-adjust-chooser.md)
+  also checks the chooser’s exact options/default, saved choice restore and legacy endpoint
+  clamps before audio starts, then applies −6, observes speed 1 and continued transport
+  progress, checks negative persistence/summary, and resets to 0 to observe speed 5.
 
 ## Owner acceptance
 
 Load a Cubulus rip, open **Rendering options**, and try **Adjust speed** at 1. If 1 is
 right the track should sit at the tempo it has on the Amiga. If a different constant fits
-better, that is the interesting finding — the control is deliberately a number, not a
-checkbox, because the constant is a guess.
+better, that is the interesting finding — the chooser offers each integer from −6 through +6 because the constant is a guess.
 
 ## Out of scope
 

@@ -296,13 +296,13 @@ function persistPreferences() {
 // during the load. Applying the bias without rescanning would leave the progress slider
 // describing a song nobody is playing.
 
-/// The range the "Adjust speed" control offers, matching the `min`/`max` on the input. A
-/// tracker speed is 1..255, so anything wider than a few ticks either way is a different
+/// The range the "Adjust speed" select offers. A tracker speed is 1..255, so anything
+/// wider than a few ticks either way is a different
 /// song rather than a corrected one.
-const SPEED_ADJUST_LIMIT = 8;
+const SPEED_ADJUST_LIMIT = 6;
 
-/// Whatever is in the number input, as an integer within range. An empty or unparseable
-/// field is zero: the control's own default, and canonical playback.
+/// Normalize the selected or saved value to an integer within range. An absent or
+/// unparseable value is zero: the control's own default, and canonical playback.
 function clampSpeedAdjust(value) {
     const number = Math.trunc(Number(value));
     if (!Number.isFinite(number)) return 0;
@@ -2284,10 +2284,8 @@ elements.applyOutputDevice.addEventListener('click', () => applyOutputDevice().c
 elements.chooseOutputDevice.addEventListener('click', () => chooseOutputDevice().catch(showError));
 elements.applyMixer.addEventListener('click', applyMixerMode);
 elements.modHeadphonePanning.addEventListener('change', () => applyLoadOptions('headphoneFriendlyModPanning').catch(showError));
-// `change` rather than `input`: a spinner arrow or a typed digit should reload the module
-// once the value has settled, not once per keystroke. The field is normalised back into
-// range first, so a typed 99 reloads at the limit the control offers rather than silently
-// asking the engine for a bias it will clamp anyway.
+// A committed selection reloads and rescans the module. Normalize first so scripted
+// changes use the same integer range as restored preferences.
 elements.speedAdjust.addEventListener('change', () => {
     elements.speedAdjust.value = String(speedAdjustFromControls());
     applyLoadOptions('speedAdjust').catch(showError);

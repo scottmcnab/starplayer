@@ -99,8 +99,22 @@
                          constant to every speed command; played canonically they run fast.
                          This is that constant, and zero is canonical playback. -->
                     <label class="speed-adjust-option">
-                        <span><strong>Adjust speed <em>(experimental)</em></strong><small>Added to every speed the module asks for, so a track written for a game's own replayer plays at the rate it was composed at. 0 is canonical playback.</small></span>
-                        <input id="speed-adjust" type="number" min="-8" max="8" step="1" value="0" inputmode="numeric" aria-label="Ticks added to every speed change">
+                        <span><strong>Adjust speed <em>(experimental)</em></strong><small>Added to the module’s speed requests. Negative values play faster; positive values play slower, with a minimum of 1 tick per row. 0 is canonical playback.</small></span>
+                        <select id="speed-adjust" aria-label="Ticks added to every speed change">
+                            <option value="-6">-6</option>
+                            <option value="-5">-5</option>
+                            <option value="-4">-4</option>
+                            <option value="-3">-3</option>
+                            <option value="-2">-2</option>
+                            <option value="-1">-1</option>
+                            <option value="0" selected>0 (default)</option>
+                            <option value="1">+1</option>
+                            <option value="2">+2</option>
+                            <option value="3">+3</option>
+                            <option value="4">+4</option>
+                            <option value="5">+5</option>
+                            <option value="6">+6</option>
+                        </select>
                     </label>
                 </div>
             </details>

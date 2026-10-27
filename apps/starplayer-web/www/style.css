@@ -58,7 +58,7 @@ button, .button, select, input[type=url], input[type=number] {
 }
 button, .button, select { cursor: pointer; }
 button:hover:not(:disabled), .button:hover { border-color: #61758c; background: #283647; }
-button:disabled, input:disabled { opacity: .38; cursor: not-allowed; }
+button:disabled, input:disabled, #speed-adjust:disabled { opacity: .38; cursor: not-allowed; }
 button.primary { color: #071512; background: var(--accent); border-color: var(--accent); font-weight: 800; }
 .url-form input { flex: 1; min-width: 12rem; }
 #archive-tracks { min-width: 0; max-width: 100%; }
@@ -74,11 +74,11 @@ button.primary { color: #071512; background: var(--accent); border-color: var(--
 .load-options-summary { color: var(--muted); font-weight: 400; font-size: 12px; }
 .load-options { padding: 2px 12px 14px; }
 .speed-adjust-option { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-top: 13px; color: var(--muted); cursor: pointer; }
-.speed-adjust-option span { display: grid; gap: 1px; }
+.speed-adjust-option span { display: grid; gap: 1px; min-width: 0; }
 .speed-adjust-option strong { color: var(--ink); font-weight: 650; }
 .speed-adjust-option em { color: var(--muted); font-weight: 400; font-style: normal; font-size: 12px; }
 .speed-adjust-option small { font-size: 12px; }
-.speed-adjust-option input { width: 5.5rem; flex: none; text-align: right; }
+.speed-adjust-option select { width: 8rem; max-width: 100%; flex: none; }
 .drop-zone { min-height: 112px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 5px; border: 1px dashed #45576c; border-radius: 8px; color: var(--muted); text-align: center; padding: 18px; }
 .drop-zone strong { color: var(--ink); }
 .drop-zone.over { color: var(--accent); border-color: var(--accent); background: #142b2b; }
