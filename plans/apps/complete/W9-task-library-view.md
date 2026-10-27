@@ -257,3 +257,8 @@ First browser check against the Hornet mirror:
 - Previous/next *track* moved from the playlist card to either end of the transport
   controls as ⏮/⏭ icon buttons (keeping the `playlist-previous`/`playlist-next` ids); they
   are disabled while the playlist is empty.
+
+## W16 follow-up
+
+[W16](W16-task-library-selection-checkboxes.md) adds native row and
+result-heading checkboxes and replaces per-track add controls with Add to Playlist.

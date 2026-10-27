@@ -1,5 +1,5 @@
 import { commentMatchLines, commentTokens, compileQuery, matchRanges } from './library-index.js';
-import { createSelection, moveFocus, selectAll, selectRow, virtualWindow } from './library-selection.js';
+import { createSelection, deselectAll, moveFocus, selectAll, selectRow, virtualWindow } from './library-selection.js';
 import { captureAnchor, restoreAnchor, formatOptions, unplayableCount, folderAddLabel, selectedSnapshot, folderSnapshot, progressText, metadataHint, scanExplanation, createIncrementalViewState, createIssuePageState } from './library-view-state.js';
 
 const ROW_HEIGHT = 32;
@@ -65,6 +65,7 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
     let viewState = null;
     const treeDOM = new Map();
     const selectedPlayable = new Set();
+    const selectedInResult = new Set();
     let issueRevision = null, issuePageIndex = 0, issuePages = createIssuePageState({ onOperation });
     let activeTokens = [];
     let treeFocus = '';
@@ -186,6 +187,15 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
         if (row.error) line.title = row.error;
         line.classList.toggle('playing', row.id === playing);
         line.classList.toggle('focused', row.id === selection.focus);
+        const selectionCell = node('label', undefined, 'library-selection-cell');
+        selectionCell.setAttribute('role', 'gridcell');
+        const checkbox = node('input');
+        checkbox.type = 'checkbox';
+        checkbox.dataset.select = 'true';
+        checkbox.checked = selection.selected.has(row.id);
+        checkbox.setAttribute('aria-label', `Select ${row.name}`);
+        selectionCell.append(checkbox);
+        line.append(selectionCell);
         for (const [column] of COLUMNS) {
             const cell = node('span', row[column] ?? '—');
             cell.setAttribute('role', 'gridcell');
@@ -203,23 +213,13 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
             }
             line.append(cell);
         }
-        const cell = node('span');
-        cell.setAttribute('role', 'gridcell');
-        const button = node('button', '+');
-        button.type = 'button';
-        button.tabIndex = -1;
-        button.disabled = !row.playable;
-        button.setAttribute('aria-label', `Add ${row.name}`);
-        button.dataset.add = 'true';
-        cell.append(button);
-        line.append(cell);
         return line;
     }
     function renderRows() {
         if (frame !== null) cancelAnimationFrame(frame);
         frame = null;
         if (!context) return;
-        const focusedAdd = rows.contains(document.activeElement) ? document.activeElement.closest('[data-row-id]')?.dataset.rowId : null;
+        const focusedCheckbox = rows.contains(document.activeElement) ? document.activeElement.closest('[data-row-id]')?.dataset.rowId : null;
         const window = virtualWindow(viewport.scrollTop, viewport.clientHeight, order.length, ROW_HEIGHT);
         const fragment = document.createDocumentFragment();
         for (let index = window.first; index < window.last; index += 1) {
@@ -228,8 +228,8 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
         }
         rows.style.transform = `translateY(${window.first * ROW_HEIGHT}px)`;
         rows.replaceChildren(fragment);
-        if (focusedAdd !== null) {
-            const replacement = document.getElementById(`library-row-${focusedAdd}`)?.querySelector('[data-add]');
+        if (focusedCheckbox !== null) {
+            const replacement = document.getElementById(`library-row-${focusedCheckbox}`)?.querySelector('[data-select]');
             (replacement ?? grid).focus({ preventScroll: true });
         }
         updateSelection(false);
@@ -239,6 +239,7 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
             const id = Number(line.dataset.rowId);
             line.setAttribute('aria-selected', String(selection.selected.has(id)));
             line.classList.toggle('focused', id === selection.focus);
+            line.querySelector('[data-select]').checked = selection.selected.has(id);
         }
         // Never point at an element that has been virtualised away.
         const active = document.getElementById(`library-row-${selection.focus}`);
@@ -246,8 +247,15 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
         else grid.removeAttribute('aria-activedescendant');
         if (recount) {
             selectedPlayable.clear();
-            for (const id of selection.selected) if (viewState.includes(id) && context.library.rows[id].playable) selectedPlayable.add(id);
+            selectedInResult.clear();
+            for (const id of selection.selected) if (viewState.includes(id)) {
+                selectedInResult.add(id);
+                if (context.library.rows[id].playable) selectedPlayable.add(id);
+            }
         }
+        selectAllCheckbox.disabled = order.length === 0;
+        selectAllCheckbox.checked = order.length > 0 && selectedInResult.size === order.length;
+        selectAllCheckbox.indeterminate = selectedInResult.size > 0 && selectedInResult.size < order.length;
         const selected = selectedPlayable.size;
         element('add-selected').disabled = selected === 0;
         renderDetails();
@@ -429,6 +437,20 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
         event.preventDefault();
         event.stopPropagation();
     });
+    const selectionHeader = node('label', undefined, 'library-selection-cell');
+    selectionHeader.setAttribute('role', 'columnheader');
+    selectionHeader.title = 'Select or clear all current results';
+    const selectAllCheckbox = node('input');
+    selectAllCheckbox.type = 'checkbox';
+    selectAllCheckbox.id = 'library-select-all';
+    selectAllCheckbox.disabled = true;
+    selectAllCheckbox.setAttribute('aria-label', 'Select all tracks in current results');
+    selectionHeader.append(selectAllCheckbox);
+    heading.append(selectionHeader);
+    selectAllCheckbox.addEventListener('change', () => {
+        selection = selectAllCheckbox.checked ? selectAll(selection, order) : deselectAll(selection, order);
+        updateSelection();
+    });
     for (const [column, label] of COLUMNS) {
         const header = node('div');
         header.setAttribute('role', 'columnheader');
@@ -442,9 +464,6 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
     const matchHeader = node('div', 'Comment match', 'library-comment-heading');
     matchHeader.setAttribute('role', 'columnheader');
     heading.append(matchHeader);
-    const actionHeader = node('div', 'Add');
-    actionHeader.setAttribute('role', 'columnheader');
-    heading.append(actionHeader);
     element('search').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(refresh, 80); });
     element('search-comments').addEventListener('change', () => refresh());
     element('format').addEventListener('change', () => refresh());
@@ -460,24 +479,25 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
     element('add-selected').onclick = addSelected;
     // Shift-click would otherwise extend a text selection across the rows (and Edge pops up
     // its Copy/Search mini menu); the click handler still moves focus to the grid.
-    rows.addEventListener('mousedown', event => { if (event.shiftKey || event.ctrlKey || event.metaKey || event.detail > 1) event.preventDefault(); });
+    rows.addEventListener('mousedown', event => { if (!event.target.closest('.library-selection-cell') && (event.shiftKey || event.ctrlKey || event.metaKey || event.detail > 1)) event.preventDefault(); });
+    rows.addEventListener('change', event => {
+        if (!event.target.matches('[data-select]')) return;
+        const id = Number(event.target.closest('[data-row-id]').dataset.rowId);
+        selection = selectRow(selection, order, id, { toggle: true });
+        updateSelection();
+    });
     rows.addEventListener('click', event => {
         const line = event.target.closest('[data-row-id]');
         if (!line) return;
         const id = Number(line.dataset.rowId);
-        if (event.target.closest('[data-add]')) {
-            if (!selection.selected.has(id)) selection = selectRow(selection, order, id);
-            addSelected();
-            updateSelection();
-            return;
-        }
+        if (event.target.closest('.library-selection-cell')) return;
         selection = selectRow(selection, order, id, { toggle: event.ctrlKey || event.metaKey, extend: event.shiftKey });
         grid.focus({ preventScroll: true });
         updateSelection();
     });
     rows.addEventListener('dblclick', event => {
         const line = event.target.closest('[data-row-id]');
-        if (line && !event.target.closest('[data-add]')) playRow(Number(line.dataset.rowId));
+        if (line && !event.target.closest('.library-selection-cell')) playRow(Number(line.dataset.rowId));
     });
     grid.addEventListener('keydown', event => {
         if (event.target !== grid) return;
@@ -581,6 +601,8 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
         order = result.order;
         for (const id of result.changedRowIds) {
             matchCache.delete(id);
+            if (selection.selected.has(id) && viewState.includes(id)) selectedInResult.add(id);
+            else selectedInResult.delete(id);
             if (selection.selected.has(id) && viewState.includes(id) && context.library.rows[id].playable) selectedPlayable.add(id);
             else selectedPlayable.delete(id);
         }
@@ -606,7 +628,7 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
                 const focused = line.contains(document.activeElement);
                 const replacement = rowElement(context.library.rows[Number(line.dataset.rowId)], Number(line.getAttribute('aria-rowindex')) - 2);
                 line.replaceWith(replacement);
-                if (focused) replacement.querySelector('[data-add]').focus({ preventScroll: true });
+                if (focused) replacement.querySelector('[data-select]').focus({ preventScroll: true });
             }
             updateSelection(false);
         }
@@ -619,6 +641,7 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
             context = next;
             viewState = createIncrementalViewState(context.library, { onOperation });
             selectedPlayable.clear();
+            selectedInResult.clear();
             issueRevision = null; issuePageIndex = 0; issuePages = createIssuePageState({ onOperation });
             detailsKey = null;
             element('comments-toggle').hidden = !context.library.hasComments;

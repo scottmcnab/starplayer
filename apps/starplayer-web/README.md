@@ -33,14 +33,15 @@ table: click a folder (or press Enter) to scope the table to it, use ▸ or →/
 expand and collapse, and ↑/↓/Home/End to move. Turning browsing off restores the
 whole library. Only visible table rows are rendered, including for large indexes.
 
-Click selects one row, Ctrl/⌘-click toggles, and Shift-click selects a range in the
+Use row checkboxes to select independently, or the heading checkbox to select/clear
+all current results (including offscreen rows). A mixed heading selects all; later
+discoveries stay unselected. Click selects one row, Ctrl/⌘-click toggles, and Shift-click selects a range in the
 current result order. Ctrl/⌘+A selects the entire filtered result, Escape clears,
 and arrows, Home/End and PageUp/Down move the focus (Shift extends the selection).
 Selections survive sorting, filtering and folder changes: **hidden rows remain
 selected, but actions use only playable rows in the current result**, in result
-order. Enter or double-click plays; `+`, Insert or **Add selected** adds to the
-playlist. A row's **+** adds the current selection (selecting that row
-first if it was not selected); a folder's **+** in the tree (or `+` / Insert on a
+order. Enter or double-click plays; `+`, Insert or **Add to Playlist** adds to the
+playlist. A folder's **+** in the tree (or `+` / Insert on a
 focused folder) adds all playable tracks beneath that folder, regardless of the
 current filter, in folder/name order. Unplayable rows cannot play or be added.
 

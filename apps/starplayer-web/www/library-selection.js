@@ -25,6 +25,12 @@ export function selectAll(state, order) {
     return { ...state, selected: new Set([...state.selected, ...order]), focus: order.includes(state.focus) ? state.focus : order[0] ?? null };
 }
 
+export function deselectAll(state, order) {
+    const selected = new Set(state.selected);
+    for (const id of order) selected.delete(id);
+    return { ...state, selected };
+}
+
 export function moveFocus(state, order, key, { extend = false, pageSize = 1 } = {}) {
     if (!order.length) return state;
     const current = order.indexOf(state.focus);

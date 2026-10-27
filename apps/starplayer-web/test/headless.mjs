@@ -1410,7 +1410,7 @@ async function runLibrary(executable, mode) {
         await clickRow(2, { shiftKey: true });
         await page.evaluate("document.getElementById('library-add-selected').click();");
         assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M']);
-        await page.evaluate("document.querySelector('[data-row-id=\"1\"] button').click();");
+        await page.evaluate("document.getElementById('library-add-selected').click();");
         assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
         await filter('', '5 of 5');
         await clickRow(0, { ctrlKey: true });
@@ -1419,7 +1419,7 @@ async function runLibrary(executable, mode) {
         assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
         // A real Shift-click must select rows, not page text (Edge pops up a Copy/Search menu over a text selection).
         const realClick = async (position, modifiers = 0) => {
-            const point = await page.evaluate(`const row = document.querySelector('#library-rows > :nth-child(${position})'); row.scrollIntoView({ block: 'center' }); const bounds = row.getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
+            const point = await page.evaluate(`const row = document.querySelector('#library-rows > :nth-child(${position})'); row.scrollIntoView({ block: 'center' }); const bounds = row.children[1].getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
             for (const type of ['mousePressed', 'mouseReleased']) await page.send('Input.dispatchMouseEvent', { type, button: 'left', clickCount: 1, modifiers, ...point });
         };
         await realClick(1);
@@ -1446,7 +1446,7 @@ async function runLibrary(executable, mode) {
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '9');
         // Real mouse clicks also prove that selection updates preserve the double-click target.
         const doubleClick = async id => {
-            const point = await page.evaluate(`const row = document.querySelector('[data-row-id="${id}"]'); row.scrollIntoView({ block: 'center' }); const bounds = row.getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
+            const point = await page.evaluate(`const row = document.querySelector('[data-row-id="${id}"]'); row.scrollIntoView({ block: 'center' }); const bounds = row.children[1].getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
             for (const clickCount of [1, 2]) {
                 await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount, ...point });
                 await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount, ...point });
@@ -1467,6 +1467,36 @@ async function runLibrary(executable, mode) {
         await page.waitFor('playback survives missing member', `document.getElementById('row').textContent !== ${JSON.stringify(missing.row)}`);
         assert.equal(await page.evaluate("return document.querySelector('.library-track.playing').dataset.rowId;"), '3');
         await page.send('Emulation.setDeviceMetricsOverride', { ...PHONE_VIEWPORT, deviceScaleFactor: 3, mobile: true });
+        await page.send('Emulation.setTouchEmulationEnabled', { enabled: true });
+        const touchTap = async selector => {
+            const point = await page.evaluate(`const target = document.querySelector(${JSON.stringify(selector)}); target.scrollIntoView({ block: 'center', inline: 'nearest' }); const bounds = target.getBoundingClientRect(); return { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };`);
+            await page.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ ...point, id: 1 }] });
+            await page.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+        };
+        await page.evaluate("document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));");
+        await page.evaluate("document.querySelector('[data-row-id=\"0\"] [data-select]').focus();");
+        for (const type of ['keyDown', 'keyUp']) await page.send('Input.dispatchKeyEvent', { type, key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32 });
+        assert.ok(await page.evaluate("return document.activeElement.matches('[data-select]') && document.activeElement.checked && document.querySelectorAll('[data-select]:checked').length === 1;"), 'native Space toggles exactly once');
+        for (const type of ['keyDown', 'keyUp']) await page.send('Input.dispatchKeyEvent', { type, key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32 });
+        assert.ok(await page.evaluate("return document.getElementById('library-add-selected').disabled;"));
+        const beforeTouch = await page.evaluate("return { title: document.getElementById('title').textContent, count: Number(document.getElementById('playlist-count').textContent) };");
+        await touchTap('[data-row-id="0"] .library-selection-cell');
+        await touchTap('[data-row-id="1"] .library-selection-cell');
+        assert.ok(await page.evaluate("return document.querySelector('[data-row-id=\"0\"] [data-select]').checked && document.querySelector('[data-row-id=\"1\"] [data-select]').checked && document.getElementById('library-select-all').indeterminate;"));
+        await touchTap('#library-select-all');
+        assert.ok(await page.evaluate("return document.getElementById('library-select-all').checked && !document.getElementById('library-select-all').indeterminate;"));
+        await touchTap('#library-select-all');
+        assert.ok(await page.evaluate("return document.getElementById('library-add-selected').disabled && !document.querySelector('[data-select]:checked');"));
+        await touchTap('[data-row-id="0"] .library-selection-cell');
+        await touchTap('[data-row-id="1"] .library-selection-cell');
+        const touchExpected = await page.evaluate("return [...document.querySelectorAll('.library-track[aria-selected=true]')].map(row => row.children[1].textContent);");
+        await touchTap('#library-add-selected');
+        assert.equal(await page.evaluate("return Number(document.getElementById('playlist-count').textContent);"), beforeTouch.count + 2);
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list .playlist-name')].slice(-2).map(item => item.textContent);"), touchExpected);
+        assert.equal(await page.evaluate("return document.getElementById('title').textContent;"), beforeTouch.title, 'checkbox taps never start playback');
+        // Restore this fixture's playlist count for the retained large-index assertions.
+        await page.evaluate("document.querySelectorAll('#playlist-list li').forEach((item, index) => { if (index >= 9) item.querySelector('button').click(); });");
+        await page.send('Emulation.setTouchEmulationEnabled', { enabled: false });
         const phoneLayout = await page.evaluate("return { width: innerWidth, scrollWidth: document.documentElement.scrollWidth, overflowing: [...document.querySelectorAll('main > *, .load-panel > *, .now-playing > *')].filter(element => element.getBoundingClientRect().right > 390).map(element => [element.className, element.getBoundingClientRect().width]) };");
         assert.ok(phoneLayout.width === 390 && phoneLayout.scrollWidth <= 390, `library fits at 390px: ${JSON.stringify(phoneLayout)}`);
         await page.send('Emulation.clearDeviceMetricsOverride');
@@ -1561,7 +1591,7 @@ async function runLibrary(executable, mode) {
         await page.evaluate("const format = document.getElementById('library-format'); format.value = '669'; format.dispatchEvent(new Event('change'));");
         await page.waitFor('format filter', "document.getElementById('library-count').textContent === '1 of 2'");
         await clickRow(1);
-        assert.equal(await page.evaluate("return document.querySelector('.library-track button').disabled && document.getElementById('library-add-selected').disabled;"), true);
+        assert.equal(await page.evaluate("return !document.querySelector('.library-track [data-select]').disabled && document.getElementById('library-add-selected').disabled;"), true);
         await doubleClick(1);
         assert.equal((await page.evaluate(READ_STATE)).title, 'Petrified');
         // W10: capture real engine snapshots on both transports without an app test API.

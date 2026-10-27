@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createSelection, moveFocus, selectAll, selectRow, virtualWindow } from '../www/library-selection.js';
+import { createSelection, deselectAll, moveFocus, selectAll, selectRow, virtualWindow } from '../www/library-selection.js';
 import { createPlaylist, libraryLocator } from '../www/playlist.js';
 
 test('click, toggle, range and filtered select-all preserve stable ids', () => {
@@ -80,4 +80,14 @@ test('playlist preserves duplicate locators, unique ids, order, current and subs
     unsubscribe();
     playlist.clear();
     assert.equal(notifications, before);
+});
+
+test('deselect current results retains hidden ids and leaves later discoveries unselected', () => {
+    const state = selectAll(selectAll(createSelection(), [9]), [1, 2, 3]);
+    const cleared = deselectAll(state, Int32Array.of(1, 3));
+    assert.deepEqual([...cleared.selected], [9, 2]);
+    assert.deepEqual([...state.selected], [9, 1, 2, 3]);
+    assert.equal(cleared.focus, state.focus);
+    assert.equal(cleared.selected.has(4), false);
+    assert.deepEqual([...deselectAll(cleared, []).selected], [9, 2]);
 });
