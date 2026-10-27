@@ -149,6 +149,11 @@ pub struct NoteParams {
     pub note: Note,
     /// How hard it was struck. Linear: velocity scales the voice volume directly.
     pub velocity: U0F16,
+    /// Original event velocity before CC7. Native format resolution may collapse two
+    /// raw values to one base volume; identity uses that resolved volume, never division
+    /// of the CC7-scaled gain. NO-06 supplies XM/IT native resolution and collision tests.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub raw_velocity: U0F16,
     /// Pan for this note, overriding the instrument's and the sample's.
     pub pan_override: Option<I1F15>,
 }
@@ -156,7 +161,9 @@ pub struct NoteParams {
 impl NoteParams {
     /// A note at full velocity with no pan override.
     pub const fn new(note: Note, velocity: U0F16) -> NoteParams {
-        NoteParams { note, velocity, pan_override: None }
+        NoteParams { note, velocity, pan_override: None,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))] raw_velocity: velocity,
+        }
     }
 }
 
@@ -707,7 +714,7 @@ impl InstrumentRack {
     /// tracker lane, or a specific voice — is [`EventOutcome::Unsupported`].
     pub fn apply(&mut self, target: Target, event: Event, context: &mut EngineContext<'_>) -> EventOutcome {
         let outcome = match target {
-            Target::Channel(channel) => match midi_channel_index(channel) {
+            Target::Channel(channel) => match context.channels.layout().midi_index(channel) {
                 Some(index) => self.apply_to_channel(index, event, context),
                 None => EventOutcome::Unsupported,
             },
@@ -765,8 +772,10 @@ impl InstrumentRack {
         state.held.push(note.to_midi());
         let (program, volume, pan, bend) = (state.program, state.volume, state.pan, state.bend);
         let Some(instrument) = self.instrument(program) else { return EventOutcome::Ignored };
-        let channel = ChannelId(MIDI_CHANNEL_BASE + index as u16);
-        let params = NoteParams { note, velocity: scale_unit(velocity, volume), pan_override: pan };
+        let channel = ChannelId(context.channels.layout().live_base() as u16 + index as u16);
+        let params = NoteParams { note, velocity: scale_unit(velocity, volume), pan_override: pan,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))] raw_velocity: velocity,
+        };
         if instrument.note_on(channel, params, context).is_none() {
             return EventOutcome::Ignored;
         }
@@ -801,7 +810,7 @@ impl InstrumentRack {
     /// remembered, for the same reason `ChannelTable::is_sounding` asks the pool: a voice
     /// that ended on its own must not leave the rack thinking a note is still down.
     fn release_if_sounding(&mut self, index: usize, note: u8, context: &mut EngineContext<'_>) -> bool {
-        let channel = ChannelId(MIDI_CHANNEL_BASE + index as u16);
+        let channel = ChannelId(context.channels.layout().live_base() as u16 + index as u16);
         let sounding = context
             .channels
             .foreground(channel)
@@ -821,7 +830,7 @@ impl InstrumentRack {
         state.held.clear();
         state.sustain = false;
         let program = state.program;
-        let channel = ChannelId(MIDI_CHANNEL_BASE + index as u16);
+        let channel = ChannelId(context.channels.layout().live_base() as u16 + index as u16);
         let Some(instrument) = self.instrument(program) else { return EventOutcome::Ignored };
         instrument.note_off(channel, context);
         EventOutcome::Applied
@@ -833,7 +842,7 @@ impl InstrumentRack {
         state.sustain = false;
         // Straight to the channel table rather than through the instrument: "all sound
         // off" means *now*, whatever release an instrument would otherwise run.
-        context.channels.stop(ChannelId(MIDI_CHANNEL_BASE + index as u16), context.voices);
+        context.channels.stop(ChannelId(context.channels.layout().live_base() as u16 + index as u16), context.voices);
         EventOutcome::Applied
     }
 
@@ -919,7 +928,7 @@ impl InstrumentRack {
         let program = state.program;
         let cents = self.bend_cents(bend);
         let Some(instrument) = self.instrument(program) else { return EventOutcome::Ignored };
-        instrument.set_bend(ChannelId(MIDI_CHANNEL_BASE + index as u16), cents, context);
+        instrument.set_bend(ChannelId(context.channels.layout().live_base() as u16 + index as u16), cents, context);
         EventOutcome::Applied
     }
 
@@ -928,7 +937,7 @@ impl InstrumentRack {
         for index in 0..MIDI_CHANNEL_COUNT {
             let Some(state) = self.channels.get(index) else { continue };
             let Some(instrument) = self.instrument(state.program) else { continue };
-            instrument.control_tick(ChannelId(MIDI_CHANNEL_BASE + index as u16), context);
+            instrument.control_tick(ChannelId(context.channels.layout().live_base() as u16 + index as u16), context);
         }
     }
 
@@ -1181,7 +1190,7 @@ impl<Feed: EventFeed> MidiSource<Feed> {
     fn publish_telemetry(&mut self, context: &mut EngineContext<'_>) {
         let mut fingerprint = 0u64;
         for index in 0..MIDI_CHANNEL_COUNT {
-            let channel = ChannelId(MIDI_CHANNEL_BASE + index as u16);
+            let channel = ChannelId(context.channels.layout().live_base() as u16 + index as u16);
             let note = context
                 .channels
                 .foreground(channel)
@@ -1242,6 +1251,38 @@ impl<Feed> core::fmt::Debug for MidiSource<Feed> {
 mod tests {
     use super::*;
     use starplayer_core::fixed::unit_from_ratio;
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    #[test]
+    fn raw_event_velocity_survives_cc7_without_reverse_scaling() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        struct VelocityProbe(Arc<AtomicU32>);
+        impl Instrument for VelocityProbe {
+            fn note_on(&self, _: ChannelId, params: NoteParams, _: &mut EngineContext<'_>) -> Option<VoiceId> {
+                self.0.store(((params.raw_velocity.to_bits() as u32) << 16) | params.velocity.to_bits() as u32, Ordering::Relaxed);
+                None
+            }
+            fn note_off(&self, _: ChannelId, _: &mut EngineContext<'_>) {}
+            fn control_tick(&self, _: ChannelId, _: &mut EngineContext<'_>) {}
+            fn set_bend(&self, _: ChannelId, _: i16, _: &mut EngineContext<'_>) {}
+        }
+        let observed = Arc::new(AtomicU32::new(0));
+        let mut rack = InstrumentRack::empty();
+        let instruments: Vec<Box<dyn Instrument>> = alloc::vec![Box::new(VelocityProbe(Arc::clone(&observed)))];
+        rack.instruments = instruments.into_boxed_slice();
+        let mut voices = starplayer_mixer::VoicePool::new(1);
+        let mut channels = crate::ChannelTable::new(64);
+        let mut control = crate::ControlClock::new(44_100, Frame::ZERO);
+        let mut context = EngineContext::new(Frame::ZERO, &mut voices, &mut channels, &mut control);
+        let raw = U0F16::from_bits(43_210);
+        for cc7 in [U0F16::ZERO, U0F16::from_bits(12_345), U0F16::MAX] {
+            rack.apply(Target::Channel(midi_channel(0)), Event::Controller { number: controller::VOLUME, value: cc7 }, &mut context);
+            rack.apply(Target::Channel(midi_channel(0)), Event::NoteOn { note: Note::new(60), velocity: raw }, &mut context);
+            let packed = observed.load(Ordering::Relaxed);
+            assert_eq!((packed >> 16) as u16, raw.to_bits());
+            assert_eq!(packed as u16, scale_unit(raw, cc7).to_bits());
+        }
+    }
 
     /// Research point 1, and master-plan decision 4: the pitch convention is exact, not
     /// nearly exact, at the reference note — for every reference rate a file can carry.

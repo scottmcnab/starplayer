@@ -1567,6 +1567,9 @@ mod tests {
 
     #[test]
     fn a_midi_event_opcode_sounds_beside_the_module_and_both_reach_telemetry() {
+        // Host::new remains the legacy constructor even when web Cargo defaults compile
+        // optional capabilities. Its 48-based assertions protect that contract; NO-02/06
+        // thread explicit interactive settings and install the 64-based live rack.
         let mut host = Host::new(48_000);
         assert!(host.load_module(FIXTURE).is_ok());
         assert!(!host.player.is_jamming());

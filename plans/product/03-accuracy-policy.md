@@ -712,7 +712,9 @@ written down here is a defect, not a decision.
 ## Planned creative playback: note overlap
 
 The [NO master plan](../engine/NO-master-plan.md) defines an optional creative playback
-layer, not a new interpretation of canonical tracker effects. It is not implemented.
+layer, not a new interpretation of canonical tracker effects. NO-01 implements its
+contract types, optional preparation and bounded lane routing; overlap/transport/audition
+execution remains in the dependent tasks. No canonical effect behavior changes in NO-01.
 Unchecked/global-bypassed and feature-disabled renders must retain existing golden output.
 Custom overlap preserves non-looping sample tails and may override IT NNA/duplicate
 actions explicitly; authored IT behavior remains the default, including looping NNA.
@@ -733,3 +735,12 @@ is held; it is not an accuracy oracle or bit-exact suspended-state resume. Audit
 prepared samples and format articulation through master DSP. Document any additional
 canonical deviation discovered during implementation under the normal §3 process;
 never refresh canonical goldens to accommodate this opt-in feature.
+
+
+NO-01 identity APIs preserve raw MOD periods and native base-volume integer values rather
+than a rendered gain or rounded identity-only conversion. Passive finalization does not
+consult checkbox/global state, and native release does not erase identity; retiring slots
+are excluded from matching. NO-04/05 must wire the capture after onset-tick processing and
+prove canonical equivalence in the three reviewed configurations. NO-06 must resolve live
+velocity before CC7 and test collisions from each format's existing volume resolution.
+Those behavioral/equivalence tests are not satisfied by NO-01's seam-level contract tests.

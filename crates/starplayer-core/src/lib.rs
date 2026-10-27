@@ -35,6 +35,7 @@ pub mod error;
 pub mod event;
 pub mod fixed;
 pub mod frame;
+pub mod interactive;
 pub mod note;
 pub mod quirks;
 pub mod random;
@@ -51,6 +52,7 @@ pub use event::{
 };
 pub use fixed::{I1F15, Q32_32, Step, U0F16};
 pub use frame::Frame;
+pub use interactive::{BuildGeneration, InteractiveAction, InteractiveCommand, InteractiveTransport, OriginalNote, PlaybackCapabilities, PlaybackIdentity, SessionId, TriggerIdentity, TriggerKind};
 pub use note::{Note, Period};
 pub use quirks::{
     BreakParameter, FormatDialect, ItLoopDialect, ModLoopDialect, PatternFlow, PaulaClock,

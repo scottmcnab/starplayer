@@ -1011,8 +1011,9 @@ const KEYBOARD_SEMITONES = new Map([
     ['KeyI', 24], ['Digit9', 25], ['KeyO', 26], ['Digit0', 27], ['KeyP', 28],
 ]);
 
-/// The MIDI channel the computer keyboard plays on. Channel 0 is `ChannelId(48)` in the
-/// engine (`MIDI_CHANNEL_BASE`), well clear of any module's own lanes.
+/// Hardware MIDI channel used by the computer keyboard. The host maps 0–15 through its
+/// configured lane layout: legacy base 48, or interactive base 64. Keep MIDI identity
+/// separate from engine lane IDs; NO-W1 negotiates interactive capability on the wire.
 const KEYBOARD_MIDI_CHANNEL = 0;
 /// Fixed, as the deliverable specifies: a computer keyboard has no velocity to read.
 const KEYBOARD_VELOCITY = 100;

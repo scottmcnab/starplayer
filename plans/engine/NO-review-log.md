@@ -792,3 +792,13 @@ explicit handoff (overriding older high effort task headers). Coordinator remain
 Tasks land serially in the recommended order with isolated sibling worktrees, coordinator
 review and verification, and single-change squash integration. Owner listening and
 hardware checks remain distinct from automated evidence.
+
+### NO-01 coordinator acceptance
+
+Reviewed the final contracts, independent feature forwarding, authoritative per-generation
+ownership/provenance, native-background protection, fixed lanes and spill routing. Worker
+checks and final coordinator engine/facade regression passed; eight goldens unchanged.
+Task commit `5d191ac` integrated by single-change squash. No overlap/transport/audition
+execution is claimed at this stage; exact dependent obligations remain in NO-01.
+Baseline at `844dac8`: eight goldens passed; offline conformance 261 total, 179 pass,
+0 unexpected fail, 16 accepted deviations, 66 known failures; serial web suite 315 pass.

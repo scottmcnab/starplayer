@@ -43,12 +43,14 @@
 //! precedence written into the type:
 //!
 //! ```no_run
+//! # #[cfg(feature = "mod")] {
 //! use starplayer::core::quirks::{QuirkSelection, QuirkSet};
 //! # let module: starplayer::rt::Arc<starplayer::model::Module> = unimplemented!();
 //! // The usual case: let the file's dialect decide.
 //! let sequencer = starplayer::mod_file::sequencer_with_quirks(module.clone(), 44_100, QuirkSelection::FromDialect);
 //! // Or override it, for a compatibility menu or a regression test.
 //! let classic = starplayer::mod_file::sequencer_with_quirks(module, 44_100, QuirkSelection::Override(QuirkSet::starplayer_classic()));
+//! # }
 //! ```
 //!
 //! The chosen set also carries the [`TempoModelId`](core::TempoModelId), so one argument

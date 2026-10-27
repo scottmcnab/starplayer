@@ -388,7 +388,21 @@ impl<'engine> TickContext<'engine> {
         let _ = (voice, state);
     }
 
+    /// Finalize a real musical onset after all of this channel's onset-tick effects.
+    /// NO-04/05 call this with the native base volume, not rendered VoiceParams.volume.
+    /// Returns false when the host has not configured overlap, or for effect retriggers
+    /// and sample replacements. Global bypass and instrument selections do not gate it.
+    #[cfg(feature = "note-overlap")]
+    pub fn finalize_onset(&mut self, voice: VoiceId, kind: starplayer_core::TriggerKind, identity: starplayer_core::TriggerIdentity) -> Result<bool, crate::ownership::PlaybackStateError> {
+        match self.channels.playback_mut() {
+            Some(playback) => playback.finalize_onset(voice, kind, identity, self.voices),
+            None => Ok(false),
+        }
+    }
+
     /// Start or retrigger a channel and trace the initial parameter writes.
+    /// Allocation does not classify a musical onset: callers must finalize actual new
+    /// notes separately after onset-tick effects. Existing trigger behavior is unchanged.
     #[inline]
     pub fn trigger_channel(
         &mut self,
@@ -1375,9 +1389,9 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         let midi_sounding = context
             .channels
             .iter()
-            .skip(crate::instrument::MIDI_CHANNEL_BASE as usize)
+            .skip(context.channels.layout().live_base())
             .any(|(_, channel)| channel.foreground.is_some_and(|voice| context.voices.get(voice).is_some()));
-        telemetry.set_channel_count(if midi_sounding {
+        telemetry.set_channel_count(if midi_sounding && !context.channels.layout().is_interactive() {
             context.channels.len().min(u8::MAX as usize) as u8
         } else {
             module_channels

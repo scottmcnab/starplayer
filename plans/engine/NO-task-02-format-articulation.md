@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Authorised; pending dependencies |
+| Status | In progress on task/no-02-articulation; NO-01 integrated |
 | Depends on | NO-01 |
 | Blocks | NO-03, NO-05, NO-06 |
 | Parallel with | None during shared engine/format runtime edits |

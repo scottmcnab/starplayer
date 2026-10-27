@@ -1291,8 +1291,8 @@ See the NO master for boundary ordering, cleanup scopes and rebuild details.
 
 ## 9. Telemetry
 
-**Planned NO amendment (not implemented):** retain 64 tracker telemetry lanes and add a
-separate live summary. With interactive audition the channel table admits up to 64+17
+**NO-01 layout contract; remaining telemetry planned:** retain 64 tracker telemetry lanes
+and add a separate live summary in NO-03. With interactive audition the channel table admits up to 64+17
 lanes: 16 shared jam/selected-input lanes plus a button-preview lane at fixed IDs 64–80,
 all outside tracker insert buses and mixed through spill/master DSP. Insert bus_count is
 decoupled from table length and capped at 64. Preserve legacy constants/constructors even
@@ -1815,9 +1815,9 @@ per-sample cost; the measurement that would show it is the budget document's §3
 
 The [NO master plan](../engine/NO-master-plan.md) proposes explicit, session-only
 instrument-only note overlap and faithful instrument audition for all five formats. This
-is **planned, not implemented**. The instrument-only checkbox/onset-volume design has completed
-external review and corrections (see the NO review log); changes remain uncommitted for
-owner review, with no implementation authorization.
+has completed external review and corrections (see the NO review log), and implementation
+was authorised on 2026-10-27. NO-01 supplies the contracts/preparation described below;
+overlap execution, interactive transport and faithful native audition remain planned.
 Each instrument has a Let notes ring boolean, with a separate Enable note overlap global
 bypass preserving selections. There are no channel overrides, inheritance or custom modes.
 Enabled eligible voices continue except when instrument, original note, exact onset base
@@ -1843,3 +1843,61 @@ fixed 128-frame DSP quanta, exact event splitting, allocation-free rendering and
 block-size-independent output. See the master for onset-volume matching, global bypass, loop exclusion,
 capacity budgets and native IT isolation; implementation must reconcile the relevant
 architecture sections as each deliverable lands.
+
+
+### NO-01 implemented API contracts
+
+`starplayer-core::interactive` defines separate `SessionId` and `BuildGeneration`, an
+atomic logical `InteractiveCommand` envelope, capability bits and transport/action types.
+These types do not execute transport changes or assign wire opcodes. `Command::Stop` and
+all existing command values retain their contracts. NO-03 supplies command execution and
+NO-W1 the negotiated wire envelope.
+
+`starplayer_engine::LaneLayout::interactive` rejects tracker widths above 64 and maps
+hardware MIDI channels 0–15 strictly to lanes 64–79, with lane 80 reserved for button
+Preview. It requires compiled audition support. `ChannelTable::try_with_layout` retains
+all 81 lanes. Tracker insert buses and scope/telemetry channels remain at most 64; live
+voices pass through spill/master DSP. Public legacy MIDI mapping helpers and constructors
+keep their 48/64/272 limits even when Cargo features unify. Rack routing reads the table's
+layout; host event senders/SMF remain legacy until the configured host plumbing in NO-02/06.
+
+Reusable engine/facade/format features default off. Web packages default both features on,
+but Cargo features alone enable no runtime reservations. Optional `EngineSettings::playback`
+is `None` by default; `with_playback` explicitly prepares budgets, and `interactive_web`
+provides the persistent web configuration (256 native + 64 custom + 16 shared live + 3
+retirement = 339 slots). `Engine::try_with_settings` rejects mismatched pool capacity and
+unsupported interactive widths before playback. NO-02 threads the prepared capacity and
+configuration through concrete format/host constructors and sizes their articulation.
+
+One optional `PlaybackState` on `ChannelTable` owns per-generation age/provenance/lifecycle
+records. It compiles with either feature, is absent with neither, and allocates only at
+preparation. Per-instrument booleans exist only with `note-overlap`; the boolean table is
+empty unless that runtime capability was configured. Bounded setters validate both session
+and build, and global bypass preserves selections and returns a custom-tail clear request.
+NO-03/04/06 execute that request with release ramps. Current setter calls do not clear PCM.
+Explicit new sessions construct false selections/global state; same-session rebuild replay
+belongs to Player in NO-03. These retained selections are session state, never presets.
+
+Resource domain N/C/L is separate from custom detachment and from live cleanup origin
+(Jam, SelectedInput, ButtonPreview). Live custom tails remain in L. Shared native detach
+marks Background, and the atomic custom-detach helper marks provenance before unbinding;
+a native-created background cannot migrate to C after a checkbox change. The live-origin
+setter validates generation and lane/source compatibility; NO-06 sets selected-input origin
+synchronously on admission before mixing. All three live origins share one L quota.
+Scoped predicates cover all/song/live/lane/custom-detached/origin cleanup. Retiring voices
+retain domain/age/generation, leave active admission counts and cannot become active again.
+Oldest selection is deterministic by age then slot; native IT retains its format victim
+policy. Enforcement of quotas/retirement ramps is a dependent-task deliverable.
+
+`TriggerIdentity` keeps the existing zero-based `InstrumentId`, exact original note
+(including raw MOD periods), originating channel and an exact native `u16` base-volume
+value, with no rescaling or tolerance. `TickContext::finalize_onset` accepts it once after
+all onset-tick effects, and passively records even while unchecked/global-bypassed. It
+rejects rewrites, invalid IDs, stale voices and retiring voices; identity survives native
+key-off/fade/NNA release until slot reclamation/reuse. `TriggerKind` distinguishes actual
+musical onset from effect retrigger/sample replacement; the allocation helper alone does
+not decide this. NO-04/05 wire the format-specific post-effects capture and duplicate
+replacement, including delayed starts. NO-05 names XM's exact base field. NO-06 wires live
+native resolution; `NoteParams::raw_velocity` already preserves event velocity separately
+from CC7-scaled playback velocity. Existing format-resolution velocity collisions need
+format-native tests there, without identity-only quantization.

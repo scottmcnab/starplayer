@@ -58,10 +58,10 @@ impl From<EngineWarnings> for WarningFlags {
 /// then calls [`TelemetryPublisher::publish`] once, so everything in the snapshot comes
 /// from this one tick.
 pub fn capture_channels(publisher: &mut TelemetryPublisher, channels: &ChannelTable, voices: &VoicePool) {
-    publisher.set_channel_count(channels.len() as u8);
+    publisher.set_channel_count(channels.layout().tracker_channels().min(ChannelTable::MAX_CHANNELS) as u8);
     publisher.set_voices_active(voices.voices_active().min(u16::MAX as usize) as u16);
 
-    for (id, lane) in channels.iter() {
+    for (id, lane) in channels.iter().take(ChannelTable::MAX_CHANNELS) {
         let sounding = lane.foreground.and_then(|voice| voices.get(voice).map(|state| (voice, state)));
         let update = match sounding {
             Some((voice, state)) => ChannelUpdate {
@@ -94,7 +94,10 @@ pub fn capture_channels(publisher: &mut TelemetryPublisher, channels: &ChannelTa
 /// Like [`capture_channels`] this does not publish; the source does, once, after it.
 #[cfg(feature = "telemetry")]
 pub fn capture_midi_channels(publisher: &mut TelemetryPublisher, channels: &ChannelTable, voices: &VoicePool) {
-    let base = crate::instrument::MIDI_CHANNEL_BASE as usize;
+    // Interactive live lanes have a separate summary in NO-03. The tracker snapshot's
+    // 64 lanes and insert mapping remain stable.
+    if channels.layout().is_interactive() { return; }
+    let base = channels.layout().live_base();
     let top = base + crate::instrument::MIDI_CHANNEL_COUNT;
     let lanes = channels.len().min(top);
     publisher.set_channel_count(publisher.working().channel_count.max(lanes.min(u8::MAX as usize) as u8));

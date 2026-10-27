@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation authorised 2026-10-27; NO-01 in progress; reviewed instrument-only/onset-volume contract unchanged |
+| Status | Implementation authorised 2026-10-27; NO-01 integrated; NO-02 in progress; reviewed instrument-only/onset-volume contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -516,3 +516,12 @@ Recommended landing order: 01 → 02 → 03 → 04 → 05 → 06 → W1 → 07.
 Do not split multiple agents across the same checkout. No workers are started by this
 planning handoff. External review findings, corrections and final disposition are in
 [the review log](NO-review-log.md).
+
+## Implementation progress
+
+- NO-01 integrated as a reviewed single-change squash (task commit `5d191ac`).
+  Independent feature matrices, no_std, WASM, firmware-common host tests and all eight
+  goldens passed; coordinator final engine/facade regression passed. Exact evidence and
+  dependent capture/behavior obligations are in NO-01. Plans stay here pending main landing.
+- NO-02 starts after NO-01; worker Astra medium per explicit owner assignment. Only one
+  task agent and one heavy Cargo workload run at a time (owner OOM constraint).

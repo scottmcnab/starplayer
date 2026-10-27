@@ -133,6 +133,10 @@ impl EngineWarnings {
 pub struct EngineSettings {
     /// Voices in the global pool.
     pub voice_capacity: usize,
+    /// Optional runtime opt-in, independent of Cargo feature unification. Configure
+    /// before playback; defaults allocate no policy tables or optional voice reserve.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub playback: Option<crate::playback::PlaybackConfiguration>,
     /// Control lanes. 32 covers S3M; IT's 64 is [`ChannelTable::MAX_CHANNELS`].
     pub channel_count: usize,
     /// Allocate oscilloscope tap rings when telemetry is enabled. Scalar snapshots remain
@@ -156,10 +160,35 @@ pub struct EngineSettings {
     pub insert_garbage_capacity: usize,
 }
 
+impl EngineSettings {
+    /// Prepare optional budgets without changing legacy constructors. This only enables
+    /// capability/identity storage: overlap policy and interactive transport land later.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn with_playback(mut self, configuration: crate::playback::PlaybackConfiguration) -> Result<Self, crate::playback::PlaybackConfigError> {
+        configuration.validate()?;
+        if self.channel_count > ChannelTable::MAX_CHANNELS { return Err(crate::playback::PlaybackConfigError::UnsupportedTrackerWidth); }
+        self.voice_capacity = configuration.capacity.physical();
+        self.playback = Some(configuration);
+        Ok(self)
+    }
+
+    /// Persistent web host opt-in: 256 native + 64 custom + 16 shared live + 3 retirement
+    /// slots; 64 tracker insert buses and separate live lanes 64–80. NO-02 threads this
+    /// through Player construction before NO-06 installs the prepared live source.
+    #[cfg(all(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn interactive_web(identity: starplayer_core::PlaybackIdentity, instrument_count: usize) -> Result<Self, crate::playback::PlaybackConfigError> {
+        Self { channel_count: ChannelTable::MAX_CHANNELS, ..Self::default() }.with_playback(crate::playback::PlaybackConfiguration {
+            identity, instrument_count, capabilities: crate::playback::compiled_playback_capabilities(), capacity: crate::playback::VoiceCapacity::web(),
+        })
+    }
+}
+
 impl Default for EngineSettings {
     fn default() -> EngineSettings {
         EngineSettings {
             voice_capacity: 64,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            playback: None,
             channel_count: 32,
             scope_taps: true,
             telemetry_depth: starplayer_rt::DEFAULT_SNAPSHOT_DEPTH,
@@ -303,16 +332,37 @@ where
     /// channel table, the quantum accumulator, the output ring, the source slots, the
     /// command ring and the garbage channel.
     pub fn with_settings(settings: EngineSettings) -> Engine<Path, Interp, Out, Module> {
+        Self::try_with_settings(settings).expect("invalid engine playback configuration")
+    }
+
+    /// Validate interactive layout/capacity before playback. Legacy constructors keep
+    /// their historical channel clamping and pool defaults. Allocation of legacy engine
+    /// components remains infallible as before; NO-02 owns wider constructor plumbing.
+    pub fn try_with_settings(settings: EngineSettings) -> Result<Engine<Path, Interp, Out, Module>, crate::playback::PlaybackConfigError> {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        let channels = if let Some(configuration) = settings.playback {
+            configuration.validate()?;
+            if settings.voice_capacity != configuration.capacity.physical() { return Err(crate::playback::PlaybackConfigError::InvalidCapacity); }
+            let layout = if configuration.capabilities.contains(starplayer_core::PlaybackCapabilities::INTERACTIVE_AUDITION) {
+                crate::playback::LaneLayout::interactive(settings.channel_count)?
+            } else {
+                if settings.channel_count > ChannelTable::MAX_CHANNELS { return Err(crate::playback::PlaybackConfigError::UnsupportedTrackerWidth); }
+                crate::playback::LaneLayout::legacy(settings.channel_count)
+            };
+            let mut channels = ChannelTable::try_with_layout(layout)?;
+            channels.prepare_playback(configuration)?;
+            channels
+        } else { ChannelTable::new(settings.channel_count) };
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        let channels = ChannelTable::new(settings.channel_count);
         let (command_producer, command_consumer) = starplayer_rt::channel(settings.command_capacity);
         let (garbage, collector) = garbage_channel(settings.garbage_capacity);
         let (insert_producer, insert_consumer) = starplayer_rt::channel(settings.insert_command_capacity);
         let (insert_garbage, insert_collector) = garbage_channel(settings.insert_garbage_capacity);
-        // The channel table clamps to `ChannelTable::MAX_CHANNELS`, so the bus count comes
-        // from the table rather than from the request: 64 buses is the widest the engine
-        // can be asked for, and the two must agree or a lane's voices would spill.
-        let channels = ChannelTable::new(settings.channel_count);
+        // Tracker insert buses never include interactive live lanes. Every live lane
+        // 64–80 routes through spill/master DSP, even for a four-channel song.
         let bus_count = match settings.layout {
-            EngineLayout::Full => channels.len(),
+            EngineLayout::Full => channels.layout().tracker_channels().min(ChannelTable::MAX_CHANNELS),
             EngineLayout::MasterOnly => 0,
         };
         #[cfg(feature = "telemetry")]
@@ -320,9 +370,9 @@ where
         // One scope ring per control lane, allocated here with everything else. A ring is
         // ~2 KB, so even IT's 64 channels cost 128 KB once, never in `render()`.
         #[cfg(feature = "telemetry")]
-        let (scope_taps, scope_readers) = crate::scope::ScopeTaps::new(if settings.scope_taps { settings.channel_count } else { 0 });
+        let (scope_taps, scope_readers) = crate::scope::ScopeTaps::new(if settings.scope_taps { channels.layout().tracker_channels().min(ChannelTable::MAX_CHANNELS) } else { 0 });
 
-        Engine {
+        Ok(Engine {
             voices: VoicePool::new(settings.voice_capacity),
             channels,
             control: ControlClock::new(settings.sample_rate_hz, Frame::ZERO),
@@ -360,7 +410,7 @@ where
             #[cfg(feature = "trace")]
             trace: crate::trace::TraceRecorder::default(),
             interpolator: core::marker::PhantomData,
-        }
+        })
     }
 
     /// Claim the telemetry reader, once (architecture §9).
