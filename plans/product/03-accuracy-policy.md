@@ -806,3 +806,15 @@ IT0–256; simple PCM retains Q0.16), including existing resolution collisions. 
 remain next-note latches. Shared native cadence supports explicitly prepared SMF N/C
 racks with either feature; live L routing requires audition. Native tracker goldens and
 pinned conformance remain unchanged; no oracle exclusions or golden hashes are updated.
+
+NO-W1 adds web controls and an audio-applied, full-identity bridge without changing native
+tracker effects or golden expectations. Preview eligibility also uses XM's pure native
+pitch-table preflight: a mapped PCM sample at reference60 can be silent because its
+relative-note/finetune is out of range, even while another mapped key is playable. This
+metadata correction shares onset resolution and does not change native tuning arithmetic.
+
+Mapped PCM loop/one-shot metadata remains independent of live-input pitch viability.
+For example, XM native cell1/map0 may sound while live input0 cannot tune under the existing
+reference adapter; that sample remains eligible for song note overlap. Mixed-map badges
+include both looping and non-looping mapped PCM even when one side is outside the live
+pitch range. No native tuning arithmetic or canonical output is changed.

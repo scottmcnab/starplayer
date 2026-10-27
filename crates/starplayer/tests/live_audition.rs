@@ -372,3 +372,59 @@ fn prepared_simple_sample_bend_preserves_cents_and_pcm_rate_scaling() {
         assert!(onset>live.voices.get(bent).unwrap().params.step);
     }
 }
+
+#[test]
+fn capability_uses_native_xm_tuning_for_reference_preview_and_other_map_keys() {
+    let mut builder = ModuleBuilder::new();
+    let sample = builder.add_sample(&[1000; 128], SampleSpec { relative_note: -80, ..SampleSpec::one_shot("low tuning") }).unwrap();
+    let mut instrument = InstrumentDef::from_sample("mapped", sample, U0F16::MAX);
+    instrument.note_sample_map.fill(0); instrument.note_sample_map[60] = 1; instrument.note_sample_map[100] = 1;
+    builder.add_instrument(instrument).unwrap();
+    builder.add_pattern(&[0; 5 * 64], 1, 64).unwrap(); builder.set_orders(&[0]); builder.set_header(ModuleHeader::new(ModuleFormat::Xm, 1));
+    let module = Arc::new(builder.build().unwrap());
+    let capability = starplayer::live_instrument_capability(&module, InstrumentId(0));
+    assert!(capability.playable && capability.one_shot);
+    assert!(!capability.preview_playable && !capability.preview_looping);
+    let mut live = Harness::new(module);
+    live.action(InteractiveAction::PreviewInstrument(InstrumentId(0)));
+    assert!(live.channels.foreground(ChannelId(80)).is_none());
+    live.on(64, 100, 65_535);
+    assert!(live.channels.foreground(ChannelId(64)).is_some());
+}
+
+
+#[test]
+fn xm_sample_loop_eligibility_is_independent_of_live_pitch_viability() {
+    use starplayer::engine::{TickContext, RowRef, SongPosition, TrackerProcessor};
+    use starplayer::core::RowClock;
+    for case in 0..3 {
+        let mut builder = ModuleBuilder::new();
+        let one_shot = builder.add_sample(&[1000; 128], SampleSpec::one_shot("one shot")).unwrap();
+        let looping = builder.add_sample(&[2000; 128], SampleSpec::one_shot("looping").with_forward_loop(0, 128)).unwrap();
+        let mut instrument = InstrumentDef::from_sample("mapped", one_shot, U0F16::MAX);
+        instrument.note_sample_map.fill(0);
+        instrument.note_sample_map[0] = if case == 2 { looping.0 + 1 } else { one_shot.0 + 1 };
+        if case != 0 { instrument.note_sample_map[60] = if case == 1 { looping.0 + 1 } else { one_shot.0 + 1 }; }
+        builder.add_instrument(instrument).unwrap();
+        builder.add_pattern(&[1, 1, 0, 0, 0], 1, 1).unwrap(); builder.set_orders(&[0]);
+        builder.set_header(ModuleHeader::new(ModuleFormat::Xm, 1));
+        let module = Arc::new(builder.build().unwrap());
+        let capability = starplayer::live_instrument_capability(&module, InstrumentId(0));
+        assert!(capability.one_shot, "native mapped PCM stays overlap-eligible case{case}");
+        assert_eq!(capability.looping, case != 0);
+        assert_eq!(capability.playable, case != 0);
+        assert_eq!(capability.preview_playable, case != 0);
+        assert_eq!(capability.preview_looping, case == 1);
+        // Native cell1 selects map0 and has a valid native period. The live adapter
+        // subtracts12 for input0, which cannot sound; that does not invalidate songPCM.
+        let mut voices = VoicePool::new(339); let mut channels = ChannelTable::new(1);
+        let mut processor = starplayer::xm::XmProcessor::new(Arc::clone(&module), 8000);
+        let mut context = TickContext::new(Frame::ZERO, &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+        let _ = processor.row(&mut context, RowRef { order: 0, pattern: 0, row: 0, bytes: &[1, 1, 0, 0, 0] });
+        let song = channels.foreground(ChannelId(0)).expect("native lowest map key starts a song voice");
+        assert_ne!(voices.get(song).unwrap().params.step, starplayer::core::Step::ZERO);
+        let mut live = Harness::new(module);
+        live.event(64, Event::NoteOn { note: Note::new(0), velocity: U0F16::MAX });
+        assert!(live.channels.foreground(ChannelId(64)).is_none());
+    }
+}

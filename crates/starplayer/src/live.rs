@@ -33,5 +33,12 @@ fn native_map(module: &Module) -> bool {
 
 /// Pure metadata query: no allocation or runtime preparation required.
 pub fn live_instrument_capability(module: &Module, instrument: crate::core::InstrumentId) -> crate::engine::instrument::live::InstrumentCapability {
-    crate::engine::instrument::live::instrument_capability(module, instrument, native_map(module))
+    crate::engine::instrument::live::instrument_capability_filtered(module, instrument, native_map(module), |note, sample| {
+        #[cfg(feature = "xm")]
+        if module.header().format == ModuleFormat::Xm {
+            return module.sample(sample).is_some_and(|sample| crate::xm::processor::live::live_note_table_index(sample, crate::core::Note::new(note), 0).is_some());
+        }
+        let _ = (note, sample);
+        true
+    })
 }

@@ -49,7 +49,7 @@ use std::vec::Vec;
 
 use backend::WorkletBackend;
 use command::{CommandRing, WireCommand};
-use starplayer::core::{AtEnd, ChannelId, U0F16};
+use starplayer::core::{AtEnd, ChannelId, U0F16, PlaybackIdentity, SessionId, BuildGeneration, InteractiveAction, InteractiveCommand, LiveDestination, InstrumentId};
 use starplayer::dsp::{InsertKind, ParamId};
 use starplayer::engine::{InsertTarget, MixerMode, RENDER_QUANTUM};
 use starplayer::model::{Module, ModuleFormat};
@@ -164,7 +164,8 @@ const AT_END_STOP: u32 = 2;
 const TELEMETRY_HEADER_WORDS: usize = 22;
 const TELEMETRY_CHANNEL_WORDS: usize = 8;
 const TELEMETRY_CHANNELS: usize = 64;
-const TELEMETRY_WORDS: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
+const TELEMETRY_LIVE_OFFSET: usize = TELEMETRY_HEADER_WORDS + TELEMETRY_CHANNELS * TELEMETRY_CHANNEL_WORDS;
+const TELEMETRY_WORDS: usize = TELEMETRY_LIVE_OFFSET + 3;
 
 /// Scope taps (architecture §9(b)): the newest window of each channel's tap ring, copied
 /// out of the engine's rings into one contiguous block the worklet can view.
@@ -296,6 +297,7 @@ struct Host {
     /// Wire records staged between render quanta, decoded straight from the SAB ring or from
     /// a fallback batch.
     commands: CommandRing,
+    interactive_status: [u32; 10],
     /// Records this host refused: an opcode it does not know, an `AT_END` argument that
     /// spells nothing, or a command the player's ring would not take.
     commands_rejected: u32,
@@ -343,7 +345,9 @@ impl Host {
         Host::with_mode(sample_rate_hz, MixerMode::DEFAULT).expect("the default mixer mode has a host engine arm")
     }
 
-    fn with_mode(sample_rate_hz: u32, active_mode: MixerMode) -> Result<Host, String> {
+    fn with_mode(sample_rate_hz: u32, active_mode: MixerMode) -> Result<Host, String> { Self::with_identity(sample_rate_hz, active_mode, None) }
+
+    fn with_identity(sample_rate_hz: u32, active_mode: MixerMode, identity: Option<PlaybackIdentity>) -> Result<Host, String> {
         let mut backend = WorkletBackend::new(sample_rate_hz);
         // `negotiate` answers with the context's own rate, so this is the rate the engine is
         // built at and the rate every module is scanned at, whatever is asked for here.
@@ -352,18 +356,28 @@ impl Host {
             channels: active_mode.channels as u16,
             preferred_block_frames: Some(RENDER_QUANTUM as u32),
         };
-        let mut player = Player::open(&mut backend, None, requested, active_mode).map_err(|error| error.to_string())?;
+        let mut player = if let Some(identity) = identity {
+            #[cfg(all(feature = "note-overlap", feature = "interactive-audition"))]
+            {
+            let mut settings = starplayer::engine::EngineSettings::interactive_web(identity, 0).map_err(|error| format!("{error:?}"))?;
+            settings.sample_rate_hz = sample_rate_hz;
+            Player::open_with_settings(&mut backend, None, requested, active_mode, settings)
+            }
+            #[cfg(not(all(feature = "note-overlap", feature = "interactive-audition")))]
+            { let _ = identity; return Err(String::from("interactive web support was not compiled")); }
+        } else { Player::open(&mut backend, None, requested, active_mode) }.map_err(|error| error.to_string())?;
         let negotiated_sample_rate_hz = player.spec().sample_rate_hz;
         let scopes = player.take_scope_readers().ok_or_else(|| String::from("a new engine owns its scope readers"))?;
         // A `Player` opens with its transport silent and its musical clock stopped; the page
         // expects a module to sound the moment it is activated, rather than after a separate
         // Play. This is one 64-frame glide up where the pre-D9 host started flat at unity,
         // which is one click fewer and nothing else.
-        player.play().map_err(|error| error.to_string())?;
+        if identity.is_none() { player.play().map_err(|error| error.to_string())?; }
         Ok(Host {
             backend,
             player,
             commands: CommandRing::new(),
+            interactive_status: [0; 10],
             commands_rejected: 0,
             interleaved: vec![0.0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
             planar: vec![0.0; MAX_FRAMES_PER_CALL * MAX_OUTPUT_CHANNELS],
@@ -440,6 +454,7 @@ impl Host {
     /// changing the song position. Both allocate — a rack, a queue, a sequencer — which
     /// is exactly why this is not an opcode.
     fn set_midi_input(&mut self, enabled: bool) -> Result<bool, String> {
+        if self.player.playback_identity().is_some() { return Err(String::from("interactive routing requires an identified destination command")); }
         if enabled == self.player.is_jamming() {
             return Ok(enabled);
         }
@@ -478,6 +493,54 @@ impl Host {
     /// One wire record. `false` means nothing was queued — the opcode is unknown, its
     /// argument spells nothing, or the player's ring was full.
     fn apply(&mut self, wire: WireCommand) -> bool {
+        if self.player.playback_identity().is_some() && wire.identity != self.player.playback_identity() { return false; }
+        if wire.identity.is_some() && wire.opcode < 13 {
+            let valid = match wire.opcode {
+                OPCODE_PLAY => wire.argument == 0 && wire.extra == 0,
+                OPCODE_SEEK_ORDER | OPCODE_SEEK_ROW => wire.argument <= u16::MAX as u32 && wire.extra == 0,
+                OPCODE_SEEK_FRAME => wire.extra == 0,
+                OPCODE_MASTER_VOLUME => wire.argument <= u16::MAX as u32 && wire.extra == 0,
+                OPCODE_MUTE_CHANNEL => wire.argument < 64 && wire.extra <= 1,
+                OPCODE_AT_END => at_end_from_wire(wire.argument).is_some(),
+                OPCODE_MIDI_EVENT => wire.extra == 0 && wire.argument & 0xff80_8000 == 0,
+                OPCODE_INSERT_PARAM | OPCODE_INSERT_BYPASS => {
+                    let target = wire.argument & 0xff;
+                    let slot = (wire.argument >> 8) & 0xf;
+                    (target < 64 || target == INSERT_TARGET_MASTER) && slot < 4 && if wire.opcode == OPCODE_INSERT_BYPASS { wire.argument & !0xfff == 0 && wire.extra <= 1 } else { wire.argument & !0xfffff == 0 }
+                }
+                _ => false,
+            };
+            if !valid { return false; }
+        }
+        if matches!(wire.opcode, OPCODE_MIDI_EVENT | 20 | 24) && self.player.playback_identity().is_some() {
+            let applied = self.player.applied_playback();
+            if !applied.accepted || applied.identity != wire.identity { return false; }
+        }
+        if wire.opcode >= 13 {
+            let Some(identity) = wire.identity else { return false };
+            if self.player.playback_identity() != Some(identity) { return false; }
+            let action = match wire.opcode {
+                13 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Play,
+                14 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Pause,
+                15 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Resume,
+                16 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Stop,
+                17 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::AllSoundOff,
+                18 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::StopPreview,
+                19 if wire.extra == 0 => InteractiveAction::SetLiveDestination(match wire.argument {
+                    0 => LiveDestination::Off, 1 => LiveDestination::Jam,
+                    value if value - 2 <= u16::MAX as u32 => LiveDestination::Selected(InstrumentId((value - 2) as u16)), _ => return false,
+                }),
+                20 if wire.argument <= u16::MAX as u32 && wire.extra == 0 => InteractiveAction::PreviewInstrument(InstrumentId(wire.argument as u16)),
+                21 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::ReleasePreview,
+                22 if wire.argument <= 1 && wire.extra == 0 => InteractiveAction::SetNoteOverlapEnabled(wire.argument != 0),
+                23 if wire.argument <= u16::MAX as u32 && wire.extra <= 1 => InteractiveAction::SetLetNotesRing { instrument: InstrumentId(wire.argument as u16), enabled: wire.extra != 0 },
+                24 if wire.extra == 0 && wire.argument & 0xff80_8000 == 0 => {
+                    return message_to_event(wire.argument as u8, (wire.argument >> 8) as u8, (wire.argument >> 16) as u8).is_some_and(|(channel, event)| self.player.send_event(channel, event).is_ok());
+                }
+                _ => return false,
+            };
+            return self.player.submit_interactive(InteractiveCommand { identity, action }).is_ok();
+        }
         let queued = match wire.opcode {
             OPCODE_PLAY => self.player.play(),
             OPCODE_STOP => self.player.stop(),
@@ -560,8 +623,11 @@ impl Host {
         self.last_peak = peak.max(self.last_peak * MASTER_PEAK_DECAY_PER_QUANTUM);
         let snapshot = *self.player.telemetry();
         self.pack_telemetry(snapshot);
+        let applied = self.player.applied_playback();
+        let identity = applied.identity.unwrap_or_default();
+        self.interactive_status = [applied.serial as u32, (applied.serial >> 32) as u32, identity.session.0 as u32, (identity.session.0 >> 32) as u32, identity.build.0 as u32, (identity.build.0 >> 32) as u32, applied.capabilities.bits() as u32, applied.accepted as u32, self.player.commands_rejected() as u32, (self.player.commands_rejected() >> 32) as u32];
         if self.quanta_rendered.is_multiple_of(SCOPE_REFRESH_QUANTA) {
-            self.refresh_scopes(snapshot.channel_count as usize);
+            self.refresh_scopes(self.tracker_channel_count(snapshot));
         }
         peak
     }
@@ -591,6 +657,11 @@ impl Host {
         self.scope_generation = self.scope_generation.wrapping_add(1);
     }
 
+    fn tracker_channel_count(&self, snapshot: Snapshot) -> usize {
+        if self.player.interactive_transport().is_some() { self.player.module().map_or(0, |module| module.header().channel_count as usize) }
+        else { snapshot.channel_count as usize }
+    }
+
     fn pack_telemetry(&mut self, snapshot: Snapshot) {
         let song_flags = ((snapshot.transport.song_end != SongEnd::Unknown) as i32)
             | (((snapshot.transport.song_end == SongEnd::Loops) as i32) << 1)
@@ -605,7 +676,7 @@ impl Host {
         let header = [
             snapshot.sequence as i32,
             snapshot.publishes_dropped as i32,
-            snapshot.channel_count as i32,
+            self.tracker_channel_count(snapshot) as i32,
             snapshot.voices_active as i32,
             snapshot.transport.order as i32,
             snapshot.transport.pattern as i32,
@@ -618,7 +689,9 @@ impl Host {
             self.player.output_frame().0 as i32,
             self.player.pending_garbage() as i32,
             self.module_generation as i32,
-            self.player.is_playing() as i32,
+            if let Some(transport) = self.player.interactive_transport() {
+                8 | i32::from(self.player.is_playing()) | (i32::from(transport == starplayer::core::InteractiveTransport::Paused) << 1) | (i32::from(self.player.natural_end()) << 2)
+            } else { self.player.is_playing() as i32 },
             // The master peak is a lossy audio tap (architecture §9): a torn or stale
             // reading costs a UI nothing, so it rides the same block as scalars for now.
             (self.last_peak.clamp(0.0, 1.0) * 65_535.0) as i32,
@@ -632,6 +705,8 @@ impl Host {
             destination.copy_from_slice(&header);
         }
 
+        let live = snapshot.live;
+        if let Some(destination) = self.telemetry_words.get_mut(TELEMETRY_LIVE_OFFSET..) { destination.copy_from_slice(&[live.active as i32, live.retiring as i32, live.peak.to_bits() as i32]); }
         for (index, channel) in snapshot.channels.iter().enumerate() {
             let base = TELEMETRY_HEADER_WORDS + index * TELEMETRY_CHANNEL_WORDS;
             let flags = (channel.active as i32) | ((channel.muted as i32) << 1);
@@ -713,6 +788,86 @@ mod exports {
         initialized
     }
 
+    /// Runtime opt-in is explicit and independent of Cargo feature unification.
+    #[wasm_bindgen]
+    pub fn init_interactive(sample_rate: f32, mode: u32, session: u64, build: u64) -> bool {
+        drop(core::hint::black_box(vec![0u8; HEAP_RESERVE_BYTES]));
+        let identity = PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) };
+        let rate = sample_rate.round().clamp(8_000.0, 384_000.0) as u32;
+        HOST.with(|cell| {
+            let Ok(mut slot) = cell.try_borrow_mut() else { return false };
+            let Ok(host) = Host::with_identity(rate, MixerMode::from_wire(mode).unwrap_or(MixerMode::DEFAULT), Some(identity)) else { return false };
+            *slot = Some(host);
+            true
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn interactive_wire_version() -> u32 { 2 }
+
+    #[wasm_bindgen]
+    pub fn interactive_status_ptr() -> u32 { with_host(0, |host| host.interactive_status.as_ptr() as usize as u32) }
+    #[wasm_bindgen]
+    pub fn queue_applied_barrier_words(low: u32, high: u32) -> bool { with_host(false, |host| host.player.playback_barrier(low as u64 | ((high as u64) << 32)).is_ok()) }
+    #[wasm_bindgen]
+    pub fn queue_applied_barrier(serial: u32) -> bool { with_host(false, |host| host.player.playback_barrier(serial as u64).is_ok()) }
+    #[wasm_bindgen]
+    pub fn enqueue_interactive_words(opcode: u32, argument: u32, extra: u32, session_low: u32, session_high: u32, build_low: u32, build_high: u32) -> bool {
+        if !(1..=24).contains(&opcode) { return false; }
+        let identity = PlaybackIdentity { session: SessionId(session_low as u64 | ((session_high as u64) << 32)), build: BuildGeneration(build_low as u64 | ((build_high as u64) << 32)) };
+        with_host(false, |host| host.enqueue(WireCommand { identity: Some(identity), opcode: opcode as u8, argument, extra }))
+    }
+
+    #[wasm_bindgen]
+    pub fn enqueue_interactive(opcode: u32, argument: u32, extra: u32, session: u64, build: u64) -> bool {
+        if !(13..=24).contains(&opcode) { return false; }
+        with_host(false, |host| host.enqueue(WireCommand { identity: Some(PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) }), opcode: opcode as u8, argument, extra }))
+    }
+
+    #[wasm_bindgen]
+    pub fn pending_control_commands() -> u32 { with_host(0, |host| host.player.pending_control_commands() as u32) }
+
+    #[wasm_bindgen]
+    pub fn flush_commands() { with_host((), |host| host.drain_commands()); }
+
+    #[wasm_bindgen]
+    pub fn playback_barrier(serial: u64) -> bool { with_host(false, |host| host.player.playback_barrier(serial).is_ok()) }
+    #[wasm_bindgen]
+    pub fn applied_serial() -> u64 { with_host(0, |host| host.player.applied_playback().serial) }
+    #[wasm_bindgen]
+    pub fn applied_session() -> u64 { with_host(0, |host| host.player.applied_playback().identity.map_or(0, |identity| identity.session.0)) }
+    #[wasm_bindgen]
+    pub fn applied_build() -> u64 { with_host(0, |host| host.player.applied_playback().identity.map_or(0, |identity| identity.build.0)) }
+    #[wasm_bindgen]
+    pub fn applied_accepted() -> bool { with_host(false, |host| host.player.applied_playback().accepted) }
+    #[wasm_bindgen]
+    pub fn applied_capabilities() -> u32 { with_host(0, |host| host.player.applied_playback().capabilities.bits() as u32) }
+    #[wasm_bindgen]
+    pub fn current_session() -> u64 { with_host(0, |host| host.player.playback_identity().map_or(0, |identity| identity.session.0)) }
+    #[wasm_bindgen]
+    pub fn current_build() -> u64 { with_host(0, |host| host.player.playback_identity().map_or(0, |identity| identity.build.0)) }
+
+    /// Off-render, versioned and field-wise. No raw Rust layouts cross realms.
+    #[wasm_bindgen]
+    pub fn replacement_state() -> Result<Vec<u64>, JsValue> {
+        with_host(Err(JsValue::NULL), |host| host.player.replacement_state().map_err(|error| JsValue::from_str(&error.to_string())))
+    }
+
+    #[wasm_bindgen]
+    pub fn load_module_identified(bytes: &[u8], panning: bool, enhancement: u32, speed_adjust: i32, session: u64, build: u64, replacement: &[u64]) -> Result<u32, JsValue> {
+        with_host(Err(JsValue::NULL), |host| {
+            let (module, flags, factor) = decode(bytes, panning, enhancement, host.sample_rate_hz.saturating_mul(2)).map_err(|error| JsValue::from_str(&error.to_string()))?;
+            let identity = PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) };
+            host.player.set_speed_adjust(speed_adjust.clamp(i8::MIN as i32, i8::MAX as i32) as i8);
+            if replacement.is_empty() { host.player.load_module_identified(Arc::new(module), identity) }
+            else { host.player.load_replacement(Arc::new(module), identity, replacement) }.map_err(|error| JsValue::from_str(&error.to_string()))?;
+            host.module_generation = host.module_generation.wrapping_add(1).max(1);
+            host.last_applied_enhancement_flags = flags;
+            host.last_enhancement_factor = factor;
+            Ok(host.module_generation)
+        })
+    }
+
     /// Decode and activate one validated native module byte buffer outside `process()`.
     #[wasm_bindgen]
     pub fn load_module(bytes: &[u8]) -> Result<u32, JsValue> { load_module_with_options(bytes, false, 0, 0) }
@@ -786,7 +941,7 @@ mod exports {
     /// Decode one SAB/fallback wire record into the wasm-side fixed command ring.
     #[wasm_bindgen]
     pub fn enqueue_command(opcode: u32, argument: u32, extra: u32) -> bool {
-        let command = WireCommand { opcode: opcode as u8, argument, extra };
+        let command = WireCommand { identity: None, opcode: opcode as u8, argument, extra };
         with_host(false, |host| host.enqueue(command))
     }
 
@@ -1125,7 +1280,7 @@ mod tests {
         let mut host = Host::new(48_000);
         assert!(host.load_module(FIXTURE).is_ok());
         host.process(RENDER_QUANTUM);
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_SEEK_ORDER, argument: 1, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_SEEK_ORDER, argument: 1, extra: 0 }));
         for _ in 0..10 { host.process(RENDER_QUANTUM); }
         assert_eq!(host.player.telemetry().transport.order, 1);
         let generation = host.module_generation;
@@ -1457,7 +1612,7 @@ mod tests {
     fn swapping_a_module_mid_song_does_not_force_the_musical_clock_forward() {
         let mut host = Host::new(48_000);
         assert!(host.load_module(FIXTURE).is_ok());
-        host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 });
+        host.enqueue(WireCommand { identity: None, opcode: OPCODE_PLAY, argument: 0, extra: 0 });
         // Long enough that a clock left at zero would be more than `MAX_ZERO_ADVANCE`
         // ticks behind the engine when the second module arrives.
         for _ in 0..1_500 { host.process(RENDER_QUANTUM); }
@@ -1500,7 +1655,7 @@ mod tests {
         let timeline = &scanned.timeline;
         let target = timeline.end_frame() / 2;
         let expected = *timeline.mark_at_frame(target).expect("a frame inside the song resolves");
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_SEEK_FRAME, argument: target as u32, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_SEEK_FRAME, argument: target as u32, extra: 0 }));
         for _ in 0..10 { host.process(RENDER_QUANTUM); }
 
         let snapshot = *host.player.telemetry();
@@ -1517,23 +1672,23 @@ mod tests {
         assert!(host.load_module(FIXTURE).is_ok());
         assert_eq!(host.player.at_end(), AtEnd::Continue, "repeat is on by default");
 
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
         host.process(RENDER_QUANTUM);
         assert_eq!(host.player.at_end(), AtEnd::FadeOut);
 
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_STOP, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: AT_END_STOP, extra: 0 }));
         host.process(RENDER_QUANTUM);
         assert_eq!(host.player.at_end(), AtEnd::Stop);
 
         let rejected = host.dropped_commands();
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: 99, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: 99, extra: 0 }));
         host.process(RENDER_QUANTUM);
         assert_eq!(host.player.at_end(), AtEnd::Stop, "an unknown mode is rejected rather than guessed");
         assert_eq!(host.dropped_commands(), rejected + 1);
 
         // The mixer-mode opcode belongs to the worklet's message handler, because rebuilding
         // a typed engine allocates. Reaching the render path is a refusal, not a rebuild.
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_SET_MIXER_MODE, argument: 0x0000_0221, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_SET_MIXER_MODE, argument: 0x0000_0221, extra: 0 }));
         host.process(RENDER_QUANTUM);
         assert_eq!(host.dropped_commands(), rejected + 2);
         assert_eq!(host.player.mixer_mode(), MixerMode::DEFAULT, "and no engine was rebuilt");
@@ -1544,6 +1699,7 @@ mod tests {
     /// Pack a channel voice message the way `ring.js` does.
     fn midi_wire(status: u8, data1: u8, data2: u8) -> WireCommand {
         WireCommand {
+            identity: None,
             opcode: OPCODE_MIDI_EVENT,
             argument: status as u32 | ((data1 as u32) << 8) | ((data2 as u32) << 16),
             extra: 0,
@@ -1667,8 +1823,8 @@ mod tests {
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
         let end_frame = host.player.song_length().expect("the module was scanned");
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
 
         let mut fade_seen = false;
         let mut stopped_at = None;
@@ -1696,8 +1852,8 @@ mod tests {
         assert!(host.load_module(&module).is_ok());
         let end_frame = host.player.song_length().expect("the module was scanned");
         assert_eq!(host.player.scan().expect("scanned").timeline.end(), EndReason::Ended);
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 48_000 * 5 }));
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 48_000 * 5 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
 
         let mut fade_seen = false;
         let mut stopped_at = None;
@@ -1725,7 +1881,7 @@ mod tests {
 
         // Play after an end-stop is "again", not "resume": the pending rewind is consumed,
         // the transport comes back to unity and the sticky end flag clears.
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
         let mut heard = false;
         for _ in 0..8 { heard |= host.process(RENDER_QUANTUM) > 0.0; }
         assert!(host.player.is_playing(), "the song plays again");
@@ -1741,11 +1897,11 @@ mod tests {
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
         let end_frame = host.player.song_length().expect("the module was scanned");
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 4_096 }));
         let budget = end_frame as usize / RENDER_QUANTUM + 200;
 
         let play_through = |host: &mut Host| {
-            assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+            assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
             let mut fade_seen = false;
             for _ in 0..budget {
                 host.process(RENDER_QUANTUM);
@@ -1774,8 +1930,8 @@ mod tests {
         let mut host = Host::new(48_000);
         assert!(host.load_module(&module).is_ok());
         let end_frame = host.player.song_length().expect("the module was scanned");
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 48_000 * 5 }));
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: 48_000 * 5 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
 
         for _ in 0..(end_frame as usize / RENDER_QUANTUM + 400) {
             host.process(RENDER_QUANTUM);
@@ -1783,7 +1939,7 @@ mod tests {
         }
         assert!(host.player.is_fading(), "the fade started at the loop point");
 
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_CONTINUE, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: AT_END_CONTINUE, extra: 0 }));
         host.process(RENDER_QUANTUM);
         assert_eq!(host.player.at_end(), AtEnd::Continue);
         assert!(!host.player.is_fading(), "the fade was taken back");
@@ -1802,8 +1958,8 @@ mod tests {
         assert!(host.load_module(&module).is_ok());
         let end_frame = host.player.song_length().expect("the module was scanned");
         let fade_frames: u32 = 48_000;
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: fade_frames }));
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_AT_END, argument: AT_END_FADE_OUT, extra: fade_frames }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
 
         let mut fading_peaks = Vec::new();
         let mut playing_words = Vec::new();
@@ -1832,7 +1988,7 @@ mod tests {
     fn seek_commands_use_the_fixed_mailbox_without_flagging_engine_unsupported() {
         let mut host = Host::new(48_000);
         assert!(host.load_module(FIXTURE).is_ok());
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_SEEK_ORDER, argument: 1, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_SEEK_ORDER, argument: 1, extra: 0 }));
         host.process(RENDER_QUANTUM);
         assert!(!host.player.warnings().unsupported_command);
     }
@@ -1847,12 +2003,12 @@ mod tests {
         for _ in 0..400 { heard |= host.process(RENDER_QUANTUM) > 0.0; }
         assert!(heard, "the fixture is sounding before the stop");
 
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_STOP, argument: 0, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_STOP, argument: 0, extra: 0 }));
         host.process(RENDER_QUANTUM);
         assert_eq!(host.process(RENDER_QUANTUM), 0.0, "the ramp reached exact silence");
         assert!(!host.player.is_playing());
 
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_PLAY, argument: 0, extra: 0 }));
         let mut again = false;
         for _ in 0..20 { again |= host.process(RENDER_QUANTUM) > 0.0; }
         assert!(again, "Play brings it back");
@@ -1901,14 +2057,14 @@ mod tests {
         host.install_insert(0, 0, reverb_wire).expect("install queues");
 
         // room is ParamId(0): target 0, slot 0, param 0 all pack to argument 0; value 80.
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_INSERT_PARAM, argument: 0, extra: 80u32 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_INSERT_PARAM, argument: 0, extra: 80u32 }));
         host.process(RENDER_QUANTUM);
         assert_eq!(
             host.player.inserts().get(InsertTarget::Channel(ChannelId(0)), 0).and_then(|installed| installed.param(ParamId(0))),
             Some(80)
         );
 
-        assert!(host.enqueue(WireCommand { opcode: OPCODE_INSERT_BYPASS, argument: 0, extra: 1 }));
+        assert!(host.enqueue(WireCommand { identity: None, opcode: OPCODE_INSERT_BYPASS, argument: 0, extra: 1 }));
         host.process(RENDER_QUANTUM);
         assert!(host.player.inserts().get(InsertTarget::Channel(ChannelId(0)), 0).unwrap().bypassed);
     }
@@ -1921,4 +2077,245 @@ mod tests {
             assert!(json.contains(&format!(r#""wire":{wire}"#)), "{}: wrong wire position in effects_json", kind.name());
         }
     }
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn interactive_host(rate: u32) -> Host { Host::with_identity(rate, MixerMode::DEFAULT, Some(PlaybackIdentity::default())).unwrap() }
+
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn identified_load(host: &mut Host, bytes: &[u8], session: u64, build: u64) {
+        let module = Arc::new(starplayer::load(bytes).unwrap());
+        host.player.load_module_identified(module, PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) }).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn applied_barrier_is_absent_initially_and_waits_for_deferred_loads() {
+        let mut host = interactive_host(44_100);
+        assert!(!host.player.applied_playback().accepted);
+        assert_eq!(host.player.applied_playback().identity, None);
+        for serial in 1..=14 {
+            identified_load(&mut host, &minimal_mod(), serial, (1u64 << 54) + serial);
+            host.player.playback_barrier(serial).unwrap();
+        }
+        assert_eq!(host.player.applied_playback().identity, None, "control shadow cannot acknowledge an installation");
+        for _ in 0..24 { host.process(128); }
+        assert!(host.player.applied_playback().serial < 14, "retirement pressure defers the whole load and its barrier");
+        for _ in 0..30 { host.collect_garbage(); host.process(128); }
+        let applied = host.player.applied_playback();
+        assert_eq!(applied.serial, 14);
+        assert_eq!(applied.identity, host.player.playback_identity());
+        assert!(applied.accepted);
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn explicit_new_session_is_clean_stopped_before_readiness_from_every_old_transport() {
+        for case in 0..4 {
+            let bytes = if case == 2 { looping_mod() } else { minimal_mod() };
+            let mut host = interactive_host(44_117);
+            identified_load(&mut host, &bytes, 1, 1);
+            host.player.interactive(InteractiveAction::SetNoteOverlapEnabled(true)).unwrap();
+            host.player.interactive(InteractiveAction::SetLetNotesRing { instrument: InstrumentId(0), enabled: true }).unwrap();
+            host.player.interactive(InteractiveAction::SetLiveDestination(LiveDestination::Selected(InstrumentId(0)))).unwrap();
+            host.player.set_at_end(if case == 2 { AtEnd::FadeOut } else { AtEnd::Stop }).unwrap();
+            host.player.set_fade_frames(10_000).unwrap(); host.player.play().unwrap();
+            if case >= 2 {
+                for _ in 0..4000 { host.process(128); if if case == 2 { host.player.is_fading() } else { host.player.natural_end() } { break; } }
+                assert!(if case == 2 { host.player.is_fading() } else { host.player.natural_end() });
+            } else { for _ in 0..8 { host.process(128); } }
+            if case == 1 { host.player.pause().unwrap(); host.process(128); }
+            host.collect_garbage();
+            identified_load(&mut host, &minimal_mod(), 2, 2);
+            // A late Stop for the old identity is rejected; installation itself must
+            // remain stopped without relying on that old command for cancellation.
+            assert!(!host.apply(WireCommand { identity: Some(PlaybackIdentity { session: SessionId(1), build: BuildGeneration(1) }), opcode: 16, argument: 0, extra: 0 }));
+            host.process(128);
+            assert_eq!(host.player.interactive_transport(), Some(starplayer::core::InteractiveTransport::Stopped), "case{case}");
+            assert!(!host.player.natural_end()); assert!(!host.player.is_fading());
+            host.player.playback_barrier(99).unwrap(); host.process(128);
+            let saved = host.player.replacement_state().unwrap();
+            assert_eq!(&saved[4..8], &[0, 0, 0, 0], "transport/end/overlap/destination reset case{case}");
+            assert_eq!(saved[9], 32767); assert_eq!(saved[13], 10_000);
+            assert_eq!(&saved[14..19], &[0, 0, 0, 0, 0]);
+            assert!(saved[47..].iter().all(|word| *word == 0));
+            let held_frame = saved[41];
+            for _ in 0..8 { host.process(128); }
+            assert_eq!(host.player.replacement_state().unwrap()[41], held_frame);
+            assert_eq!(host.telemetry_words[2], 4, "actual tracker width, not reserved lanes");
+            assert_eq!(host.scope_channels, 4);
+            host.player.interactive(InteractiveAction::PreviewInstrument(InstrumentId(0))).unwrap();
+            let mut peak = 0.0f32; for _ in 0..8 { peak = peak.max(host.process(128)); }
+            assert!(peak > 0.001, "first preview after clean load case{case}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn wide_tracker_keeps_all_sixty_four_visible_lanes_with_separate_live_summary() {
+        use starplayer::model::{InstrumentDef, ModuleBuilder, ModuleHeader, SampleSpec};
+        let mut builder = ModuleBuilder::new();
+        let sample = builder.add_sample(&[1000; 1024], SampleSpec::one_shot("wide audition")).unwrap();
+        let mut instrument = InstrumentDef::from_sample("mapped", sample, U0F16::MAX);
+        instrument.note_sample_map.fill(1);
+        builder.add_instrument(instrument).unwrap();
+        builder.add_pattern(&[0; 5 * 64], 1, 64).unwrap(); builder.set_orders(&[0]);
+        builder.set_header(ModuleHeader::new(ModuleFormat::Xm, 64));
+        let mut host = interactive_host(44_100);
+        host.player.load_module_identified(Arc::new(builder.build().unwrap()), PlaybackIdentity { session: SessionId(1), build: BuildGeneration(1) }).unwrap();
+        host.player.playback_barrier(1).unwrap();
+        for _ in 0..8 { host.process(128); }
+        assert_eq!(host.telemetry_words[2], 64); assert_eq!(host.scope_channels, 64);
+        host.player.interactive(InteractiveAction::PreviewInstrument(InstrumentId(0))).unwrap();
+        assert!(host.process(128) > 0.001);
+        assert_eq!(host.telemetry_words[2], 64);
+        assert!(host.telemetry_words[TELEMETRY_LIVE_OFFSET] > 0, "live summary follows the fixed tracker record block");
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn fresh_player_replacement_preserves_exact_held_cursor_and_fractional_conversion() {
+        let mut host = interactive_host(44_117);
+        let bytes = minimal_mod();
+        identified_load(&mut host, &bytes, 1u64 << 55, 1u64 << 56);
+        host.player.play().unwrap();
+        for _ in 0..7 { host.process(128); }
+        host.player.pause().unwrap(); host.player.playback_barrier(1).unwrap(); host.process(128);
+        let saved = host.player.replacement_state().unwrap();
+        for rate in [44_117, 48_000] {
+            let mut replacement = interactive_host(rate);
+            let identity = PlaybackIdentity { session: SessionId(saved[1]), build: BuildGeneration(saved[2] + 1) };
+            replacement.player.load_replacement(Arc::new(starplayer::load(&bytes).unwrap()), identity, &saved).unwrap();
+            assert!(!replacement.player.applied_playback().accepted, "seeded identity is not applied state");
+            replacement.player.playback_barrier(1).unwrap(); replacement.process(128);
+            let restored = replacement.player.replacement_state().unwrap();
+            assert_eq!(&restored[19..39], &saved[19..39]);
+            let pending = (((saved[39] as u128) << 32) + saved[40] as u128) * rate as u128 / 44_117;
+            assert_eq!(restored[39], (pending >> 32) as u64);
+            assert_eq!(restored[40], (pending & 0xffff_ffff) as u64);
+            assert_eq!(restored[41], saved[41] * rate as u64 / 44_117);
+            assert_eq!(restored[4], 2);
+            assert_eq!(restored[1], saved[1]);
+            assert_eq!(restored[2], saved[2] + 1);
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn replacement_codec_rejects_malformed_records_before_installation() {
+        let bytes = minimal_mod();
+        let module = Arc::new(starplayer::load(&bytes).unwrap());
+        let mut source = interactive_host(44_100);
+        identified_load(&mut source, &bytes, 7, 12);
+        source.player.play().unwrap(); source.process(128); source.player.pause().unwrap(); source.player.playback_barrier(1).unwrap(); source.process(128);
+        let valid = source.player.replacement_state().unwrap();
+        let identity = PlaybackIdentity { session: SessionId(7), build: BuildGeneration(13) };
+        let corruptions = [(0, 99), (1, 8), (4, 3), (5, 2), (6, 2), (9, u32::MAX as u64), (10, 32768), (11, i32::MAX as u64), (21, 0), (23, u16::MAX as u64 + 1), (31, 6), (40, 1u64 << 32), (46, 0)];
+        for (index, value) in corruptions {
+            let mut words = valid.clone(); words[index] = value;
+            let mut target = interactive_host(44_100);
+            assert!(target.player.load_replacement(Arc::clone(&module), identity, &words).is_err(), "field {index}");
+            assert!(target.player.module().is_none(), "field {index} installed partially");
+            assert_eq!(target.player.playback_identity(), Some(PlaybackIdentity::default()));
+        }
+        for length in [0, 1, 46, valid.len() - 1] {
+            let mut target = interactive_host(44_100);
+            assert!(target.player.load_replacement(Arc::clone(&module), identity, &valid[..length]).is_err());
+            assert!(target.player.module().is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn cleanup_invalidates_future_live_notes_but_preserves_new_input() {
+        let mut bytes = minimal_mod(); bytes[48..50].copy_from_slice(&128u16.to_be_bytes());
+        for action in [InteractiveAction::StopPreview, InteractiveAction::AllSoundOff, InteractiveAction::Stop, InteractiveAction::SetLiveDestination(LiveDestination::Jam)] {
+            let mut host = interactive_host(44_100);
+            identified_load(&mut host, &bytes, 1, 1);
+            host.player.interactive(InteractiveAction::SetLiveDestination(LiveDestination::Selected(InstrumentId(0)))).unwrap(); host.process(128);
+            host.player.send_event(0, starplayer::core::Event::NoteOn { note: starplayer::core::Note::new(60), velocity: U0F16::MAX }).unwrap();
+            host.player.interactive(action).unwrap();
+            for _ in 0..8 { assert_eq!(host.process(128), 0.0, "old future note survived {action:?}"); }
+            host.player.send_event(0, starplayer::core::Event::NoteOn { note: starplayer::core::Note::new(60), velocity: U0F16::MAX }).unwrap();
+            let mut peak = 0.0f32;
+            for _ in 0..8 { peak = peak.max(host.process(128)); }
+            assert!(peak > 0.01, "new input was lost after {action:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn note_wire_requires_audio_applied_load_and_full_replay_barrier() {
+        let mut host = interactive_host(44_100);
+        host.player.playback_barrier(1).unwrap(); host.process(128);
+        assert!(!host.player.applied_playback().accepted, "seeded engine identity is not an installed rack");
+        identified_load(&mut host, &minimal_mod(), 7, 1u64 << 54);
+        let identity = host.player.playback_identity();
+        let preview = WireCommand { identity, opcode: 20, argument: 0, extra: 0 };
+        let note = WireCommand { identity, opcode: 24, argument: 0x7f_3c_90, extra: 0 };
+        assert!(!host.apply(preview)); assert!(!host.apply(note));
+        host.process(128);
+        assert!(!host.apply(note), "installation alone is not the full replay barrier");
+        host.player.playback_barrier(2).unwrap(); host.process(128);
+        assert!(host.apply(preview));
+        assert!(host.apply(note));
+        assert!(!host.apply(WireCommand { identity: None, opcode: OPCODE_MIDI_EVENT, argument: 0x7f_3c_90, extra: 0 }));
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn codec_round_trips_natural_end_active_fade_and_repeated_rows() {
+        for case in 0..3 {
+            let mut bytes = if case == 1 { looping_mod() } else { minimal_mod() };
+            if case == 2 { bytes[1084..1088].copy_from_slice(&starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0xe, param: 0xe2 }.to_bytes()); }
+            let mut source = interactive_host(44_117); identified_load(&mut source, &bytes, 9, 20);
+            source.player.set_at_end(if case == 1 { AtEnd::FadeOut } else { AtEnd::Stop }).unwrap();
+            source.player.set_fade_frames(10_000).unwrap(); source.player.play().unwrap();
+            if case == 2 { for _ in 0..64 { source.process(128); } }
+            else {
+                for _ in 0..4000 { source.process(128); if if case == 1 { source.player.is_fading() } else { source.player.natural_end() } { break; } }
+            }
+            if case != 0 { if case == 1 { for _ in 0..4 { source.process(128); } } source.player.pause().unwrap(); }
+            source.player.playback_barrier(1).unwrap(); source.process(128);
+            let saved = source.player.replacement_state().unwrap();
+            if case == 0 { assert_eq!(saved[5], 1); assert_eq!(saved[44], 1); }
+            if case == 1 { assert_eq!(saved[14], 1); assert!(saved[15] > 0); }
+            if case == 2 { assert_eq!(saved[22], 2); assert!(saved[24] > 0); }
+            let mut target = interactive_host(44_117);
+            target.player.load_replacement(Arc::new(starplayer::load(&bytes).unwrap()), PlaybackIdentity { session: SessionId(9), build: BuildGeneration(21) }, &saved).unwrap();
+            target.player.playback_barrier(1).unwrap(); target.process(128);
+            let restored = target.player.replacement_state().unwrap();
+            assert_eq!(&restored[9..19], &saved[9..19], "transport case{case}");
+            assert_eq!(&restored[19..42], &saved[19..42], "cursor case{case}");
+            assert_eq!(restored[5], saved[5]);
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn full_control_queue_cannot_ack_or_partially_install_replacement() {
+        let bytes = minimal_mod();
+        let mut source = interactive_host(44_100); identified_load(&mut source, &bytes, 1, 1);
+        source.player.playback_barrier(1).unwrap(); source.process(128);
+        let saved = source.player.replacement_state().unwrap();
+        let mut target = interactive_host(44_100);
+        for _ in 0..starplayer_host::HOST_COMMAND_CAPACITY { target.player.set_master_volume(U0F16::MAX).unwrap(); }
+        assert!(target.player.playback_barrier(1).is_err());
+        assert!(target.player.load_replacement(Arc::new(starplayer::load(&bytes).unwrap()), PlaybackIdentity { session: SessionId(1), build: BuildGeneration(2) }, &saved).is_err());
+        assert!(target.player.module().is_none());
+        assert!(!target.player.applied_playback().accepted);
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn cleanup_cancels_future_events_after_the_midi_sender_is_handed_away() {
+        let mut host = interactive_host(44_100); identified_load(&mut host, &minimal_mod(), 1, 1);
+        host.player.interactive(InteractiveAction::SetLiveDestination(LiveDestination::Selected(InstrumentId(0)))).unwrap(); host.process(128);
+        let mut sender = host.player.take_event_sender().unwrap();
+        let event = starplayer::core::Event::NoteOn { note: starplayer::core::Note::new(60), velocity: U0F16::MAX };
+        sender.send_event(0, event).unwrap(); host.player.interactive(InteractiveAction::StopPreview).unwrap();
+        for _ in 0..8 { assert_eq!(host.process(128), 0.0); }
+        sender.send_event(0, event).unwrap();
+        let mut peak = 0.0f32; for _ in 0..8 { peak = peak.max(host.process(128)); }
+        assert!(peak > 0.001);
+    }
+
 }

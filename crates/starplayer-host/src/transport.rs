@@ -47,6 +47,22 @@ impl Default for Transport {
 }
 
 impl Transport {
+    pub(crate) fn replacement_words(self) -> [u64; 10] {
+        let (current, target, increment, remaining) = self.gain.state();
+        [current as u32 as u64, target as u32 as u64, increment as u32 as u64, remaining as u64, self.fade_frames as u64, self.fading as u64, self.fade_elapsed as u64, self.pending_stop as u64, self.pending_rewind as u64, self.paused as u64]
+    }
+
+    pub(crate) fn from_replacement_words(words: &[u64]) -> Option<Self> {
+        if words.len() != 10 || words.iter().any(|word| *word > u32::MAX as u64) || [5, 7, 8, 9].iter().any(|index| words[*index] > 1) { return None; }
+        let current = words[0] as u32 as i32;
+        let target = words[1] as u32 as i32;
+        let increment = words[2] as u32 as i32;
+        let remaining = words[3] as u32;
+        let last = current as i64 + increment as i64 * remaining.saturating_sub(1) as i64;
+        if !(0..=TRANSPORT_GAIN_UNITY).contains(&current) || !(0..=TRANSPORT_GAIN_UNITY).contains(&target) || !(0..=TRANSPORT_GAIN_UNITY as i64).contains(&last) || (remaining == 0 && (current != target || increment != 0)) || (target > current && increment < 0) || (target < current && increment > 0) { return None; }
+        Some(Self { gain: GainRamp::from_state((words[0] as u32 as i32, words[1] as u32 as i32, words[2] as u32 as i32, words[3] as u32)), fade_frames: words[4] as u32, fading: words[5] != 0, fade_elapsed: words[6] as u32, pending_stop: words[7] != 0, pending_rewind: words[8] != 0, paused: words[9] != 0 })
+    }
+
     /// A transport at unity, as an engine that starts playing wants it.
     pub fn playing() -> Transport { Transport::with_gain(TRANSPORT_GAIN_UNITY) }
 
@@ -93,6 +109,14 @@ impl Transport {
         self.pending_rewind = rewind;
         self.gain = GainRamp::steady(current);
         self.gain.glide_to(TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES);
+    }
+
+    /// Fresh interactive loads keep the configured fade duration, with no old fade,
+    /// gain, pause or natural-end rewind. Live audition starts at unity before Play.
+    pub(crate) fn reset_interactive_session(&mut self) {
+        let fade_frames = self.fade_frames;
+        *self = Self::playing();
+        self.fade_frames = fade_frames;
     }
 
     pub fn take_armed_rewind(&mut self) -> bool { core::mem::take(&mut self.pending_rewind) }

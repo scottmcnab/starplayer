@@ -68,12 +68,44 @@
         return ((target & 0xFF) | ((slot & 0xF) << 8) | ((paramId & 0xFF) << 12)) >>> 0;
     }
 
+    const INTERACTIVE_WIRE_VERSION = 2;
+    const INTERACTIVE_RECORD_WORDS = 7;
+    const INTERACTIVE_HEADER_WORDS = 5;
+    const INTERACTIVE_RING_BYTES = (INTERACTIVE_HEADER_WORDS + COMMAND_CAPACITY * INTERACTIVE_RECORD_WORDS) * 4;
+    const OPCODE_INTERACTIVE_PLAY = 13, OPCODE_PAUSE = 14, OPCODE_RESUME = 15, OPCODE_HOLD_STOP = 16;
+    const OPCODE_ALL_SOUND_OFF = 17, OPCODE_STOP_PREVIEW = 18, OPCODE_LIVE_DESTINATION = 19;
+    const OPCODE_PREVIEW = 20, OPCODE_RELEASE_PREVIEW = 21, OPCODE_NOTE_OVERLAP = 22, OPCODE_LET_NOTES_RING = 23, OPCODE_LIVE_MIDI = 24;
+    const MAX_U64 = (1n << 64n) - 1n;
+    function validWireWord(value) { return Number.isInteger(value) && value >= -2147483648 && value <= 0xffffffff; }
+    function validIdentity(identity) {
+        return !!identity && typeof identity.session === 'bigint' && typeof identity.build === 'bigint'
+            && identity.session >= 0n && identity.session <= MAX_U64 && identity.build >= 0n && identity.build <= MAX_U64;
+    }
+    function sameIdentity(left, right) { return validIdentity(left) && validIdentity(right) && left.session === right.session && left.build === right.build; }
+    function validInteractive(opcode, argument, extra, identity) {
+        if (!validIdentity(identity) || !Number.isInteger(argument) || argument < 0 || argument > 0xffffffff || !Number.isInteger(extra) || extra < 0 || extra > 0xffffffff) return false;
+        return validInteractiveArguments(opcode, argument, extra);
+    }
+    function validInteractiveArguments(opcode, argument, extra) {
+        if ((opcode >= 13 && opcode <= 18) || opcode === 21) return argument === 0 && extra === 0;
+        if (opcode === 19) return argument <= 65537 && extra === 0;
+        if (opcode === 20) return argument <= 65535 && extra === 0;
+        if (opcode === 22) return argument <= 1 && extra === 0;
+        if (opcode === 23) return argument <= 65535 && extra <= 1;
+        if (opcode === 24) return extra === 0 && (argument & 0xff808000) === 0 && (argument & 0xff) >= 0x80 && (argument & 0xff) < 0xf0;
+        return false;
+    }
     function viewCommandRing(buffer) {
-        return { buffer, words: new Int32Array(buffer) };
+        const words = new Int32Array(buffer);
+        const version = buffer.byteLength === COMMAND_RING_BYTES ? 1
+            : buffer.byteLength === INTERACTIVE_RING_BYTES && Atomics.load(words, 4) === INTERACTIVE_WIRE_VERSION ? INTERACTIVE_WIRE_VERSION : 0;
+        return { buffer, words, version, headerWords: version === 2 ? INTERACTIVE_HEADER_WORDS : COMMAND_HEADER_WORDS, recordWords: version === 2 ? INTERACTIVE_RECORD_WORDS : COMMAND_RECORD_WORDS };
     }
 
-    function createCommandRing() {
-        const ring = viewCommandRing(new SharedArrayBuffer(COMMAND_RING_BYTES));
+    function createCommandRing(version = 1) {
+        const buffer = new SharedArrayBuffer(version === 2 ? INTERACTIVE_RING_BYTES : COMMAND_RING_BYTES);
+        if (version === 2) Atomics.store(new Int32Array(buffer), 4, version);
+        const ring = viewCommandRing(buffer);
         Atomics.store(ring.words, COMMAND_CAPACITY_INDEX, COMMAND_CAPACITY);
         return ring;
     }
@@ -84,30 +116,40 @@
         return (write - read + COMMAND_INDEX_WRAP) % COMMAND_INDEX_WRAP;
     }
 
-    function pushCommand(ring, opcode, argument, extra) {
+    function pushCommand(ring, opcode, argument, extra, identity = null) {
+        if (!ring.version || (ring.version === 2 && (!validIdentity(identity) || !validWireWord(argument) || !validWireWord(extra) || !Number.isInteger(opcode) || opcode < 1 || opcode > 24)) || (opcode >= 13 && (ring.version !== 2 || !validInteractive(opcode, argument, extra, identity)))) return false;
         const words = ring.words;
         if (commandOccupancy(words) >= COMMAND_CAPACITY) {
             Atomics.add(words, COMMAND_OVERFLOW_INDEX, 1);
             return false;
         }
         const write = Atomics.load(words, COMMAND_WRITE_INDEX);
-        const base = COMMAND_HEADER_WORDS + (write % COMMAND_CAPACITY) * COMMAND_RECORD_WORDS;
+        const base = ring.headerWords + (write % COMMAND_CAPACITY) * ring.recordWords;
         words[base] = opcode;
         words[base + 1] = argument;
         words[base + 2] = extra;
+        if (ring.version === 2) {
+            const session = identity?.session ?? 0n, build = identity?.build ?? 0n;
+            words[base + 3] = Number(session & 0xffffffffn); words[base + 4] = Number(session >> 32n);
+            words[base + 5] = Number(build & 0xffffffffn); words[base + 6] = Number(build >> 32n);
+        }
         Atomics.store(words, COMMAND_WRITE_INDEX, (write + 1) % COMMAND_INDEX_WRAP);
         return true;
     }
 
     /** Consumer side: bounded, allocation-free, and called once at each render quantum. */
-    function drainCommands(ring, apply) {
+    function drainCommands(ring, apply, limit = COMMAND_CAPACITY) {
+        if (!ring.version) return 0;
         const words = ring.words;
         const write = Atomics.load(words, COMMAND_WRITE_INDEX);
         let read = Atomics.load(words, COMMAND_READ_INDEX);
         let applied = 0;
-        while (read !== write && applied < COMMAND_CAPACITY) {
-            const base = COMMAND_HEADER_WORDS + (read % COMMAND_CAPACITY) * COMMAND_RECORD_WORDS;
-            apply(words[base], words[base + 1], words[base + 2]);
+        while (read !== write && applied < Math.min(COMMAND_CAPACITY, limit)) {
+            const base = ring.headerWords + (read % COMMAND_CAPACITY) * ring.recordWords;
+            const opcode = words[base];
+            if (ring.version === 2) {
+                if ((opcode > 0 && opcode < 13) || validInteractiveArguments(opcode, words[base + 1] >>> 0, words[base + 2] >>> 0)) apply(opcode, words[base + 1] >>> 0, words[base + 2] >>> 0, words[base + 3] >>> 0, words[base + 4] >>> 0, words[base + 5] >>> 0, words[base + 6] >>> 0);
+            } else if (opcode < 13) apply(opcode, words[base + 1], words[base + 2]);
             read = (read + 1) % COMMAND_INDEX_WRAP;
             applied += 1;
         }
@@ -121,10 +163,20 @@
 
     // Fallback batches are flat triples so one animation frame produces one message,
     // regardless of how many controls changed during that frame.
-    function drainFallbackCommands(records, apply) {
+    function drainFallbackCommands(records, apply, version = 1) {
+        if (!Array.isArray(records)) return 0;
+        if (records.length && typeof records[0] === 'object') {
+            if (version !== INTERACTIVE_WIRE_VERSION) return 0;
+            let applied = 0;
+            for (const record of records.slice(0, COMMAND_CAPACITY)) {
+                if (record && validWireWord(record.argument) && validWireWord(record.extra) && validIdentity(record.identity) && ((record.opcode > 0 && record.opcode < 13 && Number.isInteger(record.opcode)) || validInteractive(record.opcode, record.argument, record.extra, record.identity))) { apply(record.opcode, record.argument >>> 0, record.extra >>> 0, Number(record.identity.session & 0xffffffffn), Number(record.identity.session >> 32n), Number(record.identity.build & 0xffffffffn), Number(record.identity.build >> 32n)); applied += 1; }
+            }
+            return applied;
+        }
+        if (version === INTERACTIVE_WIRE_VERSION) return 0;
         let applied = 0;
         for (let index = 0; index + 2 < records.length && applied < COMMAND_CAPACITY; index += 3) {
-            apply(records[index], records[index + 1], records[index + 2]);
+            if (records[index] < 13) apply(records[index], records[index + 1], records[index + 2]);
             applied += 1;
         }
         return applied;
@@ -143,7 +195,8 @@
     const SONG_FLAG_FADING = 8;
     const SNAPSHOT_CHANNEL_WORDS = 8;
     const SNAPSHOT_CHANNELS = 64;
-    const SNAPSHOT_WORDS = SNAPSHOT_HEADER_WORDS + SNAPSHOT_CHANNELS * SNAPSHOT_CHANNEL_WORDS;
+    const SNAPSHOT_LIVE_OFFSET = SNAPSHOT_HEADER_WORDS + SNAPSHOT_CHANNELS * SNAPSHOT_CHANNEL_WORDS;
+    const SNAPSHOT_WORDS = SNAPSHOT_LIVE_OFFSET + 3;
     const TELEMETRY_SEQUENCE_INDEX = 0;
     const TELEMETRY_MEMORY_INDEX = 1;
     const TELEMETRY_QUANTUM_INDEX = 2;
@@ -209,7 +262,10 @@
             engineFrame: source[12],
             pendingGarbage: source[13],
             moduleGeneration: source[14],
-            playing: source[15] !== 0,
+            playing: (source[15] & 8) ? (source[15] & 1) !== 0 : source[15] !== 0,
+            transport: (source[15] & 8) ? ((source[15] & 1) ? 'playing' : (source[15] & 2) ? 'paused' : 'stopped') : (source[15] ? 'playing' : 'stopped'),
+            naturalEnd: (source[15] & 8) ? (source[15] & 4) !== 0 : undefined,
+            live: { active: source[SNAPSHOT_LIVE_OFFSET] || 0, retiring: source[SNAPSHOT_LIVE_OFFSET + 1] || 0, peak: source[SNAPSHOT_LIVE_OFFSET + 2] || 0 },
             masterPeak: source[16],
             retiredCollected: source[17],
             mixerModeWire: source[18] >>> 0,
@@ -337,6 +393,8 @@
     }
 
     scope.StarPlayerRing = {
+        INTERACTIVE_WIRE_VERSION, INTERACTIVE_RING_BYTES, validWireWord, validIdentity, sameIdentity, validInteractive,
+        OPCODE_INTERACTIVE_PLAY, OPCODE_PAUSE, OPCODE_RESUME, OPCODE_HOLD_STOP, OPCODE_ALL_SOUND_OFF, OPCODE_STOP_PREVIEW, OPCODE_LIVE_DESTINATION, OPCODE_PREVIEW, OPCODE_RELEASE_PREVIEW, OPCODE_NOTE_OVERLAP, OPCODE_LET_NOTES_RING, OPCODE_LIVE_MIDI,
         COMMAND_CAPACITY,
         COMMAND_RING_BYTES,
         OPCODE_PLAY,

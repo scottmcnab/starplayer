@@ -380,7 +380,7 @@ pub fn build_source_with_cursor(
     }
     sequencer.restart_clock_at(frame);
     #[cfg(feature = "interactive-audition")]
-    if let Some(cursor) = cursor { sequencer.restore_cursor(cursor.converted(sample_rate_hz), frame); }
+    if let Some(cursor) = cursor && !sequencer.restore_cursor(cursor.converted(sample_rate_hz), frame) { return Err(Error::Unsupported("invalid replacement cursor")); }
     #[cfg(not(feature = "interactive-audition"))]
     let _ = cursor;
     let source = SeekableModuleSource::new(sequencer, Arc::clone(&handles.seek), Arc::clone(&handles.at_end));

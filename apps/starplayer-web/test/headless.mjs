@@ -1,3 +1,4 @@
+import { runInteractive } from './no-headless.mjs';
 import remoteWorker from '../remote-proxy/worker.js';
 import { runW15, runW15View, runW15Stress, runW15Playlist, runW15Runtime } from './w15-headless.mjs';
 import { runRemediation, runPerformance, runBackground, runDigestMeasurements, runVisibilityReturn, runEnumerationDiagnostic } from './w15-remediation-headless.mjs';
@@ -47,9 +48,10 @@ const PHONE_VIEWPORT = { width: 390, height: 844 };
 const options = parseArguments(process.argv.slice(2));
 
 function parseArguments(argv) {
-    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false };
+    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false, interactiveOnly: false };
     for (let index = 0; index < argv.length; index += 1) {
-        if (argv[index] === '--pages-smoke') parsed.pagesSmoke = true;
+        if (argv[index] === '--interactive-only') parsed.interactiveOnly = true;
+        else if (argv[index] === '--pages-smoke') parsed.pagesSmoke = true;
         else if (argv[index] === '--w15-only') parsed.w15Only = true;
         else if (argv[index] === '--w15-case') { parsed.w15Case = argv[++index]; parsed.w15Only = true; }
         else if (argv[index] === '--library-only') parsed.libraryOnly = true;
@@ -1882,6 +1884,7 @@ await verifyPackagedSources();
 if (options.pagesSmoke) {
     console.log(`pages-smoke ${JSON.stringify(await runPagesSmoke({ Page, executable, dist: DIST, syntheticMod, buildZip }))}`);
 } else for (const mode of options.modes) {
+    if (options.interactiveOnly) { console.log(`interactive[${mode}] ${JSON.stringify(await runInteractive({ Page, executable, mode, startDevServer, loadFile, syntheticMod }))}`); continue; }
     if (!options.libraryOnly && !options.w15Only) {
         const report = await run(executable, mode);
         console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);

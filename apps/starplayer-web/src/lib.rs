@@ -473,6 +473,19 @@ mod exports {
         })
     }
 
+    /// Pure metadata for any playable map key and independently for reference note60.
+    #[wasm_bindgen]
+    pub fn instrument_capability(index: u32) -> u32 {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        { with_module(0, |module| {
+            if index > u16::MAX as u32 { return 0; }
+            let capability = starplayer::live_instrument_capability(module, starplayer::core::InstrumentId(index as u16));
+            u32::from(capability.playable) | (u32::from(capability.one_shot) << 1) | (u32::from(capability.looping) << 2) | (u32::from(capability.preview_playable) << 3) | (u32::from(capability.preview_looping) << 4)
+        }) }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        { let _ = index; 0 }
+    }
+
     #[wasm_bindgen]
     pub fn instrument_sample_length(index: u32) -> u32 {
         with_module(0, |module| {

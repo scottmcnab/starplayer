@@ -4,6 +4,12 @@ use starplayer_core::VoiceId;
 use starplayer_engine::instrument::{NoteParams, live::{RackRuntime, admit_rack_note, preserve_rack_foreground}};
 use starplayer_engine::EngineContext;
 
+/// The same pure tuning preflight used by live onsets and metadata queries.
+pub fn live_note_table_index(sample: &starplayer_model::SampleIndex, note: Note, extra_cents: i16) -> Option<usize> {
+    let index = (note.semitone as i32 - 12 + sample.relative_note() as i32) * 16 + (sample.finetune() >> 3) as i32 + 16 + cents_to_table(note.cents as i32 + extra_cents as i32);
+    (0..PERIOD_TABLE_LEN as i32).contains(&index).then_some(index as usize)
+}
+
 pub struct XmLiveRuntime { articulation: XmArticulationRuntime, sample_rate_hz: u32 }
 impl XmLiveRuntime {
     pub fn try_new(capacity: usize, sample_rate_hz: u32) -> Result<Self, alloc::collections::TryReserveError> { Ok(Self { articulation: XmArticulationRuntime::try_new(capacity)?, sample_rate_hz }) }
@@ -16,10 +22,8 @@ impl RackRuntime for XmLiveRuntime {
         let sample = module.sample(sample_id).filter(|sample| sample.length_frames() != 0)?;
         // Preserve the live reference: MIDI60 is XM C-4, while the map uses the
         // original input note. Native tuning uses FT2's own period tables.
-        let note = params.note.semitone as i32 - 12 + sample.relative_note() as i32;
-        let table_index = note * 16 + (sample.finetune() >> 3) as i32 + 16 + cents_to_table(params.note.cents as i32);
-        if !(0..PERIOD_TABLE_LEN as i32).contains(&table_index) { return None; }
-        let period = if module.header().flags.linear_slides { linear_period(table_index as usize) } else { amiga_period(table_index as usize) };
+        let table_index = live_note_table_index(sample, params.note, 0)?;
+        let period = if module.header().flags.linear_slides { linear_period(table_index) } else { amiga_period(table_index) };
         let base = ((volume_to_byte(sample.default_volume()) as u32 * params.raw_velocity.to_bits() as u32 + 32_767) / 65_535) as u8;
         preserve_rack_foreground(module, channel, context);
         let state = XmVoiceState { instrument: Some(instrument), sample: Some(sample_id), out_period: period, out_volume: base, out_pan: pan_to_byte(params.pan_override.or(sample.default_pan())), ..XmVoiceState::default() };
@@ -42,10 +46,9 @@ impl RackRuntime for XmLiveRuntime {
         let Some(slot) = self.articulation.slots.get_mut(voice.index() as usize).filter(|slot| slot.voice == Some(voice) && !slot.retiring) else { return };
         if context.voices.get(voice).is_none() { return; }
         let Some(sample) = slot.state.sample.and_then(|sample| module.sample(sample)) else { return };
-        let index = (note.semitone as i32 - 12 + sample.relative_note() as i32) * 16 + (sample.finetune() >> 3) as i32 + 16 + cents_to_table(note.cents as i32 + cents as i32);
-        if !(0..PERIOD_TABLE_LEN as i32).contains(&index) { return; }
+        let Some(index) = live_note_table_index(sample, note, cents) else { return };
         let modulation = slot.state.final_period.wrapping_sub(slot.state.out_period);
-        slot.state.out_period = if module.header().flags.linear_slides { linear_period(index as usize) } else { amiga_period(index as usize) };
+        slot.state.out_period = if module.header().flags.linear_slides { linear_period(index) } else { amiga_period(index) };
         slot.state.final_period = slot.state.out_period.wrapping_add(modulation);
         context.write_voice_param(voice, starplayer_core::VoiceParam::Step(step_for_period(slot.state.final_period, self.sample_rate_hz, module.header().flags.linear_slides)));
     }

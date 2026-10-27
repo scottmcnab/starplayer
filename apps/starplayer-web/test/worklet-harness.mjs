@@ -31,7 +31,7 @@ let Processor = null;
 let lastPort = null;
 class FakePort {
     constructor() { this.messages = []; this.onmessage = null; }
-    postMessage(message) { this.messages.push(message); }
+    postMessage(message) { this.messages.push(structuredClone(message)); }
     dispatch(message) { this.onmessage?.({ data: message }); }
 }
 globalThis.sampleRate = 48_000;
@@ -308,6 +308,144 @@ for (const shared of [true, false]) {
     const removed = live.port.messages.findLast((message) => message.type === 'midiInputApplied');
     assert.equal(removed.active, false, `${transport}: live input goes off again`);
     assert.ok(renderPeak(live.processor, 400) > 0.01, `${transport}: disabling jam does not interrupt the module`);
+}
+
+
+// NO-W1: use the same packaged Rust WASM and worklet with negotiated v2 commands.
+for (const shared of [true, false]) {
+    const ring = shared ? Ring.createCommandRing(2) : null;
+    const target = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, seedSession: 0n, seedBuild: 0n, wasmModule: new WebAssembly.Module(wasmBytes), commandRing: ring?.buffer } });
+    const targetPort = lastPort;
+    const identity = { session: (1n << 59n) + 11n, build: (1n << 62n) + 37n };
+    const left = new Float32Array(128), right = new Float32Array(128);
+    const pump = (count = 1) => { let peak = 0; for (let index = 0; index < count; index++) { target.process([], [[left, right]]); for (const sample of left) peak = Math.max(peak, Math.abs(sample)); } return peak; };
+    const send = (opcode, argument = 0, extra = 0, generation = identity) => {
+        if (ring) assert.equal(Ring.pushCommand(ring, opcode, argument, extra, generation), true);
+        else targetPort.dispatch({ type: 'commandBatch', version: 2, commands: [{ opcode, argument, extra, identity: generation }] });
+    };
+    targetPort.dispatch({ type: 'loadModule', requestId: 501, bytes: syntheticMod(), identity });
+    assert.equal(targetPort.messages.some(message => message.type === 'moduleLoaded'), false, 'prepared is not audio-applied');
+    pump(4);
+    const installed = targetPort.messages.find(message => message.type === 'moduleLoaded');
+    assert.ok(installed?.accepted, JSON.stringify(targetPort.messages, (_, value) => typeof value === 'bigint' ? String(value) : value));
+    assert.deepEqual(installed.identity, identity);
+    assert.equal(installed.capabilities, 3);
+    assert.equal(target.telemetryWords[2], 4, 'reserved live lanes do not inflate visible tracker width');
+    targetPort.dispatch({ type: 'midiInput', enabled: true });
+    assert.ok(targetPort.messages.some(message => message.type === 'midiInputError'));
+    assert.equal(target.wasm.current_build(), identity.build);
+    const gainWire = JSON.parse(target.wasm.effects_json()).find(effect => effect.name === 'gain').wire;
+    for (const invalid of [{ identity: { ...identity, build: identity.build - 1n } }, { version: 1 }, { target: 64 }, { slot: 4 }, { kind: 999 }, { action: 'unknown' }]) {
+        targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 600, action: 'install', target: 255, slot: 0, kind: gainWire, ...invalid });
+        assert.equal(targetPort.messages.at(-1).type, 'insertsError');
+    }
+    const preparationOrder = [];
+    const originalFlush = target.wasm.flush_commands, originalInstall = target.wasm.install_insert;
+    target.wasm.flush_commands = (...args) => { preparationOrder.push('flush'); return originalFlush(...args); };
+    target.wasm.install_insert = (...args) => { preparationOrder.push('install'); return originalInstall(...args); };
+    send(Ring.OPCODE_MASTER_VOLUME, 65535);
+    targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 601, action: 'install', target: 255, slot: 0, kind: gainWire });
+    // The fallback batch may already own a pending barrier. A busy rejection happens
+    // before mutation; retry after that batch has reached audio.
+    if (targetPort.messages.some(message => message.type === 'insertsError' && message.requestId === 601)) { pump(4); targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 601, action: 'install', target: 255, slot: 0, kind: gainWire }); }
+    assert.equal(targetPort.messages.some(message => message.type === 'insertsApplied' && message.requestId === 601), false, 'prepared insert is not audio applied');
+    pump(4);
+    assert.ok(targetPort.messages.findLast(message => message.type === 'insertsApplied' && message.requestId === 601)?.accepted);
+    assert.ok(preparationOrder.indexOf('flush') < preparationOrder.indexOf('install'));
+    target.wasm.flush_commands = originalFlush; target.wasm.install_insert = originalInstall;
+    for (const slot of [1, 2]) targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 603 + slot, action: 'install', target: 255, slot, kind: gainWire });
+    pump(4);
+    for (const slot of [1, 2]) assert.ok(targetPort.messages.findLast(message => message.type === 'insertsApplied' && message.requestId === 603 + slot)?.accepted, 'multiple pending preparations fit complete transactions');
+    for (const slot of [0, 1, 2]) targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 620 + slot, action: 'remove', target: 255, slot });
+    pump(4);
+    for (const slot of [0, 1, 2]) assert.ok(targetPort.messages.findLast(message => message.type === 'insertsApplied' && message.requestId === 620 + slot)?.accepted, 'Reset can clear several slots before their acknowledgements');
+    target.nextBarrierLow = 0xfffffffe; target.nextBarrierHigh = 0x200000; // barrier serials above2^53, including low-word wrap
+    send(Ring.OPCODE_PREVIEW, 0);
+    assert.ok(pump(12) > 0.001, 'first Preview is audible before first Play');
+    send(Ring.OPCODE_INTERACTIVE_PLAY); pump(4);
+    const playingBeforeLegacyStop = target.wasm.replacement_state();
+    send(Ring.OPCODE_STOP); pump(4);
+    const playingAfterLegacyStop = target.wasm.replacement_state();
+    assert.equal(playingAfterLegacyStop[4], 1n, 'v2 rejects legacy Stop2; explicit Stop16 owns interactive transport');
+    assert.equal(playingAfterLegacyStop[9], playingBeforeLegacyStop[9], 'rejected legacy Stop does not fade the live output gain');
+    assert.ok(playingAfterLegacyStop[41] > playingBeforeLegacyStop[41], 'rejected legacy Stop does not hold sequencing');
+    send(Ring.OPCODE_PAUSE); pump(4);
+    const paused = target.wasm.replacement_state(); // harness control task, outside process
+    assert.equal(paused[4], 2n);
+    send(Ring.OPCODE_PREVIEW, 0);
+    assert.ok(pump(12) > 0.001, 'Preview remains audible while paused');
+    const held = target.wasm.replacement_state();
+    assert.equal(held[41], paused[41], 'audition did not advance the held song frame');
+    // Stale commands using old opcode VALUES also carry/reject full identity.
+    const stale = { ...identity, build: identity.build - 1n };
+    for (const [opcode, argument, extra] of [[Ring.OPCODE_SEEK_ROW, 20, 0], [Ring.OPCODE_MUTE_CHANNEL, 0, 1], [Ring.OPCODE_INSERT_BYPASS, 255, 1], [Ring.OPCODE_SET_MIXER_MODE, 0x201, 0], [Ring.OPCODE_LIVE_MIDI, Ring.packMidiMessage(0x90, 60, 100), 0]]) { send(opcode, argument, extra, stale); pump(4); }
+    assert.equal(target.wasm.replacement_state()[41], paused[41]);
+    send(Ring.OPCODE_SET_MIXER_MODE, 0x201); pump(4);
+    assert.equal(target.wasm.current_build(), identity.build, 'v2 opcode7 is rejected; replacement messages own mixer builds');
+    assert.ok(targetPort.messages.some(message => message.type === 'interactiveApplied' && !message.accepted));
+    send(Ring.OPCODE_HOLD_STOP); pump(4);
+    send(Ring.OPCODE_PREVIEW, 0); assert.ok(pump(12) > 0.001, 'Preview remains audible after Stop');
+    send(Ring.OPCODE_AT_END, Ring.AT_END_STOP); pump(4); send(Ring.OPCODE_SEEK_ROW, 63); pump(4); send(Ring.OPCODE_INTERACTIVE_PLAY); pump(100);
+    assert.ok((target.telemetryWords[15] & 4) !== 0, 'natural end has its explicit transport indication');
+    send(Ring.OPCODE_PREVIEW, 0); assert.ok(pump(12) > 0.001, 'Preview remains audible after natural end');
+    targetPort.dispatch({ type: 'captureState', requestId: 502, identity }); pump(4);
+    let capture = targetPort.messages.findLast(message => message.type === 'stateReady');
+    if (!capture) { targetPort.dispatch({ type: 'captureState', requestId: 502, identity }); pump(4); capture = targetPort.messages.findLast(message => message.type === 'stateReady'); }
+    assert.ok(capture?.accepted);
+    targetPort.dispatch({ type: 'readState', requestId: 502, identity, serial: BigInt(capture.serial) });
+    const saved = targetPort.messages.findLast(message => message.type === 'stateCaptured');
+    assert.ok(saved?.replacement instanceof BigUint64Array, 'opaque codec crosses WASM without Number conversion');
+    const nextIdentity = { session: identity.session, build: identity.build + 1n };
+    const recreated = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, wasmModule: new WebAssembly.Module(wasmBytes) } });
+    const recreatedPort = lastPort;
+    recreatedPort.dispatch({ type: 'loadModule', requestId: 503, bytes: syntheticMod(), identity: nextIdentity, replacement: saved.replacement, hostSettings: { volume: 65535, mutes: Array.from({ length: 64 }, (_, index) => index), inserts: [] } });
+    assert.equal(recreatedPort.messages.some(message => message.type === 'moduleLoaded'), false);
+    let delivered = 0;
+    for (let index = 0; index < 32; index++) {
+        recreated.process([], [[left, right]]);
+        while (delivered < recreatedPort.messages.length) {
+            const message = recreatedPort.messages[delivered++];
+            if (message.type === 'loadReplayPending') recreatedPort.dispatch({ type: 'continueReplay', requestId: message.requestId });
+        }
+    }
+    assert.ok(recreatedPort.messages.find(message => message.type === 'moduleLoaded')?.accepted);
+    assert.equal(recreated.wasm.replacement_state()[1], identity.session);
+    assert.equal(recreated.wasm.replacement_state()[4], 0n, 'clear-and-hold survives actual WASM recreation');
+    // Capture a genuinely Playing source, then stop/pause while installation is
+    // deferred behind an earlier control barrier, before the readiness barrier.
+    send(Ring.OPCODE_INTERACTIVE_PLAY); pump(4);
+    const playingState = target.wasm.replacement_state();
+    assert.equal(playingState[4], 1n);
+    for (const opcode of [Ring.OPCODE_PAUSE, Ring.OPCODE_HOLD_STOP]) {
+        const pendingProcessor = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, wasmModule: new WebAssembly.Module(wasmBytes) } });
+        const pendingPort = lastPort;
+        const initialIdentity = { session: identity.session, build: identity.build + 2n };
+        pendingPort.dispatch({ type: 'loadModule', requestId: 610, bytes: syntheticMod(), identity: initialIdentity, replacement: playingState });
+        for (let index = 0; index < 4; index++) pendingProcessor.process([], [[left, right]]);
+        const currentState = pendingProcessor.wasm.replacement_state();
+        pendingPort.dispatch({ type: 'commandBatch', version: 2, commands: [{ opcode: Ring.OPCODE_MASTER_VOLUME, argument: 65535, extra: 0, identity: initialIdentity }] });
+        const replacementIdentity = { session: initialIdentity.session, build: initialIdentity.build + 1n };
+        pendingPort.dispatch({ type: 'loadModule', requestId: 611, bytes: syntheticMod(), identity: replacementIdentity, replacement: currentState, hostSettings: { volume: 65535, mutes: Array.from({ length: 64 }, (_, index) => index), inserts: [] } });
+        assert.ok(pendingPort.messages.some(message => message.type === 'loadDeferred' && message.requestId === 611));
+        pendingPort.dispatch({ type: 'loadTransport', requestId: 611, identity: replacementIdentity, opcode, argument: 0, extra: 0 });
+        for (let index = 0; index < 4; index++) pendingProcessor.process([], [[left, right]]);
+        pendingPort.dispatch({ type: 'continueLoad', requestId: 611 });
+        let read = 0;
+        for (let index = 0; index < 32; index++) {
+            pendingProcessor.process([], [[left, right]]);
+            while (read < pendingPort.messages.length) {
+                const message = pendingPort.messages[read++];
+                if (message.type === 'loadReplayPending') pendingPort.dispatch({ type: 'continueReplay', requestId: message.requestId });
+            }
+        }
+        assert.ok(pendingPort.messages.findLast(message => message.type === 'moduleLoaded' && message.requestId === 611)?.accepted);
+        const restored = pendingProcessor.wasm.replacement_state();
+        assert.equal(restored[4], opcode === Ring.OPCODE_PAUSE ? 2n : 0n);
+        assert.equal(restored[41], currentState[41], 'pending user intent stops sequencing before readiness, with no resurrected Playing interval');
+        pendingPort.dispatch({ type: 'loadTransport', requestId: 611, identity: initialIdentity, opcode: Ring.OPCODE_INTERACTIVE_PLAY, argument: 0, extra: 0 });
+        pendingProcessor.process([], [[left, right]]);
+        assert.equal(pendingProcessor.wasm.replacement_state()[4], restored[4], 'delayed old intent cannot restart the new build');
+    }
 }
 
 globalThis.TextDecoder = nodeTextDecoder;

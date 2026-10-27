@@ -243,7 +243,8 @@ impl PreparedRack {
     }
 }
 
-/// Metadata from the installed prepared module. Mixed maps retain both flags.
+/// Metadata from the installed prepared module. Sample loop/one-shot eligibility
+/// covers every mapped PCM key, independently of live adapter pitch viability.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct InstrumentCapability {
     pub playable: bool, pub one_shot: bool, pub looping: bool,
@@ -253,14 +254,22 @@ pub struct InstrumentCapability {
 /// Pure metadata projection. The facade supplies native instrument/sample mode; mapped
 /// instruments never fall back from an unmapped key to definition.sample.
 pub fn instrument_capability(module: &Module, instrument: InstrumentId, mapped: bool) -> InstrumentCapability {
+    instrument_capability_filtered(module, instrument, mapped, |_, _| true)
+}
+
+/// Add a format-native, allocation-free viability preflight without preparing a rack.
+pub fn instrument_capability_filtered(module: &Module, instrument: InstrumentId, mapped: bool, playable: impl Fn(u8, SampleId) -> bool) -> InstrumentCapability {
     let Some(definition) = module.instrument(instrument) else { return InstrumentCapability::default() };
     let mut result = InstrumentCapability::default();
     for note in 0..128 {
         let sample = if mapped { definition.note_sample_map.get(note).and_then(|number| number.checked_sub(1)).map(SampleId) } else { definition.sample };
-        if let Some(sample) = sample.and_then(|sample| module.sample(sample)).filter(|sample| sample.length_frames() != 0) {
+        if let Some(sample_id) = sample && let Some(sample) = module.sample(sample_id).filter(|sample| sample.length_frames() != 0) {
             let looping = sample.loop_mode().is_looping() || sample.sustain_loop().is_some();
-            result.playable = true; result.looping |= looping; result.one_shot |= !looping;
-            if note == REFERENCE_NOTE as usize { result.preview_playable = true; result.preview_looping = looping; }
+            result.looping |= looping; result.one_shot |= !looping;
+            if playable(note as u8, sample_id) {
+                result.playable = true;
+                if note == REFERENCE_NOTE as usize { result.preview_playable = true; result.preview_looping = looping; }
+            }
         }
     }
     result

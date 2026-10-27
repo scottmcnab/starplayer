@@ -146,6 +146,9 @@ pub struct EventSender {
 }
 
 impl EventSender {
+    #[cfg(feature = "interactive-audition")]
+    pub(crate) fn cancellation_token(&self) -> Option<starplayer::rt::Arc<starplayer::rt::atomic::AtomicU32>> { self.producer.cancellation_token() }
+
     /// Pair a producer with the clock its events are stamped against.
     ///
     /// [`Player::midi_only`](crate::Player::midi_only) is how a host normally gets one;

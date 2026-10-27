@@ -78,6 +78,7 @@ pub const TELEMETRY_DEPTH: usize = 3;
 
 /// One instruction from the control side to the render callback.
 enum HostCommand {
+    AppliedBarrier { identity: PlaybackIdentity, serial: u64, rejected: u64 },
     Interactive(InteractiveCommand),
     RestoreTransport { identity: PlaybackIdentity, transport: Transport, state: InteractiveTransport, natural_end: bool },
     RestoreSelections { identity: PlaybackIdentity, enabled: bool, selections: Box<[bool]> },
@@ -88,7 +89,7 @@ enum HostCommand {
     /// A module and the source built for it, both already decoded, scanned and allocated
     /// on the control thread. Nothing here is constructed in the callback and nothing is
     /// dropped there.
-    Load { module: RtArc<Module>, source: Box<dyn EventSource>, identity: Option<PlaybackIdentity>, selections: Option<Box<[bool]>> },
+    Load { module: RtArc<Module>, source: Box<dyn EventSource>, identity: Option<PlaybackIdentity>, selections: Option<Box<[bool]>>, new_session: bool },
     /// What happens at the loop point, and how long the fade is when there is one.
     SetAtEnd { at_end: AtEnd, fade_frames: u32 },
     /// Pass straight through to the engine.
@@ -134,9 +135,22 @@ struct PlayerTaps {
     commands_rejected: AtomicU64,
 }
 
+/// A control barrier published only after preceding commands have reached rendered audio.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppliedPlayback {
+    pub identity: Option<PlaybackIdentity>,
+    pub serial: u64,
+    pub accepted: bool,
+    pub capabilities: starplayer::core::PlaybackCapabilities,
+}
+
+#[path = "replacement.rs"]
+mod replacement;
+
 /// Coherent engine and host fade state, copied together for same-session rebuilds.
 #[derive(Copy, Clone, Debug, Default)]
 struct PlayerSnapshot {
+    applied: AppliedPlayback,
     engine: Snapshot,
     source_frame: Frame,
     transport: Transport,
@@ -146,6 +160,8 @@ struct PlayerSnapshot {
 
 /// The audio side: everything the backend's callback owns.
 struct RenderState {
+    applied: AppliedPlayback,
+    pending_barrier: Option<(PlaybackIdentity, u64, u64)>,
     engine: HostEngine,
     control: EngineHandle<RtArc<Module>>,
     telemetry: TelemetryReader,
@@ -157,6 +173,7 @@ struct RenderState {
     handles: SourceHandles,
     transport: Transport,
     interactive_identity: Option<PlaybackIdentity>,
+    installed_identity: Option<PlaybackIdentity>,
     interactive_enabled: bool,
     interactive_state: InteractiveTransport,
     taps: Arc<PlayerTaps>,
@@ -235,6 +252,11 @@ impl RenderState {
             written = end;
         }
         self.retire_engine_garbage();
+        if let Some((identity, serial, rejected)) = self.pending_barrier.take() {
+            self.applied = AppliedPlayback { identity: self.interactive_identity, serial,
+                accepted: self.installed_identity == Some(identity) && rejected == self.taps.commands_rejected.load(Ordering::Relaxed),
+                capabilities: self.applied.capabilities };
+        }
         self.publish(peak);
     }
 
@@ -255,8 +277,8 @@ impl RenderState {
                 _ => 0,
             };
             let another_load = prepared_load && matches!(&command, HostCommand::Load { .. });
-            let blocked_engine_load = prepared_host && matches!(&command, HostCommand::Load { .. })
-                && self.control.queued_commands() >= self.control.command_capacity();
+            let engine_load_commands = match &command { HostCommand::Load { new_session: true, .. } if self.interactive_enabled => 2, HostCommand::Load { .. } => 1, _ => 0 };
+            let blocked_engine_load = prepared_host && self.control.command_capacity().saturating_sub(self.control.queued_commands()) < engine_load_commands;
             if another_load || blocked_engine_load || available < retirement_room {
                 self.pending_command = Some(command);
                 break;
@@ -268,6 +290,9 @@ impl RenderState {
 
     fn apply(&mut self, command: HostCommand) {
         match command {
+            HostCommand::AppliedBarrier { identity, serial, rejected } => {
+                self.pending_barrier = Some((identity, serial, rejected));
+            }
             HostCommand::Interactive(command) => self.apply_interactive(command),
             HostCommand::RestoreTransport { identity, transport, state, natural_end } => {
                 if self.interactive_identity == Some(identity) && self.interactive_enabled {
@@ -297,7 +322,7 @@ impl RenderState {
                 let _ = self.send(Command::Play);
             }
             HostCommand::Stop => self.transport.begin_stop(false),
-            HostCommand::Load { module, source, identity, selections } => {
+            HostCommand::Load { module, source, identity, selections, new_session } => {
                 let retired_selections = selections.map(|selections| self.engine.replace_instrument_selections(selections));
                 if let Some(identity) = identity {
                     self.engine.set_playback_identity(identity);
@@ -309,7 +334,13 @@ impl RenderState {
                 if retired_source.is_some() || retired_selections.is_some() {
                     self.retire(Retired::Installation { source: retired_source, selections: retired_selections });
                 }
-                let _ = self.send(Command::LoadModule(module));
+                if self.send(Command::LoadModule(module)) { self.installed_identity = identity; }
+                if new_session && self.interactive_enabled && let Some(identity) = identity {
+                    // A fresh source never inherits a playing clock, paused fade or end
+                    // marker. The paired engine Stop fits the reservation above.
+                    self.apply_interactive(InteractiveCommand { identity, action: InteractiveAction::Stop });
+                    self.transport.reset_interactive_session();
+                }
             }
             HostCommand::SetAtEnd { at_end, fade_frames } => {
                 self.transport.set_fade_frames(fade_frames);
@@ -478,7 +509,7 @@ impl RenderState {
             snapshot.transport.interactive = Some(self.interactive_state);
             snapshot.transport.natural_end = self.taps.natural_end.load(Ordering::Relaxed);
         }
-        let _ = self.forwarded.publish(PlayerSnapshot { engine: snapshot, source_frame: self.engine.source_frame(), transport: self.transport, state: self.interactive_state, natural_end: self.taps.natural_end.load(Ordering::Relaxed) });
+        let _ = self.forwarded.publish(PlayerSnapshot { applied: self.applied, engine: snapshot, source_frame: self.engine.source_frame(), transport: self.transport, state: self.interactive_state, natural_end: self.taps.natural_end.load(Ordering::Relaxed) });
     }
 }
 
@@ -534,11 +565,14 @@ fn build_sides(mode: MixerMode, spec: AudioSpec, mut settings: EngineSettings) -
         telemetry,
         forwarded,
         commands: command_consumer,
+        applied: AppliedPlayback { capabilities: settings.playback_configuration().map(|configuration| configuration.capabilities).unwrap_or_default(), ..AppliedPlayback::default() },
+        pending_barrier: None,
         pending_command: None,
         retired: retired_producer,
         handles: handles.clone(),
         transport: if interactive_enabled { Transport::playing() } else { Transport::stopped() },
         interactive_identity,
+        installed_identity: None,
         interactive_enabled,
         interactive_state: InteractiveTransport::Stopped,
         taps: Arc::clone(&taps),
@@ -615,6 +649,7 @@ pub struct Player {
     /// [`Player::jam`] has installed one and until [`Player::take_event_sender`] moves it
     /// to another thread.
     events: Option<EventSender>,
+    #[cfg(feature = "interactive-audition")] live_epoch: Option<RtArc<starplayer::rt::atomic::AtomicU32>>,
     /// Whether live input is alone or sharing a mux with the module. Not the same question
     /// as `events.is_some()`, which goes false the moment a caller takes the sender.
     live_input: LiveInputMode,
@@ -687,6 +722,7 @@ impl Player {
             scopes: control.scopes,
             event_clock: control.event_clock,
             events: None,
+            #[cfg(feature = "interactive-audition")] live_epoch: None,
             live_input: LiveInputMode::Off,
             insert_control: control.insert_control,
             insert_layout: InsertLayout::default(),
@@ -920,7 +956,7 @@ impl Player {
         let identity = self.next_identity(new_session);
         let selections = self.prepare_instrument_selections(&instruments, new_session)?;
         let instrument_shadow = selections.as_ref().map(|selections| selections.to_vec());
-        self.commands.push(HostCommand::Load { module: RtArc::clone(&instruments), source, identity, selections }).map_err(|_| HostError::ControlQueueFull)?;
+        self.commands.push(HostCommand::Load { module: RtArc::clone(&instruments), source, identity, selections, new_session }).map_err(|_| HostError::ControlQueueFull)?;
         if let Some(selections) = instrument_shadow { self.instrument_shadow = selections; }
         self.engine_settings.set_instrument_count(instruments.instruments().len());
         self.handles.seek.clear();
@@ -928,9 +964,11 @@ impl Player {
         self.module = Some(instruments);
         self.scan = None;
         self.smf = self.interactive_enabled.then_some(smf);
+        #[cfg(feature = "interactive-audition")]
+        { self.live_epoch = events.as_ref().and_then(EventSender::cancellation_token); }
         self.events = events;
         self.live_input = LiveInputMode::Off;
-        if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
+        if new_session { self.transport_shadow = InteractiveTransport::Stopped; self.overlap_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
         Ok(length_frames)
     }
 
@@ -948,6 +986,10 @@ impl Player {
     }
 
     fn install(&mut self, module: RtArc<Module>, start: SeekKind, cached_scan: Option<Arc<ScannedSong>>, new_session: bool) -> Result<(), HostError> {
+        self.install_identified(module, start, cached_scan, new_session, self.next_identity(new_session))
+    }
+
+    fn install_identified(&mut self, module: RtArc<Module>, start: SeekKind, cached_scan: Option<Arc<ScannedSong>>, new_session: bool, identity: Option<PlaybackIdentity>) -> Result<(), HostError> {
         // A new sequencer's tick clock starts at frame zero, but the engine's musical clock
         // is monotonic and has been running since the stream opened. Starting the clock
         // where the engine actually is stops the engine burning ticks catching up.
@@ -966,18 +1008,19 @@ impl Player {
         } else {
             (built.source, None)
         };
-        let identity = self.next_identity(new_session);
         let selections = self.prepare_instrument_selections(&module, new_session)?;
         let instrument_shadow = selections.as_ref().map(|selections| selections.to_vec());
-        let command = HostCommand::Load { module: RtArc::clone(&module), source, identity, selections };
+        let command = HostCommand::Load { module: RtArc::clone(&module), source, identity, selections, new_session };
         self.commands.push(command).map_err(|_| HostError::ControlQueueFull)?;
         if let Some(selections) = instrument_shadow { self.instrument_shadow = selections; }
         self.engine_settings.set_instrument_count(module.instruments().len());
         self.playback_identity = identity;
-        if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
+        if new_session { self.transport_shadow = InteractiveTransport::Stopped; self.overlap_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
         self.scan = Some(built.scanned);
         self.smf = None;
         self.module = Some(module);
+        #[cfg(feature = "interactive-audition")]
+        { self.live_epoch = events.as_ref().and_then(EventSender::cancellation_token); }
         self.events = events;
         if self.live_input != LiveInputMode::Jam {
             self.live_input = LiveInputMode::Off;
@@ -1043,6 +1086,23 @@ impl Player {
     pub fn resume(&mut self) -> Result<(), HostError> { self.interactive(InteractiveAction::Resume) }
     pub fn clear_and_hold(&mut self) -> Result<(), HostError> { self.interactive(InteractiveAction::Stop) }
     pub fn all_sound_off(&mut self) -> Result<(), HostError> { self.interactive(InteractiveAction::AllSoundOff) }
+    /// Queue after a complete load/replay transaction. A full queue returns an error;
+    /// callers must not treat a queued load or the control shadow as applied audio.
+    pub fn playback_barrier(&mut self, serial: u64) -> Result<(), HostError> {
+        let identity = self.playback_identity.ok_or(HostError::InvalidInteractiveCommand)?;
+        self.queue(HostCommand::AppliedBarrier { identity, serial, rejected: self.commands_rejected() })
+    }
+
+    pub fn pending_control_commands(&self) -> usize { self.commands.len() }
+
+    pub fn applied_playback(&mut self) -> AppliedPlayback { self.telemetry.read().applied }
+
+    /// Explicit identities let persistent hosts avoid reuse across replacement instances.
+    pub fn load_module_identified(&mut self, module: RtArc<Module>, identity: PlaybackIdentity) -> Result<(), HostError> {
+        if !self.interactive_enabled || self.playback_identity.is_none_or(|old| identity.build.0 <= old.build.0 || identity.session.0 <= old.session.0) { return Err(HostError::InvalidInteractiveCommand); }
+        self.install_identified(module, SeekKind::None, None, true, Some(identity))
+    }
+
     pub const fn playback_identity(&self) -> Option<PlaybackIdentity> { self.playback_identity }
     pub fn interactive_transport(&self) -> Option<InteractiveTransport> {
         self.interactive_enabled.then(|| match self.taps.transport_state.load(Ordering::Relaxed) { 1 => InteractiveTransport::Playing, 2 => InteractiveTransport::Paused, _ => InteractiveTransport::Stopped })
@@ -1072,6 +1132,9 @@ impl Player {
         }
         let identity = self.playback_identity.ok_or(HostError::InvalidInteractiveCommand)?;
         self.queue(HostCommand::Interactive(InteractiveCommand { identity, action }))?;
+        #[cfg(feature = "interactive-audition")]
+        if (matches!(action, InteractiveAction::Stop | InteractiveAction::StopPreview | InteractiveAction::AllSoundOff) || matches!(action, InteractiveAction::SetLiveDestination(destination) if destination != self.live_destination))
+            && let Some(epoch) = &self.live_epoch { epoch.fetch_add(1, starplayer::rt::atomic::Ordering::AcqRel); }
         match action {
             InteractiveAction::SetLiveDestination(destination) => { self.live_destination = destination; self.live_input = if destination == starplayer::core::LiveDestination::Jam { LiveInputMode::Jam } else { LiveInputMode::Off }; },
             InteractiveAction::SetNoteOverlapEnabled(enabled) => self.overlap_shadow = enabled,
@@ -1207,7 +1270,7 @@ impl Player {
         // every voice and forgets every binding, which is exactly what silencing the
         // tracker lanes as the source is swapped means. Nothing is decoded or scanned.
         self.commands
-            .push(HostCommand::Load { module, source: Box::new(source), identity: None, selections: None })
+            .push(HostCommand::Load { module, source: Box::new(source), identity: None, selections: None, new_session: true })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.events = Some(EventSender::new(producer, Arc::clone(&self.event_clock)));
         self.live_input = LiveInputMode::MidiOnly;
@@ -1251,10 +1314,12 @@ impl Player {
             (built.source, None)
         };
         self.commands
-            .push(HostCommand::Load { module, source, identity: None, selections: None })
+            .push(HostCommand::Load { module, source, identity: None, selections: None, new_session: true })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.scan = Some(built.scanned);
         self.smf = None;
+        #[cfg(feature = "interactive-audition")]
+        { self.live_epoch = events.as_ref().and_then(EventSender::cancellation_token); }
         self.events = events;
         self.live_input = if enabled { LiveInputMode::Jam } else { LiveInputMode::Off };
         Ok(())

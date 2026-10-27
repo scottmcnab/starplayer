@@ -107,7 +107,7 @@ pub fn message_to_event(status: u8, data1: u8, data2: u8) -> Option<(u8, starpla
     let mut decoder = MidiDecoder::new();
     [status, data1, data2].into_iter().find_map(|byte| decoder.decode(byte))
 }
-pub use player::{CONTROL_CADENCE_FRAMES, HOST_COMMAND_CAPACITY, Player, RETIRED_CAPACITY, TELEMETRY_DEPTH};
+pub use player::{AppliedPlayback, CONTROL_CADENCE_FRAMES, HOST_COMMAND_CAPACITY, Player, RETIRED_CAPACITY, TELEMETRY_DEPTH};
 pub use source::{
     AtEndSlot, BuiltSource, SourcePosition, SeekKind, SeekMailbox, SeekRequest, SeekableModuleSource, SourceHandles, build_source, build_source_with_settings,
     scan_module, scan_module_with_speed_adjust, interactive_sources, build_source_with_cursor,

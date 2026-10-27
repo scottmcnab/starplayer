@@ -906,3 +906,19 @@ test groups passed; pinned conformance remains261/179/0/16/66/0. Worker live17/h
 all8 goldens and portable/feature/lint evidence are in NO-06. Web applied-generation
 acknowledgements/UI are NO-W1; broad final integration/listening evidence are NO-07.
 No main merge/deployment or hardware/listening acceptance claimed.
+
+
+### NO-W1 coordinator landing — 2026-10-28
+
+Task `c20041f` reviewed against the current master/task and prior review dispositions,
+then integrated by single-change squash on the feature branch. Source-backed review
+resolved fresh-load transport/end/fade reset, latest user intent across deferred
+replacement, identity-validated applied insert preparation and multi-slot Reset, legacy
+Stop2 refusal in v2, actual tracker width, and PCM eligibility independent of live XM
+pitch viability. These implement the reviewed contract; native tuning/effects and
+canonical expectations are unchanged. Version1 semantics remain available.
+Final coordinator regression passed460 tests in30 groups; worker333 JS,59 WASM-host,19
+live tests, actual-WASM/ring and SAB/fallback/plain Chromium smoke, no-CAS portability,
+feature-off and strict lint checks passed. Exact commands/evidence are in NO-W1.
+NO-07 owns broad final CI, determinism, feature exclusion, embedded compile and acceptance
+artifacts. No main merge, deployment or physical MIDI/listening acceptance claimed.

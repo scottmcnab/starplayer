@@ -2088,3 +2088,61 @@ all-sound-off clear all, and interactive seek retains L. Recoverable input queue
 emits all-notes-off and records a bounded diagnostic counter. Runtime/table preparation
 and module ownership stay off render; both native adapters validate capacity before
 admission and roll back a failed runtime start.
+
+### NO-W1 web bridge and renderer handoff
+
+The web host explicitly opts into interactive settings; compiling optional features alone
+still leaves reusable constructors at legacy defaults. The page negotiates command
+version2 before enabling audition/overlap. Its atomic seven-word records retain opcode,
+argument and extra and add four u32 words for the complete u64 session/build identity.
+Version2 protects existing seek/mute/insert opcode values too. Legacy version1 triples
+retain their behavior; opcodes2 (legacy Stop) and7 (mixer replacement) remain v1-only, with interactive renderer changes using
+the versioned replacement-message path. Fallback envelopes carry the same identities as
+BigInts, converted off render. Ring consumers pass scalar words directly to Rust.
+
+Player publishes an applied barrier coherently with audio-side installation and host
+transport. A seeded engine identity or control shadow is insufficient: installation and
+full replay must have rendered, with no preceding rejection, before the worklet reports
+ready or admits Preview/MIDI notes. Prepared loads retain NO-04's ordered retirement
+backpressure. The worklet publishes from a fixed status block and reused acknowledgement
+arrays; full-width serials and rejection baselines prevent later markers from concealing
+an earlier failed transaction. Large master/mute/insert replay is prepared in message
+tasks and bounded across quanta before the final ready barrier.
+
+`Player::{replacement_state,load_replacement}` provide a versioned, field-wise u64-word
+handoff between independent WASM memories. The codec runs off render, validates narrow
+fields, modes, row budgets and safe transport ramp trajectories, and preflights command
+capacity before installation. It retains the NO-03 complete cursor, exact integer ramp,
+fade/rewind, routing and overlap selections; rate changes convert durations/fractional
+deadlines. It restores no held input or processor objects. Page/worklet counters seed
+fresh instances monotonically; explicit reload changes session, while replacement changes
+only build. Metadata inspection is associated with the acknowledged installed identity.
+
+Recoverable live feeds tag queued events with a cancellation epoch. Cleanup invalidates
+already queued future input without discarding newly submitted notes or sequenced SMF
+input. The owning Player retains its cancellation latch when an EventSender is handed
+away. Outer browser queue pressure uses a bounded reliable live-clear recovery and holds
+new input until its acknowledgement.
+
+Tracker telemetry remains64 lanes. Header word15 preserves legacy boolean behavior in
+v1; interactive snapshots tag bit3, with bit0 playing, bit1 paused and bit2 natural end.
+Three words after the64 tracker records carry live active/retiring/peak summary. Playlist
+completion consumes explicit natural end; paused/stopped live audio and metering continue.
+
+
+Explicit new interactive sessions install the new source Stopped with clean host fade,
+natural-end/rewind and unity audition gain before readiness; Load and the identified engine
+Stop reserve their queue capacity together. Same-session replacement preserves the captured
+state instead. Load-option capture remains inside its guarded transaction and retries after
+transport changes. A pending load stores the latest identity-stamped transport opcode,
+including when installation is deferred; replay applies it before readiness. Normal
+quantum-boundary command latency remains. Version2 legacy midiInput preparation is rejected;
+prepared insert mutations validate full installed identity and fields before allocation,
+flush earlier controls first and acknowledge after audio application. Busy mutations reject
+before preparation. Tracker telemetry storage remains64 lanes, while the interactive wire's
+channel count and scope count report the loaded module's actual tracker width.
+
+Sample loop/one-shot capability flags cover every mapped nonempty PCM sample, including
+native tracker keys that the live-input reference adapter cannot tune. Live target and
+reference-preview viability are separate flags. This preserves overlap eligibility and
+mixed-map badges independently of keyboard pitch-range restrictions.

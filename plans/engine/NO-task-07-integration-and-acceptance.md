@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Authorised; pending dependencies |
+| Status | In progress; NO-01–06 and NO-W1 integrated; sole Sol high worker |
 | Depends on | NO-W1 and NO-01–06 |
 | Blocks | Feature landing and owner listening acceptance |
 | Parallel with | None; integration verification uses final combined tree |

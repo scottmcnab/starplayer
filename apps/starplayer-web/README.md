@@ -487,3 +487,59 @@ reporting omitted uploads. **Import playlist** appends CSV rows bound to the ope
 library, keeping missing rows as unavailable for later rebinding. Exported CSV can
 also be opened as a small library. See [the CSV contract](LIBRARY-CSV.md#saving-and-exchanging-playlists)
 for storage, identity and exchange details.
+
+Interactive playback uses **Play / Pause / Stop**. Pause holds sequencing and its pending
+tracker tick while envelopes, loops, live input and master DSP continue. Play becomes
+Resume while paused. Stop clears sound and DSP tails and holds the current position.
+Media Session Pause and Stop use these same distinct actions. Only explicit natural
+completion advances a playlist.
+
+Each instrument has Preview, a selectable keyboard/MIDI target, and **Let notes ring**.
+**Enable note overlap** starts off. You can edit instrument selections while bypassed;
+bypass preserves them and clears only custom tails, including custom live tails. Unchecked
+means native behavior, including authored IT NNA. Equal notes at the same starting volume
+on the same instrument and channel replace earlier matching sounds; different notes or
+starting volumes can overlap. Only non-looping samples qualify. The infinity badge has
+accessible looping/mixed-map text; mixed maps keep their checkbox usable. Preview at
+reference note60 can be unavailable even when other mapped keys are playable. Sample
+loop/one-shot badges and overlap eligibility include all mapped PCM, including native
+tracker keys outside the live input pitch range.
+
+The keyboard/MIDI destination explicitly chooses Jam programs or the selected instrument.
+Input is routed once. Key-up, pedal-up and looping Preview-up use native release;
+one-shot button previews finish after release. Pointer cancel, focus loss, disconnect,
+routing changes and module transitions clear held audition input. Native loops without a
+terminating release can require **Stop preview**. **All sound off** clears song and live
+sound without changing transport. Audition uses prepared/enhanced PCM and current master
+processing, with no automatic tracker-channel inserts. Extra live voices can change the
+shared master dynamics.
+
+A new load/reload resets session selections; changing enhancement, renderer or output
+rate keeps session settings, transport and the full logical cursor. These operations
+rebuild processor working state and clear sounding voices. The page waits for the
+**audio-applied** load and complete state replay before accepting notes. Metadata comes
+from the separate inspection WASM and is correlated by the installed session/build.
+
+The negotiated command protocol is version2: a five-word ring header and seven-word
+atomic records (opcode, argument, extra, session low/high, build low/high). Existing
+opcode values remain; opcodes2 (legacy Stop) and7 (mixer replacement) are v1-only. The interactive UI uses
+versioned replacement messages for mixer changes. Version2 fallback batches carry the
+same full identity as BigInts, converted to scalar u32 words in message tasks. The render
+consumer uses preallocated typed arrays and a fixed applied-status block; codecs and
+preparation run outside `process()`. Large mute/insert replays are bounded across quanta.
+Old or incomplete protocols disable interactive controls and retain ordinary legacy playback.
+
+Focused verification, using the existing CDP/browser stack:
+
+```sh
+node --test --test-concurrency=1 apps/starplayer-web/test/*.test.mjs
+cargo xtask wasm
+node apps/starplayer-web/test/ring-harness.mjs
+node apps/starplayer-web/test/worklet-harness.mjs
+STARPLAYER_REQUIRE_CHROMIUM=1 node apps/starplayer-web/test/headless.mjs --interactive-only --mode sab
+# Repeat with --mode fallback and --mode plain, one browser at a time.
+```
+
+The worklet harness runs real packaged Rust WASM under a simulated AudioWorklet realm;
+it is separate from the real Chromium/CDP smoke. Physical MIDI devices, mobile lock-screen
+behavior and musical listening still need owner checks.

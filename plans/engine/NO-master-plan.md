@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation authorised 2026-10-27; NO-01–06 integrated; NO-W1 in progress; reviewed instrument-only/onset-volume contract unchanged |
+| Status | Implementation authorised 2026-10-27; NO-01–06 and NO-W1 integrated; NO-07 in progress; reviewed instrument-only/onset-volume contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -609,3 +609,28 @@ approved by the coordinator from the existing master contract.
   coordinator52 regression groups passed. Coordinator conformance remains261/179/0/16/66.
   See NO-06 for resource, timing and dependent API evidence.
 - NO-W1 starts after NO-06, using Sol high as the sole active task worker.
+
+
+### NO-W1 implementation handoff — 2026-10-28
+
+Web controls and generation-safe command/replacement paths are implemented on
+`task/no-w1-web-controls` from `b427bac`, pending coordinator review and landing.
+Explicit new loads install clean Stopped state before readiness; same-session rebuilds
+retain the full cursor/fade/settings and apply the latest user transport intent before
+input resumes. Preparation and acknowledgements distinguish queued work from applied
+audio. Version2 rejects legacy midiInput preparation and validates identity-bearing insert
+mutations;64 tracker wire lanes remain, while visible channel/scopes counts match the
+module. Detailed command/evidence and owner-only acceptance are in NO-W1. This is no main
+merge/deployment or listening/hardware acceptance. NO-07 remains outstanding.
+
+
+### NO-W1 coordinator landing — 2026-10-28
+
+Task `c20041f` is integrated by reviewed single-change squash. The final coordinator
+affected-package regression passed460 tests in30 result groups; final worker333 JS,59
+WASM-host,19 live tests, actual packaged-WASM/ring, three Chromium modes, portable and
+lint checks passed. Source review resolved fresh-session reset and pending transport,
+prepared insert ordering/Reset, v2 legacy Stop refusal, actual width and mapped PCM
+eligibility without changing the product contract. See NO-W1 for exact evidence.
+NO-07 now starts on the combined tree, using Sol high as the sole task worker. Main,
+deployment and owner hardware/listening acceptance remain outside this landing.

@@ -1060,8 +1060,15 @@ pub trait EventFeed: Send {
 /// plugin host's per-block event list (architecture §3.2). The frame is **absolute** and
 /// the host stamps it — `output_frame + lead`, two render quanta by default (E6) — so that
 /// an event lands on an exact frame rather than at the top of whatever block it arrives in.
+#[derive(Debug)]
+struct QueuedLiveEvent {
+    event: TimedEvent,
+    #[cfg(feature = "interactive-audition")] epoch: u32,
+}
+
 pub struct ExternalEventProducer {
-    producer: Producer<TimedEvent>,
+    producer: Producer<QueuedLiveEvent>,
+    #[cfg(feature = "interactive-audition")] epoch: Option<Arc<starplayer_rt::atomic::AtomicU32>>,
     #[cfg(feature = "interactive-audition")] recovery: Option<Arc<starplayer_rt::atomic::AtomicU32>>,
 }
 
@@ -1071,11 +1078,20 @@ impl ExternalEventProducer {
     /// Never blocks and never allocates: a full ring is a host that is sending faster than
     /// the audio thread consumes, and the honest answer is to say so.
     pub fn send(&mut self, event: TimedEvent) -> Result<(), TimedEvent> {
-        let result = self.producer.push(event);
+        let queued = QueuedLiveEvent { event, #[cfg(feature = "interactive-audition")] epoch: self.epoch.as_ref().map_or(0, |epoch| epoch.load(starplayer_rt::atomic::Ordering::Acquire)) };
+        let result = self.producer.push(queued).map_err(|queued| queued.event);
         #[cfg(feature = "interactive-audition")]
         if result.is_err() && let Some(recovery) = &self.recovery { recovery.fetch_add(1, starplayer_rt::atomic::Ordering::Release); }
         result
     }
+
+    /// Invalidate already queued live events without discarding later admissions.
+    #[cfg(feature = "interactive-audition")]
+    pub fn cancel_pending(&self) { if let Some(epoch) = &self.epoch { epoch.fetch_add(1, starplayer_rt::atomic::Ordering::AcqRel); } }
+
+    /// Share the cancellation latch with the owning host even if it hands away the sender.
+    #[cfg(feature = "interactive-audition")]
+    pub fn cancellation_token(&self) -> Option<Arc<starplayer_rt::atomic::AtomicU32>> { self.epoch.clone() }
 
     /// Events queued but not yet consumed.
     pub fn len(&self) -> usize { self.producer.len() }
@@ -1102,10 +1118,11 @@ impl ExternalEventProducer {
 /// on its exact frame. The host's two-quantum stamping lead is what keeps that true for an
 /// event pushed while a segment is being rendered.
 pub struct ExternalEventQueue {
+    #[cfg(feature = "interactive-audition")] epoch: Option<Arc<starplayer_rt::atomic::AtomicU32>>,
     #[cfg(feature = "interactive-audition")] recovery: Option<Arc<starplayer_rt::atomic::AtomicU32>>,
     #[cfg(feature = "interactive-audition")] recovered: u32,
-    consumer: Consumer<TimedEvent>,
-    peeked: Option<TimedEvent>,
+    consumer: Consumer<QueuedLiveEvent>,
+    peeked: Option<QueuedLiveEvent>,
 }
 
 /// A queue and the producer that feeds it, sized for `capacity` events.
@@ -1113,7 +1130,7 @@ pub struct ExternalEventQueue {
 /// Allocates once, off the audio thread.
 pub fn external_event_channel(capacity: usize) -> (ExternalEventProducer, ExternalEventQueue) {
     let (producer, consumer) = starplayer_rt::channel(capacity);
-    (ExternalEventProducer { producer, #[cfg(feature = "interactive-audition")] recovery: None }, ExternalEventQueue { consumer, peeked: None, #[cfg(feature = "interactive-audition")] recovery: None, #[cfg(feature = "interactive-audition")] recovered: 0 })
+    (ExternalEventProducer { producer, #[cfg(feature = "interactive-audition")] epoch: None, #[cfg(feature = "interactive-audition")] recovery: None }, ExternalEventQueue { consumer, peeked: None, #[cfg(feature = "interactive-audition")] epoch: None, #[cfg(feature = "interactive-audition")] recovery: None, #[cfg(feature = "interactive-audition")] recovered: 0 })
 }
 
 /// Live queue with an out-of-band overflow latch. Recovery drops queued stale input
@@ -1123,6 +1140,8 @@ pub fn recoverable_event_channel(capacity: usize) -> (ExternalEventProducer, Ext
     let (mut producer, mut queue) = external_event_channel(capacity);
     let recovery = Arc::new(starplayer_rt::atomic::AtomicU32::new(0));
     producer.recovery = Some(Arc::clone(&recovery)); queue.recovery = Some(recovery);
+    let epoch = Arc::new(starplayer_rt::atomic::AtomicU32::new(0));
+    producer.epoch = Some(Arc::clone(&epoch)); queue.epoch = Some(epoch);
     (producer, queue)
 }
 
@@ -1138,12 +1157,14 @@ impl EventFeed for ExternalEventQueue {
     #[cfg(feature = "interactive-audition")]
     fn recovery_count(&self) -> u32 { self.recovered }
 
-    fn next_frame(&self) -> Option<Frame> { self.peeked.map(|event| event.frame) }
+    fn next_frame(&self) -> Option<Frame> { self.peeked.as_ref().map(|queued| queued.event.frame) }
 
     fn pop_due(&mut self, frame: Frame) -> Option<TimedEvent> {
-        let due = self.peeked.filter(|event| event.frame <= frame)?;
+        self.refresh(frame);
+        if self.peeked.as_ref().is_none_or(|queued| queued.event.frame > frame) { return None; }
+        let due = self.peeked.take()?;
         self.peeked = self.consumer.pop();
-        Some(due)
+        Some(due.event)
     }
 
     fn refresh(&mut self, _frame: Frame) {
@@ -1153,12 +1174,18 @@ impl EventFeed for ExternalEventQueue {
             if count != self.recovered {
                 self.recovered = count;
                 for _ in 0..self.consumer.capacity() { if self.consumer.pop().is_none() { break; } }
-                self.peeked = Some(TimedEvent::global(_frame, Event::AllNotesOff));
+                self.peeked = Some(QueuedLiveEvent { event: TimedEvent::global(_frame, Event::AllNotesOff), epoch: self.epoch.as_ref().map_or(0, |epoch| epoch.load(starplayer_rt::atomic::Ordering::Acquire)) });
                 return;
             }
         }
-        if self.peeked.is_none() {
-            self.peeked = self.consumer.pop();
+        if self.peeked.is_none() { self.peeked = self.consumer.pop(); }
+        #[cfg(feature = "interactive-audition")]
+        if let Some(epoch) = &self.epoch {
+            let current = epoch.load(starplayer_rt::atomic::Ordering::Acquire);
+            for _ in 0..=self.consumer.capacity() {
+                if self.peeked.as_ref().is_none_or(|queued| queued.epoch == current) { break; }
+                self.peeked = self.consumer.pop();
+            }
         }
     }
 }
