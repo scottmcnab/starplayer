@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Authorised; pending dependencies |
+| Status | In progress on task/no-05-xm-it-overlap; NO-01–04 integrated |
 | Depends on | NO-02, NO-03 and NO-04 |
 | Blocks | NO-06, NO-W1 |
 | Parallel with | None during shared runtime/cleanup integration |

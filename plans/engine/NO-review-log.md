@@ -827,3 +827,33 @@ until NO-06. Optional telemetry payload320 bytes is absent off; Snapshot2632 byt
 versus2952 on (x86_64). Host13/engine8 transport, callback6, firmware96, no_std/WASM,
 lint and unification checks passed. Conformance remains261/179/0/16/66; all8 goldens
 unchanged. No main merge, deployment or hardware/listening acceptance claimed.
+
+
+### NO-04 implementation discovery and bounded interface decisions — 2026-10-28
+
+Coordinator/worker source review (not another external-model review) resolved two
+implementation details without changing the reviewed product contract. Actual sounding
+MOD sample/instrument tags follow queued PCM adoption, independently of immutable onset
+identity; eligibility uses the tagged sample and both model loop fields, never an `any`
+scan over possibly aliased PCM. Prepared actual-module selection boxes replace stale
+pre-load instrument counts and retire with their source; whole prepared loads defer in
+order under bounded retirement pressure, including the old module's later garbage. The
+same backpressure applies to audition-only prepared loads without a selection box; burst
+allocator coverage runs independently for each capability. MTM forwards each optional
+flag into its MOD effect core, with standalone MTM-only behavior regressions.
+
+The synthetic S3M fast-slide fixture found a pre-existing gap: `static_volume_slide`
+executes fine forms but schedules normal slides only through `set_minor`, with no read
+of the loaded `fast_volume_slides` flag. Base20+D10+flag therefore starts at20, not21.
+This is recorded as a separate accuracy follow-up in the foundation accuracy policy and
+NO-04 evidence. The task preserves that baseline and tests supported fine/Qxy onset
+operations and tremor independently; it claims no fast-flag fidelity repair.
+
+### NO-04 coordinator landing — 2026-10-28
+
+Task `61138bb` reviewed against current master and task contracts and integrated by
+single-change squash on the feature branch. Final coordinator affected-package tests
+passed, with independent worker feature/no_std/WASM/RT and canonical evidence in NO-04.
+Prepared load backpressure covers both optional runtime configurations, including
+audition-only sources. NO-05 is next; one task worker/build stream at a time.
+No main merge, deployment, hardware check or listening acceptance claimed.

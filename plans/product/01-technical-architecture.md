@@ -493,7 +493,8 @@ pub enum DuplicateCheck { Off, Note, Sample, Instrument }
 pub enum DuplicateAction{ Cut, NoteOff, NoteFade }
 ```
 
-MOD/S3M/MTM simply never create a background voice. `NewNoteAction::Cut` +
+Canonical MOD/S3M/MTM never create a background voice; NO-04's explicit optional
+custom-tail behavior is described below. `NewNoteAction::Cut` +
 `DuplicateCheck::Off` early-outs the whole DCT matching loop. Cost to the simple path:
 four bytes per voice and one branch.
 
@@ -1827,8 +1828,9 @@ The [NO master plan](../engine/NO-master-plan.md) proposes explicit, session-onl
 instrument-only note overlap and faithful instrument audition for all five formats. This
 has completed external review and corrections (see the NO review log), and implementation
 was authorised on 2026-10-27. NO-01 supplies the contracts/preparation described below;
-NO-02 adds concrete native articulation and NO-03 adds interactive transport. Custom
-overlap execution and faithful native audition remain planned.
+NO-02 adds concrete native articulation, NO-03 adds interactive transport, and NO-04
+implements opt-in MOD/S3M/MTM overlap. XM/IT overlap and faithful native audition remain
+planned.
 Each instrument has a Let notes ring boolean, with a separate Enable note overlap global
 bypass preserving selections. There are no channel overrides, inheritance or custom modes.
 Enabled eligible voices continue except when instrument, original note, exact onset base
@@ -1839,8 +1841,8 @@ uses event-velocity-derived base volume before CC7; explicit note-off still rele
 detached held voices. Custom live tails stay in L and carry custom-detachment provenance
 so global bypass clears them without clearing native-created backgrounds.
 Unchecked/bypassed/ineligible voices retain native behavior, including authored IT NNAs.
-Canonical MOD/S3M/MTM/XM still never create background voices today; the proposed
-opt-in exception must not change that default or native IT behavior.
+Canonical MOD/S3M/MTM/XM never create background voices; NO-04's runtime opt-in exception
+for MOD/S3M/MTM preserves that default and native IT behavior.
 
 The design separates held tracker sequencing time from advancing audio/live-input time
 and format-owned articulation. Pause leaves mixing, envelopes and DSP running; interactive
@@ -1952,3 +1954,54 @@ The heavy tracker/SMF rebuild fields in telemetry are gated by its no_std
 not reserve their storage; stable query methods return None. Host-local capability checks
 reject preparation when Cargo dependency feature unification enabled engine features but
 this host did not compile the required forwarding hooks. Legacy settings remain valid.
+
+
+### NO-04 legacy overlap and actual sample identity
+
+MOD and native MTM's shared effect core, and S3M's separate processor, classify musical
+starts explicitly and finalize after their onset-tick effects at the event frame.
+MOD keeps the exact packed input period; MTM keeps its native linear note and S3M its
+resolved semitone. EDx/SDx carry musical cause until the actual delayed trigger. Native
+E9x/Qxy and sample revival transfer the prior immutable identity across mixer generations
+without custom detachment or duplicate processing. MOD Cxx/EAx/EBx, S3M fine slides and
+Qxy's supported tick-zero volume operation precede capture; tremor and later effects do
+not rewrite it. The existing S3M fast-volume-slide flag gap is recorded in the accuracy
+policy and is not repaired by this creative feature.
+
+`engine::overlap` is a concrete shared helper, not a trait or another ownership table.
+`ChannelTable::{custom_overlap_candidate,prepare_note_overlap,
+replace_note_overlap_duplicates}` separate candidate eligibility, song foreground N→C
+admission/detachment, and post-onset replacement. NO-05 consumes these stages around
+native XM/IT processing. Eligibility checks the actual mixer sample tag against its PCM
+region and both normal/sustain model loops; aliases cannot borrow one-shot eligibility
+from another sample. The current sounding instrument's checkbox decides survival; the
+immutable original trigger instrument/note/volume/channel selects duplicates. Retiring
+voices are excluded. Native-created backgrounds keep N; the helper never migrates them.
+NO-06 still owns live held instances and L admission before using the shared predicate
+and replacement scan.
+
+An opted-in MOD queued swap carries instrument/sample metadata alongside its pending PCM.
+Adoption and retrigger update the actual tag at the same boundary; successful custom
+detachment discards both pending parts. Pending metadata is compiled only with overlap,
+packed into existing mixer slot padding, and absent from the embedded/default feature
+graph. The original 168-byte x86_64 slot-stride assertion remains unchanged. A queued
+one-shot-to-one-shot swap still ends natively rather than inventing a reload. MOD's
+out-of-range 9xx retained-pointer one-word fallback really starts, so it has onset
+identity; raw out-of-range one-shots in MTM/S3M do not create a tail or onset.
+
+Custom tails preserve actual sample, parameters and originating channel routing. C admits
+oldest-custom eviction with stable slot tie-break and the per-domain retirement fallback;
+unavailable custom capacity leaves native replacement and increments bounded diagnostics.
+Natural completion/reuse reclaims ownership. Legacy seek/restart retains still-sounding
+custom ownership, while interactive seek, Stop and bypass consume the scoped retirement
+contracts. No new canonical effect semantics or golden data change.
+
+Persistent Player loads prepare an actual-module-sized selection box off the callback,
+including SMF instrument modules; a zero/stale initial count is not an instrument limit.
+The engine swaps only that box/count, preserving authoritative voice ownership, and
+retires the old box with the old source. Explicit loads reset session selections/global;
+same-session installations/rebuilds retain/replay them and update stored settings bounds.
+Prepared loads defer as a whole, in order, when retirement or engine-command room is
+unavailable. One pending command and one prepared load per quantum bound ownership;
+one retirement entry is reserved for the old module after engine dispatch. Control-side
+garbage collection unblocks installation without any callback allocation or drop.

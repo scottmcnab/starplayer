@@ -83,6 +83,8 @@ pub mod channel;
 pub mod playback;
 #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
 pub mod ownership;
+#[cfg(feature = "note-overlap")]
+pub mod overlap;
 pub mod command;
 pub mod control;
 pub mod demo;

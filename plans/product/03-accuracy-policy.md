@@ -713,8 +713,9 @@ written down here is a defect, not a decision.
 
 The [NO master plan](../engine/NO-master-plan.md) defines an optional creative playback
 layer, not a new interpretation of canonical tracker effects. NO-01 implements its
-contract types, optional preparation and bounded lane routing; overlap/transport/audition
-execution remains in the dependent tasks. No canonical effect behavior changes in NO-01.
+contract types, optional preparation and bounded lane routing. NO-02/03 add native
+articulation/interactive transport; NO-04 adds opt-in MOD/S3M/MTM overlap. XM/IT overlap
+and faithful audition remain dependent work. No canonical effect behavior changes.
 Unchecked/global-bypassed and feature-disabled renders must retain existing golden output.
 Custom overlap preserves non-looping sample tails and may override IT NNA/duplicate
 actions explicitly; authored IT behavior remains the default, including looping NNA.
@@ -740,7 +741,31 @@ never refresh canonical goldens to accommodate this opt-in feature.
 NO-01 identity APIs preserve raw MOD periods and native base-volume integer values rather
 than a rendered gain or rounded identity-only conversion. Passive finalization does not
 consult checkbox/global state, and native release does not erase identity; retiring slots
-are excluded from matching. NO-04/05 must wire the capture after onset-tick processing and
-prove canonical equivalence in the three reviewed configurations. NO-06 must resolve live
+are excluded from matching. NO-04 wires MOD/S3M/MTM capture after onset-tick processing
+and proves canonical equivalence in the three reviewed configurations; NO-05 still owes
+the corresponding XM/IT integration. NO-06 must resolve live
 velocity before CC7 and test collisions from each format's existing volume resolution.
 Those behavioral/equivalence tests are not satisfied by NO-01's seam-level contract tests.
+
+
+NO-04 distinguishes immutable trigger identity from the current sounding MOD sample:
+a completed queued swap changes the instrument checkbox/loop eligibility used for
+survival, while original instrument/note/volume/channel remain unchanged for matching.
+Queued metadata follows actual PCM adoption/retrigger, and successful detachment clears
+both parts. Exact sample tags prevent an aliased looping/sustain sample from acquiring
+another sample's one-shot eligibility. The canonical swap/offset rules stay intact:
+ProTracker's out-of-range 9xx one-word retained-pointer fallback is an actual onset;
+MTM/S3M out-of-range non-looping starts are not. The optional layer adds no decay or
+loop-release synthesis and regenerates no goldens.
+
+**Recorded pre-existing accuracy follow-up (NO-04, 2026-10-28): S3M fast-volume-slide
+flag.** The loader/header represents generalflags bit 6 and ST3.00 `Cwt/v == 0x1300`
+as `ModuleFlags::fast_volume_slides` (`starplayer-s3m/src/header.rs` and `loader.rs`).
+`S3mProcessor::static_volume_slide` applies fine forms immediately but otherwise only
+calls `set_minor`; neither it nor `set_minor` reads that flag. A synthetic note with
+base volume 20 and D10 therefore remains 20 on tick zero even with the flag set,
+rather than ST3 fast-sliding to 21. NO-04's named regression pins this existing gap,
+not canonical fast-flag fidelity. Supported onset fine slides and Qxy tick-zero volume
+operations are tested separately. Repair needs a separate source/oracle-backed accuracy
+change and regression coverage; NO-04 preserves the current effect ordering/output and
+does not weaken canonical comparisons or update goldens to conceal it.

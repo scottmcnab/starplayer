@@ -72,6 +72,8 @@ pub struct S3mChannel {
     pub stop_voice: bool,
     #[cfg(feature = "interactive-audition")]
     sound_cleared: bool,
+    #[cfg(feature = "note-overlap")]
+    new_note_pending: bool,
 }
 
 impl S3mChannel {
@@ -111,6 +113,7 @@ impl S3mChannel {
             stop_voice: false,
             #[cfg(feature = "interactive-audition")]
             sound_cleared: false,
+            #[cfg(feature = "note-overlap")] new_note_pending: false,
         }
     }
 }
@@ -236,6 +239,8 @@ impl S3mProcessor {
             }
             if state.command != 17 { state.special_value = 0; }
             state.command = 0;
+            #[cfg(feature = "note-overlap")]
+            { state.new_note_pending = false; }
         }
     }
 
@@ -292,6 +297,8 @@ impl S3mProcessor {
                     #[cfg(feature = "interactive-audition")]
                     { state.sound_cleared = false; }
                     state.pending_dirty.insert(DirtyBits::SAMPLE);
+                    #[cfg(feature = "note-overlap")]
+                    { state.new_note_pending = cell.linear_semitone().is_some(); }
                 }
                 self.channels[channel_index].pending_dirty.insert(DirtyBits::PITCH);
             }
@@ -732,6 +739,16 @@ impl S3mProcessor {
                 // equal because a clamp folded them together.
                 let sample_number = sample_id.0.saturating_add(1);
                 let tag = VoiceTag { channel: channel_index as u8, instrument: instrument_number, sample: sample_number, note: linear_note(self.channels[channel_index].current_note) };
+                #[cfg(feature = "note-overlap")]
+                {
+                    let state = &self.channels[channel_index];
+                    let onset = state.new_note_pending.then_some(starplayer_core::TriggerIdentity {
+                        instrument: instrument_id, note: starplayer_core::OriginalNote::Note(Note::new(linear_note(state.current_note))), channel: channel_id, onset_volume: state.current_volume as u16,
+                    });
+                    context.trigger_legacy_overlap(tag, region, params, state.sample_offset, onset, &self.module);
+                    self.channels[channel_index].new_note_pending = false;
+                }
+                #[cfg(not(feature = "note-overlap"))]
                 context.trigger_channel(channel_id, tag, region, params, self.channels[channel_index].sample_offset);
             }
         } else if let Some(voice_id) = context.channels.foreground(channel_id)

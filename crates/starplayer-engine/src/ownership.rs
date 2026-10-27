@@ -86,6 +86,8 @@ pub struct PlaybackState {
     let_notes_ring: Box<[bool]>,
     #[cfg(feature = "note-overlap")]
     note_overlap_enabled: bool,
+    #[cfg(feature = "note-overlap")]
+    pub(crate) overlap_diagnostics: crate::overlap::OverlapDiagnostics,
 }
 
 impl PlaybackState {
@@ -105,6 +107,7 @@ impl PlaybackState {
         Ok(Self { configuration, slots: slots.into_boxed_slice(), next_age: 0,
             #[cfg(feature = "note-overlap")] let_notes_ring: selections,
             #[cfg(feature = "note-overlap")] note_overlap_enabled: false,
+            #[cfg(feature = "note-overlap")] overlap_diagnostics: Default::default(),
         })
     }
 
@@ -231,6 +234,15 @@ impl PlaybackState {
     pub const fn note_overlap_enabled(&self) -> bool { self.note_overlap_enabled }
 
     #[cfg(feature = "note-overlap")]
+    pub fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> {
+        self.configuration.instrument_count = selections.len();
+        core::mem::replace(&mut self.let_notes_ring, selections)
+    }
+
+    #[cfg(feature = "note-overlap")]
+    pub fn overlap_diagnostics(&self) -> crate::overlap::OverlapDiagnostics { self.overlap_diagnostics }
+
+    #[cfg(feature = "note-overlap")]
     pub fn let_notes_ring(&self, instrument: InstrumentId) -> Option<bool> { self.let_notes_ring.get(instrument.0 as usize).copied() }
 
     /// Returns a scoped clear request on bypass; NO-03/04/06 must execute it with ramps.
@@ -259,6 +271,19 @@ impl PlaybackState {
     pub fn finalize_onset(&mut self, voice: VoiceId, kind: TriggerKind, identity: TriggerIdentity, voices: &VoicePool) -> Result<bool, PlaybackStateError> {
         if !self.configuration.capabilities.contains(PlaybackCapabilities::NOTE_OVERLAP) { return Ok(false); }
         if kind != TriggerKind::NewNote { return Ok(false); }
+        self.store_onset(voice, identity, voices)
+    }
+
+    /// Native effect retriggers replace a mixer generation without a musical onset.
+    /// Transfer the original immutable identity; do not run custom duplicate actions.
+    #[cfg(feature = "note-overlap")]
+    pub(crate) fn inherit_onset(&mut self, voice: VoiceId, identity: TriggerIdentity, voices: &VoicePool) -> Result<bool, PlaybackStateError> {
+        if !self.configuration.capabilities.contains(PlaybackCapabilities::NOTE_OVERLAP) { return Ok(false); }
+        self.store_onset(voice, identity, voices)
+    }
+
+    #[cfg(feature = "note-overlap")]
+    fn store_onset(&mut self, voice: VoiceId, identity: TriggerIdentity, voices: &VoicePool) -> Result<bool, PlaybackStateError> {
         if identity.instrument.0 as usize >= self.configuration.instrument_count { return Err(PlaybackStateError::InvalidInstrument); }
         let owned = self.get(voice, voices).ok_or(PlaybackStateError::InvalidVoice)?;
         if owned.lifecycle == VoiceLifecycle::Retiring || owned.channel != identity.channel { return Err(PlaybackStateError::InvalidOwnership); }

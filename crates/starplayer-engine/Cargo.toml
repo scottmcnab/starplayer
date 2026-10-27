@@ -16,7 +16,7 @@ starplayer-model = { workspace = true }
 starplayer-telemetry = { workspace = true, optional = true }
 
 [features]
-note-overlap = []
+note-overlap = ["starplayer-mixer/note-overlap"]
 interactive-audition = ["starplayer-telemetry?/interactive-audition"]
 default = []
 std = ["starplayer-core/std", "starplayer-rt/std", "starplayer-dsp/std", "starplayer-mixer/std", "starplayer-model/std", "starplayer-telemetry?/std"]

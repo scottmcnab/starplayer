@@ -179,6 +179,14 @@ impl EngineSettings {
         let _ = identity;
     }
 
+    /// Keep persistent-host preparation aligned with the actual installed module.
+    pub fn set_instrument_count(&mut self, count: usize) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(configuration) = self.playback.as_mut() { configuration.instrument_count = count; }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        let _ = count;
+    }
+
     /// Prepare optional budgets without changing legacy constructors. This only enables
     /// capability/identity storage: overlap policy and interactive transport land later.
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
@@ -637,6 +645,14 @@ where
         let _ = identity;
     }
 
+    /// Swap an actual-module-sized selection table prepared by the control thread.
+    /// Return the old allocation for off-callback retirement, preserving voice ownership.
+    pub fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> {
+        #[cfg(feature = "note-overlap")]
+        if let Some(playback) = self.channels.playback_mut() { return playback.replace_instrument_selections(selections); }
+        selections
+    }
+
     /// Restore host-prepared settings on a fresh build, before any live input.
     pub fn restore_selections(&mut self, identity: starplayer_core::PlaybackIdentity, enabled: bool, selections: &[bool]) {
         #[cfg(feature = "note-overlap")]
@@ -930,6 +946,7 @@ where
                 // channels' mute flags are the host's and stay.
                 self.voices.release_all();
                 self.channels.forget_all();
+                self.channels.release_finished(&self.voices);
                 // A delay line still holding the previous song would bleed it into the
                 // first bar of the next one. The effects stay installed at their
                 // parameters; only their state goes.

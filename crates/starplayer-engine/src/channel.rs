@@ -20,9 +20,10 @@ use starplayer_mixer::{SampleRegion, VoicePool, VoiceTag};
 /// effect updates, plus zero or more *background* voices that have been detached and only
 /// run their own envelopes and fadeout until they die. Background voices are **not** owned
 /// by the channel — they live in the pool, tagged so Duplicate Check can find them — so
-/// they need no field here, and MOD/S3M/MTM simply never create one.
+/// they need no field here. Canonical MOD/S3M/MTM never create one; opt-in note
+/// overlap preserves custom tails using the shared generational PlaybackState.
 ///
-/// The cost of anticipating IT is therefore this doc comment and nothing else. Effect
+/// Background ownership is separate from this foreground binding. Effect
 /// memories live in the format crate's own per-channel state (B4's port of `ChannelData`),
 /// not here, because they are format semantics.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]

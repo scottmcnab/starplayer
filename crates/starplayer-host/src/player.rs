@@ -88,7 +88,7 @@ enum HostCommand {
     /// A module and the source built for it, both already decoded, scanned and allocated
     /// on the control thread. Nothing here is constructed in the callback and nothing is
     /// dropped there.
-    Load { module: RtArc<Module>, source: Box<dyn EventSource>, identity: Option<PlaybackIdentity> },
+    Load { module: RtArc<Module>, source: Box<dyn EventSource>, identity: Option<PlaybackIdentity>, selections: Option<Box<[bool]>> },
     /// What happens at the loop point, and how long the fade is when there is one.
     SetAtEnd { at_end: AtEnd, fade_frames: u32 },
     /// Pass straight through to the engine.
@@ -102,7 +102,7 @@ enum HostCommand {
 #[expect(dead_code, reason = "the payload exists to be dropped on the control thread, never to be read")]
 enum Retired {
     Module(RtArc<Module>),
-    Source(Box<dyn EventSource>),
+    Installation { source: Option<Box<dyn EventSource>>, selections: Option<Box<[bool]>> },
     Selections(Box<[bool]>),
 }
 
@@ -151,6 +151,8 @@ struct RenderState {
     telemetry: TelemetryReader,
     forwarded: SnapshotPublisher<PlayerSnapshot>,
     commands: Consumer<HostCommand>,
+    /// Preserve command order while a prepared load waits for off-thread retirement.
+    pending_command: Option<HostCommand>,
     retired: Producer<Retired>,
     handles: SourceHandles,
     transport: Transport,
@@ -237,8 +239,29 @@ impl RenderState {
     }
 
     fn drain_commands(&mut self) {
+        // Move the previous quantum's module retirement before reserving this one.
+        self.retire_engine_garbage();
+        let mut prepared_load = false;
+        let prepared_host = self.interactive_identity.is_some();
         for _ in 0..HOST_COMMAND_CAPACITY {
-            let Some(command) = self.commands.pop() else { break };
+            let Some(command) = self.pending_command.take().or_else(|| self.commands.pop()) else { break };
+            let available = self.retired.capacity().saturating_sub(self.retired.len());
+            let retirement_room = match &command {
+                // Source + old table share one entry; the old module arrives after
+                // Engine::render drains LoadModule. One prepared load per quantum
+                // keeps its engine garbage reservation bounded and explicit.
+                HostCommand::Load { .. } if prepared_host => 2,
+                HostCommand::RestoreSelections { .. } => 1 + usize::from(prepared_load),
+                _ => 0,
+            };
+            let another_load = prepared_load && matches!(&command, HostCommand::Load { .. });
+            let blocked_engine_load = prepared_host && matches!(&command, HostCommand::Load { .. })
+                && self.control.queued_commands() >= self.control.command_capacity();
+            if another_load || blocked_engine_load || available < retirement_room {
+                self.pending_command = Some(command);
+                break;
+            }
+            prepared_load |= prepared_host && matches!(&command, HostCommand::Load { .. });
             self.apply(command);
         }
     }
@@ -274,13 +297,17 @@ impl RenderState {
                 let _ = self.send(Command::Play);
             }
             HostCommand::Stop => self.transport.begin_stop(false),
-            HostCommand::Load { module, source, identity } => {
+            HostCommand::Load { module, source, identity, selections } => {
+                let retired_selections = selections.map(|selections| self.engine.replace_instrument_selections(selections));
                 if let Some(identity) = identity {
                     self.engine.set_playback_identity(identity);
                     self.interactive_identity = Some(identity);
                 }
-                if let Some(old) = self.engine.replace_source(source) {
-                    self.retire(Retired::Source(old));
+                let retired_source = self.engine.replace_source(source);
+                // Keep source and selection ownership in one retirement record, so
+                // preparing actual module bounds does not increase queue pressure.
+                if retired_source.is_some() || retired_selections.is_some() {
+                    self.retire(Retired::Installation { source: retired_source, selections: retired_selections });
                 }
                 let _ = self.send(Command::LoadModule(module));
             }
@@ -413,7 +440,8 @@ impl RenderState {
     /// the control thread. It is **moved**, never dropped: a `free()` here is the stall the
     /// garbage channel exists to prevent.
     fn retire_engine_garbage(&mut self) {
-        while let Some(module) = self.control.collect_garbage() {
+        while !self.retired.is_full() {
+            let Some(module) = self.control.collect_garbage() else { break };
             self.retire(Retired::Module(module));
         }
     }
@@ -506,6 +534,7 @@ fn build_sides(mode: MixerMode, spec: AudioSpec, mut settings: EngineSettings) -
         telemetry,
         forwarded,
         commands: command_consumer,
+        pending_command: None,
         retired: retired_producer,
         handles: handles.clone(),
         transport: if interactive_enabled { Transport::playing() } else { Transport::stopped() },
@@ -871,7 +900,11 @@ impl Player {
         let source: Box<dyn starplayer::engine::EventSource + Send> = Box::new(source);
         let source = if self.interactive_enabled { crate::source::interactive_sources(source, Box::new(starplayer::engine::SilentSource)) } else { source };
         let identity = self.next_identity(new_session);
-        self.commands.push(HostCommand::Load { module: RtArc::clone(&instruments), source, identity }).map_err(|_| HostError::ControlQueueFull)?;
+        let selections = self.prepare_instrument_selections(&instruments, new_session)?;
+        let instrument_shadow = selections.as_ref().map(|selections| selections.to_vec());
+        self.commands.push(HostCommand::Load { module: RtArc::clone(&instruments), source, identity, selections }).map_err(|_| HostError::ControlQueueFull)?;
+        if let Some(selections) = instrument_shadow { self.instrument_shadow = selections; }
+        self.engine_settings.set_instrument_count(instruments.instruments().len());
         self.handles.seek.clear();
         self.playback_identity = identity;
         self.module = Some(instruments);
@@ -881,6 +914,19 @@ impl Player {
         self.live_input = LiveInputMode::Off;
         if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); }
         Ok(length_frames)
+    }
+
+    /// Allocate to actual module bounds, including persistent hosts opened with count 0.
+    /// Same-session replacements retain selections; explicit user loads start false.
+    fn prepare_instrument_selections(&self, module: &Module, new_session: bool) -> Result<Option<Box<[bool]>>, HostError> {
+        if !self.engine_settings.playback_configuration().is_some_and(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)) { return Ok(None); }
+        let mut selections = Vec::new();
+        selections.try_reserve_exact(module.instruments().len()).map_err(|_| HostError::Backend(String::from("instrument selection allocation failed")))?;
+        selections.resize(module.instruments().len(), false);
+        if !new_session {
+            for (value, old) in selections.iter_mut().zip(self.instrument_shadow.iter()) { *value = *old; }
+        }
+        Ok(Some(selections.into_boxed_slice()))
     }
 
     fn install(&mut self, module: RtArc<Module>, start: SeekKind, cached_scan: Option<Arc<ScannedSong>>, new_session: bool) -> Result<(), HostError> {
@@ -900,8 +946,12 @@ impl Player {
             (built.source, None)
         };
         let identity = self.next_identity(new_session);
-        let command = HostCommand::Load { module: RtArc::clone(&module), source, identity };
+        let selections = self.prepare_instrument_selections(&module, new_session)?;
+        let instrument_shadow = selections.as_ref().map(|selections| selections.to_vec());
+        let command = HostCommand::Load { module: RtArc::clone(&module), source, identity, selections };
         self.commands.push(command).map_err(|_| HostError::ControlQueueFull)?;
+        if let Some(selections) = instrument_shadow { self.instrument_shadow = selections; }
+        self.engine_settings.set_instrument_count(module.instruments().len());
         self.playback_identity = identity;
         if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); }
         self.scan = Some(built.scanned);
@@ -1116,7 +1166,7 @@ impl Player {
         // every voice and forgets every binding, which is exactly what silencing the
         // tracker lanes as the source is swapped means. Nothing is decoded or scanned.
         self.commands
-            .push(HostCommand::Load { module, source: Box::new(source), identity: None })
+            .push(HostCommand::Load { module, source: Box::new(source), identity: None, selections: None })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.events = Some(EventSender::new(producer, Arc::clone(&self.event_clock)));
         self.live_input = LiveInputMode::MidiOnly;
@@ -1160,7 +1210,7 @@ impl Player {
             (built.source, None)
         };
         self.commands
-            .push(HostCommand::Load { module, source, identity: None })
+            .push(HostCommand::Load { module, source, identity: None, selections: None })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.scan = Some(built.scanned);
         self.smf = None;

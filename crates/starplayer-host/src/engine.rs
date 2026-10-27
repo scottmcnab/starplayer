@@ -133,6 +133,7 @@ macro_rules! define_arms {
             fn is_playing(&self) -> bool { match self { $(EngineArm::$variant(engine) => engine.is_playing(),)+ } }
             fn set_playback_identity(&mut self, identity: starplayer::core::PlaybackIdentity) { match self { $(EngineArm::$variant(engine) => engine.set_playback_identity(identity),)+ } }
             fn interactive_transport(&self) -> Option<starplayer::core::InteractiveTransport> { match self { $(EngineArm::$variant(engine) => engine.interactive_transport(),)+ } }
+            fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> { match self { $(EngineArm::$variant(engine) => engine.replace_instrument_selections(selections),)+ } }
             fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, selections: &[bool]) { match self { $(EngineArm::$variant(engine) => engine.restore_selections(identity, enabled, selections),)+ } }
             fn master_volume(&self) -> U0F16 { match self { $(EngineArm::$variant(engine) => engine.master_volume(),)+ } }
             fn warnings(&self) -> EngineWarnings { match self { $(EngineArm::$variant(engine) => engine.warnings(),)+ } }
@@ -224,6 +225,8 @@ impl HostEngine {
     pub fn replace_source(&mut self, source: Box<dyn EventSource>) -> Option<Box<dyn EventSource>> {
         self.arm.replace_source(source)
     }
+
+    pub fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> { self.arm.replace_instrument_selections(selections) }
 
     pub fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, selections: &[bool]) { self.arm.restore_selections(identity, enabled, selections); }
     pub fn set_playback_identity(&mut self, identity: starplayer::core::PlaybackIdentity) { self.arm.set_playback_identity(identity); }

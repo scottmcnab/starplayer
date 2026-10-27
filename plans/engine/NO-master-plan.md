@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation authorised 2026-10-27; NO-01–03 integrated; NO-04 in progress; reviewed instrument-only/onset-volume contract unchanged |
+| Status | Implementation authorised 2026-10-27; NO-01–04 integrated; NO-05 in progress; reviewed instrument-only/onset-volume contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -559,3 +559,11 @@ planning handoff. External review findings, corrections and final disposition ar
   Canonical conformance/goldens unchanged; allocation, no_std/WASM, unification and
   default embedded checks passed. See NO-03 for exact commands and reconstruction limits.
 - NO-04 starts after NO-03, using Sol high as the sole active task worker.
+
+- NO-04 integrated by reviewed single-change squash (task commit `61138bb`): bounded
+  MOD/S3M/MTM overlap, passive exact identity, actual sample/checkbox resolution and
+  safe prepared-load/table retirement. Three canonical configurations and six sizes,
+  all8 goldens, baseline conformance, RT, independent flags, no_std/WASM/firmware and
+  coordinator regression passed. Pre-existing S3M fast-slide flag gap is documented,
+  with no effect repair or golden changes. See NO-04 for evidence and dependent APIs.
+- NO-05 starts after NO-04, using Astra medium as the sole active task worker.
