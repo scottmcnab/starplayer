@@ -738,7 +738,7 @@ impl S3mProcessor {
                 // and IT's Duplicate Check must never see two different samples compare
                 // equal because a clamp folded them together.
                 let sample_number = sample_id.0.saturating_add(1);
-                let tag = VoiceTag { channel: channel_index as u8, instrument: instrument_number, sample: sample_number, note: linear_note(self.channels[channel_index].current_note) };
+                let tag = VoiceTag { channel: channel_index as u8, instrument: instrument_number as u16, sample: sample_number, note: linear_note(self.channels[channel_index].current_note) };
                 #[cfg(feature = "note-overlap")]
                 {
                     let state = &self.channels[channel_index];

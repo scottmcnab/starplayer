@@ -845,7 +845,7 @@ impl ModProcessor {
             if context.channels.playback().is_some_and(|playback| playback.configuration().capabilities.contains(starplayer_core::PlaybackCapabilities::NOTE_OVERLAP))
                 && let Some(voice) = context.channels.foreground(channel_id).and_then(|voice| context.voices.get_mut(voice))
                 && let Some(sample) = self.module.instrument(InstrumentId((queued - 1) as u16)).and_then(|instrument| instrument.sample)
-            { voice.tag_pending_sample(region, queued, sample.0.saturating_add(1)); }
+            { voice.tag_pending_sample(region, queued as u16, sample.0.saturating_add(1)); }
             return;
         }
         // A voice that merely ran out still owns its channel; one that was cut left it
@@ -886,7 +886,7 @@ impl ModProcessor {
             };
             let tag = VoiceTag {
                 channel: channel_index as u8,
-                instrument: state.sample_number,
+                instrument: state.sample_number as u16,
                 sample: self.module.instrument(InstrumentId((state.sample_number - 1) as u16)).and_then(|instrument| instrument.sample).map_or(0, |sample| sample.0.saturating_add(1)),
                 note: if state.current_note == NO_NOTE { 0 } else { state.current_note },
             };

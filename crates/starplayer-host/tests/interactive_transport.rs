@@ -270,3 +270,35 @@ fn smf_rebuild_retains_file_cursor_controllers_and_future_event_without_replay()
         }
     }
 }
+
+#[test]
+fn permanent_live_slot_works_before_play_after_stop_and_across_routing_without_reload() {
+    use starplayer::core::{Event, InstrumentId, InteractiveAction, LiveDestination, Note, U0F16};
+    let (mut backend, mut player, driver) = open(); player.load(&module(false)).unwrap(); render(&driver,128);
+    let identity = player.playback_identity();
+    player.interactive(InteractiveAction::PreviewInstrument(InstrumentId(0))).unwrap();
+    assert!(render(&driver,1024).iter().any(|sample| *sample != 0.0)); assert_eq!(player.song_frame(),0);
+    player.interactive(InteractiveAction::StopPreview).unwrap(); let stopped = render(&driver,1024); assert!(stopped[128..].iter().all(|sample| *sample == 0.0)); assert_eq!(player.telemetry().voices_active,0);
+    player.interactive(InteractiveAction::SetLiveDestination(LiveDestination::Selected(InstrumentId(0)))).unwrap();
+    player.send_event(15,Event::NoteOn {note:Note::new(60),velocity:U0F16::MAX}).unwrap();
+    assert!(render(&driver,4096).iter().any(|sample| *sample != 0.0));
+    assert_eq!(player.playback_identity(),identity); assert_eq!(player.song_frame(),0);
+    player.clear_and_hold().unwrap(); render(&driver,128);
+    player.send_event(0,Event::NoteOn {note:Note::new(60),velocity:U0F16::MAX}).unwrap();
+    assert!(render(&driver,8192).iter().any(|sample| *sample != 0.0));
+    let spec = player.spec(); player.reopen(&mut backend,None,spec).unwrap(); let rebuilt = backend.driver().unwrap(); render(&rebuilt,128);
+    assert_ne!(player.playback_identity(),identity); assert_eq!(player.telemetry().voices_active,0);
+    player.send_event(0,Event::NoteOn {note:Note::new(60),velocity:U0F16::MAX}).unwrap();
+    assert!(render(&rebuilt,4096).iter().any(|sample| *sample != 0.0),"routing survives rebuild with empty held generations");
+}
+
+#[test]
+fn preview_after_natural_end_is_audible_without_restarting_song() {
+    let (_,mut player,driver)=open(); player.load(&module(true)).unwrap();
+    player.set_at_end(AtEnd::FadeOut).unwrap();player.set_fade_frames(256).unwrap();player.play().unwrap();
+    for _ in 0..256 {render(&driver,128);player.telemetry();if player.natural_end(){break;}}
+    assert!(player.natural_end());render(&driver,1024);player.telemetry();let ended=player.song_frame();
+    player.interactive(starplayer::core::InteractiveAction::PreviewInstrument(starplayer::core::InstrumentId(0))).unwrap();
+    assert!(render(&driver,2048).iter().any(|sample|*sample!=0.0));
+    player.telemetry();assert!(player.natural_end());assert_eq!(player.song_frame(),ended);
+}

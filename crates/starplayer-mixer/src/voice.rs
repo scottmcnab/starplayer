@@ -102,7 +102,7 @@ pub struct VoiceTag {
     /// no longer *owned* by that channel.
     pub channel: u8,
     /// One-based tracker instrument number; zero means none.
-    pub instrument: u8,
+    pub instrument: u16,
     /// One-based tracker sample number; zero means none.
     pub sample: u16,
     /// Which note.
@@ -305,7 +305,7 @@ pub struct Voice {
     /// lock, and the accumulation loop looks at it only where it already handles the
     /// boundary. See accuracy policy D12.
     pending_region: Option<SampleRegion>,
-    // Instrument in bits 16..24, sample in 0..16; zero means no tagged swap.
+    // Instrument in bits 16..32, sample in 0..16; zero means no tagged swap.
     // Packing fits the existing slot padding (the 168-byte stride test stays exact).
     #[cfg(feature = "note-overlap")]
     pending_sample_tag: u32,
@@ -457,7 +457,7 @@ impl Voice {
     /// Actual sounding sample metadata follows the same boundary as its queued PCM.
     /// Passive note identity is separate and remains immutable in the engine.
     #[cfg(feature = "note-overlap")]
-    pub fn tag_pending_sample(&mut self, region: SampleRegion, instrument: u8, sample: u16) {
+    pub fn tag_pending_sample(&mut self, region: SampleRegion, instrument: u16, sample: u16) {
         if self.pending_region == Some(region) { self.pending_sample_tag = ((instrument as u32) << 16) | sample as u32; }
     }
 
@@ -483,7 +483,7 @@ impl Voice {
         {
             let sample_tag = core::mem::take(&mut self.pending_sample_tag);
             if sample_tag != 0 {
-                self.tag.instrument = (sample_tag >> 16) as u8;
+                self.tag.instrument = (sample_tag >> 16) as u16;
                 self.tag.sample = sample_tag as u16;
             }
         }

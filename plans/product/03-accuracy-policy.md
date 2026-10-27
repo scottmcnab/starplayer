@@ -715,7 +715,8 @@ The [NO master plan](../engine/NO-master-plan.md) defines an optional creative p
 layer, not a new interpretation of canonical tracker effects. NO-01 implements its
 contract types, optional preparation and bounded lane routing. NO-02/03 add native
 articulation/interactive transport; NO-04 adds opt-in MOD/S3M/MTM overlap. NO-05 adds
-XM/IT overlap; faithful live audition remains NO-06 work. No canonical effect behavior changes.
+XM/IT overlap; NO-06 adds faithful explicitly prepared instrument racks. No canonical
+tracker effect behavior changes.
 Unchecked/global-bypassed and feature-disabled renders must retain existing golden output.
 Custom overlap preserves non-looping sample tails and may override IT NNA/duplicate
 actions explicitly; authored IT behavior remains the default, including looping NNA.
@@ -793,3 +794,15 @@ without reapplying defaults, but this task does not change authored native NNA o
 specific cause; no exclusion is reclassified here and no canonical golden is changed.
 A separate accuracy task should repair native remembered-instrument resolution against
 the existing format reference/conformance fixtures.
+
+
+NO-06 prepared racks use native XM/IT articulation, sample maps, tuning, release/filter
+and note actions. Existing unconfigured musical racks keep their prior behavior. The
+reviewed live reference convention remains MIDI60 at the reference rate: XM selects
+map60 but uses the pitch equivalent of native zero-based48 before sample tuning; IT
+uses map/pitch60 directly. This adapter convention is explicit and tested separately
+from canonical tracker numbering. Identity uses the resolved pre-CC7 base (XM0–64,
+IT0–256; simple PCM retains Q0.16), including existing resolution collisions. CC7/CC10
+remain next-note latches. Shared native cadence supports explicitly prepared SMF N/C
+racks with either feature; live L routing requires audition. Native tracker goldens and
+pinned conformance remain unchanged; no oracle exclusions or golden hashes are updated.

@@ -70,7 +70,7 @@ pub fn capture_channels(publisher: &mut TelemetryPublisher, channels: &ChannelTa
                 // display follows a stolen or retriggered voice without the sequencer
                 // having to remember anything (architecture §5.1).
                 note: Some(Note::new(state.tag.note)),
-                instrument: Some(state.tag.instrument),
+                instrument: Some(state.tag.instrument.min(u8::MAX as u16) as u8),
                 volume: Some(state.params.volume),
                 pan: Some(state.params.pan),
                 volume_written: state.params.dirty.contains(DirtyBits::VOLUME),
@@ -114,7 +114,7 @@ pub fn capture_midi_channels(publisher: &mut TelemetryPublisher, channels: &Chan
             Some((voice, state)) => ChannelUpdate {
                 voice: Some(voice),
                 note: Some(Note::new(state.tag.note)),
-                instrument: Some(state.tag.instrument),
+                instrument: Some(state.tag.instrument.min(u8::MAX as u16) as u8),
                 volume: Some(state.params.volume),
                 pan: Some(state.params.pan),
                 volume_written: state.params.dirty.contains(DirtyBits::VOLUME),

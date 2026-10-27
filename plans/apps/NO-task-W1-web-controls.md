@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](../engine/NO-master-plan.md) |
-| Status | Authorised; pending NO-06 |
+| Status | In progress on task/no-w1-web-controls; NO-01–06 integrated |
 | Depends on | NO-06 (and all its dependencies) |
 | Blocks | NO-07 |
 | Parallel with | None touching shared web transport/command state |

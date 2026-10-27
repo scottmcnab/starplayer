@@ -52,7 +52,7 @@ pub use event::{
 };
 pub use fixed::{I1F15, Q32_32, Step, U0F16};
 pub use frame::Frame;
-pub use interactive::{BuildGeneration, InteractiveAction, InteractiveCommand, InteractiveTransport, MidiControllerState, SmfCursor, SmfPlaybackState, RowArrival, SequencerCursor, OriginalNote, PlaybackCapabilities, PlaybackIdentity, SessionId, TriggerIdentity, TriggerKind};
+pub use interactive::{BuildGeneration, InteractiveAction, LiveDestination, InteractiveCommand, InteractiveTransport, MidiControllerState, SmfCursor, SmfPlaybackState, RowArrival, SequencerCursor, OriginalNote, PlaybackCapabilities, PlaybackIdentity, SessionId, TriggerIdentity, TriggerKind};
 pub use note::{Note, Period};
 pub use quirks::{
     BreakParameter, FormatDialect, ItLoopDialect, ModLoopDialect, PatternFlow, PaulaClock,

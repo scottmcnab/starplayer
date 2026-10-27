@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation authorised 2026-10-27; NO-01–05 integrated; NO-06 in progress; reviewed instrument-only/onset-volume contract unchanged |
+| Status | Implementation authorised 2026-10-27; NO-01–06 integrated; NO-W1 in progress; reviewed instrument-only/onset-volume contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -575,3 +575,37 @@ planning handoff. External review findings, corrections and final disposition ar
   no_std/WASM, all8 goldens and baseline conformance passed; coordinator regression
   passed. The existing authored IT NNA note-only mapping defect is recorded separately.
 - NO-06 starts after NO-05, using Astra medium as the sole active task worker.
+
+### NO-06 live reference convention
+
+The configured adapter preserves the existing live convention documented in M4-E4:
+XM input note60 selects native sample-map entry60, but plays the8363 Hz reference
+before relative-note/finetune adjustment. The equivalent native XM tracker pitch is
+zero-based48 (cell49), not zero-based60 (cell61). Mapping and pitch conversion are
+independent, and tests must demonstrate both without silently remapping fixtures.
+IT input60 uses native map60 and native reference60 directly. This is an explicit
+live-input adapter convention, not a change to canonical tracker note numbering or
+unconfigured legacy rack output.
+
+### NO-06 prepared SMF cadence gate correction
+
+Source review found NO-03 gated the shared cadence/post-source hook solely on
+interactive-audition, although an explicitly prepared overlap-only SMF rack also needs
+native articulation. The shared cadence and prepared Song rack are available under
+either optional feature, activated only by a prepared source. Song uses lanes0–15,
+N native quota and C custom tails. Live uses lanes64–80 and L, and remains gated by
+interactive-audition together with Pause/held transport, routing and Preview commands.
+Unconfigured SMF/racks retain the original1ms sample-only behavior, even under feature
+unification; neither-feature builds construct none of this optional machinery. No new
+product switch or default behavior is introduced. This bounded gate correction was
+approved by the coordinator from the existing master contract.
+
+- NO-06 integrated by reviewed single-change squash (task commit `fd14c4d`): faithful
+  native prepared racks, immutable pre-CC7 identity, held instances and scoped cleanup,
+  permanent live source, shared N/C/L admission and precise wide instrument tags.
+  Prepared SMF native cadence is available with either feature; live controls remain
+  audition-only. Existing MIDI60 reference and next-note CC7/CC10 latches are explicit.
+  Worker17 live/15 host/10 RT, independent feature and portable matrices, goldens and
+  coordinator52 regression groups passed. Coordinator conformance remains261/179/0/16/66.
+  See NO-06 for resource, timing and dependent API evidence.
+- NO-W1 starts after NO-06, using Sol high as the sole active task worker.

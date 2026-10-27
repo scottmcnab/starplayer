@@ -34,6 +34,9 @@
 // length before use, and every table index is masked to its declared domain.
 #![allow(clippy::indexing_slicing)]
 
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+pub mod live;
+
 use alloc::boxed::Box;
 use alloc::vec;
 
@@ -280,6 +283,10 @@ pub struct ItVoiceState {
     /// The last parameters written, so a tick only writes what changed.
     written: VoiceParams,
     has_written: bool,
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    live_bend_cents: i16,
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    output_frequency_hz: u32,
     /// The volume the last tick computed, in OpenMPT's 14-bit mixing scale.
     real_volume: i32,
     /// The pan the last tick computed, 0..=256.
@@ -324,6 +331,10 @@ impl Default for ItVoiceState {
             new_note_action: NewNoteAction::Cut,
             written: VoiceParams::SILENT,
             has_written: false,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            live_bend_cents: 0,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            output_frequency_hz: 0,
             real_volume: 0,
             real_pan: 128,
         }
@@ -794,6 +805,8 @@ impl ItArticulationRuntime {
             };
         }
         frequency = advance_auto_vibrato(state, module.sample(SampleId(state.sample.wrapping_sub(1))), frequency, &mut self.random);
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        { state.output_frequency_hz = frequency; }
 
         if state.surround {
             // Accuracy policy D66: StarPlayer has no rear bus, so surround is centre.
@@ -1547,7 +1560,7 @@ impl ItProcessor {
         let offset = self.channels[channel_index].sample_offset;
         let tag = VoiceTag {
             channel: channel_index as u8,
-            instrument: instrument.min(u8::MAX as u16) as u8,
+            instrument,
             sample,
             note,
         };

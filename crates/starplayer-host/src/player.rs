@@ -584,6 +584,7 @@ pub struct Player {
     interactive_enabled: bool,
     overlap_shadow: bool,
     instrument_shadow: Vec<bool>,
+    live_destination: starplayer::core::LiveDestination,
     transport_shadow: InteractiveTransport,
     rebuild_cursor: Option<starplayer::core::SequencerCursor>,
     stream: Stream,
@@ -663,6 +664,7 @@ impl Player {
             playback_identity: settings.playback_configuration().map(|configuration| configuration.identity),
             interactive_enabled: settings.playback_configuration().is_some_and(|configuration| configuration.capacity.interactive_transport),
             overlap_shadow: false,
+            live_destination: starplayer::core::LiveDestination::Off,
             instrument_shadow: vec![false; settings.playback_configuration().filter(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)).map_or(0, |configuration| configuration.instrument_count)],
             transport_shadow: InteractiveTransport::Stopped,
             rebuild_cursor: None,
@@ -833,6 +835,7 @@ impl Player {
             rebuilt.overlap_shadow = self.overlap_shadow;
         }
         if self.interactive_enabled {
+            rebuilt.interactive(InteractiveAction::SetLiveDestination(self.live_destination))?;
             if let Some(identity) = rebuilt.playback_identity {
                 rebuilt.queue(HostCommand::RestoreTransport { identity, transport: if saved_host.engine.is_idle() { Transport::playing() } else { saved_host.transport.converted(self.spec.sample_rate_hz, rebuilt.spec.sample_rate_hz) }, state: interactive_state, natural_end: saved_host.natural_end })?;
                 rebuilt.transport_shadow = interactive_state;
@@ -880,25 +883,40 @@ impl Player {
 
     fn install_smf(&mut self, smf: Arc<starplayer::midi::smf::Smf>, instruments: RtArc<Module>, restore: Option<starplayer::core::SmfPlaybackState>, new_session: bool) -> Result<u64, HostError> {
         let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
-        #[cfg(feature = "interactive-audition")]
-        let sequencer = if self.interactive_enabled {
-            starplayer::midi::SmfSequencer::interactive_at(&smf, self.spec.sample_rate_hz, frame, restore.map(|state| state.cursor))
-        } else { starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame) };
-        #[cfg(not(feature = "interactive-audition"))]
-        let sequencer = { let _ = restore; starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame) };
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        let prepared = self.engine_settings.playback_configuration().is_some_and(|configuration| !configuration.capabilities.is_empty());
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        let sequencer = {
+            #[cfg(feature = "interactive-audition")]
+            if self.interactive_enabled { starplayer::midi::SmfSequencer::interactive_at(&smf, self.spec.sample_rate_hz, frame, restore.map(|state| state.cursor)) }
+            else if prepared { starplayer::midi::SmfSequencer::prepared_song_at(&smf, self.spec.sample_rate_hz, frame) }
+            else { starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame) }
+            #[cfg(not(feature = "interactive-audition"))]
+            if prepared { starplayer::midi::SmfSequencer::prepared_song_at(&smf, self.spec.sample_rate_hz, frame) }
+            else { starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame) }
+        };
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        let sequencer = starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame);
         let length_frames = sequencer.length_frames();
-        #[cfg(not(feature = "interactive-audition"))]
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
         let rack = InstrumentRack::for_module(&instruments, self.spec.sample_rate_hz);
-        #[cfg(feature = "interactive-audition")]
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
         let rack = {
-            let mut rack = if self.interactive_enabled { InstrumentRack::for_sequenced_module(&instruments, self.spec.sample_rate_hz) } else { InstrumentRack::for_module(&instruments, self.spec.sample_rate_hz) };
+            #[allow(unused_mut)]
+            let mut rack = if prepared { starplayer::prepare_instrument_rack(&instruments, self.spec.sample_rate_hz, self.engine_settings.voice_capacity, starplayer::engine::instrument::live::RackScope::Song)? } else { InstrumentRack::for_module(&instruments, self.spec.sample_rate_hz) };
+            #[cfg(feature = "interactive-audition")]
             if let Some(state) = restore { rack.restore_controllers(state.channels); }
             rack
         };
+        #[cfg(not(feature = "interactive-audition"))]
+        let _ = restore;
         let mut source = MidiSource::new(sequencer, rack, self.spec.sample_rate_hz);
         source.start_control_at(frame);
-        let source: Box<dyn starplayer::engine::EventSource + Send> = Box::new(source);
-        let source = if self.interactive_enabled { crate::source::interactive_sources(source, Box::new(starplayer::engine::SilentSource)) } else { source };
+        let source: Box<dyn starplayer::engine::EventSource> = Box::new(source);
+        let (source, events) = if self.interactive_enabled {
+            let (live, producer) = self.build_live_source(&instruments, frame)?;
+            (crate::source::interactive_sources(source, live), Some(EventSender::interactive(producer, Arc::clone(&self.event_clock))))
+        } else { (source, None) };
         let identity = self.next_identity(new_session);
         let selections = self.prepare_instrument_selections(&instruments, new_session)?;
         let instrument_shadow = selections.as_ref().map(|selections| selections.to_vec());
@@ -910,9 +928,9 @@ impl Player {
         self.module = Some(instruments);
         self.scan = None;
         self.smf = self.interactive_enabled.then_some(smf);
-        self.events = None;
+        self.events = events;
         self.live_input = LiveInputMode::Off;
-        if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); }
+        if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
         Ok(length_frames)
     }
 
@@ -938,7 +956,10 @@ impl Player {
         self.handles.seek.clear();
         let built = crate::source::build_source_with_cursor(RtArc::clone(&module), crate::source::SourcePosition { seek: start, cursor: self.rebuild_cursor.take() }, frame, &self.handles, cached_scan, self.speed_adjust, self.engine_settings)?;
         let (source, events) = if self.interactive_enabled {
-            (crate::source::interactive_sources(built.source, Box::new(starplayer::engine::SilentSource)), None)
+            {
+                let (live, producer) = self.build_live_source(&module, frame)?;
+                (crate::source::interactive_sources(built.source, live), Some(EventSender::interactive(producer, Arc::clone(&self.event_clock))))
+            }
         } else if self.live_input == LiveInputMode::Jam {
             let (source, producer) = self.build_jam_source(&module, frame, built.source)?;
             (source, Some(EventSender::new(producer, Arc::clone(&self.event_clock))))
@@ -953,7 +974,7 @@ impl Player {
         if let Some(selections) = instrument_shadow { self.instrument_shadow = selections; }
         self.engine_settings.set_instrument_count(module.instruments().len());
         self.playback_identity = identity;
-        if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); }
+        if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
         self.scan = Some(built.scanned);
         self.smf = None;
         self.module = Some(module);
@@ -962,6 +983,19 @@ impl Player {
             self.live_input = LiveInputMode::Off;
         }
         Ok(())
+    }
+
+    fn build_live_source(&self, module: &RtArc<Module>, frame: Frame) -> Result<(Box<dyn EventSource>, ExternalEventProducer), HostError> {
+        #[cfg(feature = "interactive-audition")]
+        {
+            let rack = starplayer::prepare_live_rack(module, self.spec.sample_rate_hz, self.engine_settings.voice_capacity)?;
+            let (producer, queue) = starplayer::engine::instrument::recoverable_event_channel(EVENT_QUEUE_CAPACITY);
+            let mut source = MidiSource::new(queue, rack, self.spec.sample_rate_hz);
+            source.start_control_at(frame);
+            Ok((Box::new(source), producer))
+        }
+        #[cfg(not(feature = "interactive-audition"))]
+        { let _ = (module, frame); Err(HostError::Backend(String::from("interactive input was not compiled"))) }
     }
 
     /// Put a seekable module source in slot 0 and live input in slot 1.
@@ -1020,19 +1054,26 @@ impl Player {
     /// Accept an atomic command from a wire/client, rejecting old sessions/builds before
     /// changing host shadow or fade state.
     pub fn submit_interactive(&mut self, command: InteractiveCommand) -> Result<(), HostError> {
-        if self.playback_identity != Some(command.identity) { return Err(HostError::Backend(String::from("stale playback identity"))); }
+        if self.playback_identity != Some(command.identity) { return Err(HostError::InvalidInteractiveCommand); }
         self.interactive(command.action)
     }
 
     pub fn interactive(&mut self, action: InteractiveAction) -> Result<(), HostError> {
-        if !self.interactive_enabled && matches!(action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview) {
-            return Err(HostError::Backend(String::from("interactive transport was not prepared")));
+        if !self.interactive_enabled && matches!(action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview | InteractiveAction::SetLiveDestination(_) | InteractiveAction::PreviewInstrument(_) | InteractiveAction::ReleasePreview) {
+            return Err(HostError::InvalidInteractiveCommand);
         }
-        if matches!(action, InteractiveAction::SetNoteOverlapEnabled(_) | InteractiveAction::SetLetNotesRing { .. }) && !self.engine_settings.playback_configuration().is_some_and(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)) { return Err(HostError::Backend(String::from("note overlap was not prepared"))); }
-        if let InteractiveAction::SetLetNotesRing { instrument, .. } = action && instrument.0 as usize >= self.instrument_shadow.len() { return Err(HostError::Backend(String::from("instrument override is outside prepared capacity"))); }
-        let identity = self.playback_identity.ok_or_else(|| HostError::Backend(String::from("interactive transport was not prepared")))?;
+        if matches!(action, InteractiveAction::SetNoteOverlapEnabled(_) | InteractiveAction::SetLetNotesRing { .. }) && !self.engine_settings.playback_configuration().is_some_and(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)) { return Err(HostError::InvalidInteractiveCommand); }
+        if let InteractiveAction::SetLetNotesRing { instrument, .. } = action && instrument.0 as usize >= self.instrument_shadow.len() { return Err(HostError::InvalidInteractiveCommand); }
+        #[cfg(feature = "interactive-audition")]
+        match action {
+            InteractiveAction::PreviewInstrument(instrument) if !self.module.as_ref().is_some_and(|module| starplayer::live_instrument_capability(module, instrument).preview_playable) => return Err(HostError::InvalidInteractiveCommand),
+            InteractiveAction::SetLiveDestination(starplayer::core::LiveDestination::Selected(instrument)) if !self.module.as_ref().is_some_and(|module| starplayer::live_instrument_capability(module, instrument).playable) => return Err(HostError::InvalidInteractiveCommand),
+            _ => {}
+        }
+        let identity = self.playback_identity.ok_or(HostError::InvalidInteractiveCommand)?;
         self.queue(HostCommand::Interactive(InteractiveCommand { identity, action }))?;
         match action {
+            InteractiveAction::SetLiveDestination(destination) => { self.live_destination = destination; self.live_input = if destination == starplayer::core::LiveDestination::Jam { LiveInputMode::Jam } else { LiveInputMode::Off }; },
             InteractiveAction::SetNoteOverlapEnabled(enabled) => self.overlap_shadow = enabled,
             InteractiveAction::SetLetNotesRing { instrument, enabled } => { if let Some(value) = self.instrument_shadow.get_mut(instrument.0 as usize) { *value = enabled; } }
             _ => {}
@@ -1183,7 +1224,7 @@ impl Player {
     pub fn jam(&mut self, enabled: bool) -> Result<(), HostError> {
         if self.interactive_enabled {
             self.module.as_ref().ok_or(HostError::NoModule)?;
-            // NO-06 consumes this routing state using its permanent prepared rack.
+            self.interactive(InteractiveAction::SetLiveDestination(if enabled { starplayer::core::LiveDestination::Jam } else { starplayer::core::LiveDestination::Off }))?;
             self.live_input = if enabled { LiveInputMode::Jam } else { LiveInputMode::Off };
             return Ok(());
         }

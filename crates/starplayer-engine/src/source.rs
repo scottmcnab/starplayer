@@ -210,8 +210,16 @@ pub trait EventSource: Send {
     #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
     fn describe_interactive(&mut self, _context: &mut EngineContext<'_>) {}
 
-    /// Exactly one live articulation step after all due sources, at the authority's frame.
     #[cfg(feature = "interactive-audition")]
+    fn interactive_action(&mut self, _action: starplayer_core::InteractiveAction, _context: &mut EngineContext<'_>) {}
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn uses_articulation_cadence(&self) -> bool { false }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn initial_articulation_interval(&self) -> Option<u64> { None }
+
+    /// Exactly one live articulation step after all due sources, at the authority's frame.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     fn post_source_articulation(&mut self, _frame: Frame, _context: &mut EngineContext<'_>) {}
 
     /// Invalidate source-owned holds/articulation immediately; the engine owns voice ramps.
@@ -231,8 +239,14 @@ impl<Source: EventSource> EventSource for [Source; 1] {
     fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame, control: &mut ControlClock) { let [source] = self; source.set_transport(state, frame, control); }
     #[cfg(feature = "interactive-audition")]
     fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) { let [source] = self; source.dispatch_interactive(frame, context); }
-    #[cfg(feature = "interactive-audition")]
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     fn post_source_articulation(&mut self, frame: Frame, context: &mut EngineContext<'_>) { let [source] = self; source.post_source_articulation(frame, context); }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn uses_articulation_cadence(&self) -> bool { let [source] = self; source.uses_articulation_cadence() }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn initial_articulation_interval(&self) -> Option<u64> { let [source] = self; source.initial_articulation_interval() }
+    #[cfg(feature = "interactive-audition")]
+    fn interactive_action(&mut self, action: starplayer_core::InteractiveAction, context: &mut EngineContext<'_>) { let [source] = self; source.interactive_action(action, context); }
     #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
     fn describe_interactive(&mut self, context: &mut EngineContext<'_>) { let [source] = self; source.describe_interactive(context); }
 
@@ -473,9 +487,17 @@ impl EventSource for SourceMux {
     fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
         for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.dispatch_interactive(frame, context); } }
     }
-    #[cfg(feature = "interactive-audition")]
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     fn post_source_articulation(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
         for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.post_source_articulation(frame, context); } }
+    }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn uses_articulation_cadence(&self) -> bool { self.slots.iter().any(|slot| slot.source.as_ref().is_some_and(|source| source.uses_articulation_cadence())) }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn initial_articulation_interval(&self) -> Option<u64> { self.slots.iter().find_map(|slot| slot.source.as_ref().and_then(|source| source.initial_articulation_interval())) }
+    #[cfg(feature = "interactive-audition")]
+    fn interactive_action(&mut self, action: starplayer_core::InteractiveAction, context: &mut EngineContext<'_>) {
+        for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.interactive_action(action, context); } }
     }
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     fn clear_scope(&mut self, scope: crate::ownership::ClearScope, context: &mut EngineContext<'_>) {

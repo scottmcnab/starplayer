@@ -475,3 +475,10 @@ mod tests {
         assert_eq!(load(&bytes).map(|module| module.header().format), Ok(starplayer_model::ModuleFormat::Mtm));
     }
 }
+
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+mod live;
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+pub use live::{prepare_instrument_rack, live_instrument_capability};
+#[cfg(feature = "interactive-audition")]
+pub use live::prepare_live_rack;

@@ -23,13 +23,13 @@
 //! do **not** implement it: they own their formats' per-voice articulation and write voice
 //! parameters through `TickContext`, which is what the M4-lite decision made them.
 //!
-//! # What these instruments do not do
+//! # Legacy and explicitly prepared racks
 //!
-//! No volume, panning or pitch envelopes, no fadeout, no New Note Actions, no
-//! auto-vibrato and no resonant filter — a MIDI-driven note starts, sounds and stops.
-//! Giving a MIDI-driven XM or IT instrument its format's own articulation is **M11**'s
-//! deliverable (`plans/engine/M11-master-plan.md`), and architecture open question Q4 —
-//! whether the trait survives contact with a non-sample instrument — stays open for M10.
+//! The legacy constructors retain sample-only playback and their 1 ms control clock.
+//! Explicitly prepared racks use one pool-indexed native XM/IT runtime for all programs,
+//! with native envelopes, release, fadeout, NNA, auto-vibrato and IT filtering. They
+//! consume the engine's shared articulation cadence. Song scope is available under
+//! either optional feature; live routing and Preview require interactive-audition.
 //!
 //! # The two shapes E5 and E6 build on
 //!
@@ -88,6 +88,9 @@ use starplayer_rt::{Arc, Consumer, Producer};
 
 use crate::control::{ControlClock, DEFAULT_CONTROL_INTERVAL_MICROS};
 use crate::source::{EngineContext, EventSource};
+
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+pub mod live;
 
 // ── the conventions ─────────────────────────────────────────────────────────────────
 
@@ -324,7 +327,7 @@ fn plan_voice(sample: &SampleIndex, recipe: VoiceRecipe) -> Option<VoicePlan> {
         channel: 0,
         // One-based, as every format processor tags its voices, so the telemetry and the
         // trace read a MIDI voice exactly as they read a tracker one.
-        instrument: recipe.instrument.0.saturating_add(1).min(u8::MAX as u16) as u8,
+        instrument: recipe.instrument.0.saturating_add(1),
         sample: recipe.sample_id.0.saturating_add(1),
         note: recipe.note.to_midi(),
     };
@@ -380,23 +383,16 @@ impl SampleInstrument {
         SampleInstrument { module: Arc::clone(module), instrument: index, sample_rate_hz }
     }
 
-    fn definition(&self) -> Option<&InstrumentDef> { self.module.instrument(self.instrument) }
+    fn plan(&self, params: NoteParams) -> Option<VoicePlan> { plan_simple(&self.module, self.instrument, self.sample_rate_hz, params) }
 
-    fn plan(&self, params: NoteParams) -> Option<VoicePlan> {
-        let definition = self.definition()?;
-        let sample_id = definition.sample?;
-        let sample = self.module.sample(sample_id)?;
-        let recipe = VoiceRecipe {
-            sample_id,
-            instrument: self.instrument,
-            note: params.note,
-            velocity: params.velocity,
-            volume_scale: definition.default_volume,
-            pan: params.pan_override.or(sample.default_pan()).unwrap_or(I1F15::ZERO),
-            sample_rate_hz: self.sample_rate_hz,
-        };
-        plan_voice(sample, recipe)
-    }
+}
+
+fn plan_simple(module: &Module, instrument: InstrumentId, sample_rate_hz: u32, params: NoteParams) -> Option<VoicePlan> {
+    let definition = module.instrument(instrument)?;
+    let sample_id = definition.sample?;
+    let sample = module.sample(sample_id)?;
+    plan_voice(sample, VoiceRecipe { sample_id, instrument, note: params.note, velocity: params.velocity,
+        volume_scale: definition.default_volume, pan: params.pan_override.or(sample.default_pan()).unwrap_or(I1F15::ZERO), sample_rate_hz })
 }
 
 impl Instrument for SampleInstrument {
@@ -637,6 +633,8 @@ impl Default for RackChannel {
 /// Everything the rack does after that is allocation-free: fixed arrays, no locks, and
 /// every lookup answers `None` rather than indexing.
 pub struct InstrumentRack {
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    live: Option<live::PreparedRack>,
     instruments: Box<[Box<dyn Instrument>]>,
     channels: [RackChannel; MIDI_CHANNEL_COUNT],
     bend_range_cents: i16,
@@ -655,6 +653,7 @@ impl InstrumentRack {
             instruments.push(instrument_for(module, InstrumentId(index as u16), sample_rate_hz));
         }
         InstrumentRack {
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))] live: None,
             instruments: instruments.into_boxed_slice(),
             channels: [RackChannel::default(); MIDI_CHANNEL_COUNT],
             bend_range_cents: DEFAULT_BEND_RANGE_CENTS,
@@ -662,6 +661,21 @@ impl InstrumentRack {
             unsupported_events: 0,
         }
     }
+
+    /// Prepare all live state off-render. The facade supplies a format runtime for XM/IT.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn try_prepared(module: &Arc<Module>, sample_rate_hz: u32, capacity: usize, runtime: Option<Box<dyn live::RackRuntime>>, mapped: bool, scope: live::RackScope) -> Result<Self, alloc::collections::TryReserveError> {
+        let mut rack = Self::empty();
+        if scope == live::RackScope::Song { rack.channel_base = Some(0); }
+        rack.live = Some(live::PreparedRack::try_new(module, sample_rate_hz, capacity, runtime, mapped, scope)?);
+        Ok(rack)
+    }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn instrument_capability(&self, instrument: InstrumentId) -> live::InstrumentCapability { self.live.as_ref().map(|live| live.capability(instrument)).unwrap_or_default() }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn live_diagnostics(&self) -> live::LiveDiagnostics { self.live.as_ref().map(|live| live.diagnostics).unwrap_or_default() }
 
     /// Sequenced SMF playback owns song lanes 0–15, leaving live lanes independent.
     #[cfg(feature = "interactive-audition")]
@@ -677,6 +691,7 @@ impl InstrumentRack {
     /// a module is loaded.
     pub fn empty() -> InstrumentRack {
         InstrumentRack {
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))] live: None,
             instruments: Vec::new().into_boxed_slice(),
             channels: [RackChannel::default(); MIDI_CHANNEL_COUNT],
             bend_range_cents: DEFAULT_BEND_RANGE_CENTS,
@@ -686,7 +701,11 @@ impl InstrumentRack {
     }
 
     /// How many instruments a program number may address.
-    pub fn instrument_count(&self) -> usize { self.instruments.len() }
+    pub fn instrument_count(&self) -> usize {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(live) = &self.live { return live.module.instruments().len(); }
+        self.instruments.len()
+    }
 
     /// Cents a full-scale pitch bend moves a note.
     pub const fn bend_range_cents(&self) -> i16 { self.bend_range_cents }
@@ -739,6 +758,8 @@ impl InstrumentRack {
     /// that channel, [`Target::Global`] addresses all sixteen, and anything else — a
     /// tracker lane, or a specific voice — is [`EventOutcome::Unsupported`].
     pub fn apply(&mut self, target: Target, event: Event, context: &mut EngineContext<'_>) -> EventOutcome {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(live) = &mut self.live { return live.apply(&mut self.channels, target, event, context); }
         let outcome = match target {
             Target::Channel(channel) => match channel.0.checked_sub(self.channel_base(context)).filter(|index| (*index as usize) < MIDI_CHANNEL_COUNT).map(|index| index as usize) {
                 Some(index) => self.apply_to_channel(index, event, context),
@@ -969,6 +990,8 @@ impl InstrumentRack {
 
     /// Stop every voice on every MIDI channel and forget every held note.
     pub fn all_sound_off_everywhere(&mut self, context: &mut EngineContext<'_>) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(live) = &mut self.live { live.apply(&mut self.channels, Target::Global, Event::AllSoundOff, context); return; }
         for index in 0..MIDI_CHANNEL_COUNT {
             self.all_sound_off(index, context);
         }
@@ -998,6 +1021,10 @@ impl core::fmt::Debug for InstrumentRack {
 /// over a MIDI file's sorted event list. They differ in exactly one respect — whether the
 /// next event is already known — which is what [`EventFeed::refresh`] exists for.
 pub trait EventFeed: Send {
+    /// Cumulative recoverable overflows. Legacy/scripted feeds need no diagnostic state.
+    #[cfg(feature = "interactive-audition")]
+    fn recovery_count(&self) -> u32 { 0 }
+
     /// Live feeds keep absolute timestamps; file sequencers hold and translate theirs.
     #[cfg(feature = "interactive-audition")]
     fn set_transport(&mut self, _state: starplayer_core::InteractiveTransport, _frame: Frame) {}
@@ -1035,6 +1062,7 @@ pub trait EventFeed: Send {
 /// an event lands on an exact frame rather than at the top of whatever block it arrives in.
 pub struct ExternalEventProducer {
     producer: Producer<TimedEvent>,
+    #[cfg(feature = "interactive-audition")] recovery: Option<Arc<starplayer_rt::atomic::AtomicU32>>,
 }
 
 impl ExternalEventProducer {
@@ -1042,7 +1070,12 @@ impl ExternalEventProducer {
     ///
     /// Never blocks and never allocates: a full ring is a host that is sending faster than
     /// the audio thread consumes, and the honest answer is to say so.
-    pub fn send(&mut self, event: TimedEvent) -> Result<(), TimedEvent> { self.producer.push(event) }
+    pub fn send(&mut self, event: TimedEvent) -> Result<(), TimedEvent> {
+        let result = self.producer.push(event);
+        #[cfg(feature = "interactive-audition")]
+        if result.is_err() && let Some(recovery) = &self.recovery { recovery.fetch_add(1, starplayer_rt::atomic::Ordering::Release); }
+        result
+    }
 
     /// Events queued but not yet consumed.
     pub fn len(&self) -> usize { self.producer.len() }
@@ -1069,6 +1102,8 @@ impl ExternalEventProducer {
 /// on its exact frame. The host's two-quantum stamping lead is what keeps that true for an
 /// event pushed while a segment is being rendered.
 pub struct ExternalEventQueue {
+    #[cfg(feature = "interactive-audition")] recovery: Option<Arc<starplayer_rt::atomic::AtomicU32>>,
+    #[cfg(feature = "interactive-audition")] recovered: u32,
     consumer: Consumer<TimedEvent>,
     peeked: Option<TimedEvent>,
 }
@@ -1078,7 +1113,17 @@ pub struct ExternalEventQueue {
 /// Allocates once, off the audio thread.
 pub fn external_event_channel(capacity: usize) -> (ExternalEventProducer, ExternalEventQueue) {
     let (producer, consumer) = starplayer_rt::channel(capacity);
-    (ExternalEventProducer { producer }, ExternalEventQueue { consumer, peeked: None })
+    (ExternalEventProducer { producer, #[cfg(feature = "interactive-audition")] recovery: None }, ExternalEventQueue { consumer, peeked: None, #[cfg(feature = "interactive-audition")] recovery: None, #[cfg(feature = "interactive-audition")] recovered: 0 })
+}
+
+/// Live queue with an out-of-band overflow latch. Recovery drops queued stale input
+/// and emits AllNotesOff, so a lost key-up cannot leave a held generation indefinitely.
+#[cfg(feature = "interactive-audition")]
+pub fn recoverable_event_channel(capacity: usize) -> (ExternalEventProducer, ExternalEventQueue) {
+    let (mut producer, mut queue) = external_event_channel(capacity);
+    let recovery = Arc::new(starplayer_rt::atomic::AtomicU32::new(0));
+    producer.recovery = Some(Arc::clone(&recovery)); queue.recovery = Some(recovery);
+    (producer, queue)
 }
 
 impl ExternalEventQueue {
@@ -1090,6 +1135,9 @@ impl ExternalEventQueue {
 }
 
 impl EventFeed for ExternalEventQueue {
+    #[cfg(feature = "interactive-audition")]
+    fn recovery_count(&self) -> u32 { self.recovered }
+
     fn next_frame(&self) -> Option<Frame> { self.peeked.map(|event| event.frame) }
 
     fn pop_due(&mut self, frame: Frame) -> Option<TimedEvent> {
@@ -1099,6 +1147,16 @@ impl EventFeed for ExternalEventQueue {
     }
 
     fn refresh(&mut self, _frame: Frame) {
+        #[cfg(feature = "interactive-audition")]
+        if let Some(recovery) = &self.recovery {
+            let count = recovery.load(starplayer_rt::atomic::Ordering::Acquire);
+            if count != self.recovered {
+                self.recovered = count;
+                for _ in 0..self.consumer.capacity() { if self.consumer.pop().is_none() { break; } }
+                self.peeked = Some(TimedEvent::global(_frame, Event::AllNotesOff));
+                return;
+            }
+        }
         if self.peeked.is_none() {
             self.peeked = self.consumer.pop();
         }
@@ -1115,7 +1173,10 @@ impl core::fmt::Debug for ExternalEventQueue {
 
 /// An [`EventSource`] that plays a feed's events through an [`InstrumentRack`].
 ///
-/// # Its own control tick
+/// # Legacy control tick and prepared native cadence
+///
+/// The following 1 ms policy applies to unconfigured legacy racks. Explicitly prepared
+/// racks use the engine post-source articulation hook and report feed deadlines only.
 ///
 /// Master-plan decision 2: a MIDI-driven source carries its own control tick. Architecture
 /// §5.4 wants a tracker's tick to *be* the control tick when one is playing, but that rate
@@ -1200,9 +1261,14 @@ impl<Feed: EventFeed> MidiSource<Feed> {
 
     /// Take one control tick and let the rack advance whatever it has.
     fn run_control_ticks(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if self.rack.live.is_some() { return; }
         let mut taken = 0u32;
         while self.control.next_synthesised_frame().is_some_and(|next| next <= frame) {
             self.control.tick_synthesised();
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            if self.rack.live.is_none() { self.rack.control_tick(context); }
+            #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
             self.rack.control_tick(context);
             taken = taken.saturating_add(1);
             if taken >= MAX_CONTROL_TICKS_PER_DISPATCH {
@@ -1244,6 +1310,20 @@ impl<Feed: EventFeed> MidiSource<Feed> {
 }
 
 impl<Feed: EventFeed> EventSource for MidiSource<Feed> {
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn uses_articulation_cadence(&self) -> bool { self.rack.live.is_some() }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn initial_articulation_interval(&self) -> Option<u64> { self.rack.live.as_ref().map(|rack| rack.initial_interval) }
+    #[cfg(feature = "interactive-audition")]
+    fn interactive_action(&mut self, action: starplayer_core::InteractiveAction, context: &mut EngineContext<'_>) {
+        if let Some(live) = &mut self.rack.live { live.action(&mut self.rack.channels, action, context); }
+    }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn post_source_articulation(&mut self, _frame: Frame, context: &mut EngineContext<'_>) {
+        if let Some(live) = &mut self.rack.live { live.control(context); }
+    }
+
     #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
     fn describe_interactive(&mut self, context: &mut EngineContext<'_>) {
         let Some(cursor) = self.feed.smf_cursor(context.frame) else { return };
@@ -1259,6 +1339,8 @@ impl<Feed: EventFeed> EventSource for MidiSource<Feed> {
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     fn clear_scope(&mut self, scope: crate::ownership::ClearScope, context: &mut EngineContext<'_>) {
         use crate::ownership::ClearScope;
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(live) = &mut self.rack.live { live.clear(scope, context); }
         let base = self.rack.channel_base(context);
         let sequenced = self.rack.channel_base.is_some();
         for (index, state) in self.rack.channels.iter_mut().enumerate() {
@@ -1271,6 +1353,8 @@ impl<Feed: EventFeed> EventSource for MidiSource<Feed> {
     }
 
     fn next_event_frame(&self) -> Option<Frame> {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if self.rack.live.is_some() { return self.feed.next_frame(); }
         match (self.feed.next_frame(), self.control.next_synthesised_frame()) {
             (Some(feed), Some(control)) => Some(feed.min(control)),
             (feed, control) => feed.or(control),
@@ -1290,6 +1374,8 @@ impl<Feed: EventFeed> EventSource for MidiSource<Feed> {
             }
             self.rack.apply(event.target, event.event, context);
         }
+        #[cfg(feature = "interactive-audition")]
+        if let Some(live) = &mut self.rack.live { live.diagnostics.queue_overflows = self.feed.recovery_count() as u64; }
         self.run_control_ticks(frame, context);
         #[cfg(feature = "telemetry")]
         self.publish_telemetry(context);

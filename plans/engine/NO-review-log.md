@@ -870,3 +870,39 @@ fix and passes with unchanged native voice state. The pre-existing native IT not
 NNA mapping gap is documented in the accuracy policy without reclassifying conformance.
 NO-06 is next; one worker/build stream at a time. No main merge/deployment or owner
 hardware/listening acceptance claimed.
+
+### NO-06 live reference convention
+
+The configured adapter preserves the existing live convention documented in M4-E4:
+XM input note60 selects native sample-map entry60, but plays the8363 Hz reference
+before relative-note/finetune adjustment. The equivalent native XM tracker pitch is
+zero-based48 (cell49), not zero-based60 (cell61). Mapping and pitch conversion are
+independent, and tests must demonstrate both without silently remapping fixtures.
+IT input60 uses native map60 and native reference60 directly. This is an explicit
+live-input adapter convention, not a change to canonical tracker note numbering or
+unconfigured legacy rack output.
+
+### NO-06 prepared SMF cadence gate correction
+
+Source review found NO-03 gated the shared cadence/post-source hook solely on
+interactive-audition, although an explicitly prepared overlap-only SMF rack also needs
+native articulation. The shared cadence and prepared Song rack are available under
+either optional feature, activated only by a prepared source. Song uses lanes0–15,
+N native quota and C custom tails. Live uses lanes64–80 and L, and remains gated by
+interactive-audition together with Pause/held transport, routing and Preview commands.
+Unconfigured SMF/racks retain the original1ms sample-only behavior, even under feature
+unification; neither-feature builds construct none of this optional machinery. No new
+product switch or default behavior is introduced. This bounded gate correction was
+approved by the coordinator from the existing master contract.
+
+### NO-06 coordinator landing — 2026-10-28
+
+Task `fd14c4d` reviewed and integrated by single-change squash on the feature branch.
+The existing live60 convention and shared prepared-SMF cadence gate correction above
+were resolved before their seams were implemented. Both real native runtimes, held
+instances, scopes, pre-CC7 identity/next-note latch, stale/retiring inertness, initial
+model cadence and independent feature exclusion were reviewed. Coordinator52 affected
+test groups passed; pinned conformance remains261/179/0/16/66/0. Worker live17/host15/RT10,
+all8 goldens and portable/feature/lint evidence are in NO-06. Web applied-generation
+acknowledgements/UI are NO-W1; broad final integration/listening evidence are NO-07.
+No main merge/deployment or hardware/listening acceptance claimed.

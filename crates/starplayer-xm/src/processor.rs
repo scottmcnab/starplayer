@@ -41,6 +41,9 @@
 // the dispatch boundary lets the individual handlers read as the C they port.
 #![allow(clippy::indexing_slicing)]
 
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+pub mod live;
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -1959,7 +1962,7 @@ impl XmProcessor {
                 };
                 let tag = VoiceTag {
                     channel: channel_index as u8,
-                    instrument: state.instrument_number,
+                    instrument: state.instrument_number as u16,
                     sample: sample_id.0.saturating_add(1),
                     note: state.sounding_note,
                 };
@@ -2043,7 +2046,7 @@ impl XmProcessor {
                 if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_none_or(|owned| owned.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) { continue; }
                 let state = &slot.state;
                 context.report_trace_voice(voice, TraceChannelState {
-                    note: context.voices.get(voice).map(|voice| voice.tag.note), instrument: context.voices.get(voice).map_or(0, |voice| voice.tag.instrument as u16),
+                    note: context.voices.get(voice).map(|voice| voice.tag.note), instrument: context.voices.get(voice).map_or(0, |voice| voice.tag.instrument),
                     sample: state.sample.map_or(0, |sample| sample.0.saturating_add(1)),
                     volume: (((state.final_volume >> 6) + 8) / 16) as u16,
                     period: state.final_period as u32, pan: state.final_pan as u16,

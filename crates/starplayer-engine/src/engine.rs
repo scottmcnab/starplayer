@@ -324,6 +324,8 @@ where
     /// resonant filter, whose cutoff is an absolute frequency; everything else in the
     /// audio path works in ratios and in frames.
     sample_rate_hz: u32,
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    articulation_interval_micros: u32,
     master_volume: U0F16,
     limiter: Limiter,
     warnings: EngineWarnings,
@@ -447,6 +449,8 @@ where
             #[cfg(feature = "interactive-audition")]
             interactive_transport: settings.playback_configuration().filter(|configuration| configuration.capacity.interactive_transport).map(|_| starplayer_core::InteractiveTransport::Stopped),
             sample_rate_hz: settings.sample_rate_hz,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            articulation_interval_micros: settings.articulation_interval_micros,
             master_volume: U0F16::MAX,
             limiter: Limiter::SoftKnee,
             warnings: EngineWarnings::default(),
@@ -555,6 +559,11 @@ where
         let mut source = source;
         self.sources.clear();
         self.control.resume_synthesis(self.source_frame);
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if source.uses_articulation_cadence() {
+            let interval = ((self.sample_rate_hz as u128 * self.articulation_interval_micros as u128) << 32) / 1_000_000;
+            self.control.set_cadence(self.source_frame, source.initial_articulation_interval().unwrap_or(interval.min(u64::MAX as u128) as u64), 0, true);
+        } else if self.interactive_transport().is_none() { self.control.clear_cadence(); }
         // The mux was just cleared, so a slot is free unless its capacity is zero.
         #[cfg(feature = "interactive-audition")]
         if let Some(state) = self.interactive_transport { source.set_transport(state, self.source_frame, &mut self.control); }
@@ -578,6 +587,11 @@ where
         let mut source = source;
         let retired = self.sources.take_first();
         self.control.resume_synthesis(self.source_frame);
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if source.uses_articulation_cadence() {
+            let interval = ((self.sample_rate_hz as u128 * self.articulation_interval_micros as u128) << 32) / 1_000_000;
+            self.control.set_cadence(self.source_frame, source.initial_articulation_interval().unwrap_or(interval.min(u64::MAX as u128) as u64), 0, true);
+        } else if self.interactive_transport().is_none() { self.control.clear_cadence(); }
         // The take above freed the lowest occupied slot, so this insert lands in that slot
         // and can only fail for a mux built with no capacity at all.
         #[cfg(feature = "interactive-audition")]
@@ -1005,6 +1019,13 @@ where
                     self.sources.set_transport(state, self.source_frame, &mut self.control);
 
                 }
+                #[cfg(feature = "interactive-audition")]
+                InteractiveAction::StopPreview if self.interactive_transport.is_some() => self.clear_scope(crate::ownership::ClearScope::Live),
+                #[cfg(feature = "interactive-audition")]
+                InteractiveAction::SetLiveDestination(_) | InteractiveAction::PreviewInstrument(_) | InteractiveAction::ReleasePreview if self.interactive_transport.is_some() => {
+                    let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+                    self.sources.interactive_action(command.action, &mut context);
+                }
                 InteractiveAction::AllSoundOff => self.clear_scope(crate::ownership::ClearScope::All),
                 #[cfg(feature = "note-overlap")]
                 InteractiveAction::SetNoteOverlapEnabled(enabled) => {
@@ -1089,7 +1110,7 @@ where
                 break;
             }
 
-            #[cfg(feature = "interactive-audition")]
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
             let previous_ticks = self.control.ticks();
             if source_due || (self.interactive_transport().is_some() && control_due) {
                 // Mirrored before the dispatch rather than after, because the dispatch is
@@ -1116,13 +1137,13 @@ where
                 self.control.tick_synthesised();
             }
 
-            #[cfg(feature = "interactive-audition")]
-            if self.interactive_transport.is_some() && self.control.ticks() != previous_ticks {
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            if (self.interactive_transport().is_some() || self.sources.uses_articulation_cadence()) && self.control.ticks() != previous_ticks {
                 let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
                 #[cfg(feature = "telemetry")]
                 context.set_telemetry(&mut self.telemetry);
                 self.sources.post_source_articulation(self.source_frame, &mut context);
-                #[cfg(feature = "telemetry")]
+                #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
                 self.publish_interactive();
             }
 

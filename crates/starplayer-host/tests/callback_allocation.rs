@@ -394,3 +394,42 @@ fn active_xm_it_overlap_articulation_pressure_and_bypass_are_callback_safe() {
         player.collect_garbage();
     }
 }
+
+#[cfg(feature = "interactive-audition")]
+#[test]
+fn actual_loaded_native_live_runtimes_and_bounded_controls_allocate_and_free_nothing() {
+    use starplayer::core::{Event, InstrumentId, InteractiveAction, LiveDestination, Note};
+    for format in [starplayer::model::ModuleFormat::Xm,starplayer::model::ModuleFormat::It] {
+        use starplayer::model::{ModuleBuilder, ModuleHeader, ModuleFormat, SampleSpec, InstrumentDef, Envelope, EnvelopePoint};
+        let mut builder = ModuleBuilder::new(); let sample = builder.add_sample(&[1500;32768],SampleSpec::one_shot("live")).unwrap();
+        let mut instrument = InstrumentDef::from_sample("live",sample,U0F16::MAX); instrument.note_sample_map.fill(1);
+        for (note,mapped) in instrument.note_transpose_map.iter_mut().enumerate() { *mapped = note as u8; }
+        instrument.new_note_action = starplayer::model::NewNoteAction::Continue;
+        instrument.volume_envelope = Some(Envelope {points:vec![EnvelopePoint {tick:0,value:64},EnvelopePoint {tick:100,value:0}].into_boxed_slice(),..Envelope::default()});
+        builder.add_instrument(instrument).unwrap();
+        let cell = if format == ModuleFormat::Xm {vec![0;5]} else {vec![255,0,255,0,0]}; builder.add_pattern(&cell,1,1).unwrap(); builder.set_orders(&[0]);
+        let mut header = ModuleHeader::new(format,1); header.flags.linear_slides=true;
+        if format == ModuleFormat::It { header.format_extra=starplayer::it::ItFormatExtra {flags:12,special:0,old_instruments:false,has_midi_configuration:false}.encode(); }
+        builder.set_header(header); let module = starplayer::rt::Arc::new(builder.build().unwrap());
+        let mut backend = ManualBackend::new();
+        let settings = starplayer::engine::EngineSettings::default().with_playback(starplayer::engine::PlaybackConfiguration {
+            identity:Default::default(),capabilities:starplayer::engine::compiled_playback_capabilities(),instrument_count:0,
+            capacity:starplayer::engine::VoiceCapacity {native:256,custom:if cfg!(feature="note-overlap") {4} else {0},live:16,interactive_transport:true},
+        }).unwrap();
+        let mut player = Player::open_with_settings(&mut backend,None,AudioSpec::stereo(44_100),MixerMode::DEFAULT,settings).unwrap();
+        let driver = backend.driver().unwrap(); player.load_module(module).unwrap();
+        player.interactive(InteractiveAction::SetLiveDestination(LiveDestination::Selected(InstrumentId(0)))).unwrap();
+        let mut output = [0.0;512]; let mut heard = false;
+        let (_, report) = while_watching_for_allocations(|| {
+            for index in 0..80 {
+                let _ = player.send_event(0,Event::NoteOn {note:Note::new(60+(index%12) as u8),velocity:U0F16::MAX});
+                driver.render(&mut output); heard |= output.iter().any(|sample| *sample != 0.0);
+            }
+            let _ = player.interactive(InteractiveAction::PreviewInstrument(InstrumentId(u16::MAX)));
+            let _ = player.interactive(InteractiveAction::StopPreview); driver.render(&mut output);
+            let _ = player.interactive(InteractiveAction::Stop); driver.render(&mut output);
+        });
+        assert!(report.is_clean(),"native live runtime, pressure, reject and clears: {report:?}");
+        assert!(player.event_clock().sent() > 0); assert!(heard,"the actual native runtime must sound under the allocation hook");
+    }
+}

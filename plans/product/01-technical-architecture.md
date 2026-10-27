@@ -620,10 +620,12 @@ bend and a fixed array of held notes. It consumes `Event`s and reports `Trigger`
 unsupported: the tracker vocabulary is a **peer** of the musical one (§2.4), never a
 lowering of it.
 
-Neither implementation runs envelopes, fadeout, NNA or auto-vibrato. Giving a MIDI-driven
-XM or IT instrument its format's own articulation is NO-06's loaded-module deliverable;
-M11 still owns extraction/library work, and Q4 — whether
-this surface survives a non-sample instrument — is still M10's to settle.
+These legacy implementations remain sample-only. NO-06 adds the explicitly prepared
+rack: one mutable, pool-indexed `RackRuntime`, with real XM and IT implementations,
+serves every program. Native articulation and RNG belong to that rack, separate from
+the tracker. The facade `prepare_instrument_rack` selects Song scope (lanes0–15, N/C)
+or, with interactive-audition, Live scope (lanes64–80, L). `prepare_live_rack` is the Live
+wrapper. M11 continues to own extraction/library work; legacy constructors do not opt in.
 
 **Owner decision, 2026-09-03** (the history this replaced) (`plans/engine/M3-M6-concurrency-plan.md`, delivered by
 M4-lite task E3): the extraction moves to **M4-full**, and XM and IT are implemented
@@ -715,8 +717,10 @@ engine rate (~1 ms), reports `min(feed, control)` as its next event frame, and t
 from inside its own `dispatch`. Nothing in the engine changed for it — the render loop
 already splits its segments at whatever frame a source reports — and the engine's own
 synthesised clock keeps running alongside, unread by the source, so a tracker taking that
-clock over cannot silence a MIDI instrument. Revisit when M11 gives MIDI instruments
-envelopes and the two rates have to agree about something.
+clock over cannot silence a legacy MIDI instrument. NO-06 explicitly prepared racks
+instead consume the engine's shared native articulation cadence and report only feed
+events as source deadlines. Onset initializes native output immediately; a coincident
+post-source hook skips that onset, and subsequent ticks advance it exactly once.
 
 **Where this stands after M4-lite (task E3).** With a tracker sequencer driving, the
 tracker tick *is* the control tick — `PatternSequencer::dispatch` calls
@@ -2034,3 +2038,53 @@ Interactive seek/Stop/bypass already retire their scopes through NO-03, so their
 receive no further effects/articulation writes. At native quota an existing authoritative
 N foreground remains a net-zero replacement after its runtime snapshot was reset.
 The pre-existing native IT note-only/NNA mapping gap is documented in the accuracy policy.
+
+### NO-06 live reference convention
+
+The configured adapter preserves the existing live convention documented in M4-E4:
+XM input note60 selects native sample-map entry60, but plays the8363 Hz reference
+before relative-note/finetune adjustment. The equivalent native XM tracker pitch is
+zero-based48 (cell49), not zero-based60 (cell61). Mapping and pitch conversion are
+independent, and tests must demonstrate both without silently remapping fixtures.
+IT input60 uses native map60 and native reference60 directly. This is an explicit
+live-input adapter convention, not a change to canonical tracker note numbering or
+unconfigured legacy rack output.
+
+### NO-06 prepared SMF cadence gate correction
+
+Source review found NO-03 gated the shared cadence/post-source hook solely on
+interactive-audition, although an explicitly prepared overlap-only SMF rack also needs
+native articulation. The shared cadence and prepared Song rack are available under
+either optional feature, activated only by a prepared source. Song uses lanes0–15,
+N native quota and C custom tails. Live uses lanes64–80 and L, and remains gated by
+interactive-audition together with Pause/held transport, routing and Preview commands.
+Unconfigured SMF/racks retain the original1ms sample-only behavior, even under feature
+unification; neither-feature builds construct none of this optional machinery. No new
+product switch or default behavior is introduced. This bounded gate correction was
+approved by the coordinator from the existing master contract.
+
+### NO-06 installed runtime and controller contract
+
+Prepared native racks capture original input note (including cents), MIDI identity lane,
+exact instrument and pre-CC7 native base volume for every actual onset. XM resolves that
+base to0–64, IT to0–256: distinct raw velocities can legitimately collide at the native
+resolution. CC7 and CC10 retain their existing next-note latch semantics. A sounding
+instance retains its onset CC7 gain across envelope steps; bend applies to held foreground
+and detached instances without advancing envelope or auto-vibrato phase. Original
+identity is never rewritten by controllers, release, modulation or sample tags.
+
+Held instances contain VoiceId/generation, note, lane, pedal and onset gain only;
+PlaybackState remains the sole domain/lifecycle/age/provenance authority. Key-up/pedal-up
+find detached held voices even after checkbox changes. Native released backgrounds keep
+their immutable identity until terminal release, while retiring/stale generations neither
+match replacement candidates nor consume native articulation/RNG. Current sounding
+sample loops determine replacement eligibility independently of original note identity.
+
+Interactive hosts install source1 before Play and retain it while paused/stopped/ended.
+Bounded destination/program/preview changes clear the matching audition voices without
+rebuilding source0. Normal one-shot button release permits completion; looping release
+uses native release. Stop-preview clears L, CC120 clears its lane, user Stop/global
+all-sound-off clear all, and interactive seek retains L. Recoverable input queue overflow
+emits all-notes-off and records a bounded diagnostic counter. Runtime/table preparation
+and module ownership stay off render; both native adapters validate capacity before
+admission and roll back a failed runtime start.

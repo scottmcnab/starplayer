@@ -50,6 +50,16 @@ impl SmfSequencer {
         }
     }
 
+    /// Prepare song lanes0–15 without enabling interactive transport.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn prepared_song_at(smf: &Smf, sample_rate_hz: u32, start_frame: Frame) -> Self {
+        let mut source = Self::new_at(smf, sample_rate_hz, start_frame);
+        for event in &mut source.events {
+            if let starplayer_core::Target::Channel(channel) = &mut event.target { channel.0 = channel.0.saturating_sub(starplayer_engine::MIDI_CHANNEL_BASE); }
+        }
+        source
+    }
+
     /// Prepare the interactive lane mapping and optional sound-free rebuild cursor.
     /// All event-vector work is on the control thread, never in dispatch.
     #[cfg(feature = "interactive-audition")]

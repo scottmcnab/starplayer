@@ -47,9 +47,16 @@ pub enum InteractiveAction {
     Stop,
     AllSoundOff,
     StopPreview,
+    SetLiveDestination(LiveDestination),
+    PreviewInstrument(InstrumentId),
+    ReleasePreview,
     SetNoteOverlapEnabled(bool),
     SetLetNotesRing { instrument: InstrumentId, enabled: bool },
 }
+
+/// Mutually exclusive input routing. All destinations share the same sixteen lanes.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum LiveDestination { #[default] Off, Jam, Selected(InstrumentId) }
 
 /// No generation-prefix protocol: identity and action form one indivisible record.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

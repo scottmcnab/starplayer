@@ -30,7 +30,7 @@ impl ChannelTable {
         let Some(playback) = self.playback() else { return false };
         let Some(owned) = playback.get(voice, voices) else { return false };
         playback.note_overlap_enabled() && owned.identity().is_some() && owned.lifecycle != VoiceLifecycle::Retiring
-            && voices.get(voice).and_then(|voice| voice.tag.instrument.checked_sub(1)).is_some_and(|instrument| playback.let_notes_ring(starplayer_core::InstrumentId(instrument as u16)) == Some(true))
+            && voices.get(voice).and_then(|voice| voice.tag.instrument.checked_sub(1)).is_some_and(|instrument| playback.let_notes_ring(starplayer_core::InstrumentId(instrument)) == Some(true))
             && voices.get(voice).is_some_and(|voice| eligible_one_shot(voice, module))
     }
 
