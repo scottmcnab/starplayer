@@ -219,3 +219,26 @@ Loop-tail synthesis/release overrides, saved presets, sample replacement catalog
 ModDNA, an instrument library/extractor, native UI controls, new file formats, changing
 historical sources, and broad M11 synthesis/MIDI-controller expansion. This delivers the
 format articulation subset needed for faithful loaded-module audition, not all of M11.
+
+## Task breakdown and landing order
+
+All files below are pending external review and implementation. The coordinator is
+`gpt-6.1-sol` (xhigh); worker floors and effort are explicit in each task header.
+
+| Task | Deliverable | Worker | Prerequisites |
+|---|---|---|---|
+| [NO-01](NO-task-01-contracts-and-features.md) | Contracts, feature gates and ownership | gpt-6.1-sol (high) | Reviewed master; implementation explicitly requested |
+| [NO-02](NO-task-02-format-articulation.md) | Format-owned per-voice articulation | gpt-6-astra (high) | NO-01 |
+| [NO-03](NO-task-03-interactive-transport.md) | Sequencer-only pause and clear-and-hold Stop | gpt-6-astra (high) | NO-02 |
+| [NO-04](NO-task-04-legacy-overlap.md) | Legacy-format overlap and bounded tails | gpt-6.1-sol (high) | NO-01 |
+| [NO-05](NO-task-05-xm-it-overlap.md) | XM and IT overlap integration | gpt-6-astra (high) | NO-02 and NO-04 |
+| [NO-06](NO-task-06-faithful-audition.md) | Faithful loaded-module audition | gpt-6-astra (high) | NO-03 and NO-05 |
+| [NO-W1](../apps/NO-task-W1-web-controls.md) | Web transport, Instruments panel and command bridge | gpt-6.1-sol (high) | NO-06 (and all its dependencies) |
+| [NO-07](NO-task-07-integration-and-acceptance.md) | Integration, determinism and feature exclusion | gpt-6.1-sol (high) | NO-W1 and NO-01–06 |
+
+Recommended landing order: 01 → 02 → 03 → 04 → 05 → 06 → W1 → 07.
+04 can be prepared independently after 01; 05 can be prepared after 02/04 while 03
+finishes, but shared engine edits must be integrated by the coordinator sequentially.
+Do not split multiple agents across the same checkout. No workers are started by this
+planning handoff. External review procedure and pending evidence are in
+[the review log](NO-review-log.md).
