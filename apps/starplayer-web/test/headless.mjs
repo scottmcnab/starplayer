@@ -1,4 +1,7 @@
 import remoteWorker from '../remote-proxy/worker.js';
+import { runW15, runW15View, runW15Stress, runW15Playlist, runW15Runtime } from './w15-headless.mjs';
+import { runRemediation, runPerformance, runBackground, runDigestMeasurements, runVisibilityReturn, runEnumerationDiagnostic } from './w15-remediation-headless.mjs';
+import { runPagesSmoke } from './w15-pages-smoke.mjs';
 import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // End-to-end check of the packaged player in headless Chromium, over the DevTools
 // protocol, with Node's built-in `WebSocket` and `http` and nothing else installed.
@@ -16,10 +19,16 @@ import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // a regression in the display is as visible here as a regression in the engine.
 //
 // Usage: node apps/starplayer-web/test/headless.mjs [--seconds 60] [--mode sab|fallback|plain]
+// W15-only: --w15-only, or --w15-case app|view|stress|playlist|runtime|remediation.
+// Dedicated evidence: --w15-case performance|digest|background|visibility|enumeration (select one mode).
+// Background runs at least six minutes with normal throttling. STARPLAYER_BACKGROUND_SMOKE=1
+// exercises its lifecycle paths quickly and is explicitly labeled non-acceptance smoke.
+// After cargo xtask wasm --pages: --pages-smoke serves a local repository subpath.
 //
 // Exits 0 and prints `headless: skipped` when no Chromium is installed.
 
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { access, readFile, readdir, mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -38,9 +47,12 @@ const PHONE_VIEWPORT = { width: 390, height: 844 };
 const options = parseArguments(process.argv.slice(2));
 
 function parseArguments(argv) {
-    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false };
+    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false };
     for (let index = 0; index < argv.length; index += 1) {
-        if (argv[index] === '--library-only') parsed.libraryOnly = true;
+        if (argv[index] === '--pages-smoke') parsed.pagesSmoke = true;
+        else if (argv[index] === '--w15-only') parsed.w15Only = true;
+        else if (argv[index] === '--w15-case') { parsed.w15Case = argv[++index]; parsed.w15Only = true; }
+        else if (argv[index] === '--library-only') parsed.libraryOnly = true;
         else if (argv[index] === '--seconds') {
             parsed.seconds = Number(argv[index + 1]);
             index += 1;
@@ -51,10 +63,24 @@ function parseArguments(argv) {
             throw new Error(`unexpected argument \`${argv[index]}\``);
         }
     }
+    if (parsed.w15Case !== null && !['app', 'view', 'stress', 'playlist', 'runtime', 'remediation', 'performance', 'background', 'digest', 'visibility', 'enumeration'].includes(parsed.w15Case)) throw new Error('invalid --w15-case');
+    if (!parsed.modes.every(mode => ['sab', 'fallback', 'plain'].includes(mode))) throw new Error('invalid --mode');
     return parsed;
 }
 
 // ── environment ─────────────────────────────────────────────────────────────────────
+
+async function verifyPackagedSources() {
+    const names=['cooperative-yield.js','library-source.js','library-discovery.js','library-worker.js','library-worker-runtime.js','library-worker-jobs.js','library-index.js','library-controls.js','playlist-transfer.js','playlist-controls.js','library-view.js','library-view-state.js'];
+    const hashes={};
+    for(const name of names) {
+        const source=await readFile(join(REPOSITORY_ROOT,'apps/starplayer-web/www',name));
+        const packaged=await readFile(join(DIST,name)).catch(()=>null);
+        if(!packaged||!source.equals(packaged))throw new Error(`Stale packaged asset ${name}; rebuild packaged assets with cargo xtask wasm in ${REPOSITORY_ROOT}`);
+        hashes[name]=createHash('sha256').update(source).digest('hex');
+    }
+    console.log(`packaged-source-preflight ${JSON.stringify(hashes)}`);
+}
 
 async function findChromium() {
     if (process.env.CHROME) return process.env.CHROME;
@@ -106,14 +132,14 @@ function buildZip(entries) {
     for (const entry of entries) {
         const name = Buffer.from(entry.name, 'utf8');
         const bytes = Buffer.from(entry.bytes);
-        const compressed = deflateRawSync(bytes);
+        const compressed = entry.stored ? bytes : deflateRawSync(bytes);
         const checksum = crc32(bytes) >>> 0;
 
         const localHeader = Buffer.alloc(30);
         localHeader.writeUInt32LE(0x04034B50, 0);
         localHeader.writeUInt16LE(20, 4);
-        localHeader.writeUInt16LE(0x0800, 6);
-        localHeader.writeUInt16LE(8, 8);
+        localHeader.writeUInt16LE(entry.encrypted ? 0x0801 : 0x0800, 6);
+        localHeader.writeUInt16LE(entry.stored ? 0 : 8, 8);
         localHeader.writeUInt32LE(checksum, 14);
         localHeader.writeUInt32LE(compressed.length, 18);
         localHeader.writeUInt32LE(bytes.length, 22);
@@ -124,8 +150,8 @@ function buildZip(entries) {
         centralHeader.writeUInt32LE(0x02014B50, 0);
         centralHeader.writeUInt16LE(20, 4);
         centralHeader.writeUInt16LE(20, 6);
-        centralHeader.writeUInt16LE(0x0800, 8);
-        centralHeader.writeUInt16LE(8, 10);
+        centralHeader.writeUInt16LE(entry.encrypted ? 0x0801 : 0x0800, 8);
+        centralHeader.writeUInt16LE(entry.stored ? 0 : 8, 10);
         centralHeader.writeUInt32LE(checksum, 16);
         centralHeader.writeUInt32LE(compressed.length, 20);
         centralHeader.writeUInt32LE(bytes.length, 24);
@@ -211,7 +237,7 @@ class Page {
 
     static async open(executable, url) {
         const port = await freePort();
-        const browser = spawn(executable, [
+        const browserArguments = [
             '--headless=new',
             `--remote-debugging-port=${port}`,
             '--remote-allow-origins=*',
@@ -229,7 +255,8 @@ class Page {
             '--mute-audio',
             '--user-data-dir=' + join(process.env.TMPDIR ?? '/tmp', `starplayer-cdp-${port}`),
             'about:blank',
-        ], { stdio: ['ignore', 'ignore', 'ignore'] });
+        ];
+        const browser = spawn(executable, browserArguments, { stdio: ['ignore', 'ignore', 'ignore'] });
 
         let version = null;
         for (let attempt = 0; attempt < 100 && version === null; attempt += 1) {
@@ -249,7 +276,11 @@ class Page {
         });
         const page = new Page(socket);
         page.browser = browser;
+        page.browserArguments = browserArguments;
+        page.debugPort = port;
+        page.targetId = target.id;
         page.version = version.Browser;
+        page.profileDirectory = join(process.env.TMPDIR ?? '/tmp', `starplayer-cdp-${port}`);
         await page.send('Runtime.enable');
         await page.send('Log.enable');
         await page.send('Page.enable');
@@ -331,6 +362,7 @@ class Page {
         this.browser.kill('SIGTERM');
         await delay(200);
         this.browser.kill('SIGKILL');
+        await rm(this.profileDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
 }
 
@@ -1469,6 +1501,16 @@ async function runLibrary(executable, mode) {
         assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
         await page.evaluate("const grid = document.getElementById('library-grid'); grid.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));");
         assert.ok(await page.evaluate("return document.getElementById(document.getElementById('library-grid').getAttribute('aria-activedescendant')) !== null;"));
+        assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^1 playable selected/);
+        assert.equal(await page.evaluate("return document.getElementById('library-add-selected').disabled;"), false);
+        await page.evaluate("document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', shiftKey: true, bubbles: true }));");
+        assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
+        await page.evaluate("document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));");
+        assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^0 playable selected/);
+        assert.equal(await page.evaluate("return document.getElementById('library-add-selected').disabled;"), true);
+        await page.evaluate("document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));");
+        assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^1 playable selected/);
+        assert.equal(await page.evaluate("return document.getElementById('library-add-selected').disabled;"), false);
         await page.evaluate("document.getElementById('library-grid').dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', shiftKey: true, bubbles: true }));");
         assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
         await filter('TRACK37673', '1 of 37,674');
@@ -1770,12 +1812,26 @@ if (executable === null) {
     process.exit(required ? 1 : 0);
 }
 
-for (const mode of options.modes) {
-    if (!options.libraryOnly) {
+await verifyPackagedSources();
+if (options.pagesSmoke) {
+    console.log(`pages-smoke ${JSON.stringify(await runPagesSmoke({ Page, executable, dist: DIST, syntheticMod, buildZip }))}`);
+} else for (const mode of options.modes) {
+    if (!options.libraryOnly && !options.w15Only) {
         const report = await run(executable, mode);
         console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);
     }
-    console.log(`remote-library[${mode}] ${JSON.stringify(await runRemoteLibrary(executable, mode))}`);
-    console.log(`library[${mode}] ${JSON.stringify(await runLibrary(executable, mode))}`);
+    if (options.w15Case === 'background') console.log(`w15-background[${mode}] ${JSON.stringify(await runBackground({ Page, executable, mode, startDevServer }))}`);
+    if (options.w15Case === 'enumeration') console.log(`w15-enumeration[${mode}] ${JSON.stringify(await runEnumerationDiagnostic({ Page, executable, mode, startDevServer }))}`);
+    if (options.w15Case === 'visibility') console.log(`w15-visibility[${mode}] ${JSON.stringify(await runVisibilityReturn({ Page, executable, mode, startDevServer }))}`);
+    if (options.w15Case === 'performance') console.log(`w15-performance[${mode}] ${JSON.stringify(await runPerformance({ Page, executable, mode, startDevServer }))}`);
+    if (options.w15Case === 'digest') console.log(`w15-digest[${mode}] ${JSON.stringify(await runDigestMeasurements({ Page, executable, mode, startDevServer, syntheticMod, buildZip }))}`);
+    if (!options.w15Case || options.w15Case === 'remediation') console.log(`w15-remediation[${mode}] ${JSON.stringify(await runRemediation({ Page, executable, mode, startDevServer, syntheticMod, buildZip }))}`);
+    if (!options.w15Case || options.w15Case === 'app') console.log(`w15[${mode}] ${JSON.stringify(await runW15({ Page, executable, mode, startDevServer, syntheticMod, buildZip, verifyPlaylistStore }))}`);
+    if (!options.w15Case || options.w15Case === 'view') console.log(`w15-dom[${mode}] ${JSON.stringify(await runW15View({ Page, executable, mode, startDevServer }))}`);
+    if (!options.w15Case || options.w15Case === 'stress') console.log(`w15-stress[${mode}] ${JSON.stringify(await runW15Stress({ Page, executable, mode, startDevServer }))}`);
+    if (!options.w15Case || options.w15Case === 'playlist') console.log(`w15-playlist[${mode}] ${JSON.stringify(await runW15Playlist({ Page, executable, mode, startDevServer, syntheticMod }))}`);
+    if (!options.w15Case || options.w15Case === 'runtime') console.log(`w15-runtime[${mode}] ${JSON.stringify(await runW15Runtime({ Page, executable, mode, startDevServer, syntheticMod }))}`);
+    if (!options.w15Only) console.log(`remote-library[${mode}] ${JSON.stringify(await runRemoteLibrary(executable, mode))}`);
+    if (!options.w15Only) console.log(`library[${mode}] ${JSON.stringify(await runLibrary(executable, mode))}`);
 }
-console.log('headless harness: all modes passed');
+console.log(options.pagesSmoke ? 'headless harness: Pages smoke passed' : 'headless harness: all requested modes passed');

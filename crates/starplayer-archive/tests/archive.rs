@@ -329,3 +329,239 @@ fn zip_container_indices_include_non_module_slots_and_skip_resources() {
     ], &["directory.zip/"]);
     assert_eq!(starplayer_archive::list_zip_containers(&bytes).unwrap(), vec![2]);
 }
+
+
+#[test]
+fn structured_catalog_reads_direct_nested_and_inner_only_archives() {
+    use starplayer_archive::{CatalogKind, catalog, list_catalog_entries};
+    let inner = archive(&[("inner.IT", b"not a module", CompressionMethod::Deflated)], &[]);
+    let outer = archive(&[("direct.MOD", b"not a module", CompressionMethod::Stored), ("folder/inner.zip", &inner, CompressionMethod::Deflated)], &[]);
+    let directory = list_catalog_entries(&outer).unwrap();
+    assert_eq!(directory.len(), 2);
+    assert_eq!(directory[1].kind, CatalogKind::Zip);
+    assert_eq!(directory[1].raw_name, b"folder/inner.zip");
+    let result = catalog(&outer).unwrap();
+    assert!(result.issues.is_empty());
+    assert_eq!(result.entries.len(), 2);
+    assert_eq!(result.entries[0].container_member, "");
+    assert_eq!(result.entries[1].container_member, "folder/inner.zip");
+    assert_eq!(result.entries[1].member.name, "inner.IT");
+    let inner_only = archive(&[("only.zip", &inner, CompressionMethod::Stored)], &[]);
+    assert_eq!(catalog(&inner_only).unwrap().entries.len(), 1);
+    let mut bad_local_header = archive(&[("central-only.mod", b"ok", CompressionMethod::Stored)], &[]);
+    bad_local_header[26..28].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert_eq!(catalog(&bad_local_header).unwrap().entries.len(), 1);
+    // Even invalid compressed module streams are listed; cataloging never inflates them.
+    for method in [0, 1, 2, 3, 4, 5, 6, 8] {
+        let broken = legacy_encode::archive(&[("broken.mod", b"module", method, 0, &[255])]);
+        assert!(catalog(&broken).unwrap().entries[0].member.error.is_empty());
+    }
+}
+
+#[test]
+fn structured_catalog_keeps_unplayable_modules_and_reports_container_failures() {
+    use starplayer_archive::catalog;
+    let mut bytes = legacy_encode::archive(&[
+        ("large.mod", b"x", 8, 0, &[255]),
+        ("encrypted.s3m", b"x", 0, 1, b"x"),
+        ("unsupported.it", b"x", 9, 0, b"x"),
+        ("unsupported.zip", b"x", 12, 0, b"x"),
+        ("encrypted.zip", b"x", 0, 1, b"x"),
+        ("broken.zip", b"not a zip", 0, 0, b"not a zip"),
+        ("good.mtm", b"ok", 0, 0, b"ok"),
+    ]);
+    set_central_directory_size(&mut bytes, (MAX_ENTRY_BYTES + 1) as u32);
+    let result = catalog(&bytes).unwrap();
+    assert_eq!(result.entries.len(), 4);
+    for (index, reason) in ["too large", "encrypted", "unsupported"].iter().enumerate() { assert!(result.entries[index].member.error.contains(reason)); }
+    assert!(result.entries[3].member.error.is_empty());
+    assert_eq!(result.issues.len(), 3);
+    assert_eq!(result.issues[2].path, "broken.zip");
+    let mut oversized_container = archive(&[("large.zip", b"invalid", CompressionMethod::Stored)], &[]);
+    set_central_directory_size(&mut oversized_container, (MAX_ENTRY_BYTES + 1) as u32);
+    assert!(catalog(&oversized_container).unwrap().issues[0].reason.contains("too large"));
+}
+
+#[test]
+fn structured_catalog_preserves_other_results_on_corrupt_inner_and_reports_depth() {
+    use starplayer_archive::catalog;
+    let inner = archive(&[("nested.xm", b"module", CompressionMethod::Stored), ("deeper.zip", b"never extracted", CompressionMethod::Stored)], &[]);
+    let mut corrupt = inner.clone();
+    corrupt.truncate(corrupt.len() - 12);
+    let outer = archive(&[("direct.mod", b"ok", CompressionMethod::Stored), ("corrupt.zip", &corrupt, CompressionMethod::Stored), ("good.zip", &inner, CompressionMethod::Stored)], &[]);
+    let result = catalog(&outer).unwrap();
+    assert_eq!(result.entries.len(), 2);
+    assert_eq!(result.issues.len(), 2);
+    assert_eq!(result.issues[0].path, "corrupt.zip");
+    assert_eq!(result.issues[1].path, "good.zip/deeper.zip");
+    assert!(result.issues[1].reason.contains("deeper"));
+    assert!(matches!(catalog(&corrupt), Err(ArchiveError::Corrupt(_))));
+    assert!(matches!(catalog(b"module"), Err(ArchiveError::NotAnArchive)));
+    assert!(catalog(&archive(&[], &[])).unwrap().entries.is_empty());
+}
+
+#[test]
+fn structured_catalog_preserves_cp437_raw_names_and_exact_case_variants() {
+    use starplayer_archive::{catalog, find_entry};
+    let inner = archive(&[("song.mod", b"ok", CompressionMethod::Stored)], &[]);
+    let mut outer = archive(&[("x.zip", &inner, CompressionMethod::Stored), ("A.ZIP", &inner, CompressionMethod::Stored), ("a.zip", &inner, CompressionMethod::Stored), ("x.mod", b"ok", CompressionMethod::Stored)], &[]);
+    unflagged_name(&mut outer, b"x.zip", b"\x82.zip");
+    unflagged_name(&mut outer, b"x.mod", b"\x82.mod");
+    let result = catalog(&outer).unwrap();
+    assert!(result.issues.is_empty());
+    assert_eq!(result.entries.len(), 4);
+    assert_eq!(result.entries[0].container_member, "é.zip");
+    assert_eq!(result.entries[1].container_member, "A.ZIP");
+    assert_eq!(result.entries[2].container_member, "a.zip");
+    assert_eq!(result.entries[3].member.raw_name, b"\x82.mod");
+    for entry in result.entries.iter().filter(|entry| entry.container_member.is_empty()) {
+        assert_eq!(find_entry(&outer, &entry.member.name, Some(&entry.member.raw_name)).unwrap(), entry.member.index);
+    }
+}
+
+#[test]
+fn structured_catalog_keeps_first_decoded_locator_and_rejects_wrong_container_resolution() {
+    use starplayer_archive::catalog;
+    // Two different raw names decode to the same CP437 name: UTF-8-flagged versus
+    // unflagged. They must retain the first directory entry, not the later payload.
+    let inner = archive(&[("inside.mod", b"ok", CompressionMethod::Stored)], &[]);
+    let mut outer = legacy_encode::archive(&[
+        ("é.zip", &inner, 0, 0x800, &inner),
+        ("x.zip", &inner, 0, 0, &inner),
+        ("é.mod", b"first", 0, 0x800, b"first"),
+        ("x.mod", b"second", 0, 0, b"second"),
+    ]);
+    unflagged_name(&mut outer, b"x.zip", b"\x82.zip");
+    unflagged_name(&mut outer, b"x.mod", b"\x82.mod");
+    let result = catalog(&outer).unwrap();
+    assert_eq!(result.entries.len(), 2);
+    assert_eq!(result.entries[1].member.size, 5);
+    assert_eq!(result.issues.len(), 2);
+    assert!(result.issues.iter().all(|issue| issue.reason.contains("duplicate")));
+    // Raw C3 A9 decodes as é under the ZIP decoder, but is also the CP437
+    // encoding of ├⌐. The earlier encoded match shadows that later UTF-8 name.
+    let mut ambiguous = legacy_encode::archive(&[
+        ("xx.zip", &inner, 0, 0, &inner),
+        ("├⌐.zip", &inner, 0, 0x800, &inner),
+        ("direct.it", b"ok", 0, 0, b"ok"),
+    ]);
+    unflagged_name(&mut ambiguous, b"xx.zip", b"\xc3\xa9.zip");
+    let result = catalog(&ambiguous).unwrap();
+    assert_eq!(result.entries.len(), 2);
+    assert_eq!(result.entries[0].container_member, "é.zip");
+    assert_eq!(result.issues.len(), 1);
+    assert_eq!(result.issues[0].path, "├⌐.zip");
+    assert!(result.issues[0].reason.contains("different central-directory"));
+}
+
+#[test]
+fn structured_catalog_checks_source_limit_before_zip_parsing() {
+    use starplayer_archive::{MAX_SOURCE_BYTES, catalog};
+    let bytes = vec![0; MAX_SOURCE_BYTES as usize + 1];
+    assert!(matches!(catalog(&bytes), Err(ArchiveError::SourceTooLarge { size }) if size == MAX_SOURCE_BYTES + 1));
+}
+
+
+fn zip64_footer(mut bytes: Vec<u8>) -> Vec<u8> {
+    let end = bytes.len() - 22;
+    let mut footer = bytes[end..].to_vec();
+    let count = u16::from_le_bytes(footer[10..12].try_into().unwrap()) as u64;
+    let size = u32::from_le_bytes(footer[12..16].try_into().unwrap()) as u64;
+    let offset = u32::from_le_bytes(footer[16..20].try_into().unwrap()) as u64;
+    bytes.truncate(end);
+    bytes.extend_from_slice(b"PK\x06\x06");
+    bytes.extend_from_slice(&44u64.to_le_bytes());
+    bytes.extend_from_slice(&[45, 0, 45, 0]);
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(&offset.to_le_bytes());
+    bytes.extend_from_slice(b"PK\x06\x07");
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&(end as u64).to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    footer[8..20].fill(255);
+    bytes.extend_from_slice(&footer);
+    bytes
+}
+
+#[test]
+fn duplicate_raw_names_keep_first_payload_in_classic_and_zip64_catalog_and_legacy_apis() {
+    use starplayer_archive::{catalog, find_entry, list_zip_containers};
+    let first_inner = archive(&[("first.it", b"first inner", CompressionMethod::Stored)], &[]);
+    let last_inner = archive(&[("last.it", b"last inner", CompressionMethod::Stored)], &[]);
+    let bytes = legacy_encode::archive(&[
+        ("same.mod", b"first", 0, 0, b"first"),
+        ("inner.zip", &first_inner, 0, 0, &first_inner),
+        ("same.mod", b"last payload", 0, 0, b"last payload"),
+        ("other.mtm", b"other", 0, 0, b"other"),
+        ("inner.zip", &last_inner, 0, 0, &last_inner),
+    ]);
+    for bytes in [bytes.clone(), zip64_footer(bytes)] {
+        let result = catalog(&bytes).unwrap();
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.issues.len(), 2);
+        assert_eq!(result.entries[0].member.size, 5);
+        assert_eq!(result.entries[1].member.name, "first.it");
+        assert_eq!(extract(&bytes, find_entry(&bytes, "same.mod", Some(b"same.mod")).unwrap()).unwrap(), b"first");
+        assert_eq!(list_zip_containers(&bytes).unwrap(), vec![1]);
+        assert_eq!(extract(&bytes, 1).unwrap(), first_inner);
+        let modules = list_modules(&bytes).unwrap();
+        assert_eq!(modules.iter().map(|entry| entry.index).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(extract(&bytes, modules[1].index).unwrap(), b"other");
+        let mut truncated = bytes.clone();
+        truncated.truncate(truncated.len() - 12);
+        assert!(catalog(&truncated).is_err());
+    }
+}
+
+#[test]
+fn owned_duplicate_preparation_compacts_in_place_and_preserves_legacy_first_entry_policy() {
+    use starplayer_archive::{find_entry, prepare_owned_archive};
+    let bytes = legacy_encode::archive(&[("same.mod", b"first", 0, 0, b"first"), ("same.mod", b"last", 0, 0, b"last")]);
+    for bytes in [bytes.clone(), zip64_footer(bytes)] {
+        let original_pointer = bytes.as_ptr();
+        let original_capacity = bytes.capacity();
+        let original_length = bytes.len();
+        let prepared = prepare_owned_archive(bytes).unwrap();
+        assert_eq!(prepared.as_ptr(), original_pointer);
+        assert_eq!(prepared.capacity(), original_capacity);
+        assert!(prepared.len() < original_length);
+        let modules = list_modules(&prepared).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].size, 5);
+        assert_eq!(extract(&prepared, find_entry(&prepared, "same.mod", Some(b"same.mod")).unwrap()).unwrap(), b"first");
+        let again = prepare_owned_archive(prepared).unwrap();
+        assert_eq!(again.as_ptr(), original_pointer);
+        assert_eq!(again.capacity(), original_capacity);
+    }
+    assert!(matches!(prepare_owned_archive(vec![0; starplayer_archive::MAX_SOURCE_BYTES as usize + 1]), Err(ArchiveError::SourceTooLarge { .. })));
+}
+
+#[test]
+fn duplicate_directory_mutations_return_errors_without_panics() {
+    use starplayer_archive::catalog;
+    let bytes = legacy_encode::archive(&[("same.mod", b"first", 0, 0, b"first"), ("same.mod", b"last", 0, 0, b"last")]);
+    let directory = bytes.windows(4).position(|window| window == b"PK\x01\x02").unwrap();
+    for index in directory..bytes.len() {
+        for mask in [1, 128, 255] {
+            let mut mutated = bytes.clone();
+            mutated[index] ^= mask;
+            assert!(std::panic::catch_unwind(|| catalog(&mutated)).is_ok(), "mutation at {index}, mask {mask}");
+        }
+    }
+}
+
+
+#[test]
+fn duplicate_inner_names_report_paths_and_keep_first_payload() {
+    use starplayer_archive::{catalog, find_entry};
+    let inner = legacy_encode::archive(&[("same.it", b"first", 0, 0, b"first"), ("same.it", b"last", 0, 0, b"last")]);
+    let outer = archive(&[("inner.zip", &inner, CompressionMethod::Stored)], &[]);
+    let result = catalog(&outer).unwrap();
+    assert_eq!(result.entries.len(), 1);
+    assert_eq!(result.entries[0].member.size, 5);
+    assert_eq!(result.issues[0].path, "inner.zip/same.it");
+    assert_eq!(extract(&inner, find_entry(&inner, "same.it", Some(b"same.it")).unwrap()).unwrap(), b"first");
+}

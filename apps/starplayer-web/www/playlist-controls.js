@@ -2,10 +2,10 @@ import { openPlaylistStore } from './playlist-store.js';
 import { createResolver } from './track-resolver.js';
 import { exportPlaylist, importPlaylist, keysForLibrary, locatorKey, rebindCandidates, rebindEntries } from './playlist-transfer.js';
 
-export async function createPlaylistControls({ playlist, state, loader, ready = () => {} }) {
+export async function createPlaylistControls({ playlist, state, loader, ready = () => {}, openStore = openPlaylistStore }) {
     const element = name => document.getElementById(`playlist-${name}`);
     const report = message => { element('status').textContent = message; };
-    const store = await openPlaylistStore({ report });
+    const store = await openStore({ report });
     playlist.restore(store.state);
     element('loop').checked = store.state.loop;
     const snapshot = () => ({ entries: playlist.entries, currentId: playlist.current?.id ?? null, loop: element('loop').checked });
@@ -19,15 +19,29 @@ export async function createPlaylistControls({ playlist, state, loader, ready = 
         if (entry.locator.kind === 'upload') return store.hasBlob(entry.locator.blobId) ? '' : 'missing — re-add';
         const library = state.library;
         if (library?.identity.sha256 !== entry.locator.libraryIdentity?.sha256) return `library not connected — ${entry.locator.libraryIdentity?.name || 'unknown library'}`;
-        return keysForLibrary(library.library).has(locatorKey(entry.locator)) ? '' : 'track not in library';
+        if (keysForLibrary(library.library).has(locatorKey(entry.locator))) return '';
+        if (library.mode === 'discovered') return library.discoveryStatus?.phase === 'complete' ? 'not found in scan' : 'not yet discovered';
+        return 'track not in library';
+    }
+    function canPlay(entry) {
+        if (entry.locator.kind === 'upload') return store.hasBlob(entry.locator.blobId);
+        const library = state.library;
+        if (!library || library.identity.sha256 !== entry.locator.libraryIdentity?.sha256) return false;
+        return library.mode === 'discovered' || keysForLibrary(library.library).has(locatorKey(entry.locator));
     }
     function updateRebind() {
         const candidates = rebindCandidates(playlist.entries, state.library);
-        element('rebind').hidden = !candidates.length;
-        element('rebind').textContent = `Rebind ${candidates.length} entries to ${state.library?.identity.name || ''}`;
+        const pending = state.library?.mode === 'discovered' && state.library.discoveryStatus?.phase !== 'complete'
+            && playlist.entries.some(entry => entry.locator.kind === 'library' && entry.locator.libraryIdentity?.sha256 !== state.library.identity.sha256);
+        element('rebind').hidden = !candidates.length && !pending;
+        element('rebind').disabled = Boolean(pending);
+        element('rebind').title = pending ? `Rebind waits for discovery to complete (currently ${state.library.discoveryStatus?.phase || 'running'}). Resume or retry discovery to finish.` : '';
+        element('rebind').textContent = pending ? `Rebind pending — discovery ${state.library.discoveryStatus?.phase || 'running'}` : `Rebind ${candidates.length} entries to ${state.library?.identity.name || ''}`;
     }
     element('rebind').addEventListener('click', () => {
+        if (!state.library || (state.library.mode === 'discovered' && state.library.discoveryStatus?.phase !== 'complete')) return;
         playlist.restore({ ...snapshot(), entries: rebindEntries(playlist.entries, rebindCandidates(playlist.entries, state.library), state.library.identity) });
+        enrichDisplay(state.library, state.library.library.rows.filter(row => row.metadataState === 'ready').map(row => ({ locator: row, patch: row })));
         render();
     });
     async function addFiles(files) {
@@ -93,14 +107,42 @@ export async function createPlaylistControls({ playlist, state, loader, ready = 
         try {
             const result = importPlaylist(await file.text(), state.library);
             playlist.add(result.items);
-            report(`Imported ${result.items.length} tracks; ${result.unavailable} unavailable; ${result.issues.length} CSV issues.`);
+            report(`Imported ${result.items.length} tracks; ${result.unavailable} unavailable; ${result.pending} pending discovery; ${result.issues.length} CSV issues.`);
         } catch (error) { report(error.message); }
     });
+    function enrichDisplay(library, updates) {
+        if (library !== state.library || library.mode !== 'discovered') return;
+        const patches = new Map();
+        for (const { locator, patch } of updates) {
+            const key = locatorKey(locator);
+            patches.set(key, { ...patches.get(key), ...patch });
+        }
+        const displays = [];
+        for (const entry of playlist.entries) {
+            if (entry.locator.kind !== 'library' || entry.locator.libraryIdentity?.sha256 !== library.identity.sha256) continue;
+            const patch = patches.get(locatorKey(entry.locator));
+            if (!patch) continue;
+            const display = {};
+            for (const key of ['title', 'format', 'metadataState']) if (Object.hasOwn(patch, key)) display[key] = patch[key];
+            if (Object.keys(display).length) displays.push({ id: entry.id, patch: display });
+        }
+        playlist.updateDisplay(displays);
+    }
     return {
-        resolver, availability,
+        resolver, availability, canPlay,
         setRender(callback) { render = callback; },
         libraryChanged(library) {
+            if (library !== state.library) return;
+            enrichDisplay(library, library.library.rows.filter(row => row.metadataState === 'ready').map(row => ({ locator: row, patch: row })));
             store.save(snapshot(), { knownLibraries: [{ ...library.identity, sourceKind: library.source.kind, label: library.source.label }] }).catch(error => report(error.message));
+            updateRebind(); render();
+        },
+        libraryUpdated(library, change) {
+            if (library !== state.library) return;
+            // Row snapshots cover membership arrivals already enriched before discovery.
+            // Explicit partial patches also cover playback before the row exists.
+            const rows = (change.changedRowIds || []).map(id => library.library.rows[id]).filter(row => row?.metadataState === 'ready');
+            enrichDisplay(library, [...rows.map(row => ({ locator: row, patch: row })), ...(change.metadataUpdates || [])]);
             updateRebind(); render();
         },
     };

@@ -14,6 +14,21 @@ export function createPlaylist() {
             notify();
             return added;
         },
+        // One notification (and normal subscriber save) for a batch; unchanged fields
+        // do not turn hash/status-only publications into persistence writes.
+        updateDisplay(updates) {
+            const patches = new Map();
+            for (const { id, patch } of updates) patches.set(id, { ...patches.get(id), ...patch });
+            const changed = [];
+            for (const entry of entries) {
+                const patch = patches.get(entry.id);
+                if (!patch || !Object.keys(patch).some(key => !Object.is(entry.display[key], patch[key]))) continue;
+                entry.display = { ...entry.display, ...patch };
+                changed.push(entry.id);
+            }
+            if (changed.length) notify();
+            return changed;
+        },
         remove(ids) {
             const removed = new Set(ids);
             entries = entries.filter(entry => !removed.has(entry.id));

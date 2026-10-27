@@ -615,8 +615,10 @@ function createNode(context, processorOptions, wasmBytes, channels) {
 
 export async function playLibraryRow(row) {
     if (!row.playable || !state.library) return;
-    const result = await playback.play(libraryLocator(row, state.library.identity), { origin: 'library', folder: row.folder, label: `${row.name} — ${row.title} (${row.folder})` });
-    if (result.status === 'played') libraryView.setPlaying(row.id);
+    const library = state.library;
+    const label = `${row.name}${row.title ? ` — ${row.title}` : ''}${row.folder ? ` (${row.folder})` : ''}`;
+    const result = await playback.play(libraryLocator(row, library.identity), { origin: 'library', folder: row.folder, label });
+    if (result.status === 'played' && library === state.library) libraryView.setPlaying(row.id);
     else if (result.status === 'failed') reportLoadFailure(row.name, result.error);
 }
 
@@ -656,6 +658,10 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
     Loader.inspect_s3m(new Uint8Array(moduleBuffer));
     loadEffectNames();
     const metadata = readMetadata(moduleLabel);
+    // The loader is mutable: snapshot its optional structured data before any await.
+    // Older assets or accessor/JSON errors must not prevent ordinary playback.
+    let libraryMetadata = null;
+    try { libraryMetadata = JSON.parse(Loader.module_metadata()); } catch {}
     await context.audio;
     if (!context.isCurrent() || revision !== state.moduleRevision) return null;
     showMessage(`Activating ${moduleLabel}…`);
@@ -694,6 +700,13 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
     queueCommand(Ring.OPCODE_PLAY, 0, 0);
     const reduction = describeEnhancementReduction(loadOptions.enhancementFlags, result.appliedEnhancementFactor);
     showMessage(`Playing ${metadata.title || moduleLabel}.${reduction ? ` (${reduction}.)` : ''}`);
+    const library = context.libraryContext;
+    if (libraryMetadata && context.locator?.kind === 'library' && library === state.library
+        && library?.identity.sha256 === context.locator.libraryIdentity?.sha256) {
+        // D2 borrows bytes and owns any asynchronous hash copy. Enrichment is optional
+        // and follows the successful current/revision/node activation commit above.
+        try { library.discovery?.acceptPlaybackMetadata(context.locator, libraryMetadata, retainedBytes); } catch {}
+    }
 
     // The engine applies LoadModule at the next quantum. Collection happens in a
     // later worklet message task, never inside process(). Two attempts cover a busy
@@ -2328,7 +2341,7 @@ const libraryResolver = {
     async resolve(locator, options) {
         if (locator.kind === 'upload') return playlistControls.resolver.resolve(locator, options);
         const library = state.library;
-        if (!library || library.identity.sha256 !== locator.libraryIdentity?.sha256) throw new Error('Library unavailable: reconnect its original index.');
+        if (!library || library.identity.sha256 !== locator.libraryIdentity?.sha256) throw new Error('Library unavailable: reconnect its library.');
         const buffer = await library.resolver.resolve(locator, options);
         if (library !== state.library) throw new DOMException('Library changed', 'AbortError');
         return buffer;
@@ -2341,6 +2354,7 @@ const libraryResolver = {
 const playback = createPlaybackController({
     resolver: libraryResolver, activate: preparePlayback, ready: () => startAudio(true),
     repeat: () => elements.repeat.checked,
+    captureContext: locator => ({ libraryContext: locator.kind === 'library' ? state.library : null }),
     readSnapshot: () => {
         const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
         if (snapshot && state.metadata && playback.current?.graph === state.node && snapshot.moduleGeneration === playback.current.generation) {
@@ -2409,7 +2423,7 @@ document.addEventListener('visibilitychange', () => {
 const playlistPlayback = createPlaylistPlayback({
     playlist, controller: playback, resolver: libraryResolver,
     loop: () => byId('playlist-loop').checked, report: showError,
-    changed: () => playlistView.render(), available: entry => !playlistControls.availability(entry),
+    changed: () => playlistView.render(), available: playlistControls.canPlay,
 });
 const playlistView = wirePlaylistList(playlist, { playback: playlistPlayback, availability: playlistControls.availability });
 playlistControls.setRender(() => playlistView.render());
@@ -2422,7 +2436,11 @@ function userSeek(opcode, frame) {
     scheduleMediaPosition();
 }
 const libraryView = createLibraryView({ playlist, play: playLibraryRow });
-await wireLibraryControls({ state, loader: Loader, onLibrary: library => { libraryView.setLibrary(library); playlistControls.libraryChanged(library); }, onComments: () => libraryView.refreshComments() });
+await wireLibraryControls({ state, loader: Loader,
+    onLibrary: library => { libraryView.setLibrary(library); playlistControls.libraryChanged(library); },
+    onLibraryUpdate: (library, change) => { libraryView.updateLibrary(library, change); playlistControls.libraryUpdated(library, change); },
+    onComments: () => libraryView.refreshComments(),
+});
 
 // `app.js` is a module and therefore deferred. This is the one honest signal that its
 // listeners are attached, which is what the headless harness waits on before clicking.

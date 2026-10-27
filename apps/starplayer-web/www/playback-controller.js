@@ -2,7 +2,7 @@
 // after its own awaits, and before transferring bytes or committing UI state.
 const SONG_FLAG_END_REACHED = 4; // ring.js snapshot ABI
 
-export function createPlaybackController({ resolver, activate, ready = () => {}, readSnapshot, flushCommands = () => {}, stop = () => {}, repeat = () => true, onIntent = () => {}, onTrackEnded = () => {}, clock = globalThis }) {
+export function createPlaybackController({ resolver, activate, ready = () => {}, readSnapshot, flushCommands = () => {}, stop = () => {}, repeat = () => true, onIntent = () => {}, captureContext = () => ({}), onTrackEnded = () => {}, clock = globalThis }) {
     const endedListeners = new Set([onTrackEnded]);
     let intent = 0;
     let controlRevision = 0;
@@ -34,16 +34,20 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
             const isCurrent = () => token === intent && !signal.aborted;
             playlistMode = origin === 'playlist';
             onIntent({ origin, entryId });
+            // Preserve the originating locator/context across resolution and activation.
+            // A later playlist selection or source re-open must not redirect enrichment.
+            const capturedLocator = { ...locator, ...(locator.libraryIdentity ? { libraryIdentity: { ...locator.libraryIdentity } } : {}) };
             // Start audio synchronously within the user's gesture, even while fetching.
             let audioReady;
             try {
+                const activationContext = { ...captureContext(capturedLocator), locator: capturedLocator, isCurrent, entryId, folder, archiveLabel };
                 audioReady = Promise.resolve(ready());
                 audioReady.catch(() => {});
                 const buffer = locator.kind === 'bytes'
                     ? await (locator.read ? locator.read(signal) : locator.buffer)
-                    : await resolver.resolve(locator, { signal });
+                    : await resolver.resolve(capturedLocator, { signal });
                 if (!isCurrent()) return { status: 'abandoned' };
-                const activation = await activate(buffer, label, origin, { isCurrent, audio: audioReady, entryId, folder, archiveLabel });
+                const activation = await activate(buffer, label, origin, { ...activationContext, audio: audioReady });
                 if (!isCurrent() || !activation) return { status: 'abandoned' };
                 current = { ...activation, origin, entryId };
                 blocked = false;

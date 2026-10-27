@@ -103,7 +103,7 @@ test('precomputed stable sorts with folder/name ties, numeric and timestamp colu
         { source_path: 'b/z.mod', title: 'same' }, { source_path: 'a/z.mod', title: 'Same' },
         { source_path: 'a/b.mod', title: 'same' }, { source_path: 'a/B.mod', title: 'same' },
     ]));
-    assert.deepEqual([...search(tied, '', { sort: { column: 'title' } })], [2, 3, 1, 0]);
+    assert.deepEqual([...search(tied, '', { sort: { column: 'title' } })], [3, 2, 1, 0], 'case-sensitive locators break folded folder/name ties');
 });
 
 test('tree models ZIP and nested ZIP levels and counts playable descendants', () => {

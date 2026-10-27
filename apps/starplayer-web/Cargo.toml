@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 starplayer = { workspace = true, features = ["std"] }
 starplayer-archive = { workspace = true }
 wasm-bindgen = { workspace = true }
+serde_json = "1.0"
 
 [dev-dependencies]
 zip = { workspace = true }

@@ -1,0 +1,606 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createLibraryWorkerRuntime } from '../www/library-worker-runtime.js';
+import { executeLibraryJob, startLibraryWorker, MAX_SOURCE_BYTES, MAX_EXTRACTED_BYTES } from '../www/library-worker-jobs.js';
+import { webcrypto } from 'node:crypto';
+import { runInNewContext } from 'node:vm';
+
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
+const catalog = { entries: [], issues: [] };
+const metadata = { format: 'mod', title: 'A title', channels: 4, instrumentNames: '\nBass', sampleNames: 'Kick\n', songMessage: '' };
+const sha256 = 'a'.repeat(64);
+const tags = job => Object.fromEntries(['instanceId', 'id', 'generation', 'attempt', 'kind'].map(field => [field, job[field]]));
+// Single-member fixture convenience; production accepts only the grouped contract.
+function grouped(request) {
+    if (request.kind !== 'inspect-group' || request.members) return request;
+    return { ...request, sourcePath: request.locator.sourcePath, members: [{ token: 'member', locator: request.locator, version: 0 }], purpose: 'scan' };
+}
+async function executeMemberJob(request, options) {
+    let delivered;
+    await executeLibraryJob(grouped(request), { ...options, onMember: result => { delivered = result; } });
+    if (delivered.error) throw Object.assign(new Error(delivered.error.message), delivered.error);
+    return delivered.payload;
+}
+const locator = sourcePath => ({ kind: 'library', sourcePath, containerMember: 'inner.zip', memberPath: 'song.mod', rawHex: 'abcd' });
+function fixture({ source: overrides = {}, autoReady = true, workerFactory } = {}) {
+    const workers = [];
+    const reads = [];
+    const sizes = [];
+    const source = { size: async path => { sizes.push(path); return 4; }, readFile: async path => { reads.push(path); return new Uint8Array([1, 2, 3, 4]).buffer; }, ...overrides };
+    function factory() {
+        const worker = {
+            jobs: [], transfers: [], terminated: false,
+            postMessage(message, transfer) {
+                this.transfers.push(transfer[0]);
+                this.jobs.push(structuredClone(message, { transfer }));
+            },
+            emit(message) { this.onmessage?.({ data: message }); },
+            ready() { this.emit({ type: 'ready' }); },
+            reply(payload, tag = {}) {
+                const job = this.jobs.at(-1);
+                if (job.kind === 'inspect-group') {
+                    for (const member of job.members) this.emit({ type: 'member-result', ...tags(job), token: member.token, payload: payload ?? { metadata, sha256 }, ...tag });
+                }
+                this.emit({ type: job.kind === 'inspect-group' ? 'group-result' : 'result', ...tags(job), payload: payload ?? catalog, ...tag });
+            },
+            fail(code = 'job-failed', message = 'bad file') {
+                const job = this.jobs.at(-1);
+                this.emit({ type: 'error', ...tags(job), error: { name: 'Error', code, message } });
+            },
+            terminate() { this.terminated = true; },
+        };
+        workers.push(worker);
+        if (autoReady) queueMicrotask(() => worker.ready());
+        return worker;
+    }
+    const runtime = createLibraryWorkerRuntime({ source, workerFactory: workerFactory || factory });
+    const enqueue = job => {
+        const handle = runtime.enqueue({ generation: 7, ...grouped(job) });
+        // Consumers may retain work through multiple turns without unhandled rejections.
+        handle.result.catch(() => {});
+        return handle;
+    };
+    return { runtime, enqueue, workers, reads, sizes };
+}
+const expectCode = (promise, code) => assert.rejects(promise, error => error.code === code && error.name === (code === 'aborted' || code === 'disposed' ? 'AbortError' : 'Error') && typeof error.message === 'string');
+
+test('priority is catalog/groups with serial dispatch and no queued archive reads', async () => {
+    const { runtime, enqueue, workers, reads, sizes } = fixture();
+    const inspect = enqueue({ kind: 'inspect-group', locator: locator('track.zip') });
+    const first = enqueue({ kind: 'catalog', sourcePath: 'first.zip' });
+    const second = enqueue({ kind: 'catalog', sourcePath: 'second.zip' });
+    await tick();
+    assert.equal(workers[0].jobs[0].kind, 'catalog');
+    assert.deepEqual(reads, ['first.zip']);
+    assert.deepEqual(sizes, ['first.zip']);
+    workers[0].reply(); await first.result; await tick();
+    assert.deepEqual(reads, ['first.zip', 'second.zip']);
+    workers[0].reply(); await second.result; await tick();
+    assert.deepEqual(reads, ['first.zip', 'second.zip', 'track.zip']);
+    workers[0].reply(); await inspect.result;
+    runtime.dispose();
+});
+
+
+
+test('source reads transfer ownership, queued jobs retain locator snapshots only', async () => {
+    const input = new Uint8Array([1, 2]);
+    const { runtime, enqueue, workers } = fixture({ source: { readFile: async () => input.buffer } });
+    const original = locator('original.zip');
+    const job = enqueue({ kind: 'inspect-group', locator: original });
+    original.sourcePath = 'mutated.zip';
+    await tick();
+    assert.equal(input.byteLength, 0);
+    assert.equal(workers[0].jobs[0].members[0].locator.sourcePath, 'original.zip');
+    workers[0].reply(); await job.result;
+    runtime.dispose();
+});
+
+
+
+test('size rejects before reading and unrelated work continues', async () => {
+    const { runtime, enqueue, workers, reads } = fixture({ source: { size: async path => path === 'huge.zip' ? MAX_SOURCE_BYTES + 1 : null } });
+    const huge = enqueue({ kind: 'catalog', sourcePath: 'huge.zip' });
+    const good = enqueue({ kind: 'catalog', sourcePath: 'good.zip' });
+    await expectCode(huge.result, 'source-too-large'); await tick();
+    assert.deepEqual(reads, ['good.zip']);
+    workers[0].reply(); await good.result;
+    runtime.dispose();
+});
+
+test('post-read size checks unknown sizes and read failures do not suspend', async () => {
+    const { runtime, enqueue, workers } = fixture({ source: {
+        size: async () => null,
+        readFile: async path => {
+            if (path === 'bad.zip') throw new Error('permission denied');
+            if (path === 'huge.zip') return new ArrayBuffer(MAX_SOURCE_BYTES + 1);
+            return new ArrayBuffer(1);
+        },
+    } });
+    const bad = enqueue({ kind: 'catalog', sourcePath: 'bad.zip' });
+    const huge = enqueue({ kind: 'catalog', sourcePath: 'huge.zip' });
+    const good = enqueue({ kind: 'catalog', sourcePath: 'good.zip' });
+    await expectCode(bad.result, 'read-failed');
+    await expectCode(huge.result, 'source-too-large'); await tick();
+    workers[0].reply(); await good.result;
+    runtime.dispose();
+});
+
+test('binding failures and invalid result JSON/schema reject only their job', async () => {
+    const { runtime, enqueue, workers } = fixture();
+    const first = enqueue({ kind: 'catalog', sourcePath: 'bad.zip' });
+    const errors = [];
+    const second = runtime.enqueue({ generation: 7, ...grouped({ kind: 'inspect-group', locator: locator('bad.mod') }) }, { onMember: result => errors.push(result.error) });
+    const third = enqueue({ kind: 'inspect-group', locator: locator('good.mod') });
+    await tick(); workers[0].fail(); await expectCode(first.result, 'job-failed');
+    await tick(); workers[0].reply({ metadata: { ...metadata, channels: 0 }, sha256 }); await second.result; assert.equal(errors[0].code, 'job-failed');
+    await tick(); workers[0].reply(); await third.result;
+    runtime.dispose();
+});
+
+for (const failure of ['startup', 'crash', 'messageerror', 'post']) {
+    test(`${failure} worker failure rejects active and suspends queued work until recreation`, async () => {
+        const { runtime, enqueue, workers, reads } = fixture({ autoReady: false });
+        const first = enqueue({ kind: 'catalog', sourcePath: 'a.zip' });
+        const second = enqueue({ kind: 'catalog', sourcePath: 'b.zip' });
+        await tick();
+        if (failure === 'startup') workers[0].emit({ type: 'startup-error', error: { message: 'no wasm' } });
+        if (failure === 'crash') workers[0].onerror({ message: 'crashed', preventDefault() {} });
+        if (failure === 'messageerror') workers[0].onmessageerror();
+        if (failure === 'post') { workers[0].postMessage = () => { throw new Error('clone failed'); }; workers[0].ready(); }
+        await expectCode(first.result, 'worker-failed');
+        await tick();
+        assert.equal(workers.length, 1);
+        assert.equal(workers[0].terminated, true);
+        assert.equal(reads.includes('b.zip'), false);
+        runtime.resumeCatalog(); await tick(); assert.equal(workers.length, 1);
+        runtime.dispose(); await expectCode(second.result, 'disposed');
+    });
+}
+
+test('synchronous worker construction failure is asynchronous to enqueue caller', async () => {
+    const { runtime, enqueue } = fixture({ workerFactory: () => { throw new Error('CSP'); } });
+    const job = enqueue({ kind: 'catalog', sourcePath: 'a.zip' });
+    await expectCode(job.result, 'worker-failed');
+    runtime.dispose();
+});
+
+test('cancel mid-read releases slot immediately and late file data cannot post', async () => {
+    const read = deferred();
+    const signals = [];
+    const { runtime, enqueue, workers } = fixture({ source: { readFile: async (path, { signal }) => { signals.push(signal); return path === 'slow.zip' ? read.promise : new ArrayBuffer(1); } } });
+    const slow = enqueue({ kind: 'catalog', sourcePath: 'slow.zip' });
+    const next = enqueue({ kind: 'catalog', sourcePath: 'next.zip' });
+    await tick(); slow.cancel(); await expectCode(slow.result, 'aborted'); await tick();
+    assert.equal(signals[0].aborted, true);
+    assert.equal(workers[1].jobs.length, 1);
+    read.resolve(new ArrayBuffer(1)); await tick();
+    assert.equal(workers[0].jobs.length, 0);
+    workers[1].reply(); await next.result;
+    runtime.dispose();
+});
+
+test('cancel during size lookup does not read, and queued cancellation creates no worker', async () => {
+    const size = deferred();
+    const { runtime, enqueue, workers, reads } = fixture({ source: { size: () => size.promise } });
+    const first = enqueue({ kind: 'catalog', sourcePath: 'a.zip' });
+    const queued = enqueue({ kind: 'inspect-group', locator: locator('b.zip') });
+    queued.cancel(); await expectCode(queued.result, 'aborted');
+    await tick(); first.cancel(); await expectCode(first.result, 'aborted');
+    size.resolve(2); await tick(); assert.deepEqual(reads, []); assert.equal(workers.length, 1);
+    runtime.dispose();
+});
+
+test('pause active catalog requeues same promise while inspect proceeds; stale replies ignored', async () => {
+    const { runtime, enqueue, workers } = fixture();
+    const archive = enqueue({ kind: 'catalog', sourcePath: 'a.zip' });
+    const inspect = enqueue({ kind: 'inspect-group', locator: locator('b.zip') });
+    let settlements = 0;
+    archive.result.then(() => { settlements += 1; });
+    await tick();
+    const stale = workers[0].onmessage;
+    const old = workers[0].jobs[0];
+    runtime.pauseCatalog(); await tick();
+    assert.equal(workers[0].terminated, true);
+    assert.equal(workers[1].jobs[0].kind, 'inspect-group');
+    stale({ data: { ...old, type: 'result', payload: catalog } });
+    workers[1].reply(); await inspect.result; await tick(); assert.equal(settlements, 0);
+    runtime.resumeCatalog(); await tick();
+    assert.equal(workers[1].jobs[1].id, archive.id);
+    workers[1].reply(); await archive.result; workers[1].reply(); await tick();
+    assert.equal(settlements, 1);
+    runtime.dispose();
+});
+
+test('pause before startup and late ready cannot dispatch the interrupted attempt', async () => {
+    const { runtime, enqueue, workers } = fixture({ autoReady: false });
+    const archive = enqueue({ kind: 'catalog', sourcePath: 'a.zip' });
+    await tick();
+    const stale = workers[0].onmessage;
+    runtime.pauseCatalog();
+    stale({ data: { type: 'ready' } }); await tick();
+    assert.equal(workers[0].jobs.length, 0);
+    runtime.resumeCatalog(); await tick(); workers[1].ready(); await tick();
+    workers[1].reply(); await archive.result;
+    runtime.dispose();
+});
+
+test('pause mid-read reuses promise and rereads on resume without buffering stale bytes', async () => {
+    const read = deferred();
+    let reads = 0;
+    const { runtime, enqueue, workers } = fixture({ source: { readFile: () => ++reads === 1 ? read.promise : new ArrayBuffer(1) } });
+    const job = enqueue({ kind: 'catalog', sourcePath: 'a.zip' });
+    await tick(); runtime.pauseCatalog(); runtime.resumeCatalog(); await tick();
+    read.resolve(new ArrayBuffer(5)); await tick();
+    assert.equal(workers[1].jobs.length, 1);
+    workers[1].reply(); await job.result; runtime.dispose();
+});
+
+test('cancelMetadata cancels inspect only and preserves active/queued archive jobs', async () => {
+    const { runtime, enqueue, workers } = fixture();
+    const inspect = enqueue({ kind: 'inspect-group', locator: locator('a.zip') });
+    await tick();
+    const archive = enqueue({ kind: 'catalog', sourcePath: 'b.zip' });
+    const next = enqueue({ kind: 'inspect-group', locator: locator('c.zip') });
+    runtime.cancelMetadata(); await expectCode(inspect.result, 'aborted'); await expectCode(next.result, 'aborted');
+    await tick(); assert.equal(workers[1].jobs[0].kind, 'catalog'); workers[1].reply(); await archive.result;
+    const later = enqueue({ kind: 'inspect-group', locator: locator('d.zip') });
+    await tick(); workers[1].reply(); await later.result;
+    runtime.dispose();
+});
+
+test('job and generation tags gate stale replies and settle exactly once', async () => {
+    const { runtime, enqueue, workers } = fixture();
+    const job = enqueue({ kind: 'catalog', sourcePath: 'a.zip', generation: 12 });
+    let settlements = 0;
+    job.result.then(() => { settlements += 1; });
+    await tick();
+    workers[0].reply(undefined, { generation: 11 });
+    workers[0].reply(undefined, { id: job.id + 1 });
+    workers[0].reply(undefined, { kind: 'inspect-group' });
+    await tick(); assert.equal(settlements, 0);
+    workers[0].reply(); assert.equal((await job.result).generation, 12);
+    workers[0].reply(); job.cancel(); runtime.dispose(); await tick(); assert.equal(settlements, 1);
+});
+
+test('recycle after 32 MiB input and every 100 completed jobs, preserving queue', async () => {
+    const { runtime, enqueue, workers } = fixture({ source: { size: async path => path === 'big.zip' ? 32 * 1024 * 1024 : 1, readFile: async path => new ArrayBuffer(path === 'big.zip' ? 32 * 1024 * 1024 : 1) } });
+    const big = enqueue({ kind: 'catalog', sourcePath: 'big.zip' });
+    await tick(); workers[0].reply(); await big.result;
+    assert.equal(workers[0].terminated, true);
+    for (let count = 0; count < 100; count += 1) {
+        const job = enqueue({ kind: 'catalog', sourcePath: `small-${count}.zip` });
+        await tick(); workers[1].reply(); await job.result;
+        assert.equal(workers[1].terminated, count === 99);
+    }
+    const after = enqueue({ kind: 'catalog', sourcePath: 'small.zip' });
+    await tick(); assert.equal(workers.length, 3); workers[2].reply(); await after.result;
+    runtime.dispose();
+});
+
+test('dispose rejects active and queued jobs, is idempotent and rejects later enqueues asynchronously', async () => {
+    const { runtime, enqueue, workers } = fixture({ autoReady: false });
+    const first = enqueue({ kind: 'catalog', sourcePath: 'a.zip' });
+    const second = enqueue({ kind: 'catalog', sourcePath: 'small.zip' });
+    const third = enqueue({ kind: 'inspect-group', locator: locator('b.zip') });
+    await tick(); runtime.dispose(); runtime.dispose();
+    await Promise.all([first, second, third].map(job => expectCode(job.result, 'disposed')));
+    assert.equal(workers[0].terminated, true);
+    await expectCode(enqueue({ kind: 'catalog', sourcePath: 'c.zip' }).result, 'disposed');
+});
+
+function bindings(overrides = {}) {
+    const calls = [];
+    const loader = {
+        ArchiveInspectionSession: class {
+            constructor(bytes) { this.bytes = bytes; }
+            extract_member(...names) { return loader.archive_extract_path(this.bytes, ...names); }
+            free() {}
+        },
+        archive_catalog(bytes) { calls.push(['catalog', bytes.byteLength]); return JSON.stringify(catalog); },
+        archive_extract_path(bytes, ...names) { calls.push(['extract', ...names]); return new Uint8Array([9, 8]); },
+        inspect_s3m(bytes) { calls.push(['inspect', [...bytes]]); },
+        module_metadata() { calls.push(['metadata']); return JSON.stringify(metadata); },
+        ...overrides,
+    };
+    return { calls, loader, digest: bytes => webcrypto.subtle.digest('SHA-256', bytes) };
+}
+
+test('worker catalog never extracts/inspects members; no-module catalog is valid', async () => {
+    const fixture = bindings();
+    assert.deepEqual(await executeLibraryJob({ kind: 'catalog', bytes: new ArrayBuffer(2) }, fixture), catalog);
+    assert.deepEqual(fixture.calls, [['catalog', 2]]);
+});
+
+test('worker inspection uses exact session path extraction and hashes extracted bytes', async () => {
+    const fixture = bindings();
+    const result = await executeMemberJob({ kind: 'inspect-group', locator: locator('a.zip'), bytes: new ArrayBuffer(4) }, fixture);
+    assert.deepEqual(result.metadata, metadata);
+    assert.equal(result.sha256, '4674d5929bf80d90d5d455d37bd530ca60bdf6a870c7014d92b529a89c4c4e95');
+    assert.deepEqual(fixture.calls, [['extract', 'inner.zip', 'song.mod', 'abcd'], ['inspect', [9, 8]], ['metadata']]);
+});
+
+test('worker loose inspection captures metadata before asynchronous digest', async () => {
+    const pending = deferred();
+    const fixture = bindings();
+    const promise = executeMemberJob({ kind: 'inspect-group', locator: { sourcePath: 'a.mod' }, bytes: new Uint8Array([1]).buffer }, { ...fixture, digest: () => pending.promise });
+    assert.deepEqual(fixture.calls, [['inspect', [1]], ['metadata']]);
+    pending.resolve(new Uint8Array(32).buffer);
+    assert.deepEqual((await promise).metadata, metadata);
+});
+
+test('worker rejects invalid binding JSON/schema, throws and oversized extracted entries', async () => {
+    await assert.rejects(executeLibraryJob({ kind: 'catalog', bytes: new ArrayBuffer(1) }, bindings({ archive_catalog: () => '{' })), SyntaxError);
+    await expectCode(executeLibraryJob({ kind: 'catalog', bytes: new ArrayBuffer(1) }, bindings({ archive_catalog: () => '{}' })), 'job-failed');
+    await assert.rejects(executeLibraryJob({ kind: 'catalog', bytes: new ArrayBuffer(1) }, bindings({ archive_catalog: () => { throw new Error('corrupt'); } })), /corrupt/);
+    await expectCode(executeMemberJob({ kind: 'inspect-group', locator: locator('a.zip'), bytes: new ArrayBuffer(1) }, bindings({ archive_extract_path: () => new Uint8Array(MAX_EXTRACTED_BYTES + 1) })), 'source-too-large');
+});
+
+
+test('unknown job kinds and removed hash jobs reject asynchronously without worker failure', async () => {
+    const { runtime, enqueue, workers } = fixture();
+    await expectCode(enqueue({ kind: 'toString' }).result, 'job-failed');
+    await expectCode(enqueue({ kind: 'hash', bytes: 1 }).result, 'job-failed');
+    await expectCode(enqueue({ kind: 'hash', bytes: new ArrayBuffer(1) }).result, 'job-failed');
+    assert.equal(workers.length, 0);
+    const good = enqueue({ kind: 'catalog', sourcePath: 'good.zip' });
+    await tick(); workers[0].reply(); await good.result; runtime.dispose();
+});
+
+test('worker catalog validation rejects unknown format tokens', async () => {
+    const invalid = { entries: [{ containerMember: '', memberPath: 'song.mod', rawHex: 'ab', size: 2, format: 'MOD', playable: true, error: '' }], issues: [] };
+    await expectCode(executeLibraryJob({ kind: 'catalog', bytes: new ArrayBuffer(1) }, bindings({ archive_catalog: () => JSON.stringify(invalid) })), 'job-failed');
+});
+
+
+test('worker endpoint reports startup errors separately from binding/decoding job errors', async () => {
+    const messages = [];
+    const scope = { postMessage: message => messages.push(message) };
+    await startLibraryWorker({ scope, loadLoader: async () => { throw new Error('no WASM'); } });
+    assert.deepEqual(messages.pop(), { type: 'startup-error', error: { name: 'Error', code: 'worker-failed', message: 'no WASM' } });
+    assert.equal(scope.onmessage, undefined);
+    const { loader } = bindings({ archive_catalog: () => '{' });
+    await startLibraryWorker({ scope, loadLoader: async () => loader });
+    assert.deepEqual(messages.pop(), { type: 'ready' });
+    const tag = { instanceId: 1, attempt: 1, id: 42, generation: 9, kind: 'catalog' };
+    await scope.onmessage({ data: { ...tag, bytes: new ArrayBuffer(1) } });
+    const failure = messages.pop();
+    assert.deepEqual({ type: failure.type, ...tags(failure) }, { type: 'error', ...tag });
+    assert.equal(failure.error.code, 'job-failed');
+    assert.equal(failure.error.name, 'Error');
+    loader.archive_catalog = () => { throw new Error('bad outer ZIP'); };
+    await scope.onmessage({ data: { ...tag, bytes: new ArrayBuffer(1) } });
+    assert.deepEqual(messages.pop().error, { name: 'Error', code: 'job-failed', message: 'bad outer ZIP' });
+    loader.archive_catalog = () => JSON.stringify(catalog);
+    await scope.onmessage({ data: { ...tag, bytes: new ArrayBuffer(1) } });
+    assert.deepEqual(messages.pop(), { type: 'result', ...tag, payload: catalog });
+});
+
+test('paused catalog returns ahead of its queued siblings with original promise identity', async () => {
+    const { runtime, enqueue, workers, reads } = fixture();
+    const first = enqueue({ kind: 'catalog', sourcePath: 'first.zip' });
+    const second = enqueue({ kind: 'catalog', sourcePath: 'second.zip' });
+    const third = enqueue({ kind: 'catalog', sourcePath: 'third.zip' });
+    const promise = first.result;
+    await tick(); runtime.pauseCatalog(); await tick(); runtime.resumeCatalog(); await tick();
+    assert.equal(first.result, promise);
+    assert.equal(workers[1].jobs[0].id, first.id);
+    workers[1].reply(); await promise; await tick();
+    assert.equal(workers[1].jobs[1].id, second.id);
+    workers[1].reply(); await second.result; await tick();
+    assert.equal(workers[1].jobs[2].id, third.id);
+    workers[1].reply(); await third.result;
+    assert.deepEqual(reads, ['first.zip', 'first.zip', 'second.zip', 'third.zip']);
+    runtime.dispose();
+});
+
+
+for (const kind of ['catalog', 'inspect-group']) {
+    test(`idle worker crash is reported through the next ${kind} job without resuming the queue`, async () => {
+        const { runtime, enqueue, workers, reads } = fixture();
+        const initial = enqueue({ kind: 'catalog', sourcePath: 'initial.zip' });
+        await tick(); workers[0].reply(); await initial.result; await tick();
+        const staleError = workers[0].onerror;
+        staleError({ message: 'idle crash' });
+        assert.equal(workers[0].terminated, true);
+        const request = kind === 'catalog' ? { kind, sourcePath: 'next.zip' } : { kind, locator: locator('next.zip') };
+        const next = enqueue(request);
+        const unrelated = enqueue({ kind: 'inspect-group', locator: locator('waiting.zip') });
+        let settlements = 0;
+        next.result.catch(() => { settlements += 1; });
+        await assert.rejects(next.result, error => error.code === 'worker-failed' && error.name === 'Error' && error.message === 'idle crash');
+        next.cancel(); staleError({ message: 'duplicate stale crash' });
+        runtime.resumeCatalog(); await tick();
+        assert.equal(workers.length, 1);
+        assert.deepEqual(reads, ['initial.zip']);
+        assert.equal(settlements, 1);
+        runtime.dispose(); await expectCode(unrelated.result, 'disposed');
+    });
+}
+
+test('idle transport failure reports one paused catalog job while preserving the remaining queue', async () => {
+    const { runtime, enqueue, workers, reads } = fixture();
+    const initial = enqueue({ kind: 'catalog', sourcePath: 'initial.zip' });
+    await tick(); workers[0].reply(); await initial.result; await tick();
+    runtime.pauseCatalog();
+    const first = enqueue({ kind: 'catalog', sourcePath: 'first.zip' });
+    const second = enqueue({ kind: 'catalog', sourcePath: 'second.zip' });
+    workers[0].onmessageerror();
+    await expectCode(first.result, 'worker-failed');
+    let secondSettled = false;
+    second.result.catch(() => { secondSettled = true; });
+    runtime.resumeCatalog(); await tick();
+    assert.equal(secondSettled, false);
+    assert.deepEqual(reads, ['initial.zip']);
+    assert.equal(workers.length, 1);
+    runtime.dispose(); await expectCode(second.result, 'disposed');
+});
+
+test('cancellation does not consume an unreported idle failure', async () => {
+    const { runtime, enqueue, workers } = fixture();
+    const initial = enqueue({ kind: 'catalog', sourcePath: 'initial.zip' });
+    await tick(); workers[0].reply(); await initial.result; await tick();
+    workers[0].onerror({ message: 'idle crash' });
+    const cancelled = enqueue({ kind: 'catalog', sourcePath: 'cancelled.zip' });
+    cancelled.cancel();
+    await expectCode(cancelled.result, 'aborted');
+    const replacement = enqueue({ kind: 'catalog', sourcePath: 'replacement.zip' });
+    await expectCode(replacement.result, 'worker-failed');
+    assert.equal(workers.length, 1);
+    runtime.dispose();
+});
+
+test('dispose before deferred idle-failure delivery rejects queued work once as disposed', async () => {
+    const { runtime, enqueue, workers } = fixture();
+    const initial = enqueue({ kind: 'catalog', sourcePath: 'initial.zip' });
+    await tick(); workers[0].reply(); await initial.result; await tick();
+    workers[0].onerror({ message: 'idle crash' });
+    const next = enqueue({ kind: 'catalog', sourcePath: 'small.zip' });
+    let settlements = 0;
+    next.result.catch(() => { settlements += 1; });
+    runtime.dispose(); runtime.dispose();
+    await expectCode(next.result, 'disposed');
+    await tick(); assert.equal(settlements, 1);
+    await expectCode(enqueue({ kind: 'catalog', sourcePath: 'later.zip' }).result, 'disposed');
+});
+
+
+function wasmUnreachable() {
+    // () -> () export containing WASM unreachable: the same engine error as an aborting Rust panic.
+    const module = new WebAssembly.Module(new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x08, 0x01, 0x04, 0x74, 0x72, 0x61, 0x70, 0x00, 0x00,
+        0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
+    ]));
+    new WebAssembly.Instance(module).exports.trap();
+}
+
+for (const binding of ['archive_catalog', 'archive_extract_path', 'inspect_s3m', 'module_metadata']) {
+    test(`worker endpoint classifies an actual WASM unreachable in ${binding} as a fatal trap`, async () => {
+        const messages = [];
+        const scope = { postMessage: message => messages.push(message) };
+        const { loader } = bindings({ [binding]: wasmUnreachable });
+        let frees = 0;
+        loader.ArchiveInspectionSession.prototype.free = () => {
+            frees += 1;
+            throw new Error('recursive use of an object detected which would lead to unsafe aliasing in rust');
+        };
+        await startLibraryWorker({ scope, loadLoader: async () => loader });
+        assert.deepEqual(messages.shift(), { type: 'ready' });
+        const tag = { instanceId: 1, attempt: 1, id: 42, generation: 9, kind: binding === 'archive_catalog' ? 'catalog' : 'inspect-group' };
+        await scope.onmessage({ data: grouped({ ...tag, locator: locator('trap.zip'), bytes: new ArrayBuffer(1) }) });
+        assert.deepEqual(messages, [{ type: 'error', ...tag, error: { name: 'Error', code: 'worker-failed', message: 'unreachable', cause: 'wasm-trap' } }]);
+        assert.equal(frees, 0, 'fatal trap must reach the endpoint without reentering WASM to free');
+    });
+}
+
+test('worker endpoint recognizes a RuntimeError from another realm', async () => {
+    const error = runInNewContext("new WebAssembly.RuntimeError('cross-realm trap')");
+    assert.equal(error instanceof WebAssembly.RuntimeError, false);
+    const messages = [];
+    const scope = { postMessage: message => messages.push(message) };
+    const { loader } = bindings({ archive_catalog: () => { throw error; } });
+    await startLibraryWorker({ scope, loadLoader: async () => loader });
+    const tag = { instanceId: 1, attempt: 1, id: 2, generation: 7, kind: 'catalog' };
+    await scope.onmessage({ data: { ...tag, bytes: new ArrayBuffer(1) } });
+    assert.deepEqual(messages.at(-1), { type: 'error', ...tag, error: { name: 'Error', code: 'worker-failed', message: 'cross-realm trap', cause: 'wasm-trap' } });
+});
+
+function endpointFixture(loader, workers) {
+    return fixture({ workerFactory() {
+        const scope = { postMessage: message => worker.onmessage?.({ data: structuredClone(message) }) };
+        const worker = {
+            jobs: [], terminated: false,
+            postMessage(message, transfer) { this.jobs.push(structuredClone(message, { transfer })); },
+            run() { return scope.onmessage({ data: this.jobs.at(-1) }); },
+            terminate() { this.terminated = true; },
+        };
+        workers.push(worker);
+        void startLibraryWorker({ scope, loadLoader: async () => loader });
+        return worker;
+    } });
+}
+
+test('endpoint trap retires its runtime once, leaves row callbacks untouched and requires explicit recreation after each trap', async () => {
+    const workers = [];
+    let trap = true;
+    const { loader } = bindings({ inspect_s3m: () => { if (trap) wasmUnreachable(); } });
+    const first = endpointFixture(loader, workers);
+    const updates = [];
+    const active = first.enqueue({ kind: 'inspect-group', locator: locator('trap.zip') });
+    let rejections = 0;
+    active.result.then(result => updates.push(result), () => { rejections += 1; });
+    await tick();
+    const waiting = first.enqueue({ kind: 'inspect-group', locator: locator('waiting.zip') });
+    const catalogJob = first.enqueue({ kind: 'catalog', sourcePath: 'waiting-catalog.zip' });
+    waiting.result.then(result => updates.push(result), () => {});
+    let queuedSettlements = 0;
+    for (const job of [waiting, catalogJob]) job.result.then(() => { queuedSettlements += 1; }, () => { queuedSettlements += 1; });
+    const staleMessage = workers[0].onmessage;
+    const tag = workers[0].jobs[0];
+    await workers[0].run();
+    await assert.rejects(active.result, error => error.code === 'worker-failed' && error.cause === 'wasm-trap' && error.message === 'unreachable');
+    assert.equal(workers[0].terminated, true);
+    staleMessage({ data: { ...tag, type: 'error', error: { code: 'worker-failed', message: 'late trap', cause: 'wasm-trap' } } });
+    staleMessage({ data: { ...tag, type: 'result', payload: { metadata, sha256 } } });
+    active.cancel();
+    first.runtime.resumeCatalog();
+    await tick();
+    assert.equal(rejections, 1);
+    assert.deepEqual(updates, []);
+    assert.equal(queuedSettlements, 0);
+    assert.equal(workers.length, 1);
+    assert.equal(workers[0].jobs.length, 1);
+    assert.deepEqual(first.reads, ['trap.zip']);
+
+    // Explicit Retry is controller-owned: dispose and recreate, then resubmit unfinished work.
+    first.runtime.dispose();
+    await Promise.all([waiting, catalogJob].map(job => expectCode(job.result, 'disposed')));
+    trap = false;
+    const retry = endpointFixture(loader, workers);
+    const recovered = retry.enqueue({ kind: 'catalog', sourcePath: 'waiting-catalog.zip' });
+    await tick();
+    await workers[1].run();
+    assert.deepEqual(await recovered.result, { generation: 7, kind: 'catalog', payload: catalog });
+    assert.equal(workers[1].terminated, false);
+
+    trap = true;
+    const secondTrap = retry.enqueue({ kind: 'inspect-group', locator: locator('trap-again.zip') });
+    await tick();
+    const stillWaiting = retry.enqueue({ kind: 'catalog', sourcePath: 'still-waiting.zip' });
+    await workers[1].run();
+    await assert.rejects(secondTrap.result, error => error.code === 'worker-failed' && error.cause === 'wasm-trap');
+    retry.runtime.resumeCatalog();
+    await tick();
+    assert.equal(workers[1].terminated, true);
+    assert.equal(workers.length, 2);
+    assert.deepEqual(retry.reads, ['waiting-catalog.zip', 'trap-again.zip']);
+    retry.runtime.dispose();
+    await expectCode(stillWaiting.result, 'disposed');
+});
+
+test('ordinary wasm-bindgen Result throws and endpoint payload errors keep the same worker usable', async () => {
+    const workers = [];
+    const { loader } = bindings({ archive_catalog: () => { throw 'unsupported module data'; } });
+    const { runtime, enqueue } = endpointFixture(loader, workers);
+    const badFile = enqueue({ kind: 'catalog', sourcePath: 'bad.zip' });
+    const invalidPayload = enqueue({ kind: 'catalog', sourcePath: 'invalid.zip' });
+    const goodFile = enqueue({ kind: 'catalog', sourcePath: 'good.zip' });
+    await tick();
+    await workers[0].run();
+    await assert.rejects(badFile.result, error => error.code === 'job-failed' && error.message === 'unsupported module data' && !Object.hasOwn(error, 'cause'));
+    loader.archive_catalog = () => '{}';
+    await tick();
+    await workers[0].run();
+    await expectCode(invalidPayload.result, 'job-failed');
+    loader.archive_catalog = () => JSON.stringify(catalog);
+    await tick();
+    await workers[0].run();
+    assert.deepEqual((await goodFile.result).payload, catalog);
+    assert.equal(workers.length, 1);
+    assert.equal(workers[0].terminated, false);
+    runtime.dispose();
+});
