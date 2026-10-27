@@ -34,6 +34,7 @@
 //! browser host does not need this only because everything it owns is already on one
 //! thread.
 
+use starplayer::core::{InteractiveAction, InteractiveCommand, InteractiveTransport, PlaybackIdentity};
 use std::boxed::Box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -77,6 +78,9 @@ pub const TELEMETRY_DEPTH: usize = 3;
 
 /// One instruction from the control side to the render callback.
 enum HostCommand {
+    Interactive(InteractiveCommand),
+    RestoreTransport { identity: PlaybackIdentity, transport: Transport, state: InteractiveTransport, natural_end: bool },
+    RestoreSelections { identity: PlaybackIdentity, enabled: bool, selections: Box<[bool]> },
     /// Ramp up and start the musical clock.
     Play,
     /// Ramp down and stop it when the ramp lands.
@@ -84,7 +88,7 @@ enum HostCommand {
     /// A module and the source built for it, both already decoded, scanned and allocated
     /// on the control thread. Nothing here is constructed in the callback and nothing is
     /// dropped there.
-    Load { module: RtArc<Module>, source: Box<dyn EventSource> },
+    Load { module: RtArc<Module>, source: Box<dyn EventSource>, identity: Option<PlaybackIdentity> },
     /// What happens at the loop point, and how long the fade is when there is one.
     SetAtEnd { at_end: AtEnd, fade_frames: u32 },
     /// Pass straight through to the engine.
@@ -99,6 +103,7 @@ enum HostCommand {
 enum Retired {
     Module(RtArc<Module>),
     Source(Box<dyn EventSource>),
+    Selections(Box<[bool]>),
 }
 
 /// Which live-input arrangement the installed source uses.
@@ -119,6 +124,8 @@ struct PlayerTaps {
     source_frame: AtomicU64,
     output_frame: AtomicU64,
     playing: AtomicBool,
+    transport_state: AtomicU32,
+    natural_end: AtomicBool,
     /// Whether the song fade is running, which a UI shows and a wire header carries.
     fading: AtomicBool,
     /// `f32::to_bits` of the last block's peak.
@@ -127,16 +134,29 @@ struct PlayerTaps {
     commands_rejected: AtomicU64,
 }
 
+/// Coherent engine and host fade state, copied together for same-session rebuilds.
+#[derive(Copy, Clone, Debug, Default)]
+struct PlayerSnapshot {
+    engine: Snapshot,
+    source_frame: Frame,
+    transport: Transport,
+    state: InteractiveTransport,
+    natural_end: bool,
+}
+
 /// The audio side: everything the backend's callback owns.
 struct RenderState {
     engine: HostEngine,
     control: EngineHandle<RtArc<Module>>,
     telemetry: TelemetryReader,
-    forwarded: SnapshotPublisher<Snapshot>,
+    forwarded: SnapshotPublisher<PlayerSnapshot>,
     commands: Consumer<HostCommand>,
     retired: Producer<Retired>,
     handles: SourceHandles,
     transport: Transport,
+    interactive_identity: Option<PlaybackIdentity>,
+    interactive_enabled: bool,
+    interactive_state: InteractiveTransport,
     taps: Arc<PlayerTaps>,
     last_snapshot: Snapshot,
     /// A typed [`Command::Stop`] the engine has been sent and has not acted on yet.
@@ -147,6 +167,7 @@ struct RenderState {
     /// finished — re-arming the very fade that just landed, which leaves the transport
     /// reporting a fade over silence.
     awaiting_engine_stop: bool,
+    awaiting_restart: bool,
     /// Frames handed to the backend so far. The clock the control-plane cadence is aligned
     /// to; `HostEngine::frame` cannot serve, because it counts frames *rendered* and so
     /// jumps a whole quantum at a time however few of them the host has taken.
@@ -224,6 +245,23 @@ impl RenderState {
 
     fn apply(&mut self, command: HostCommand) {
         match command {
+            HostCommand::Interactive(command) => self.apply_interactive(command),
+            HostCommand::RestoreTransport { identity, transport, state, natural_end } => {
+                if self.interactive_identity == Some(identity) && self.interactive_enabled {
+                    let action = match state { InteractiveTransport::Playing => InteractiveAction::Play, InteractiveTransport::Paused => InteractiveAction::Pause, InteractiveTransport::Stopped => InteractiveAction::Stop };
+                    if self.send(Command::Interactive(InteractiveCommand { identity, action })) {
+                        self.transport = transport;
+                        self.interactive_state = state;
+                        self.awaiting_engine_stop = natural_end;
+                        self.taps.natural_end.store(natural_end, Ordering::Relaxed);
+                    }
+                } else { self.reject(); }
+            }
+            HostCommand::RestoreSelections { identity, enabled, selections } => {
+                if self.interactive_identity == Some(identity) { self.engine.restore_selections(identity, enabled, &selections); }
+                else { self.reject(); }
+                self.retire(Retired::Selections(selections));
+            }
             HostCommand::Play => {
                 // Play during a fade, or after the song ran out of order list, means
                 // "again", not "louder": the song is over, so it goes back to the top,
@@ -236,7 +274,11 @@ impl RenderState {
                 let _ = self.send(Command::Play);
             }
             HostCommand::Stop => self.transport.begin_stop(false),
-            HostCommand::Load { module, source } => {
+            HostCommand::Load { module, source, identity } => {
+                if let Some(identity) = identity {
+                    self.engine.set_playback_identity(identity);
+                    self.interactive_identity = Some(identity);
+                }
                 if let Some(old) = self.engine.replace_source(source) {
                     self.retire(Retired::Source(old));
                 }
@@ -248,6 +290,47 @@ impl RenderState {
                 self.transport.cancel_fade(at_end);
             }
             HostCommand::Engine(command) => { let _ = self.send(command); }
+        }
+    }
+
+    fn apply_interactive(&mut self, command: InteractiveCommand) {
+        if self.interactive_identity != Some(command.identity) { self.reject(); return; }
+        if !self.interactive_enabled && matches!(command.action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview) { self.reject(); return; }
+        // Queue first: a full engine ring must not partially apply a host fade change.
+        if !self.send(Command::Interactive(command)) { return; }
+        match command.action {
+            InteractiveAction::Pause => {
+                self.interactive_state = InteractiveTransport::Paused;
+                self.transport.pause(true);
+            }
+            InteractiveAction::Play | InteractiveAction::Resume => {
+                if self.interactive_state == InteractiveTransport::Stopped && self.transport.take_armed_rewind() {
+                    self.request_seek(SeekKind::Frame(0));
+                    self.awaiting_restart = true;
+                }
+                self.interactive_state = InteractiveTransport::Playing;
+                self.transport.pause(false);
+                self.awaiting_engine_stop = false;
+                self.taps.natural_end.store(false, Ordering::Relaxed);
+            }
+            InteractiveAction::Stop => {
+                self.interactive_state = InteractiveTransport::Stopped;
+                self.transport.interactive_stop(false);
+                self.awaiting_restart = false;
+                self.awaiting_engine_stop = false;
+                self.taps.natural_end.store(false, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_interactive_song(&mut self) {
+        let Some(identity) = self.interactive_identity else { return };
+        if self.send(Command::Interactive(InteractiveCommand { identity, action: InteractiveAction::Stop })) {
+            self.interactive_state = InteractiveTransport::Stopped;
+            self.transport.interactive_stop(true);
+            self.awaiting_engine_stop = true;
+            self.taps.natural_end.store(true, Ordering::Relaxed);
         }
     }
 
@@ -265,6 +348,11 @@ impl RenderState {
     /// saying `end_reached` and would otherwise re-arm over silence.
     fn arm_end_of_song(&mut self) {
         self.last_snapshot = *self.telemetry.read();
+        if self.awaiting_restart {
+            if self.last_snapshot.transport.end_reached { return; }
+            self.awaiting_restart = false;
+        }
+        if self.interactive_enabled && self.interactive_state != InteractiveTransport::Playing { return; }
         let running = self.engine.is_playing() && !self.transport.stop_is_pending() && !self.awaiting_engine_stop;
         if !running || !self.last_snapshot.transport.end_reached || self.transport.is_fading() {
             return;
@@ -272,6 +360,7 @@ impl RenderState {
         let loops = self.last_snapshot.transport.song_end == SongEnd::Loops;
         match self.handles.at_end.get() {
             AtEnd::FadeOut if loops => self.transport.begin_fade(),
+            AtEnd::FadeOut | AtEnd::Stop if !loops && self.interactive_enabled => self.finish_interactive_song(),
             AtEnd::FadeOut | AtEnd::Stop if !loops => self.transport.begin_stop(true),
             _ => {}
         }
@@ -281,6 +370,10 @@ impl RenderState {
     /// same typed engine stop. A song that faded out or ended is over, not paused, so it
     /// rewinds for the next Play; a Stop the caller asked for keeps its place.
     fn settle_transport(&mut self) {
+        if self.interactive_enabled {
+            if self.interactive_state == InteractiveTransport::Playing && self.transport.fade_has_landed() { self.finish_interactive_song(); }
+            return;
+        }
         if self.transport.fade_has_landed() && self.send(Command::Stop) {
             self.awaiting_engine_stop = true;
             self.transport.take_fade();
@@ -336,12 +429,12 @@ impl RenderState {
 
     fn publish(&mut self, peak: f32) {
         self.taps.source_frame.store(self.engine.source_frame().0, Ordering::Relaxed);
-        // The *musical* clock, not the output one: a live event is dispatched against the
-        // frame an `EventSource` reports in, which stops with the transport. See
-        // `crate::events`.
+        // Source time is monotonic in interactive mode; legacy transport can freeze it.
+        // Live events always use the clock sources actually dispatch against.
         self.event_clock.publish(self.engine.source_frame());
         self.taps.output_frame.store(self.engine.frame().0, Ordering::Relaxed);
         self.taps.playing.store(self.engine.is_playing() && !self.transport.stop_is_pending(), Ordering::Relaxed);
+        self.taps.transport_state.store(match self.interactive_state { InteractiveTransport::Playing => 1, InteractiveTransport::Paused => 2, InteractiveTransport::Stopped => 0 }, Ordering::Relaxed);
         self.taps.fading.store(self.transport.is_fading(), Ordering::Relaxed);
         self.taps.peak_bits.store(peak.to_bits(), Ordering::Relaxed);
         self.taps.blocks_rendered.fetch_add(1, Ordering::Relaxed);
@@ -352,7 +445,12 @@ impl RenderState {
         //
         // A snapshot the caller is too slow to collect is dropped rather than queued, which
         // is the same bargain the engine's own telemetry channel strikes.
-        let _ = self.forwarded.publish(*self.telemetry.read());
+        let mut snapshot = *self.telemetry.read();
+        if self.interactive_enabled {
+            snapshot.transport.interactive = Some(self.interactive_state);
+            snapshot.transport.natural_end = self.taps.natural_end.load(Ordering::Relaxed);
+        }
+        let _ = self.forwarded.publish(PlayerSnapshot { engine: snapshot, source_frame: self.engine.source_frame(), transport: self.transport, state: self.interactive_state, natural_end: self.taps.natural_end.load(Ordering::Relaxed) });
     }
 }
 
@@ -360,7 +458,7 @@ impl RenderState {
 struct ControlSide {
     commands: Producer<HostCommand>,
     retired: Consumer<Retired>,
-    telemetry: SnapshotReader<Snapshot>,
+    telemetry: SnapshotReader<PlayerSnapshot>,
     taps: Arc<PlayerTaps>,
     handles: SourceHandles,
     /// Taken from the engine here, because [`Player::open`] is the last moment a `&mut` to
@@ -389,11 +487,13 @@ fn build_sides(mode: MixerMode, spec: AudioSpec, mut settings: EngineSettings) -
     let scopes = engine.scope_readers();
     // Freeze the musical clock until the first Play. Without this a stream that is started
     // as soon as it is open plays the song silently while the caller is still deciding.
-    control.send(Command::Stop).map_err(|_| HostError::ControlQueueFull)?;
+    let interactive_identity = settings.playback_configuration().map(|configuration| configuration.identity);
+    let interactive_enabled = settings.playback_configuration().is_some_and(|configuration| configuration.capacity.interactive_transport);
+    if !interactive_enabled { control.send(Command::Stop).map_err(|_| HostError::ControlQueueFull)?; }
 
     let (command_producer, command_consumer) = channel(HOST_COMMAND_CAPACITY);
     let (retired_producer, retired_consumer) = channel(RETIRED_CAPACITY);
-    let (forwarded, snapshot_reader) = snapshot_channel(TELEMETRY_DEPTH, Snapshot::default());
+    let (forwarded, snapshot_reader) = snapshot_channel(TELEMETRY_DEPTH, PlayerSnapshot::default());
     let taps = Arc::new(PlayerTaps::default());
     let event_clock = EventClock::new(spec.sample_rate_hz);
     // Made once, for the life of the stream, and shared. A pair made per module would leave
@@ -408,10 +508,14 @@ fn build_sides(mode: MixerMode, spec: AudioSpec, mut settings: EngineSettings) -
         commands: command_consumer,
         retired: retired_producer,
         handles: handles.clone(),
-        transport: Transport::stopped(),
+        transport: if interactive_enabled { Transport::playing() } else { Transport::stopped() },
+        interactive_identity,
+        interactive_enabled,
+        interactive_state: InteractiveTransport::Stopped,
         taps: Arc::clone(&taps),
         last_snapshot: Snapshot::default(),
         awaiting_engine_stop: false,
+        awaiting_restart: false,
         frames_emitted: 0,
         event_clock: Arc::clone(&event_clock),
     };
@@ -447,12 +551,18 @@ struct Rebuild {
 /// The backend-neutral player: one engine, one stream, one module at a time.
 pub struct Player {
     engine_settings: EngineSettings,
+    playback_identity: Option<PlaybackIdentity>,
+    interactive_enabled: bool,
+    overlap_shadow: bool,
+    instrument_shadow: Vec<bool>,
+    transport_shadow: InteractiveTransport,
+    rebuild_cursor: Option<starplayer::core::SequencerCursor>,
     stream: Stream,
     spec: AudioSpec,
     mode: MixerMode,
     commands: Producer<HostCommand>,
     retired: Consumer<Retired>,
-    telemetry: SnapshotReader<Snapshot>,
+    telemetry: SnapshotReader<PlayerSnapshot>,
     taps: Arc<PlayerTaps>,
     handles: SourceHandles,
     at_end: AtEnd,
@@ -464,6 +574,7 @@ pub struct Player {
     master_volume: U0F16,
     module: Option<RtArc<Module>>,
     scan: Option<Arc<ScannedSong>>,
+    smf: Option<Arc<starplayer::midi::smf::Smf>>,
     collected: usize,
     scopes: Option<Box<[TapReader]>>,
     /// The clock, the lead and the counters live input is stamped and reported against.
@@ -506,6 +617,7 @@ impl Player {
     /// Open with explicit prepared capacities. Rebuilds and every module-source builder
     /// retain these settings; the negotiated output rate replaces settings.sample_rate_hz.
     pub fn open_with_settings(backend: &mut dyn AudioBackend, device: Option<&str>, requested: AudioSpec, mode: MixerMode, mut settings: EngineSettings) -> Result<Player, HostError> {
+        crate::engine::validate_host_settings(settings).map_err(HostError::EngineConfiguration)?;
         let negotiated = backend.negotiate(device, requested)?;
         settings.sample_rate_hz = negotiated.sample_rate_hz;
         let (mut render, control) = build_sides(mode, negotiated, settings)?;
@@ -519,6 +631,13 @@ impl Player {
         stream.play()?;
         Ok(Player {
             engine_settings: settings,
+            playback_identity: settings.playback_configuration().map(|configuration| configuration.identity),
+            interactive_enabled: settings.playback_configuration().is_some_and(|configuration| configuration.capacity.interactive_transport),
+            overlap_shadow: false,
+            instrument_shadow: vec![false; settings.playback_configuration().filter(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)).map_or(0, |configuration| configuration.instrument_count)],
+            transport_shadow: InteractiveTransport::Stopped,
+            rebuild_cursor: None,
+            smf: None,
             stream,
             spec: negotiated,
             mode,
@@ -576,7 +695,7 @@ impl Player {
             return Ok(());
         }
         let playing = self.is_playing();
-        let snapshot = *self.telemetry.read();
+        let snapshot = self.telemetry.read().engine;
         // The sounding *song frame*, not just the order: a rebuild in the middle of a bar
         // should come back where the ear left it, and the scan can say where that is.
         let start = match self.scan {
@@ -595,6 +714,23 @@ impl Player {
     /// callback — dies here, on this thread.
     fn rebuild(&mut self, backend: &mut dyn AudioBackend, device: Option<&str>, requested: AudioSpec, plan: Rebuild) -> Result<(), HostError> {
         let module = self.module.clone();
+        let saved_host = *self.telemetry.read();
+        let interactive_state = if saved_host.engine.is_idle() { self.transport_shadow } else { saved_host.state };
+        let held_song_frame = saved_host.engine.transport.song_frame;
+        let mut rebuild_cursor = saved_host.engine.transport.sequencer_cursor();
+        if interactive_state == InteractiveTransport::Playing && let Some(cursor) = rebuild_cursor.as_mut() {
+            // Never extrapolate through a tick absent from this published record.
+            let elapsed = cursor.captured_frame.frames_until(saved_host.source_frame).min(cursor.remaining_frames);
+            cursor.remaining_frames = cursor.remaining_frames.saturating_sub(elapsed);
+            cursor.song_frame = cursor.song_frame.saturating_add(elapsed);
+        }
+        let mut rebuild_smf = saved_host.engine.transport.smf_state();
+        if interactive_state == InteractiveTransport::Playing && let Some(state) = rebuild_smf.as_mut() {
+            let elapsed = state.cursor.captured_frame.frames_until(saved_host.source_frame);
+            let elapsed = state.cursor.remaining_frames.map_or(elapsed, |remaining| elapsed.min(remaining));
+            state.cursor.remaining_frames = state.cursor.remaining_frames.map(|remaining| remaining.saturating_sub(elapsed));
+            state.cursor.song_frame = state.cursor.song_frame.saturating_add(elapsed);
+        }
         let at_end = self.at_end;
         let fade_frames = self.fade_frames;
         let master_volume = self.master_volume;
@@ -605,10 +741,20 @@ impl Player {
         // layout lives in `Player`), replayed into the freshly built engine below — a new
         // engine's insert graph starts empty, exactly as a new engine's module does.
         let insert_layout = self.insert_layout.clone();
-        let mut rebuilt = Player::open_with_settings(backend, device, requested, plan.mode, self.engine_settings)?;
+        let mut settings = self.engine_settings;
+        let rebuild_identity = self.next_identity(false);
+        if let Some(identity) = rebuild_identity { settings.set_playback_identity(identity); }
+        let mut rebuilt = Player::open_with_settings(backend, device, requested, plan.mode, settings)?;
         // Carried, not restarted: the count is what a caller reports as "modules dropped on
         // this thread since start-up", and a rebuild is not a fresh start-up.
         rebuilt.collected = collected;
+        rebuilt.playback_identity = rebuild_identity;
+        rebuilt.speed_adjust = self.speed_adjust;
+        rebuilt.rebuild_cursor = rebuild_cursor;
+        let rebuild_start = if self.interactive_enabled {
+            let converted = (held_song_frame as u128 * rebuilt.spec.sample_rate_hz as u128 / self.spec.sample_rate_hz.max(1) as u128).min(u64::MAX as u128) as u64;
+            SeekKind::Frame(converted)
+        } else { plan.start };
         rebuilt.set_master_volume(master_volume)?;
         if fade_frames > 0 {
             rebuilt.set_fade_frames(fade_frames)?;
@@ -623,7 +769,9 @@ impl Player {
             rebuilt.live_input = LiveInputMode::Jam;
         }
         if let Some(module) = module {
-            rebuilt.install(module, plan.start, plan.cached_scan)?;
+            if let Some(smf) = self.smf.as_ref().filter(|_| self.interactive_enabled) {
+                rebuilt.install_smf(Arc::clone(smf), module, rebuild_smf, false)?;
+            } else { rebuilt.install(module, rebuild_start, plan.cached_scan, false)?; }
         }
         // A rebuilt engine gets a **new** live-input queue, because the old one's consumer
         // went into the retired engine. An [`EventSender`] a caller had already taken is
@@ -649,9 +797,19 @@ impl Player {
                 rebuilt.bypass_insert(target, slot, true)?;
             }
         }
-        if plan.resume {
-            rebuilt.play()?;
+        // One atomic replay, even when more than a command ring's worth are selected.
+        if let Some(identity) = rebuilt.playback_identity {
+            rebuilt.queue(HostCommand::RestoreSelections { identity, enabled: self.overlap_shadow, selections: self.instrument_shadow.clone().into_boxed_slice() })?;
+            rebuilt.instrument_shadow.clone_from(&self.instrument_shadow);
+            rebuilt.overlap_shadow = self.overlap_shadow;
         }
+        if self.interactive_enabled {
+            if let Some(identity) = rebuilt.playback_identity {
+                rebuilt.queue(HostCommand::RestoreTransport { identity, transport: if saved_host.engine.is_idle() { Transport::playing() } else { saved_host.transport.converted(self.spec.sample_rate_hz, rebuilt.spec.sample_rate_hz) }, state: interactive_state, natural_end: saved_host.natural_end })?;
+                rebuilt.transport_shadow = interactive_state;
+            }
+        } else if plan.resume { rebuilt.play()?; }
+
         *self = rebuilt;
         Ok(())
     }
@@ -672,12 +830,12 @@ impl Player {
     /// A failed load leaves the previous module playing.
     pub fn load(&mut self, bytes: &[u8]) -> Result<(), HostError> {
         let module = RtArc::new(starplayer::load(bytes)?);
-        self.install(module, SeekKind::None, None)
+        self.install(module, SeekKind::None, None, true)
     }
 
     /// [`Player::load`] for a module the caller has already decoded.
     pub fn load_module(&mut self, module: RtArc<Module>) -> Result<(), HostError> {
-        self.install(module, SeekKind::None, None)
+        self.install(module, SeekKind::None, None, true)
     }
 
     /// Play a Standard MIDI File through `instruments` without a tracker sequencer.
@@ -688,40 +846,66 @@ impl Player {
     /// source's synthesised control clock intentionally runs forever.
     pub fn load_smf(&mut self, bytes: &[u8], instruments: RtArc<Module>) -> Result<u64, HostError> {
         let smf = starplayer::midi::smf::parse_smf(bytes).map_err(HostError::StandardMidiFile)?;
+        self.install_smf(Arc::new(smf), instruments, None, true)
+    }
+
+    fn install_smf(&mut self, smf: Arc<starplayer::midi::smf::Smf>, instruments: RtArc<Module>, restore: Option<starplayer::core::SmfPlaybackState>, new_session: bool) -> Result<u64, HostError> {
         let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
-        let sequencer = starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame);
+        #[cfg(feature = "interactive-audition")]
+        let sequencer = if self.interactive_enabled {
+            starplayer::midi::SmfSequencer::interactive_at(&smf, self.spec.sample_rate_hz, frame, restore.map(|state| state.cursor))
+        } else { starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame) };
+        #[cfg(not(feature = "interactive-audition"))]
+        let sequencer = { let _ = restore; starplayer::midi::SmfSequencer::new_at(&smf, self.spec.sample_rate_hz, frame) };
         let length_frames = sequencer.length_frames();
+        #[cfg(not(feature = "interactive-audition"))]
         let rack = InstrumentRack::for_module(&instruments, self.spec.sample_rate_hz);
+        #[cfg(feature = "interactive-audition")]
+        let rack = {
+            let mut rack = if self.interactive_enabled { InstrumentRack::for_sequenced_module(&instruments, self.spec.sample_rate_hz) } else { InstrumentRack::for_module(&instruments, self.spec.sample_rate_hz) };
+            if let Some(state) = restore { rack.restore_controllers(state.channels); }
+            rack
+        };
         let mut source = MidiSource::new(sequencer, rack, self.spec.sample_rate_hz);
         source.start_control_at(frame);
-        self.commands
-            .push(HostCommand::Load { module: RtArc::clone(&instruments), source: Box::new(source) })
-            .map_err(|_| HostError::ControlQueueFull)?;
+        let source: Box<dyn starplayer::engine::EventSource + Send> = Box::new(source);
+        let source = if self.interactive_enabled { crate::source::interactive_sources(source, Box::new(starplayer::engine::SilentSource)) } else { source };
+        let identity = self.next_identity(new_session);
+        self.commands.push(HostCommand::Load { module: RtArc::clone(&instruments), source, identity }).map_err(|_| HostError::ControlQueueFull)?;
         self.handles.seek.clear();
+        self.playback_identity = identity;
         self.module = Some(instruments);
         self.scan = None;
+        self.smf = self.interactive_enabled.then_some(smf);
         self.events = None;
         self.live_input = LiveInputMode::Off;
+        if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); }
         Ok(length_frames)
     }
 
-    fn install(&mut self, module: RtArc<Module>, start: SeekKind, cached_scan: Option<Arc<ScannedSong>>) -> Result<(), HostError> {
+    fn install(&mut self, module: RtArc<Module>, start: SeekKind, cached_scan: Option<Arc<ScannedSong>>, new_session: bool) -> Result<(), HostError> {
         // A new sequencer's tick clock starts at frame zero, but the engine's musical clock
         // is monotonic and has been running since the stream opened. Starting the clock
         // where the engine actually is stops the engine burning ticks catching up.
         let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
         // A seek asked for against the outgoing module means nothing to the incoming one.
         self.handles.seek.clear();
-        let built = build_source_with_settings(RtArc::clone(&module), start, frame, &self.handles, cached_scan, self.speed_adjust, self.engine_settings)?;
-        let (source, events) = if self.live_input == LiveInputMode::Jam {
+        let built = crate::source::build_source_with_cursor(RtArc::clone(&module), crate::source::SourcePosition { seek: start, cursor: self.rebuild_cursor.take() }, frame, &self.handles, cached_scan, self.speed_adjust, self.engine_settings)?;
+        let (source, events) = if self.interactive_enabled {
+            (crate::source::interactive_sources(built.source, Box::new(starplayer::engine::SilentSource)), None)
+        } else if self.live_input == LiveInputMode::Jam {
             let (source, producer) = self.build_jam_source(&module, frame, built.source)?;
             (source, Some(EventSender::new(producer, Arc::clone(&self.event_clock))))
         } else {
             (built.source, None)
         };
-        let command = HostCommand::Load { module: RtArc::clone(&module), source };
+        let identity = self.next_identity(new_session);
+        let command = HostCommand::Load { module: RtArc::clone(&module), source, identity };
         self.commands.push(command).map_err(|_| HostError::ControlQueueFull)?;
+        self.playback_identity = identity;
+        if new_session { self.overlap_shadow = false; self.instrument_shadow.fill(false); }
         self.scan = Some(built.scanned);
+        self.smf = None;
         self.module = Some(module);
         self.events = events;
         if self.live_input != LiveInputMode::Jam {
@@ -767,7 +951,58 @@ impl Player {
     }
 
     /// Start, or resume, playing. Glides up over 64 frames, so it does not click.
-    pub fn play(&mut self) -> Result<(), HostError> { self.queue(HostCommand::Play) }
+    pub fn play(&mut self) -> Result<(), HostError> {
+        if self.interactive_enabled { self.interactive(InteractiveAction::Play) } else { self.queue(HostCommand::Play) }
+    }
+
+    pub fn pause(&mut self) -> Result<(), HostError> { self.interactive(InteractiveAction::Pause) }
+    pub fn resume(&mut self) -> Result<(), HostError> { self.interactive(InteractiveAction::Resume) }
+    pub fn clear_and_hold(&mut self) -> Result<(), HostError> { self.interactive(InteractiveAction::Stop) }
+    pub fn all_sound_off(&mut self) -> Result<(), HostError> { self.interactive(InteractiveAction::AllSoundOff) }
+    pub const fn playback_identity(&self) -> Option<PlaybackIdentity> { self.playback_identity }
+    pub fn interactive_transport(&self) -> Option<InteractiveTransport> {
+        self.interactive_enabled.then(|| match self.taps.transport_state.load(Ordering::Relaxed) { 1 => InteractiveTransport::Playing, 2 => InteractiveTransport::Paused, _ => InteractiveTransport::Stopped })
+    }
+    pub fn natural_end(&self) -> bool { self.taps.natural_end.load(Ordering::Relaxed) }
+
+    /// Route a generation-bearing request through host fade handling, never directly to
+    /// the engine. Later feature tasks extend the same shadow/replay seam for settings.
+    /// Accept an atomic command from a wire/client, rejecting old sessions/builds before
+    /// changing host shadow or fade state.
+    pub fn submit_interactive(&mut self, command: InteractiveCommand) -> Result<(), HostError> {
+        if self.playback_identity != Some(command.identity) { return Err(HostError::Backend(String::from("stale playback identity"))); }
+        self.interactive(command.action)
+    }
+
+    pub fn interactive(&mut self, action: InteractiveAction) -> Result<(), HostError> {
+        if !self.interactive_enabled && matches!(action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview) {
+            return Err(HostError::Backend(String::from("interactive transport was not prepared")));
+        }
+        if matches!(action, InteractiveAction::SetNoteOverlapEnabled(_) | InteractiveAction::SetLetNotesRing { .. }) && !self.engine_settings.playback_configuration().is_some_and(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)) { return Err(HostError::Backend(String::from("note overlap was not prepared"))); }
+        if let InteractiveAction::SetLetNotesRing { instrument, .. } = action && instrument.0 as usize >= self.instrument_shadow.len() { return Err(HostError::Backend(String::from("instrument override is outside prepared capacity"))); }
+        let identity = self.playback_identity.ok_or_else(|| HostError::Backend(String::from("interactive transport was not prepared")))?;
+        self.queue(HostCommand::Interactive(InteractiveCommand { identity, action }))?;
+        match action {
+            InteractiveAction::SetNoteOverlapEnabled(enabled) => self.overlap_shadow = enabled,
+            InteractiveAction::SetLetNotesRing { instrument, enabled } => { if let Some(value) = self.instrument_shadow.get_mut(instrument.0 as usize) { *value = enabled; } }
+            _ => {}
+        }
+        self.transport_shadow = match action {
+            InteractiveAction::Play | InteractiveAction::Resume => InteractiveTransport::Playing,
+            InteractiveAction::Pause => InteractiveTransport::Paused,
+            InteractiveAction::Stop => InteractiveTransport::Stopped,
+            _ => self.transport_shadow,
+        };
+        Ok(())
+    }
+
+    fn next_identity(&self, new_session: bool) -> Option<PlaybackIdentity> {
+        self.playback_identity.map(|mut identity| {
+            if new_session { identity.session.0 = identity.session.0.wrapping_add(1); }
+            identity.build.0 = identity.build.0.wrapping_add(1);
+            identity
+        })
+    }
 
     /// Stop. Glides down over 64 frames and stops the musical clock when the ramp lands, so
     /// it does not click either.
@@ -868,6 +1103,7 @@ impl Player {
     /// The transport has to be **running** for anything to sound: the musical clock is
     /// what a source is dispatched against, and it stops with the transport.
     pub fn midi_only(&mut self) -> Result<(), HostError> {
+        if self.interactive_enabled { return Err(HostError::Backend(String::from("interactive input uses the permanent live slot"))); }
         let module = self.module.clone().ok_or(HostError::NoModule)?;
         let rack = InstrumentRack::for_module(&module, self.spec.sample_rate_hz);
         let (producer, queue) = external_event_channel(EVENT_QUEUE_CAPACITY);
@@ -880,7 +1116,7 @@ impl Player {
         // every voice and forgets every binding, which is exactly what silencing the
         // tracker lanes as the source is swapped means. Nothing is decoded or scanned.
         self.commands
-            .push(HostCommand::Load { module, source: Box::new(source) })
+            .push(HostCommand::Load { module, source: Box::new(source), identity: None })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.events = Some(EventSender::new(producer, Arc::clone(&self.event_clock)));
         self.live_input = LiveInputMode::MidiOnly;
@@ -895,12 +1131,18 @@ impl Player {
     /// mode does not return the song to its first row. The seek mailbox stays inside slot
     /// 0, and therefore order, row and elapsed-frame seeks keep working unchanged.
     pub fn jam(&mut self, enabled: bool) -> Result<(), HostError> {
+        if self.interactive_enabled {
+            self.module.as_ref().ok_or(HostError::NoModule)?;
+            // NO-06 consumes this routing state using its permanent prepared rack.
+            self.live_input = if enabled { LiveInputMode::Jam } else { LiveInputMode::Off };
+            return Ok(());
+        }
         if enabled == (self.live_input == LiveInputMode::Jam) {
             return Ok(());
         }
         let module = self.module.clone().ok_or(HostError::NoModule)?;
         let frame = Frame(self.taps.source_frame.load(Ordering::Relaxed));
-        let song_frame = self.telemetry.read().transport.song_frame;
+        let song_frame = self.telemetry.read().engine.transport.song_frame;
         self.handles.seek.clear();
         let built = build_source_with_settings(
             RtArc::clone(&module),
@@ -918,9 +1160,10 @@ impl Player {
             (built.source, None)
         };
         self.commands
-            .push(HostCommand::Load { module, source })
+            .push(HostCommand::Load { module, source, identity: None })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.scan = Some(built.scanned);
+        self.smf = None;
         self.events = events;
         self.live_input = if enabled { LiveInputMode::Jam } else { LiveInputMode::Off };
         Ok(())
@@ -931,13 +1174,14 @@ impl Player {
     /// The scan is reused — nothing the timeline depends on changed — so this costs a
     /// sequencer, not a rescan, and the song restarts from the top of the order list.
     pub fn restore_module_source(&mut self) -> Result<(), HostError> {
+        if self.interactive_enabled { return self.jam(false); }
         if self.live_input == LiveInputMode::Jam {
             return self.jam(false);
         }
         let module = self.module.clone().ok_or(HostError::NoModule)?;
         let cached_scan = self.scan.clone();
         self.live_input = LiveInputMode::Off;
-        self.install(module, SeekKind::None, cached_scan)
+        self.install(module, SeekKind::None, cached_scan, false)
     }
 
     /// Whether the engine is playing a live-input source.
@@ -989,11 +1233,11 @@ impl Player {
 
     /// The most recent coherent snapshot the audio thread published: transport position,
     /// per-channel note, effect and VU.
-    pub fn telemetry(&mut self) -> &Snapshot { self.telemetry.read() }
+    pub fn telemetry(&mut self) -> &Snapshot { &self.telemetry.read().engine }
 
     /// Sticky engine warnings, as of the last snapshot.
     pub fn warnings(&mut self) -> EngineWarnings {
-        let snapshot = *self.telemetry.read();
+        let snapshot = self.telemetry.read().engine;
         EngineWarnings {
             zero_advance_forced: snapshot.warnings.zero_advance_forced,
             event_limit_reached: snapshot.warnings.event_limit_reached,
@@ -1013,7 +1257,7 @@ impl Player {
     pub fn song_length(&self) -> Option<u64> { self.scan.as_ref().map(|scanned| scanned.timeline.end_frame()) }
 
     /// How far into the song the audio thread is, in frames — what a progress bar draws.
-    pub fn song_frame(&mut self) -> u64 { self.telemetry.read().transport.song_frame }
+    pub fn song_frame(&mut self) -> u64 { self.telemetry.read().engine.transport.song_frame }
 
     /// The musical clock, in frames since the stream opened.
     pub fn source_frame(&self) -> Frame { Frame(self.taps.source_frame.load(Ordering::Relaxed)) }

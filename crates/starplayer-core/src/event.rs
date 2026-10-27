@@ -429,6 +429,8 @@ bitflags! {
 /// is worse.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Command<ModuleHandle> {
+    /// Explicit capability/generation-checked interactive action. Legacy Stop is unchanged.
+    Interactive(crate::InteractiveCommand),
     /// Swap in a module that was loaded off the audio thread. The retired handle goes
     /// back over the garbage channel to be dropped by the control thread (architecture
     /// §8) — the audio thread must never run a deallocator.

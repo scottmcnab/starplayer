@@ -229,3 +229,35 @@ fn allocation_on_another_thread_is_not_a_violation() {
     });
     assert!(report.largest < 1 << 20, "another thread's megabyte was attributed to this one: {report:?}");
 }
+
+#[cfg(all(feature = "note-overlap", feature = "interactive-audition"))]
+#[test]
+fn interactive_pause_clear_seek_and_rebuild_replay_allocate_nothing_in_callback() {
+    let mut backend = ManualBackend::new();
+    let spec = AudioSpec::stereo(44_100);
+    let settings = starplayer::engine::EngineSettings::interactive_web(Default::default(), 256).unwrap();
+    let mut player = Player::open_with_settings(&mut backend, None, spec, MixerMode::DEFAULT, settings).unwrap();
+    let driver = backend.driver().unwrap();
+    player.load(include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M")).unwrap(); player.play().unwrap();
+    let mut output = [0.0; 2048];
+    driver.render(&mut output);
+    for action in [starplayer::core::InteractiveAction::Pause, starplayer::core::InteractiveAction::Stop, starplayer::core::InteractiveAction::Resume, starplayer::core::InteractiveAction::AllSoundOff] {
+        player.interactive(action).unwrap();
+        let (_, report) = while_watching_for_allocations(|| driver.render(&mut output));
+        assert!(report.is_clean(), "{action:?}: {report:?}");
+    }
+    player.pause().unwrap(); player.seek_row(3).unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output)); assert!(report.is_clean(), "seek: {report:?}");
+    player.telemetry();
+    let mut mode = player.mixer_mode(); mode.interpolator = starplayer::core::Interpolator::Cubic;
+    player.set_mixer_mode(&mut backend, None, mode).unwrap(); let driver = backend.driver().unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output)); assert!(report.is_clean(), "replay: {report:?}");
+    let midi = b"MThd\0\0\0\x06\0\0\0\x01\0\x60MTrk\0\0\0\x08\0\x90\x3C\x64\x60\xFF\x2F\0";
+    let instruments = starplayer::rt::Arc::clone(player.module().unwrap());
+    player.load_smf(midi, instruments).unwrap(); player.play().unwrap(); driver.render(&mut output);
+    player.pause().unwrap(); driver.render(&mut output); player.telemetry();
+    player.reopen(&mut backend, None, AudioSpec::stereo(48_000)).unwrap(); let driver = backend.driver().unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output)); assert!(report.is_clean(), "SMF rebuild: {report:?}");
+    player.resume().unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output)); assert!(report.is_clean(), "SMF resume: {report:?}");
+}

@@ -40,6 +40,9 @@ pub struct ControlClock {
     interval_frames: u32,
     next_frame: Frame,
     ticks: u64,
+    #[cfg(feature = "interactive-audition")]
+    cadence: Option<(u64, u64)>,
+
 }
 
 impl ControlClock {
@@ -62,6 +65,8 @@ impl ControlClock {
             interval_frames: ControlClock::interval_frames_for(sample_rate_hz, interval_micros),
             next_frame: first_tick_frame,
             ticks: 0,
+            #[cfg(feature = "interactive-audition")]
+            cadence: None,
         }
     }
 
@@ -95,6 +100,13 @@ impl ControlClock {
     /// so a caller looping on "is a tick due?" always terminates.
     pub fn tick_synthesised(&mut self) {
         self.ticks = self.ticks.saturating_add(1);
+        #[cfg(feature = "interactive-audition")]
+        if let Some((interval, remainder)) = self.cadence.as_mut() {
+            let sum = interval.saturating_add(*remainder);
+            *remainder = sum & 0xffff_ffff;
+            self.next_frame = self.next_frame.saturating_add(sum >> 32);
+            return;
+        }
         self.next_frame = self.next_frame.saturating_add(self.interval_frames as u64);
     }
 
@@ -114,6 +126,18 @@ impl ControlClock {
         self.driver = ControlDriver::Synthesised;
         self.next_frame = first_tick_frame;
     }
+
+    /// One authority for loaded-format articulation. The sequencer supplies the exact
+    /// model interval and pending fractional phase; held steps never modify its clock.
+    #[cfg(feature = "interactive-audition")]
+    pub fn set_cadence(&mut self, next: Frame, interval: u64, remainder: u64, synthesised: bool) {
+        self.cadence = Some((interval, remainder));
+        self.next_frame = next;
+        self.driver = if synthesised { ControlDriver::Synthesised } else { ControlDriver::Tracker };
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    pub fn cadence_due(&self, frame: Frame) -> bool { self.next_synthesised_frame().is_some_and(|next| next <= frame) }
 
     /// Change the output rate, recomputing the synthesised interval.
     pub fn set_sample_rate_hz(&mut self, sample_rate_hz: u32, interval_micros: u32) {

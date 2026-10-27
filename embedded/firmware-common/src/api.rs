@@ -583,6 +583,7 @@ mod tests {
                 song_length_frames: 8_820_000,
                 song_end: SongEnd::Loops,
                 end_reached: true,
+                ..TransportState::IDLE
             },
             warnings: WarningFlags {
                 zero_advance_forced: true,

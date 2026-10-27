@@ -179,15 +179,19 @@ impl ChannelTable {
         params: VoiceParams,
         offset_frames: u32,
     ) -> Option<VoiceId> {
-        let lane = self.channels.get_mut(channel.0 as usize)?;
-        if let Some(previous) = lane.foreground.take() {
+        if let Some(previous) = self.channels.get_mut(channel.0 as usize)?.foreground.take() {
             voices.release(previous);
         }
 
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if self.playback.is_some() {
+            let domain = if self.layout.is_interactive() && channel.0 >= crate::playback::INTERACTIVE_LIVE_BASE { crate::ownership::VoiceDomain::Live } else { crate::ownership::VoiceDomain::Native };
+            if !self.prepare_admission(domain, None, voices) { return None; }
+        }
         let tag = VoiceTag { channel: channel.0 as u8, ..tag };
         let params = VoiceParams { step: scaled_step(params.step, region), ..params };
         let voice = voices.allocate(tag, region, params, offset_frames)?;
-        lane.foreground = Some(voice);
+        self.channels.get_mut(channel.0 as usize)?.foreground = Some(voice);
         #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
         if let Some(playback) = self.playback.as_mut() {
             let domain = if self.layout.is_interactive() && channel.0 >= crate::playback::INTERACTIVE_LIVE_BASE {
@@ -195,7 +199,7 @@ impl ChannelTable {
             } else { crate::ownership::VoiceDomain::Native };
             if playback.register(voice, domain, channel, voices).is_err() {
                 voices.release(voice);
-                lane.foreground = None;
+                self.channels.get_mut(channel.0 as usize)?.foreground = None;
                 return None;
             }
         }
@@ -254,6 +258,52 @@ impl ChannelTable {
         for index in 0..self.channels.len() {
             self.stop(ChannelId(index as u16), voices);
         }
+    }
+
+    /// Immediately invalidate a generation's logical binding and start its existing
+    /// mixer release ramp. Ownership remains until physical reclamation.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn retire_voice(&mut self, voice: VoiceId, voices: &mut VoicePool) -> bool {
+        let Some(playback) = self.playback.as_mut() else { return false };
+        if playback.set_lifecycle(voice, crate::ownership::VoiceLifecycle::Retiring, voices).is_err() { return false; }
+        for channel in self.channels.iter_mut() { if channel.foreground == Some(voice) { channel.foreground = None; } }
+        if let Some(state) = voices.get_mut(voice) { state.stop(); }
+        true
+    }
+
+    /// Includes detached backgrounds, not just foreground channel bindings.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn clear_scope(&mut self, scope: crate::ownership::ClearScope, voices: &mut VoicePool) {
+        for index in 0..voices.capacity() {
+            let candidate = self.playback.as_ref().and_then(|playback| playback.slot(index, voices))
+                .filter(|owned| owned.in_scope(scope) && owned.lifecycle != crate::ownership::VoiceLifecycle::Retiring);
+            if let Some(owned) = candidate { self.retire_voice(owned.voice, voices); }
+        }
+    }
+
+    /// Reserve physical room in one domain before its caller admits a scheduled note.
+    /// The optional victim is selected by the domain's policy (native IT keeps its own).
+    /// Only an already-retiring member of this domain may be hard-released under pressure.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn prepare_admission(&mut self, domain: crate::ownership::VoiceDomain, victim: Option<VoiceId>, voices: &mut VoicePool) -> bool {
+        use crate::ownership::{VoiceDomain, VoiceLifecycle};
+        let Some(playback) = self.playback.as_ref() else { return false };
+        let capacity = playback.configuration().capacity;
+        let (active_limit, reserve) = match domain {
+            VoiceDomain::Native => (capacity.native, capacity.interactive_transport as usize),
+            VoiceDomain::Custom => (capacity.custom, usize::from(capacity.custom != 0)),
+            VoiceDomain::Live => (capacity.live, usize::from(capacity.live != 0)),
+        };
+        if active_limit == 0 { return false; }
+        let active = playback.active_count(domain, voices);
+        let victim = victim.filter(|voice| playback.get(*voice, voices).is_some_and(|owned| owned.domain == domain && owned.lifecycle != VoiceLifecycle::Retiring));
+        if active >= active_limit && victim.is_none() { return false; }
+        if playback.iter(voices).filter(|owned| owned.domain == domain).count() >= active_limit + reserve {
+            let Some(retiring) = playback.oldest(domain, true, voices) else { return false };
+            voices.release(retiring);
+        }
+        if let Some(victim) = victim { self.retire_voice(victim, voices); }
+        voices.voices_active() < voices.capacity()
     }
 
     /// Forget every binding without touching the pool — for after

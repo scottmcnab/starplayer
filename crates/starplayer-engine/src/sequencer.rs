@@ -479,6 +479,9 @@ impl<'engine> TickContext<'engine> {
     /// [`TickContext::trigger_channel`] are the only two places a step reaches a voice.
     #[inline]
     pub fn write_voice_param(&mut self, voice: VoiceId, param: VoiceParam) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if self.channels.playback().and_then(|playback| playback.get(voice, self.voices)).is_some_and(|owned| owned.lifecycle == crate::ownership::VoiceLifecycle::Retiring) { return; }
+
         #[cfg(feature = "trace")]
         if let Some(trace) = self.trace.as_deref_mut() {
             trace.record_param_write(self.voices, self.channels, voice, param);
@@ -495,6 +498,8 @@ impl<'engine> TickContext<'engine> {
     /// Set a non-value dirty bit such as tempo and feed the same trace hook.
     #[inline]
     pub fn mark_voice_dirty(&mut self, voice: VoiceId, flags: DirtyBits) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if self.channels.playback().and_then(|playback| playback.get(voice, self.voices)).is_some_and(|owned| owned.lifecycle == crate::ownership::VoiceLifecycle::Retiring) { return; }
         #[cfg(feature = "trace")]
         if let Some(trace) = self.trace.as_deref_mut() {
             trace.record_voice_flags(self.voices, self.channels, voice, flags);
@@ -539,6 +544,10 @@ pub trait TrackerProcessor {
     /// Advance held voice articulation only: no row/effect/flow or row-trace events.
     /// The caller must not also dispatch a tracker tick at this boundary.
     fn control_step(&mut self, _context: &mut TickContext<'_>) {}
+
+    /// Clear sound ownership/onset bookkeeping while retaining row/effect memories.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_sound(&mut self, _scope: crate::ownership::ClearScope, _context: &mut TickContext<'_>) {}
 
     /// Drop every piece of replay state a seek must not carry across the discontinuity:
     /// deferred tempo commands, LFO random streams, effect memories, pattern-loop
@@ -707,6 +716,10 @@ pub struct PatternSequencer<Tempo: TempoModel, Processor: TrackerProcessor, Data
     /// monotonic clock has only just started puts the origin *before* frame zero, and a
     /// saturating `Frame` would quietly report the seek as "at the beginning".
     song_origin: i64,
+    #[cfg(feature = "interactive-audition")]
+    transport: Option<starplayer_core::InteractiveTransport>,
+    #[cfg(feature = "interactive-audition")]
+    held_at: Option<Frame>,
     /// What the host wants to happen at the detected loop point.
     at_end: AtEnd,
     /// Whether the loop point has been passed. Cleared at the next row under
@@ -766,6 +779,10 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             detector,
             timeline: None,
             song_origin: settings.first_tick_frame.0 as i64,
+            #[cfg(feature = "interactive-audition")]
+            transport: None,
+            #[cfg(feature = "interactive-audition")]
+            held_at: None,
             at_end: AtEnd::default(),
             end_reached: false,
             last_arrival: RowArrival::Start,
@@ -913,6 +930,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// How far into the song `now` is, in frames — the elapsed position a progress slider
     /// draws. Clamped at zero, so a frame before the current pass reads as its start.
     pub const fn song_frame(&self, now: Frame) -> u64 {
+        #[cfg(feature = "interactive-audition")]
+        let now = match self.held_at { Some(held) => held, None => now };
         let elapsed = (now.0 as i64).saturating_sub(self.song_origin);
         if elapsed < 0 { 0 } else { elapsed as u64 }
     }
@@ -1031,7 +1050,69 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     ///
     /// A seek on the engine's monotonic timeline, not a rewind: the caller supplies a frame
     /// the engine has not reached yet.
-    pub fn restart_clock_at(&mut self, frame: Frame) { self.clock.reset(frame); }
+    pub fn restart_clock_at(&mut self, frame: Frame) {
+        self.clock.reset(frame);
+        #[cfg(feature = "interactive-audition")]
+        if self.held_at.is_some() {
+            self.held_at = Some(frame);
+            self.sounding_position = self.position;
+            self.sounding_tick = 0;
+        }
+    }
+
+    /// Validate before clearing song voices or resetting format state.
+    pub fn can_seek_order(&self, order: u16) -> bool { self.resolve_order(order).is_some() }
+    pub fn can_seek_frame(&self, frame: u64) -> bool { self.timeline.as_ref().filter(|timeline| frame < timeline.end_frame()).and_then(|timeline| timeline.mark_at_frame(frame)).is_some_and(|mark| self.can_seek_order(mark.order)) }
+    pub fn can_seek_row(&self, row: u16) -> bool { self.data.rows_in_pattern(self.position.pattern).is_some_and(|rows| row < rows) }
+
+    /// Row seeks also rebase the song progress cursor.
+    pub fn seek_row_at(&mut self, row: u16, frame: Frame) {
+        self.seek_row(row);
+        self.song_origin = self.rebased_origin(frame, self.position.order, self.position.row);
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    pub fn cursor(&self, now: Frame) -> starplayer_core::SequencerCursor {
+        let held_now = self.held_at.unwrap_or(now);
+        starplayer_core::SequencerCursor {
+            order: self.position.order, row: self.position.row, row_clock: self.row_clock,
+            sounding_order: self.sounding_position.order, sounding_pattern: self.sounding_position.pattern,
+            sounding_row: self.sounding_position.row, sounding_tick: self.sounding_tick,
+            tempo_bpm: self.tempo_bpm, requested_speed: self.requested_speed,
+            arrival: self.last_arrival, detector_state: self.detector.cursor_state(),
+            pending_jump: self.pending_jump.map(|jump| (jump.order, jump.row, jump.within_pattern)),
+            remaining_frames: held_now.frames_until(self.clock.pending_tick_frame()), fractional_remainder: self.clock.fractional_remainder(),
+            song_frame: self.song_frame(now), captured_frame: now, sample_rate_hz: self.clock.sample_rate_hz(),
+            sequence_ended: self.state == SequencerState::Stopped, end_reached: self.end_reached,
+        }
+    }
+
+    /// Restore the logical position of a fresh renderer without running past music.
+    /// Sound/format working state is fresh, as for the host's existing rebuild path.
+    #[cfg(feature = "interactive-audition")]
+    pub fn restore_cursor(&mut self, cursor: starplayer_core::SequencerCursor, frame: Frame) -> bool {
+        if !self.seek_order_row(cursor.order, cursor.row) { return false; }
+        self.row_clock = cursor.row_clock;
+        self.last_arrival = cursor.arrival;
+        if let Some(timeline) = self.timeline.as_ref() { self.detector.reset_marking_before(timeline, cursor.song_frame); }
+        self.detector.restore_cursor_state(cursor.detector_state);
+        self.tempo_bpm = cursor.tempo_bpm;
+        self.requested_speed = cursor.requested_speed;
+        self.sounding_position = SongPosition { order: cursor.sounding_order, pattern: cursor.sounding_pattern, row: cursor.sounding_row };
+        self.sounding_tick = cursor.sounding_tick;
+        self.pending_jump = cursor.pending_jump.map(|(order, row, within_pattern)| Jump { order, row, within_pattern });
+        self.clock.restore_pending(frame.saturating_add(cursor.remaining_frames), cursor.fractional_remainder);
+        self.song_origin = (frame.0 as i64).saturating_sub(cursor.song_frame.min(i64::MAX as u64) as i64);
+        self.end_reached = cursor.end_reached;
+        if cursor.sequence_ended { self.state = SequencerState::Stopped; }
+        true
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    pub fn sync_cadence(&self, control: &mut crate::ControlClock) {
+        control.set_cadence(self.clock.pending_tick_frame(), self.clock.interval_bits(self.tempo_bpm, self.row_clock.speed), self.clock.fractional_remainder(), self.held_at.is_some() || self.state == SequencerState::Stopped);
+    }
+
 
     /// Run one tick and return what it left in effect.
     ///
@@ -1371,7 +1452,11 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     /// when the engine was built.
     #[cfg(feature = "telemetry")]
     fn publish_telemetry(&mut self, context: &mut EngineContext<'_>) {
+        #[cfg(feature = "interactive-audition")]
+        let cursor = self.transport.map(|_| self.cursor(context.frame));
         let Some(telemetry) = context.telemetry.as_deref_mut() else { return };
+        #[cfg(feature = "interactive-audition")]
+        if let Some(cursor) = cursor { telemetry.set_sequencer_cursor(cursor); }
         let sounding = self.sounding_position;
         telemetry.set_position(sounding.order, sounding.pattern, sounding.row, self.sounding_tick);
         telemetry.set_timing(self.row_clock.speed, self.tempo_bpm);
@@ -1400,6 +1485,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         } else {
             module_channels
         });
+        #[cfg(feature = "interactive-audition")]
+        if self.transport.is_some() { return; }
         telemetry.publish();
     }
 }
@@ -1417,7 +1504,51 @@ where
     Processor: TrackerProcessor + Send,
     Data: PatternData + Send,
 {
+    #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+    fn describe_interactive(&mut self, context: &mut EngineContext<'_>) { self.publish_telemetry(context); }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, scope: crate::ownership::ClearScope, context: &mut EngineContext<'_>) {
+        let mut tick = TickContext::new(context.frame, context.voices, context.channels, self.row_clock, self.position, self.tempo_bpm);
+        self.processor.clear_sound(scope, &mut tick);
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame, control: &mut crate::ControlClock) {
+        use starplayer_core::InteractiveTransport::Playing;
+        if self.transport == Some(state) { return; }
+        let was_held = self.held_at.is_some();
+        if state == Playing {
+            if let Some(held) = self.held_at.take() {
+                let duration = held.frames_until(frame);
+                self.clock.translate(duration);
+                self.song_origin = self.song_origin.saturating_add(duration.min(i64::MAX as u64) as i64);
+            }
+        } else if !was_held {
+            self.held_at = Some(frame);
+        }
+        self.transport = Some(state);
+        // Paused↔Stopped keeps the already-running articulation phase.
+        if !was_held || state == Playing { self.sync_cadence(control); }
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        if self.next_event_frame().is_some_and(|next| next <= frame) {
+            self.dispatch(frame, context);
+        } else if context.control.cadence_due(frame) {
+            if self.transport != Some(starplayer_core::InteractiveTransport::Stopped) {
+                let mut tick = TickContext::new(frame, context.voices, context.channels, self.row_clock, self.position, self.tempo_bpm);
+                self.processor.control_step(&mut tick);
+            }
+            #[cfg(feature = "telemetry")]
+            self.publish_telemetry(context);
+        }
+    }
+
     fn next_event_frame(&self) -> Option<Frame> {
+        #[cfg(feature = "interactive-audition")]
+        if self.held_at.is_some() { return None; }
         match self.state {
             SequencerState::Ready => Some(self.clock.pending_tick_frame()),
             // No boundary exists while a tick is in flight, and none exists after the song
@@ -1446,6 +1577,11 @@ where
             // tick does not run; the voices already sounding ring out, exactly as any other
             // stop leaves them.
             self.state = SequencerState::Stopped;
+            #[cfg(feature = "interactive-audition")]
+            if self.transport.is_some() {
+                self.clock.advance_tick(self.tempo_bpm, self.row_clock.speed);
+                self.sync_cadence(context.control);
+            }
             #[cfg(feature = "telemetry")]
             self.publish_telemetry(context);
             return;
@@ -1453,6 +1589,8 @@ where
 
         let outcome = self.run_tick(frame, context);
         self.commit(outcome);
+        #[cfg(feature = "interactive-audition")]
+        if self.transport.is_some() { self.sync_cadence(context.control); }
 
         #[cfg(feature = "trace")]
         if let Some(trace) = context.trace.as_deref_mut() {

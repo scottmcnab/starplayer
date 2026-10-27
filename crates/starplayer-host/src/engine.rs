@@ -11,6 +11,16 @@
 //! not arms; they are the post-stage in [`crate::depth`], which is what gives every arm
 //! all five depths without eighty instantiations.
 
+/// Cargo dependency feature unification must not opt this host into missing hooks.
+pub(crate) fn validate_host_settings(settings: starplayer::engine::EngineSettings) -> Result<(), starplayer::engine::PlaybackConfigError> {
+    let Some(configuration) = settings.playback_configuration() else { return Ok(()) };
+    let mut supported = starplayer::core::PlaybackCapabilities::empty();
+    if cfg!(feature = "note-overlap") { supported.insert(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP); }
+    if cfg!(feature = "interactive-audition") { supported.insert(starplayer::core::PlaybackCapabilities::INTERACTIVE_AUDITION); }
+    if !supported.contains(configuration.capabilities) { return Err(starplayer::engine::PlaybackConfigError::FeatureUnavailable); }
+    Ok(())
+}
+
 use std::boxed::Box;
 use std::string::{String, ToString};
 use std::vec;
@@ -121,6 +131,9 @@ macro_rules! define_arms {
             fn frame(&self) -> Frame { match self { $(EngineArm::$variant(engine) => engine.frame(),)+ } }
             fn source_frame(&self) -> Frame { match self { $(EngineArm::$variant(engine) => engine.source_frame(),)+ } }
             fn is_playing(&self) -> bool { match self { $(EngineArm::$variant(engine) => engine.is_playing(),)+ } }
+            fn set_playback_identity(&mut self, identity: starplayer::core::PlaybackIdentity) { match self { $(EngineArm::$variant(engine) => engine.set_playback_identity(identity),)+ } }
+            fn interactive_transport(&self) -> Option<starplayer::core::InteractiveTransport> { match self { $(EngineArm::$variant(engine) => engine.interactive_transport(),)+ } }
+            fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, selections: &[bool]) { match self { $(EngineArm::$variant(engine) => engine.restore_selections(identity, enabled, selections),)+ } }
             fn master_volume(&self) -> U0F16 { match self { $(EngineArm::$variant(engine) => engine.master_volume(),)+ } }
             fn warnings(&self) -> EngineWarnings { match self { $(EngineArm::$variant(engine) => engine.warnings(),)+ } }
             fn module(&self) -> Option<&Arc<Module>> { match self { $(EngineArm::$variant(engine) => engine.module(),)+ } }
@@ -187,6 +200,7 @@ impl HostEngine {
     /// Explicit runtime opt-in, including N+C+L+R physical capacity and lane layout.
     /// Merely compiling optional features does not change `build`'s legacy defaults.
     pub fn build_with_settings(mode: MixerMode, settings: EngineSettings) -> Result<BuiltHost, HostError> {
+        validate_host_settings(settings).map_err(HostError::EngineConfiguration)?;
         let (arm, control, insert_control, telemetry) = EngineArm::build(mode, settings)?;
         let samples = MAX_FRAMES_PER_RENDER * mode.channels as usize;
         let engine = HostEngine {
@@ -210,6 +224,10 @@ impl HostEngine {
     pub fn replace_source(&mut self, source: Box<dyn EventSource>) -> Option<Box<dyn EventSource>> {
         self.arm.replace_source(source)
     }
+
+    pub fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, selections: &[bool]) { self.arm.restore_selections(identity, enabled, selections); }
+    pub fn set_playback_identity(&mut self, identity: starplayer::core::PlaybackIdentity) { self.arm.set_playback_identity(identity); }
+    pub fn interactive_transport(&self) -> Option<starplayer::core::InteractiveTransport> { self.arm.interactive_transport() }
 
     /// One [`TapReader`] per channel, in channel order, claimed once (architecture §9(b)).
     ///

@@ -155,17 +155,39 @@ pub struct SeekableModuleSource {
     request: Arc<SeekMailbox>,
     at_end: Arc<AtEndSlot>,
     applied_at_end: AtEnd,
+    #[cfg(feature = "interactive-audition")]
+    transport: Option<starplayer::core::InteractiveTransport>,
 }
 
 impl SeekableModuleSource {
     /// Wrap `sequencer` around a mailbox and a repeat slot the host keeps a handle to.
     pub fn new(sequencer: NativeSequencer, request: Arc<SeekMailbox>, at_end: Arc<AtEndSlot>) -> SeekableModuleSource {
         let applied_at_end = at_end.get();
-        SeekableModuleSource { sequencer, request, at_end, applied_at_end }
+        SeekableModuleSource { sequencer, request, at_end, applied_at_end,
+            #[cfg(feature = "interactive-audition")] transport: None,
+        }
     }
 }
 
 impl EventSource for SeekableModuleSource {
+    #[cfg(feature = "interactive-audition")]
+    fn describe_interactive(&mut self, context: &mut EngineContext<'_>) { self.sequencer.describe_interactive(context); }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, scope: starplayer::engine::ClearScope, context: &mut EngineContext<'_>) { self.sequencer.clear_scope(scope, context); }
+
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, state: starplayer::core::InteractiveTransport, frame: Frame, control: &mut starplayer::engine::ControlClock) {
+        self.transport = Some(state);
+        self.sequencer.set_transport(state, frame, control);
+    }
+    #[cfg(feature = "interactive-audition")]
+    fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        // Mailbox dispatch must remain available while the sequencer is held.
+        self.apply_request(frame, context);
+        self.sequencer.dispatch_interactive(frame, context);
+    }
+
     fn next_event_frame(&self) -> Option<Frame> {
         let request = self.request.peek();
         match request.kind {
@@ -180,6 +202,17 @@ impl EventSource for SeekableModuleSource {
     fn advance_to(&mut self, frame: Frame) { self.sequencer.advance_to(frame); }
 
     fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        self.apply_request(frame, context);
+        if self.sequencer.next_event_frame().is_some_and(|next| next <= frame) {
+            self.sequencer.dispatch(frame, context);
+        }
+    }
+}
+
+impl SeekableModuleSource {
+    fn apply_request(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        #[cfg(not(feature = "interactive-audition"))]
+        let _ = context;
         let at_end = self.at_end.get();
         if at_end != self.applied_at_end {
             self.sequencer.set_at_end(at_end);
@@ -191,16 +224,32 @@ impl EventSource for SeekableModuleSource {
             // An order the module does not have, or a frame past the end of the scan, is a
             // caller-side mistake and not something the audio realm can report: the
             // sequencer stays where it was, which is the only answer that keeps playing.
+            #[cfg(feature = "interactive-audition")]
+            if self.transport.is_some() {
+                let valid = match request.kind {
+                    SeekKind::Order(order) => self.sequencer.can_seek_order(order),
+                    SeekKind::Frame(song_frame) => self.sequencer.can_seek_frame(song_frame),
+                    SeekKind::Row(row) => self.sequencer.can_seek_row(row),
+                    SeekKind::None => false,
+                };
+                if !valid { return; }
+                context.channels.clear_scope(starplayer::engine::ClearScope::Song, context.voices);
+            }
             match request.kind {
                 SeekKind::Order(order) => { let _ = self.sequencer.seek_order_at(order, frame); }
-                SeekKind::Row(row) => self.sequencer.seek_row(row),
+                SeekKind::Row(row) => {
+                    #[cfg(feature = "interactive-audition")]
+                    if self.transport.is_some() { self.sequencer.seek_row_at(row, frame); }
+                    else { self.sequencer.seek_row(row); }
+                    #[cfg(not(feature = "interactive-audition"))]
+                    self.sequencer.seek_row(row);
+                },
                 SeekKind::Frame(song_frame) => { let _ = self.sequencer.seek_frame(song_frame, frame); }
                 SeekKind::None => {}
             }
             self.sequencer.restart_clock_at(frame);
-        }
-        if self.sequencer.next_event_frame().is_some_and(|next| next <= frame) {
-            self.sequencer.dispatch(frame, context);
+            #[cfg(feature = "interactive-audition")]
+            if self.transport.is_some() { self.sequencer.sync_cadence(context.control); }
         }
     }
 }
@@ -223,6 +272,15 @@ pub struct SourceHandles {
 impl SourceHandles {
     /// A fresh pair, with the repeat setting at `at_end`.
     pub fn new(at_end: AtEnd) -> SourceHandles { SourceHandles { seek: SeekMailbox::new(), at_end: AtEndSlot::new(at_end) } }
+}
+
+/// Interactive installation always reserves slot 0 for sequencing and slot 1 for
+/// the prepared live source. NO-06 supplies its rack; routing never replaces this mux.
+pub fn interactive_sources(sequenced: Box<dyn EventSource>, live: Box<dyn EventSource>) -> Box<dyn EventSource> {
+    let mut mux = starplayer::engine::SourceMux::new(2);
+    let _ = mux.insert(sequenced);
+    let _ = mux.insert(live);
+    Box::new(mux)
 }
 
 /// Everything module activation hands back: the source the engine plays, and the scan it
@@ -281,6 +339,23 @@ pub fn build_source_with_settings(
     module: RtArc<Module>, start: SeekKind, frame: Frame,
     handles: &SourceHandles, cached_scan: Option<Arc<ScannedSong>>, speed_adjust: i8, settings: starplayer::engine::EngineSettings,
 ) -> Result<BuiltSource, Error> {
+    build_source_with_cursor(module, SourcePosition { seek: start, cursor: None }, frame, handles, cached_scan, speed_adjust, settings)
+}
+
+/// Prepared source position: ordinary seek or exact same-session rebuild cursor.
+#[derive(Copy, Clone, Debug)]
+pub struct SourcePosition {
+    pub seek: SeekKind,
+    pub cursor: Option<starplayer::core::SequencerCursor>,
+}
+
+/// The prepared rebuild path additionally restores an exact logical tick cursor.
+pub fn build_source_with_cursor(
+    module: RtArc<Module>, position: SourcePosition, frame: Frame,
+    handles: &SourceHandles, cached_scan: Option<Arc<ScannedSong>>, speed_adjust: i8, settings: starplayer::engine::EngineSettings,
+) -> Result<BuiltSource, Error> {
+    crate::engine::validate_host_settings(settings).map_err(|_| Error::Unsupported("optional playback is not compiled in this host"))?;
+    let SourcePosition { seek: start, cursor } = position;
     let voice_capacity = settings.voice_capacity;
     let sample_rate_hz = settings.sample_rate_hz;
     let scanned = match cached_scan {
@@ -304,6 +379,10 @@ pub fn build_source_with_settings(
         SeekKind::None => { let _ = sequencer.seek_order_at(0, frame); }
     }
     sequencer.restart_clock_at(frame);
+    #[cfg(feature = "interactive-audition")]
+    if let Some(cursor) = cursor { sequencer.restore_cursor(cursor.converted(sample_rate_hz), frame); }
+    #[cfg(not(feature = "interactive-audition"))]
+    let _ = cursor;
     let source = SeekableModuleSource::new(sequencer, Arc::clone(&handles.seek), Arc::clone(&handles.at_end));
     Ok(BuiltSource { source: Box::new(source), scanned })
 }

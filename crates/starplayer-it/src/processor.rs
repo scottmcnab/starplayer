@@ -3173,6 +3173,17 @@ fn advance_auto_vibrato(state: &mut ItVoiceState, sample: Option<&SampleIndex>, 
 // ── the TrackerProcessor seam ────────────────────────────────────────────────────────
 
 impl TrackerProcessor for ItProcessor {
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_sound(&mut self, _scope: starplayer_engine::ClearScope, context: &mut TickContext<'_>) {
+        self.sync_retirement(context);
+        for channel in self.channels.iter_mut() {
+            if channel.voice.is_some_and(|voice| context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.lifecycle == starplayer_engine::VoiceLifecycle::Retiring)) {
+                channel.voice = None;
+                channel.triggered = false;
+            }
+        }
+    }
+
     fn control_step(&mut self, context: &mut TickContext<'_>) {
         self.sync_retirement(context);
         for channel in self.channels.iter_mut() { channel.triggered = false; }
@@ -3356,6 +3367,27 @@ mod tests {
             }
         }
         (processor, voices, channels)
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    #[test]
+    fn interactive_clear_invalidates_foreground_and_native_background_articulation() {
+        let module = module_with(&[note_cell(60, 1), ItCell::EMPTY, ItCell { command: COMMAND_RETRIGGER, info: 0x01, ..note_cell(64, 1) }, ItCell::EMPTY], NewNoteAction::Continue);
+        let (mut processor, mut voices, mut channels) = play(module, 2, 6);
+        let configuration = starplayer_engine::PlaybackConfiguration {
+            identity: Default::default(), capabilities: starplayer_core::PlaybackCapabilities::empty(), instrument_count: 1,
+            capacity: starplayer_engine::VoiceCapacity { native: VIRTUAL_CHANNELS, custom: 0, live: 0, interactive_transport: false },
+        };
+        channels.prepare_playback(configuration).unwrap();
+        for (voice, state) in voices.iter() { channels.playback_mut().unwrap().register(voice, starplayer_engine::VoiceDomain::Native, ChannelId(state.tag.channel as u16), &voices).unwrap(); }
+        channels.clear_scope(starplayer_engine::ClearScope::All, &mut voices);
+        let mut context = TickContext::new(Frame(882), &mut voices, &mut channels, RowClock { tick_in_row: 1, ..RowClock::new(6) }, SongPosition::default(), 125);
+        processor.clear_sound(starplayer_engine::ClearScope::All, &mut context);
+        assert!(processor.channels.iter().all(|channel| channel.voice.is_none()));
+        assert!(processor.articulation.voices.iter().filter(|voice| voice.voice.is_some()).all(|voice| voice.retiring));
+        let _ = processor.tick(&mut context);
+        assert_eq!(context.channels.foreground(ChannelId(0)), None);
+        assert_eq!(context.channels.playback().unwrap().active_count(starplayer_engine::VoiceDomain::Native, context.voices), 0);
     }
 
     #[test]

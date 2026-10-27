@@ -98,6 +98,15 @@ pub struct TelemetryPublisher {
 }
 
 impl TelemetryPublisher {
+    #[cfg(feature = "interactive-audition")]
+    pub fn set_sequencer_cursor(&mut self, cursor: starplayer_core::SequencerCursor) { self.working.transport.cursor = Some(cursor); self.working.transport.smf = None; }
+
+    pub fn set_interactive_transport(&mut self, state: starplayer_core::InteractiveTransport, natural_end: bool) {
+        self.working.transport.interactive = Some(state);
+        self.working.transport.natural_end = natural_end;
+    }
+    pub fn set_live_summary(&mut self, summary: crate::LiveSummary) { self.working.live = summary; }
+
     /// Latch the `_MActual*` position: the order, pattern, row and tick currently
     /// **sounding**.
     pub fn set_position(&mut self, order: u16, pattern: u16, row: u16, tick: u16) {
@@ -112,6 +121,10 @@ impl TelemetryPublisher {
         self.working.transport.speed = speed;
         self.working.transport.tempo_bpm = tempo_bpm;
     }
+
+    /// Coherent file cursor and channel controllers for a sound-free renderer rebuild.
+    #[cfg(feature = "interactive-audition")]
+    pub fn set_smf_state(&mut self, state: starplayer_core::SmfPlaybackState) { self.working.transport.smf = Some(state); self.working.transport.cursor = None; }
 
     /// The song clock: elapsed frames into this pass, the length of a pass, how the song
     /// ends, and whether the loop point has been passed.
@@ -320,6 +333,7 @@ mod tests {
                 song_length_frames: 1_764_000,
                 song_end: SongEnd::Loops,
                 end_reached: false,
+                ..TransportState::IDLE
             }
         );
         assert_eq!(snapshot.channel_count, 4);

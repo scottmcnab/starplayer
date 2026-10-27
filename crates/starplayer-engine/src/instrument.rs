@@ -640,6 +640,7 @@ pub struct InstrumentRack {
     instruments: Box<[Box<dyn Instrument>]>,
     channels: [RackChannel; MIDI_CHANNEL_COUNT],
     bend_range_cents: i16,
+    channel_base: Option<u16>,
     unsupported_events: u32,
 }
 
@@ -657,9 +658,20 @@ impl InstrumentRack {
             instruments: instruments.into_boxed_slice(),
             channels: [RackChannel::default(); MIDI_CHANNEL_COUNT],
             bend_range_cents: DEFAULT_BEND_RANGE_CENTS,
+            channel_base: None,
             unsupported_events: 0,
         }
     }
+
+    /// Sequenced SMF playback owns song lanes 0–15, leaving live lanes independent.
+    #[cfg(feature = "interactive-audition")]
+    pub fn for_sequenced_module(module: &Arc<Module>, sample_rate_hz: u32) -> Self {
+        let mut rack = Self::for_module(module, sample_rate_hz);
+        rack.channel_base = Some(0);
+        rack
+    }
+
+    fn channel_base(&self, context: &EngineContext<'_>) -> u16 { self.channel_base.unwrap_or(context.channels.layout().live_base() as u16) }
 
     /// A rack with no instruments at all — every note is silent. What a host builds before
     /// a module is loaded.
@@ -668,6 +680,7 @@ impl InstrumentRack {
             instruments: Vec::new().into_boxed_slice(),
             channels: [RackChannel::default(); MIDI_CHANNEL_COUNT],
             bend_range_cents: DEFAULT_BEND_RANGE_CENTS,
+            channel_base: None,
             unsupported_events: 0,
         }
     }
@@ -698,6 +711,19 @@ impl InstrumentRack {
         }
     }
 
+    #[cfg(feature = "interactive-audition")]
+    pub fn controller_state(&self) -> [starplayer_core::MidiControllerState; MIDI_CHANNEL_COUNT] {
+        self.channels.map(|state| starplayer_core::MidiControllerState { program: state.program, volume: state.volume, pan: state.pan, bend: state.bend, sustain: state.sustain })
+    }
+
+    /// Restore controllers only: held notes and instrument voices remain empty.
+    #[cfg(feature = "interactive-audition")]
+    pub fn restore_controllers(&mut self, states: [starplayer_core::MidiControllerState; MIDI_CHANNEL_COUNT]) {
+        for (channel, state) in self.channels.iter_mut().zip(states) {
+            *channel = RackChannel { program: state.program, volume: state.volume, pan: state.pan, bend: state.bend, sustain: state.sustain, held: HeldNotes::default() };
+        }
+    }
+
     /// Whether MIDI channel `channel`'s sustain pedal is down.
     pub fn sustain(&self, channel: u8) -> bool {
         self.channels.get(channel as usize % MIDI_CHANNEL_COUNT).is_some_and(|state| state.sustain)
@@ -714,7 +740,7 @@ impl InstrumentRack {
     /// tracker lane, or a specific voice — is [`EventOutcome::Unsupported`].
     pub fn apply(&mut self, target: Target, event: Event, context: &mut EngineContext<'_>) -> EventOutcome {
         let outcome = match target {
-            Target::Channel(channel) => match context.channels.layout().midi_index(channel) {
+            Target::Channel(channel) => match channel.0.checked_sub(self.channel_base(context)).filter(|index| (*index as usize) < MIDI_CHANNEL_COUNT).map(|index| index as usize) {
                 Some(index) => self.apply_to_channel(index, event, context),
                 None => EventOutcome::Unsupported,
             },
@@ -772,7 +798,7 @@ impl InstrumentRack {
         state.held.push(note.to_midi());
         let (program, volume, pan, bend) = (state.program, state.volume, state.pan, state.bend);
         let Some(instrument) = self.instrument(program) else { return EventOutcome::Ignored };
-        let channel = ChannelId(context.channels.layout().live_base() as u16 + index as u16);
+        let channel = ChannelId(self.channel_base(context) + index as u16);
         let params = NoteParams { note, velocity: scale_unit(velocity, volume), pan_override: pan,
             #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))] raw_velocity: velocity,
         };
@@ -810,7 +836,7 @@ impl InstrumentRack {
     /// remembered, for the same reason `ChannelTable::is_sounding` asks the pool: a voice
     /// that ended on its own must not leave the rack thinking a note is still down.
     fn release_if_sounding(&mut self, index: usize, note: u8, context: &mut EngineContext<'_>) -> bool {
-        let channel = ChannelId(context.channels.layout().live_base() as u16 + index as u16);
+        let channel = ChannelId(self.channel_base(context) + index as u16);
         let sounding = context
             .channels
             .foreground(channel)
@@ -830,7 +856,7 @@ impl InstrumentRack {
         state.held.clear();
         state.sustain = false;
         let program = state.program;
-        let channel = ChannelId(context.channels.layout().live_base() as u16 + index as u16);
+        let channel = ChannelId(self.channel_base(context) + index as u16);
         let Some(instrument) = self.instrument(program) else { return EventOutcome::Ignored };
         instrument.note_off(channel, context);
         EventOutcome::Applied
@@ -842,7 +868,7 @@ impl InstrumentRack {
         state.sustain = false;
         // Straight to the channel table rather than through the instrument: "all sound
         // off" means *now*, whatever release an instrument would otherwise run.
-        context.channels.stop(ChannelId(context.channels.layout().live_base() as u16 + index as u16), context.voices);
+        context.channels.stop(ChannelId(self.channel_base(context) + index as u16), context.voices);
         EventOutcome::Applied
     }
 
@@ -928,7 +954,7 @@ impl InstrumentRack {
         let program = state.program;
         let cents = self.bend_cents(bend);
         let Some(instrument) = self.instrument(program) else { return EventOutcome::Ignored };
-        instrument.set_bend(ChannelId(context.channels.layout().live_base() as u16 + index as u16), cents, context);
+        instrument.set_bend(ChannelId(self.channel_base(context) + index as u16), cents, context);
         EventOutcome::Applied
     }
 
@@ -937,7 +963,7 @@ impl InstrumentRack {
         for index in 0..MIDI_CHANNEL_COUNT {
             let Some(state) = self.channels.get(index) else { continue };
             let Some(instrument) = self.instrument(state.program) else { continue };
-            instrument.control_tick(ChannelId(context.channels.layout().live_base() as u16 + index as u16), context);
+            instrument.control_tick(ChannelId(self.channel_base(context) + index as u16), context);
         }
     }
 
@@ -972,6 +998,14 @@ impl core::fmt::Debug for InstrumentRack {
 /// over a MIDI file's sorted event list. They differ in exactly one respect — whether the
 /// next event is already known — which is what [`EventFeed::refresh`] exists for.
 pub trait EventFeed: Send {
+    /// Live feeds keep absolute timestamps; file sequencers hold and translate theirs.
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, _state: starplayer_core::InteractiveTransport, _frame: Frame) {}
+
+    /// File cursor only; live queues have no reconstructible sequenced position.
+    #[cfg(feature = "interactive-audition")]
+    fn smf_cursor(&self, _frame: Frame) -> Option<starplayer_core::SmfCursor> { None }
+
     /// Absolute frame of the next event, or `None` when the feed is idle.
     ///
     /// `&self`, because [`EventSource::next_event_frame`] is: a feed that has to *look* for
@@ -1190,7 +1224,7 @@ impl<Feed: EventFeed> MidiSource<Feed> {
     fn publish_telemetry(&mut self, context: &mut EngineContext<'_>) {
         let mut fingerprint = 0u64;
         for index in 0..MIDI_CHANNEL_COUNT {
-            let channel = ChannelId(context.channels.layout().live_base() as u16 + index as u16);
+            let channel = ChannelId(self.rack.channel_base(context) + index as u16);
             let note = context
                 .channels
                 .foreground(channel)
@@ -1205,11 +1239,37 @@ impl<Feed: EventFeed> MidiSource<Feed> {
         self.published_sounding = fingerprint;
         let Some(telemetry) = context.telemetry.as_deref_mut() else { return };
         crate::telemetry::capture_midi_channels(telemetry, context.channels, context.voices);
-        telemetry.publish();
+        if !context.channels.layout().is_interactive() { telemetry.publish(); }
     }
 }
 
 impl<Feed: EventFeed> EventSource for MidiSource<Feed> {
+    #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+    fn describe_interactive(&mut self, context: &mut EngineContext<'_>) {
+        let Some(cursor) = self.feed.smf_cursor(context.frame) else { return };
+        if let Some(telemetry) = context.telemetry.as_deref_mut() {
+            telemetry.set_song_clock(cursor.song_frame, 0, starplayer_telemetry::SongEnd::Unknown, false);
+            telemetry.set_smf_state(starplayer_core::SmfPlaybackState { cursor, channels: self.rack.controller_state() });
+        }
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame, _control: &mut ControlClock) { self.feed.set_transport(state, frame); }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, scope: crate::ownership::ClearScope, context: &mut EngineContext<'_>) {
+        use crate::ownership::ClearScope;
+        let base = self.rack.channel_base(context);
+        let sequenced = self.rack.channel_base.is_some();
+        for (index, state) in self.rack.channels.iter_mut().enumerate() {
+            let lane = ChannelId(base + index as u16);
+            let clear = scope == ClearScope::All || (sequenced && scope == ClearScope::Song) || (!sequenced && scope == ClearScope::Live) || scope == ClearScope::Lane(lane);
+            #[cfg(feature = "interactive-audition")]
+            let clear = clear || (!sequenced && scope == ClearScope::LiveOrigin(crate::ownership::LiveOrigin::Jam));
+            if clear { state.held.clear(); state.sustain = false; }
+        }
+    }
+
     fn next_event_frame(&self) -> Option<Frame> {
         match (self.feed.next_frame(), self.control.next_synthesised_frame()) {
             (Some(feed), Some(control)) => Some(feed.min(control)),
@@ -1251,6 +1311,32 @@ impl<Feed> core::fmt::Debug for MidiSource<Feed> {
 mod tests {
     use super::*;
     use starplayer_core::fixed::unit_from_ratio;
+
+    #[cfg(feature = "interactive-audition")]
+    #[test]
+    fn sequenced_and_live_rack_holds_are_cleared_only_in_their_own_scope() {
+        let (_, song_feed) = external_event_channel(8);
+        let (_, live_feed) = external_event_channel(8);
+        let mut song_rack = InstrumentRack::empty(); song_rack.channel_base = Some(0);
+        let mut song = MidiSource::new(song_feed, song_rack, 44_100);
+        let mut live = MidiSource::new(live_feed, InstrumentRack::empty(), 44_100);
+        let mut channels = crate::ChannelTable::try_with_layout(crate::LaneLayout::interactive(16).expect("valid lanes")).expect("channel allocation");
+        let mut voices = starplayer_mixer::VoicePool::new(2);
+        let mut control = ControlClock::new(44_100, Frame::ZERO);
+        let mut context = EngineContext::new(Frame::ZERO, &mut voices, &mut channels, &mut control);
+        let note = Event::NoteOn { note: Note::from_midi(60), velocity: U0F16::MAX };
+        song.rack.apply(Target::Channel(ChannelId(0)), note, &mut context);
+        live.rack.apply(Target::Channel(ChannelId(64)), note, &mut context);
+        song.rack.apply(Target::Channel(ChannelId(0)), Event::Controller { number: controller::SUSTAIN, value: U0F16::MAX }, &mut context);
+        live.rack.apply(Target::Channel(ChannelId(64)), Event::Controller { number: controller::SUSTAIN, value: U0F16::MAX }, &mut context);
+        assert_eq!(song.rack.channels[0].held.len, 1); assert_eq!(live.rack.channels[0].held.len, 1);
+        song.clear_scope(crate::ClearScope::Song, &mut context); live.clear_scope(crate::ClearScope::Song, &mut context);
+        assert_eq!(song.rack.channels[0].held.len, 0); assert!(!song.rack.sustain(0));
+        assert_eq!(live.rack.channels[0].held.len, 1); assert!(live.rack.sustain(0));
+        song.rack.apply(Target::Channel(ChannelId(0)), note, &mut context);
+        song.clear_scope(crate::ClearScope::Live, &mut context); live.clear_scope(crate::ClearScope::Live, &mut context);
+        assert_eq!(song.rack.channels[0].held.len, 1); assert_eq!(live.rack.channels[0].held.len, 0); assert!(!live.rack.sustain(0));
+    }
 
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     #[test]

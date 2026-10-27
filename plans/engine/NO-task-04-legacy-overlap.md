@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Authorised; pending dependencies |
+| Status | In progress on task/no-04-legacy-overlap; NO-01–03 integrated |
 | Depends on | NO-01 |
 | Blocks | NO-05, NO-06 |
 | Parallel with | NO-02/03 only with isolated worktrees and explicit shared-seam ownership |

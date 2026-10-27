@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation authorised 2026-10-27; NO-01/02 integrated; NO-03 in progress; reviewed instrument-only/onset-volume contract unchanged |
+| Status | Implementation authorised 2026-10-27; NO-01–03 integrated; NO-04 in progress; reviewed instrument-only/onset-volume contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -268,7 +268,15 @@ While held, song progress uses the frozen song-time cursor. Stopped time is held
 Keep the separate live timestamp clock monotonic. Explicit seek is a different operation
 and may reset tick phase. Tracker and SMF playback sources are sequenced sources and
 freeze; keyboard/MIDI feeds are live sources and continue. SMF scheduling needs the same
-held-time translation, but does not invent tracker tempo effects.
+held-time translation, but does not invent tracker tempo effects. Interactive SMF installation and
+same-session replacement retain parsed file data off-thread and restore its consumed-event
+index, song time, pending event duration and channel program/volume/pan/bend/sustain state,
+with no replay of consumed events and no restored held notes. `InstrumentRack::for_sequenced_module`
+uses song lanes 0–15/N in slot 0; the permanent live rack uses lanes 64–80/L in slot 1.
+Song custom-detached tails belong to C; live custom tails remain L. Song/live clears reach
+only the corresponding rack's holds/sustain. Generic MIDI racks retain their legacy or
+configured live mapping unless explicitly constructed as sequenced. The existing SMF
+length-return/caller-owned completion policy is unchanged.
 
 The cadence is also an engine event boundary: NO-03 includes its next frame in event
 splitting and adds a provided post-source articulation method to the existing EventSource
@@ -407,7 +415,18 @@ call site. Song and live random state remain separate.
 A user-session ID changes for explicit new loads/reloads, even identical bytes. An engine
 build generation changes for every replacement/rebuild, including sample enhancement.
 Same-session rebuilds retain overrides/cursor/mode via Player shadow state, but reject
-old-generation commands/replies. The web labels rebuild vs explicit reload intentionally;
+old-generation commands/replies. Renderer replacement still clears voices and reconstructs
+format processor working state, as the existing host rebuild path does; it does not
+transfer a suspended processor object or promise continuation of its effect-memory
+internals. This boundary does not relax Pause/Stop in the same renderer: those preserve
+the processor and effect memories exactly. NO-03's rebuild cursor retains RowClock tick,
+repeat and delay budgets, pending jump/requested speed, row arrival, tempo, sounding
+position, remaining deadline and fractional phase, song time and end flags. Restore runs
+no musical callbacks. Loop-detector visited rows are reconstructed from the scanned
+timeline through the saved song frame; its loop/budget/armed scalars are retained.
+The coherent host snapshot also retains fade gain/elapsed and pending natural-end rewind.
+Sample-rate changes convert durations and the whole-plus-fraction pending deadline; they
+do not copy old-rate frame counts. The web labels rebuild vs explicit reload intentionally;
 no byte-equality heuristic. Replay the full state before accepting input in the new build.
 
 NO-W1 uses a versioned atomic wire record for interactive commands carrying the engine
@@ -532,3 +551,11 @@ planning handoff. External review findings, corrections and final disposition ar
   at all six required sizes. Allocation hooks, optional combinations, no_std and Clippy
   passed; coordinator affected-package regression passed. See NO-02 for exact evidence.
 - NO-03 starts after NO-02, using Astra medium as the sole active task worker.
+
+- NO-03 integrated by reviewed single-change squash (task commit `adaa84e`): opt-in
+  sequencer-only Pause, clear-and-hold Stop, exact cadence/source ordering, scoped
+  retirement, DSP transition, held seeks and tracker/SMF rebuild cursors. Root final
+  affected-package regression passed, including 13 host and 8 engine transport tests.
+  Canonical conformance/goldens unchanged; allocation, no_std/WASM, unification and
+  default embedded checks passed. See NO-03 for exact commands and reconstruction limits.
+- NO-04 starts after NO-03, using Sol high as the sole active task worker.

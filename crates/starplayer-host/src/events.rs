@@ -3,16 +3,10 @@
 //!
 //! # Which clock an event is stamped against
 //!
-//! The master plan writes the stamp as `output_frame + lead`. That is right for an engine
-//! that has never been paused and wrong for every other one, and a [`Player`](crate::Player)
-//! is always paused at least once: [`Player::open`](crate::Player::open) freezes the musical
-//! clock before the stream starts, so the output clock is already ahead by however long the
-//! caller took to press Play. The engine dispatches sources against
-//! [`Engine::source_frame`](starplayer::engine::Engine::source_frame) — the **musical**
-//! clock, the one that stops with the transport — so that is the clock a live event has to
-//! be stamped in. Stamping in the output clock instead would delay every note by exactly
-//! the time the transport had spent stopped, and stop the keyboard entirely after a long
-//! pause. See this task's research resolution, point 2.
+//! Events use [`Engine::source_frame`](starplayer::engine::Engine::source_frame), the
+//! clock sources dispatch against. Interactive playback keeps it monotonic through
+//! Pause and Stop; song time is held separately. Legacy transport freezes source time,
+//! so stamping against the output clock would add the entire stopped duration as delay.
 //!
 //! # The lead, and why it has a floor
 //!

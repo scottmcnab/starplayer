@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Instrument-only/onset-volume revision reviewed and corrected; no further amendments required; staged/uncommitted |
+| Status | Reviewed contract implementation in progress; NO-01–03 integrated on feature branch |
 | Requested reviewer | Claude CLI `claude-opus-5-5`; `--effort high` supplied; returned modelUsage confirms exact model |
 | Earliest invocation | After 2026-10-27 16:20 Australia/Perth / 08:20 UTC, per owner |
 | Master planning commit | c3bead3 |
@@ -814,3 +814,16 @@ of the reviewed contract, with no contract substitution. Task `bbf57f4` is integ
 single-change squash. Conformance remains261/179/0/16/66; eight goldens unchanged;
 six-size prepared PCM, allocation hooks, independent features, no_std and final coordinator
 regressions passed. Held scheduling, overlap and live runtime remain dependent tasks.
+
+### NO-03 coordinator acceptance — 2026-10-28
+
+Task `adaa84e` integrated by single-change squash after source review and the final
+affected-package regression. Resolved draft clock, DSP continuity, runtime capability,
+held-seek validation, telemetry coherence/resource exclusion and rebuild gaps before
+acceptance. Tracker/SMF source kind, cursor/controller state and fade state survive
+interactive rebuilds; master/foundation document fresh processor reconstruction and
+scanned detector-visit reconstruction. Live slot remains prepared-placeholder scope
+until NO-06. Optional telemetry payload320 bytes is absent off; Snapshot2632 bytes off
+versus2952 on (x86_64). Host13/engine8 transport, callback6, firmware96, no_std/WASM,
+lint and unification checks passed. Conformance remains261/179/0/16/66; all8 goldens
+unchanged. No main merge, deployment or hardware/listening acceptance claimed.

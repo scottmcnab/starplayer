@@ -1827,7 +1827,8 @@ The [NO master plan](../engine/NO-master-plan.md) proposes explicit, session-onl
 instrument-only note overlap and faithful instrument audition for all five formats. This
 has completed external review and corrections (see the NO review log), and implementation
 was authorised on 2026-10-27. NO-01 supplies the contracts/preparation described below;
-overlap execution, interactive transport and faithful native audition remain planned.
+NO-02 adds concrete native articulation and NO-03 adds interactive transport. Custom
+overlap execution and faithful native audition remain planned.
 Each instrument has a Let notes ring boolean, with a separate Enable note overlap global
 bypass preserving selections. There are no channel overrides, inheritance or custom modes.
 Enabled eligible voices continue except when instrument, original note, exact onset base
@@ -1859,7 +1860,7 @@ architecture sections as each deliverable lands.
 
 `starplayer-core::interactive` defines separate `SessionId` and `BuildGeneration`, an
 atomic logical `InteractiveCommand` envelope, capability bits and transport/action types.
-These types do not execute transport changes or assign wire opcodes. `Command::Stop` and
+The types alone do not execute transport changes or assign wire opcodes. `Command::Stop` and
 all existing command values retain their contracts. NO-03 supplies command execution and
 NO-W1 the negotiated wire envelope.
 
@@ -1889,7 +1890,7 @@ records. It compiles with either feature, is absent with neither, and allocates 
 preparation. Per-instrument booleans exist only with `note-overlap`; the boolean table is
 empty unless that runtime capability was configured. Bounded setters validate both session
 and build, and global bypass preserves selections and returns a custom-tail clear request.
-NO-03/04/06 execute that request with release ramps. Current setter calls do not clear PCM.
+NO-03 executes that request with release ramps; NO-04/06 attach their domain cleanup.
 Explicit new sessions construct false selections/global state; same-session rebuild replay
 belongs to Player in NO-03. These retained selections are session state, never presets.
 
@@ -1902,7 +1903,7 @@ synchronously on admission before mixing. All three live origins share one L quo
 Scoped predicates cover all/song/live/lane/custom-detached/origin cleanup. Retiring voices
 retain domain/age/generation, leave active admission counts and cannot become active again.
 Oldest selection is deterministic by age then slot; native IT retains its format victim
-policy. Enforcement of quotas/retirement ramps is a dependent-task deliverable.
+policy. NO-03 enforces domain admission and bounded retirement ramps for the prepared runtime.
 
 `TriggerIdentity` keeps the existing zero-based `InstrumentId`, exact original note
 (including raw MOD periods), originating channel and an exact native `u16` base-volume
@@ -1916,3 +1917,38 @@ replacement, including delayed starts. NO-05 names XM's exact base field. NO-06 
 native resolution; `NoteParams::raw_velocity` already preserves event velocity separately
 from CC7-scaled playback velocity. Existing format-resolution velocity collisions need
 format-native tests there, without identity-only quantization.
+
+
+### NO-03 interactive transport and replacement boundaries
+
+Explicit interactive preparation keeps engine audio/source time monotonic while tracker
+and SMF sources hold their musical cursor. Legacy Stop remains unchanged. Tracker cadence
+is the sole native-articulation authority: slot 0 controls held song voices before live
+events; the post-source hook controls live articulation after all due events. Resume
+translates deadlines without resetting the fractional clock. Each cadence publishes one
+coherent tracker/live/transport snapshot; transitions may publish immediately.
+
+Clear scopes invalidate bindings immediately and preserve retiring ownership until bounded
+voice ramps finish. Domain admission may recycle only the oldest already-retiring slot of
+that domain. Global clears reset DSP state with a 64-frame additive continuity bridge,
+never a persistent gain mute. New input remains admissible while old voices retire.
+
+Player preserves interactive mode through held seeks, routing changes and renderer
+replacement, with permanent sequenced/live source slots. NO-03 supplies the live placeholder;
+NO-06 installs the native audition rack. Tracker replacement retains the logical tick/flow
+cursor and pending fractional deadline, but reconstructs processor working state and clears
+voices. Loop visit marks are reconstructed from the scan; arbitrary modified runtime visit
+history is not transferred. Pure Pause/Stop within the same renderer preserve effect memory.
+A coherent host snapshot also preserves fade gain/elapsed and armed natural-end rewind.
+
+Interactive SMF replacement retains parsed file data on the control side, event index,
+song/pending-event time and program/volume/pan/bend/sustain state. It restores no held notes
+and dispatches no past events. Sequenced MIDI uses song lanes 0–15; generic live racks keep
+their configured live base. Sample-rate changes convert saved durations before resuming.
+The legacy SMF length-return/caller-owned completion policy remains unchanged.
+
+The heavy tracker/SMF rebuild fields in telemetry are gated by its no_std
+`interactive-audition` feature, forwarded weakly by the engine. Feature-off snapshots do
+not reserve their storage; stable query methods return None. Host-local capability checks
+reject preparation when Cargo dependency feature unification enabled engine features but
+this host did not compile the required forwarding hooks. Legacy settings remain valid.

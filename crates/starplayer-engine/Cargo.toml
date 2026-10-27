@@ -17,7 +17,7 @@ starplayer-telemetry = { workspace = true, optional = true }
 
 [features]
 note-overlap = []
-interactive-audition = []
+interactive-audition = ["starplayer-telemetry?/interactive-audition"]
 default = []
 std = ["starplayer-core/std", "starplayer-rt/std", "starplayer-dsp/std", "starplayer-mixer/std", "starplayer-model/std", "starplayer-telemetry?/std"]
 alloc = ["starplayer-core/alloc", "starplayer-rt/alloc", "starplayer-dsp/alloc", "starplayer-mixer/alloc", "starplayer-model/alloc", "starplayer-telemetry?/alloc"]

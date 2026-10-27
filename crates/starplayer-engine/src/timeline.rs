@@ -66,28 +66,7 @@ pub const MAX_PATTERN_LOOP_ARRIVALS: u32 = 4_096;
 /// The loop detector needs this because "I have played this row before" only means the
 /// song has looped when the row was reached by *moving through the song*. A row revisited
 /// by an `SBx` pattern loop is the loop doing its job.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub enum RowArrival {
-    /// The song was just started, or seeked. Nothing before this row is continuous with it.
-    #[default]
-    Start,
-    /// The next row of the same pattern.
-    Sequential,
-    /// The first row of the next order, because the pattern ran out.
-    NextOrder,
-    /// A `Bxx` / `Cxx` / `Dxx` jump through the order list.
-    Jump,
-    /// An `SBx` / `E6x` pattern loop, back to a row of the pattern already playing.
-    PatternLoop,
-    /// The order list ran out and [`EndOfSongPolicy::Loop`](crate::EndOfSongPolicy)
-    /// restarted it.
-    ///
-    /// **This is the end of the song, not a loop point.** Running off the end of the order
-    /// list is not something the music asks for — it is what is left when the music stops
-    /// asking for anything — so it ends the pass whatever row the restart order names and
-    /// whether or not that row has been played (task D2).
-    Wrapped,
-}
+pub use starplayer_core::RowArrival;
 
 /// What [`LoopDetector::visit`] made of one row.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -383,6 +362,12 @@ impl LoopDetector {
         words.try_reserve_exact(word_count)?;
         words.resize(word_count, 0);
         Ok(LoopDetector { order_offsets, order_rows, words, inside_loop: false, loop_arrivals: 0, armed: true })
+    }
+
+    /// Compact flow state paired with timeline-based visited-row reconstruction.
+    pub const fn cursor_state(&self) -> (bool, u32, bool) { (self.inside_loop, self.loop_arrivals, self.armed) }
+    pub fn restore_cursor_state(&mut self, state: (bool, u32, bool)) {
+        (self.inside_loop, self.loop_arrivals, self.armed) = state;
     }
 
     /// Whether the detector is still watching. It disarms once it has fired.

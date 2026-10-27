@@ -90,3 +90,102 @@ pub enum TriggerKind {
     EffectRetrigger,
     SampleReplacement,
 }
+
+/// Logical sequencer cursor for a renderer rebuild. Sound and processor working state
+/// are rebuilt separately; restoring this record never dispatches a musical tick.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SequencerCursor {
+    pub order: u16,
+    pub row: u16,
+    pub row_clock: crate::RowClock,
+    pub sounding_order: u16,
+    pub sounding_pattern: u16,
+    pub sounding_row: u16,
+    pub sounding_tick: u16,
+    pub tempo_bpm: u16,
+    pub requested_speed: u8,
+    pub arrival: RowArrival,
+    pub detector_state: (bool, u32, bool),
+    pub pending_jump: Option<(Option<u16>, Option<u16>, bool)>,
+    pub remaining_frames: u64,
+    pub fractional_remainder: u64,
+    pub song_frame: u64,
+    pub captured_frame: crate::Frame,
+    pub sample_rate_hz: u32,
+    pub sequence_ended: bool,
+    pub end_reached: bool,
+}
+
+impl SequencerCursor {
+    /// Convert time, including the pending subframe phase, instead of copying old-rate
+    /// frame counts into a replacement renderer. Current tempo uses its native model.
+    pub fn converted(mut self, sample_rate_hz: u32) -> Self {
+        let old_rate = self.sample_rate_hz.max(1) as u128;
+        let pending = (((self.remaining_frames as u128) << 32) + self.fractional_remainder as u128)
+            .saturating_mul(sample_rate_hz as u128) / old_rate;
+        self.remaining_frames = (pending >> 32).min(u64::MAX as u128) as u64;
+        self.fractional_remainder = (pending & 0xffff_ffff) as u64;
+        self.song_frame = (self.song_frame as u128 * sample_rate_hz as u128 / old_rate).min(u64::MAX as u128) as u64;
+        self.sample_rate_hz = sample_rate_hz;
+        self
+    }
+}
+
+/// How sequencing arrived at the current row, retained across renderer replacement.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RowArrival {
+    /// The song was just started, or seeked. Nothing before this row is continuous with it.
+    #[default]
+    Start,
+    /// The next row of the same pattern.
+    Sequential,
+    /// The first row of the next order, because the pattern ran out.
+    NextOrder,
+    /// A `Bxx` / `Cxx` / `Dxx` jump through the order list.
+    Jump,
+    /// An `SBx` / `E6x` pattern loop, back to a row of the pattern already playing.
+    PatternLoop,
+    /// The order list ran out and `EndOfSongPolicy::Loop`
+    /// restarted it.
+    ///
+    /// **This is the end of the song, not a loop point.** Running off the end of the order
+    /// list is not something the music asks for — it is what is left when the music stops
+    /// asking for anything — so it ends the pass whatever row the restart order names and
+    /// whether or not that row has been played (task D2).
+    Wrapped,
+}
+
+/// Sound-free MIDI channel state used when replacing an interactive renderer.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MidiControllerState {
+    pub program: InstrumentId,
+    pub volume: crate::U0F16,
+    pub pan: Option<crate::I1F15>,
+    pub bend: crate::I1F15,
+    pub sustain: bool,
+}
+
+/// Exact next-event cursor; already consumed events are never replayed on restore.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SmfCursor {
+    pub event_index: u64,
+    pub song_frame: u64,
+    pub remaining_frames: Option<u64>,
+    pub captured_frame: crate::Frame,
+    pub sample_rate_hz: u32,
+}
+impl SmfCursor {
+    pub fn converted(mut self, sample_rate_hz: u32) -> Self {
+        let old_rate = self.sample_rate_hz.max(1) as u128;
+        self.song_frame = (self.song_frame as u128 * sample_rate_hz as u128 / old_rate).min(u64::MAX as u128) as u64;
+        self.remaining_frames = self.remaining_frames.map(|frames| (frames as u128 * sample_rate_hz as u128 / old_rate).min(u64::MAX as u128) as u64);
+        self.sample_rate_hz = sample_rate_hz;
+        self
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SmfPlaybackState {
+    pub cursor: SmfCursor,
+    pub channels: [MidiControllerState; 16],
+}

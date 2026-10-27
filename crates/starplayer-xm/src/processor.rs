@@ -144,6 +144,8 @@ pub struct XmChannel {
     pub sample_pan: u8,
     /// `realVol` — the channel volume the slides own, 0..64.
     pub real_volume: u8,
+    #[cfg(feature = "interactive-audition")]
+    sound_cleared: bool,
 
     // ── the row's columns ───────────────────────────────────────────────────────────
     /// `efx` — the effect column, 0..=0x21.
@@ -253,6 +255,8 @@ impl XmChannel {
             sample_volume: 0,
             sample_pan: 128,
             real_volume: 0,
+            #[cfg(feature = "interactive-audition")]
+            sound_cleared: false,
 
 
 
@@ -972,6 +976,11 @@ impl XmProcessor {
 
     /// `triggerNote` (`ft2_replayer.c` 539).
     fn trigger_note(&mut self, channel_index: usize, note: u8, effect: u8, parameter: u8) {
+        #[cfg(feature = "interactive-audition")]
+        {
+            if note == 0 && self.channels[channel_index].sound_cleared { return; }
+            if note != 0 && note != NOTE_KEY_OFF { self.channels[channel_index].sound_cleared = false; }
+        }
         if note == NOTE_KEY_OFF {
             self.key_off(channel_index);
             return;
@@ -2170,6 +2179,14 @@ fn sample_region(sample: &starplayer_model::SampleIndex) -> SampleRegion {
 }
 
 impl TrackerProcessor for XmProcessor {
+    #[cfg(feature = "interactive-audition")]
+    fn clear_sound(&mut self, scope: starplayer_engine::ClearScope, _context: &mut TickContext<'_>) {
+        use starplayer_engine::ClearScope;
+        for (index, channel) in self.channels.iter_mut().enumerate() {
+            if matches!(scope, ClearScope::All | ClearScope::Song) || scope == ClearScope::Lane(ChannelId(index as u16)) { channel.sound_cleared = true; }
+        }
+    }
+
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     fn control_step(&mut self, context: &mut TickContext<'_>) {
         let Some(runtime) = &mut self.articulation else { return };
@@ -2373,6 +2390,26 @@ mod tests {
 
     fn note(note: u8, instrument: u8) -> XmCell { XmCell { note, instrument, ..XmCell::EMPTY } }
     fn effect(effect: u8, parameter: u8) -> XmCell { XmCell { effect, parameter, ..XmCell::EMPTY } }
+
+    #[cfg(feature = "interactive-audition")]
+    #[test]
+    fn interactive_clear_suppresses_effect_retrigger_but_keeps_a_future_delayed_note() {
+        let mut harness = Harness::new(processor());
+        let _ = harness.row(&[XmCell { note: 49, instrument: 1, effect: 0xE, parameter: 0x91, ..XmCell::EMPTY }]);
+        assert!(harness.channels.foreground(ChannelId(0)).is_some());
+        harness.channels.stop_all(&mut harness.voices);
+        let mut context = TickContext::new(Frame::ZERO, &mut harness.voices, &mut harness.channels, harness.row_clock, SongPosition::default(), 125);
+        harness.processor.clear_sound(starplayer_engine::ClearScope::All, &mut context);
+        let volume = harness.processor.channels[0].real_volume;
+        let _ = harness.tick(); let _ = harness.tick();
+        assert_eq!(harness.channels.foreground(ChannelId(0)), None);
+        assert_eq!(harness.processor.channels[0].real_volume, volume);
+        let _ = harness.row(&[XmCell { note: 52, instrument: 1, effect: 0xE, parameter: 0xD2, ..XmCell::EMPTY }]);
+        let mut context = TickContext::new(Frame::ZERO, &mut harness.voices, &mut harness.channels, harness.row_clock, SongPosition::default(), 125);
+        harness.processor.clear_sound(starplayer_engine::ClearScope::All, &mut context);
+        let _ = harness.tick(); assert_eq!(harness.channels.foreground(ChannelId(0)), None);
+        let _ = harness.tick(); assert!(harness.channels.foreground(ChannelId(0)).is_some());
+    }
 
     #[test]
     fn legacy_constructors_never_allocate_optional_slot_state() {

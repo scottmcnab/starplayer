@@ -109,6 +109,17 @@ impl PlaybackState {
     }
 
     pub const fn configuration(&self) -> PlaybackConfiguration { self.configuration }
+    /// A prepared replacement build keeps storage, but invalidates old command envelopes.
+    /// Explicit new sessions reset selections; same-session rebuilds replay them separately.
+    pub fn set_identity(&mut self, identity: PlaybackIdentity) {
+        #[cfg(feature = "note-overlap")]
+        if identity.session != self.configuration.identity.session {
+            self.let_notes_ring.fill(false);
+            self.note_overlap_enabled = false;
+        }
+        self.configuration.identity = identity;
+    }
+
     pub fn capacity(&self) -> usize { self.slots.len() }
     pub fn validate_identity(&self, identity: PlaybackIdentity) -> Result<(), PlaybackStateError> {
         if identity == self.configuration.identity { Ok(()) } else { Err(PlaybackStateError::StaleIdentity) }
@@ -147,6 +158,22 @@ impl PlaybackState {
 
     pub fn iter<'state>(&'state self, voices: &'state VoicePool) -> impl Iterator<Item = &'state VoiceOwnership> {
         self.slots.iter().flatten().filter(|owned| voices.get(owned.voice).is_some())
+    }
+
+    /// Replay a complete prebuilt session shadow before input is accepted in a new build.
+    #[cfg(feature = "note-overlap")]
+    pub fn restore_selections(&mut self, identity: PlaybackIdentity, enabled: bool, selections: &[bool]) -> Result<(), PlaybackStateError> {
+        self.validate_identity(identity)?;
+        if selections.len() != self.let_notes_ring.len() { return Err(PlaybackStateError::InvalidInstrument); }
+        self.let_notes_ring.copy_from_slice(selections);
+        self.note_overlap_enabled = enabled;
+        Ok(())
+    }
+
+    /// Copy one generation-checked record for a linear, allocation-free mutation walk.
+    pub fn slot(&self, index: usize, voices: &VoicePool) -> Option<VoiceOwnership> {
+        let owned = self.slots.get(index).copied().flatten()?;
+        self.get(owned.voice, voices).copied()
     }
 
     /// Native note-off/fade remains Background and retains identity. Retirement is only

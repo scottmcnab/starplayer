@@ -369,12 +369,40 @@ impl NativeSequencer {
     /// One pass of the song in frames, when a timeline says how long that is.
     pub fn song_length_frames(&self) -> Option<u64> { forward!(self, (), |sequencer| sequencer.song_length_frames()) }
 
+    #[cfg(feature = "interactive-audition")]
+    pub fn sync_cadence(&self, control: &mut starplayer_engine::ControlClock) { forward!(self, (control), |sequencer| sequencer.sync_cadence(control)) }
+
+    #[cfg(feature = "interactive-audition")]
+    pub fn restore_cursor(&mut self, cursor: starplayer_core::SequencerCursor, frame: Frame) -> bool { forward_mut!(self, (cursor, frame), |sequencer| sequencer.restore_cursor(cursor, frame)) }
+
+    pub fn can_seek_order(&self, order: u16) -> bool { forward!(self, (order), |sequencer| sequencer.can_seek_order(order)) }
+    pub fn can_seek_row(&self, row: u16) -> bool { forward!(self, (row), |sequencer| sequencer.can_seek_row(row)) }
+    pub fn can_seek_frame(&self, frame: u64) -> bool { forward!(self, (frame), |sequencer| sequencer.can_seek_frame(frame)) }
+    pub fn seek_row_at(&mut self, row: u16, frame: Frame) { forward_mut!(self, (row, frame), |sequencer| sequencer.seek_row_at(row, frame)) }
+
     /// Whether the song has been heard through once — its detected loop point, or the end
     /// of its order list (tasks D1 and D2).
     pub fn end_reached(&self) -> bool { forward!(self, (), |sequencer| sequencer.end_reached()) }
 }
 
 impl EventSource for NativeSequencer {
+    #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+    fn describe_interactive(&mut self, context: &mut EngineContext<'_>) { forward_mut!(self, (context), |sequencer| sequencer.describe_interactive(context)) }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, scope: starplayer_engine::ClearScope, context: &mut EngineContext<'_>) {
+        forward_mut!(self, (scope, context), |sequencer| sequencer.clear_scope(scope, context))
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame, control: &mut starplayer_engine::ControlClock) {
+        forward_mut!(self, (state, frame, control), |sequencer| sequencer.set_transport(state, frame, control))
+    }
+    #[cfg(feature = "interactive-audition")]
+    fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        forward_mut!(self, (frame, context), |sequencer| sequencer.dispatch_interactive(frame, context))
+    }
+
     fn next_event_frame(&self) -> Option<Frame> { forward!(self, (), |sequencer| sequencer.next_event_frame()) }
 
     fn advance_to(&mut self, frame: Frame) { forward_mut!(self, (frame), |sequencer| sequencer.advance_to(frame)) }

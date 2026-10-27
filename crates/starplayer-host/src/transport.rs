@@ -28,7 +28,7 @@ pub const DEFAULT_FADE_FRAMES: u32 = 10 * 48_000;
 ///
 /// Lives on the audio side and is stepped once per output frame. Nothing here allocates or
 /// branches on anything but its own state.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct Transport {
     gain: GainRamp,
     fade_frames: u32,
@@ -39,6 +39,7 @@ pub struct Transport {
     /// Whether that queued stop is the end of the song rather than a Stop the user asked
     /// for, and so must rewind to the top once it lands.
     pending_rewind: bool,
+    paused: bool,
 }
 
 impl Default for Transport {
@@ -60,8 +61,41 @@ impl Transport {
             fade_elapsed: 0,
             pending_stop: false,
             pending_rewind: false,
+            paused: false,
         }
     }
+
+    /// Renderer rebuilds preserve gain/fade/rewind state, converting durations to the
+    /// negotiated output rate. A same-rate rebuild preserves the ramp arithmetic exactly.
+    pub fn converted(mut self, old_rate: u32, new_rate: u32) -> Self {
+        if old_rate == new_rate { return self; }
+        let convert = |frames: u32| (frames as u64 * new_rate as u64 / old_rate.max(1) as u64).min(u32::MAX as u64) as u32;
+        self.fade_frames = convert(self.fade_frames);
+        self.fade_elapsed = convert(self.fade_elapsed);
+        let remaining = convert(self.gain.frames_remaining());
+        let target = self.gain.target();
+        self.gain = GainRamp::steady(self.gain.current());
+        self.gain.glide_to(target, remaining);
+        self
+    }
+
+    /// Pause holds the exact fade/ramp gain; Resume does not consume the restart flag.
+    pub fn pause(&mut self, paused: bool) { self.paused = paused; }
+
+    /// Clear-and-hold leaves live audio usable. Natural end arms a future rewind;
+    /// an explicit user Stop cancels it. Recovery to unity is bounded to 64 frames.
+    pub fn interactive_stop(&mut self, rewind: bool) {
+        let current = self.faded_gain(self.gain.current());
+        self.paused = false;
+        self.fading = false;
+        self.fade_elapsed = 0;
+        self.pending_stop = false;
+        self.pending_rewind = rewind;
+        self.gain = GainRamp::steady(current);
+        self.gain.glide_to(TRANSPORT_GAIN_UNITY, TRANSPORT_RAMP_FRAMES);
+    }
+
+    pub fn take_armed_rewind(&mut self) -> bool { core::mem::take(&mut self.pending_rewind) }
 
     /// Glide up to unity. A Play during a fade or after the song ended is "again", not
     /// "louder", so the caller clears the fade first — [`Transport::take_restart`] says
@@ -129,6 +163,7 @@ impl Transport {
     /// One frame's gain, in units of [`TRANSPORT_GAIN_UNITY`], advancing both the ramp and
     /// the fade.
     pub fn advance(&mut self) -> i32 {
+        if self.paused { return self.faded_gain(self.gain.current()); }
         let ramped = self.gain.advance();
         let gain = self.faded_gain(ramped);
         if self.fading {
@@ -148,10 +183,10 @@ impl Transport {
     }
 
     /// Whether the fade has run its course, so the caller should stop and rewind.
-    pub const fn fade_has_landed(&self) -> bool { self.fading && self.fade_elapsed >= self.fade_frames }
+    pub const fn fade_has_landed(&self) -> bool { !self.paused && self.fading && self.fade_elapsed >= self.fade_frames }
 
     /// Whether the queued engine stop is now due, because the ramp has finished.
-    pub fn stop_has_landed(&self) -> bool { self.pending_stop && !self.gain.is_ramping() }
+    pub fn stop_has_landed(&self) -> bool { !self.paused && self.pending_stop && !self.gain.is_ramping() }
 
     /// Consume the queued stop and report whether it also asked for a rewind.
     pub fn take_stop(&mut self) -> bool {

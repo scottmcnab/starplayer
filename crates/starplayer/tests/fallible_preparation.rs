@@ -141,6 +141,9 @@ fn prepared_articulation_preserves_canonical_pcm_at_every_host_block_size() {
             starplayer::NativeSequencer::new_with_articulation(Arc::clone(module), 8000, QuirkSelection::FromDialect, 339).unwrap()
         } else { starplayer::NativeSequencer::new(Arc::clone(module), 8000, QuirkSelection::FromDialect).unwrap() };
         engine.set_source(Box::new(source));
+        if prepared {
+            control.send(starplayer::core::Command::Interactive(starplayer::core::InteractiveCommand { identity: Default::default(), action: starplayer::core::InteractiveAction::Play })).ok().unwrap();
+        }
         let mut output = vec![0; 32_000];
         for chunk in output.chunks_mut(block * 2) { engine.render(chunk); }
         output
