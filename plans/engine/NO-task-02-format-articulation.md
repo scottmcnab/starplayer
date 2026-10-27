@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
+| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
 | Depends on | NO-01 |
 | Blocks | NO-03, NO-05, NO-06 |
 | Parallel with | None during shared engine/format runtime edits |
@@ -80,7 +80,7 @@ owned until completion but cannot receive effects or further articulation update
 ## Verification
 
 - Existing XM/IT tests and pinned conformance results must not regress; compare trace
-  and PCM before/after extraction with all policies Original.
+  and PCM before/after extraction with all instrument checkboxes unchecked.
 - `cargo test -p starplayer-xm`, `cargo test -p starplayer-it`,
   `cargo test -p starplayer-engine`, `cargo xtask goldens --check`.
 - Test capacities above 256, slot reuse/generation, envelope carry/sustain/release,

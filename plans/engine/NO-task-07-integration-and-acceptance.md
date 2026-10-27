@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
+| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
 | Depends on | NO-W1 and NO-01–06 |
 | Blocks | Feature landing and owner listening acceptance |
 | Parallel with | None; integration verification uses final combined tree |
@@ -26,9 +26,12 @@ listening and embedded execution cannot be inferred from a successful root build
 
 ## Deliverables
 
-- Add end-to-end deterministic fixtures spanning all formats, overlap policies, transport
+- Add end-to-end deterministic fixtures spanning all formats, instrument checkbox/global states, transport
   and timed audition. Include non-looping/mixed-loop XM/IT and native IT backgrounds.
-- Exercise default/original/bypass and feature-off canonical equivalence. Matrix neither,
+- Exercise unchecked/global-bypass and feature-off canonical equivalence. Include equal
+  note/equal-volume replacement, different-volume echo overlap, equal-volume echo limitation,
+  velocity variation, onset volume commands/delays, later effects not changing identity
+  and instrument independence across channels. No channel policy UI/API remains. Matrix neither,
   each feature alone, both; telemetry on/off and relevant fixed/float configurations.
 - Verify paused/stopped clocks, wide-channel routing, pool caps and IT slot bounds, stale
   generation commands, rebuild lifecycle and same-channel duplicate semantics.
@@ -59,6 +62,14 @@ negotiation and paused telemetry in integrated tests. Produce browser fixtures a
 renders and perform available automated/smoke checks. The listening matrix is an owner
 acceptance checklist, not a worker completion gate; report owner/device evidence pending
 honestly. No worker is asked to fabricate subjective listening acceptance.
+
+Run all five formats with identity recording active in three from-start canonical pairs:
+global enabled/all unchecked; bypassed/all checked; enabled/only wholly looping or otherwise
+ineligible instruments checked (including authored IT NNA). Compare to feature-off. Add
+mid-song enable-after-unchecked/bypass and scoped live/song bypass cleanup separately;
+these do not promise retrospective canonical voice history. Include onset fine slides,
+tremolo/tremor exclusion and live pre-CC7 velocity identity in the integrated fixtures.
+
 
 ## Research points
 

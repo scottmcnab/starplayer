@@ -1814,9 +1814,20 @@ per-sample cost; the measurement that would show it is the budget document's §3
 ## Planned: optional note overlap and interactive transport
 
 The [NO master plan](../engine/NO-master-plan.md) proposes explicit, session-only
-playback overrides and faithful instrument audition for all five formats. This is
-**planned, not implemented**. External review and corrections are complete; focused
-re-review evidence is recorded in the NO review log.
+instrument-only note overlap and faithful instrument audition for all five formats. This
+is **planned, not implemented**. The instrument-only checkbox/onset-volume design has completed
+external review and corrections (see the NO review log); changes remain uncommitted for
+owner review, with no implementation authorization.
+Each instrument has a Let notes ring boolean, with a separate Enable note overlap global
+bypass preserving selections. There are no channel overrides, inheritance or custom modes.
+Enabled eligible voices continue except when instrument, original note, exact onset base
+volume and originating channel all match; later effects do not change this identity.
+Capture every new voice passively, even while unchecked/bypassed, after onset-tick base
+volume setters/fine slides but excluding tremolo/tremor and separate gains. Live matching
+uses event-velocity-derived base volume before CC7; explicit note-off still releases
+detached held voices. Custom live tails stay in L and carry custom-detachment provenance
+so global bypass clears them without clearing native-created backgrounds.
+Unchecked/bypassed/ineligible voices retain native behavior, including authored IT NNAs.
 Canonical MOD/S3M/MTM/XM still never create background voices today; the proposed
 opt-in exception must not change that default or native IT behavior.
 
@@ -1829,6 +1840,6 @@ and faithful mapped-instrument live playback require new implementation, not mer
 Optional `note-overlap` and `interactive-audition` features remain off in reusable-crate
 defaults and embedded builds, enabled explicitly by the web host. They preserve no_std,
 fixed 128-frame DSP quanta, exact event splitting, allocation-free rendering and
-block-size-independent output. See the master for policy precedence, loop exclusion,
+block-size-independent output. See the master for onset-volume matching, global bypass, loop exclusion,
 capacity budgets and native IT isolation; implementation must reconcile the relevant
 architecture sections as each deliverable lands.

@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
+| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
 | Depends on | NO-02 |
 | Blocks | NO-06, NO-W1 |
 | Parallel with | NO-04 only in isolated worktrees; serialize shared engine integration |

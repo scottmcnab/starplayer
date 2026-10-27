@@ -2,13 +2,13 @@
 
 | Field | Value |
 |---|---|
-| Status | Reviewed and corrected; ready for coordinator handoff; implementation NOT started or authorised by this document |
+| Status | Instrument-only/onset-volume revision reviewed; staged and uncommitted; implementation NOT started or authorised by this document |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
-| Goal | Optional per-instrument/per-channel note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
+| Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
 | Coordinator | `gpt-6.1-sol`, reasoning `xhigh` |
 | Workers | `gpt-6.1-sol` for bounded tasks; `gpt-6-astra` for clock/articulation/NNA work; see task headers |
-| External review | Claude CLI `claude-opus-5-5`, invoked with `--effort high`; master/task review and focused follow-ups complete; final conditional approval satisfied; see review log |
+| External review | Claude CLI `claude-opus-5-5`, invoked with `--effort high`; instrument-only/onset-volume revision reviewed with corrections and final verdict: no further amendments required; see review log |
 | Related | M4 live input, M5 XM, M6 IT, M10-K5 sample enhancement, M11 instrument library |
 
 ## Context for a fresh coordinator
@@ -20,7 +20,8 @@ The original checkout contains unrelated untracked files; never stage them.
 
 The owner wants to hear truncated sample decays and optionally allow them to finish.
 A snare should survive the next kick on its channel; piano C then G should overlap,
-with an optional rule that another C cuts earlier C voices on that channel. Defaults
+with another C at the same onset volume replacing earlier matching C voices on that
+channel; quieter repeats may overlap as echoes. Defaults
 must preserve canonical output. This cannot reconstruct audio absent from the sample.
 
 Verified starting points (2026-10-27, base `267c559`):
@@ -69,29 +70,86 @@ one-shots can finish before resume. Do not represent Pause as natural song compl
 Keep legacy `Command::Stop` behavior for unmodified hosts; add explicit interactive
 transport commands so the web Stop can select the new clear-and-hold behavior.
 
-### Overlap policies
+### Instrument-only note overlap
 
-Store overrides outside immutable Module data; session-only, reset on different module,
-retained across pause, seek and renderer/DSP/sample-enhancement rebuilds of the same load.
-Use separate user-session identity and engine-build generation as specified below to reject stale commands, including explicit reloads of the same bytes.
+Store one `let_notes_ring` boolean per instrument outside immutable Module data, plus
+one global `note_overlap_enabled` boolean. Both default false. Settings are session-only,
+reset on explicit new load, and retained across pause, seek and same-session renderer/
+DSP/sample-enhancement rebuilds. Use separate session identity and engine-build generation
+to reject stale commands, including explicit reloads of the same bytes.
 
-Instrument: Follow channel (default), Original, Cut, Overlap, Overlap different notes.
-Channel: Original (default), Cut, Overlap, Overlap different notes.
-Explicit instrument policy wins. Original means native format behavior, including IT
-runtime NNA changes. It can exempt an instrument from a channel override.
+There is no NoteOverlapMode enum, channel setting, inheritance, explicit Cut mode or
+unrestricted Continue option. Unchecked instruments preserve native format behavior,
+including authored IT NNA/DCT/DCA and runtime NNA changes; unchecked does not force Cut.
+An instrument's checkbox applies everywhere it appears in the song. Channel identity
+remains part of duplicate matching, not a configurable override.
 
-The outgoing voice's instrument determines survival. The incoming instrument/note drives
-duplicate matching. Different-notes mode cuts all matching voices for that instrument
-and original trigger note in the same originating channel, not just its foreground.
-Notes on other channels remain independent; slides do not change trigger identity.
+When globally enabled, an eligible checked instrument lets outgoing notes finish, except
+that a new musical note replaces **all** earlier matching foreground/background voices
+with the same instrument, original trigger note, onset volume and originating channel.
+Different notes or different onset volumes overlap. Notes on other channels remain
+independent. The outgoing sounding instrument determines survival; the incoming identity
+selects duplicates. Use existing bounded cut/release ramps for replacement.
 
-For IT, custom policy replaces the affected voice's authored NNA/DCT/DCA behavior; do
-not run both. Native-policy voices retain native matching/action behavior. Evaluate
-policy per candidate during duplicate scans; custom Overlap has no native duplicate
-scan, Different-notes uses the explicit match, Cut has no background-duplicate action.
-Native foreground processing still applies to the outgoing voice when incoming and
-outgoing instruments differ. Tag detachment provenance separately from current policy
-so bypass can clear custom-created tails without deleting authored IT background voices.
+Finalize onset identity on the actual start tick (including delayed starts), after all
+of that channel’s processing for that tick, using its exact base, unmodulated note volume.
+Include defaults, volume setters and any fine/fast slides executed on that onset tick.
+MOD/MTM/S3M use `current_volume`, not `actual_volume`; IT uses `note_volume`; NO-05 must
+name and document the corresponding XM base field before implementing its capture seam. Do not compare current audible loudness
+or introduce rounding/tolerance buckets. Exclude tremolo/tremor, envelopes, later-tick slides, separate channel/global/master
+gains, random gain modulation and DSP. Live identity uses the resolved base note gain
+from event velocity and applicable note defaults **before CC7** or other separate gains,
+using the same format mapping as playback. Preserve raw event velocity alongside the
+current gain-scaled input where necessary; do not infer it by dividing the rendered gain.
+Existing format volume resolution may map different velocities to the same base volume;
+document/test these collisions, with no new identity-only quantization. NO-01 defines this identity field; format workers document and test the
+capture point without changing canonical effect ordering. Later effects never rewrite
+stored original note/onset volume. A volume change after a delayed note has actually
+started does not retroactively change its identity.
+
+Record identity passively for **every** actual new song/live note whenever note-overlap
+support is compiled and the host has configured its runtime capability, including notes
+started unchecked, globally bypassed or sample-ineligible and native IT backgrounds.
+The global enable switch is not a recording gate. Defaults/bypass still produce canonical
+PCM. Keep identity for the whole life of the generational voice — through key-off, fadeout,
+NNA note-off/fade and live key-up release — until its slot is freed or reused, independent
+of later toggles. Voices already retiring (bypass/Stop/eviction ramps) are not duplicate
+candidates.
+
+IT's native NNA/DCT seam precedes instrument defaults and onset volume effects. Keep
+native candidate processing at that seam. For custom candidates, preserve/detach the
+outgoing voice there without native duplicate action, then finalize incoming identity and
+run the custom replacement scan after that channel's onset-tick effects, before mixing
+any samples at that frame. Skip the new foreground by VoiceId/generation. Never match
+against the previous note's volume, replay effects, or reorder native candidates' actions.
+Resolve each onset synchronously at its event frame; delayed starts follow the same rule.
+NO-05 must test this sequence under capacity pressure as well as ordinary playback; an
+allocation fallback may not leave an unresolved incoming identity or run a duplicate scan
+against a reused slot. Retain the bounded allocation/retirement rules already specified.
+
+Examples: same-volume C→G→C replaces earlier C while G continues; repeated snare at the
+same note/volume replaces the earlier hit; quieter repeats of the same note can ring as
+echoes. This is a heuristic: equal-volume echoes are replaced, and differently pitched or
+velocity-varied drum/piano hits overlap. No automatic echo or physical-instrument detection.
+
+For IT, effective checked/eligible behavior substitutes this duplicate rule and continuing
+NNA for the affected candidate's authored NNA/DCT/DCA; do not run both scans on that voice.
+Unchecked, bypassed or ineligible candidates retain native matching/actions. Native
+foreground processing still applies to outgoing native voices when incoming/outgoing
+instruments differ. Keep native background-control commands. Track detachment provenance
+separately from the current checkbox so bypass clears only custom-created tails.
+
+For each IT candidate use the current global switch, its sounding instrument's current
+checkbox and its actual sample's loop eligibility. Incoming sample eligibility does not
+force native DCT on an otherwise eligible candidate. Ownership/provenance records are
+orthogonal to this decision: existing native backgrounds keep their native budget and
+survive bypass even if their instrument is now checked; custom-created tails keep their
+custom provenance when unchecked and become subject to native DCT/DCA on subsequent
+notes. Checkbox changes never retroactively migrate a voice between budgets. Song custom
+tails use C; live tails use L even when custom-detached, with a separate custom-detachment
+flag in the same authoritative ownership record. Bypass clears custom-detached voices
+in both domains, never native-created backgrounds or live foregrounds merely because
+an instrument is checked.
 
 Only new musical note starts (including actual delayed starts) detach. Portamento,
 effect retriggers, sample-only changes and queued swaps retain native semantics.
@@ -101,20 +159,29 @@ mute and inserts. Explicit tracker cuts target foreground; native IT background-
 commands retain their authored semantics. A pending MOD swap must not make a custom
 one-shot tail loop: detach the current non-looping region and discard its queued swap.
 
-Custom Overlap / Different-notes applies only to PCM with neither a normal loop nor a
-sustain loop. Ineligible voices use native behavior, NOT forced Cut. Cut/Original remain
-available for loops. IT's authored looping NNA remains intact. For mapped XM/IT instruments
-check the note's actual sample; show a mixed-loop badge rather than disabling all notes.
-User changes affect subsequent note events. Global overlap bypass clears custom-created
-tails immediately and restores native policy; enabling does not recreate lost tails.
+Let notes ring applies only to PCM with neither a normal loop nor a sustain loop.
+Ineligible voices retain native behavior, including authored IT looping NNA. For mapped
+XM/IT instruments check the actual sample; show a mixed-loop badge instead of disabling
+all notes. Checkbox edits affect subsequent note events.
+
+The global switch is labelled **Enable note overlap** and starts off. Off preserves all
+instrument selections but restores native behavior for subsequent notes and immediately requests ramped clearing
+of custom-created tails; authored IT backgrounds remain. On applies checked instruments
+without recreating lost tails. This switch affects overlap in song playback and live audition/jam, but never disables
+audition input/output, transport/Pause or other DSP settings. Bypass is a live comparison,
+not reconstruction of the voices that an uninterrupted native render would have retained.
 
 ### Audition and UI
 
-Instrument rows gain a Preview button, selection, Note overlap dropdown and loop status.
+Instrument rows gain a Preview button, selection, a **Let notes ring** checkbox and loop status.
 Use infinity with accessible text, and distinguish all-looping from mixed-map instruments.
 Disable Preview for empty/unmapped/non-PCM slots. Do not implement S3M FM synthesis here.
-Show why overlap is unavailable; use explicit labels, never a blank default.
-Channel rows gain Note overlap beside mute. A global enable switch starts disabled.
+Show why overlap is unavailable; disable the checkbox for entirely ineligible instruments,
+not mixed maps. No channel overlap controls. Keep checkboxes editable while the global
+switch is off so selections can be prepared. Checkbox help: “Let previous notes finish.
+An identical note played at the same starting volume on this instrument and channel
+replaces its earlier sound. Applies only to non-looping samples.” Explain that unchecked
+means native behavior and may still overlap in IT.
 
 Selecting an instrument sets an explicitly armed keyboard/MIDI target. Keep jam and
 selected-instrument destinations distinct; no duplicated input. Preview sounds over
@@ -131,6 +198,16 @@ use their native mapping at that note. No raw/DSP-bypass switch in v1. Keyboard/
 note-off invokes native release; simple samples use the existing click-safe release.
 For a looped XM/IT voice with no terminating release, Stop preview is always available;
 never claim every native note-off guarantees silence.
+
+Live note lifecycle is unchanged by the checkbox: key-up releases the corresponding
+held instance (foreground or detached) through native release, or the simple-sample ramp;
+sustain defers that release until pedal-up. Let notes ring prevents replacement by a new
+note, not explicit note-off. One-shot button Preview still runs to completion as specified
+above. Jam programs use their own instrument checkbox, not the selected-preview instrument.
+All live voices, including custom-detached tails, use L, not C. Stop preview clears its
+live audition scope; global bypass clears custom-detached live tails as well as song tails.
+Test C and G held together, key-up of detached C, pedal release, equal/different velocities,
+CC7 changes and bypass without shutting down audition or killing native live backgrounds.
 
 Allocate interactive live lanes at 64–80, beyond the maximum tracker width, with an
 explicit address mapping; never hardcode 48 as universally safe. Preserve hardware MIDI channel identity and tracker VoiceTag
@@ -357,12 +434,16 @@ No implementation starts until explicitly requested. Planning commits are not ev
 of external approval. First commit this master, index and planned foundation amendments;
 then commit executable task specs and the review handoff separately.
 
-External review is complete: an initial source-backed master/task pass, a source-backed
+External review of the prior multi-mode design is complete: an initial source-backed
+master/task pass, a source-backed
 follow-up, and a final focused consistency pass using the corrected documents. All used
 Claude CLI `claude-opus-5-5` with `--effort high`; no fallback model or implementation.
 The final pass's remaining wording condition has been applied, and findings/dispositions
 are preserved in the review log. Future material contract changes need focused review;
-planning approval does not authorize implementation. No automatic invocation is scheduled.
+the subsequent instrument-only/onset-volume revision has now completed its own source-backed
+review and focused follow-ups, ending with “No further amendments required.” Corrections
+and dispositions are in the review log. Planning approval does not authorize implementation.
+Changes remain staged and uncommitted for owner review; no automatic invocation is scheduled.
 Never include session URLs or attribution in commits/PRs.
 
 Implementation coordinator is gpt-6.1-sol (xhigh). It reads this master and task headers,
@@ -375,12 +456,19 @@ listening items clearly distinguished.
 ## Verification and acceptance
 
 Canonical goldens must remain byte-identical with runtime bypass and with features off.
-Run paired feature-on/original and feature-off output comparisons for all five formats.
+For all five formats compare canonical/feature-off PCM against three independently reset
+feature-on configurations with passive identity recording active: globally enabled with
+all instruments unchecked; globally bypassed with all checked; globally enabled with only
+wholly ineligible/looping instruments checked (including authored IT looping NNA).
+Do not confuse these from-start equivalence tests with mid-song bypass, which clears
+custom tails and cannot recreate an uninterrupted canonical voice history.
 Enabled behavior must be byte-identical at host block sizes 1, 3, 64, 128, 4096 and 8191
 for identical absolute-frame input/control schedules. Include mid-quantum stamped live
 events; host commands retain their existing quantum-boundary application contract.
 
-Cover snare→kick, C→G→C, cross-channel identity, mixed maps/loops, IT policies and runtime
+Cover snare→kick, same-volume C→G→C and snare repeats, different-volume echoes, onset
+volume commands/delays, later slides/envelopes/gain changes, cross-channel identity,
+mixed maps/loops, checked/unchecked IT candidates and runtime
 commands, XM envelope sustain/release/carry, pending MOD swaps, offsets, delayed notes,
 retrigger/portamento, resource exhaustion and stale generational handles. Test pause
 mid-tick across tempo models, fractional clocks, repeated toggles, stop/seek/rebuild,
@@ -407,7 +495,9 @@ format articulation subset needed for faithful loaded-module audition, not all o
 
 ## Task breakdown and landing order
 
-All files below have completed external review; implementation remains pending authorization. The coordinator is
+The instrument-only/onset-volume revision and all task amendments have completed external
+review. They remain staged and uncommitted for owner review; implementation remains
+pending authorization. The coordinator is
 `gpt-6.1-sol` (xhigh); worker floors and effort are explicit in each task header.
 
 | Task | Deliverable | Worker | Prerequisites |

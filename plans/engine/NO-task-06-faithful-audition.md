@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
+| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
 | Depends on | NO-03 and NO-05 |
 | Blocks | NO-W1 |
 | Parallel with | None in shared live-input/runtime code |
@@ -30,7 +30,11 @@ input is not sufficient for faithful XM/IT audition; no independent preview engi
   operations; keep format identity and avoid engine→format dependency cycles. The facade
   constructs format-specific instruments and passes existing engine abstractions.
 - Preserve mapping/tuning, envelopes, release/fadeout, auto-vibrato, IT filter/native NNA,
-  and selected custom policy. Velocity scales base note gain before envelope application
+  and the selected instrument’s checkbox when globally enabled. Duplicate identity includes
+  exact base onset gain resolved from event velocity before CC7/separate gains; different
+  onset gains overlap. Preserve event velocity before the rack’s current CC7 folding;
+  use existing format volume resolution and document/test mapping collisions.
+  Velocity scales base note gain before envelope application
   using existing live-input convention; do not invent broad controller features.
 - Use NO-01’s fixed interactive live lanes 64–80 for every module width (16 MIDI-identity
   lanes shared by jam/selected input, plus lane 80 for the Preview button). All live input,
@@ -82,6 +86,16 @@ release the oldest already-retiring live voice before retiring an active victim/
 the new note. Test every key press admits at its frame under saturation and immediately
 after Stop. The documented pressure fallback may truncate a ramp, never another domain.
 
+Live checkbox behavior prevents replacement by a later note, not explicit release.
+Key-up and pedal-up locate detached held instances as well as foregrounds and apply native
+release/simple-sample ramps. One-shot button preview remains completion-based. Jam uses
+each program's own checkbox. Custom live tails remain in L with custom-detachment flags;
+global bypass clears them without disabling input or clearing native-created live voices,
+and Stop preview clears the audition scope. Test held C→G, detached C key-up, sustain,
+same/different velocity, unchanged event velocity with CC7 changes, toggle after an
+unchecked/bypassed start and bypass with mixed native/custom live backgrounds.
+
+
 ## Research points
 
 - Land the decided rack-level mutable interface with both XM/IT implementations; no
@@ -93,7 +107,8 @@ after Stop. The documented pressure fallback may truncate a ramp, never another 
 
 ## Verification
 
-- Unit tests for keyboard-equivalent/MIDI note lifecycle, pedal, repeated notes, program
+- Unit tests for keyboard-equivalent/MIDI note lifecycle, pedal, repeated notes at equal
+  and different velocities, immutable onset identity, global bypass, program
   changes, held-loop release, mapped instruments, feature combinations and overflow.
 - Compare isolated live XM/IT articulation to equivalent controlled tracker note fixtures,
   with timing/velocity conventions made explicit; verify pitch and filter envelopes.

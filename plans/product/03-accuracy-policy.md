@@ -713,9 +713,19 @@ written down here is a defect, not a decision.
 
 The [NO master plan](../engine/NO-master-plan.md) defines an optional creative playback
 layer, not a new interpretation of canonical tracker effects. It is not implemented.
-Original/bypass and feature-disabled renders must retain existing golden output.
+Unchecked/global-bypassed and feature-disabled renders must retain existing golden output.
 Custom overlap preserves non-looping sample tails and may override IT NNA/duplicate
 actions explicitly; authored IT behavior remains the default, including looping NNA.
+The opt-in setting is one Let notes ring checkbox per instrument, not a channel override
+or mode selector. Replace earlier voices only on matching instrument, original note,
+captured onset base volume and originating channel; different-volume repeats may overlap
+as echoes. Onset-tick fine/fast slides are included; tremolo/tremor and later slides/envelopes/gain/DSP
+do not change the captured identity. Record identity even while unchecked/bypassed. Live
+identity is resolved before CC7, while explicit key-up/pedal-up retains native release.
+Global bypass restores native behavior for subsequent notes, not historical voice state. This is a
+heuristic: equal-volume echoes still replace, while velocity-varied repetitions can overlap.
+Global Enable note overlap bypass preserves selections and clears only custom tails with
+bounded ramps; it does not disable native IT backgrounds, audition, transport or DSP.
 This cannot restore missing recorded decay and can change balance or musical intent.
 
 Sequencer-only Pause deliberately allows sound state to evolve while musical position

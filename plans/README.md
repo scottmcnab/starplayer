@@ -47,7 +47,7 @@ the engine, the applications, the original DOS sources, and this plan set.
 
 ### Engine
 
-- **NO — Note overlap and audition:** [master plan](engine/NO-master-plan.md). Planning only; optional all-format overlap, sequencer Pause and web instrument audition. Claude master/task reviews deferred until after 2026-10-27 16:20 Australia/Perth.
+- **NO — Note overlap and audition:** [master plan](engine/NO-master-plan.md). Planning only; optional all-format overlap, sequencer Pause and web instrument audition. Instrument-only checkbox/onset-volume revision externally reviewed and corrected; staged/uncommitted for owner review. No implementation started.
 
 | Milestone | Status | Master plan | Notes |
 |---|---|---|---|

@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
+| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
 | Depends on | NO-02, NO-03 and NO-04 |
 | Blocks | NO-06, NO-W1 |
 | Parallel with | None during shared runtime/cleanup integration |
@@ -29,16 +29,23 @@ background-control effects. Extend each format at its real note lifecycle seam.
 - XM detaches eligible voices with their current format state; background articulation
   continues independently of foreground channel effects. Preserve carry, key-off,
   fadeout, auto-vibrato, panning and note maps for actual new notes and delayed starts.
-- IT explicit policy substitutes for native NNA/DCT/DCA for the affected candidate;
-  Original retains runtime NNA changes. Resolve outgoing survival separately from
-  incoming duplicate action. Do not apply native and override duplicate scans twice.
-- Mixed policies: apply candidate's effective mode to duplicate scan; Original candidates
-  use native matching/action, Continue skips native duplicate checks, Different-notes
-  cuts matching raw trigger identity, Cut does not scan background duplicates. Keep
-  native background control commands and native eligibility/stealing semantics.
-- Resolve eligibility per actual mapped sample, including sustain/normal loops. Ineligible
-  custom overlap falls back to native behavior, preserving IT looping NNA. Cut remains
-  an explicit option for loops. Sample-mode IT must also support eligible custom tails.
+- For IT, checked/eligible instruments under global enable substitute continuation and
+  the instrument/note/onset-volume/origin-channel duplicate rule for native NNA/DCT/DCA.
+  Unchecked/bypassed/ineligible candidates keep native actions and runtime NNA changes.
+  Resolve outgoing survival separately from incoming duplicate identity; never apply
+  native and custom duplicate scans twice to a candidate. Preserve native background
+  commands, eligibility and stealing semantics.
+- Check actual mapped sample loop eligibility. Ineligible notes keep native behavior,
+  including IT looping NNA; there is no custom Cut option. Support sample-mode IT too.
+- Finalize base onset volume after all channel processing on its actual start tick,
+  including fine slides. IT uses `note_volume`; name the XM base field in runtime docs.
+  Exclude tremolo/tremor/envelopes/random/separate gains. Keep native IT NNA/DCT at its
+  current early seam; preserve/detach custom candidates without native duplicate action,
+  then scan after onset effects and before mixing at that frame, skipping the new VoiceId.
+  Test IT same-row vxx and DxF, XM and IT volume-column fine slides, XM EAx/EBx on
+  the onset tick, XM EDx and IT SDx delayed notes carrying volume-column values, and
+  capacity pressure. Never scan with stale volume or re-run native effects.
+
 - Preserve original trigger note for duplicate identity even through transpose maps,
   pitch slides or different mapped sample selections. Tag custom-detachment provenance.
 - Update trace to expose detached voices without duplicate channel events; ensure
@@ -50,7 +57,8 @@ background-control effects. Extend each format at its real note lifecycle seam.
 Consume NO-02 concrete runtimes, NO-04 helper and NO-01 single ownership/provenance record.
 Own XM/IT note lifecycles, quota/victim filters and per-origin-channel background stepping.
 Exclude custom-provenance tails from native IT quota and victim selection; test a saturated
-256-native + 64-custom + 16-live active pool with retirement headroom with Original voices protected from other domains.
+256-native + 64-custom + 16-live active pool with retirement headroom; keep native-domain voices (all tracker foregrounds and native-created backgrounds,
+regardless of current checkbox) protected from other domains.
 Custom cap can reduce polyphony relative to authored NNA; test/document that consequence.
 
 Preserve foreground XM ordering. Step custom backgrounds after their origin channel's
@@ -61,9 +69,19 @@ native and custom ownership correctly without affecting unrelated live voices. T
 cover active native/custom backgrounds, retiring ramps, slot reuse and bypass provenance.
 
 Test retirement ownership independently of active quota and native victim eligibility;
-custom saturation admits notes using the bounded retired-slot fallback, while Original
-native IT allocation remains unchanged. Legacy seek/restart retains ownership for any
+custom saturation admits notes using the bounded retired-slot fallback, while native (unchecked)
+IT allocation remains unchanged. Legacy seek/restart retains ownership for any
 still-sounding custom tails rather than resetting their budget/age records.
+
+Candidate decisions use current global/checkbox state and the candidate's actual sample;
+provenance alone controls cleanup/budget, never whether its duplicate rule is native.
+Test native background→checkbox on→custom matching→bypass preserves that native-created
+background; custom tail→checkbox off→native DCT/DCA; looping incoming mapped note with
+DCT=Instrument leaves eligible one-shot tails of different notes alone. Capture identity
+for every new voice, including unchecked/bypassed/ineligible starts. Test subsequent
+repeat after enable. Include the three from-start canonical configurations in the master,
+with passive recording active and native IT looping NNA intact.
+
 
 ## Research points
 
@@ -77,11 +95,12 @@ still-sounding custom tails rather than resetting their budget/age records.
 
 - Full XM/IT unit tests, pinned conformance comparisons and golden check; no new native
   failure or regenerated golden accepted.
-- Cross product of Original/Cut/Continue/Different-notes with native IT NNA/DCT/DCA;
+- Cross product of checkbox checked/unchecked, global enabled/bypassed and loop eligibility
+  with native IT NNA/DCT/DCA;
   mixed incoming/outgoing instruments, runtime NNA effects and sample-mode IT.
 - XM envelope carry/sustain/key-off/fadeout, background auto-vibrato/filter, mixed maps,
   looping fallback, custom/native bypass cleanup and slots beyond 255.
-- Same-channel C→G→C versus cross-channel notes, bounded exhaustion and determinism at
+- Same-volume C→G→C and same-note echoes at different onset volumes versus cross-channel notes, bounded exhaustion and determinism at
   all six block sizes; allocation guard around actual note/control processing.
 
 ## Out of scope

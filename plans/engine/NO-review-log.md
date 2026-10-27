@@ -2,12 +2,35 @@
 
 | Field | Value |
 |---|---|
-| Status | Master/task review complete; corrections applied; final approval condition satisfied |
+| Status | Instrument-only/onset-volume revision reviewed and corrected; no further amendments required; staged/uncommitted |
 | Requested reviewer | Claude CLI `claude-opus-5-5`; `--effort high` supplied; returned modelUsage confirms exact model |
 | Earliest invocation | After 2026-10-27 16:20 Australia/Perth / 08:20 UTC, per owner |
 | Master planning commit | c3bead3 |
 | Task planning commit | 4755c94 |
 | Implementation | Not started; owner expressly requested planning only |
+
+## Subsequent owner-requested simplification (current revision)
+
+This revision supersedes the reviewed multi-mode/channel-override design below. Historical
+reports and verdicts remain verbatim evidence for that earlier version, not approval of
+these new semantics. A subsequent owner-requested Opus review of this revision is recorded below.
+The owner requested that these planning changes be staged, **not committed**, for review.
+
+- Replace NoteOverlapMode/inheritance/channel overrides with a Let notes ring boolean
+  per instrument; unchecked preserves native format behavior, including IT NNAs.
+- Replace duplicates only when instrument, original note, exact captured onset volume
+  and originating channel match. This permits quieter echo repeats and preserves
+  same-volume repeated-note replacement. Later volume slides/envelopes/gains do not
+  change identity. Format workers own capture-point tests, including delayed starts;
+  live input uses the existing velocity-scaled base onset gain.
+- Keep global Enable note overlap, default off, retaining checkbox selections while
+  bypassed. Bypass clears only custom tails with bounded ramps; native IT background
+  voices, audition, Pause and DSP remain independent.
+- Keep one-shot eligibility and mixed-loop indications. Remove custom Cut/unrestricted
+  Continue modes, channel controls, precedence tests and channel-setting commands/tables.
+- Update foundation/master/tasks and verification for echoes, velocity variation and
+  checkbox/bypass behavior. Transport, budgets, feature flags and worker assignments stay
+  as previously planned. Implementation remains unauthorized.
 
 ## Original deferred-review procedure (historical)
 
@@ -571,3 +594,190 @@ A worker following that bullet could implement either the dynamic base or a 16 +
 ## Verdict
 
 Once the NO-06 bullet 3 replacement above is applied, no blockers remain. At that point, the master and task plans are ready to hand to the implementation coordinator, pending owner authorization to implement. The task headers' "external task review pending" status and the review log should then be updated to record this disposition.
+
+
+## Instrument-only revision review, pass 1
+
+2026-10-27 14:13 UTC: Claude CLI `claude-opus-5-5`, `--effort high`; returned exact
+model confirmed, success. Read-only source-backed review; no nested agents or implementation.
+Accepted findings 1–6 with the following refinements:
+
+- Preserve native IT ordering; finalize custom duplicate matching at the onset frame after
+  channel effects, excluding the new foreground. Test capacity pressure and stale handles.
+- Passive identity recording is gated by configured host capability, never by the global
+  enable switch. It includes unchecked/ineligible starts and native IT backgrounds.
+- Retain the already planned live release contract: key-up/pedal-up reaches detached
+  voices. Let notes ring changes new-note replacement, not note-off. No new product
+  decision to ignore explicit releases is introduced. Live identity excludes CC7; existing
+  format resolution collisions are documented. Custom live tails stay in L, not C.
+- Apply mixed IT rules per candidate and separate current checkbox from creation provenance.
+- Expand canonical equivalence and toggle tests, and remove stale mode terminology.
+- Do not use the suggested MOD EDx+Cxx same-cell fixture: MOD has one effect column.
+  Instead test Cxx and EAx onset rows separately, EDx inheriting a prior Cxx without a
+  sample-default reset, and delayed XM/IT starts with a volume-column value.
+
+Follow-up review pending; changes remain uncommitted as requested.
+
+### Reviewer report (verbatim)
+
+I found no blocking contradictions. The simplified design holds together. The removal of channel UI/API state is clean, except for a few stale words, and the transport/budget architecture is untouched. Six amendments are recommended before handoff: three medium, two low and one set of wording nits. I checked them against the source with read-only tools, wrote no files and started no agents.
+
+### 1. Medium: the onset-volume capture point can't be implemented as written for IT, and it's ambiguous elsewhere
+**Where:** master "Instrument-only note overlap", the "Capture onset volume once…" paragraph; NO-01 trigger-identity deliverable; NO-04 and NO-05 capture bullets.
+
+**The problem:**
+- **IT:** the duplicate check and New Note Action run in `check_new_note_action` (`crates/starplayer-it/src/processor.rs:1031`). That happens before the code that sets the new note's volume: `instrument_change` (1090) and `volume_column_set` (1051, 1634). So at the existing native seam, the incoming note's volume isn't known yet. A worker who adds the custom match there would compare against the channel's previous note volume, and same-row `vxx` would never be taken into account.
+- **MOD/S3M/MTM:** each channel keeps two volume values: a base value and a modulated one. S3M runs tremor on tick 0 (`crates/starplayer-s3m/src/processor.rs:358`, `:593`), so the modulated value (`actual_volume`) can be 0 at onset.
+- **Fine slides:** the plan says "volume-setting commands applicable at that onset". It doesn't say whether tick-0 fine slides count (MOD `EAx`, S3M fast slides, IT `DxF` or volume-column fine slides). Two workers could reasonably choose differently.
+
+**Fix:** define identity as the base, unmodulated note-volume field after all of that channel's processing on the onset tick. That is the value the new voice is first sent to the mixer with. Name the fields:
+- MOD/MTM/S3M: `current_volume`, not `actual_volume`.
+- IT: `note_volume`. Its random volume swing is kept separately in `volume_swing`, so it is already excluded.
+- XM: the matching base field, which the worker names.
+
+Add tremolo and tremor to the exclusion list. For IT, run the custom replacement scan for checked, eligible candidates after `trigger_channel` and that channel's tick-0 effects, in the same tick and at the same frame. Native NNA/DCT for native candidates stays at its current seam, and the scan must skip the new foreground voice. Add tests for: IT `vxx` on the note row, S3M tremor on tick 0, MOD `EAx` on tick 0, and a MOD `EDx` delayed note with `Cxx` set on tick 0.
+
+### 2. Medium: identity must be recorded whatever the checkbox or global state
+**Where:** master capture paragraph; NO-01 identity deliverable.
+
+**The problem:** nothing says identity is recorded for voices started while their instrument is unchecked, bypassed or ineligible. That includes native IT backgrounds. If identity is only recorded for checked instruments, then: play C while unchecked, tick the box, play the same C at the same volume — the old C becomes a tail instead of being replaced.
+
+**Fix:** record identity passively for every new note start whenever `note-overlap` is compiled and enabled at runtime. Recording must never change canonical output. Add that toggle sequence as a test in NO-01/04/05.
+
+### 3. Medium: live-input overlap behaviour isn't defined
+**Where:** master "Audition and UI"; NO-06 deliverables and Verification.
+
+**The problem:**
+- **Mono lanes:** the current rack plays one note per MIDI lane ("A channel sounds its newest note", `crates/starplayer-engine/src/instrument.rs:799`). So a ticked box means a new key detaches the previous note.
+- **Key-up:** the plan doesn't say whether key-up or pedal release reaches a custom live tail. The master's "Live note-offs must locate held note instances even after NNA detachment" suggests it should. But then simple samples get the click-safe release when the key lifts, so "let notes ring" would mostly not work from the keyboard.
+- **Velocity identity:** the rack folds the MIDI channel volume (CC7) into velocity (`instrument.rs:769`), then multiplies in instrument and sample volume (`:311`). "After the existing velocity mapping" doesn't pick one of these values. CC7 behaves like a channel gain, which the plan excludes elsewhere.
+- **Bypass wording:** "this switch controls only note overlap, not audition" can be read as bypass not affecting live overlap at all.
+
+**Fix (owner decision on key-up):**
+- State whether key-up releases custom live tails or lets them ring to completion.
+- Pin velocity identity to the event velocity before CC7 (or state explicitly that it is after CC7).
+- State that live custom tails count toward the live budget L, not C; that global bypass and Stop preview clear them; and that jam-mode programs use their own instrument's checkbox.
+- If NO-06 maps velocity into XM/IT note volume, the identity is the value actually applied, and any collisions from the format's existing volume resolution are documented. The worker can handle that detail.
+
+### 4. Low: say exactly how mixed IT cases are decided
+**Where:** master IT paragraph; NO-05 IT bullets.
+
+**The problem:** native duplicate checks always require the same instrument (`processor.rs:1525–1527`). So a candidate voice's checkbox is always the incoming note's checkbox. Only sample eligibility and provenance (custom- vs native-created) can differ, and neither is spelled out.
+
+**Fix:** state that each candidate is judged by the current global switch, its sounding instrument's current checkbox, and its actual sample's eligibility. Provenance only decides what bypass clears and which budget the voice counts toward. Test three cases:
+- A native background of an instrument that has since been ticked follows only the custom identity rule while enabled, and survives bypass.
+- Custom tails of an instrument that has since been unticked get native DCT/DCA.
+- In a mixed map, a looping incoming note with DCT=Instrument does not cut eligible one-shot tails of other notes.
+
+### 5. Low: the canonical-equivalence matrix is incomplete
+**Where:** master "Verification and acceptance"; NO-04 Verification (only checks "all-unchecked"); NO-05 and NO-07.
+
+**Fix:** for all five formats, require byte-identical output to canonical in three configurations:
+1. Enabled with every instrument unchecked.
+2. Bypassed with every instrument checked.
+3. Enabled with only wholly ineligible (looping) instruments checked, including IT authored NNA.
+
+All three must run with identity recording active.
+
+### 6. Nit: leftover wording
+- NO-05 "Interfaces consumed": "Original voices protected" and "while Original native IT allocation" refer to a mode that no longer exists. Change them to "native (unchecked) voices".
+- NO-W1 Verification: "stale policies" should be "stale checkbox/global state".
+- Master global-switch paragraph: say Off "restores native behavior for subsequent notes". This acknowledges that clearing tails from a checked instrument whose authored NNA is Continue removes tails native playback would have kept.
+- Review log: "No additional Claude review was requested or performed" becomes untrue once this review is recorded.
+
+### Safe to leave to workers
+The exact XM base field and trigger point, whether IT's lone-instrument-number retrigger (`processor.rs:1013–1026`) counts as a new musical note, ramp mechanics, and how velocity maps into XM/IT live note volume. Each is bounded by the fixes above.
+
+Once 1–5 are written into the master and tasks, I see nothing else stopping handoff.
+
+
+## Instrument-only revision review, focused follow-up
+
+2026-10-27 14:17 UTC: Recorded focused follow-up and final confirmation. Both used
+Claude CLI `claude-opus-5-5` with `--effort high`, returned success and confirmed that exact
+model. These passes had no tools; they checked amended documents against the first pass’s
+source-backed findings, rather than repeating source inspection.
+
+Accepted all three follow-up amendments: identity survives key-off/fadeout until physical
+slot release/reuse and retiring voices are excluded from matching; XM onset/fine-slide/
+delayed-volume fixtures are explicit; native-domain protection is independent of checkbox
+state. Adapted the reviewer’s quota wording to protect **all** tracker foregrounds, not
+only unchecked ones, consistent with N. Final review explicitly confirmed this correction.
+Applied its optional readability suggestion (replace repeated “with” by “; keep”) without
+changing semantics. Updated statuses/index after the final verdict.
+
+Final verdict: **No further amendments required.** All accepted findings are incorporated;
+the sole rejected test shape (MOD EDx+Cxx in one cell) has valid substitute fixtures and
+was accepted in follow-up. No implementation or builds/playback/device tests performed.
+Documentation link/section checks and whitespace checks pass. Restage exactly the planning
+files; retain the owner’s explicit no-commit instruction.
+
+### Focused follow-up report (verbatim)
+
+**Three small amendments are still required: two content fixes and one wording fix.** Findings 1–6 are otherwise resolved, and the fixes contain no concrete contradiction beyond the items below. The XM/IT delayed-start volume-column fixtures you substituted for my MOD EDx+Cxx test are covered once amendment B is applied.
+
+## Status of findings 1–6
+
+| # | Status | Notes |
+|---|---|---|
+| 1 Onset capture | Resolved, apart from the XM wording in B | Fields are named. Fine/fast slides on the onset tick are included; tremolo/tremor is excluded. The IT split seam, skipping the new VoiceId and the capacity-pressure rule are all present. The NO-04 tests are correct, and the MOD one-effect-column note is right. |
+| 2 Passive recording | Resolved, apart from identity lifetime (A) | Recording is not gated by the global switch, and the toggle-then-repeat test appears in NO-01, NO-04 and NO-05. |
+| 3 Live behaviour | Resolved | Key-up and pedal-up keep native release, including for detached held instances. Velocity identity is taken before CC7. Live custom tails count toward L and carry a flag. Bypass and Stop preview scopes, jam per-program checkboxes and volume-resolution collisions are all stated consistently in the master, NO-01, NO-06, W1 and both foundation documents. |
+| 4 Mixed IT decisions | Resolved | The rule for deciding each candidate, provenance being separate from that decision, and the three tests appear in the master and NO-05. |
+| 5 Equivalence matrix | Resolved | All three from-start configurations run with recording active in the master, NO-04, NO-05 and NO-07. They are kept separate from mid-song bypass. |
+| 6 Wording | Resolved, except one wording I suggested (C) | The review-log text wasn't included in this pass, so I couldn't check that item. See bookkeeping. |
+
+## Required amendments
+
+### A. Identity lifetime contradicts matching released backgrounds (medium)
+
+The master says "Keep identity until the generational voice is released". Several voices that must stay matchable are "released" in the ordinary sense:
+- IT backgrounds with authored NNA Note Off or Note Fade. These must follow the custom identity rule once their instrument is ticked, which is one of the finding 4 tests.
+- XM voices fading out after key-off.
+- Live voices after key-up.
+
+A worker could drop identity at key-off, and that test would then be impossible to pass.
+
+**Master**, replace that sentence with:
+> Keep identity for the whole life of the generational voice — through key-off, fadeout, NNA note-off/fade and live key-up release — until its slot is freed or reused, independent of later toggles. Voices already retiring (bypass/Stop/eviction ramps) are not duplicate candidates.
+
+**NO-01**, append to the "Define immutable trigger identity" deliverable:
+> Identity persists through key-off/fadeout/NNA release until the slot is freed or reused; retiring voices are excluded from duplicate scans.
+
+### B. The NO-05 onset tests read as IT-only (low)
+
+NO-05 currently says "Test IT same-row vxx, DxF/volume-column fine slides, delayed notes with volume-column values, and capacity pressure." Read literally, this leaves out the XM fixtures the coordinator chose.
+
+**Replace with:**
+> Test IT same-row vxx and DxF, XM and IT volume-column fine slides, XM EAx/EBx on the onset tick, XM EDx and IT SDx delayed notes carrying volume-column values, and capacity pressure.
+
+### C. The NO-05 quota wording I suggested now conflicts with provenance (low)
+
+In finding 6, I suggested "native (unchecked) voices". Under the provenance paragraph, native-created backgrounds of an instrument that has since been ticked are still in N and still protected. "Unchecked" therefore under-specifies which voices are protected.
+
+**NO-05**, in "with native (unchecked) voices protected from other domains", replace with:
+> with native-domain voices (unchecked foregrounds and all native-created backgrounds, whatever their current checkbox) protected from other domains
+
+The second occurrence ("native (unchecked) IT allocation remains unchanged") is accurate and can stay.
+
+## Bookkeeping (not content)
+
+When you record this pass's disposition in the review log, update the "pending review" / "not externally re-reviewed" wording in these places:
+- the master header row,
+- the master "Delivery and review workflow" and "Task breakdown" paragraphs,
+- the task Status rows,
+- the foundation 01 sentence.
+
+Also make sure the log no longer says that no further Claude review was performed.
+
+Once A–C are applied: **no further amendments required**.
+
+### Final confirmation (verbatim)
+
+**No further amendments required.**
+
+- **A: incorporated.** The master text is my replacement, verbatim. The NO-01 deliverable now carries the persistence and retiring-exclusion sentence. Neither contradicts the passive-recording paragraph or the IT seam paragraph.
+- **B: incorporated verbatim.** The NO-05 test sentence now covers both the XM and IT fixtures.
+- **C: incorporated, and correctly adapted.** My suggested "unchecked foregrounds" would have under-specified the protected set, because the master places every tracker foreground in N. Your text, "all tracker foregrounds and native-created backgrounds, regardless of current checkbox", is the right correction. It also agrees with excluding custom-provenance tails from the native quota in the preceding sentence. The surviving "native (unchecked) IT allocation remains unchanged" describes behaviour, not domain membership, so it doesn't conflict.
+
+One optional readability nit, not required: the C sentence reads "pool with retirement headroom with native-domain voices…". Changing the second "with" to ", and" or "; keep" would avoid misparsing which noun the headroom applies to.

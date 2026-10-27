@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](../engine/NO-master-plan.md) |
-| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
+| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
 | Depends on | NO-06 (and all its dependencies) |
 | Blocks | NO-07 |
 | Parallel with | None touching shared web transport/command state |
@@ -29,18 +29,20 @@ Do not build a site with external hosting tools; this is the existing repository
 - Add Play / pause-icon Pause / Stop in order, pressed/accessibility state, Resume action
   and explicit transport status. Stop invokes clear-and-hold, not rewind. Map media Pause
   to sequencer pause and Stop to clear-and-hold; preserve playlist end detection.
-- Instruments: Preview, select, Note overlap dropdown (Follow channel/Original/Cut/
-  Overlap/Overlap different notes), accessible loop or mixed-loop badges and tooltips.
-  Disable unavailable PCM/maps and all-loop overlap, not mixed instruments wholesale.
-- Channels: Original/Cut/Overlap/Overlap different notes beside mute. Instrument explicit
-  setting wins. Global enable starts off, preserves selections while bypassed and shows
-  how Original can exempt an instrument. Add Stop preview and global all-sound-off.
+- Instruments: Preview, select, **Let notes ring** checkbox and accessible loop/mixed-map
+  badges. Disable overlap for wholly ineligible instruments, not mixed maps. No dropdown,
+  channel controls, inheritance or custom Cut/Continue options. Unchecked means native
+  behavior, including authored IT NNA. Use master-plan help for onset-volume matching.
+- Global **Enable note overlap** starts off; remember checkbox selections and permit edits
+  while bypassed. Off ramp-clears only custom tails and restores native behavior, without
+  disabling audition, Pause or DSP; custom live tails are cleared too. Add Stop preview and global all-sound-off separately.
+
 - Expose selected-instrument keyboard/MIDI destination separately from existing jam mode;
   preserve focus/text-entry rules. Never duplicate events. Handle pointer cancel, key-up,
   window blur, input disconnect and module changes. Show reference note and routing help.
 - Add capability/loop metadata and bounded command opcodes/acks to host/WASM/worklet/ring
   and postMessage paths. Keep existing opcode numbers, reject stale module generations,
-  validate IDs/enums before RT dispatch. Apply message-task preparation before note events.
+  validate IDs/booleans and transport enums before RT dispatch. Apply message-task preparation before note events.
 - Reapply session overrides after same-load renderer/sample-enhancement rebuilds and keep
   transport state; reset on new load. New load generation rejects delayed prior replies.
 - Reuse current master processing and prepared PCM. Explain that audition has no automatic
@@ -85,12 +87,13 @@ and prove destination changes do not rebuild the tracker source or clear song ta
 ## Verification
 
 - Run existing web JS/unit tests and host-wasm Rust tests, plus `cargo xtask wasm`.
-- Automated controls/bridge tests for precedence, loop/mixed metadata, generations,
+- Automated controls/bridge tests for instrument checkbox/global enable, no channel controls,
+  native IT defaults, remembered bypass selections, loop/mixed metadata, generations,
   state rebuild/reset, input cleanup, shared-ring and fallback ordering.
 - Browser smoke: audition over song and paused/stopped, keyboard/MIDI selected target,
   rapid pause/resume, Stop holding position, channel mute/tails and instant bypass.
 - Playlist/media controls never interpret Pause as track end; repeated loads/rebuilds
-  leave no stuck keys or stale policies. Verify keyboard navigation/screen-reader labels.
+  leave no stuck keys or stale checkbox/global state. Verify keyboard navigation/screen-reader labels.
 - Report manual MIDI/hardware checks honestly when no device is available.
 
 ## Out of scope

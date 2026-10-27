@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
+| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
 | Depends on | Reviewed master; implementation explicitly requested |
 | Blocks | NO-02, NO-04 |
 | Parallel with | None; shared API foundation |
@@ -27,13 +27,22 @@ clear-and-hold semantics; this task defines it, NO-03 implements it.
 
 ## Deliverables
 
-- Define concrete `NoteOverlapMode` (Original/Cut/Continue/ContinueDifferentNotes),
-  instrument override (Inherit or explicit mode), capability bits and interactive
-  transport state/commands. Internal Continue maps to UI Overlap. Separate enabled
-  runtime state from persisted session selections. Use existing IDs, validated at boundary.
-- Preallocate policy tables only with note-overlap; compile generational ownership/age
-  metadata with either optional feature and gate custom policy fields separately. Expose bounded setters, all-original defaults and module-generation
-  invalidation; no Module/image schema changes and no serialized preset format.
+- Define per-instrument `let_notes_ring` and global `note_overlap_enabled` booleans,
+  both default false, capability bits and interactive transport state/commands. No mode
+  enum, channel settings, inheritance, explicit Cut or unrestricted Continue. Keep global
+  enable separate from remembered session selections; use validated existing IDs.
+- Define immutable trigger identity: instrument, original note, originating channel and
+  exact unmodulated base volume after all channel processing on the actual onset tick,
+  including applicable fine/fast slides, before tremolo/tremor/envelopes or separate gains.
+  Live input uses resolved event-velocity base volume before CC7; preserve raw velocity
+  separately from gain-scaled input and document existing format-resolution collisions.
+  Later volume/pitch effects cannot mutate identity; no new quantization or tolerance.
+  Identity persists through key-off/fadeout/NNA release until the slot is freed or reused;
+  retiring voices are excluded from duplicate scans.
+- Preallocate instrument boolean tables only with note-overlap; compile ownership/age
+  metadata with either optional feature. Expose bounded boolean setters with session/build
+  generation validation, no channel-setting commands/tables or Module/schema changes.
+
 - Add independently selectable feature forwarding through engine, facade, formats and
   host. Web defaults enable both; core defaults and embedded dependency graph enable
   neither. Gate optional state, reservations and dispatch, not native IT functionality.
@@ -78,6 +87,15 @@ add interactive constants/layout constructors and explicit web settings. Own dec
 engine.rs insert bus_count from table length (maximum 64); test a 4-channel module and
 64-channel module both route live lanes 64–80 through spill with no tracker inserts.
 
+Record immutable identity for every new voice when the host configures note-overlap
+capability, regardless of instrument checkbox, global bypass or sample eligibility. No
+canonical PCM change and no allocation on toggles. Provide a separate custom-detachment
+flag alongside ownership domain, so custom live tails remain in L while song custom tails
+use C, and bypass can clear both without clearing native-created backgrounds. Test a
+note begun unchecked/bypassed, enabling its checkbox/global switch, then identical-note
+replacement; the global switch must never gate identity capture.
+
+
 ## Research points
 
 - Inspect every feature forwarding edge, including optional dependencies (`?/` forwarding)
@@ -89,7 +107,7 @@ engine.rs insert bus_count from table length (maximum 64); test a 4-channel modu
 
 ## Verification
 
-- Unit tests for policy precedence/default/reset, invalid IDs/generations, lane capacity
+- Unit tests for boolean defaults/reset, global bypass preserving selections, onset identity, invalid IDs/generations, lane capacity
   boundaries and independent feature combinations.
 - `cargo test -p starplayer-engine` and `cargo test -p starplayer`; feature-specific tests
   with neither, each individually, and both flags once declared.
