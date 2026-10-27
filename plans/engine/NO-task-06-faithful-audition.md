@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Planned; external task review pending; do not implement until requested |
+| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
 | Depends on | NO-03 and NO-05 |
 | Blocks | NO-W1 |
 | Parallel with | None in shared live-input/runtime code |
@@ -32,9 +32,11 @@ input is not sufficient for faithful XM/IT audition; no independent preview engi
 - Preserve mapping/tuning, envelopes, release/fadeout, auto-vibrato, IT filter/native NNA,
   and selected custom policy. Velocity scales base note gain before envelope application
   using existing live-input convention; do not invent broad controller features.
-- Allocate live lanes using NO-01 layout after module channels. Give preview input its
-  own ownership domain and 16-voice cap, separate from tracker/native tail reservations.
-  Oldest-preview stealing is deterministic; format states cover the actual pool slots.
+- Use NO-01’s fixed interactive live lanes 64–80 for every module width (16 MIDI-identity
+  lanes shared by jam/selected input, plus lane 80 for the Preview button). All live input,
+  including the Preview lane and live NNA tails, shares the single live domain L (web 16
+  active slots plus one retirement slot), separate from tracker/native and custom-tail
+  domains. Oldest-live stealing is deterministic; format states cover the actual pool slots.
 - Track live note instances for key-up/sustain and NNA backgrounds, with original input
   note and generation. Release held instances on program/destination changes; keep
   preview isolated from tracker duplicate scans even for matching instrument/note.
@@ -49,10 +51,41 @@ input is not sufficient for faithful XM/IT audition; no independent preview engi
 - Before first tracker tick use module initial articulation cadence; after Pause/Stop use
   retained cadence. Native loops without terminal release require explicit Stop preview.
 
+## Interfaces consumed/provided and source scope
+
+Own `engine/src/instrument.rs` rack integration and MIDI-source cadence consumption,
+XM/IT live runtime implementations, facade runtime factory, and host rack-builder calls
+in `player.rs` (currently `InstrumentRack::for_module` at load_smf/load_module/jam paths).
+Consume NO-02 concrete runtimes, NO-03 cadence/scoped clears and NO-01 ownership/layout.
+
+Implement one mutable pool-indexed runtime per rack for all its format programs, with
+separate live RNG; immutable program definitions hold sample/maps. Land a rack-level
+runtime interface together with both real XM/IT implementations, not a runtime for
+every program or RefCell mutation. Do not step format articulation on MidiSource's 1 ms
+clock. Test live/playing cadence equality, paused phase rejoin and no song RNG advance
+from audition. The 17 lanes share 16 live voice slots including jam and live NNA tails;
+all live exhaustion uses oldest-live eviction, not native tracker quota/victim selection.
+
+Own Stop-preview orchestration over NO-03 clear hooks. Register cleanup for Stop/global
+all-sound-off, destination/program/module changes and rebuild, including retiring ramps.
+Hardware CC120 remains lane-scoped. Interactive seek preserves audition. Test these scopes
+with native/custom song tails active, plus held-note generations during rebuild.
+
+Own installation of the permanent live MidiSource/rack in Player's interactive mux slot 1;
+consume NO-03 invariant and post-source cadence hook. All 17 fixed live lanes are available
+before first Play. Jam/selected/button changes use bounded routing commands, never source
+replacement/LoadModule. Implement exact-frame articulation via the hook rather than 1 ms
+MidiSource polling. Test first preview while paused, before Play and after natural end.
+
+Use 16 active live slots plus one retirement headroom slot. At domain physical exhaustion,
+release the oldest already-retiring live voice before retiring an active victim/admitting
+the new note. Test every key press admits at its frame under saturation and immediately
+after Stop. The documented pressure fallback may truncate a ramp, never another domain.
+
 ## Research points
 
-- Inspect trait object/context limitations; adapt existing real implementations rather
-  than introducing a speculative new abstraction or circular format dependency.
+- Land the decided rack-level mutable interface with both XM/IT implementations; no
+  per-program runtime, interior-mutability shortcut or engine-to-format dependency.
 - Audit retriggered key ownership, sustain pedal and MIDI channel/instrument numbering;
   queue overflow must have a recoverable all-notes-off path and diagnostics.
 - Prove live random state cannot perturb song runtime randomness, and wide modules do

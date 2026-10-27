@@ -656,7 +656,32 @@ array covers all 272 global slots while its allocator still caps IT-owned voices
 so MIDI occupying a low slot cannot push an IT voice beyond its state and IT cannot
 consume the reserve. A pool **smaller** is legal too — fewer voices sound.
 
+**Planned NO amendment (not implemented):** loaded-module audition will use one mutable
+live format runtime per rack, with pool-indexed state for all its programs and independent
+RNG. Immutable program definitions keep sample/map data. A rack-level mutable interface
+lands only together with real XM and IT implementations; format crates retain ownership
+and the facade constructs them. Prepared pool capacity is N+C+L: native capacity (IT 256,
+otherwise channel count), custom tails (web 64), shared jam/audition (web 16, including the
+existing jam reserve). Persistent web active capacity is 336; physical capacity is 339 including one bounded
+retirement slot per domain. Retiring voices retain ownership but not active quota; domain
+pressure hard-releases its oldest already-retiring voice before admission. Legacy defaults
+remain unchanged even when Cargo features unify; interactive runtime settings opt in. All per-slot state is sized to the
+actual prepared pool; native IT quota/victims exclude custom and live domains. One
+engine-owned generation/provenance/age record is authoritative. Custom voices use oldest
+custom eviction, all live voices oldest live eviction; native IT keeps its native policy.
+
 ### 5.4 The control clock
+
+**Planned NO amendment (not implemented):** loaded XM/IT live articulation will consume
+one engine-owned cadence: tracker ticks during playback and synthesised retained/initial
+cadence while held or without an active tracker (configured 50 Hz without a module).
+The MIDI 1 ms clock must not also advance format envelopes. Cadence deadlines split the
+render loop; a provided post-source EventSource hook, forwarded by SourceMux, dispatches
+live articulation after due source events at the exact frame. At equal frames native
+sequenced processing precedes live events and one live articulation step; held song
+articulation advances on control-only steps. Resume rejoins the saved tracker deadline
+once. NO-02 provides the tracker control hook, NO-03 the cadence, NO-06 the live consumer.
+The historical/current behavior described below remains until these tasks land.
 
 XM and IT envelopes, auto-vibrato, fadeout and NNA advance **exactly once per tracker
 tick** — not per sample, not per buffer. Rather than special-casing this, the control
@@ -1249,7 +1274,33 @@ about it.
 
 ---
 
+**Planned NO transport amendment (not implemented):** interactive Pause holds sequencing
+and progress while sample mixing, live input, DSP and format articulation continue.
+Tracker and SMF are sequenced sources; keyboard/MIDI are live. Preserve pending tick
+fractional remainder and translate absolute song origin/deadlines by held audio time.
+The host Player/Transport layer must freeze fade elapsed time, end arming and settlement,
+without ramping to silence. A permanent live mux slot supports previews without replacing
+the sequencer. Initial interactive Stopped keeps unity output gain; natural end clears into
+that state with rewind armed for the next Play. Held seek repositions without dispatching
+a tick and rebases the hold baseline at the seek frame. Interactive Stop holds position, cancels fade/rewind state,
+and clears sound with bounded ramps, leaving new live input audible. Legacy commands
+retain their contracts. Interactive seek clears song voices before processor reset,
+preserves audition and mode; legacy seek remains unchanged. Session identity survives
+renderer/enhancement rebuild, build generation does not; Player shadows and replays state.
+See the NO master for boundary ordering, cleanup scopes and rebuild details.
+
 ## 9. Telemetry
+
+**Planned NO amendment (not implemented):** retain 64 tracker telemetry lanes and add a
+separate live summary. With interactive audition the channel table admits up to 64+17
+lanes: 16 shared jam/selected-input lanes plus a button-preview lane at fixed IDs 64–80,
+all outside tracker insert buses and mixed through spill/master DSP. Insert bus_count is
+decoupled from table length and capped at 64. Preserve legacy constants/constructors even
+with features compiled; web opts into runtime interactive settings.
+Control-only cadence publishes meters/voice counts while paused/stopped; transitions and
+clears publish promptly. Explicit transport/natural-end state replaces falling-playing
+edge inference. Interactive wire commands use negotiated atomic generation-bearing
+records; metadata and acknowledgements are correlated with session/build identity.
 
 A single triple-buffered snapshot does not work for oscilloscopes: 32 channels × 512 f32
 is 64 KB per snapshot, ×3 buffers, copied at UI rate. Split it:
@@ -1764,7 +1815,8 @@ per-sample cost; the measurement that would show it is the budget document's §3
 
 The [NO master plan](../engine/NO-master-plan.md) proposes explicit, session-only
 playback overrides and faithful instrument audition for all five formats. This is
-**planned, not implemented**, and external design/task review remains outstanding.
+**planned, not implemented**. External review and corrections are complete; focused
+re-review evidence is recorded in the NO review log.
 Canonical MOD/S3M/MTM/XM still never create background voices today; the proposed
 opt-in exception must not change that default or native IT behavior.
 

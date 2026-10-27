@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Planned; external task review pending; do not implement until requested |
+| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
 | Depends on | NO-01 |
 | Blocks | NO-05, NO-06 |
 | Parallel with | NO-02/03 only with isolated worktrees and explicit shared-seam ownership |
@@ -40,8 +40,21 @@ on replacement and reserve one voice per channel. Implement only opt-in behavior
 - Wire MOD/S3M/MTM delayed musical notes; preserve native portamento, effect retrigger,
   sample-only, offset-past-end and invalid-note behavior. Blank/no-op rows create no tail.
 - Policy edits affect subsequent note starts; bypass clears custom-provenance tails.
-  Seek/restart/module replacement clear ownership. Preserve mute/channel insert routing.
+  Module replacement clears voices and ownership together. Legacy seek/restart retains
+  custom ownership for any still-sounding tails; never discard bookkeeping alone.
+  Interactive seek uses scoped clearing. Preserve mute/channel insert routing.
 - Add event-frame tests and update accuracy/architecture implementation status.
+
+## Interfaces consumed and cleanup integration
+
+Consume NO-01 ownership/provenance and layout contracts; do not create another age/
+provenance table. Own MOD/S3M/MTM trigger seams and the concrete engine overlap helper
+consumed by NO-05. Integrate NO-03 scoped clears after its landing: Stop and global
+all-sound-off clear tails/bindings/metadata, interactive seek clears song tails only,
+and bypass clears custom tails only. Retiring ramps keep ownership but not active quota; use the master’s per-domain retirement reserve/fallback. If this
+task is prepared before NO-03, coordinator must integrate and test the clear hooks before
+landing it. Add Stop/seek/bypass tests with active tails and unrelated live voices.
+Player shadow state retains policy selections on rebuild, resets on explicit user load.
 
 ## Research points
 

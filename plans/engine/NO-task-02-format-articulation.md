@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Planned; external task review pending; do not implement until requested |
+| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
 | Depends on | NO-01 |
 | Blocks | NO-03, NO-05, NO-06 |
 | Parallel with | None during shared engine/format runtime edits |
@@ -46,6 +46,27 @@ This is the highest canonical-regression risk and must land before enhanced beha
   callback-time allocation/drop. Wire no optional background creation yet.
 - Correct M11's current-state claims and architecture descriptions narrowly to identify
   what this task lands and what NO-06 still owes; do not broaden M11 scope.
+
+## Interfaces provided and source scope
+
+Own XM/IT concrete runtimes and the provided `TrackerProcessor` control-step hook in
+`engine/src/sequencer.rs`, with real XM and IT implementations and a no-op default for
+formats without articulation. Preserve existing tracker-driven update ordering; NO-03
+consumes the hook for held sequencing, NO-06 consumes the concrete runtime operations.
+No per-program pool-sized runtime and no speculative live trait in this task: NO-06
+lands that rack-level interface with both live implementations.
+
+Own actual capacity plumbing while preserving legacy `MAX_VOICE_CAPACITY`, through `HostEngine::build`, facade
+`NativeSequencer::new`, `host/src/source.rs` builders and format constructors. Follow
+N+C+L+R, including the existing jam reserve in L, and size every indexed array from the
+prepared pool. Validate failure off render. Native quota membership remains distinct
+from storage size; NO-05 wires custom exclusions. Foreground XM ordering stays native;
+NO-05 supplies the specified per-origin-channel background ordering.
+
+Physical arrays include bounded per-domain retirement headroom (interactive web 339);
+this is not extra active/native quota. Constructors accept actual configured capacity
+without changing legacy defaults when features unify. Provide retirement state that is
+owned until completion but cannot receive effects or further articulation updates.
 
 ## Research points
 

@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Planned; external task review pending; do not implement until requested |
+| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
 | Depends on | NO-W1 and NO-01–06 |
 | Blocks | Feature landing and owner listening acceptance |
 | Parallel with | None; integration verification uses final combined tree |
@@ -43,6 +43,23 @@ listening and embedded execution cannot be inferred from a successful root build
 - Reconcile task/master/foundation status and narrow M11 integration notes. Do not archive
   until landing; owner listening can remain explicitly outstanding after code lands.
 
+## Evidence ownership and feature exclusion
+
+Consume every task's interface and verification record; own final integrated evidence.
+Feature-off proof uses isolated per-package `-p ... --no-default-features` invocations
+with neither/each/both flags and `cargo tree -e features`; workspace CI alone unifies
+host-wasm defaults and is not proof. In the embedded workspace run
+`cargo test -p starplayer-firmware-common` with its documented host toolchain in addition
+to available board compile checks. Verify active capacity N+C+L, physical N+C+L+R, legacy runtime defaults under feature
+unification, and fixed live lanes 64–80 alongside maximum-width tracker modules.
+
+Include retained fade/seek/rebuild transport, SMF vs live pause, frozen progress, live
+cadence, quota-domain isolation, XM Gxx background ordering, generation-envelope/ring
+negotiation and paused telemetry in integrated tests. Produce browser fixtures and
+renders and perform available automated/smoke checks. The listening matrix is an owner
+acceptance checklist, not a worker completion gate; report owner/device evidence pending
+honestly. No worker is asked to fabricate subjective listening acceptance.
+
 ## Research points
 
 - Confirm test scheduling uses absolute frames, not host render calls, so buffer-size
@@ -56,7 +73,7 @@ listening and embedded execution cannot be inferred from a successful root build
 - Required sizes: 1, 3, 64, 128, 4096, 8191 with byte-identical outputs per fixed schedule.
 - `cargo xtask goldens --check`, `cargo xtask ci`, current web suite and WASM build;
   feature-matrix crate tests and bare-metal/no-std checks per existing tooling.
-- Manual browser listening matrix: percussion snare→kick, piano C→G→C, mixed-loop XM,
+- Prepare the owner browser listening matrix and available smoke checks: percussion snare→kick, piano C→G→C, mixed-loop XM,
   dense IT, Stop/Resume and audition with master inserts. Include fallback transport.
 - Record browser, device availability and exact remaining owner acceptance items.
 - Review final diff and explicit staged paths; no unrelated formatting or golden churn.

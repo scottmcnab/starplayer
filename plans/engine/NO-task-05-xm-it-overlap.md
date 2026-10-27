@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Planned; external task review pending; do not implement until requested |
-| Depends on | NO-02 and NO-04 |
+| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
+| Depends on | NO-02, NO-03 and NO-04 |
 | Blocks | NO-06, NO-W1 |
-| Parallel with | NO-03 after shared runtime interface is landed; coordinate engine changes |
+| Parallel with | None during shared runtime/cleanup integration |
 | Least-capable safe worker | `gpt-6-astra` (high) |
 | Coordinator | `gpt-6.1-sol` (xhigh) |
 | Verified by | Worker runs Verification; coordinator reviews diff/evidence; owner listening where specified |
@@ -44,6 +44,26 @@ background-control effects. Extend each format at its real note lifecycle seam.
 - Update trace to expose detached voices without duplicate channel events; ensure
   native and extra pools share safe addressable articulation storage and cleanup.
 - Update accuracy-policy implementation notes and doc explanations of IT override effects.
+
+## Interfaces consumed and cleanup integration
+
+Consume NO-02 concrete runtimes, NO-04 helper and NO-01 single ownership/provenance record.
+Own XM/IT note lifecycles, quota/victim filters and per-origin-channel background stepping.
+Exclude custom-provenance tails from native IT quota and victim selection; test a saturated
+256-native + 64-custom + 16-live active pool with retirement headroom with Original voices protected from other domains.
+Custom cap can reduce polyphony relative to authored NNA; test/document that consequence.
+
+Preserve foreground XM ordering. Step custom backgrounds after their origin channel's
+foreground processing, before the next channel, once per tick (including detach ticks).
+Test same-row Gxx, detached voices and global-volume changes on different channels.
+Use scoped cleanup hooks for Stop/global all-sound-off/interactive seek/bypass, removing
+native and custom ownership correctly without affecting unrelated live voices. Tests
+cover active native/custom backgrounds, retiring ramps, slot reuse and bypass provenance.
+
+Test retirement ownership independently of active quota and native victim eligibility;
+custom saturation admits notes using the bounded retired-slot fallback, while Original
+native IT allocation remains unchanged. Legacy seek/restart retains ownership for any
+still-sounding custom tails rather than resetting their budget/age records.
 
 ## Research points
 

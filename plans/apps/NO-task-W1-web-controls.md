@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](../engine/NO-master-plan.md) |
-| Status | Planned; external task review pending; do not implement until requested |
+| Status | Reviewed; ready for coordinator handoff; do not implement until requested |
 | Depends on | NO-06 (and all its dependencies) |
 | Blocks | NO-07 |
 | Parallel with | None touching shared web transport/command state |
@@ -46,6 +46,31 @@ Do not build a site with external hosting tools; this is the existing repository
 - Reuse current master processing and prepared PCM. Explain that audition has no automatic
   tracker-channel inserts and sustained loops can remain audible while paused.
 - Update web README/help and test existing seek/playlist/background output transitions.
+
+## Interfaces consumed and wire/source scope
+
+Consume engine capabilities/layout and Player session/build/transport contracts. Own
+`apps/starplayer-web/src/lib.rs` metadata exports plus app.js/ring.js/worklet-processor.js,
+playback-controller/media-session and host-wasm command/telemetry exports. Loop/mixed-map
+badges come from the metadata WASM instance, correlated with installed session/build;
+worklet acks/capabilities report actual audio-side state.
+
+Use a negotiated versioned atomic command record carrying build generation plus existing
+opcode/argument/extra; preserve old opcode values and do not use a separate generation
+prefix. postMessage validates the same logical envelope. Reject incompatible interactive
+ring versions and disable controls gracefully. User load/reload creates a new session;
+sample enhancement/renderer rebuild creates only a new build generation and replays the
+Player/UI shadow state before input is re-enabled. Reject stale acknowledgements too.
+
+Keep 64 tracker telemetry lanes plus a live summary. `is_playing` is false while paused/
+stopped; explicit transport and natural-end fields replace the falling-edge playlist
+heuristic (`endReachedStopped`), including telemetry header word 15 consumers. Update
+hardcoded MIDI-base UI consumers to the fixed interactive 64–80 layout. Test both wire paths,
+old-version rejection, paused live meters, 64-channel audition and same-session rebuild.
+
+Enable interactive runtime settings explicitly; feature compilation alone must not change
+legacy host defaults. Add first-preview tests before Play, in Pause and after natural end,
+and prove destination changes do not rebuild the tracker source or clear song tails.
 
 ## Research points
 

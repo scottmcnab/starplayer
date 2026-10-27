@@ -2,13 +2,13 @@
 
 | Field | Value |
 |---|---|
-| Status | Planning complete enough for external review; implementation NOT started or authorised by this document |
+| Status | Reviewed and corrected; ready for coordinator handoff; implementation NOT started or authorised by this document |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional per-instrument/per-channel note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
 | Coordinator | `gpt-6.1-sol`, reasoning `xhigh` |
 | Workers | `gpt-6.1-sol` for bounded tasks; `gpt-6-astra` for clock/articulation/NNA work; see task headers |
-| External review | Claude CLI, requested Opus-5.5, high effort; master and task reviews deferred until after 2026-10-27 16:20 Australia/Perth (08:20 UTC), at owner's request |
+| External review | Claude CLI `claude-opus-5-5`, invoked with `--effort high`; master/task review and focused follow-ups complete; final conditional approval satisfied; see review log |
 | Related | M4 live input, M5 XM, M6 IT, M10-K5 sample enhancement, M11 instrument library |
 
 ## Context for a fresh coordinator
@@ -73,7 +73,7 @@ transport commands so the web Stop can select the new clear-and-hold behavior.
 
 Store overrides outside immutable Module data; session-only, reset on different module,
 retained across pause, seek and renderer/DSP/sample-enhancement rebuilds of the same load.
-Use module load generation to reject stale commands (including a reload of the same bytes).
+Use separate user-session identity and engine-build generation as specified below to reject stale commands, including explicit reloads of the same bytes.
 
 Instrument: Follow channel (default), Original, Cut, Overlap, Overlap different notes.
 Channel: Original (default), Cut, Overlap, Overlap different notes.
@@ -101,8 +101,8 @@ mute and inserts. Explicit tracker cuts target foreground; native IT background-
 commands retain their authored semantics. A pending MOD swap must not make a custom
 one-shot tail loop: detach the current non-looping region and discard its queued swap.
 
-Custom Overlap / Different-notes applies only to actually non-looping PCM, including
-sustain loops. Ineligible voices use native behavior, NOT forced Cut. Cut/Original remain
+Custom Overlap / Different-notes applies only to PCM with neither a normal loop nor a
+sustain loop. Ineligible voices use native behavior, NOT forced Cut. Cut/Original remain
 available for loops. IT's authored looping NNA remains intact. For mapped XM/IT instruments
 check the note's actual sample; show a mixed-loop badge rather than disabling all notes.
 User changes affect subsequent note events. Global overlap bypass clears custom-created
@@ -132,8 +132,8 @@ note-off invokes native release; simple samples use the existing click-safe rele
 For a looped XM/IT voice with no terminating release, Stop preview is always available;
 never claim every native note-off guarantees silence.
 
-Allocate live lanes after module lanes with an explicit address mapping; never hardcode
-48 as universally safe. Preserve hardware MIDI channel identity and tracker VoiceTag
+Allocate interactive live lanes at 64–80, beyond the maximum tracker width, with an
+explicit address mapping; never hardcode 48 as universally safe. Preserve hardware MIDI channel identity and tracker VoiceTag
 limits. Preview voices do not consume tracker foreground reservations. Live note-offs
 must locate held note instances even after NNA detachment; sustain, repeated keys and
 program changes must not leave stuck voices.
@@ -141,8 +141,8 @@ program changes must not leave stuck voices.
 ### Capacity, real-time behavior and feature flags
 
 Preallocate web budgets of 64 custom tails and 16 audition voices, in addition to native
-format foreground/background requirements. These are caps in the global pool, not new
-mixers. Validate IT's per-slot state sizing when total capacity exceeds 256. Never leave
+format foreground/background requirements and bounded retirement headroom specified below.
+These are caps in the global pool, not new mixers. Validate IT's per-slot state sizing when total capacity exceeds 256. Never leave
 an allocated voice outside the format state's addressable range. Host budgets are
 configurable before playback; no allocations on toggle, dispatch or render.
 
@@ -163,23 +163,207 @@ must NOT be gated by these features. Small transport types may be unconditional;
 interactive machinery under `interactive-audition` and keep existing host semantics.
 Do not introduce a new trait before two real implementations exist.
 
+## Reviewed implementation decisions
+
+These decisions resolve the initial external review and apply to every task.
+
+### One articulation cadence, separate sequencing time
+
+NO-03 owns one engine-level cadence authority for loaded-format articulation, consumed
+by song and live runtimes. While Playing, tracker ticks drive it; while Paused/Stopped,
+after natural sequence exhaustion, or without a tracker, it synthesises steps at the
+retained/module-initial cadence with fractional remainder preserved. A host without a
+loaded tracker uses an explicit configured format cadence (default 50 Hz), never the
+MidiSource 1 ms housekeeping clock. The latter may still service simple instruments or
+input, but must not advance loaded XM/IT articulation a second time.
+
+At equal frames: apply due quantum-boundary commands, then sequenced events (preserving
+native per-channel effect/articulation ordering), then stamped live events in stable
+source order, then one live articulation step. A control-only boundary advances held
+song articulation before live events and live articulation. Original tracker processing
+continues to step its own voices once; the authority must not step them again. NO-02
+adds the provided tracker control-step hook with real XM/IT implementations; NO-03 owns
+its non-sequencing dispatch; NO-06 consumes the cadence for live format runtimes.
+
+Pausing translates the tracker's pending absolute tick deadline and song origin by the
+held audio-frame duration on resume, without resetting FrameClock's fractional remainder.
+While held, song progress uses the frozen song-time cursor. Stopped time is held likewise.
+Keep the separate live timestamp clock monotonic. Explicit seek is a different operation
+and may reset tick phase. Tracker and SMF playback sources are sequenced sources and
+freeze; keyboard/MIDI feeds are live sources and continue. SMF scheduling needs the same
+held-time translation, but does not invent tracker tempo effects.
+
+The cadence is also an engine event boundary: NO-03 includes its next frame in event
+splitting and adds a provided post-source articulation method to the existing EventSource
+trait (default no-op, forwarded in SourceMux slot order). After due source dispatch at
+the exact frame, call this method once when the cadence is due. NO-06 implements it for
+MidiSource's format runtime. The MIDI 1 ms deadline must not defer this step. NO-03 tests
+a scripted consumer before NO-06 lands the real one.
+
+### Host transport, cleanup and telemetry
+
+NO-03 covers `crates/starplayer-host/{src/player.rs,src/transport.rs,src/events.rs,
+src/source.rs}`, not just engine commands. Add explicit interactive HostCommands.
+Pause must never invoke the legacy ramp-to-zero Stop. Freeze song-fade elapsed time,
+end-of-song arming and fade settlement during Pause. The existing fade gain is held
+while paused (and can attenuate audition); resume continues the saved fade. Interactive
+Stop cancels pending fades/rewinds and leaves the output path able to sound new live
+notes at normal transport gain. Preserve the legacy host command path unchanged.
+
+Interactive hosts install the sequenced source in mux slot 0 and a prepared live
+MidiSource/rack supporting all 17 lanes in slot 1 at module installation, before any
+Preview or destination selection. Jam/selected-input/Preview are bounded routing state
+changes, never jam()/midi_only() source reconstruction or LoadModule. Feature-off or
+non-opted-in hosts retain those existing APIs. NO-03 defines/enforces the Player source
+invariant; NO-06 installs the rack/live slot and routing. Test first preview during pause
+without changing song voices, effect state, row/tick or pending remainder.
+
+Before first Play, interactive hosts start Stopped with a running audio/live path and
+unity transport gain. Natural end/fade completion follows host playlist policy but clears
+into interactive Stopped, restores unity gain after a bounded transition, and arms rewind
+for next Play instead of immediately seeking or freezing live audio. User Stop cancels
+pending rewind and holds position. Explicit Resume from Pause resumes the saved fade;
+it must not take the legacy Play-during-fade restart branch. Preview is audible before
+first Play and after natural end, with no false playlist event from user Pause/Stop.
+
+
+Scoped clearing must reach foregrounds and all backgrounds; `ChannelTable::stop_all`
+alone is insufficient and unramped `VoicePool::release_all` is not the audible solution.
+Use bounded existing-duration release ramps, invalidate bindings/held input immediately,
+and keep retiring slots owned until their ramps finish. They no longer count against
+active admission, but use bounded physical retirement capacity as specified below. Stop clears DSP tails with a bounded click-safe transition, without a persistent
+master mute or muting new preview input. Exact ramp mechanics belong to NO-03/06.
+Bypass and Stop preview clear only their own scope. Global all-sound-off is a distinct
+UI/host command; hardware MIDI CC120 stays lane-scoped.
+
+Interactive seek clears song foregrounds, native/custom backgrounds and song articulation
+before processor reset, retaining transport mode and audition voices. Invalid seeks do
+not clear sound. Wire this at the seek dispatch that has engine context, and ensure seek
+requests can dispatch while the sequencing gate is closed. Legacy seek behavior stays
+unchanged in this feature; the pre-existing IT reset/voice ownership hazard is separate
+follow-up work, not an excuse to change canonical seek silently. Jam/source replacement
+and same-session rebuild must retain interactive mode and must not synthesize end events.
+A valid seek while Paused/Stopped repositions without dispatching a sequence tick,
+sets the frozen cursor to the target timeline mark, zeroes the held tick remainder, and
+rebases the hold baseline to the seek frame S. Resume at R translates origin/deadline by
+R−S, not by the time since the original pause. Test both held states and repeated seeks.
+Legacy seek/restart with custom overlap enabled must retain ownership of sounding custom
+tails until completion/bypass (or explicitly ramp-clear them); never reset bookkeeping
+alone. Native legacy seek behavior remains outside this feature's cleanup change.
+
+Rebuild may clear sounding voices (as today), but clears held input consistently and
+restores logical cursor/mode/settings; sample-rate changes use time conversion, not an
+assumption that old frame counts and fractional bits remain valid at a new rate.
+
+Publish transport and live voice/meter telemetry on rate-limited control-only ticks,
+and immediately on clears/state transitions at the next publication boundary. Keep the
+64 tracker-lane telemetry layout; add a separate live summary. Existing `is_playing`
+means sequencing advances (false for Paused/Stopped); a new explicit transport field
+and natural-end indication govern host/UI behavior, never a falling boolean edge alone.
+
+### Lane layout and capacity accounting
+
+With interactive-audition, admit 64 tracker lanes plus **17 live lanes** (maximum 81).
+The first 16 live lanes preserve MIDI channel identity; jam and selected-instrument
+input are mutually exclusive destinations sharing these lanes. A seventeenth lane is
+for the Preview button, with independent held-instance ownership. Its voices share the
+live budget. Live lane base is fixed at 64 for every module width, so live lanes 64–80 lie outside
+the maximum 64 tracker insert buses and mix through spill/master DSP. Decouple insert
+bus_count from ChannelTable length. Preserve legacy MAX_CHANNELS=64, MIDI_CHANNEL_BASE=48
+and MAX_VOICE_CAPACITY=272; add separate interactive limits and explicitly configured
+constructors. Features make this capability available, but do not alter legacy host
+settings when Cargo unifies features. Web opts in through runtime EngineSettings/host
+configuration; other constructors keep legacy defaults. Keep mixer spill grouping and
+tracker telemetry unchanged. Audit VoiceTag bounds,
+insert packing and every hardcoded-48 consumer; expose layout-aware mappings to interactive
+hosts instead of silently changing public legacy helpers. NO-01 implements the layout.
+
+Active capacity is **N + C + L**: N is native format capacity (channel count for MOD/S3M/MTM/XM,
+256 for IT), C is the configured custom-tail cap (web 64 when enabled, otherwise zero),
+and L is a shared live budget (web 16). L replaces/includes the existing 16 jam reserve;
+it is not 16 jam plus another 16 preview. Existing feature-off hosts with jam retain their
+existing reserve; offline hosts without live input need none. A persistent host that
+prepares before load uses maximum N=256, yielding 336 active web slots with both features
+plus retirement headroom below.
+NO-02 threads the prepared actual pool size through host/facade/source/format constructors;
+all indexed articulation arrays cover it, and allocation errors occur before playback.
+
+IT tracker foregrounds and authored backgrounds count toward N. Custom-provenance tails
+count only toward C, are excluded from native quota counts and native victim selection,
+and use oldest-custom eviction. All live voices, including native IT live NNA tails,
+count only toward L and use oldest-live eviction at exhaustion; native live note actions
+are preserved but resource-pressure stealing follows the live budget. None may steal
+another domain's foreground. An overridden IT instrument can have fewer tails under the
+64 custom cap than under native 256-voice behavior; this is an explicit bounded creative
+mode, not a guarantee of increased polyphony. Each generation has one engine-owned
+ownership/provenance/age record, used by format runtimes rather than duplicated tables.
+
+Physical pool size is **N+C+L+R**, with R split into one native retirement slot when
+interactive transport is configured, one custom retirement slot when custom tails are
+configured, and one live retirement slot when interactive live input is configured.
+The default interactive web pool is therefore 339 slots. These reserve slots are not
+additional active voices. Retiring voices retain domain/age/generation ownership and
+cannot receive note/effect updates, but no longer consume active admission quota. Physical
+domain capacity is its active cap plus its retirement slot, even if other domains are
+empty. Before a new admission at that physical limit, hard-release that domain's oldest
+already-retiring voice (stable slot tie-break); never another domain's voice. Then move
+the active victim into retiring state and admit the new note at its scheduled frame.
+This bounded pressure fallback can shorten a release ramp; it is preferred to delaying
+or refusing new input and must be tested/documented. Normal native IT allocation/stealing
+is unchanged; native headroom serves interactive clearing, not increased native polyphony.
+Stop can initially leave all former voices retiring in the domain's ordinary slots; the
+extra slot permits immediate new input and the same rule bounds subsequent admissions.
+NO-02 plumbs physical capacity; NO-03 supplies retirement/clear contracts; NO-04/05/06
+apply them. Ownership metadata compiles with either feature, with custom-only policy
+fields gated by note-overlap. Runtime defaults leave all optional budgets zero.
+
+### Live runtime ownership and session/wire identity
+
+One mutable live format runtime per rack owns the pool-indexed articulation and RNG for
+all its XM or IT programs; never allocate one pool-sized runtime per program. Immutable
+Instrument definitions retain mapping/sample data. NO-06 introduces a rack-level mutable
+runtime interface only in the same commit as its two real XM and IT implementations,
+backed by NO-02 concrete runtimes. No engine-to-format dependencies or RefCell-based RT
+mutation. The facade constructs the format runtime and host uses it at each rack-builder
+call site. Song and live random state remain separate.
+
+A user-session ID changes for explicit new loads/reloads, even identical bytes. An engine
+build generation changes for every replacement/rebuild, including sample enhancement.
+Same-session rebuilds retain overrides/cursor/mode via Player shadow state, but reject
+old-generation commands/replies. The web labels rebuild vs explicit reload intentionally;
+no byte-equality heuristic. Replay the full state before accepting input in the new build.
+
+NO-W1 uses a versioned atomic wire record for interactive commands carrying the engine
+build generation alongside opcode/argument/extra. Do not squeeze it into fields already
+needed by the command, or send a non-atomic generation prefix. Negotiate ring version
+before enabling interactive commands; old records retain existing opcode values and
+legacy behavior, while missing capability disables interactive UI. postMessage uses the
+same logical envelope/validation. Obtain loop/maps metadata from the metadata WASM
+instance (`apps/starplayer-web/src/lib.rs`), and correlate it with session/build identity;
+worklet capability/ack state confirms what is actually installed.
+
+### XM background update ordering
+
+Preserve foreground effects → articulation → flush ordering per channel. Custom XM
+backgrounds step after that originating channel's effects/foreground processing, before
+the next channel; they see that channel's current module global-volume value. A detached
+voice already stepped at that boundary must not step twice. Control-only steps use
+stable channel/slot order and the frozen global-volume state. NO-05 tests same-tick Gxx
+and detachment to make the ordering executable rather than inferred.
+
 ## Delivery and review workflow
 
 No implementation starts until explicitly requested. Planning commits are not evidence
 of external approval. First commit this master, index and planned foundation amendments;
 then commit executable task specs and the review handoff separately.
 
-Deferred review has two passes: master first, then tasks against the corrected master.
-After the specified reset, use the installed `claude` CLI in this sibling worktree in
-read-only review mode. Inspect `claude --help` and locally supported model selection;
-request exactly Opus-5.5 with high effort. Do not silently substitute an alias/model or
-claim it is available. If rejected/unavailable, record the exact limitation for the owner.
-Give it repo context and file paths, request severity-ranked findings with evidence and
-proposed fixes, and prohibit edits/implementation. Capture review text in the review log,
-resolve findings agreed with, explain rejected findings, and seek focused re-review of
-material amendments. Never include session URLs or attribution in commits/PRs.
-The owner deferred invocation; do not probe the paid model before the reset. No automatic
-scheduled invocation is installed by this plan.
+External review is complete: an initial source-backed master/task pass, a source-backed
+follow-up, and a final focused consistency pass using the corrected documents. All used
+Claude CLI `claude-opus-5-5` with `--effort high`; no fallback model or implementation.
+The final pass's remaining wording condition has been applied, and findings/dispositions
+are preserved in the review log. Future material contract changes need focused review;
+planning approval does not authorize implementation. No automatic invocation is scheduled.
+Never include session URLs or attribution in commits/PRs.
 
 Implementation coordinator is gpt-6.1-sol (xhigh). It reads this master and task headers,
 creates task branches/sibling worktrees, delegates to the named worker tier, reviews
@@ -193,7 +377,8 @@ listening items clearly distinguished.
 Canonical goldens must remain byte-identical with runtime bypass and with features off.
 Run paired feature-on/original and feature-off output comparisons for all five formats.
 Enabled behavior must be byte-identical at host block sizes 1, 3, 64, 128, 4096 and 8191
-for identical absolute-frame input/control schedules. Include mid-quantum commands.
+for identical absolute-frame input/control schedules. Include mid-quantum stamped live
+events; host commands retain their existing quantum-boundary application contract.
 
 Cover snare→kick, C→G→C, cross-channel identity, mixed maps/loops, IT policies and runtime
 commands, XM envelope sustain/release/carry, pending MOD swaps, offsets, delayed notes,
@@ -222,7 +407,7 @@ format articulation subset needed for faithful loaded-module audition, not all o
 
 ## Task breakdown and landing order
 
-All files below are pending external review and implementation. The coordinator is
+All files below have completed external review; implementation remains pending authorization. The coordinator is
 `gpt-6.1-sol` (xhigh); worker floors and effort are explicit in each task header.
 
 | Task | Deliverable | Worker | Prerequisites |
@@ -231,14 +416,14 @@ All files below are pending external review and implementation. The coordinator 
 | [NO-02](NO-task-02-format-articulation.md) | Format-owned per-voice articulation | gpt-6-astra (high) | NO-01 |
 | [NO-03](NO-task-03-interactive-transport.md) | Sequencer-only pause and clear-and-hold Stop | gpt-6-astra (high) | NO-02 |
 | [NO-04](NO-task-04-legacy-overlap.md) | Legacy-format overlap and bounded tails | gpt-6.1-sol (high) | NO-01 |
-| [NO-05](NO-task-05-xm-it-overlap.md) | XM and IT overlap integration | gpt-6-astra (high) | NO-02 and NO-04 |
+| [NO-05](NO-task-05-xm-it-overlap.md) | XM and IT overlap integration | gpt-6-astra (high) | NO-02, NO-03 and NO-04 |
 | [NO-06](NO-task-06-faithful-audition.md) | Faithful loaded-module audition | gpt-6-astra (high) | NO-03 and NO-05 |
 | [NO-W1](../apps/NO-task-W1-web-controls.md) | Web transport, Instruments panel and command bridge | gpt-6.1-sol (high) | NO-06 (and all its dependencies) |
 | [NO-07](NO-task-07-integration-and-acceptance.md) | Integration, determinism and feature exclusion | gpt-6.1-sol (high) | NO-W1 and NO-01–06 |
 
 Recommended landing order: 01 → 02 → 03 → 04 → 05 → 06 → W1 → 07.
-04 can be prepared independently after 01; 05 can be prepared after 02/04 while 03
-finishes, but shared engine edits must be integrated by the coordinator sequentially.
+04 can be prepared independently after 01, with NO-03 cleanup integrated before landing;
+05 begins after 02/03/04. Shared engine edits land sequentially.
 Do not split multiple agents across the same checkout. No workers are started by this
-planning handoff. External review procedure and pending evidence are in
+planning handoff. External review findings, corrections and final disposition are in
 [the review log](NO-review-log.md).
