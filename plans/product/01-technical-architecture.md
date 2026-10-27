@@ -1759,3 +1759,24 @@ An override would therefore be a knob with no question behind it, and a second b
 for every buffer-size-independence test to keep honest. The one result that would reopen
 this is a cycles-per-frame figure showing the per-quantum fixed cost dominating the
 per-sample cost; the measurement that would show it is the budget document's §3 table.
+
+## Planned: optional note overlap and interactive transport
+
+The [NO master plan](../engine/NO-master-plan.md) proposes explicit, session-only
+playback overrides and faithful instrument audition for all five formats. This is
+**planned, not implemented**, and external design/task review remains outstanding.
+Canonical MOD/S3M/MTM/XM still never create background voices today; the proposed
+opt-in exception must not change that default or native IT behavior.
+
+The design separates held tracker sequencing time from advancing audio/live-input time
+and format-owned articulation. Pause leaves mixing, envelopes and DSP running; interactive
+Stop clears sound while holding sequence position. Existing hosts retain their legacy
+Stop contract unless they select the new interactive command. XM background articulation
+and faithful mapped-instrument live playback require new implementation, not merely UI.
+
+Optional `note-overlap` and `interactive-audition` features remain off in reusable-crate
+defaults and embedded builds, enabled explicitly by the web host. They preserve no_std,
+fixed 128-frame DSP quanta, exact event splitting, allocation-free rendering and
+block-size-independent output. See the master for policy precedence, loop exclusion,
+capacity budgets and native IT isolation; implementation must reconcile the relevant
+architecture sections as each deliverable lands.

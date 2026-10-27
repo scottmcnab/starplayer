@@ -708,3 +708,18 @@ emulation resamples, so that would be diffing emulator artefacts.
 When implementation discovers a new deviation, add it to §3 with its cause and the
 canonical behaviour chosen, in the same commit as the code. A deviation that is not
 written down here is a defect, not a decision.
+
+## Planned creative playback: note overlap
+
+The [NO master plan](../engine/NO-master-plan.md) defines an optional creative playback
+layer, not a new interpretation of canonical tracker effects. It is not implemented.
+Original/bypass and feature-disabled renders must retain existing golden output.
+Custom overlap preserves non-looping sample tails and may override IT NNA/duplicate
+actions explicitly; authored IT behavior remains the default, including looping NNA.
+This cannot restore missing recorded decay and can change balance or musical intent.
+
+Sequencer-only Pause deliberately allows sound state to evolve while musical position
+is held; it is not an accuracy oracle or bit-exact suspended-state resume. Audition uses
+prepared samples and format articulation through master DSP. Document any additional
+canonical deviation discovered during implementation under the normal §3 process;
+never refresh canonical goldens to accommodate this opt-in feature.

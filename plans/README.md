@@ -47,6 +47,8 @@ the engine, the applications, the original DOS sources, and this plan set.
 
 ### Engine
 
+- **NO — Note overlap and audition:** [master plan](engine/NO-master-plan.md). Planning only; optional all-format overlap, sequencer Pause and web instrument audition. Claude master/task reviews deferred until after 2026-10-27 16:20 Australia/Perth.
+
 | Milestone | Status | Master plan | Notes |
 |---|---|---|---|
 | M0 Foundations + WASM spike | **Landed** — owner audible check pending | [M0](engine/M0-master-plan.md) | All four tasks in `engine/complete/`: [A1](engine/complete/M0-task-A1-workspace-skeleton.md) workspace/CI, [A2](engine/complete/M0-task-A2-core-types.md) core types, [A3](engine/complete/M0-task-A3-minimal-mixer-and-determinism.md) mixer + determinism test, [A4](engine/complete/M0-task-A4-audioworklet-spike.md) AudioWorklet sine wave. Exit: **sound from a browser tab** — `cargo xtask wasm && cargo xtask serve` |
