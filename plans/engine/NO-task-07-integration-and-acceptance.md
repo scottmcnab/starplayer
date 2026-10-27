@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
+| Status | Authorised; pending dependencies |
 | Depends on | NO-W1 and NO-01–06 |
 | Blocks | Feature landing and owner listening acceptance |
 | Parallel with | None; integration verification uses final combined tree |

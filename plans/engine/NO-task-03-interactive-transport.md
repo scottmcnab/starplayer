@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
+| Status | Authorised; pending dependencies |
 | Depends on | NO-02 |
 | Blocks | NO-06, NO-W1 |
 | Parallel with | NO-04 only in isolated worktrees; serialize shared engine integration |
-| Least-capable safe worker | `gpt-6-astra` (high) |
+| Least-capable safe worker | `gpt-6-astra` (medium; explicit owner assignment 2026-10-27) |
 | Coordinator | `gpt-6.1-sol` (xhigh) |
 | Verified by | Worker runs Verification; coordinator reviews diff/evidence; owner listening where specified |
 

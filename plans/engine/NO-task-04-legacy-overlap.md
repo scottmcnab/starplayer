@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
+| Status | Authorised; pending dependencies |
 | Depends on | NO-01 |
 | Blocks | NO-05, NO-06 |
 | Parallel with | NO-02/03 only with isolated worktrees and explicit shared-seam ownership |

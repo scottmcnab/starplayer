@@ -47,7 +47,7 @@ the engine, the applications, the original DOS sources, and this plan set.
 
 ### Engine
 
-- **NO — Note overlap and audition:** [master plan](engine/NO-master-plan.md). Planning only; optional all-format overlap, sequencer Pause and web instrument audition. Instrument-only checkbox/onset-volume revision externally reviewed and corrected; staged/uncommitted for owner review. No implementation started.
+- **NO — Note overlap and audition:** [master plan](engine/NO-master-plan.md). Implementation authorised on `feature/note-overlap-audition`; NO-01 contracts in progress. Reviewed instrument-only overlap, sequencer Pause and faithful web audition; no main merge or deployment authorised.
 
 | Milestone | Status | Master plan | Notes |
 |---|---|---|---|

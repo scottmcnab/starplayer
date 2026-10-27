@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
+| Status | In progress on task/no-01-contracts |
 | Depends on | Reviewed master; implementation explicitly requested |
 | Blocks | NO-02, NO-04 |
 | Parallel with | None; shared API foundation |

@@ -7,7 +7,7 @@
 | Earliest invocation | After 2026-10-27 16:20 Australia/Perth / 08:20 UTC, per owner |
 | Master planning commit | c3bead3 |
 | Task planning commit | 4755c94 |
-| Implementation | Not started; owner expressly requested planning only |
+| Implementation | Authorised 2026-10-27 after `f844ba7`; feature/task branches only; see implementation evidence |
 
 ## Subsequent owner-requested simplification (current revision)
 
@@ -781,3 +781,14 @@ Once A–C are applied: **no further amendments required**.
 - **C: incorporated, and correctly adapted.** My suggested "unchecked foregrounds" would have under-specified the protected set, because the master places every tracker foreground in N. Your text, "all tracker foregrounds and native-created backgrounds, regardless of current checkbox", is the right correction. It also agrees with excluding custom-provenance tails from the native quota in the preceding sentence. The surviving "native (unchecked) IT allocation remains unchanged" describes behaviour, not domain membership, so it doesn't conflict.
 
 One optional readability nit, not required: the C sentence reads "pool with retirement headroom with native-domain voices…". Changing the second "with" to ", and" or "; keep" would avoid misparsing which noun the headroom applies to.
+
+## Implementation handoff — 2026-10-27
+
+Owner explicitly authorised implementation, delegation, tests and commits on feature/task
+branches, with no main merge or deployment. Clean feature worktree confirmed at `f844ba7`.
+The current master/task contracts supersede historical review text. Worker assignments
+are Sol high for NO-01/04/W1/07 and Astra medium for NO-02/03/05/06, per the owner’s
+explicit handoff (overriding older high effort task headers). Coordinator remains Sol xhigh.
+Tasks land serially in the recommended order with isolated sibling worktrees, coordinator
+review and verification, and single-change squash integration. Owner listening and
+hardware checks remain distinct from automated evidence.

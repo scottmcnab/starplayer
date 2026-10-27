@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Instrument-only/onset-volume revision reviewed; staged and uncommitted; implementation NOT started or authorised by this document |
+| Status | Implementation authorised 2026-10-27; NO-01 in progress; reviewed instrument-only/onset-volume contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -443,7 +443,7 @@ are preserved in the review log. Future material contract changes need focused r
 the subsequent instrument-only/onset-volume revision has now completed its own source-backed
 review and focused follow-ups, ending with “No further amendments required.” Corrections
 and dispositions are in the review log. Planning approval does not authorize implementation.
-Changes remain staged and uncommitted for owner review; no automatic invocation is scheduled.
+The owner authorised implementation, delegation, testing and feature/task-branch commits on 2026-10-27, after planning commit `f844ba7`. No merge into main or deployment is authorised.
 Never include session URLs or attribution in commits/PRs.
 
 Implementation coordinator is gpt-6.1-sol (xhigh). It reads this master and task headers,
@@ -496,18 +496,17 @@ format articulation subset needed for faithful loaded-module audition, not all o
 ## Task breakdown and landing order
 
 The instrument-only/onset-volume revision and all task amendments have completed external
-review. They remain staged and uncommitted for owner review; implementation remains
-pending authorization. The coordinator is
+review. Implementation is authorised by the 2026-10-27 owner handoff. The coordinator is
 `gpt-6.1-sol` (xhigh); worker floors and effort are explicit in each task header.
 
 | Task | Deliverable | Worker | Prerequisites |
 |---|---|---|---|
 | [NO-01](NO-task-01-contracts-and-features.md) | Contracts, feature gates and ownership | gpt-6.1-sol (high) | Reviewed master; implementation explicitly requested |
-| [NO-02](NO-task-02-format-articulation.md) | Format-owned per-voice articulation | gpt-6-astra (high) | NO-01 |
-| [NO-03](NO-task-03-interactive-transport.md) | Sequencer-only pause and clear-and-hold Stop | gpt-6-astra (high) | NO-02 |
+| [NO-02](NO-task-02-format-articulation.md) | Format-owned per-voice articulation | gpt-6-astra (medium) | NO-01 |
+| [NO-03](NO-task-03-interactive-transport.md) | Sequencer-only pause and clear-and-hold Stop | gpt-6-astra (medium) | NO-02 |
 | [NO-04](NO-task-04-legacy-overlap.md) | Legacy-format overlap and bounded tails | gpt-6.1-sol (high) | NO-01 |
-| [NO-05](NO-task-05-xm-it-overlap.md) | XM and IT overlap integration | gpt-6-astra (high) | NO-02, NO-03 and NO-04 |
-| [NO-06](NO-task-06-faithful-audition.md) | Faithful loaded-module audition | gpt-6-astra (high) | NO-03 and NO-05 |
+| [NO-05](NO-task-05-xm-it-overlap.md) | XM and IT overlap integration | gpt-6-astra (medium) | NO-02, NO-03 and NO-04 |
+| [NO-06](NO-task-06-faithful-audition.md) | Faithful loaded-module audition | gpt-6-astra (medium) | NO-03 and NO-05 |
 | [NO-W1](../apps/NO-task-W1-web-controls.md) | Web transport, Instruments panel and command bridge | gpt-6.1-sol (high) | NO-06 (and all its dependencies) |
 | [NO-07](NO-task-07-integration-and-acceptance.md) | Integration, determinism and feature exclusion | gpt-6.1-sol (high) | NO-W1 and NO-01–06 |
 

@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](../engine/NO-master-plan.md) |
-| Status | Instrument-only revision reviewed; staged/uncommitted for owner review; do not implement until requested |
+| Status | Authorised; pending NO-06 |
 | Depends on | NO-06 (and all its dependencies) |
 | Blocks | NO-07 |
 | Parallel with | None touching shared web transport/command state |
