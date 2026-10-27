@@ -27,19 +27,53 @@ test('rebind requires matching keys, changes identity explicitly, preserves ids/
 });
 
 import { keysForLibrary, locatorKey } from '../www/playlist-transfer.js';
-import { createDiscoveredLibrary, appendDiscoveredRows, updateDiscoveredRows, parseCsv, locatorKey as modelLocatorKey } from '../www/library-index.js';
+import { createDiscoveredLibrary, appendDiscoveredRows, updateDiscoveredRows, attachComments, parseLibraryCsv, parseCsv, locatorKey as modelLocatorKey } from '../www/library-index.js';
 const discovered = phase => ({ identity, mode: 'discovered', library: createDiscoveredLibrary({ name: 'Folder' }), discoveryStatus: { phase } });
 const record = sourcePath => ({ sourcePath, containerMember: '', memberPath: '', rawHex: '', format: 'mod', size: 1, timestamp: '', playable: true });
 
-test('membership uses shared locator keys, follows revisions and caches immutable CSV libraries', () => {
+test('membership is a live Set across append, metadata and sidecar revisions', () => {
     assert.equal(locatorKey, modelLocatorKey);
     const context = discovered('running');
-    const empty = keysForLibrary(context.library);
-    assert.equal(keysForLibrary(context.library), empty);
+    const lookup = keysForLibrary(context.library);
+    assert.ok(lookup instanceof Set);
+    assert.equal(keysForLibrary(context.library), lookup);
     appendDiscoveredRows(context.library, [record('new.mod')]);
-    assert.ok(keysForLibrary(context.library).has(locatorKey(record('new.mod'))));
-    assert.notEqual(keysForLibrary(context.library), empty);
+    assert.equal(keysForLibrary(context.library), lookup);
+    assert.ok(lookup.has(locatorKey(record('new.mod'))));
+    updateDiscoveredRows(context.library, [{ locator: record('new.mod'), patch: { title: 'Actual', metadataState: 'ready', sha256: 'a'.repeat(64) } }]);
+    attachComments(context.library, new Map([['a'.repeat(64), { instrumentNames: 'Sidecar' }]]));
+    assert.equal(keysForLibrary(context.library), lookup);
+    assert.deepEqual([...lookup], [locatorKey(record('new.mod'))]);
+    appendDiscoveredRows(context.library, [record('next.mod'), record('new.mod')]);
+    assert.equal(keysForLibrary(context.library), lookup);
+    assert.ok(lookup.has(locatorKey(record('next.mod'))));
+    assert.equal(lookup.size, 2);
     assert.equal(keysForLibrary(library.library), keysForLibrary(library.library));
+});
+
+test('membership resets on rows replacement or shrink and stays isolated between libraries', () => {
+    const model = { rows: [record('first.mod'), record('removed.mod')] };
+    const original = keysForLibrary(model);
+    model.rows = [record('replacement.mod'), record('second.mod')];
+    const replacement = keysForLibrary(model);
+    assert.notEqual(replacement, original);
+    assert.deepEqual([...replacement], model.rows.map(locatorKey));
+    model.rows.length = 1;
+    assert.deepEqual([...keysForLibrary(model)], [locatorKey(record('replacement.mod'))]);
+    const other = { rows: [record('isolated.mod')] };
+    assert.deepEqual([...keysForLibrary(other)], [locatorKey(record('isolated.mod'))]);
+    assert.equal(keysForLibrary(model).has(locatorKey(record('isolated.mod'))), false);
+});
+
+test('indexed CSV and legacy rows-only libraries preserve row zero and append membership without revisions', () => {
+    for (const model of [parseLibraryCsv('source_path\nfirst.mod'), { rows: [record('first.mod')] }]) {
+        const lookup = keysForLibrary(model);
+        assert.ok(lookup.has(locatorKey(record('first.mod'))));
+        model.rows.push(record('next.mod'));
+        assert.equal(keysForLibrary(model), lookup);
+        assert.ok(lookup.has(locatorKey(record('next.mod'))));
+        assert.equal(lookup.size, 2);
+    }
 });
 
 for (const phase of ['running', 'paused', 'failed', 'complete']) test(`discovered imports preserve metadata provenance and ${phase} missing counts`, () => {

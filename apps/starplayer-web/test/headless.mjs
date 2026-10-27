@@ -71,7 +71,7 @@ function parseArguments(argv) {
 // ── environment ─────────────────────────────────────────────────────────────────────
 
 async function verifyPackagedSources() {
-    const names=['cooperative-yield.js','library-source.js','library-discovery.js','library-worker.js','library-worker-runtime.js','library-worker-jobs.js','library-index.js','library-controls.js','library-view.js','library-view-state.js'];
+    const names=['cooperative-yield.js','library-source.js','library-discovery.js','library-worker.js','library-worker-runtime.js','library-worker-jobs.js','library-index.js','library-controls.js','playlist-transfer.js','playlist-controls.js','library-view.js','library-view-state.js'];
     const hashes={};
     for(const name of names) {
         const source=await readFile(join(REPOSITORY_ROOT,'apps/starplayer-web/www',name));

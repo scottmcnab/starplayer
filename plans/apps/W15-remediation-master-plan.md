@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | **Implemented, independently reviewed and verified on `w15-remediation` — manual owner acceptance and future main landing pending (2026-10-27)** |
+| Status | **Implemented, independently reviewed and verified — R10 closed; manual owner acceptance and future main landing pending (2026-10-27)** |
 | Baseline | `48eee06`, `library-folder-plan` (feature baseline `b3faf9e`) |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Workers | GPT-6.1-sol, **high** effort |
@@ -73,6 +73,7 @@ cannot prove no future match. Documentation of both behaviors is in scope, not o
 | [R7](W15-remediation-R7-integration-evidence.md) | R4b/R5/R5a/R6/R6a (transitively all) | headless/W15 browser harness, documentation, final evidence |
 | [R8](W15-remediation-R8-trap-cleanup.md) | R4b/R7 (post-integration review) | worker jobs and endpoint/group/browser trap-cleanup regressions |
 | [R9](W15-remediation-R9-playback-scan-status.md) | R2/R6/R7/R8 (post-integration review) | controller scan-phase logic and focused/browser view regressions |
+| [R10](W15-remediation-R10-playlist-membership.md) | R2/R6/R7/R9 (full-feature Astra review) | playlist membership cache and actual-consumer regressions/preflight |
 
 R1, R2, R3, R4a and R5 all start from the baseline and touch disjoint files; run up to
 three concurrently (R1 and R4a are small). R6 follows R2/R3/R5 and consumes R5's
@@ -385,6 +386,19 @@ no scanning all tree nodes for every status tick. Existing playlist snapshot-add
 and indexed-library search semantics remain unchanged. A longer debounce alone does not
 meet this contract; incremental batch work must stay O(changed rows) plus at most one
 O(N) merge.
+
+### F. Playlist membership consumer work (post-review R10)
+
+Metadata-only notifications must remain bounded through playlist consumers as well as
+the view. General library.revision changes do not invalidate locator membership.
+`keysForLibrary` retains a live Set per library/rows array and, when accessed, adds
+newly appended locator keys only. Metadata/sidecar/status updates reuse it without full row traversal;
+row-array replacement or shrink resets it defensively. Legacy indexed libraries and
+all `.has` consumers remain supported. This supersedes archived F's revision-aware
+cache clause and its old Set-identity-after-append test; positive arrival/membership,
+availability and Rebind assertions remain mandatory. The complete-set Rebind gate is
+unchanged. R10 owns implementation/tests; coordinator notifies both reviewers of this
+explicit live-lookup contract. Source preflight includes both playlist consumer files.
 
 ## Research points
 
@@ -778,3 +792,79 @@ WebCrypto produces a raw path issue. Both were explicitly classified low-consequ
 by the reviewer. The already documented large-digest profiling follow-up remains
 separate. Native permission prompts, real collection/device and saved-playlist/
 reconnect/FileList/storage-denied/rebind checks remain manual owner acceptance.
+
+## Full-feature Astra review and R10 (2026-10-27)
+
+Astra at medium reviewed the complete main...w15-remediation delta at `72489c0` and
+found one P2 outside the isolated view benchmark: playlist membership cache rebuilds
+on metadata-only revisions. The actual controls diagnostic counted 2,000,000 locator
+visits for twenty one-row updates over 100k rows, even with an empty playlist after
+discovery completed. Independent 309 Node,31 archive/22 web and W15 SAB tests passed;
+these passes did not cover the operation bound. Other reviewed contracts had no new
+substantive findings. Report: `/tmp/starplayer-w15-astra-review/review.md`.
+The owner authorized [R10](W15-remediation-R10-playlist-membership.md), followed by
+read-only reviews from the original Claude session and Astra-medium. R10 was integrated
+as `f3f2171`; both requested reviewers closed it and all final gates passed, as recorded below. Earlier review closures above remain historical.
+
+### R10 review closure and final verification
+
+The production fix at `f3f2171` keeps a refreshed-on-access Set per library/rows array,
+processes only appended keys, and resets for array replacement or observed shrink.
+Metadata/sidecar/status revisions no longer invalidate membership. This removes the
+repeated library-size cost through actual playlist controls while preserving complete
+Rebind gating, source identity, availability, current/order and metadata provenance.
+No production model or controls change was needed. The permanent package preflight
+now checks twelve critical files, including both playlist consumers.
+
+| Actual controls work, 100k rows | Baseline | Integrated R10 |
+|---|---|---|
+| Twenty one-row metadata updates: numeric row reads | 2,000,020 | 20 |
+| Same updates: locator-field reads | 6,000,120 | 120 |
+| Status-only update: row / locator-field reads | 0 / 0 | 0 / 0 |
+| One appended row: row / locator-field reads | 100,002 / 300,003 | 2 / 3 |
+
+Counts isolate the consumer after producer mutations. They prove bounded changed-row
+work rather than a portable latency improvement; playlist-entry work remains
+proportional to playlist size. Initial cache construction, array replacement/shrink,
+explicit full import/Rebind and producer sidecar attachment retain their permitted
+full-library work. The dense append-only model never performs unsupported in-place
+locator edits, unobserved truncate/regrow or sparse-row mutations.
+
+Both requested reviews closed the finding on the actual integrated source:
+
+- Original Claude CLI session `e80ca7f5-7ec4-43b0-9549-fcc7c76304f5`: P2 closed;
+  no new correctness or performance defects. It verified the model/caller assumptions,
+  current code, positive counts, updated contract and regression assertions.
+- Original Astra reviewer, medium effort: P2 closed; no new substantive findings.
+  Independently passed the focused 40 tests, positive 100k actual-controls bounds and
+  500 oracle-checked append/metadata/replacement/observed-shrink/isolation transitions.
+
+The reviewers closed the code finding before all coordinator integration jobs
+finished. The coordinator subsequently checked every gate below; no pending reviewer
+verification is represented as an executed test.
+
+| Fresh R10 verification | Result / artifact under `/tmp/starplayer-w15-membership-fix/` |
+|---|---|
+| Focused Node tests | 40 passed; `coordinator-focused.log` |
+| Complete Node suite | 314 passed, zero failed/skipped; `coordinator-full-node.log` |
+| Positive 100k consumer reproduction | Passed bounded metadata/status/append assertions; `coordinator-after.json`, `membership-counts.mjs` |
+| Web Rust source contracts | 22 passed; `coordinator-web-rust.log` |
+| Development and Pages builds | Passed; `coordinator-wasm.log`, `coordinator-pages-build.log` |
+| W15 Chromium | All W15-only SAB/fallback/plain cases passed, including prior trap/status fixes, original indexed/OPFS/reload/playlist/40k and archive matrices; `coordinator-browser.log` |
+| Pages subpath worker smoke | Shipped isolation shim and nested worker passed; `coordinator-pages-smoke.log` |
+| Source/package identity | All twelve critical JS files match; playlist transfer/controls explicitly included |
+| Complete CI | All 11 jobs passed; `coordinator-ci.log` |
+
+`final-evidence.json` records exact commands, the before/after operation counts,
+review files, source/package SHA-256 values and artifact hashes. `validate-final.py`
+checks the full extended task graph, links, scopes, attribution, clean integration,
+unchanged AGENTS/main, both review closures, final results and cleanup. The temporary
+membership task branch/worktree was removed after clean-status and integrated-patch
+checks. Final production code is exactly what both reviewers inspected; subsequent
+changes only record evidence/status.
+
+Earlier unfiltered 60-second audio, hidden/freeze-thaw, native digest and 100k view
+latency runs remain historical evidence; they were not rerun for this narrow cache
+fix. Existing low-consequence callback/insecure-HTTP diagnostics, the separate large
+digest profiling task and manual native-picker/real-collection/device/reconnect/
+reselection/rebind acceptance remain unchanged. No main merge, push or deployment.

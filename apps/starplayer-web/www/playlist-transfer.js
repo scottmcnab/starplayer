@@ -3,10 +3,18 @@ import { libraryLocator } from './playlist.js';
 
 export { locatorKey };
 const libraryKeys = new WeakMap();
+// Rows and locators are append-only; metadata/sidecar revisions do not change membership.
+// Refresh the same Set on access using appended rows; reset for a replaced or shortened array.
 export function keysForLibrary(library) {
-    const cached = libraryKeys.get(library);
-    if (!cached || cached.revision !== library.revision) libraryKeys.set(library, { revision: library.revision, keys: new Set(library.rows.map(locatorKey)) });
-    return libraryKeys.get(library).keys;
+    const rows = library.rows;
+    let cached = libraryKeys.get(library);
+    if (!cached || cached.rows !== rows || cached.length > rows.length) {
+        cached = { rows, length: 0, keys: new Set() };
+        libraryKeys.set(library, cached);
+    }
+    for (let index = cached.length; index < rows.length; index++) cached.keys.add(locatorKey(rows[index]));
+    cached.length = rows.length;
+    return cached.keys;
 }
 export function rebindCandidates(entries, library) {
     if (!library || (library.mode === 'discovered' && library.discoveryStatus?.phase !== 'complete')) return [];

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { createPlaylist } from '../www/playlist.js';
 import { createPlaylistControls } from '../www/playlist-controls.js';
 import { createPlaylistPlayback } from '../www/playlist-playback.js';
-import { createDiscoveredLibrary, appendDiscoveredRows } from '../www/library-index.js';
+import { keysForLibrary, locatorKey } from '../www/playlist-transfer.js';
+import { createDiscoveredLibrary, appendDiscoveredRows, updateDiscoveredRows, attachComments, parseLibraryCsv } from '../www/library-index.js';
 
 const identity = { sha256: 'folder', name: 'Folder' };
 const row = sourcePath => ({ sourcePath, containerMember: '', memberPath: '', rawHex: '', size: 1, timestamp: '', playable: true, format: 'mod' });
@@ -142,5 +143,130 @@ test('row arrivals already enriched before discovery update legacy playlist snap
         const count = fixture.saved.length;
         fixture.controls.libraryUpdated(fixture.state.library, { changedRowIds, metadataUpdates: [] });
         assert.equal(fixture.saved.length, count);
+    } finally { fixture.restore(); }
+});
+
+// Count numeric row reads and locator fields, so map, loops and iterators all count.
+// Reset after producer mutations: these bounds concern the real controls consumer.
+function trackMembershipReads(model) {
+    const counts = { rows: 0, locatorFields: 0 };
+    const tracked = new WeakMap();
+    model.rows = new Proxy(model.rows, {
+        get(rows, property, receiver) {
+            const value = Reflect.get(rows, property, receiver);
+            if (typeof property !== 'string' || !/^(0|[1-9][0-9]*)$/.test(property)) return value;
+            counts.rows++;
+            if (!value) return value;
+            if (!tracked.has(value)) tracked.set(value, new Proxy(value, {
+                get(row, field, rowReceiver) {
+                    if (['sourcePath', 'containerMember', 'memberPath'].includes(field)) counts.locatorFields++;
+                    return Reflect.get(row, field, rowReceiver);
+                },
+            }));
+            return tracked.get(value);
+        },
+    });
+    return { counts, reset() { counts.rows = 0; counts.locatorFields = 0; } };
+}
+
+for (const populated of [false, true]) test(`completed 100k library bounds metadata, sidecar, status and append work with ${populated ? 'populated' : 'empty'} playlist`, async t => {
+    const fixture = await setup();
+    try {
+        const context = fixture.state.library;
+        appendDiscoveredRows(context.library, Array.from({ length: 100000 }, (_, index) => row(`song-${index}.mod`)));
+        context.discoveryStatus.phase = 'complete';
+        const reads = trackMembershipReads(context.library);
+        fixture.controls.libraryUpdated(context, { changedRowIds: [], metadataUpdates: [] });
+        const lookup = keysForLibrary(context.library);
+        assert.equal(lookup.size, 100000);
+        const initialReads = { ...reads.counts };
+        const old = { sha256: 'old', name: 'Old' };
+        const entries = populated ? fixture.playlist.add([item('song-0.mod'), item('later.mod'), item('rebind.mod', old)]) : [];
+        if (populated) fixture.playlist.setCurrent(entries[0].id);
+        const metadataReads = { rows: 0, locatorFields: 0 };
+        for (let index = 0; index < 20; index++) {
+            const changedRowIds = updateDiscoveredRows(context.library, [{ locator: row(`song-${index}.mod`), patch: { title: `Updated ${index}`, metadataState: 'ready', sha256: index === 0 ? 'a'.repeat(64) : '' } }]);
+            reads.reset();
+            fixture.controls.libraryUpdated(context, { changedRowIds, rowChanges: context.library.lastRowChanges, metadataUpdates: [] });
+            metadataReads.rows += reads.counts.rows;
+            metadataReads.locatorFields += reads.counts.locatorFields;
+        }
+        t.diagnostic(JSON.stringify({ rows: 100000, playlistEntries: entries.length, batches: 20, initialReads, metadataReads }));
+        assert.ok(metadataReads.rows <= 20, 'metadata reads at most one library row per changed row');
+        assert.ok(metadataReads.locatorFields <= 120, 'metadata locator reads stay bounded per changed row');
+        assert.equal(keysForLibrary(context.library), lookup);
+        if (populated) {
+            assert.equal(fixture.playlist.entries[0].display.title, 'Updated 0');
+            assert.equal(fixture.playlist.current.id, entries[0].id);
+            assert.deepEqual(fixture.playlist.entries.map(entry => entry.id), entries.map(entry => entry.id));
+            assert.equal(fixture.controls.availability(entries[1]), 'not found in scan');
+        }
+        for (const comments of [new Map([['a'.repeat(64), { instrumentNames: 'First' }]]), new Map([['a'.repeat(64), { instrumentNames: 'Replacement' }]]), null]) {
+            attachComments(context.library, comments);
+            assert.deepEqual(context.library.commentChangedRowIds, [0]);
+            reads.reset();
+            fixture.controls.libraryUpdated(context, { changedRowIds: context.library.commentChangedRowIds, rowChanges: context.library.lastRowChanges, metadataUpdates: [] });
+            t.diagnostic(JSON.stringify({ sidecarReads: { ...reads.counts } }));
+            assert.ok(reads.counts.rows <= 1, 'sidecar reads at most its changed row');
+            assert.ok(reads.counts.locatorFields <= 6, 'sidecar locator reads stay bounded per changed row');
+            assert.equal(keysForLibrary(context.library), lookup);
+        }
+        reads.reset();
+        fixture.controls.libraryUpdated(context, { changedRowIds: [], rowChanges: [], statusChanged: true });
+        assert.deepEqual(reads.counts, { rows: 0, locatorFields: 0 });
+        const changedRowIds = appendDiscoveredRows(context.library, [row('later.mod'), row('rebind.mod')]);
+        reads.reset();
+        fixture.controls.libraryUpdated(context, { changedRowIds, rowChanges: context.library.lastRowChanges, metadataUpdates: [] });
+        t.diagnostic(JSON.stringify({ appendedRows: changedRowIds.length, appendReads: { ...reads.counts } }));
+        assert.ok(reads.counts.rows <= changedRowIds.length * 2, 'append reads only changed rows for display and membership');
+        assert.ok(reads.counts.locatorFields <= changedRowIds.length * 3, 'append serializes at most the new locator keys');
+        assert.equal(keysForLibrary(context.library), lookup);
+        assert.equal(lookup.size, 100002);
+        assert.ok(lookup.has(locatorKey(row('later.mod'))));
+        if (populated) {
+            assert.equal(fixture.controls.availability(entries[1]), '');
+            assert.equal(fixture.controls.canPlay(entries[1]), true);
+            assert.equal(fixture.element('rebind').disabled, false);
+            assert.match(fixture.element('rebind').textContent, /Rebind 1 entries/);
+            fixture.element('rebind').dispatchEvent(new Event('click'));
+            assert.equal(fixture.playlist.entries[2].locator.libraryIdentity.sha256, identity.sha256);
+            assert.equal(fixture.controls.availability(fixture.playlist.entries[2]), '');
+            assert.equal(fixture.playlist.current.id, entries[0].id);
+            assert.deepEqual(fixture.playlist.entries.map(entry => entry.id), entries.map(entry => entry.id));
+        }
+    } finally { fixture.restore(); }
+});
+
+test('controls replace library membership and preserve legacy indexed row-zero gates', async () => {
+    const fixture = await setup();
+    try {
+        const entries = fixture.playlist.add([item('first.mod'), item('second.mod')]);
+        const context = fixture.state.library;
+        context.mode = 'indexed';
+        context.library = parseLibraryCsv('source_path\nfirst.mod');
+        fixture.controls.libraryChanged(context);
+        assert.equal(fixture.controls.canPlay(entries[0]), true);
+        assert.equal(fixture.controls.canPlay(entries[1]), false);
+        context.library.rows = [row('second.mod')];
+        fixture.controls.libraryUpdated(context, { changedRowIds: [0] });
+        assert.equal(fixture.controls.availability(entries[0]), 'track not in library');
+        assert.equal(fixture.controls.canPlay(entries[0]), false);
+        assert.equal(fixture.controls.canPlay(entries[1]), true);
+        context.library.rows.length = 0;
+        fixture.controls.libraryUpdated(context, { statusChanged: true });
+        assert.equal(fixture.controls.canPlay(entries[1]), false);
+        const replacement = { ...context, library: { rows: [row('first.mod')] } };
+        fixture.state.library = replacement;
+        fixture.controls.libraryChanged(replacement);
+        assert.equal(fixture.controls.availability(entries[0]), '');
+        assert.equal(fixture.controls.canPlay(entries[0]), true);
+        assert.equal(fixture.controls.canPlay(entries[1]), false);
+        replacement.library.rows.push(row('second.mod'));
+        fixture.controls.libraryUpdated(replacement, { changedRowIds: [1] });
+        assert.equal(fixture.controls.canPlay(entries[1]), true);
+        fixture.state.library = library('complete', { sha256: 'replacement', name: 'Replacement' });
+        fixture.controls.libraryChanged(fixture.state.library);
+        assert.match(fixture.controls.availability(entries[0]), /library not connected/);
+        assert.equal(fixture.controls.canPlay(entries[0]), false);
     } finally { fixture.restore(); }
 });

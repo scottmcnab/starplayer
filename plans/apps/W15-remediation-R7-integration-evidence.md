@@ -207,3 +207,15 @@ is authoritative. No main merge, push or deployment occurred.
 ## Post-integration review follow-up (2026-10-27)
 
 The owner-requested post-integration review produced [R8](W15-remediation-R8-trap-cleanup.md) and [R9](W15-remediation-R9-playback-scan-status.md), both closed on re-review at `a18d224`. The complete repeated Node suite is 309 tests; full three-mode Chromium, Rust/WASM/Pages, 11-job CI and repeated hidden/visibility checks passed. Initial R7 evidence above remains historical; see the [master final review record](W15-remediation-master-plan.md#review-closure-and-final-post-review-gates).
+
+
+## R10 actual-consumer coverage (2026-10-27)
+
+The full-feature Astra review found membership work outside the isolated view
+benchmark. [R10](W15-remediation-R10-playlist-membership.md) fixes it and adds bounded
+100k actual playlist-controls regressions. Both original Claude and Astra-medium
+reviews closed the finding. Fresh 314 Node, W15 SAB/fallback/plain, development/Pages,
+22 web source-contract tests and all 11 CI jobs passed; twelve package preflight
+identities now include both playlist consumers. Earlier audio/hidden/performance
+measurements remain historical, not new R10 timing claims. See the
+[master closure](W15-remediation-master-plan.md#r10-review-closure-and-final-verification).

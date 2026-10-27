@@ -10,6 +10,11 @@
 | Ownership | playlist JS, `app.js`, `playback-controller.js`, playlist/app unit tests; source-contract tests after B |
 | Coordinator | gpt-6.1-sol, xhigh; [master](W15-master-plan.md) |
 
+> Post-review amendment (2026-10-27): [R10](../W15-remediation-R10-playlist-membership.md)
+> supersedes only the revision-aware membership-cache clause: the lookup is a live
+> append-aware Set, reused across metadata/sidecar revisions. Historical evidence and
+> all membership/Rebind behavior remain requirements.
+
 ## Context for a fresh agent
 
 Read `AGENTS.md`, [W15 master](W15-master-plan.md), and the complete
