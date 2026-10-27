@@ -2,12 +2,12 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — independently re-reviewed/closed; all final automated gates passed** |
+| Status | **Landed on `main` via `ece531f` (2026-10-27) — reviewed/verified; manual feature acceptance pending** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Integrated R4b and R7 |
 | Ownership | library-worker-jobs.js, focused worker/group tests and w15-remediation-headless.mjs; narrow Rust binding comment if needed |
-| Branch / sibling worktree | `w15-remediation-review-fixes` / `../starplayer-w15-remediation-review-fixes` |
+| Historical branch / sibling worktree | `w15-remediation-review-fixes` / `../starplayer-w15-remediation-review-fixes` |
 | Authorization | Worker implements and verifies; no staging, commit, merge, push or deployment |
 
 ## Context for a fresh agent

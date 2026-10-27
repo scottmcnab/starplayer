@@ -3,12 +3,12 @@
 | Field | Value |
 |---|---|
 | Milestone | Web player: music library |
-| Status | Complete on `w15-folder-library` — automated gates passed; manual owner acceptance pending |
+| Status | **Landed on `main` via `ece531f` (2026-10-27) — automated verification complete; manual owner acceptance pending** |
 | Depends on | W7–W13 library, resolver, view and playlist work (alongside this archive) |
 | Role | Behavioral specification; execute through [W15 master](W15-master-plan.md) |
 | Coordinator | gpt-6.1-sol, xhigh effort |
 | Workers | gpt-6.1-sol, high effort; eight tasks in master |
-| Branch | `w15-folder-library` (integration; not merged to `main`) |
+| Historical branch | `w15-folder-library` (original integration; final delivery landed through `w15-remediation`) |
 | Verification | Web unit/headless tests, archive/web Rust tests, WASM packaging, repository CI |
 
 This document retains the reviewed product behavior. The [master plan](W15-master-plan.md)
@@ -16,10 +16,10 @@ splits execution into eight tasks, fixes ownership and shared interfaces, and de
 coordinator review gates. Do not delegate this entire specification as one worker task.
 
 > Follow-up (updated 2026-10-27): independent review identified correctness, performance and
-> hardening work after this delivery. See the active [W15 remediation master](../W15-remediation-master-plan.md).
+> hardening work after this delivery. See the archived [W15 remediation master](W15-remediation-master-plan.md).
 > The delivery/evidence below remains historical; the new master explicitly supersedes
-> affected contracts. Remediation is implemented and verified on `w15-remediation`;
-> manual owner acceptance and future main landing remain pending. No deployment occurred.
+> affected contracts. Final remediation landed on `main` via `ece531f` (2026-10-27);
+> manual owner acceptance remains pending. No deployment occurred.
 
 ## Context for a fresh agent
 

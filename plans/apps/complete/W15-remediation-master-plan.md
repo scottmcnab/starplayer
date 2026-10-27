@@ -2,23 +2,52 @@
 
 | Field | Value |
 |---|---|
-| Status | **Implemented, independently reviewed and verified — R10 closed; manual owner acceptance and future main landing pending (2026-10-27)** |
+| Status | **Landed on `main` via `ece531f` (2026-10-27) — reviewed/verified; manual feature acceptance pending** |
 | Baseline | `48eee06`, `library-folder-plan` (feature baseline `b3faf9e`) |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Workers | GPT-6.1-sol, **high** effort |
-| Historical delivery | [W15 master and evidence](complete/W15-master-plan.md), [behavioral specification](complete/W15-task-folder-library-discovery.md) |
-| Integration branch / worktree | `w15-remediation` / `../starplayer-w15-remediation` |
-| Authorization now | Implementation, delegated workers and integration commits authorized; no main merge, push or deployment |
+| Historical delivery | [W15 master and evidence](W15-master-plan.md), [behavioral specification](W15-task-folder-library-discovery.md) |
+| Historical integration branch / worktree | `w15-remediation` / `../starplayer-w15-remediation` |
+| Landing authorization | Owner authorized `--no-ff` main merge and W15 checkout cleanup; merge `ece531f` completed 2026-10-27; no push/deployment |
+
+## Main landing (2026-10-27)
+
+The owner authorized and completed `git merge --no-ff w15-remediation` from main's
+own checkout. Merge `ece531f02ae4bcc635a1f925f01aaf57fd20afe6` has first parent
+`127027f3c3fce29ff7e81240e19501ead9bb5000` and feature parent
+`31a19158eca3c7557a704e4fa4fbd2662ab112ad`. Its tree exactly matches the previously reviewed/tested
+feature tree; no source conflict or implementation change was introduced by landing.
+
+The final feature history was consolidated from 45 to 15 commits before landing.
+The [historical commit map](W15-history-map.tsv) maps original execution/review IDs
+used below to the rebased commits reachable from main. Earlier no-main-merge and
+not-landed statements describe their original implementation/verification phase;
+this landing record and header are the current status. These 14 completed remediation
+plans now live in `complete/`; the separate [large-digest profiling follow-up](../W15-followup-large-digest-start-cost.md)
+remains active. No push or deployment occurred.
+
+Landing verification in main's own checkout passed all 314 Node tests,
+`cargo xtask wasm` with the package destination checked, and every W15 SAB browser
+case with the twelve-file source/package preflight. The merge preserved the exact
+reviewed feature tree; archiving changes only plans and links, so the previously
+recorded full feature CI/browser evidence remains applicable to unchanged sources.
+Landing logs and checks are under `/tmp/starplayer-w15-landing-kp22czit/`.
+
+Manual owner acceptance remains for native folder-picker permissions/reconnect,
+real large collections and device responsiveness, and saved-playlist reload/reconnect/
+FileList/storage-denied reselection and complete-scan rebind. Review findings are closed;
+these owner checks and the separate profiling follow-up are not represented as done.
 
 ## Context for a fresh agent
 
 Read AGENTS.md, this master and the assigned task. The original W15 implementation
 and its successful automated evidence remain historical facts; independent review
-subsequently reproduced gaps not established by those tests. This active plan is the
-source of truth for remediation. Implementation is authorized; verification results are recorded as tasks finish.
-Original task branches/worktrees were deleted; the original integration checkout
-`/home/scott/projects/starplayer-w15-folder-library` on `w15-folder-library` remains.
-Do not reuse/delete that checkout as part of remediation.
+subsequently reproduced gaps not established by those tests. This archived plan
+records the reviewed contracts and execution results. Implementation is complete;
+remaining owner acceptance and the active profiling follow-up are listed above.
+Original delivery checkouts were retained during implementation. The owner separately
+authorized cleanup of the obsolete W15 checkouts after the final main landing recorded
+above; the implementation-time retention restriction is now historical.
 
 Review input was `/tmp/starplayer-w15-review/planning-request.md`, including twelve
 dispositions and independent reproductions. Temporary reproduction programs were
@@ -46,13 +75,14 @@ new archive formats. Do not run cargo fmt or touch historical assembly.
 | 9 | Intentional compatibility behavior / regression | First raw duplicate wins for catalog AND legacy upload/extraction; retain compatibility tests and note; R4a/R7 |
 | 10 | Fatal-instance hardening blocker | Actual WASM RuntimeError retires worker, suspends queue, explicit retry; ordinary data errors remain isolated; R1/R4b |
 | 11 | Intentional incomplete-scan behavior | Preserve disabled Rebind pending and complete matching-set gating; optional explanatory help only, no inferred zero matches; R7 |
-| 12 | Process / landing bookkeeping | Keep not-merged status truthful; future authorized multi-commit milestone landing uses --no-ff; coordinator/R7 |
+| 12 | Completed landing bookkeeping | Landed with `--no-ff` merge `ece531f`; archive/cleanup and remaining owner-acceptance status recorded |
 
 Items 1–3 must pass before R4b (archive grouping integration) starts. All blocker tasks
 and automated R7 gates are required before this remediation is considered ready for a
 future landing. Native-picker, actual large collection and real-device performance
 checks remain explicitly named owner acceptance; do not silently replace failed
-browser gates with those manual items. No merge to main, push or deployment is authorized.
+browser gates with those manual items. The implementation phase did not authorize main landing; the owner separately
+authorized the main merge recorded above. Push/deployment remain outside this landing.
 Registry deletion/reconciliation UI (#8) and cosmetic Rebind redesign (#11) are deferred:
 uncertain equality is not evidence that two identities differ, and incomplete discovery
 cannot prove no future match. Documentation of both behaviors is in scope, not optional.
@@ -487,7 +517,8 @@ No automatic registry eviction or storage reset, no eager Size/Date stat pass, n
 ZIP duplicate policy, no partial-discovery rebind, no content-addressed permanent catalog,
 no engine/RT changes. Coordinator updates #12 only when a landing actually happens;
 retain archived success evidence with a dated link to this follow-up. Implementation and integration commits were authorized by the owner on 2026-10-27.
-No merge to main, push or deployment is authorized.
+The implementation phase did not authorize main landing; the owner separately
+authorized the main merge recorded above. Push/deployment remain outside this landing.
 
 ## Execution record (2026-10-27)
 
@@ -590,7 +621,7 @@ harness/docs work; final full/hidden/performance acceptance passed on this versi
 All native fixture correctness/cleanup gates passed, but large input invocation cost
 is material: 128 MiB p50 150.020 ms / p95=max 181.165 ms, with four physical promises
 and 512 MiB summed input bytes in the controlled burst. This is not measured total
-browser memory. [Separate profiling follow-up](W15-followup-large-digest-start-cost.md)
+browser memory. [Separate profiling follow-up](../W15-followup-large-digest-start-cost.md)
 records all sizes/distributions and requests diagnosis plus a reviewed recommendation.
 No queue/cap/recovery implementation is added here. Final isolated 100k user re-sort
 was 81.910 ms with an 88 ms overlapping long task, below the 100 ms slicing trigger; no sliced
@@ -608,8 +639,8 @@ reviewed, committed and verified on `w15-remediation` in
 effort, did not stage/commit/merge, and reported bounded diffs/results. The coordinator
 reviewed each diff, independently verified focused gates, and squashed each single
 change from the integration checkout. No merge to main, push or deployment occurred.
-These plans remain active until the future authorized main landing, following the
-archive rule in [the plan index](../README.md).
+These plans are now archived after the main landing, following the archive rule in
+[the plan index](../../README.md). Earlier execution results below remain historical.
 
 | Task / correction | Integration commit | Result |
 |---|---|---|
@@ -686,7 +717,7 @@ it is not a six-minute hidden pending-delta measurement. No visibility listener 
 forced flush was added. No observed result triggered a visibility-flush follow-up.
 
 Native large-input invocation cost triggered the separate
-[profiling follow-up](W15-followup-large-digest-start-cost.md), committed as `9a098a2`.
+[profiling follow-up](../W15-followup-large-digest-start-cost.md), committed as `9a098a2`.
 For 128 MiB, invocation p50/p95=max was 150.020/181.165 ms. A deliberate four-request
 controller burst had four physical promises and a 512 MiB summed input-byte estimate;
 this is not measured total browser memory or an upper bound on native overhead.

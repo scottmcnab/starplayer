@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Complete on `library-folder-plan` — automated gates passed; manual owner acceptance pending |
+| Status | **Landed on `main` via `ece531f` (2026-10-27) — automated verification complete; manual owner acceptance pending** |
 | Coordinator | gpt-6.1-sol, **xhigh** effort |
 | Workers | gpt-6.1-sol, **high** effort for all tasks |
 | Planning branch | `library-folder-plan` |
@@ -12,10 +12,10 @@
 | Deliverable | Progressive local folder/ZIP libraries, lazy metadata, usable saved playlists |
 
 > Follow-up (updated 2026-10-27): independent review identified correctness, performance and
-> hardening work after this delivery. See the active [W15 remediation master](../W15-remediation-master-plan.md).
+> hardening work after this delivery. See the archived [W15 remediation master](W15-remediation-master-plan.md).
 > The delivery/evidence below remains historical; the new master explicitly supersedes
-> affected contracts. Remediation is implemented and verified on `w15-remediation`;
-> manual owner acceptance and future main landing remain pending. No deployment occurred.
+> affected contracts. Final remediation landed on `main` via `ece531f` (2026-10-27);
+> manual owner acceptance remains pending. No deployment occurred.
 
 ## Context for a fresh coordinator
 

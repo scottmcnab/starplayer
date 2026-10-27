@@ -11,7 +11,7 @@
 
 ## Context for a fresh agent
 
-Read AGENTS.md, [remediation master](W15-remediation-master-plan.md), its R2/R7 tasks,
+Read AGENTS.md, [remediation master](complete/W15-remediation-master-plan.md), its R2/R7 tasks,
 and apps/starplayer-web/test/w15-remediation-headless.mjs. Remediation deliberately
 hashes playback bytes on the page, calls WebCrypto synchronously before any await,
 and publishes metadata/SHA atomically when the accepted context/version is current.

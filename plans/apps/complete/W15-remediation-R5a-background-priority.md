@@ -2,12 +2,12 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — reviewed; focused and final combined automated gates passed** |
+| Status | **Landed on `main` via `ece531f` (2026-10-27) — reviewed/verified; manual feature acceptance pending** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Integrated R5; preserve integrated R2/R4b notification contracts |
 | Ownership | www/cooperative-yield.js and test/cooperative-yield.test.mjs only |
-| Branch / sibling worktree | `w15-remediation-r5a` / `../starplayer-w15-remediation-r5a` |
+| Historical branch / sibling worktree | `w15-remediation-r5a` / `../starplayer-w15-remediation-r5a` |
 | Authorization | Implementation/integration authorized; worker must not stage, commit or merge |
 
 ## Context for a fresh agent

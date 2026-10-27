@@ -2,18 +2,18 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — reviewed; focused and final combined automated gates passed** |
+| Status | **Landed on `main` via `ece531f` (2026-10-27) — reviewed/verified; manual feature acceptance pending** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | Baseline; parallel R1/R3 |
 | Ownership | library-source.js, new cooperative-yield.js, source/scheduler unit tests |
-| Branch / sibling worktree | `w15-remediation-r5` / `../starplayer-w15-remediation-r5` |
+| Historical branch / sibling worktree | `w15-remediation-r5` / `../starplayer-w15-remediation-r5` |
 | Authorization now | Implementation authorized; worker must not stage, commit or merge |
 
 ## Context for a fresh agent
 
 Read AGENTS.md, [remediation master](W15-remediation-master-plan.md), and the
-[archived W15 master](complete/W15-master-plan.md) with its linked implementation
+[archived W15 master](W15-master-plan.md) with its linked implementation
 evidence. The remediation contracts explicitly supersede only listed archived clauses.
 Feature baseline is b3faf9e; execution starts from the integrated planning tip.
 Task status and verification are updated by the coordinator.

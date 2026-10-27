@@ -2,18 +2,18 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — reviewed; all automated gates passed, manual owner acceptance pending** |
+| Status | **Landed on `main` via `ece531f` (2026-10-27) — reviewed/verified; manual feature acceptance pending** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | R4b/R5/R5a/R6/R6a; measured corrections must integrate before final acceptance |
 | Ownership | w15-headless.mjs/headless harness, LIBRARY-CSV.md, help text after R6 handoff |
-| Branch / sibling worktree | `w15-remediation-r7` / `../starplayer-w15-remediation-r7` |
+| Historical branch / sibling worktree | `w15-remediation-r7` / `../starplayer-w15-remediation-r7` |
 | Authorization now | Implementation authorized; worker must not stage, commit or merge |
 
 ## Context for a fresh agent
 
 Read AGENTS.md, [remediation master](W15-remediation-master-plan.md), and the
-[archived W15 master](complete/W15-master-plan.md) with its linked implementation
+[archived W15 master](W15-master-plan.md) with its linked implementation
 evidence. The remediation contracts explicitly supersede only listed archived clauses.
 Feature baseline is b3faf9e; execution starts from the integrated planning tip.
 Task status and verification are updated by the coordinator.
@@ -177,7 +177,7 @@ re-sort was 81.910 ms synchronous / 88 ms overlapping long task, below the 100 m
 follow-up trigger. Its overall longest task, including initial construction, was
 654 ms; no universal latency claim is made. Native loose 1/32/64/128 MiB and extracted
 64 MiB fixtures all passed correctness/cleanup. Large-input cost and all distributions
-are preserved in the [separate profiling task](W15-followup-large-digest-start-cost.md).
+are preserved in the [separate profiling task](../W15-followup-large-digest-start-cost.md).
 No queue/cap/recovery design was introduced.
 
 Evidence directory: `/tmp/starplayer-w15-remediation-evidence/`.

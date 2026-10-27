@@ -2,17 +2,17 @@
 
 | Field | Value |
 |---|---|
-| Status | **Integrated — original Claude and Astra reviews closed; final automated gates passed** |
+| Status | **Landed on `main` via `ece531f` (2026-10-27) — reviewed/verified; manual feature acceptance pending** |
 | Worker | GPT-6.1-sol, **high** effort |
 | Coordinator | GPT-6.1-sol, **xhigh** effort |
 | Depends on | R2/R6/R7/R9; reviewed integration baseline `72489c0` |
 | Ownership | playlist-transfer.js; playlist-transfer/control regression tests; narrow headless source-preflight list extension |
-| Branch / sibling worktree | `w15-remediation-membership` / `../starplayer-w15-remediation-membership` |
+| Historical branch / sibling worktree | `w15-remediation-membership` / `../starplayer-w15-remediation-membership` |
 | Authorization | Worker implements/verifies only; no staging, commits, merges, pushes or deployment |
 
 ## Context for a fresh agent
 
-Read AGENTS.md, [master](W15-remediation-master-plan.md), archived [F](complete/W15-task-F-playlist-playback-integration.md), and the producer/consumer code/tests. The owner requests fixing the medium full-feature review finding, followed by the original Claude CLI session and Astra-medium reviewing the fix. The full review report and diagnostic are `/tmp/starplayer-w15-astra-review/review.md` and membership-repro.mjs/json. The diagnostic asserts the bad behavior and is not an acceptance test.
+Read AGENTS.md, [master](W15-remediation-master-plan.md), archived [F](W15-task-F-playlist-playback-integration.md), and the producer/consumer code/tests. The owner requests fixing the medium full-feature review finding, followed by the original Claude CLI session and Astra-medium reviewing the fix. The full review report and diagnostic are `/tmp/starplayer-w15-astra-review/review.md` and membership-repro.mjs/json. The diagnostic asserts the bad behavior and is not an acceptance test.
 
 At the reviewed baseline, `keysForLibrary` invalidated on any library.revision. Once discovery completed, playlistControls.libraryUpdated -> updateRebind -> rebindCandidates rebuilt all locator keys even for an empty playlist. The 100k-row diagnostic counts two million row visits for twenty one-row title updates; instrumented Node mean 28.63 ms / max 36.67 ms. Existing view-only performance counters omit this consumer. Model rows/IDs/locators are append-only; metadata/sidecar revisions change no membership. This narrow fix must preserve all prior playback/digest/identity/Rebind contracts.
 
