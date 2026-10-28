@@ -270,6 +270,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .library-track > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 5px; border-bottom: 1px solid var(--line); }
 .library-selection-cell { display: flex; align-items: center; justify-content: center; min-width: 44px; min-height: 32px; cursor: pointer; border-bottom: 1px solid var(--line); }
 .library-selection-cell input { width: 18px; height: 18px; margin: 0; cursor: pointer; accent-color: var(--accent); }
+.library-track > .library-name-cell { display: flex; align-items: center; gap: 5px; }
+.library-track-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.library-error-marker, .playlist-availability-warning { flex: none; color: #e6c66b; font-weight: 700; }
 .library-track[aria-selected=true] { background: #263e51; }
 .library-track.focused { outline: 1px solid var(--accent); outline-offset: -1px; }
 .library-track.playing { color: var(--accent); box-shadow: inset 4px 0 var(--accent); }
@@ -326,7 +329,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .playlist-marker { flex-shrink: 0; max-width: 50%; overflow: hidden; text-overflow: ellipsis; color: var(--accent-2); }
 
 #library-details { min-width: 0; max-height: 260px; overflow: auto; margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 7px; }
-#library-details h3 { margin: 0 0 8px; overflow-wrap: anywhere; }
+#library-details summary { font-weight: 700; cursor: pointer; overflow-wrap: anywhere; }
+#library-details[open] summary { margin-bottom: 8px; }
 #library-details h4 { margin: 8px 0 4px; }
 #library-details pre { max-width: 100%; overflow-x: auto; white-space: pre; margin: 0; font: 12px/1.5 ui-monospace, monospace; }
 #library-details mark { background: #e6c66b; color: #10151b; }

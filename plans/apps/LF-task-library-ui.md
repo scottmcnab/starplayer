@@ -56,6 +56,18 @@ avoid redundant tests mirroring trivial markup. Parent owns WASM/browser checks:
 phone/desktop widths, tooltip reasons, selection/deselection, collapse persistence,
 header/body column order and audition. Coordinate any browser/build needs.
 
+### Worker evidence (2026-10-29)
+
+- Implemented explicit Library error-marker tooltips, compact yellow Playlist
+  availability markers, selected-row details with native disclosure persistence,
+  sole-row click deselection, Escape clearing from native checkboxes, and Play
+  before note-overlap checkbox in both table headings and rows.
+- Updated existing Library/Playlist/instrument browser scenarios for the new
+  behavior; coordinator will run the packaged WASM/browser checks.
+- Focused Node selection/rendering/control checks: 41 passed. Full serialized Node
+  suite: 394 passed, zero failed (about 9.5 seconds).
+- `node --check` passed for all touched JavaScript/test files; `git diff --check` passed.
+
 ## Out of scope
 
 Engine/duration/loaders, persistence schema, Sites hosting/deployment.

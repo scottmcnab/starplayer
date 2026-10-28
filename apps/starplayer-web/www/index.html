@@ -151,7 +151,7 @@
             <summary>About folder libraries</summary>
             <p>Open a folder with or without an index CSV. A valid index is used first; Browse folder without an index discovers the folder directly. Server and streaming libraries require an index.</p>
             <p>Tracks appear progressively as directories and ZIP catalogs are read. You can search, play and add tracks immediately. Stop discovery keeps partial results; Resume continues. Folder + adds only the tracks discovered when clicked, including subfolders; later discoveries are never appended automatically.</p>
-            <p>Titles, channels and instrument/sample text arrive on playback or with Scan metadata. Metadata searches remain incomplete until that information is available. Cancel metadata scan leaves discovery and playback available. Track errors appear in row tooltips and focused-row details, with Retry metadata for failed inspections. Show unplayable reveals known archive extraction failures. Song messages are searchable through comments sidecars only in this version; they are not extracted from module bytes.</p>
+            <p>Titles, channels and instrument/sample text arrive on playback or with Scan metadata. Metadata searches remain incomplete until that information is available. Cancel metadata scan leaves discovery and playback available. Track errors appear in exclamation-marker tooltips and selected-row details, with Retry metadata for failed inspections. Show unplayable reveals known archive extraction failures. Song messages are searchable through comments sidecars only in this version; they are not extracted from module bytes.</p>
             <p>Size and Date stay blank for loose files when browsing a folder directly. File-list selections and CSV indexes can supply those values.</p>
             <p>ZIPs support one nested ZIP level, with a 128 MiB source-file limit and 64 MiB extracted-entry limit. Discovery reads no loose module contents; selecting or adding tracks reads no module contents. Duplicate ZIP paths use the first entry.</p>
             <p>Reconnect restores an accepted directory when browser storage and permissions permit, then discovers it again. Saved matching folder tracks can play before discovery reaches them. File-list folders and storage failures last for this session; choose the folder again and explicitly rebind after discovery completes. If the browser cannot confirm a previously selected folder, this selection lasts for the session. Try Reconnect or select the folder again; otherwise use Rebind after discovery completes to reconnect matching saved tracks. Rebind pending means the matching set is not known yet, without promising matches. The fallback folder picker collects the entire file list before returning, so its initial browser-controlled delay cannot be removed.</p>
@@ -167,7 +167,7 @@
                 <output id="library-count" aria-live="polite"></output>
             </div>
             <p id="library-query-hint" class="library-hint">Search names, titles and paths; prefixes: name:, title:, path:, format:, tracker:, text:, ch:8, ch:&gt;8. Use quotes for phrases, e.g. "purple motion" or purplemotion; a leading - excludes, e.g. oxygen -oxygene.</p>
-            <p id="library-selection-hint" class="library-hint">Use row checkboxes to select tracks, or the heading checkbox for all current results. Click, Ctrl/⌘-click or Shift-click also selects. Ctrl/⌘+A selects all results; Escape clears. Arrows, Home/End and PageUp/Down move; Shift extends. Enter plays; + or Insert adds. Hidden rows stay selected; actions use only playable rows in the current result.</p>
+            <p id="library-selection-hint" class="library-hint">Use row checkboxes to select tracks, or the heading checkbox for all current results. Click selects; click the sole selected row again to clear. Ctrl/⌘-click toggles and Shift-click selects a range. Ctrl/⌘+A selects all results; Escape clears. Arrows, Home/End and PageUp/Down move; Shift extends. Enter plays; + or Insert adds. Hidden rows stay selected; actions use only playable rows in the current result.</p>
             <div id="library-body" class="library-body">
                 <div id="library-folders" hidden>
                     <p id="library-scope" class="library-tree-caption">All folders</p>
@@ -183,10 +183,10 @@
                     </div>
                 </div>
             </div>
-            <section id="library-details" role="region" aria-labelledby="library-details-title" hidden>
-                <h3 id="library-details-title"></h3>
+            <details id="library-details" aria-labelledby="library-details-title" open hidden>
+                <summary id="library-details-title"></summary>
                 <div id="library-details-content"></div>
-            </section>
+            </details>
             <p id="library-selection-count" class="library-hint"></p>
         </div>
     </details>
@@ -299,8 +299,8 @@
             <p class="library-hint">Preview uses the selected Reference Note (default C-5, 60), prepared samples and the current master DSP, with no automatic tracker-channel inserts. One-shot previews finish after release; loops release natively and may require Stop preview. Pause keeps envelopes, loops and DSP running.</p>
             <div class="instrument-scroll">
                 <table class="instrument-table" aria-label="Instruments">
-                    <colgroup><col class="instrument-number"><col><col class="instrument-loop"><col class="instrument-overlap"><col class="instrument-play-column"><col class="instrument-frames"></colgroup>
-                    <thead><tr><th scope="col">#</th><th scope="col">Name</th><th scope="col" aria-label="Loop"></th><th scope="col"><label class="instrument-checkbox" title="Select or clear note overlap for every eligible instrument, including offscreen rows. Unchecked preserves native behavior, including IT NNA."><input id="instrument-select-all" type="checkbox" aria-label="Select all eligible instruments for note overlap" disabled></label></th><th scope="col" aria-label="Play"></th><th scope="col" title="Total source frames across distinct mapped samples, before enhancement and excluding guard frames">Frames</th></tr></thead>
+                    <colgroup><col class="instrument-number"><col><col class="instrument-loop"><col class="instrument-play-column"><col class="instrument-overlap"><col class="instrument-frames"></colgroup>
+                    <thead><tr><th scope="col">#</th><th scope="col">Name</th><th scope="col" aria-label="Loop"></th><th scope="col" aria-label="Play"></th><th scope="col"><label class="instrument-checkbox" title="Select or clear note overlap for every eligible instrument, including offscreen rows. Unchecked preserves native behavior, including IT NNA."><input id="instrument-select-all" type="checkbox" aria-label="Select all eligible instruments for note overlap" disabled></label></th><th scope="col" title="Total source frames across distinct mapped samples, before enhancement and excluding guard frames">Frames</th></tr></thead>
                     <tbody id="instrument-list"><tr><td class="empty" colspan="6">No module loaded.</td></tr></tbody>
                 </table>
             </div>

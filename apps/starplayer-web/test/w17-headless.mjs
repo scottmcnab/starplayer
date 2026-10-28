@@ -72,6 +72,7 @@ export async function runCompactInstruments({ page, loadFile, mode }) {
     assert.equal(await value("document.getElementById('reference-note').value"), '60');
     assert.match(await value("document.getElementById('reference-note').selectedOptions[0].textContent"), /C-5 \(60\).*middle C/);
     assert.deepEqual(await value("[...document.querySelectorAll('.instrument-table th')].map(cell => cell.getAttribute('aria-label')).filter(Boolean)"), ['Loop', 'Play']);
+    assert.equal(await value("document.querySelector('.instrument-table th:nth-child(4)').getAttribute('aria-label') === 'Play' && !!document.querySelector('.instrument-table th:nth-child(5) input') && !!document.querySelector('#instrument-list tr td:nth-child(4) button') && !!document.querySelector('#instrument-list tr td:nth-child(5) input')"), true);
     assert.equal(await value("getComputedStyle(document.querySelector('.instrument-play')).borderTopWidth"), '0px');
     assert.equal(await value("document.querySelector('#instrument-list tr td:last-child').textContent"), '512');
     assert.equal(await value("document.querySelector('#instrument-list tr td:nth-child(3)').textContent"), '∞');

@@ -1,7 +1,7 @@
 // Selection is independent of the rendered window. Hidden ids survive all view changes.
 export function createSelection() { return { selected: new Set(), anchor: null, focus: null }; }
 
-export function selectRow(state, order, id, { toggle = false, extend = false } = {}) {
+export function selectRow(state, order, id, { toggle = false, extend = false, clearSole = false } = {}) {
     if (!order.includes(id)) return state;
     const selected = new Set(state.selected);
     let anchor = state.anchor;
@@ -13,8 +13,9 @@ export function selectRow(state, order, id, { toggle = false, extend = false } =
         if (!toggle) for (const visible of order) selected.delete(visible);
         for (let index = Math.min(first, last); index <= Math.max(first, last); index += 1) selected.add(order[index]);
     } else {
+        const clear = clearSole && selected.size === 1 && selected.has(id);
         if (!toggle) selected.clear();
-        if (toggle && selected.has(id)) selected.delete(id);
+        if (clear || toggle && selected.has(id)) selected.delete(id);
         else selected.add(id);
         anchor = id;
     }

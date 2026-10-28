@@ -39,6 +39,8 @@ test('compact semantic table keeps independent PCM, live, reference-preview, loo
     const { rows, state, elements } = instrumentHarness();
     assert.equal(rows[0].tag, 'tr');
     assert.equal(rows[0].children.length, 6);
+    assert.equal(rows[0].children[3].querySelector('button'), rows[0].querySelector('button'));
+    assert.equal(rows[0].children[4].querySelector('input'), rows[0].querySelector('input'));
     assert.equal(rows[0].children[0].textContent, '01');
     assert.equal(rows[0].querySelector('input').checked, true);
     assert.equal(rows[0].querySelector('input').disabled, false, 'bypassed overlap remains editable');
@@ -64,7 +66,7 @@ test('compact semantic table keeps independent PCM, live, reference-preview, loo
     state.metadata.instruments[0].name = ''; // A new module rebuild gives empty-name fallbacks.
     state.metadata.instruments = [...state.metadata.instruments];
     const html = await readFile(new URL('../www/index.html', import.meta.url), 'utf8');
-    assert.match(html, /<th scope="col">#<\/th><th scope="col">Name<\/th><th scope="col" aria-label="Loop"><\/th><th scope="col"><label[^>]+><input id="instrument-select-all"[^>]+><\/label><\/th><th scope="col" aria-label="Play"><\/th><th scope="col"[^>]+>Frames<\/th>/);
+    assert.match(html, /<th scope="col">#<\/th><th scope="col">Name<\/th><th scope="col" aria-label="Loop"><\/th><th scope="col" aria-label="Play"><\/th><th scope="col"><label[^>]+><input id="instrument-select-all"[^>]+><\/label><\/th><th scope="col"[^>]+>Frames<\/th>/);
 });
 
 test('row activation retains native controls and same-module refresh preserves accepted selection and readiness', () => {
