@@ -45,6 +45,8 @@ Task files record *how*; the `product/` documents record *what and why*.
 M0–M7 have landed and M10-K5 is in; the tables below are current. The repository holds
 the engine, the applications, the original DOS sources, and this plan set.
 
+- **Library playback and usability fixes** — landed 2026-10-29; [review and verification](apps/complete/LF-review-and-verification.md). Six legacy 15-sample MODs load/play, HNZ-SAS duration includes its introduction, warnings stay compact with diagnostic tooltips, Library details support deselection/disclosure, and Instruments Play precedes its checkbox. All eleven CI gates,394 Node tests and packaged Chromium checks in all three modes passed; owner listening/device acceptance remains.
+
 ### Engine
 
 - **NO — Note overlap and audition:** [master plan](engine/complete/NO-master-plan.md). NO-01–08 and NO-W1 landed on `main` via `--no-ff` merge `e031eda` (2026-10-28); completed plans and [full-branch/corrective reviews](engine/complete/NO-branch-review-2026-10-28.md) are archived. [NO-08](engine/complete/NO-task-08-branch-review-fixes.md) retains settled CI, feature/resource/PCM, browser and A1S/C5 compile evidence; landing checks passed 347 JavaScript tests and 13 Rust regressions. Owner listening/device acceptance remains pending; no deployment.

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | In progress; coordinator review required |
+| Status | Landed on main; automated verification passed; owner acceptance pending |
 | Baseline | main 556ed6a |
 | Least-capable safe worker | GPT-6.1-sol (high) |
 | Coordinator | library-playback-fixes; workers leave changes uncommitted |
@@ -161,3 +161,9 @@ owned/incremental image equality for both dialects (also pins append-only image 
 at host blocks1,3,64,128,4096,8191. Coordinator owns combined CI/WASM/browser checks
 and review before committing. No music files, scratch harness or generated audio are
 part of this change.
+
+## Coordinator acceptance
+
+Reviewed and verified in the combined integration branch. See [combined review and
+verification](../../apps/complete/LF-review-and-verification.md) for CI, real-file, browser and landing evidence. Only owner
+listening and device acceptance remains.

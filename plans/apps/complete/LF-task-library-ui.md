@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | In progress; coordinator review required |
+| Status | Landed on main; automated verification passed; owner acceptance pending |
 | Baseline | main 556ed6a |
 | Least-capable safe worker | GPT-6.1-sol (high) |
 | Coordinator | library-playback-fixes; workers leave changes uncommitted |
@@ -71,3 +71,9 @@ header/body column order and audition. Coordinate any browser/build needs.
 ## Out of scope
 
 Engine/duration/loaders, persistence schema, Sites hosting/deployment.
+
+## Coordinator acceptance
+
+Reviewed and verified in the combined integration branch. See [combined review and
+verification](LF-review-and-verification.md) for CI, real-file, browser and landing evidence. Only owner
+listening and device acceptance remains.

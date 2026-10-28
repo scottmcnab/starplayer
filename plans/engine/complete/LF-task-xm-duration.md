@@ -124,3 +124,9 @@ Every Cargo command used `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`,
 slot coordinated. Parent owns combined CI, WASM, browser validation and the shared
 foundation amendment: architecture section 4.1 should explicitly distinguish the
 initial order-zero pass from subsequent configured restart-position wraps.
+
+## Coordinator acceptance
+
+Reviewed and verified in the combined integration branch. See [combined review and
+verification](../../apps/complete/LF-review-and-verification.md) for CI, real-file, browser and landing evidence. Only owner
+listening and device acceptance remains.
