@@ -2103,9 +2103,9 @@ function renderMetadata() {
             });
             const cells = Array.from({ length: 6 }, () => document.createElement('td'));
             cells[0].textContent = String(index + 1).padStart(2, '0');
-            cells[2].className = 'instrument-name';
-            cells[2].textContent = instrument.name || `(instrument ${index + 1})`;
-            cells[2].title = cells[2].textContent;
+            cells[1].className = 'instrument-name';
+            cells[1].textContent = instrument.name || `(instrument ${index + 1})`;
+            cells[1].title = cells[1].textContent;
             cells[5].textContent = instrument.length ? String(instrument.length) : '';
             let preview = null, checkbox = null;
             if (instrument.length > 0) {
@@ -2138,13 +2138,13 @@ function renderMetadata() {
                 preview.addEventListener('keyup', event => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); finish(); } });
                 preview.addEventListener('blur', () => { if (state.previewInstrument === index) cleanupLiveInput(); });
                 preview.addEventListener('click', event => { if (event.detail === 0 && !keyboardPreview) { begin(); finish(); } keyboardPreview = false; });
-                cells[1].append(preview);
+                cells[4].append(preview);
             }
             const mixed = (instrument.capability & 6) === 6;
-            cells[3].textContent = instrument.capability & 4 ? '∞' : '';
+            cells[2].textContent = instrument.capability & 4 ? '∞' : '';
             if (instrument.capability & 4) {
                 const explanation = mixed ? 'Mixed map: looping and non-looping samples; overlap applies only to non-looping notes' : 'Native looping samples, including sustain loops; note overlap unavailable';
-                cells[3].setAttribute('aria-label', explanation); cells[3].title = explanation;
+                cells[2].setAttribute('aria-label', explanation); cells[2].title = explanation;
             }
             if (instrument.capability & 2) {
                 const label = document.createElement('label'); label.className = 'instrument-checkbox';
@@ -2153,7 +2153,7 @@ function renderMetadata() {
                 checkbox.type = 'checkbox'; checkbox.dataset.instrument = String(index);
                 checkbox.setAttribute('aria-label', `Let notes ring for instrument ${index + 1}`);
                 checkbox.addEventListener('change', () => { queueInteractive(Ring.OPCODE_LET_NOTES_RING, index, Number(checkbox.checked)); flushFallbackCommands(); });
-                label.append(checkbox); cells[4].append(label);
+                label.append(checkbox); cells[3].append(label);
             }
             item.append(...cells); elements.instrumentList.append(item);
             state.instrumentRows.push({ item, preview, checkbox });

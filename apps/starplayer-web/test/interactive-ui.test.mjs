@@ -43,8 +43,8 @@ test('compact semantic table keeps independent PCM, live, reference-preview, loo
     assert.equal(rows[0].querySelector('input').checked, true);
     assert.equal(rows[0].querySelector('input').disabled, false, 'bypassed overlap remains editable');
     assert.equal(rows[1].querySelector('input').disabled, false);
-    assert.match(rows[1].children[3].attributes['aria-label'], /Mixed map/);
-    assert.equal(rows[1].children[3].textContent, '∞');
+    assert.match(rows[1].children[2].attributes['aria-label'], /Mixed map/);
+    assert.equal(rows[1].children[2].textContent, '∞');
     assert.equal(rows[2].querySelector('input'), null, 'ineligible cells stay empty');
     assert.equal(rows[3].dataset.selectable, 'true', 'another key is playable');
     assert.equal(rows[3].querySelector('button').disabled, true, 'reference60 has no viable sample');
@@ -56,15 +56,15 @@ test('compact semantic table keeps independent PCM, live, reference-preview, loo
     assert.equal(rows[5].querySelector('input').disabled, false, 'song one-shot PCM remains eligible');
     assert.equal(rows[5].attributes['aria-disabled'], undefined, 'unselectable rows must not semantically disable eligible native descendants');
     assert.match(rows[5].attributes['aria-label'], /selection unavailable/);
-    assert.equal(rows[5].children[3].textContent, '');
+    assert.equal(rows[5].children[2].textContent, '');
     assert.equal(rows[5].children[5].textContent, '128');
-    assert.match(rows[6].children[3].attributes['aria-label'], /Mixed map/);
+    assert.match(rows[6].children[2].attributes['aria-label'], /Mixed map/);
     assert.match(rows[0].querySelector('label').title, /Unchecked preserves native behavior, including IT NNA/);
     assert.equal(elements.instrumentSelectAll.indeterminate, true);
     state.metadata.instruments[0].name = ''; // A new module rebuild gives empty-name fallbacks.
     state.metadata.instruments = [...state.metadata.instruments];
     const html = await readFile(new URL('../www/index.html', import.meta.url), 'utf8');
-    assert.match(html, /<th scope="col">#<\/th><th scope="col" aria-label="Play"><\/th><th scope="col">Name<\/th><th scope="col" aria-label="Loop"><\/th><th scope="col"><label[^>]+><input id="instrument-select-all"[^>]+><\/label><\/th><th scope="col"[^>]+>Frames<\/th>/);
+    assert.match(html, /<th scope="col">#<\/th><th scope="col">Name<\/th><th scope="col" aria-label="Loop"><\/th><th scope="col"><label[^>]+><input id="instrument-select-all"[^>]+><\/label><\/th><th scope="col" aria-label="Play"><\/th><th scope="col"[^>]+>Frames<\/th>/);
 });
 
 test('row activation retains native controls and same-module refresh preserves accepted selection and readiness', () => {

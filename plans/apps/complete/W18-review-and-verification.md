@@ -116,3 +116,28 @@ and therefore failed eight callback-allocation tests. The guard was not weakened
 shipping note-overlap + interactive-audition configuration passes all eleven allocator
 regressions, including the new browser-release path; the standard CI trace jobs exercise
 trace separately. This exploratory configuration is not claimed as passing.
+
+## Main follow-up — adjacent audition controls
+
+After landing W18, the owner requested a single direct-to-main commit moving Play
+between the note-overlap checkbox and Frames, reducing pointer travel while auditioning.
+The resulting columns are **# / Name / Loop / checkbox / Play / Frames**; Play and Loop
+headers remain visually blank. HTML column widths/headings, rendered cells, existing
+layout regressions and the application README follow that order.
+
+Astra reviewed the complete follow-up diff and approved it without actionable findings.
+All 11 `cargo xtask ci` jobs and all 390 JavaScript tests passed; WASM packaging and
+interactive Chromium SAB, forced fallback and plain HTTP checks passed. Desktop and
+390px phone captures show adjacent checkbox/Play controls with the existing 32px rows.
+Logs: `/tmp/w18-play-column-{ci,node,wasm}.log` and
+`/tmp/w18-play-column-browser-final.log`.
+
+The first SAB browser run intermittently failed the existing fresh-load-during-bulk
+scenario with a settings-replay rejection. An unchanged isolated SAB rerun and the
+subsequent full three-mode run passed. Astra found no column-layout regression; an
+old-identity cleanup/replay race is a possible cause, but the failure log lacks command
+identities to confirm it. The initial evidence remains in
+`/tmp/w18-play-column-browser.log`; the isolated pass is in
+`/tmp/w18-play-column-browser-retry.log`. Playback rejection checks were not weakened.
+
+No engine, wire, preference-lifetime or input-handler changes are part of the column move.

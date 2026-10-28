@@ -280,8 +280,9 @@ guard frames. Repeated note-map entries count once; different sample IDs count s
 even when their PCM matches. XM and IT instrument mode use native note maps; IT sample
 mode and MOD/S3M/MTM use direct sample references. Zero-frame cells stay blank.
 
-The Instruments table uses compact 32 px rows in source order: **# / Play / Name / Loop /
-note-overlap checkbox / Frames**. Select a playable row with a click or Enter/Space to
+The Instruments table uses compact 32 px rows in source order: **# / Name / Loop /
+note-overlap checkbox / Play / Frames**. Play sits beside the checkbox for quick audition.
+Select a playable row with a click or Enter/Space to
 choose its keyboard/MIDI target. Play auditions the selected **Reference Note** without
 selecting the row or retuning keyboard/MIDI. The native chooser covers 0–127 and defaults
 to **C-5 (60), middle C**; its value lasts until page reload. PCM-bearing instruments
