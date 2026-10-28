@@ -868,7 +868,9 @@ pub fn trace_s3m(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceErro
 /// Load a MOD and capture its stable per-tick trace through the ProTracker processor.
 #[cfg(feature = "trace")]
 pub fn trace_mod(bytes: &[u8], options: TraceOptions) -> Result<Trace, TraceError> {
-    trace_loaded(Arc::new(starplayer::mod_file::load(bytes)?), options)
+    let module = starplayer::load(bytes)?;
+    if module.header().format != ModuleFormat::Mod { return Err(Error::BadMagic.into()); }
+    trace_loaded(Arc::new(module), options)
 }
 
 /// Load an MTM and capture its stable per-tick trace through the MultiTracker processor.
@@ -1178,6 +1180,20 @@ mod tests {
             let trace = trace_mod(&module, TraceOptions { ticks: Some(24), host_block_frames }).expect("native MOD trace").to_text();
             assert_eq!(trace, first, "host block size {host_block_frames} changed the MOD trace");
         }
+    }
+
+    #[cfg(feature = "trace")]
+    #[test]
+    fn mod_trace_accepts_legacy_soundtracker_and_rejects_other_formats() {
+        let mut bytes = vec![0; 600 + 1024 + 8];
+        bytes[42..44].copy_from_slice(&4u16.to_be_bytes());
+        bytes[45] = 64;
+        bytes[470] = 1;
+        bytes[471] = 120;
+        bytes[600..604].copy_from_slice(&starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0xF, param: 6 }.to_bytes());
+        let options = TraceOptions { ticks: Some(12), ..TraceOptions::default() };
+        assert_eq!(trace_mod(&bytes, options).expect("legacy MOD trace").to_text(), trace_module(&bytes, options).expect("automatic trace").to_text());
+        assert!(trace_mod(&minimal_mtm(), options).is_err(), "the MOD-specific helper still rejects MTM");
     }
 
     #[cfg(feature = "trace")]

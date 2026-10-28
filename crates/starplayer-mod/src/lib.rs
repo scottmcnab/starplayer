@@ -17,6 +17,7 @@ pub mod pattern;
 pub mod processor;
 pub mod tables;
 pub mod timing;
+pub mod soundtracker;
 
 pub use loader::{LoadOptions, StereoSeparation, load, load_from, load_from_with_options, load_with_options, probe, probe_reader};
 pub use image::ImageDecoder;

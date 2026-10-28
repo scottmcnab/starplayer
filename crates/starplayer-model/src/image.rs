@@ -1277,6 +1277,8 @@ const fn dialect_code(dialect: FormatDialect) -> u16 {
         FormatDialect::OpenMptIt => 23,
         FormatDialect::SchismTracker => 24,
         FormatDialect::ModPlugIt => 25,
+        FormatDialect::Soundtracker => 26,
+        FormatDialect::UltimateSoundtracker => 27,
     }
 }
 
@@ -1308,6 +1310,8 @@ fn dialect_from_code(code: u16) -> Result<FormatDialect, Error> {
         23 => Ok(FormatDialect::OpenMptIt),
         24 => Ok(FormatDialect::SchismTracker),
         25 => Ok(FormatDialect::ModPlugIt),
+        26 => Ok(FormatDialect::Soundtracker),
+        27 => Ok(FormatDialect::UltimateSoundtracker),
         _ => Err(BAD_ENUM),
     }
 }

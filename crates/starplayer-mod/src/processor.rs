@@ -991,8 +991,11 @@ impl TrackerProcessor for ModProcessor {
     }
 
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
-        let cells = row.bytes.chunks_exact(CELL_BYTES)
-            .map(|bytes| EffectCell::from(ModCell::from_bytes(bytes).unwrap_or(ModCell::EMPTY)));
+        let ultimate = self.module.header().dialect == starplayer_core::quirks::FormatDialect::UltimateSoundtracker;
+        let cells = row.bytes.chunks_exact(CELL_BYTES).map(|bytes| {
+            let cell = EffectCell::from(ModCell::from_bytes(bytes).unwrap_or(ModCell::EMPTY));
+            if ultimate { crate::soundtracker::ultimate_effect(cell) } else { cell }
+        });
         self.row_effects(context, row.order, row.pattern, row.row, cells)
     }
 
@@ -1061,7 +1064,7 @@ fn sequencer_settings(module: &Module, sample_rate_hz: u32) -> SequencerSettings
         first_tick_frame: Frame::ZERO,
         initial_speed: module.header().initial_speed,
         initial_tempo_bpm: module.header().initial_tempo,
-        restart_order: 0,
+        restart_order: crate::soundtracker::restart_order(module),
         end_of_song: EndOfSongPolicy::Loop,
     }
 }

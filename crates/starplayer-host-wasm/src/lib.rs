@@ -204,9 +204,13 @@ const SCOPE_REFRESH_QUANTA: u64 = 4;
 /// finished module goes to [`Player::load_module`].
 fn decode(bytes: &[u8], headphone_friendly_mod_panning: bool, enhancement_flags: u32, rate_ceiling_hz: u32) -> Result<(Module, u32, u32), starplayer::core::Error> {
     let module = match starplayer::probe(bytes) {
-        Some(ModuleFormat::Mod) => starplayer::mod_file::load_with_options(bytes, starplayer::mod_file::LoadOptions {
-            stereo_separation: starplayer::mod_file::StereoSeparation::percent(if headphone_friendly_mod_panning { 60 } else { 100 }),
-        }),
+        Some(ModuleFormat::Mod) => {
+            let options = starplayer::mod_file::LoadOptions {
+                stereo_separation: starplayer::mod_file::StereoSeparation::percent(if headphone_friendly_mod_panning { 60 } else { 100 }),
+            };
+            if starplayer::mod_file::probe(bytes) { starplayer::mod_file::load_with_options(bytes, options) }
+            else { starplayer::mod_file::soundtracker::load_with_options(bytes, options) }
+        },
         Some(ModuleFormat::S3m) => starplayer::s3m::load(bytes),
         Some(ModuleFormat::Mtm) => starplayer::mtm::load(bytes),
         Some(ModuleFormat::Xm) => starplayer::xm::load(bytes),
@@ -1207,6 +1211,32 @@ mod tests {
         let sample_offset = 1084 + 64 * 4 * 4;
         for (index, byte) in bytes[sample_offset..].iter_mut().enumerate() { *byte = if index & 1 == 0 { 0x7F } else { 0x80 }; }
         bytes
+    }
+
+    #[test]
+    fn tagless_soundtracker_is_admitted_with_the_web_panning_preference_and_renders() {
+        let mut bytes = vec![0; 600 + 1024 + 8];
+        bytes[42..44].copy_from_slice(&4u16.to_be_bytes());
+        bytes[45] = 64;
+        bytes[48..50].copy_from_slice(&4u16.to_be_bytes());
+        bytes[470] = 1;
+        bytes[471] = 120;
+        bytes[600..604].copy_from_slice(&starplayer::mod_file::ModCell { period: 428, instrument: 1, effect: 0xF, param: 6 }.to_bytes());
+        bytes[600 + 1024..].copy_from_slice(&[0x7f, 0x80, 0x40, 0xc0, 0x7f, 0x80, 0x40, 0xc0]);
+        for headphone_friendly in [false, true] {
+            let (module, flags, factor) = decode(&bytes, headphone_friendly, 0, 48_000).expect("web legacy decode");
+            assert_eq!((flags, factor), (0, 1));
+            assert_eq!(module.header().dialect, starplayer::core::quirks::FormatDialect::Soundtracker);
+            let amount = if headphone_friendly { 60 } else { 100 };
+            assert_eq!(module.header().channel_pan(0), Some(starplayer::core::fixed::bipolar_from_ratio(-amount, 100)));
+            let mut host = Host::new(48_000);
+            assert_eq!(host.load_module_with_options(&bytes, headphone_friendly, 0, 0), Ok(1));
+            let mut audible = false;
+            for _ in 0..8 {
+                audible |= host.process(RENDER_QUANTUM) > 0.0;
+            }
+            assert!(audible, "legacy MOD reaches the worklet output");
+        }
     }
 
     /// [`minimal_mod`] with a `B00` on its very last row, so the song genuinely loops

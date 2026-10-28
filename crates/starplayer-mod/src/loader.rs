@@ -1,4 +1,4 @@
-//! Bounds-checked 31-sample MOD loading.
+//! Bounds-checked tagged MOD loading, shared with the explicit Soundtracker loader.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -57,14 +57,21 @@ pub fn load_from<R: ModuleReader + ?Sized>(reader: &R) -> Result<Module, Error> 
 
 pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: LoadOptions) -> Result<Module, Error> {
     let source = Source { reader };
-    let fixed: [u8; HEADER_BYTES] = source.array(0)?;
-    let layout = layout(fixed.get(MAGIC_OFFSET..MAGIC_OFFSET + 4).unwrap_or(&[])).ok_or(Error::BadMagic)?;
+    let magic: [u8; 4] = source.array(MAGIC_OFFSET)?;
+    let layout = layout(&magic).ok_or(Error::BadMagic)?;
+    load_layout_from(reader, options, layout)
+}
+
+pub(crate) fn load_layout_from<R: ModuleReader + ?Sized>(reader: &R, options: LoadOptions, layout: ModLayout) -> Result<Module, Error> {
+    let source = Source { reader };
+    let mut fixed = [0u8; HEADER_BYTES];
+    reader.read_at(0, &mut fixed[..layout.header_bytes()])?;
     let channels = layout.channels;
     // libxmp loads a zero-length order list and plays nothing; only a length past the
     // 128-entry table is a structural error.
-    let song_length = (fixed.get(SONG_LENGTH_OFFSET).copied().unwrap_or(0) as usize).min(128);
+    let song_length = (fixed.get(layout.song_length_offset()).copied().unwrap_or(0) as usize).min(128);
 
-    let order_bytes = fixed.get(ORDER_OFFSET..ORDER_OFFSET + 128).ok_or(Error::Truncated { offset: ORDER_OFFSET, needed: 128 })?;
+    let order_bytes = fixed.get(layout.order_offset()..layout.order_offset() + 128).ok_or(Error::Truncated { offset: ORDER_OFFSET, needed: 128 })?;
     // ProTracker scans the complete on-disk table when locating sample data. Entries
     // after song_length are not played, but their patterns still occupy file space.
     // ProTracker's mt_init compares each byte signed (`cmp.b` / `bgt`), so any entry
@@ -77,7 +84,7 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
         .and_then(|value| usize::try_from(value).ok()).ok_or(Error::TooLarge("MOD pattern data"))?;
     // Digital Tracker writes four more bytes after the tag — always `00 40 00 00` — before
     // the pattern data (libxmp `mod_load.c:533-539` skips them the same way).
-    let pattern_data_offset = HEADER_BYTES + layout.extra_header_bytes;
+    let pattern_data_offset = layout.header_bytes() + layout.extra_header_bytes;
     let sample_data_offset = pattern_data_offset.checked_add(pattern_bytes).ok_or(Error::TooLarge("MOD data offset"))?;
     if sample_data_offset > source.len() { return Err(Error::Truncated { offset: pattern_data_offset, needed: pattern_bytes }); }
 
@@ -125,7 +132,7 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
     // one. This is the long-sample gate OpenMPT's own loader applies for the same reason.
     let mut oversized_sample = false;
     let mut declared_sample_offset = sample_data_offset;
-    for index in 0..SAMPLE_COUNT {
+    for index in 0..layout.sample_count() {
         let header_offset = 20 + index * SAMPLE_HEADER_BYTES;
         let header = fixed.get(header_offset..header_offset + SAMPLE_HEADER_BYTES).ok_or(Error::Truncated { offset: header_offset, needed: SAMPLE_HEADER_BYTES })?;
         let name = starplayer_model::decode_cp437(header.get(..22).unwrap_or(&[]));
@@ -134,10 +141,14 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
         let declared_length = declared_words as usize * 2;
         let finetune = header.get(24).copied().unwrap_or(0) & 15;
         let volume = header.get(25).copied().unwrap_or(0).min(64);
-        let loop_start = (be_u16(header, 26)? as usize * 2).min(declared_length);
+        // Soundtracker stores loop starts in bytes and starts playback at that
+        // position, skipping the attack even on the first pass. Lengths stay in words.
+        let prefix = if layout.soundtracker { (be_u16(header, 26)? as usize).min(declared_length) } else { 0 };
+        let loop_start = if layout.soundtracker { 0 } else { (be_u16(header, 26)? as usize * 2).min(declared_length) };
         let loop_length = be_u16(header, 28)? as usize * 2;
-        let available = source.len().saturating_sub(declared_sample_offset).min(declared_length);
-        let raw = source.with_slice(declared_sample_offset.min(source.len()), available, <[u8]>::to_vec)?;
+        let pcm_offset = declared_sample_offset.checked_add(prefix).ok_or(Error::TooLarge("MOD sample data"))?;
+        let available = source.len().saturating_sub(pcm_offset).min(declared_length - prefix);
+        let raw = source.with_slice(pcm_offset.min(source.len()), available, <[u8]>::to_vec)?;
         let pcm: Vec<i16> = raw.iter().map(|byte| (*byte as i8 as i16) * 256).collect();
         declared_sample_offset = declared_sample_offset.checked_add(declared_length).ok_or(Error::TooLarge("MOD sample data"))?;
 
@@ -164,7 +175,7 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
     let played_orders: Vec<u16> = order_bytes.iter().take(song_length).map(|order| logical_order(*order, layout) as u16).collect();
     let evidence = ModTimingEvidence {
         timing_detection: matches!(layout.dialect, FormatDialect::ProTracker) && !oversized_sample,
-        vblank_only_tag: matches!(layout.dialect, FormatDialect::Noisetracker),
+        vblank_only_tag: layout.vblank_only(),
         has_high_fxx: last_high_fxx.iter().any(|value| *value != 0),
         mixed_row,
         high_fxx_only_at_end: high_fxx_only_at_end(&played_orders, &last_high_fxx),
@@ -179,13 +190,13 @@ pub fn load_from_with_options<R: ModuleReader + ?Sized>(reader: &R, options: Loa
         format: ModuleFormat::Mod,
         channel_count: channels,
         initial_speed: 6,
-        initial_tempo: 125,
+        initial_tempo: layout.initial_tempo(&fixed),
         global_volume: U0F16::MAX,
         master_volume: U0F16::MAX,
         default_pan: default_pan(channels, options.stereo_separation),
         flags: ModuleFlags { amiga_limits, linear_slides: false, fast_volume_slides: false, stereo: options.stereo_separation.get() != 0 },
         dialect: layout.dialect,
-        format_extra: encode_evidence(evidence),
+        format_extra: encode_evidence(evidence) | crate::soundtracker::encode_restart(layout, &fixed),
         default_channel_volume: Vec::new().into_boxed_slice(),
         format_data: Vec::new().into_boxed_slice(),
     });
@@ -225,6 +236,7 @@ fn scan_timing_evidence(pattern: &[u8], channels: u8) -> (u8, bool) {
 #[derive(Copy, Clone)]
 pub(crate) struct ModLayout {
     pub(crate) channels: u8,
+    pub(crate) soundtracker: bool,
     pub(crate) paired_four_channel_patterns: bool,
     /// Bytes between the end of the 1084-byte header and the pattern data. Four for
     /// Digital Tracker, zero for everything else.
@@ -233,8 +245,18 @@ pub(crate) struct ModLayout {
 }
 
 impl ModLayout {
+    pub(crate) fn header_bytes(self) -> usize { if self.soundtracker { 600 } else { HEADER_BYTES } }
+    pub(crate) fn sample_count(self) -> usize { if self.soundtracker { 15 } else { SAMPLE_COUNT } }
+    pub(crate) fn song_length_offset(self) -> usize { if self.soundtracker { 470 } else { SONG_LENGTH_OFFSET } }
+    pub(crate) fn order_offset(self) -> usize { self.song_length_offset() + 2 }
+    pub(crate) fn initial_tempo(self, header: &[u8]) -> u16 {
+        if self.dialect == FormatDialect::UltimateSoundtracker { header.get(471).copied().unwrap_or(125) as u16 } else { 125 }
+    }
+    pub(crate) fn vblank_only(self) -> bool {
+        matches!(self.dialect, FormatDialect::Noisetracker | FormatDialect::Soundtracker | FormatDialect::UltimateSoundtracker)
+    }
     const fn plain(channels: u8, dialect: FormatDialect) -> ModLayout {
-        ModLayout { channels, paired_four_channel_patterns: false, extra_header_bytes: 0, dialect }
+        ModLayout { channels, soundtracker: false, paired_four_channel_patterns: false, extra_header_bytes: 0, dialect }
     }
 }
 
@@ -255,16 +277,16 @@ pub(crate) fn layout(magic: &[u8]) -> Option<ModLayout> {
         // the pattern-evidence detection that `M.K.` and `M!K!` do.
         b"LARD" | b"NSMS" => Some(ModLayout::plain(4, FormatDialect::ProTracker3)),
         b"FLT4" => Some(ModLayout::plain(4, FormatDialect::Startrekker)),
-        b"FLT8" => Some(ModLayout { channels: 8, paired_four_channel_patterns: true, extra_header_bytes: 0, dialect: FormatDialect::Startrekker }),
+        b"FLT8" => Some(ModLayout { soundtracker: false, channels: 8, paired_four_channel_patterns: true, extra_header_bytes: 0, dialect: FormatDialect::Startrekker }),
         b"6CHN" => Some(ModLayout::plain(6, FormatDialect::FastTracker)),
         b"8CHN" => Some(ModLayout::plain(8, FormatDialect::FastTracker)),
         // Atari Octalyser. Accepted together with its pattern-loop dialect, never before.
         b"CD61" => Some(ModLayout::plain(6, FormatDialect::Octalyser)),
         b"CD81" => Some(ModLayout::plain(8, FormatDialect::Octalyser)),
         // Atari Digital Tracker, whose header carries four more bytes (`00 40 00 00`).
-        b"FA04" => Some(ModLayout { channels: 4, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
-        b"FA06" => Some(ModLayout { channels: 6, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
-        b"FA08" => Some(ModLayout { channels: 8, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
+        b"FA04" => Some(ModLayout { soundtracker: false, channels: 4, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
+        b"FA06" => Some(ModLayout { soundtracker: false, channels: 6, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
+        b"FA08" => Some(ModLayout { soundtracker: false, channels: 8, paired_four_channel_patterns: false, extra_header_bytes: 4, dialect: FormatDialect::DigitalTracker }),
         // TakeTracker's one- to four-channel tags.
         [b'T', b'D', b'Z', digit @ b'1'..=b'4'] => Some(ModLayout::plain(digit - b'0', FormatDialect::FastTracker)),
         [tens, ones, b'C', b'H'] if tens.is_ascii_digit() && ones.is_ascii_digit() => {
