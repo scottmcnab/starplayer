@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](../engine/NO-master-plan.md) |
-| Status | Integrated on feature/note-overlap-audition by reviewed single-change squash; task commit c20041f; NO-07 outstanding |
+| Status | Integrated on feature/note-overlap-audition by reviewed single-change squash; task commit c20041f; NO-07 integration verification complete; owner listening/device acceptance pending |
 | Depends on | NO-06 (and all its dependencies) |
 | Blocks | NO-07 |
 | Parallel with | None touching shared web transport/command state |

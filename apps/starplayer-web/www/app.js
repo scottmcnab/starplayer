@@ -102,6 +102,7 @@ const state = {
     sessionClock: 0n,
     buildClock: 0n,
     interactiveReady: false,
+    sessionSettingsRevision: 0,
     lastTransportOpcode: null,
     liveRecoveryPending: false,
     selectedInstrument: null,
@@ -512,6 +513,8 @@ function installGraph(graph) {
     state.latestScope = null;
     state.drawnScopeGeneration = -1;
     state.workletSampleRate = graph.node.starplayerSampleRate ?? graph.context.sampleRate;
+    state.eventLeadFrames = graph.node.starplayerLeadFrames ?? 0;
+    state.eventLeadMillis = graph.node.starplayerLeadMillis ?? 0;
     state.outputChannelCount = graph.channels;
     state.liveInputActive = state.interactiveReady && (elements.keyboardEnable.checked || state.midiPort !== null);
     updateLiveInputPanel();
@@ -696,7 +699,18 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
     const node = state.node;
     const controlRevision = playback.controlRevision;
     const result = await activateModuleOnNode(node, moduleBuffer, loadOptions);
-    if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node) return null;
+    if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node) {
+        // Stop may cancel the request after audio installed it. Old metadata cannot arm
+        // input for that newly installed session; a newer installation keeps its authority.
+        if (node === state.node && result.identity && Ring.sameIdentity(node.starplayerIdentity, result.identity) && !Ring.sameIdentity(state.metadata?.identity, result.identity)) {
+            state.interactiveReady = false;
+            state.liveInputActive = false;
+            state.liveInputPending = false;
+            state.currentModuleBytes = null;
+            renderMetadata(); setControlsEnabled(false); updateLiveInputPanel();
+        }
+        return null;
+    }
     libraryView.setPlaying(null);
     metadata.identity = result.identity;
     state.metadata = metadata;
@@ -892,18 +906,24 @@ function readMetadata(label) {
 }
 
 function activateModuleOnNode(node, buffer, loadOptions = loadOptionsFromControls(), replacement = null) {
+    const previousReady = node === state.node && state.interactiveReady;
+    const previousIdentity = node.starplayerIdentity;
     cleanupLiveInput();
     if (node === state.node) state.interactiveReady = false;
     const identity = { session: replacement ? replacement[1] : ++state.sessionClock, build: ++state.buildClock };
     const requestId = state.nextRequestId++;
+    node.starplayerLatestLoadRequest = requestId;
     return new Promise((resolve, reject) => {
-        state.pendingLoads.set(requestId, { resolve, reject, node, identity });
+        state.pendingLoads.set(requestId, { resolve, reject, node, identity, fresh: replacement === null, loadOptions: { ...loadOptions }, previousReady, previousIdentity, previousDestination: elements.inputDestination.value, previousKeyboardEnabled: elements.keyboardEnable.checked });
+        if (node === state.node) restoreUnreadyInteractiveControls();
         updateModPanningAvailability();
         node.port.postMessage({
             type: 'loadModule',
             requestId, identity, replacement,
             hostSettings: {
                 volume: Math.round(Number(elements.volume.value) * 65535 / 100),
+                atEnd: playback.effectiveAtEnd() ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT,
+                fadeFrames: Math.round(SONG_FADE_SECONDS * (node.starplayerSampleRate || state.workletSampleRate || 44100)),
                 mutes: replacement ? (state.latest?.channels ?? []).map((channel, index) => channel.muted ? index : -1).filter(index => index >= 0) : [],
                 inserts: node !== state.node ? [...state.insertLayout].map(([key, insert]) => ({ target: Number(key.split(':')[0]), slot: Number(key.split(':')[1]), ...insert })) : [],
             },
@@ -933,8 +953,12 @@ function onWorkletMessage(message, node) {
         node.starplayerInteractiveVersion = message.interactiveVersion === Ring.INTERACTIVE_WIRE_VERSION && message.commandRingVersion === Ring.INTERACTIVE_WIRE_VERSION ? message.interactiveVersion : 0;
         node.starplayerSampleRate = message.sampleRate;
         node.starplayerRenderQuantum = message.renderQuantum;
+        node.starplayerLeadFrames = message.leadFrames ?? 0;
+        node.starplayerLeadMillis = message.leadMillis ?? 0;
         if (node === state.node) {
             state.workletSampleRate = message.sampleRate;
+            state.eventLeadFrames = node.starplayerLeadFrames;
+            state.eventLeadMillis = node.starplayerLeadMillis;
             elements.quantum.textContent = `${message.renderQuantum} frames`;
             updateOutputPanel();
         }
@@ -977,6 +1001,10 @@ function onWorkletMessage(message, node) {
             state.pendingLoads.delete(message.requestId);
             updateModPanningAvailability();
             if (message.type === 'moduleLoaded' && ((!node.starplayerInteractiveVersion && message.generation > 0) || (message.accepted && Ring.sameIdentity(pending.identity, message.identity)))) {
+                // A valid reply can already be superseded by a newer same-node load.
+                // Resolve its waiter so the caller's revision check can finish, while
+                // only the latest request may publish identity/readiness or retry input.
+                if (node.starplayerLatestLoadRequest !== undefined && node.starplayerLatestLoadRequest !== message.requestId) { pending.resolve(message); return; }
                 node.starplayerIdentity = message.identity ?? pending.identity;
                 node.starplayerCapabilities = message.capabilities ?? 0;
                 // Retry against the acknowledged build if the early intent reached a
@@ -991,7 +1019,15 @@ function onWorkletMessage(message, node) {
                 }
                 pending.resolve(message);
             }
-            else pending.reject(new Error(message.reason || 'Interactive audio protocol is unavailable or the load acknowledgement is stale.'));
+            else {
+                if (node === state.node && node.starplayerLatestLoadRequest === message.requestId) {
+                    // Recovery requires explicit unchanged control AND audio-applied proof;
+                    // a failed partial installation must leave mismatched controls disabled.
+                    state.interactiveReady = Boolean(pending.previousReady && message.retainedCapabilities === 3 && node.starplayerCapabilities === 3 && Ring.sameIdentity(message.retainedIdentity, pending.previousIdentity) && Ring.sameIdentity(message.retainedIdentity, node.starplayerIdentity) && Ring.sameIdentity(message.retainedIdentity, state.metadata?.identity));
+                    renderMetadata(); setControlsEnabled(state.interactiveReady); updateLiveInputPanel();
+                }
+                pending.reject(new Error(message.reason || 'Interactive audio protocol is unavailable or the load acknowledgement is stale.'));
+            }
         }
     } else if (message.type === 'stateBusy') {
         const pending = state.pendingStates.get(message.requestId);
@@ -1137,7 +1173,8 @@ function queueMidiMessage(status, data1, data2) {
 /// Turn the live-input source on or off in the worklet. It allocates an instrument rack,
 /// so it is a port message rather than a ring command.
 function requestLiveInput(enabled) {
-    if (!state.interactiveReady || state.node === null || state.liveInputPending) return;
+    if (!state.interactiveReady) { restoreUnreadyInteractiveControls(); return; }
+    if (state.node === null || state.liveInputPending) return;
     const selected = elements.inputDestination.value === 'selected';
     const destination = !enabled ? 0 : selected && state.selectedInstrument !== null ? state.selectedInstrument + 2 : selected ? 0 : 1;
     state.liveInputPending = true;
@@ -1325,8 +1362,21 @@ function queueTransport(opcode) {
     else if (!state.node?.starplayerInteractiveVersion) queueCommand(opcode === Ring.OPCODE_HOLD_STOP ? Ring.OPCODE_STOP : Ring.OPCODE_PLAY);
 }
 
+function restoreUnreadyInteractiveControls() {
+    elements.overlapEnable.checked = state.overlapEnabled;
+    elements.overlapEnable.disabled = true;
+    if (state.metadata) renderMetadata();
+    for (const pending of state.pendingLoads?.values() ?? []) {
+        if (pending.node !== state.node) continue;
+        elements.inputDestination.value = pending.previousDestination;
+        elements.keyboardEnable.checked = pending.previousKeyboardEnabled;
+    }
+    updateLiveInputPanel();
+}
+
 function queueInteractive(opcode, argument = 0, extra = 0) {
-    if (!state.interactiveReady || !state.node?.starplayerIdentity) return;
+    if (!state.interactiveReady) { restoreUnreadyInteractiveControls(); return; }
+    if (!state.node?.starplayerIdentity) return;
     queueCommand(opcode, argument, extra, state.node.starplayerIdentity);
 }
 
@@ -1342,6 +1392,12 @@ function queueCommand(opcode, argument = 0, extra = 0, identity = null) {
     identity ??= state.node.starplayerIdentity;
     if (!Ring.validIdentity(identity)) return;
     if (!Ring.validWireWord(argument) || !Ring.validWireWord(extra)) return;
+    switch (opcode) {
+        case Ring.OPCODE_MASTER_VOLUME: case Ring.OPCODE_MUTE_CHANNEL: case Ring.OPCODE_AT_END:
+        case Ring.OPCODE_INSERT_PARAM: case Ring.OPCODE_INSERT_BYPASS: case Ring.OPCODE_SET_MIXER_MODE:
+        case Ring.OPCODE_LIVE_DESTINATION: case Ring.OPCODE_NOTE_OVERLAP: case Ring.OPCODE_LET_NOTES_RING:
+            state.sessionSettingsRevision = (state.sessionSettingsRevision ?? 0) + 1;
+    }
     const record = { opcode, argument: argument >>> 0, extra: extra >>> 0, identity };
     if (state.fallbackCommands.length || !state.commandRing || !Ring.pushCommand(state.commandRing, opcode, argument, extra, identity)) state.fallbackCommands.push(record);
 }
@@ -1427,6 +1483,19 @@ async function applyLoadOptions(changedKey) {
         persistPreferences();
         return;
     }
+    // A disabled control can still emit a scripted event while a fresh session installs.
+    // Its cursor/identity cannot rebuild the previously retained module. Preserve the
+    // options actually posted with the latest fresh load, before claiming any revision.
+    let pendingFreshLoad = null;
+    for (const pending of state.pendingLoads.values()) {
+        if (pending.node === state.node && pending.fresh) pendingFreshLoad = pending;
+    }
+    if (pendingFreshLoad) {
+        writeLoadOptionsToControls(pendingFreshLoad.loadOptions);
+        renderLoadOptionsSummary();
+        persistPreferences();
+        return;
+    }
     // After the guard, so a refused change is summarised as what is still loading rather
     // than as what was refused.
     renderLoadOptionsSummary();
@@ -1452,9 +1521,9 @@ async function applyLoadOptions(changedKey) {
     clearError();
     showMessage(wording.reloading);
     try {
-        let controlRevision, replacement;
-        do { controlRevision = playback.controlRevision; replacement = await captureReplacement(); }
-        while (controlRevision !== playback.controlRevision && revision === state.moduleRevision && node === state.node);
+        let controlRevision, settingsRevision, replacement;
+        do { controlRevision = playback.controlRevision; settingsRevision = state.sessionSettingsRevision; replacement = await captureReplacement(); }
+        while ((controlRevision !== playback.controlRevision || settingsRevision !== state.sessionSettingsRevision) && revision === state.moduleRevision && node === state.node);
         if (revision !== state.moduleRevision || node !== state.node || retainedBytes !== state.currentModuleBytes) return;
         const activation = await activateModuleOnNode(node, retainedBytes.slice(0), requested, replacement);
         if (revision !== state.moduleRevision || node !== state.node) return;
@@ -1470,7 +1539,7 @@ async function applyLoadOptions(changedKey) {
         if (state.metadata) state.metadata.identity = activation.identity;
         state.liveInputPending = false;
         state.liveInputActive = (elements.keyboardEnable.checked || state.midiPort !== null);
-        renderMetadata();
+        renderMetadata(); setControlsEnabled(true);
         persistPreferences();
         const reduction = describeEnhancementReduction(requested.enhancementFlags, activation.appliedEnhancementFactor);
         showMessage(`${wording.applied}; playback restored at the sounding order.${reduction ? ` (${reduction}.)` : ''}`);
@@ -1506,6 +1575,7 @@ async function rebuildAudioContext() {
     const moduleBytes = state.currentModuleBytes;
     const revision = state.moduleRevision;
     const controlRevision = playback.controlRevision;
+    const settingsRevision = state.sessionSettingsRevision;
     const oldSinkId = 'sinkId' in oldContext ? oldContext.sinkId : '';
     const replacement = state.currentModuleBytes === null ? null : await captureReplacement();
     const contextOptions = { latencyHint: 'interactive' };
@@ -1530,7 +1600,7 @@ async function rebuildAudioContext() {
             });
         }
         await unlock;
-        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || settingsRevision !== state.sessionSettingsRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
         graph.node.connect(candidateContext.destination);
 
         state.context = candidateContext;
@@ -1579,6 +1649,7 @@ async function rebuildOutputChannels() {
     const moduleBytes = state.currentModuleBytes;
     const revision = state.moduleRevision;
     const controlRevision = playback.controlRevision;
+    const settingsRevision = state.sessionSettingsRevision;
     const replacement = state.currentModuleBytes === null ? null : await captureReplacement();
     let candidateNode = null;
     try {
@@ -1588,7 +1659,7 @@ async function rebuildOutputChannels() {
         const activation = state.currentModuleBytes === null
             ? null
             : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions, replacement);
-        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || settingsRevision !== state.sessionSettingsRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
         graph.node.connect(state.context.destination);
 
         installGraph(graph);
@@ -1825,6 +1896,7 @@ function sendInsertMessage(action, target, slot, kind, previous) {
     const requestId = state.nextRequestId++;
     flushFallbackCommands();
     const identity = state.node.starplayerIdentity;
+    state.sessionSettingsRevision = (state.sessionSettingsRevision ?? 0) + 1;
     state.pendingInserts.set(requestId, { target, slot, previous, identity });
     state.node.port.postMessage({ type: 'inserts', version: state.node.starplayerInteractiveVersion, identity, action, target, slot, kind, requestId });
 }
@@ -2409,8 +2481,7 @@ elements.progress.addEventListener('input', () => {
 });
 elements.progress.addEventListener('change', () => {
     const frame = Number(elements.progress.value);
-    userSeek(Ring.OPCODE_SEEK_FRAME, frame);
-    state.pendingSeekFrame = frame;
+    state.pendingSeekFrame = userSeek(Ring.OPCODE_SEEK_FRAME, frame);
     state.pendingSeekSequence = state.latest?.sequence ?? 0;
     state.scrubbing = false;
 });
@@ -2595,10 +2666,13 @@ playlistControls.setRender(() => playlistView.render());
 function userSeek(opcode, frame) {
     playlistPlayback.cancel();
     playback.userControl('seek');
-    queueCommand(opcode, frame);
     const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
+    // The displayed fade margin is output time, not additional sequenced music.
+    if (opcode === Ring.OPCODE_SEEK_FRAME && (snapshot?.songFlags & Ring.SONG_FLAG_LENGTH_KNOWN) !== 0 && snapshot.songLengthFrames > 0) frame = Math.min(Math.max(0, frame), snapshot.songLengthFrames - 1);
+    queueCommand(opcode, frame);
     refreshMediaPosition(opcode === Ring.OPCODE_SEEK_FRAME ? frame : snapshot?.songFrame);
     scheduleMediaPosition();
+    return frame;
 }
 const libraryView = createLibraryView({ playlist, play: playLibraryRow });
 await wireLibraryControls({ state, loader: Loader,

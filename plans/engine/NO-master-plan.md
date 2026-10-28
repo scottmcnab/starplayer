@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implementation authorised 2026-10-27; NO-01–06 and NO-W1 integrated; NO-07 in progress; reviewed instrument-only/onset-volume contract unchanged |
+| Status | NO-01–07 and NO-W1 integrated on feature/note-overlap-audition; available automated verification passed; owner listening/device acceptance pending; no main merge or deployment; reviewed contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -634,3 +634,52 @@ prepared insert ordering/Reset, v2 legacy Stop refusal, actual width and mapped 
 eligibility without changing the product contract. See NO-W1 for exact evidence.
 NO-07 now starts on the combined tree, using Sol high as the sole task worker. Main,
 deployment and owner hardware/listening acceptance remain outside this landing.
+
+
+### NO-07 integration evidence — 2026-10-28
+
+The combined-base worker diff adds five-format absolute-frame fixed and real float
+schedules at all six required block sizes, three fresh canonical states against separately
+compiled neither-feature PCM, and actual native IT plus prepared live full pressure:
+N256/C64/L16 active, all 339 physical slots, maximum slot 338. The owner artifact helper
+also checks all eight committed golden inputs in all three prepared passive states;
+24 hashes agree, including REFLEX Linear/Cubic/Sinc. Goldens were not regenerated.
+
+Source-backed integration fixes retain the reviewed behavior: atomic v2 group preflight
+through shared validation and separate queue reservations; actual Engine/DSP completion
+before applied acknowledgements despite the 32-command quantum drain; exact requested/
+current identity on rejected groups; readiness only for the latest same-node load; safe
+controls-disabled cancellation after installation; guarded scripted load-option changes
+during fresh loads. Neither-feature builds omit optional Command/live-summary payloads,
+with isolated exact layout/allocation guards and direct-core/engine-off unification proof.
+
+The final whole root CI run passed all 11 jobs (`/tmp/no07-ci-clean.log`), with unchanged
+261-case conformance baseline and all eight goldens. Package-isolated feature graphs,
+neither/each/both tests, portable bare-metal/WASM checks, strict allocation hooks and
+actual WASM batch/ring regressions pass. [NO-07](NO-task-07-integration-and-acceptance.md)
+records exact commands, diagnostic failures, final browser/embedded evidence, resource
+formulas and the pending owner checklist. M11's implemented loaded-module audition subset
+is distinguished from its outstanding instrument extraction/library deliverables.
+
+Task files remain in this directory until main landing. Generated WAVs/browser fixtures
+and screenshot are available under `/tmp/no07-artifacts`; subjective listening, real MIDI,
+phone/device checks and hardware execution remain pending and are not worker completion
+gates. No main merge or deployment occurred.
+
+
+### NO-07 final verification disposition — 2026-10-28
+
+The worker completed the combined task diff and available verification; the coordinator
+reviewed the final source and independently passed 136 facade/WASM-host tests in ten
+groups. Final Node343/web22, actual packaged WASM/ring, and ordinary plus interactive
+Chromium SAB/fallback/plain all pass. Ordinary checks include all W15/remote/library,
+post-failure controls, graph rebuilds and actual playlist fade/end/rewind behavior.
+Separate firmware-common host96 tests and both installed-board release builds pass:
+A1S production/default on Xtensa and C5 renderer bench on RISC-V, with neither optional
+feature in their exact target graphs. These are compile-only hardware results.
+
+[NO-07](NO-task-07-integration-and-acceptance.md) owns exact commands, resource/feature
+proof, diagnostic failures, settled logs and generated listening/browser artifacts.
+The coordinator accepted task commit `0d1eb0e` and integrated it as one reviewed change
+from the feature branch checkout; no main merge/deployment or plan archival occurs here. Owner listening, physical MIDI, phone/device acceptance
+and firmware execution remain honestly pending, without blocking worker completion.

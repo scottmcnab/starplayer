@@ -430,6 +430,7 @@ bitflags! {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Command<ModuleHandle> {
     /// Explicit capability/generation-checked interactive action. Legacy Stop is unchanged.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     Interactive(crate::InteractiveCommand),
     /// Swap in a module that was loaded off the audio thread. The retired handle goes
     /// back over the garbage channel to be dropped by the control thread (architecture
@@ -645,4 +646,10 @@ mod tests {
         let mute: Command<u32> = Command::MuteChannel { channel: ChannelId(1), muted: true };
         assert_ne!(mute, Command::<u32>::Stop);
     }
+}
+
+#[cfg(all(test, target_pointer_width = "64", not(any(feature = "note-overlap", feature = "interactive-audition"))))]
+#[test]
+fn neither_feature_keeps_the_native_command_ring_stride() {
+    assert_eq!(core::mem::size_of::<Command<usize>>(), 16);
 }

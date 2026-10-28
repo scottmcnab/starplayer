@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Reviewed contract implementation in progress; NO-01–03 integrated on feature branch |
+| Status | NO-01–07 and NO-W1 reviewed and integrated on feature/note-overlap-audition; available automated verification passed; owner listening/device acceptance pending; no main merge or deployment |
 | Requested reviewer | Claude CLI `claude-opus-5-5`; `--effort high` supplied; returned modelUsage confirms exact model |
 | Earliest invocation | After 2026-10-27 16:20 Australia/Perth / 08:20 UTC, per owner |
 | Master planning commit | c3bead3 |
@@ -922,3 +922,76 @@ live tests, actual-WASM/ring and SAB/fallback/plain Chromium smoke, no-CAS porta
 feature-off and strict lint checks passed. Exact commands/evidence are in NO-W1.
 NO-07 owns broad final CI, determinism, feature exclusion, embedded compile and acceptance
 artifacts. No main merge, deployment or physical MIDI/listening acceptance claimed.
+
+
+## NO-07 integration review dispositions — 2026-10-28
+
+Current master/task contracts supersede the historical verbatim reviews above. The sole
+worker used combined base `dd838b3` in `task/no-07-integration`; the diff remains for
+coordinator review. Source-backed findings and bounded corrections approved during work:
+
+- Whole-group v2 rejection must leave no audio/control mutation. Shared pure validation
+  and fixed staging preflight all records and separate actual queues; no per-record
+  quantum serialization, live batch throughput retained. Invalid seek is validated before
+  enable/control mutation and reserves its actual DSP ResetAll cost.
+- Host and Engine queues have different quantum drain limits. Real queued/held work,
+  including DSP inserts, gates applied acknowledgement; pending preparation/markers and
+  already queued Engine commands consume conservative headroom. Regression checks rendered
+  transport/gain effects and valid retry rather than only optimistic shadows.
+- Barrier-queue failure stamps requested identity. Any current member of a rejected mixed
+  group makes current UI rollback authoritative in either ordering; wholly stale groups
+  cannot roll back/clear the current session. Actual WASM/VM tests cover both paths.
+- Superseded same-node moduleLoaded replies cannot reenable old controls. A Stop-canceled
+  installed session disables mismatched retained metadata/rebuild controls until reload.
+  Scripted changes on disabled load options retain the latest fresh request's posted
+  options; old module bytes cannot reconstruct the new session cursor. Posted preparation
+  failures restore readiness only with unchanged control/audio-applied identity/capabilities
+  and latest-request/prior-ready/metadata proof. Off-render error paths rebase WASM views;
+  failed partial installations get no retained identity claim. Actual WASM and real browser
+  regressions distinguish main-inspection failure from later audio failure.
+- Exact resource failures exposed a genuine optional Command ring leak and unconditional
+  live-summary bytes. Feature gating removes both; tiny shared transport flags remain
+  explicitly permitted. Original base plus source-counted snapshot/command strides retains
+  exact equality, with isolated off assertions protecting against automatic budget growth.
+- Full-pressure native IT/live fixture reaches N256/C64/L16 and all 339 physical slots,
+  preserving strict slot338 and N257/C65/L17 physical maxima. An initial338 result was a
+  fixture error (zero-age live retiree ended immediately), corrected by retaining an
+  already sounding live retiree rather than weakening the target assertion.
+- Ordinary browser panning waited for a new row-zero note before checking the restored
+  cursor. Full-cursor replacement reconstructs fresh voices/effects and does not replay
+  prior notes. Strict first-playing-new-generation order checks and five-phase native
+  follow-up tests prove preservation; exact new-note panning checks remain afterward.
+  Generation waits replace transient applied text for speed-bias acceptance; actual speeds
+  remain strict. V2 readiness now exposes the existing WASM lead and stores it on candidate
+  nodes, preserving the exact 256-frame/current-rate disclosure after graph changes.
+- Cross-Host graph replay omitted effective AtEnd/fade policy, unlike native rebuild.
+  Existing hostSettings/opcode replay now restores it at the candidate rate before
+  readiness. Actual WASM detects the original wrap with a one-line omission negative
+  control, and the browser requires applied near-end seek before suspending animation
+  frames for background playlist completion.
+- Deferred graph candidates could overwrite a setting accepted after cursor capture.
+  A separate persistent-settings revision protects both graph install guards and same-node
+  recapture; transient MIDI/Preview are excluded. Optional controls restore unsent changes
+  while current-node loading is unready. A deferred accepted-checkbox VM proves the race
+  and correct candidate discard with the old graph/settings retained.
+- Fade output margin offered by slider/Media Session is outside valid native scan frames.
+  Shared UI frame seeks clamp known lengths to their last valid music frame; unknown and
+  order/row semantics are preserved. The original PETRI fade-zone seek remains a real
+  browser assertion. Core validation/timing was not changed to accommodate the test.
+
+Final root CI exits zero with all 11 jobs. Initial heap/manifest and brittle source-shape
+failures are retained as diagnostic evidence, not hidden passes. Exact feature matrices,
+resource formulas, final browser/embedded evidence and owner-only pending acceptance are
+in [NO-07](NO-task-07-integration-and-acceptance.md). Main merge/deployment is outside this
+worker task; plans stay unarchived pending main landing.
+
+
+NO-07 final disposition: coordinator source review accepted, independent facade/WASM-host
+136 tests/10 groups passed; worker final Node343/web22, packaged wire/WASM and all six
+ordinary/interactive browser mode runs passed. Firmware-common96 host tests, A1S default
+Xtensa release and C5 renderer-bench RISC-V release passed with neither optional feature.
+Exact evidence and pending owner checklist are in NO-07. Code/test source remained frozen
+after coordinator verification. No main merge/deployment, firmware execution or subjective
+listening was claimed. The coordinator accepted task commit `0d1eb0e` and integrated it
+by single-change squash from the feature branch checkout after explicit path review.
+Only plan status/landing evidence changed after the tested task commit.

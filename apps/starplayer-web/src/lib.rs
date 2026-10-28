@@ -615,9 +615,11 @@ mod tests {
         let inspect = activate.find("Loader.inspect_s3m(new Uint8Array(moduleBuffer));").unwrap();
         let snapshot = activate.find("JSON.parse(Loader.module_metadata())").expect("structured snapshot parsed immediately");
         let audio = activate.find("await context.audio;").unwrap();
-        let commit = activate.find("if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node) return null;").unwrap();
+        let guard = activate.find("if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node)").expect("current installation guard");
+        let commit = activate.find("libraryView.setPlaying(null);").expect("committed playback state");
         let enrich = activate.find("acceptPlaybackMetadata(context.locator, libraryMetadata, retainedBytes)").unwrap();
-        assert!(inspect < snapshot && snapshot < audio && audio < commit && commit < enrich);
+        assert!(inspect < snapshot && snapshot < audio && audio < guard && guard < commit && commit < enrich);
+        assert!(activate[guard..commit].contains("return null;"), "cancelled/stale installations return before metadata enrichment");
         assert!(activate.contains("catch {}"), "optional metadata failures preserve playback");
         assert!(activate.contains("library === state.library"), "same identity in a newer source context must not receive old metadata");
         assert!(activate.contains("context.locator.libraryIdentity?.sha256"));

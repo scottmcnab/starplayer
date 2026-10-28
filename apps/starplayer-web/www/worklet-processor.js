@@ -61,7 +61,11 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         this.applyCommand = (opcode, argument, extra, sessionLow, sessionHigh, buildLow, buildHigh) => {
             if (this.interactiveVersion) {
                 if (opcode === Ring.OPCODE_SET_MIXER_MODE || this.controlAck.count >= Ring.COMMAND_CAPACITY || !this.wasm.enqueue_interactive_words(opcode, argument, extra, sessionLow, sessionHigh, buildLow, buildHigh)) this.controlFailed = true;
-                if (this.controlAck.count === 0) { this.controlAck.requestedIdentity[0] = sessionLow; this.controlAck.requestedIdentity[1] = sessionHigh; this.controlAck.requestedIdentity[2] = buildLow; this.controlAck.requestedIdentity[3] = buildHigh; }
+                // A mixed stale/current group is rejected atomically. Prefer its current
+                // member's identity so that UI receives that member's rejection too;
+                // a wholly stale group keeps its original identity and cannot clear live input.
+                const installed = this.interactiveStatus;
+                if (this.controlAck.count === 0 || sessionLow === installed[2] && sessionHigh === installed[3] && buildLow === installed[4] && buildHigh === installed[5]) { this.controlAck.requestedIdentity[0] = sessionLow; this.controlAck.requestedIdentity[1] = sessionHigh; this.controlAck.requestedIdentity[2] = buildLow; this.controlAck.requestedIdentity[3] = buildHigh; }
                 const index = this.controlAck.count++ * 3;
                 this.controlAck.commands[index] = opcode; this.controlAck.commands[index + 1] = argument; this.controlAck.commands[index + 2] = extra;
                 return;
@@ -79,6 +83,8 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             commandRingVersion: this.commandRing?.version ?? this.interactiveVersion,
             sampleRate,
             renderQuantum: this.renderQuantum,
+            leadFrames: this.wasm.event_lead_frames(),
+            leadMillis: this.wasm.event_lead_millis(),
             initialMemoryBytes: this.initialMemoryBytes,
             commandTransport: this.commandRing ? 'SharedArrayBuffer' : 'postMessage',
             telemetryTransport: this.telemetry ? 'SharedArrayBuffer' : 'postMessage',
@@ -125,12 +131,13 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
     flushInteractive() {
         if (!this.interactiveVersion || this.pendingControlSerial) return;
         const rejected = this.wasm.dropped_commands();
-        this.wasm.flush_commands();
         if (this.controlAck.count || this.controlFailed) {
-            this.pendingControlFailed = this.controlFailed || this.wasm.dropped_commands() !== rejected;
+            const admitted = this.wasm.flush_interactive_batch(!this.controlFailed);
+            this.pendingControlFailed = !admitted || this.wasm.dropped_commands() !== rejected;
             this.controlFailed = false;
             if (!this.allocateBarrier() || !this.wasm.queue_applied_barrier_words(this.barrierLow, this.barrierHigh)) {
                 this.controlAck.accepted = false; this.controlAck.words.set(this.interactiveStatus);
+                this.controlAck.words.set(this.controlAck.requestedIdentity, 2);
                 this.port.postMessage(this.controlAck); this.controlAck.count = 0; return;
             }
             this.pendingControlSerial = true;
@@ -173,6 +180,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
     startReplay(settings, loaded) {
         const identity = loaded.identity;
         const actions = [{ opcode: Ring.OPCODE_MASTER_VOLUME, argument: settings.volume, extra: 0 }];
+        if (settings.atEnd !== undefined) actions.push({ opcode: Ring.OPCODE_AT_END, argument: settings.atEnd, extra: settings.fadeFrames });
         for (const channel of settings.mutes) actions.push({ opcode: Ring.OPCODE_MUTE_CHANNEL, argument: channel, extra: 1 });
         for (const insert of settings.inserts) {
             actions.push({ install: insert });
@@ -277,6 +285,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             return;
         }
         if (message.type === 'loadModule') {
+            const previousIdentity = this.interactiveVersion ? this.identity() : null;
             try {
                 if (this.interactiveVersion && !Ring.validIdentity(message.identity)) throw new Error('Missing full playback identity.');
                 if (this.commandRing && !this.pendingControlSerial) Ring.drainCommands(this.commandRing, this.applyCommand, this.interactiveVersion ? 63 : Ring.COMMAND_CAPACITY);
@@ -318,9 +327,19 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                 else if (this.interactiveVersion) this.queueApplied(loaded);
                 else this.port.postMessage(loaded);
             } catch (error) {
+                // Decode/preparation may fail before changing the installed player.
+                // Rebase after possible memory growth and prove both control and audio
+                // still identify that prior installation. Partial installs get no proof.
+                this.bindViews();
+                const controlIdentity = this.interactiveVersion ? this.identity() : null;
+                const status = this.interactiveStatus;
+                const appliedIdentity = status ? { session: BigInt(status[2]) | (BigInt(status[3]) << 32n), build: BigInt(status[4]) | (BigInt(status[5]) << 32n) } : null;
+                const retained = previousIdentity && status[7] !== 0 && Ring.sameIdentity(previousIdentity, controlIdentity) && Ring.sameIdentity(controlIdentity, appliedIdentity);
                 this.port.postMessage({
                     type: 'moduleError',
                     requestId: message.requestId,
+                    retainedIdentity: retained ? controlIdentity : undefined,
+                    retainedCapabilities: retained ? status[6] : 0,
                     reason: error && error.message ? error.message : String(error),
                 });
             }

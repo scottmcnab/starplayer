@@ -23,25 +23,26 @@ An XM or IT instrument **is** a synthesiser patch in everything but name.
 The engine already supplies sample mapping and a shared voice pool, but MIDI mapping
 alone does not supply native instrument articulation.
 
-- **Current live instruments are sample players.** M4's `SampleInstrument` and
-  `MappedInstrument` live in the engine. The latter maps XM/IT samples and tuning, but
-  does not run native envelopes, fadeout, auto-vibrato, IT NNA or the IT filter lifecycle.
-- **NO-02 extracts the existing format computations.** Concrete `XmArticulationRuntime`
-  and `ItArticulationRuntime` remain in their format crates and can address the full
-  prepared pool. Tracker playback uses the same computations in its original order.
-  The provided tracker control-step hook advances articulation without row effects;
-  NO-03 must supply its held cadence. These are concrete runtimes, not live `Instrument`
-  implementations or one runtime per program.
-- **NO-06 still owes faithful loaded-module audition.** It must install a rack-level
-  mutable interface together with its two real XM/IT implementations, native mapping/
-  release/NNA and separate live random state. M11's extraction, library and bank design
-  remain unimplemented and outside the NO feature's scope.
+- **Legacy live constructors remain sample players.** M4's `SampleInstrument` and
+  `MappedInstrument` map samples and tuning without native XM/IT articulation.
+- **The NO feature branch implements native loaded-module articulation and audition.**
+  NO-02 supplies `XmArticulationRuntime`/`ItArticulationRuntime`; NO-03 supplies the shared
+  exact tracker/held cadence; NO-06 installs one mutable `RackRuntime` per rack with both
+  concrete format adapters and a separate live RNG. The facade's explicitly prepared
+  Song and Live factories run native maps, envelopes, release, fadeout, auto-vibrato,
+  IT filter and note actions. NO-W1 exposes loaded-module controls in the browser.
+  NO-07 verifies the combined path, including real browser and firmware compile checks;
+  main landing and owner listening/device execution remain separate.
+  Optional features and runtime preparation preserve legacy/embedded defaults.
+- **M11 extraction, library and bank design remain outstanding.** Loaded-module audition
+  does not extract self-contained instruments or implement stable bank addresses,
+  synthetic release envelopes, broad controllers or a library browser.
 - **The event vocabulary is already a MIDI superset.** `Event::NoteOn`/`NoteOff`/
   `Program`/`Controller` exist, MIDI parsing is a codec rather than the internal
   representation, and velocity is `U0F16` rather than 7 bits
   (`plans/product/01-technical-architecture.md` §2.3).
 - **Voices are format-agnostic.** One global pool, generational handles, background
-  voices for NNA. Native tracker IT already uses this; live IT lifecycle integration remains NO-06 work.
+  voices for NNA. Native tracker IT and explicitly prepared native live racks both use it.
 - **`Module` is already position-independent** — blob plus u32 offsets — so extracting
   and re-packing sample data is a mechanical transform, not a redesign.
 
@@ -85,9 +86,9 @@ envelope and fadeout.
 ### 4. Velocity, and what else MIDI should reach
 
 Tracker instruments have no velocity layers, so velocity maps to volume through a curve
-that has to be chosen. For IT there is a genuine decision to make and document: does
-velocity scale the volume envelope's output, or set the initial channel volume? They
-differ audibly once an envelope is involved.
+that has to be chosen. NO loaded-module audition scales the native base note gain from velocity before the
+envelope and records that identity before separate CC7 gain. A future extracted bank
+still needs its own velocity curve and metadata contract.
 
 Worth doing while in the area: map IT's filter cutoff and resonance to MIDI CC 74/71.
 That turns an IT instrument into something genuinely expressive from a keyboard, and IT's

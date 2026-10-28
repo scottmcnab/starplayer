@@ -709,7 +709,7 @@ When implementation discovers a new deviation, add it to §3 with its cause and 
 canonical behaviour chosen, in the same commit as the code. A deviation that is not
 written down here is a defect, not a decision.
 
-## Planned creative playback: note overlap
+## Optional creative playback: note overlap
 
 The [NO master plan](../engine/NO-master-plan.md) defines an optional creative playback
 layer, not a new interpretation of canonical tracker effects. NO-01 implements its
@@ -744,8 +744,8 @@ than a rendered gain or rounded identity-only conversion. Passive finalization d
 consult checkbox/global state, and native release does not erase identity; retiring slots
 are excluded from matching. NO-04 wires MOD/S3M/MTM capture after onset-tick processing
 and proves canonical equivalence in the three reviewed configurations; NO-05 extends
-the same capture and equivalence contract to XM/IT. NO-06 must resolve live
-velocity before CC7 and test collisions from each format's existing volume resolution.
+the same capture and equivalence contract to XM/IT. NO-06 resolves live
+velocity before CC7 and tests collisions from each format's existing volume resolution.
 Those behavioral/equivalence tests are not satisfied by NO-01's seam-level contract tests.
 
 

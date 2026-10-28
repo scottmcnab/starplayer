@@ -1,0 +1,13 @@
+[package]
+name = "no07-acceptance-artifacts"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[workspace]
+[[bin]]
+name = "no07-acceptance-artifacts"
+path = "main.rs"
+[dependencies]
+starplayer = { path = "../../crates/starplayer", features = ["note-overlap", "interactive-audition"] }
+starplayer-offline = { path = "../../crates/starplayer-offline" }
+sha2 = "=0.10.9"

@@ -58,6 +58,10 @@ impl CommandRing {
         Some(command)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = WireCommand> + '_ {
+        (0..self.write_index.wrapping_sub(self.read_index)).map(|offset| self.slots[self.read_index.wrapping_add(offset) & CAPACITY_MASK])
+    }
+
     pub const fn dropped(&self) -> u32 { self.dropped }
 }
 

@@ -135,6 +135,7 @@ macro_rules! define_arms {
             fn interactive_transport(&self) -> Option<starplayer::core::InteractiveTransport> { match self { $(EngineArm::$variant(engine) => engine.interactive_transport(),)+ } }
             fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> { match self { $(EngineArm::$variant(engine) => engine.replace_instrument_selections(selections),)+ } }
             fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, selections: &[bool]) { match self { $(EngineArm::$variant(engine) => engine.restore_selections(identity, enabled, selections),)+ } }
+            fn pending_insert_commands(&self) -> usize { match self { $(EngineArm::$variant(engine) => engine.pending_insert_commands(),)+ } }
             fn master_volume(&self) -> U0F16 { match self { $(EngineArm::$variant(engine) => engine.master_volume(),)+ } }
             fn warnings(&self) -> EngineWarnings { match self { $(EngineArm::$variant(engine) => engine.warnings(),)+ } }
             fn module(&self) -> Option<&Arc<Module>> { match self { $(EngineArm::$variant(engine) => engine.module(),)+ } }
@@ -248,6 +249,9 @@ impl HostEngine {
 
     /// Whether the musical clock is running.
     pub fn is_playing(&self) -> bool { self.arm.is_playing() }
+
+    /// Insert requests that have not reached a rendered quantum.
+    pub fn pending_insert_commands(&self) -> usize { self.arm.pending_insert_commands() }
 
     /// The master volume the control plane last set.
     pub fn master_volume(&self) -> U0F16 { self.arm.master_volume() }

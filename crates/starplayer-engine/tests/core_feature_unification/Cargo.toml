@@ -1,0 +1,17 @@
+[package]
+name = "core-feature-unification-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "core-feature-unification-check"
+path = "check.rs"
+
+[dependencies]
+starplayer-core = { path = "../../../starplayer-core", features = ["note-overlap"] }
+starplayer-engine = { path = "../..", default-features = false }
+starplayer-dsp = { path = "../../../starplayer-dsp" }
+starplayer-mixer = { path = "../../../starplayer-mixer" }

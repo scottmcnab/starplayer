@@ -287,6 +287,7 @@ pub struct Snapshot {
     pub channel_count: u8,
     /// Voices sounding in the global pool.
     pub voices_active: u16,
+    #[cfg(feature = "interactive-audition")]
     pub live: LiveSummary,
     /// Where the song is.
     pub transport: TransportState,
@@ -303,11 +304,20 @@ impl Snapshot {
         publishes_dropped: 0,
         channel_count: 0,
         voices_active: 0,
+        #[cfg(feature = "interactive-audition")]
         live: LiveSummary { active: 0, retiring: 0, peak: U0F16::ZERO },
         transport: TransportState::IDLE,
         warnings: WarningFlags::NONE,
         channels: [ChannelState::SILENT; MAX_CHANNELS],
     };
+
+    /// Live summary storage is absent without audition; shared consumers see silence.
+    pub const fn live_summary(&self) -> LiveSummary {
+        #[cfg(feature = "interactive-audition")]
+        { self.live }
+        #[cfg(not(feature = "interactive-audition"))]
+        { LiveSummary { active: 0, retiring: 0, peak: U0F16::ZERO } }
+    }
 
     /// One channel, or `None` past [`MAX_CHANNELS`].
     pub fn channel(&self, index: usize) -> Option<&ChannelState> { self.channels.get(index) }
@@ -381,4 +391,12 @@ mod tests {
         assert!(WarningFlags { zero_advance_forced: true, ..WarningFlags::NONE }.any());
         assert!(WarningFlags { unsupported_command: true, ..WarningFlags::NONE }.any());
     }
+}
+
+#[cfg(all(test, target_pointer_width = "64", not(feature = "interactive-audition")))]
+#[test]
+fn feature_off_snapshot_has_no_rebuild_or_live_payload_storage() {
+    assert_eq!(core::mem::size_of::<TransportState>(), 40);
+    assert_eq!(core::mem::size_of::<Snapshot>(), 2624);
+    assert_eq!(Snapshot::IDLE.live_summary(), LiveSummary::default());
 }

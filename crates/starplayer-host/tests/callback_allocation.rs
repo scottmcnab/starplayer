@@ -407,7 +407,7 @@ fn actual_loaded_native_live_runtimes_and_bounded_controls_allocate_and_free_not
         instrument.new_note_action = starplayer::model::NewNoteAction::Continue;
         instrument.volume_envelope = Some(Envelope {points:vec![EnvelopePoint {tick:0,value:64},EnvelopePoint {tick:100,value:0}].into_boxed_slice(),..Envelope::default()});
         builder.add_instrument(instrument).unwrap();
-        let cell = if format == ModuleFormat::Xm {vec![0;5]} else {vec![255,0,255,0,0]}; builder.add_pattern(&cell,1,1).unwrap(); builder.set_orders(&[0]);
+        let cells = if format == ModuleFormat::Xm {vec![49,1,0,0,0,56,1,0,0,0,49,1,0x27,0,0,49,1,0x27,0,0]} else {vec![60,1,255,0,0,67,1,255,0,0,60,1,23,0,0,60,1,23,0,0]}; builder.add_pattern(&cells,4,1).unwrap(); builder.set_orders(&[0]);
         let mut header = ModuleHeader::new(format,1); header.flags.linear_slides=true;
         if format == ModuleFormat::It { header.format_extra=starplayer::it::ItFormatExtra {flags:12,special:0,old_instruments:false,has_midi_configuration:false}.encode(); }
         builder.set_header(header); let module = starplayer::rt::Arc::new(builder.build().unwrap());
@@ -419,9 +419,14 @@ fn actual_loaded_native_live_runtimes_and_bounded_controls_allocate_and_free_not
         let mut player = Player::open_with_settings(&mut backend,None,AudioSpec::stereo(44_100),MixerMode::DEFAULT,settings).unwrap();
         let driver = backend.driver().unwrap(); player.load_module(module).unwrap();
         player.interactive(InteractiveAction::SetLiveDestination(LiveDestination::Selected(InstrumentId(0)))).unwrap();
+        #[cfg(feature = "note-overlap")]
+        { player.interactive(InteractiveAction::SetLetNotesRing { instrument: InstrumentId(0), enabled: true }).unwrap(); player.interactive(InteractiveAction::SetNoteOverlapEnabled(true)).unwrap(); }
+        player.play().unwrap();
         let mut output = [0.0;512]; let mut heard = false;
         let (_, report) = while_watching_for_allocations(|| {
             for index in 0..80 {
+                if index == 40 { let _ = player.pause(); }
+                if index == 60 { let _ = player.resume(); }
                 let _ = player.send_event(0,Event::NoteOn {note:Note::new(60+(index%12) as u8),velocity:U0F16::MAX});
                 driver.render(&mut output); heard |= output.iter().any(|sample| *sample != 0.0);
             }

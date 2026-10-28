@@ -73,3 +73,21 @@ test('v2 legacy-numbered controls keep their complete identity on both transport
         assert.equal(BigInt(received[0][5]) | (BigInt(received[0][6]) << 32n), identity.build);
     }
 });
+
+test('barrier queue failure retains the rejected request identity instead of the installed identity', async () => {
+    const worklet = await readFile(new URL('../www/worklet-processor.js', import.meta.url), 'utf8');
+    const method = worklet.slice(worklet.indexOf('    flushInteractive() {'), worklet.indexOf('    publishApplied() {'));
+    const flush = vm.runInNewContext(`({ ${method} }).flushInteractive`);
+    const requested = new Uint32Array([11, 12, 13, 14]), installed = new Uint32Array([1, 2, 91, 92, 93, 94, 3, 1, 0, 0]);
+    let acknowledgement;
+    const receiver = {
+        interactiveVersion: 2, pendingControlSerial: false, controlFailed: false, interactiveStatus: installed,
+        controlAck: { count: 1, requestedIdentity: requested, words: new Uint32Array(10) },
+        wasm: { dropped_commands: () => 0, flush_interactive_batch: () => false, queue_applied_barrier_words: () => false },
+        allocateBarrier: () => true, port: { postMessage: message => { acknowledgement = structuredClone(message); } },
+    };
+    flush.call(receiver);
+    assert.equal(acknowledgement.accepted, false);
+    assert.deepEqual([...acknowledgement.words.slice(2, 6)], [...requested]);
+    assert.notDeepEqual([...acknowledgement.words.slice(2, 6)], [...installed.slice(2, 6)]);
+});

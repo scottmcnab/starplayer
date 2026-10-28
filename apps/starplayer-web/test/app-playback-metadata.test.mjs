@@ -182,3 +182,20 @@ test('Pause during a pending fresh activation wins over its default automatic Pl
     assert.equal((await pending).generation, 10);
     assert.equal(sent.some(command => command[0] === 13 || command[0] === 15), false);
 });
+
+test('cancel after audio installation disables old-metadata controls until another load', async () => {
+    const fixture = setup(); const activation = deferred(); const disabled = [];
+    const old = { session: 1n, build: 1n }, installed = { session: 2n, build: 2n };
+    fixture.state.metadata = { identity: old }; fixture.state.currentModuleBytes = new ArrayBuffer(1);
+    fixture.sandbox.Ring.sameIdentity = (left, right) => left?.session === right?.session && left?.build === right?.build;
+    fixture.sandbox.setControlsEnabled = enabled => disabled.push(enabled);
+    fixture.sandbox.updateLiveInputPanel = () => {};
+    fixture.sandbox.activateModuleOnNode = () => activation.promise;
+    let current = true; fixture.context.isCurrent = () => current;
+    const pending = fixture.activate(new Uint8Array([1]).buffer, 'cancelled.mod', fixture.context); await settle();
+    current = false; fixture.state.node.starplayerIdentity = installed; fixture.state.interactiveReady = true;
+    activation.resolve({ generation: 9, identity: installed }); assert.equal(await pending, null);
+    assert.equal(fixture.state.interactiveReady, false); assert.equal(fixture.state.liveInputActive, false);
+    assert.equal(fixture.state.currentModuleBytes, null); assert.deepEqual(disabled, [false]);
+    assert.equal(fixture.state.metadata.identity, old);
+});

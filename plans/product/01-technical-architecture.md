@@ -663,14 +663,14 @@ array defaults to 272 global slots while its allocator still caps IT-owned voice
 so MIDI occupying a low slot cannot push an IT voice beyond its state and IT cannot
 consume the reserve. A pool **smaller** is legal too — fewer voices sound.
 
-**NO-02 extraction and remaining planned NO integration:** configured HostEngine/Player,
+**NO prepared articulation and capacity:** configured HostEngine/Player,
 source builders and facade constructors now thread the actual N+C+L+R capacity to format
 storage, with preparation failures returned before dispatch. Capacity-only constructors
 preserve legacy behavior; explicit articulation preparation is separate. Loaded-module
-audition will use one mutable
+audition uses one mutable
 live format runtime per rack, with pool-indexed state for all its programs and independent
-RNG. Immutable program definitions keep sample/map data. A rack-level mutable interface
-lands only together with real XM and IT implementations; format crates retain ownership
+RNG. Immutable program definitions keep sample/map data. The rack-level mutable interface
+landed together with real XM and IT implementations; format crates retain ownership
 and the facade constructs them. Prepared pool capacity is N+C+L: native capacity (IT 256,
 otherwise channel count), custom tails (web 64), shared jam/audition (web 16, including the
 existing jam reserve). Persistent web active capacity is 336; physical capacity is 339 including one bounded
@@ -683,7 +683,7 @@ custom eviction, all live voices oldest live eviction; native IT keeps its nativ
 
 ### 5.4 The control clock
 
-**Planned NO amendment (not implemented):** loaded XM/IT live articulation will consume
+**Implemented on the NO feature branch:** explicitly prepared XM/IT live articulation consumes
 one engine-owned cadence: tracker ticks during playback and synthesised retained/initial
 cadence while held or without an active tracker (configured 50 Hz without a module).
 The MIDI 1 ms clock must not also advance format envelopes. Cadence deadlines split the
@@ -692,9 +692,9 @@ live articulation after due source events at the exact frame. At equal frames na
 sequenced processing precedes live events and one live articulation step; held song
 articulation advances on control-only steps. Resume rejoins the saved tracker deadline
 once. NO-02 now provides `TrackerProcessor::control_step` (default no-op), with real
-XM/IT implementations that run no row/effect/flow/trace-row events. NO-03 still owns its
-non-sequencing dispatch and cadence; NO-06 owns the live consumer.
-The historical/current behavior described below remains until these tasks land.
+XM/IT implementations that run no row/effect/flow/trace-row events. NO-03 supplies its
+non-sequencing dispatch and cadence; NO-06 supplies the native live consumer.
+The historical MIDI behavior below remains for unconfigured legacy racks.
 
 XM and IT envelopes, auto-vibrato, fadeout and NNA advance **exactly once per tracker
 tick** — not per sample, not per buffer. Rather than special-casing this, the control
@@ -1289,7 +1289,7 @@ about it.
 
 ---
 
-**Planned NO transport amendment (not implemented):** interactive Pause holds sequencing
+**Implemented NO interactive transport:** interactive Pause holds sequencing
 and progress while sample mixing, live input, DSP and format articulation continue.
 Tracker and SMF are sequenced sources; keyboard/MIDI are live. Preserve pending tick
 fractional remainder and translate absolute song origin/deadlines by held audio time.
@@ -1306,8 +1306,8 @@ See the NO master for boundary ordering, cleanup scopes and rebuild details.
 
 ## 9. Telemetry
 
-**NO-01 layout contract; remaining telemetry planned:** retain 64 tracker telemetry lanes
-and add a separate live summary in NO-03. With interactive audition the channel table admits up to 64+17
+**NO implemented telemetry contract:** retain 64 tracker telemetry lanes
+and publish a separate live summary. With interactive audition the channel table admits up to 64+17
 lanes: 16 shared jam/selected-input lanes plus a button-preview lane at fixed IDs 64–80,
 all outside tracker insert buses and mixed through spill/master DSP. Insert bus_count is
 decoupled from table length and capped at 64. Preserve legacy constants/constructors even
@@ -1826,15 +1826,17 @@ for every buffer-size-independence test to keep honest. The one result that woul
 this is a cycles-per-frame figure showing the per-quantum fixed cost dominating the
 per-sample cost; the measurement that would show it is the budget document's §3 table.
 
-## Planned: optional note overlap and interactive transport
+## Optional note overlap and interactive transport
 
-The [NO master plan](../engine/NO-master-plan.md) proposes explicit, session-only
+The [NO master plan](../engine/NO-master-plan.md) specifies explicit, session-only
 instrument-only note overlap and faithful instrument audition for all five formats. This
 has completed external review and corrections (see the NO review log), and implementation
 was authorised on 2026-10-27. NO-01 supplies the contracts/preparation described below;
 NO-02 adds concrete native articulation, NO-03 adds interactive transport, and NO-04
-implements opt-in MOD/S3M/MTM overlap. NO-05 implements XM/IT overlap; faithful native
-live audition remains NO-06 work.
+implements opt-in MOD/S3M/MTM overlap. NO-05 implements XM/IT overlap; NO-06 implements
+faithful prepared native live audition and NO-W1 its web controls. The combined feature
+remains on the feature branch after NO-07 source review/verification, pending feature and
+main landing plus owner listening/device acceptance.
 Each instrument has a Let notes ring boolean, with a separate Enable note overlap global
 bypass preserving selections. There are no channel overrides, inheritance or custom modes.
 Enabled eligible voices continue except when instrument, original note, exact onset base
@@ -1852,7 +1854,7 @@ The design separates held tracker sequencing time from advancing audio/live-inpu
 and format-owned articulation. Pause leaves mixing, envelopes and DSP running; interactive
 Stop clears sound while holding sequence position. Existing hosts retain their legacy
 Stop contract unless they select the new interactive command. XM background articulation
-and faithful mapped-instrument live playback require new implementation, not merely UI.
+and faithful prepared native live playback use the format-owned runtimes.
 
 Optional `note-overlap` and `interactive-audition` features remain off in reusable-crate
 defaults and embedded builds, enabled explicitly by the web host. They preserve no_std,
@@ -1921,8 +1923,8 @@ musical onset from effect retrigger/sample replacement; the allocation helper al
 not decide this. NO-04/05 wire the format-specific post-effects capture and duplicate
 replacement, including delayed starts. NO-05 captures XM `real_volume` after onset-tick effects. NO-06 wires live
 native resolution; `NoteParams::raw_velocity` already preserves event velocity separately
-from CC7-scaled playback velocity. Existing format-resolution velocity collisions need
-format-native tests there, without identity-only quantization.
+from CC7-scaled playback velocity. Native-format tests cover existing velocity-resolution collisions without
+identity-only quantization.
 
 
 ### NO-03 interactive transport and replacement boundaries
@@ -1981,7 +1983,7 @@ region and both normal/sustain model loops; aliases cannot borrow one-shot eligi
 from another sample. The current sounding instrument's checkbox decides survival; the
 immutable original trigger instrument/note/volume/channel selects duplicates. Retiring
 voices are excluded. Native-created backgrounds keep N; the helper never migrates them.
-NO-06 still owns live held instances and L admission before using the shared predicate
+NO-06 integrates live held instances and L admission with the shared predicate
 and replacement scan.
 
 An opted-in MOD queued swap carries instrument/sample metadata alongside its pending PCM.
@@ -2146,3 +2148,55 @@ Sample loop/one-shot capability flags cover every mapped nonempty PCM sample, in
 native tracker keys that the live-input reference adapter cannot tune. Live target and
 reference-preview viability are separate flags. This preserves overlap eligibility and
 mixed-map badges independently of keyboard pitch-range restrictions.
+
+
+### NO-07 applied controls and integration evidence
+
+Version 2 acknowledgement groups preflight every record through shared pure action
+validation before mutating controls or queues. A stale/invalid record, host/engine/DSP
+pressure or insufficient live event room rejects the whole group. Fixed staging and
+separate queue reservations preserve allocation-free rendering and 63-record live batches.
+Capacity uses the shared 32-command quantum drain bound, including pending host expansion
+and observed engine backlog. The applied barrier also waits for actual engine/insert
+queues and held host work to empty, so a Host drain alone cannot claim audio application.
+Version 1 command admission retains its behavior. A rejected group containing any current
+identity is tagged with that identity so its optimistic controls roll back; a wholly stale
+group retains a stale identity and cannot clear current input, including barrier failure.
+Neither-feature builds omit the optional Command dispatch payload and live telemetry
+storage. Small shared transport flags remain; exact queue/snapshot strides and allocation
+formulas guard that boundary, including a direct core-feature/engine-off unification graph.
+
+Only the latest same-node load request may publish installed identity/readiness. A valid
+superseded reply resolves its waiter without arming controls. If Stop cancels a request
+after audio installation, mismatched old metadata cannot arm that installed session:
+interactive controls remain disabled and retained rebuild bytes are cleared until another
+load. A newer installation retains its own authority. Scripted changes to a disabled load-option
+control while a current-node fresh load is pending restore the options actually posted
+with that latest request before capture/revision changes; they cannot replay older retained
+module bytes against the new session cursor.
+Failed posted preparation can restore prior readiness only when unchanged pre/post control
+identity also matches accepted audio-applied identity/capabilities and the latest request's
+prior-ready metadata. The off-render failure handler rebases WASM views before reading
+that proof. Unproved/partial installations keep controls disabled; successful page-side
+inspection alone never establishes an installed session.
+The ready message reports the existing backend event lead (256 frames for this host),
+stored per node so candidate graph installation updates the millisecond conversion at
+its own sample rate. Fallback batching disclosure remains separate from that lead.
+Cross-Host graph installation replays the effective at-end policy and fade duration at the
+candidate sample rate before the final load barrier, alongside volume/mutes/inserts. A
+fresh WASM Host's default Continue policy must not silently replace playlist completion
+or Repeat-off behavior after a graph rebuild.
+Persistent settings queued after cursor capture advance a separate session-settings
+revision. Candidate graph installation checks it alongside transport/module revisions;
+a concurrent accepted edit keeps the current graph/settings. Same-node capture retries
+when settings change. Transient live MIDI/Preview do not invalidate capture. Pending
+current-node installation disables optional controls and restores scripted unsent changes
+to accepted checkbox/global/destination values; pending transport forwarding is unchanged.
+Known-length frame seeks at the shared slider/Media Session boundary clamp to the last
+valid scanned music frame. The displayed fade margin is output time, not extra sequenced
+music; unknown-length and native order/row seek semantics remain unchanged.
+
+NO-07 adds five-format fixed/float absolute-frame song/live schedules, isolated feature-off
+canonical PCM pairs and real native IT plus prepared live pressure through slot 338.
+The task evidence distinguishes automated checks, compile-only embedded evidence and
+pending owner listening/device acceptance. Canonical goldens are never regenerated.

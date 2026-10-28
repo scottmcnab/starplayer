@@ -871,6 +871,9 @@ where
         self.ring.refill_with(|destination| Out::convert(accumulator, destination));
     }
 
+    /// Insert requests still awaiting a quantum boundary. There is no deferred insert slot.
+    pub fn pending_insert_commands(&self) -> usize { self.insert_commands.len() }
+
     /// Apply up to [`MAX_COMMANDS_PER_QUANTUM`] queued commands.
     fn drain_commands(&mut self) {
         for _ in 0..MAX_COMMANDS_PER_QUANTUM {
@@ -975,6 +978,7 @@ where
                     drop(orphan);
                 }
             }
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
             Command::Interactive(command) => self.apply_interactive(command),
             Command::Play => self.playing = true,
             Command::Stop => self.playing = false,
@@ -997,9 +1001,14 @@ where
             | Command::SetTempoModel(_) => {
                 self.warnings.unsupported_command = true;
             }
+            // A direct core consumer can enable its optional command variant without
+            // enabling this engine's capability. Compile it out in ordinary off builds.
+            #[allow(unreachable_patterns, reason = "core features can unify independently of engine capabilities")]
+            _ => { self.warnings.unsupported_command = true; }
         }
     }
 
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     fn apply_interactive(&mut self, command: starplayer_core::InteractiveCommand) {
         #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
         {

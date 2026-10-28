@@ -490,9 +490,65 @@ impl Host {
         }
     }
 
+    fn interactive_action(wire: WireCommand) -> Option<InteractiveAction> {
+        Some(
+            match wire.opcode {
+                13 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Play,
+                14 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Pause,
+                15 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Resume,
+                16 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Stop,
+                17 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::AllSoundOff,
+                18 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::StopPreview,
+                19 if wire.extra == 0 => InteractiveAction::SetLiveDestination(match wire.argument {
+                    0 => LiveDestination::Off, 1 => LiveDestination::Jam,
+                    value if value - 2 <= u16::MAX as u32 => LiveDestination::Selected(InstrumentId((value - 2) as u16)), _ => return None,
+                }),
+                20 if wire.argument <= u16::MAX as u32 && wire.extra == 0 => InteractiveAction::PreviewInstrument(InstrumentId(wire.argument as u16)),
+                21 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::ReleasePreview,
+                22 if wire.argument <= 1 && wire.extra == 0 => InteractiveAction::SetNoteOverlapEnabled(wire.argument != 0),
+                23 if wire.argument <= u16::MAX as u32 && wire.extra <= 1 => InteractiveAction::SetLetNotesRing { instrument: InstrumentId(wire.argument as u16), enabled: wire.extra != 0 },
+                _ => return None,
+            }
+        )
+    }
+
+    /// Validate and reserve the entire v2 acknowledgement group before touching state.
+    /// Fixed staging remains in CommandRing; rejection discards every member together.
+    fn drain_interactive_batch(&mut self, complete: bool) -> bool {
+        let mut host_commands = 0;
+        let mut inserts = 0;
+        let mut events = 0;
+        let mut records = [WireCommand::default(); COMMAND_RING_CAPACITY];
+        let mut count = 0;
+        for (wire, slot) in self.commands.iter().zip(records.iter_mut()) { *slot = wire; count += 1; }
+        let valid = complete && records[..count].iter().copied().all(|wire| {
+            if wire.identity.is_none() || !self.valid_wire(wire) { return false; }
+            match wire.opcode {
+                OPCODE_MIDI_EVENT | 24 => {
+                    events += 1;
+                    message_to_event(wire.argument as u8, (wire.argument >> 8) as u8, (wire.argument >> 16) as u8).is_some()
+                }
+                OPCODE_INSERT_PARAM | OPCODE_INSERT_BYPASS => { inserts += 1; true }
+                // A seek uses a mailbox rather than HostCommand, but requests one DSP
+                // ResetAll. Browser seeks require an installed native scanned source.
+                OPCODE_SEEK_ORDER | OPCODE_SEEK_ROW | OPCODE_SEEK_FRAME => { inserts += 1; self.player.module().is_some() && self.player.scan().is_some() }
+                OPCODE_AT_END => { host_commands += if wire.extra == 0 { 1 } else { 2 }; true }
+                13..=23 => { host_commands += 1; Self::interactive_action(wire).is_some_and(|action| self.player.validate_interactive(action).is_ok()) }
+                _ => { host_commands += 1; true }
+            }
+        }) && self.player.can_admit_browser_batch(host_commands, inserts, events);
+        if !valid {
+            while self.commands.pop().is_some() {}
+            self.commands_rejected = self.commands_rejected.saturating_add(1);
+            return false;
+        }
+        self.drain_commands();
+        true
+    }
+
     /// One wire record. `false` means nothing was queued — the opcode is unknown, its
     /// argument spells nothing, or the player's ring was full.
-    fn apply(&mut self, wire: WireCommand) -> bool {
+    fn valid_wire(&mut self, wire: WireCommand) -> bool {
         if self.player.playback_identity().is_some() && wire.identity != self.player.playback_identity() { return false; }
         if wire.identity.is_some() && wire.opcode < 13 {
             let valid = match wire.opcode {
@@ -512,33 +568,21 @@ impl Host {
             };
             if !valid { return false; }
         }
-        if matches!(wire.opcode, OPCODE_MIDI_EVENT | 20 | 24) && self.player.playback_identity().is_some() {
+        if (matches!(wire.opcode, OPCODE_MIDI_EVENT | 20 | 24) || wire.identity.is_some() && matches!(wire.opcode, OPCODE_SEEK_ORDER | OPCODE_SEEK_ROW | OPCODE_SEEK_FRAME)) && self.player.playback_identity().is_some() {
             let applied = self.player.applied_playback();
             if !applied.accepted || applied.identity != wire.identity { return false; }
         }
+        wire.opcode <= 12 || (wire.opcode == 24 && wire.extra == 0 && wire.argument & 0xff80_8000 == 0) || Self::interactive_action(wire).is_some()
+    }
+
+    fn apply(&mut self, wire: WireCommand) -> bool {
+        if !self.valid_wire(wire) { return false; }
         if wire.opcode >= 13 {
             let Some(identity) = wire.identity else { return false };
-            if self.player.playback_identity() != Some(identity) { return false; }
-            let action = match wire.opcode {
-                13 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Play,
-                14 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Pause,
-                15 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Resume,
-                16 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::Stop,
-                17 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::AllSoundOff,
-                18 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::StopPreview,
-                19 if wire.extra == 0 => InteractiveAction::SetLiveDestination(match wire.argument {
-                    0 => LiveDestination::Off, 1 => LiveDestination::Jam,
-                    value if value - 2 <= u16::MAX as u32 => LiveDestination::Selected(InstrumentId((value - 2) as u16)), _ => return false,
-                }),
-                20 if wire.argument <= u16::MAX as u32 && wire.extra == 0 => InteractiveAction::PreviewInstrument(InstrumentId(wire.argument as u16)),
-                21 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::ReleasePreview,
-                22 if wire.argument <= 1 && wire.extra == 0 => InteractiveAction::SetNoteOverlapEnabled(wire.argument != 0),
-                23 if wire.argument <= u16::MAX as u32 && wire.extra <= 1 => InteractiveAction::SetLetNotesRing { instrument: InstrumentId(wire.argument as u16), enabled: wire.extra != 0 },
-                24 if wire.extra == 0 && wire.argument & 0xff80_8000 == 0 => {
-                    return message_to_event(wire.argument as u8, (wire.argument >> 8) as u8, (wire.argument >> 16) as u8).is_some_and(|(channel, event)| self.player.send_event(channel, event).is_ok());
-                }
-                _ => return false,
-            };
+            if wire.opcode == 24 {
+                return message_to_event(wire.argument as u8, (wire.argument >> 8) as u8, (wire.argument >> 16) as u8).is_some_and(|(channel, event)| self.player.send_event(channel, event).is_ok());
+            }
+            let Some(action) = Self::interactive_action(wire) else { return false };
             return self.player.submit_interactive(InteractiveCommand { identity, action }).is_ok();
         }
         let queued = match wire.opcode {
@@ -705,7 +749,7 @@ impl Host {
             destination.copy_from_slice(&header);
         }
 
-        let live = snapshot.live;
+        let live = snapshot.live_summary();
         if let Some(destination) = self.telemetry_words.get_mut(TELEMETRY_LIVE_OFFSET..) { destination.copy_from_slice(&[live.active as i32, live.retiring as i32, live.peak.to_bits() as i32]); }
         for (index, channel) in snapshot.channels.iter().enumerate() {
             let base = TELEMETRY_HEADER_WORDS + index * TELEMETRY_CHANNEL_WORDS;
@@ -826,6 +870,9 @@ mod exports {
 
     #[wasm_bindgen]
     pub fn pending_control_commands() -> u32 { with_host(0, |host| host.player.pending_control_commands() as u32) }
+
+    #[wasm_bindgen]
+    pub fn flush_interactive_batch(complete: bool) -> bool { with_host(false, |host| host.drain_interactive_batch(complete)) }
 
     #[wasm_bindgen]
     pub fn flush_commands() { with_host((), |host| host.drain_commands()); }
@@ -2088,6 +2135,82 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn versioned_groups_reject_without_partial_shadows_and_retry_after_queue_pressure() {
+        fn ready() -> Host {
+            let mut host = interactive_host(48_000); identified_load(&mut host, &minimal_mod(), 1, 1);
+            host.player.playback_barrier(1).unwrap(); host.process(128); host
+        }
+        for failure in 0..7 {
+            let mut host = ready(); let identity = host.player.playback_identity();
+            let enable = WireCommand { identity, opcode: 22, argument: 1, extra: 0 };
+            let mut bad = WireCommand { identity, opcode: 23, argument: 0, extra: 1 };
+            match failure {
+                0 => bad.identity.as_mut().unwrap().build.0 += 1,
+                1 => bad.argument = u16::MAX as u32,
+                2 => { for _ in 0..30 { host.player.set_master_volume(U0F16::MAX).unwrap(); } }
+                3 => {
+                    for _ in 0..16 { host.player.bypass_insert(InsertTarget::Master, 0, false).unwrap(); }
+                    bad = WireCommand { identity, opcode: OPCODE_INSERT_BYPASS, argument: 255, extra: 1 };
+                }
+                4 => {
+                    for _ in 0..256 { host.player.send_event(0, starplayer::core::Event::NoteOn { note: starplayer::core::Note::new(60), velocity: U0F16::MAX }).unwrap(); }
+                    bad = WireCommand { identity, opcode: 24, argument: 0x7f_3c_90, extra: 0 };
+                }
+                5 => {
+                    for _ in 0..16 { host.player.bypass_insert(InsertTarget::Master, 0, false).unwrap(); }
+                    bad = WireCommand { identity, opcode: OPCODE_SEEK_ROW, argument: 0, extra: 0 };
+                }
+                6 => bad = WireCommand { identity, opcode: OPCODE_SEEK_ORDER, argument: u32::MAX, extra: 0 },
+                _ => unreachable!(),
+            }
+            assert!(host.enqueue(enable)); assert!(host.enqueue(bad));
+            assert!(!host.drain_interactive_batch(true), "case{failure}");
+            assert_eq!(host.player.pending_seek().kind, starplayer_host::SeekKind::None, "rejected seek never reaches mailbox");
+            for _ in 0..8 { host.process(128); }
+            assert_eq!(host.player.replacement_state().unwrap()[6], 0, "no partial overlap shadow case{failure}");
+            assert!(host.enqueue(enable)); assert!(host.drain_interactive_batch(true));
+            host.player.playback_barrier(2).unwrap(); host.process(128);
+            assert!(host.player.applied_playback().accepted);
+            assert_eq!(host.player.replacement_state().unwrap()[6], 1);
+        }
+        let mut empty = interactive_host(48_000); let identity = empty.player.playback_identity();
+        empty.enqueue(WireCommand { identity, opcode: 22, argument: 1, extra: 0 });
+        empty.enqueue(WireCommand { identity, opcode: OPCODE_SEEK_ROW, argument: 0, extra: 0 });
+        assert!(!empty.drain_interactive_batch(true)); assert_eq!(empty.player.pending_control_commands(), 0);
+        assert_eq!(empty.player.pending_seek().kind, starplayer_host::SeekKind::None);
+        let mut host = ready(); let identity = host.player.playback_identity();
+        // Existing throughput: one group admits63 real MIDI events, not one per quantum.
+        let sent = host.player.events_sent();
+        for _ in 0..63 { assert!(host.enqueue(WireCommand { identity, opcode: 24, argument: 0x7f_3c_90, extra: 0 })); }
+        assert!(host.drain_interactive_batch(true)); assert_eq!(host.player.events_sent() - sent, 63);
+        host.player.playback_barrier(2).unwrap(); host.process(128); assert!(host.player.applied_playback().accepted);
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn applied_barriers_wait_for_actual_engine_backlog_and_rejected_pause_leaves_song_running() {
+        let mut host = interactive_host(48_000); identified_load(&mut host, &minimal_mod(), 1, 1);
+        host.player.playback_barrier(1).unwrap(); host.process(128);
+        let identity = host.player.playback_identity();
+        host.player.play().unwrap(); host.process(128);
+        let before = host.player.telemetry().transport.song_frame;
+        host.enqueue(WireCommand { identity, opcode: 14, argument: 0, extra: 0 });
+        host.enqueue(WireCommand { identity: Some(PlaybackIdentity::default()), opcode: 23, argument: 0, extra: 1 });
+        assert!(!host.drain_interactive_batch(true)); for _ in 0..8 { host.process(128); }
+        assert_eq!(host.player.interactive_transport(), Some(starplayer::core::InteractiveTransport::Playing));
+        assert!(host.player.telemetry().transport.song_frame > before);
+        for index in 0..63 { host.player.set_master_volume(if index == 62 { U0F16::ZERO } else { U0F16::MAX }).unwrap(); }
+        host.player.playback_barrier(2).unwrap(); host.process(128);
+        assert_eq!(host.player.applied_playback().serial, 1, "Host drain does not imply Engine drain");
+        host.enqueue(WireCommand { identity, opcode: 22, argument: 1, extra: 0 });
+        assert!(!host.drain_interactive_batch(true), "existing Engine backlog consumes admission headroom");
+        host.process(128);
+        assert_eq!(host.player.applied_playback().serial, 2); assert!(host.player.applied_playback().accepted);
+        assert!(host.interleaved[..256].iter().all(|sample| *sample == 0.0), "final zero gain reached actual rendered audio before ack");
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
     fn applied_barrier_is_absent_initially_and_waits_for_deferred_loads() {
         let mut host = interactive_host(44_100);
         assert!(!host.player.applied_playback().accepted);
@@ -2168,6 +2291,31 @@ mod tests {
         assert!(host.process(128) > 0.001);
         assert_eq!(host.telemetry_words[2], 64);
         assert!(host.telemetry_words[TELEMETRY_LIVE_OFFSET] > 0, "live summary follows the fixed tracker record block");
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn same_player_panning_replacement_preserves_forward_seek_order_after_subsequent_ticks() {
+        let mut bytes = minimal_mod();
+        let pattern = bytes[1084..2108].to_vec(); bytes.splice(2108..2108, pattern);
+        bytes[950] = 2; bytes[953] = 1;
+        for quanta in [1, 7, 42, 47, 80] {
+            let mut host = interactive_host(44_100); identified_load(&mut host, &bytes, 1, 1);
+            host.player.play().unwrap(); host.player.playback_barrier(1).unwrap(); host.process(128);
+            host.player.mute(ChannelId(0), true).unwrap(); host.player.seek_order(1).unwrap();
+            for _ in 0..quanta { host.process(128); }
+            let saved = host.player.replacement_state().unwrap();
+            assert_eq!(saved[19], 1); assert_eq!(saved[25], 1);
+            let (module, _, _) = decode(&bytes, true, 0, 88_200).unwrap();
+            host.player.load_replacement(Arc::new(module), PlaybackIdentity { session: SessionId(1), build: BuildGeneration(2) }, &saved).unwrap();
+            host.player.playback_barrier(2).unwrap();
+            for index in 0..80 {
+                host.process(128);
+                let restored = host.player.replacement_state().unwrap();
+                assert_eq!(restored[19], 1, "seek quanta{quanta}, rebuild quantum{index}, saved tick{} song{} next{}", saved[23], saved[41], saved[39]);
+                assert_eq!(restored[25], 1, "sounding order must stay on the forward seek");
+            }
+        }
     }
 
     #[test]

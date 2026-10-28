@@ -105,7 +105,12 @@ impl TelemetryPublisher {
         self.working.transport.interactive = Some(state);
         self.working.transport.natural_end = natural_end;
     }
-    pub fn set_live_summary(&mut self, summary: crate::LiveSummary) { self.working.live = summary; }
+    pub fn set_live_summary(&mut self, summary: crate::LiveSummary) {
+        #[cfg(feature = "interactive-audition")]
+        { self.working.live = summary; }
+        #[cfg(not(feature = "interactive-audition"))]
+        { let _ = summary; }
+    }
 
     /// Latch the `_MActual*` position: the order, pattern, row and tick currently
     /// **sounding**.

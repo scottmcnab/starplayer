@@ -133,6 +133,7 @@ struct PlayerTaps {
     peak_bits: AtomicU32,
     blocks_rendered: AtomicU64,
     commands_rejected: AtomicU64,
+    pending_engine_commands: AtomicU32,
 }
 
 /// A control barrier published only after preceding commands have reached rendered audio.
@@ -252,7 +253,13 @@ impl RenderState {
             written = end;
         }
         self.retire_engine_garbage();
-        if let Some((identity, serial, rejected)) = self.pending_barrier.take() {
+        let pending_engine_commands = self.control.queued_commands();
+        self.taps.pending_engine_commands.store(pending_engine_commands as u32, Ordering::Relaxed);
+        // Engine drains are bounded independently of Host drains. A popped Host barrier
+        // is complete only once actual Engine and DSP requests have reached audio.
+        if pending_engine_commands == 0 && self.engine.pending_insert_commands() == 0
+            && self.pending_command.is_none() && self.commands.is_empty()
+            && let Some((identity, serial, rejected)) = self.pending_barrier.take() {
             self.applied = AppliedPlayback { identity: self.interactive_identity, serial,
                 accepted: self.installed_identity == Some(identity) && rejected == self.taps.commands_rejected.load(Ordering::Relaxed),
                 capabilities: self.applied.capabilities };
@@ -297,7 +304,7 @@ impl RenderState {
             HostCommand::RestoreTransport { identity, transport, state, natural_end } => {
                 if self.interactive_identity == Some(identity) && self.interactive_enabled {
                     let action = match state { InteractiveTransport::Playing => InteractiveAction::Play, InteractiveTransport::Paused => InteractiveAction::Pause, InteractiveTransport::Stopped => InteractiveAction::Stop };
-                    if self.send(Command::Interactive(InteractiveCommand { identity, action })) {
+                    if self.send_interactive(InteractiveCommand { identity, action }) {
                         self.transport = transport;
                         self.interactive_state = state;
                         self.awaiting_engine_stop = natural_end;
@@ -351,11 +358,18 @@ impl RenderState {
         }
     }
 
+    fn send_interactive(&mut self, command: InteractiveCommand) -> bool {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        { self.send(Command::Interactive(command)) }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        { let _ = command; self.reject(); false }
+    }
+
     fn apply_interactive(&mut self, command: InteractiveCommand) {
         if self.interactive_identity != Some(command.identity) { self.reject(); return; }
         if !self.interactive_enabled && matches!(command.action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview) { self.reject(); return; }
         // Queue first: a full engine ring must not partially apply a host fade change.
-        if !self.send(Command::Interactive(command)) { return; }
+        if !self.send_interactive(command) { return; }
         match command.action {
             InteractiveAction::Pause => {
                 self.interactive_state = InteractiveTransport::Paused;
@@ -384,7 +398,7 @@ impl RenderState {
 
     fn finish_interactive_song(&mut self) {
         let Some(identity) = self.interactive_identity else { return };
-        if self.send(Command::Interactive(InteractiveCommand { identity, action: InteractiveAction::Stop })) {
+        if self.send_interactive(InteractiveCommand { identity, action: InteractiveAction::Stop }) {
             self.interactive_state = InteractiveTransport::Stopped;
             self.transport.interactive_stop(true);
             self.awaiting_engine_stop = true;
@@ -1118,7 +1132,8 @@ impl Player {
         self.interactive(command.action)
     }
 
-    pub fn interactive(&mut self, action: InteractiveAction) -> Result<(), HostError> {
+    /// Pure validation shared with bounded browser batch admission. No shadow or queue mutation.
+    pub fn validate_interactive(&self, action: InteractiveAction) -> Result<(), HostError> {
         if !self.interactive_enabled && matches!(action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview | InteractiveAction::SetLiveDestination(_) | InteractiveAction::PreviewInstrument(_) | InteractiveAction::ReleasePreview) {
             return Err(HostError::InvalidInteractiveCommand);
         }
@@ -1130,6 +1145,25 @@ impl Player {
             InteractiveAction::SetLiveDestination(starplayer::core::LiveDestination::Selected(instrument)) if !self.module.as_ref().is_some_and(|module| starplayer::live_instrument_capability(module, instrument).playable) => return Err(HostError::InvalidInteractiveCommand),
             _ => {}
         }
+        self.playback_identity.ok_or(HostError::InvalidInteractiveCommand)?;
+        Ok(())
+    }
+
+    /// Conservatively reserve a whole browser group and its final applied barrier.
+    /// Existing Host commands can expand to at most two Engine commands (fresh Load).
+    /// The last callback reports actual Engine backlog; four further slots cover a held
+    /// fresh Load (two), plus end/settlement work. Completion also checks both real queues.
+    /// The browser owns the sole producers and cannot race another sender between checks.
+    pub fn can_admit_browser_batch(&self, host_commands: usize, inserts: usize, events: usize) -> bool {
+        let pending = self.commands.len();
+        pending.saturating_add(host_commands).saturating_add(1) <= self.commands.capacity()
+            && (self.taps.pending_engine_commands.load(Ordering::Relaxed) as usize).saturating_add(pending.saturating_mul(2)).saturating_add(host_commands).saturating_add(4) <= self.engine_settings.command_capacity.min(starplayer::engine::MAX_COMMANDS_PER_QUANTUM)
+            && inserts <= self.insert_control.command_room()
+            && (events == 0 || self.events.as_ref().is_some_and(|sender| events <= sender.capacity().saturating_sub(sender.queued())))
+    }
+
+    pub fn interactive(&mut self, action: InteractiveAction) -> Result<(), HostError> {
+        self.validate_interactive(action)?;
         let identity = self.playback_identity.ok_or(HostError::InvalidInteractiveCommand)?;
         self.queue(HostCommand::Interactive(InteractiveCommand { identity, action }))?;
         #[cfg(feature = "interactive-audition")]

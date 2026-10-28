@@ -85,6 +85,14 @@ impl HostInsertControl {
         if sent { Ok(()) } else { Err(HostError::InsertQueueFull) }
     }
 
+    /// Remaining insert entries, including any already prepared installs/removes.
+    pub fn command_room(&self) -> usize {
+        match self {
+            Self::Float(handle) => handle.command_capacity().min(starplayer::engine::MAX_COMMANDS_PER_QUANTUM).saturating_sub(handle.queued_commands()),
+            Self::Fixed(handle) => handle.command_capacity().min(starplayer::engine::MAX_COMMANDS_PER_QUANTUM).saturating_sub(handle.queued_commands()),
+        }
+    }
+
     /// Drop every retired insert waiting, and report how many that was. **Call this
     /// regularly**, exactly as [`crate::Player::collect_garbage`] does for modules.
     pub fn collect_all_garbage(&mut self) -> usize {
