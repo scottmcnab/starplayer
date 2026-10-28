@@ -5,7 +5,7 @@
 | Reviewed feature head | `55479442f198f16be0492e8da9821f35a02762ec` |
 | Main / merge base | `d0cdcc53dd320675edd64258aacf247f8cc57f0c` |
 | Scope | All 120 changed paths against main, not only NO-07; current master/tasks authoritative |
-| Status | Both independent full reviews and final corrective reviews complete; all eight accepted corrections integrated on feature/note-overlap-audition from task 20dbc07; automated verification passed; owner/device acceptance pending |
+| Status | Landed on main via e031eda (2026-10-28); implementation and automated verification complete; owner listening/device acceptance pending |
 | Opus reviewer | Claude CLI `claude-opus-5-5`, `--effort high` supplied; exact returned model confirmed |
 | Astra reviewer | `gpt-6-astra`, medium reasoning explicitly requested and accepted by agent orchestration |
 | Coordinator | `gpt-6.1-sol`, xhigh |

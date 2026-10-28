@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Integrated on feature/note-overlap-audition by reviewed single-change squash; task commit 0d1eb0e; available automated verification passed; owner listening/device acceptance pending |
+| Status | Landed on main via e031eda (2026-10-28); implementation and automated verification complete; owner listening/device acceptance pending |
 | Depends on | NO-W1 and NO-01–06 |
 | Blocks | Feature landing; prepares owner listening acceptance |
 | Parallel with | None; integration verification uses final combined tree |
@@ -319,7 +319,7 @@ compact); it gains no optional runtime state. Separate neither-feature size asse
 prevent a future unconditional Command/live payload from making the formula auto-grow.
 RenderHalf is 11,800 bytes neither, 13,280 both. These are host measurements; current
 embedded compile evidence is recorded separately and no new device heap measurement is
-claimed. See [embedded budget](../reference/embedded-budget.md).
+claimed. See [embedded budget](../../reference/embedded-budget.md).
 
 ### Available artifacts and owner acceptance
 

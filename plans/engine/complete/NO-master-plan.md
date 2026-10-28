@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| Status | NO-01–08 and NO-W1 integrated on feature/note-overlap-audition; independent Opus/Astra full and corrective reviews accepted; automated verification passed; owner/device acceptance pending; no main merge/deploy; product contract unchanged |
+| Status | Landed on main via e031eda (2026-10-28); implementation and automated verification complete; owner listening/device acceptance pending |
 | Created | 2026-10-27 |
-| Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
+| Landing | `feature/note-overlap-audition` merged to `main` with `--no-ff` as `e031eda`; completed branch/worktree cleanup |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
 | Coordinator | `gpt-6.1-sol`, reasoning `xhigh` |
 | Workers | `gpt-6.1-sol` for bounded tasks; `gpt-6-astra` for clock/articulation/NNA work; see task headers |
@@ -531,7 +531,7 @@ review. Implementation is authorised by the 2026-10-27 owner handoff. The coordi
 | [NO-04](NO-task-04-legacy-overlap.md) | Legacy-format overlap and bounded tails | gpt-6.1-sol (high) | NO-01 |
 | [NO-05](NO-task-05-xm-it-overlap.md) | XM and IT overlap integration | gpt-6-astra (medium) | NO-02, NO-03 and NO-04 |
 | [NO-06](NO-task-06-faithful-audition.md) | Faithful loaded-module audition | gpt-6-astra (medium) | NO-03 and NO-05 |
-| [NO-W1](../apps/NO-task-W1-web-controls.md) | Web transport, Instruments panel and command bridge | gpt-6.1-sol (high) | NO-06 (and all its dependencies) |
+| [NO-W1](../../apps/complete/NO-task-W1-web-controls.md) | Web transport, Instruments panel and command bridge | gpt-6.1-sol (high) | NO-06 (and all its dependencies) |
 | [NO-07](NO-task-07-integration-and-acceptance.md) | Integration, determinism and feature exclusion | gpt-6.1-sol (high) | NO-W1 and NO-01–06 |
 | [NO-08](NO-task-08-branch-review-fixes.md) | Independent branch-review corrections and regressions | gpt-6.1-sol (high) | Integrated NO-01–07 and NO-W1; coordinator dispositions |
 
@@ -758,3 +758,30 @@ full-branch reviews and their corrective follow-ups are complete; eight accepted
 are resolved without changing the product contract. The final code/test manifest is
 unchanged from the reviewed/verified tree. NO-08 owns exact evidence and remaining owner
 acceptance. No main merge, deployment or archival occurred.
+
+
+## Main landing and archival — 2026-10-28
+
+The owner requested a `--no-ff` merge and cleanup of branches/worktrees already
+landed on main. Feature head `88a0f6d` landed as merge `e031edab65aac42fee69cfec3826bf3888db68ee`
+from main's own checkout. The merge tree is byte-identical to the reviewed feature
+head; no production or test source changed during landing.
+
+Landing verification passed 347 JavaScript tests and 13 targeted NO-08 Rust
+regressions across the facade, engine and native host. Exact commands:
+
+- `node --test --test-concurrency=1 --test-reporter=tap apps/starplayer-web/test/*.test.mjs`
+- `CARGO_TARGET_DIR=/tmp/starplayer-no-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_TEST_THREADS=2 cargo test --offline -p starplayer-engine -p starplayer-host -p starplayer --features note-overlap,interactive-audition no08`
+
+The JavaScript suite required loopback access for its local development-server
+checks; its initial sandboxed run could not complete that test file. Logs are
+`/tmp/starplayer-main-no-merge-js-retry.log` and
+`/tmp/starplayer-main-no-merge-rust.log`. The full verification already recorded
+in NO-07/08 applies to the identical production tree; it was not rerun in full.
+
+Completed NO plans and review evidence are archived here and under
+`plans/apps/complete/`. [The task commit map](NO-history-map.tsv) records the
+original task tips and their reviewed feature squashes. Only landing status and
+link destinations changed in the archived records; historical reports remain
+verbatim. Owner listening, real MIDI, phone/device acceptance and firmware
+execution/timing remain pending. No deployment was performed.

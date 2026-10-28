@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Integrated on feature/note-overlap-audition; task commit 61138bb; no main landing |
+| Status | Landed on main via e031eda (2026-10-28); implementation and automated verification complete; owner listening/device acceptance pending |
 | Depends on | NO-01 |
 | Blocks | NO-05, NO-06 |
 | Parallel with | NO-02/03 only with isolated worktrees and explicit shared-seam ownership |

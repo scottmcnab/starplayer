@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Feature | [NO master plan](NO-master-plan.md) |
-| Status | Integrated on feature/note-overlap-audition by reviewed single-change squash; task commit 20dbc07; all eight corrections accepted by final Opus/Astra reviews; automated verification complete; owner/device acceptance pending |
+| Status | Landed on main via e031eda (2026-10-28); implementation and automated verification complete; owner listening/device acceptance pending |
 | Depends on | NO-01–07 and NO-W1 at 55479442f198f16be0492e8da9821f35a02762ec |
 | Worker | gpt-6.1-sol (high) |
 | Coordinator | gpt-6.1-sol (xhigh) |

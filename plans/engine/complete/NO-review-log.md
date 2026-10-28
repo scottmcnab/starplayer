@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | NO-01–08 and NO-W1 reviewed and integrated on feature/note-overlap-audition; independent Opus/Astra full and corrective reviews complete; automated verification passed; owner/device acceptance pending; no main merge/deploy |
+| Status | Landed on main via e031eda (2026-10-28); implementation and automated verification complete; owner listening/device acceptance pending |
 | Requested reviewer | Claude CLI `claude-opus-5-5`; `--effort high` supplied; returned modelUsage confirms exact model |
 | Earliest invocation | After 2026-10-27 16:20 Australia/Perth / 08:20 UTC, per owner |
 | Master planning commit | c3bead3 |

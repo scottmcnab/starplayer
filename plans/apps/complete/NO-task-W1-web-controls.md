@@ -2,8 +2,8 @@
 
 | Field | Value |
 |---|---|
-| Feature | [NO master plan](../engine/NO-master-plan.md) |
-| Status | Integrated on feature/note-overlap-audition by reviewed single-change squash; task commit c20041f; NO-07 integration verification complete; owner listening/device acceptance pending |
+| Feature | [NO master plan](../../engine/complete/NO-master-plan.md) |
+| Status | Landed on main via e031eda (2026-10-28); implementation and automated verification complete; owner listening/device acceptance pending |
 | Depends on | NO-06 (and all its dependencies) |
 | Blocks | NO-07 |
 | Parallel with | None touching shared web transport/command state |

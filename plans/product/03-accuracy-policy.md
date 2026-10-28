@@ -711,7 +711,7 @@ written down here is a defect, not a decision.
 
 ## Optional creative playback: note overlap
 
-The [NO master plan](../engine/NO-master-plan.md) defines an optional creative playback
+The [NO master plan](../engine/complete/NO-master-plan.md) defines an optional creative playback
 layer, not a new interpretation of canonical tracker effects. NO-01 implements its
 contract types, optional preparation and bounded lane routing. NO-02/03 add native
 articulation/interactive transport; NO-04 adds opt-in MOD/S3M/MTM overlap. NO-05 adds

@@ -1828,7 +1828,7 @@ per-sample cost; the measurement that would show it is the budget document's §3
 
 ## Optional note overlap and interactive transport
 
-The [NO master plan](../engine/NO-master-plan.md) specifies explicit, session-only
+The [NO master plan](../engine/complete/NO-master-plan.md) specifies explicit, session-only
 instrument-only note overlap and faithful instrument audition for all five formats. This
 has completed external review and corrections (see the NO review log), and implementation
 was authorised on 2026-10-27. NO-01 supplies the contracts/preparation described below;
