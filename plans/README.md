@@ -99,15 +99,15 @@ M3) or extending it (M4 onward). From 2026-09-03 the rest of M3, M4-lite, M5 and
 concurrently; [`engine/M3-M6-concurrency-plan.md`](engine/M3-M6-concurrency-plan.md) is
 the dependency graph and merge order.
 
-## Active web panel work
+## Completed web panel work
 
-[W18 — Instruments policies and compact Playlist selection](apps/W18-master-panel-controls.md)
-is implemented and verified on `feature/panel-playback-controls`. It retains global
+[W18 — Instruments policies and compact Playlist selection](apps/complete/W18-master-panel-controls.md)
+landed on main as --no-ff merge `14bec2c` from `feature/panel-playback-controls`. It retains global
 policy preferences for the page session, adds selected-note audition and optional
 cross-channel song-tail uniqueness, and adds Playlist table selection. Astra reviewed
-the entire branch and verified all four fixes. [Verification evidence](apps/W18-review-and-verification.md)
-records 11 passing CI jobs, 390 Node tests and all three browser modes. The owner
-explicitly requested no main merge; the feature remains unmerged.
+the entire branch and verified all four fixes. [Verification evidence](apps/complete/W18-review-and-verification.md)
+records 11 passing CI jobs, 390 Node tests and all three browser modes. Owner acceptance
+remains; merge, origin push and merged-worktree cleanup were subsequently authorized.
 
 ## Locked-in decisions
 

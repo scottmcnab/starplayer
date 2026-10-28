@@ -4,9 +4,9 @@
 |---|---|
 | Branch | feature/panel-playback-controls |
 | Baseline | main 4d03bcbd995288e1153085f7cce355693e4e1e3d |
-| Status | Implemented, reviewed and verified; intentionally unmerged |
+| Status | Landed on main via merge 14bec2c; owner acceptance pending |
 | Review | GPT-6 Astra, medium; entire branch and untracked source/tests, then two follow-ups |
-| Landing | Explicitly prohibited by owner for this task; no main merge, push or deployment |
+| Landing | Owner subsequently authorized --no-ff merge, origin push and merged-worktree cleanup; merged as 14bec2c |
 
 ## Scope and coordinator review
 
@@ -106,8 +106,10 @@ full Node run, WASM package, worklet harness and all browser modes.
   `/mnt/c/temp/w18-{instruments,playlist}-{desktop,phone}.png`.
 
 Logs and screenshots are external review artifacts, not repository assets. Physical
-MIDI/device testing and owner listening were not performed or claimed. Task plans remain
-active because the feature is intentionally unmerged; there was no push or deployment.
+MIDI/device testing and owner listening were not performed or claimed. The owner later
+authorized --no-ff main landing, origin push and cleanup. Merge 14bec2c preserves the
+reviewed feature as one unit; plans are archived with owner acceptance remaining.
+No direct deployment was performed.
 
 An exploratory worker `--all-features` run included diagnostic trace instrumentation
 and therefore failed eight callback-allocation tests. The guard was not weakened. The

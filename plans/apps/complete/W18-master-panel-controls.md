@@ -2,17 +2,18 @@
 
 | Field | Value |
 |---|---|
-| Status | Implemented, Astra-reviewed and verified; feature branch intentionally unmerged |
+| Status | Landed on main via merge 14bec2c; verified and reviewed; owner acceptance pending |
 | Baseline | main 4d03bcb, compact Instruments W17 |
 | Least-capable safe worker | GPT-6.1-sol (high) |
-| Review | Plan reviewed by GPT-6 Astra medium; entire completed branch must receive another Astra review |
+| Review | Plan and entire implementation reviewed by GPT-6 Astra medium; all four findings fixed and verified |
 
 ## Context for a fresh agent
 
-The owner approved the two detailed tasks linked below. The latest direction explicitly
-forbids merging to main. Implement in sibling worktrees, review and verify before
-committing, then get GPT-6 Astra medium to review the ENTIRE feature branch against
-main and fix agreed findings. Leave plans here until landing, with honest evidence.
+The owner approved the detailed tasks below and initially withheld main landing until
+Astra reviewed the entire branch and agreed findings were fixed. Implementation and
+verification are complete. The owner subsequently authorized a --no-ff merge into main,
+push to origin and merged-branch/worktree cleanup. Merge 14bec2c lands the reviewed
+feature; these plans are archived with owner acceptance remaining.
 Do not touch historical sources, user scratch files or independent W6 worktree.
 No cargo fmt, broad staging, unrelated formatting or commit attribution.
 
@@ -24,7 +25,8 @@ No cargo fmt, broad staging, unrelated formatting or commit attribution.
   from the Instruments task for independent implementation and review.
 - Amend architecture/accuracy foundations, application help and README to the approved
   contracts. Coordinator owns foundation docs/index and combined acceptance.
-- Feature branch remains unmerged. No deployment or push requested.
+- Feature landed with --no-ff as 14bec2c after review. The owner authorized origin
+  push and merged-branch/worktree cleanup; no direct deployment was requested.
 
 Detailed review findings and final evidence: [W18 review and verification](W18-review-and-verification.md).
 

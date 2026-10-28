@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Implemented and verified on feature branch; intentionally unmerged |
+| Status | Landed on main via merge 14bec2c; owner acceptance pending |
 | Baseline | main 4d03bcb |
 | Least-capable safe worker | GPT-6.1-sol (high) |
 | Coordinator | W18 master; worker leaves changes uncommitted for review |
@@ -86,5 +86,6 @@ and owner scratch files, unrelated formatting or historical sources.
 ## Completion evidence
 
 Implementation, independent verification and all resolved Astra findings are recorded
-in [W18 review and verification](W18-review-and-verification.md). The owner requested
-that the completed feature remain unmerged; no main landing, push or deployment occurred.
+in [W18 review and verification](W18-review-and-verification.md). After review, the owner
+authorized --no-ff landing and origin push. Merge 14bec2c lands the feature on main;
+owner acceptance remains. No direct deployment was performed.
