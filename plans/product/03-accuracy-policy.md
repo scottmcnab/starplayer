@@ -721,8 +721,8 @@ Unchecked/global-bypassed and feature-disabled renders must retain existing gold
 Custom overlap preserves non-looping sample tails and may override IT NNA/duplicate
 actions explicitly; authored IT behavior remains the default, including looping NNA.
 The opt-in setting is one Let notes ring checkbox per instrument, not a channel override
-or mode selector. Replace earlier voices only on matching instrument, original note,
-captured onset base volume and originating channel; different-volume repeats may overlap
+or mode selector. By default, replace earlier voices only on matching instrument, original
+note, captured onset base volume and originating channel; different-volume repeats may overlap
 as echoes. Onset-tick fine/fast slides are included; tremolo/tremor and later slides/envelopes/gain/DSP
 do not change the captured identity. Record identity even while unchecked/bypassed. Live
 identity is resolved before CC7, while explicit key-up/pedal-up retains native release.
@@ -818,3 +818,16 @@ For example, XM native cell1/map0 may sound while live input0 cannot tune under 
 reference adapter; that sample remains eligible for song note overlap. Mixed-map badges
 include both looping and non-looping mapped PCM even when one side is outside the live
 pitch range. No native tuning arithmetic or canonical output is changed.
+
+
+W18 adds the opt-in Unique notes across channels page preference, initially unchecked.
+With global overlap and the instrument Ring selection enabled, a subsequent song onset
+may also replace an eligible Custom-domain Background custom_detached song tail matching
+exact instrument, original note and captured native onset volume on another channel.
+Original channel and raw MOD-period identity remain intact. This extra predicate excludes
+foregrounds, native-created backgrounds and live/audition in both directions; existing
+same-channel behavior is unchanged. Toggling uniqueness alone affects future onsets only.
+No authored tracker effect, tuning arithmetic, canonical default or golden is changed.
+Global overlap and uniqueness persist through module/rebuild transitions only for the
+current page; Ring selections remain per module. Reference-note choice affects button
+audition only; MIDI60 remains the reference tuning anchor and default.

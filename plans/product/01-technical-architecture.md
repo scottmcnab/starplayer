@@ -2215,3 +2215,42 @@ NO-07 adds five-format fixed/float absolute-frame song/live schedules, isolated 
 canonical PCM pairs and real native IT plus prepared live pressure through slot 338.
 The task evidence distinguishes automated checks, compile-only embedded evidence and
 pending owner listening/device acceptance. Canonical goldens are never regenerated.
+
+
+### W18 page preferences, selected-note audition and song-tail uniqueness
+
+The browser keeps desired Enable note overlap and Unique notes across channels policies
+in page memory, initially false, independently of installed session/build identity.
+New modules, explicit reloads and processor replacements reconcile those desires with
+acknowledged audio settings before readiness or Playing. Older acknowledgements update
+applied state without replacing newer intent; rejection of the latest direct edit rolls
+back to the last applied value. Failed preparations retain page desires and reconcile
+the retained module. Instrument Ring selections still reset for a fresh session and
+survive same-session replacement. None of these page preferences uses browser storage.
+
+Pending Play/Resume and a replacement's saved Playing transport are deferred until the
+latest policies have actually applied, including across multi-quantum mute/insert replay.
+Restoration retains the captured cursor and integer ramp state, respects newer Stop/Pause,
+and must not emulate saved restoration with a destructive Stop/Play sequence.
+
+Button audition accepts an explicit note 0–127, default MIDI60 (middle C, displayed C-5
+in this interface). This page-memory selection does not change the fixed tuning anchor
+or keyboard/MIDI routing. Immutable per-note viability/loop metadata belongs to the
+committed module metadata; UI, host and rack share native-map/tuning validation. Press
+captures note/looping for release. Unreleased interactive wire version2 gains opcode25
+(explicit-note preview) and26 (uniqueness policy); opcode20 remains reference60 and the
+seven-word identified record stays unchanged. Host shadows, feature gates and transient
+replacement snapshots evolve together without a legacy snapshot migration.
+
+Unique notes across channels adds only a subsequent-song-onset predicate: an eligible
+Custom Background custom_detached song tail with the same instrument, original note
+(raw MOD period included) and captured onset volume may retire regardless of channel.
+Immutable channel identity is retained. Incoming live/audition, candidate live/audition,
+foregrounds and native-created backgrounds are excluded from this additional predicate.
+Existing same-channel matching and all eligibility, opt-in and bounded retirement rules
+remain unchanged. Changing uniqueness alone never scans or cuts currently sounding tails.
+
+The Playlist table keeps Library-style selection in page memory by entry UUID, separate
+from persistent playlist metadata. Header selection includes every current entry, including
+unavailable/duplicate/offscreen entries. Remove selected and Delete perform one bulk model
+removal, retaining existing navigation cancellation and uploaded-blob ownership rules.

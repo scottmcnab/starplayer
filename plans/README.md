@@ -99,6 +99,14 @@ M3) or extending it (M4 onward). From 2026-09-03 the rest of M3, M4-lite, M5 and
 concurrently; [`engine/M3-M6-concurrency-plan.md`](engine/M3-M6-concurrency-plan.md) is
 the dependency graph and merge order.
 
+## Active web panel work
+
+[W18 — Instruments policies and compact Playlist selection](apps/W18-master-panel-controls.md)
+is approved for implementation on `feature/panel-playback-controls`. It retains global
+policy preferences for the page session, adds selected-note audition and optional
+cross-channel song-tail uniqueness, and adds Playlist table selection. A final Astra
+whole-branch review is required. The owner explicitly requested no main merge.
+
 ## Locked-in decisions
 
 Made by the project owner during scoping (2026-08-28); do not re-litigate in derived
