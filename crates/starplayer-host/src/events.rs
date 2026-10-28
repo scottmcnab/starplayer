@@ -3,16 +3,10 @@
 //!
 //! # Which clock an event is stamped against
 //!
-//! The master plan writes the stamp as `output_frame + lead`. That is right for an engine
-//! that has never been paused and wrong for every other one, and a [`Player`](crate::Player)
-//! is always paused at least once: [`Player::open`](crate::Player::open) freezes the musical
-//! clock before the stream starts, so the output clock is already ahead by however long the
-//! caller took to press Play. The engine dispatches sources against
-//! [`Engine::source_frame`](starplayer::engine::Engine::source_frame) — the **musical**
-//! clock, the one that stops with the transport — so that is the clock a live event has to
-//! be stamped in. Stamping in the output clock instead would delay every note by exactly
-//! the time the transport had spent stopped, and stop the keyboard entirely after a long
-//! pause. See this task's research resolution, point 2.
+//! Events use [`Engine::source_frame`](starplayer::engine::Engine::source_frame), the
+//! clock sources dispatch against. Interactive playback keeps it monotonic through
+//! Pause and Stop; song time is held separately. Legacy transport freezes source time,
+//! so stamping against the output clock would add the entire stopped duration as delay.
 //!
 //! # The lead, and why it has a floor
 //!
@@ -33,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use starplayer::core::{ChannelId, Event, Frame, TimedEvent};
-use starplayer::engine::{ExternalEventProducer, RENDER_QUANTUM, midi_channel};
+use starplayer::engine::{ExternalEventProducer, RENDER_QUANTUM};
 
 use crate::backend::HostError;
 
@@ -148,23 +142,30 @@ impl EventClock {
 pub struct EventSender {
     producer: ExternalEventProducer,
     clock: Arc<EventClock>,
+    live_base: u16,
 }
 
 impl EventSender {
+    #[cfg(feature = "interactive-audition")]
+    pub(crate) fn cancellation_token(&self) -> Option<starplayer::rt::Arc<starplayer::rt::atomic::AtomicU32>> { self.producer.cancellation_token() }
+
     /// Pair a producer with the clock its events are stamped against.
     ///
     /// [`Player::midi_only`](crate::Player::midi_only) is how a host normally gets one;
     /// this is public for a host driving an `ExternalEventQueue` it built itself, and for
     /// the `midir` round-trip test, which owns both ends of a virtual port.
     pub fn new(producer: ExternalEventProducer, clock: Arc<EventClock>) -> EventSender {
-        EventSender { producer, clock }
+        EventSender { producer, clock, live_base: 48 }
     }
+
+    /// Explicit interactive mapping; the legacy constructor remains48-based.
+    pub fn interactive(producer: ExternalEventProducer, clock: Arc<EventClock>) -> Self { Self { producer, clock, live_base: 64 } }
 
     /// Queue `event` on MIDI channel `channel` (0–15), stamped `source_frame + lead`.
     ///
     /// A full queue is counted and reported, never waited on.
     pub fn send_event(&mut self, channel: u8, event: Event) -> Result<(), HostError> {
-        self.send_to(midi_channel(channel), event)
+        self.send_to(ChannelId(self.live_base + channel as u16 % 16), event)
     }
 
     /// [`EventSender::send_event`] addressed at an engine lane directly, for a caller that
@@ -213,6 +214,7 @@ impl core::fmt::Debug for EventSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starplayer::engine::midi_channel;
     use starplayer::core::{Note, U0F16};
     use starplayer::engine::external_event_channel;
 

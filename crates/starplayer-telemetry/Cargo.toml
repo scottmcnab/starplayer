@@ -12,6 +12,8 @@ starplayer-rt = { workspace = true }
 
 [features]
 default = []
+# Optional rebuild payloads must not reserve space in embedded/default snapshots.
+interactive-audition = []
 std = ["starplayer-core/std", "starplayer-rt/std"]
 alloc = ["starplayer-core/alloc", "starplayer-rt/alloc"]
 serde = ["starplayer-core/serde"]

@@ -48,3 +48,11 @@ test('absent media session is a no-op', () => {
     const media = createMediaSession({});
     media.metadata({}); media.playing(true); media.position({}); media.refresh({});
 });
+
+test('interactive Media Pause has a distinct sequencer-pause action from clear-and-hold Stop', () => {
+    const handlers = new Map(), calls = [];
+    const media = createMediaSession({ mediaSession: { setActionHandler(action, callback) { handlers.set(action, callback); } }, play: () => calls.push('resume'), pause: () => calls.push('pause'), stop: () => calls.push('clear-and-hold') });
+    handlers.get('pause')(); handlers.get('play')(); handlers.get('stop')();
+    assert.deepEqual(calls, ['pause', 'resume', 'clear-and-hold']);
+    media.playing(false);
+});

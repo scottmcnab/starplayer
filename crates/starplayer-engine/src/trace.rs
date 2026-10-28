@@ -469,7 +469,7 @@ impl TraceRecorder {
                     // numbers. Format processors with richer native state report it before
                     // this fallback runs.
                     entry.state.note = Some(voice.tag.note);
-                    entry.state.instrument = voice.tag.instrument as u16;
+                    entry.state.instrument = voice.tag.instrument;
                     entry.state.sample = voice.tag.sample;
                     entry.state.volume = unit_to_scale(voice.params.volume.to_bits(), 64);
                     entry.state.pan = bipolar_pan_to_u8(voice.params.pan.to_bits());
@@ -513,7 +513,7 @@ impl TraceRecorder {
                 None => {
                     // The same tag-and-params fallback an unreported channel gets.
                     row.note = Some(voice.tag.note);
-                    row.instrument = voice.tag.instrument as u16;
+                    row.instrument = voice.tag.instrument;
                     row.sample = voice.tag.sample;
                     row.volume = unit_to_scale(voice.params.volume.to_bits(), 64);
                     row.pan = bipolar_pan_to_u8(voice.params.pan.to_bits());

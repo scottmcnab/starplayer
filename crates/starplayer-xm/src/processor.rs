@@ -13,13 +13,12 @@
 //! Where libxmp (the conformance oracle) and FT2 disagree, FT2 wins and the difference is
 //! recorded in `plans/product/03-accuracy-policy.md`.
 //!
-//! # Per-voice state is per-channel state
+//! # Format-owned voice articulation
 //!
-//! Architecture §5.3 as amended by task E3: there is no engine envelope runner and no
-//! `Instrument` trait. XM has exactly one voice per channel and never detaches one, so the
-//! envelope positions, the fadeout level, the key-off flag and the auto-vibrato phase all
-//! live in [`XmChannel`] beside the effect memories, and [`XmProcessor::tick`] advances
-//! them itself — `updateVolPanAutoVib` in `ft2_replayer.c`.
+//! [`XmVoiceState`] contains the shared FT2 articulation computations. A channel holds
+//! its foreground working state beside its effect memories. Explicit optional preparation
+//! adds a generational [`XmArticulationRuntime`] snapshot table for held/detached voices;
+//! legacy constructors allocate no such table, even when Cargo unifies optional features.
 //!
 //! Envelope output is written **straight into the voice's
 //! [`VoiceParams`]**, not through [`TickContext::write_voice_param`], so the diagnostic
@@ -42,6 +41,9 @@
 // the dispatch boundary lets the individual handlers read as the C they port.
 #![allow(clippy::indexing_slicing)]
 
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+pub mod live;
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -52,7 +54,7 @@ use starplayer_engine::{EndOfSongPolicy, Jump, PatternFlowState, PatternSequence
 #[cfg(any(feature = "trace", test))]
 use starplayer_engine::TraceChannelState;
 use starplayer_mixer::{LoopSpan, SampleRegion, VoiceTag};
-use starplayer_model::{AutoVibratoWaveform, EffectNames, Envelope, EnvelopePoint, InstrumentDef, LoopMode, Module, PatternId};
+use starplayer_model::{AutoVibratoWaveform, EffectNames, Envelope, EnvelopePoint, LoopMode, Module, PatternId};
 use starplayer_rt::Arc;
 
 use crate::data::XmPatternData;
@@ -103,16 +105,13 @@ const MAX_PERIOD: u16 = 32_000;
 /// `ChannelData` fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XmChannel {
+    /// Foreground working articulation; optional slot snapshot synchronizes after native flush.
+    pub articulation: XmVoiceState,
     // ── what is playing ─────────────────────────────────────────────────────────────
     /// `noteNum` — the pattern's own note byte, 1..96, of the last note triggered.
     pub note_number: u8,
     /// `instrNum` — the one-based instrument number last latched; 0 is none.
     pub instrument_number: u8,
-    /// `instrPtr` — the instrument that number resolves to, or `None` for FT2's empty
-    /// placeholder instrument (volume 0, pan 128, no envelopes, no fadeout).
-    pub instrument: Option<InstrumentId>,
-    /// `smpPtr` — the sample the note→sample map chose, if the instrument had one.
-    pub sample: Option<SampleId>,
     /// `relativeNote` — the sounding sample's transpose, latched at note-on and **kept**
     /// across an instrument column with no note (`kFT2PortaIgnoreInstr`).
     pub relative_note: i8,
@@ -122,10 +121,6 @@ pub struct XmChannel {
     // ── pitch ───────────────────────────────────────────────────────────────────────
     /// `realPeriod` — the period the slides own.
     pub real_period: u16,
-    /// `outPeriod` — `realPeriod` plus this tick's vibrato or arpeggio.
-    pub out_period: u16,
-    /// `finalPeriod` — `outPeriod` plus auto-vibrato; what the mixer plays.
-    pub final_period: u16,
     /// `portamentoTargetPeriod`.
     pub portamento_target_period: u16,
     /// `portamentoSpeed` — already multiplied by four, as FT2 stores it. libxmp calls the
@@ -152,12 +147,8 @@ pub struct XmChannel {
     pub sample_pan: u8,
     /// `realVol` — the channel volume the slides own, 0..64.
     pub real_volume: u8,
-    /// `outVol` — `realVol` plus this tick's tremolo or tremor.
-    pub out_volume: u8,
-    /// `outPan` — the channel pan, 0..255.
-    pub out_pan: u8,
-    /// `finalPan` — `outPan` plus the panning envelope.
-    pub final_pan: u8,
+    #[cfg(feature = "interactive-audition")]
+    sound_cleared: bool,
 
     // ── the row's columns ───────────────────────────────────────────────────────────
     /// `efx` — the effect column, 0..=0x21.
@@ -225,46 +216,14 @@ pub struct XmChannel {
     /// `smpStartPos` — the frame the next trigger starts at.
     pub sample_start_frame: u32,
 
-    // ── articulation ────────────────────────────────────────────────────────────────
-    /// `keyOff`.
-    pub key_off: bool,
-    /// `fadeoutVol`, 0..[`FADEOUT_MAX`].
-    pub fadeout_volume: u16,
-    /// `fadeoutSpeed` — the instrument's `volFade`, latched at note-on.
-    pub fadeout_speed: u16,
-    /// `volEnvTick` — the envelope's own clock, which starts at `65535` so that the first
-    /// increment lands on zero.
-    pub volume_envelope_tick: u16,
-    /// `volEnvPos`.
-    pub volume_envelope_point: u8,
-    /// `volEnvValue` — the interpolated value, in the point's `y` shifted left by eight.
-    pub volume_envelope_value: i16,
-    /// `volEnvDelta` — the per-tick increment in the same domain.
-    pub volume_envelope_delta: i16,
-    /// `panEnvTick`.
-    pub panning_envelope_tick: u16,
-    /// `panEnvPos`.
-    pub panning_envelope_point: u8,
-    /// `panEnvValue`.
-    pub panning_envelope_value: i16,
-    /// `panEnvDelta`.
-    pub panning_envelope_delta: i16,
-    /// `autoVibPos`.
-    pub auto_vibrato_position: u8,
-    /// `autoVibAmp` — the swept depth, in the instrument's depth shifted left by eight.
-    pub auto_vibrato_amplitude: u16,
-    /// `autoVibSweep` — the per-tick sweep increment; zero once the sweep is over.
-    pub auto_vibrato_sweep: u16,
-
     // ── what the flush has to do ────────────────────────────────────────────────────
     /// `CS_TRIGGER_VOICE` — start the sample from [`XmChannel::sample_start_frame`].
     pub trigger_voice: bool,
+    #[cfg(feature = "note-overlap")]
+    onset_note: Option<u8>,
     /// Stop the voice outright. FastTracker 2 has exactly one of these: a `9xx` past the
     /// end of the sample (`kFT2ST3OffsetOutOfRange`).
     pub stop_voice: bool,
-    /// `fFinalVol`, in the 0..65536 integer domain this crate keeps it in rather than
-    /// FT2's `float`. Recomputed every tick by `updateVolPanAutoVib`.
-    pub final_volume: u32,
     /// The instrument number of the sample **actually sounding**, which is not
     /// [`XmChannel::instrument_number`]: FastTracker 2 latches any number from 1 to 128
     /// into `instrNum` and falls back to its empty placeholder instrument when the number
@@ -283,15 +242,16 @@ pub struct XmChannel {
 impl XmChannel {
     fn new() -> XmChannel {
         XmChannel {
+            articulation: XmVoiceState::default(),
             note_number: 0,
             instrument_number: 0,
-            instrument: None,
-            sample: None,
+
+
             relative_note: 0,
             finetune: 0,
             real_period: 0,
-            out_period: 0,
-            final_period: 0,
+
+
             portamento_target_period: 0,
             portamento_speed: 0,
             portamento_slide: 0,
@@ -300,9 +260,11 @@ impl XmChannel {
             sample_volume: 0,
             sample_pan: 128,
             real_volume: 0,
-            out_volume: 0,
-            out_pan: 128,
-            final_pan: 128,
+            #[cfg(feature = "interactive-audition")]
+            sound_cleared: false,
+
+
+
             effect: 0,
             effect_data: 0,
             volume_column: 0,
@@ -332,6 +294,92 @@ impl XmChannel {
             pan_slide_memory: 0,
             offset_memory: 0,
             sample_start_frame: 0,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            trigger_voice: false,
+            #[cfg(feature = "note-overlap")]
+            onset_note: None,
+            stop_voice: false,
+
+            sounding_instrument: 0,
+            sounding_note: 0,
+        }
+    }
+}
+
+/// Only persistent sounding-voice state; row columns and effect memories stay on
+/// XmChannel. This value is copied at the foreground/detachment seam, without allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XmVoiceState {
+    /// `instrPtr` — the instrument that number resolves to, or `None` for FT2's empty
+    /// placeholder instrument (volume 0, pan 128, no envelopes, no fadeout).
+    pub instrument: Option<InstrumentId>,
+    /// `smpPtr` — the sample the note→sample map chose, if the instrument had one.
+    pub sample: Option<SampleId>,
+    /// `outPeriod` — `realPeriod` plus this tick's vibrato or arpeggio.
+    pub out_period: u16,
+    /// `finalPeriod` — `outPeriod` plus auto-vibrato; what the mixer plays.
+    pub final_period: u16,
+    /// `outVol` — `realVol` plus this tick's tremolo or tremor.
+    pub out_volume: u8,
+    /// `outPan` — the channel pan, 0..255.
+    pub out_pan: u8,
+    /// `finalPan` — `outPan` plus the panning envelope.
+    pub final_pan: u8,
+    /// `keyOff`.
+    pub key_off: bool,
+    /// `fadeoutVol`, 0..[`FADEOUT_MAX`].
+    pub fadeout_volume: u16,
+    /// `fadeoutSpeed` — the instrument's `volFade`, latched at note-on.
+    pub fadeout_speed: u16,
+    /// `volEnvTick` — the envelope's own clock, which starts at `65535` so that the first
+    /// increment lands on zero.
+    pub volume_envelope_tick: u16,
+    /// `volEnvPos`.
+    pub volume_envelope_point: u8,
+    /// `volEnvValue` — the interpolated value, in the point's `y` shifted left by eight.
+    pub volume_envelope_value: i16,
+    /// `volEnvDelta` — the per-tick increment in the same domain.
+    pub volume_envelope_delta: i16,
+    /// `panEnvTick`.
+    pub panning_envelope_tick: u16,
+    /// `panEnvPos`.
+    pub panning_envelope_point: u8,
+    /// `panEnvValue`.
+    pub panning_envelope_value: i16,
+    /// `panEnvDelta`.
+    pub panning_envelope_delta: i16,
+    /// `autoVibPos`.
+    pub auto_vibrato_position: u8,
+    /// `autoVibAmp` — the swept depth, in the instrument's depth shifted left by eight.
+    pub auto_vibrato_amplitude: u16,
+    /// `autoVibSweep` — the per-tick sweep increment; zero once the sweep is over.
+    pub auto_vibrato_sweep: u16,
+    /// `fFinalVol`, in the 0..65536 integer domain this crate keeps it in rather than
+    /// FT2's `float`. Recomputed every tick by `updateVolPanAutoVib`.
+    pub final_volume: u32,
+}
+impl Default for XmVoiceState {
+    fn default() -> Self { Self {
+            instrument: None,
+            sample: None,
+            out_period: 0,
+            final_period: 0,
+            out_volume: 0,
+            out_pan: 128,
+            final_pan: 128,
             key_off: false,
             fadeout_volume: FADEOUT_MAX,
             fadeout_speed: 0,
@@ -346,19 +394,295 @@ impl XmChannel {
             auto_vibrato_position: 0,
             auto_vibrato_amplitude: 0,
             auto_vibrato_sweep: 0,
-            trigger_voice: false,
-            stop_voice: false,
             final_volume: 0,
-            sounding_instrument: 0,
-            sounding_note: 0,
+    } }
+}
+impl XmVoiceState {
+    /// Native envelope/fadeout/auto-vibrato reset. Tracker LFO and retrigger memory
+    /// resets remain on the channel and are deliberately absent from this operation.
+    pub fn start(&mut self, module: &Module) {
+        self.key_off = false;
+        // FastTracker 2 never has a null instrument pointer: `triggerNote` parks the
+        // channel on `instr[0]`, the placeholder `allocateInstr` fills with the standard
+        // envelope defaults, whenever the instrument number names a slot the file did not
+        // store. So an out-of-range instrument column still reloads a fadeout — the
+        // placeholder's — and `ft2_instrument_fade_update.xm` is the fixture that sees it,
+        // because the *next* row's instrument-without-note reads the same stale pointer.
+        let instrument = self.instrument.and_then(|id| module.instrument(id));
+        let volume_enabled = instrument.is_some_and(|instrument| instrument.volume_envelope.is_some());
+        let panning_enabled = instrument.is_some_and(|instrument| instrument.panning_envelope.is_some());
+        let fadeout = instrument.map_or(PLACEHOLDER_FADEOUT, |instrument| instrument.fadeout);
+        let auto_vibrato = self.sample
+            .and_then(|id| module.sample(id))
+            .map(|sample| sample.auto_vibrato())
+            .unwrap_or_default();
+
+        let state = self;
+        if volume_enabled {
+            state.volume_envelope_tick = u16::MAX;
+            state.volume_envelope_point = 0;
         }
+        if panning_enabled {
+            state.panning_envelope_tick = u16::MAX;
+            state.panning_envelope_point = 0;
+        }
+        state.fadeout_speed = fadeout;
+        state.fadeout_volume = FADEOUT_MAX;
+
+        if auto_vibrato.depth > 0 {
+            state.auto_vibrato_position = 0;
+            if auto_vibrato.sweep > 0 {
+                state.auto_vibrato_amplitude = 0;
+                state.auto_vibrato_sweep = ((auto_vibrato.depth as u16) << 8) / auto_vibrato.sweep as u16;
+            } else {
+                state.auto_vibrato_amplitude = (auto_vibrato.depth as u16) << 8;
+                state.auto_vibrato_sweep = 0;
+            }
+        }
+    }
+
+    /// Native key-off; returns true when no volume envelope exists and the caller
+    /// must also zero the channel's base volume.
+    pub fn release(&mut self, module: &Module) -> bool {
+        self.key_off = true;
+        let envelope = self.instrument.and_then(|id| module.instrument(id)).and_then(|instrument| instrument.volume_envelope.as_ref());
+        if let Some(envelope) = envelope {
+            let tick = envelope.points.get(self.volume_envelope_point as usize).map_or(0, |point| point.tick);
+            if self.volume_envelope_tick >= tick { self.volume_envelope_tick = tick.wrapping_sub(1); }
+            false
+        } else {
+            self.out_volume = 0;
+            true
+        }
+    }
+    /// FT2 order: key-off fadeout, volume envelope, pan envelope, auto-vibrato,
+    /// then the final volume product. No channel effects run here.
+    pub fn control_step(&mut self, module: &Module, global_volume: u8) {
+        let global_volume = global_volume.min(64) as u64;
+        let state = self;
+        let instrument = state.instrument.and_then(|id| module.instrument(id));
+
+        // *** FADEOUT ON KEY OFF ***
+        if state.key_off {
+            if state.fadeout_speed > state.fadeout_volume {
+                state.fadeout_volume = 0;
+                state.fadeout_speed = 0;
+            } else {
+                state.fadeout_volume -= state.fadeout_speed;
+            }
+        }
+
+        // *** VOLUME ENVELOPE ***
+        let key_off = state.key_off;
+        let envelope_value = match instrument.and_then(|instrument| instrument.volume_envelope.as_ref()) {
+            Some(envelope) => {
+                let mut cursor = EnvelopeCursor {
+                    tick: state.volume_envelope_tick,
+                    point: state.volume_envelope_point,
+                    value: state.volume_envelope_value,
+                    delta: state.volume_envelope_delta,
+                };
+                let value = advance_envelope(&mut cursor, envelope, key_off);
+                state.volume_envelope_tick = cursor.tick;
+                state.volume_envelope_point = cursor.point;
+                state.volume_envelope_value = cursor.value;
+                state.volume_envelope_delta = cursor.delta;
+                value
+            }
+            None => ENVELOPE_UNITY,
+        };
+
+        // *** PANNING ENVELOPE ***
+        let panning_value = instrument.and_then(|instrument| instrument.panning_envelope.as_ref()).map(|envelope| {
+            let mut cursor = EnvelopeCursor {
+                tick: state.panning_envelope_tick,
+                point: state.panning_envelope_point,
+                value: state.panning_envelope_value,
+                delta: state.panning_envelope_delta,
+            };
+            let value = advance_envelope(&mut cursor, envelope, key_off);
+            state.panning_envelope_tick = cursor.tick;
+            state.panning_envelope_point = cursor.point;
+            state.panning_envelope_value = cursor.value;
+            state.panning_envelope_delta = cursor.delta;
+            value
+        });
+
+        state.final_pan = match panning_value {
+            Some(value) => {
+                let mut multiplier = state.out_pan as i32 - 128;
+                if multiplier >= 0 {
+                    multiplier = -multiplier;
+                }
+                multiplier = (multiplier + 128) << 3;
+                let centred = value - 32 * 256;
+                let addend = ((centred * multiplier) >> 16) as i8;
+                state.out_pan.wrapping_add(addend as u8)
+            }
+            None => state.out_pan,
+        };
+
+        // *** AUTO VIBRATO ***
+        let auto_vibrato = state.sample
+            .and_then(|id| module.sample(id))
+            .map(|sample| sample.auto_vibrato())
+            .unwrap_or_default();
+        if auto_vibrato.depth > 0 {
+            let amplitude = match state.auto_vibrato_sweep > 0 {
+                true => {
+                    let mut amplitude = state.auto_vibrato_sweep;
+                    if !state.key_off {
+                        amplitude = amplitude.wrapping_add(state.auto_vibrato_amplitude);
+                        if amplitude >> 8 > auto_vibrato.depth as u16 {
+                            amplitude = (auto_vibrato.depth as u16) << 8;
+                            state.auto_vibrato_sweep = 0;
+                        }
+                        state.auto_vibrato_amplitude = amplitude;
+                    }
+                    amplitude
+                }
+                false => state.auto_vibrato_amplitude,
+            };
+            state.auto_vibrato_position = state.auto_vibrato_position.wrapping_add(auto_vibrato.rate);
+            let sample = match auto_vibrato.waveform {
+                AutoVibratoWaveform::Square => match state.auto_vibrato_position > 127 {
+                    true => 64i16,
+                    false => -64,
+                },
+                // FT2's `vibType` 2 is ramp **down** in its own numbering and the loader
+                // maps it to [`AutoVibratoWaveform::RampDown`]; the arithmetic below is
+                // FT2's own, sign and all.
+                AutoVibratoWaveform::RampDown => (((state.auto_vibrato_position >> 1) as i16 + 64) & 127) - 64,
+                AutoVibratoWaveform::RampUp => ((-((state.auto_vibrato_position >> 1) as i16) + 64) & 127) - 64,
+                // FastTracker 2 has only four waveforms and masks anything else down to a
+                // sine, which is where the loader already sends an unknown `vibType`; IT's
+                // random waveform can only reach here through a hand-built module.
+                AutoVibratoWaveform::Sine | AutoVibratoWaveform::Random => AUTO_VIBRATO_SINE_TABLE[state.auto_vibrato_position as usize] as i16,
+            };
+            let delta = ((sample as i32 * amplitude as i32) >> 14) as i16;
+            let period = state.out_period.wrapping_add(delta as u16);
+            state.final_period = if period >= MAX_PERIOD { 0 } else { period };
+        } else {
+            state.final_period = state.out_period;
+        }
+
+        // The final volume, in FT2's own product: global x channel x fadeout x envelope,
+        // whose full scale is `64 * 64 * 32768 * 16384 == 2^41`. Shifting to a 0..65536
+        // range is a shift by 25, and the trace's 0..64 domain is a further rounded 10.
+        let product = global_volume
+            * state.out_volume.min(64) as u64
+            * state.fadeout_volume as u64
+            * envelope_value.clamp(0, ENVELOPE_UNITY) as u64;
+        state.final_volume = (product >> 25) as u32;
+    }
+
+ }
+
+impl core::ops::Deref for XmChannel {
+    type Target = XmVoiceState;
+    fn deref(&self) -> &XmVoiceState { &self.articulation }
+}
+impl core::ops::DerefMut for XmChannel {
+    fn deref_mut(&mut self) -> &mut XmVoiceState { &mut self.articulation }
+}
+
+#[derive(Clone)]
+struct XmVoiceSlot {
+    voice: Option<starplayer_core::VoiceId>,
+    root_channel: ChannelId,
+    retiring: bool,
+    state: XmVoiceState,
+}
+
+/// One pool-sized XM runtime, shared by all programs in one song or live rack.
+/// Runtime construction is fallible; every lifecycle/control operation is allocation-free.
+pub struct XmArticulationRuntime { slots: Box<[XmVoiceSlot]> }
+impl XmArticulationRuntime {
+    pub fn try_new(capacity: usize) -> Result<Self, alloc::collections::TryReserveError> {
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(capacity)?;
+        slots.resize(capacity, XmVoiceSlot { voice: None, root_channel: ChannelId(0), retiring: false, state: XmVoiceState::default() });
+        Ok(Self { slots: slots.into_boxed_slice() })
+    }
+    pub fn capacity(&self) -> usize { self.slots.len() }
+    /// Snapshot an already stepped foreground without restarting its envelopes.
+    pub fn snapshot(&mut self, voice: starplayer_core::VoiceId, channel: ChannelId, state: &XmVoiceState, voices: &starplayer_mixer::VoicePool) -> bool {
+        if voices.get(voice).is_none() { return false; }
+        let Some(slot) = self.slots.get_mut(voice.index() as usize) else { return false };
+        if slot.voice == Some(voice) && slot.retiring { return false; }
+        *slot = XmVoiceSlot { voice: Some(voice), root_channel: channel, retiring: false, state: state.clone() };
+        true
+    }
+    /// Origin used for stable control-step ordering, separate from instrument identity.
+    pub fn root_channel(&self, voice: starplayer_core::VoiceId) -> Option<ChannelId> {
+        self.slots.get(voice.index() as usize).filter(|slot| slot.voice == Some(voice)).map(|slot| slot.root_channel)
+    }
+    pub fn voice(&self, voice: starplayer_core::VoiceId) -> Option<&XmVoiceState> {
+        self.slots.get(voice.index() as usize).filter(|slot| slot.voice == Some(voice)).map(|slot| &slot.state)
+    }
+    pub fn start(&mut self, module: &Module, voice: starplayer_core::VoiceId, channel: ChannelId, mut state: XmVoiceState, voices: &starplayer_mixer::VoicePool) -> bool {
+        state.start(module);
+        self.snapshot(voice, channel, &state, voices)
+    }
+    pub fn release(&mut self, module: &Module, voice: starplayer_core::VoiceId) {
+        if let Some(slot) = self.slots.get_mut(voice.index() as usize).filter(|slot| slot.voice == Some(voice) && !slot.retiring) { slot.state.release(module); }
+    }
+    pub fn cut(&mut self, voice: starplayer_core::VoiceId) {
+        if let Some(slot) = self.slots.get_mut(voice.index() as usize).filter(|slot| slot.voice == Some(voice) && !slot.retiring) { slot.state.out_volume = 0; slot.state.final_volume = 0; }
+    }
+    pub fn retire(&mut self, voice: starplayer_core::VoiceId) {
+        if let Some(slot) = self.slots.get_mut(voice.index() as usize).filter(|slot| slot.voice == Some(voice)) { slot.retiring = true; }
+    }
+    pub fn discard(&mut self, voice: starplayer_core::VoiceId) {
+        if let Some(slot) = self.slots.get_mut(voice.index() as usize).filter(|slot| slot.voice == Some(voice)) { slot.voice = None; }
+    }
+    pub fn reset(&mut self) { for slot in self.slots.iter_mut() { slot.voice = None; } }
+    /// Advance one generation. The caller supplies cadence and stable channel/slot order.
+    pub fn control_step(&mut self, module: &Module, voice: starplayer_core::VoiceId, global_volume: u8, sample_rate_hz: u32, linear_periods: bool, voices: &mut starplayer_mixer::VoicePool) {
+        let Some(slot) = self.slots.get_mut(voice.index() as usize).filter(|slot| slot.voice == Some(voice)) else { return };
+        let Some(mixer_voice) = voices.get_mut(voice) else { slot.voice = None; return };
+        if slot.retiring { return; }
+        slot.state.control_step(module, global_volume);
+        let state = &slot.state;
+        let step = starplayer_engine::scaled_step(step_for_period(state.final_period, sample_rate_hz, linear_periods), mixer_voice.region());
+        if mixer_voice.params.step != step { mixer_voice.params.set_step(step); }
+        let volume = volume_from_bits(state.final_volume);
+        if mixer_voice.params.volume != volume { mixer_voice.params.set_volume(volume); }
+        let pan = pan_from_byte(state.final_pan);
+        if mixer_voice.params.pan != pan { mixer_voice.params.set_pan(pan); }
     }
 }
 
+pub fn step_for_period(period: u16, sample_rate_hz: u32, linear_periods: bool) -> Step {
+        if period == 0 {
+            // FT2: "in FT2, a period of 0 results in 0Hz".
+            return Step::ZERO;
+        }
+        let rate = sample_rate_hz.max(1) as u64;
+        match linear_periods {
+            true => {
+                // `period2Ft2Delta`'s own arithmetic: the inverse period, masked to sixteen
+                // bits so FT2's period overflow quirk survives, read out of the shared
+                // Q8.24 table. `linear_frequency_q24` answers `2^(units/768 - 14)`, which
+                // is `2^((4608 - period)/768)` scaled by `2^-8`, so the numerator carries
+                // the reference rate shifted up by sixteen and the quotient is already
+                // Q32.32.
+                let inverse = LINEAR_INVERSE_BASE.wrapping_sub(period as u32) & 0xFFFF;
+                let frequency_q24 = linear_frequency_q24(inverse) as u64;
+                Step::from_bits(LINEAR_FREQUENCY_NUMERATOR.saturating_mul(frequency_q24) / rate)
+            }
+            false => Step::from_ratio(REFERENCE_RATE_HZ * AMIGA_C4_PERIOD, period as u64 * rate),
+        }
+    }
+
 /// The stateful FastTracker 2 effect processor.
 pub struct XmProcessor {
+    #[cfg(feature = "note-overlap")]
+    pending_articulation_reset: bool,
     module: Arc<Module>,
     channels: Box<[XmChannel]>,
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    articulation: Option<XmArticulationRuntime>,
     sample_rate_hz: u32,
     /// `song.globalVolume`, 0..64.
     global_volume: u8,
@@ -381,6 +705,17 @@ pub struct XmProcessor {
 }
 
 impl XmProcessor {
+    // Public context-free seeks reset channels immediately. Resolve retained slot
+    // storage against the sole ownership authority before any callback can advance it.
+    #[cfg(feature = "note-overlap")]
+    fn resolve_articulation_reset(&mut self, context: &TickContext<'_>) {
+        if !core::mem::take(&mut self.pending_articulation_reset) { return; }
+        let Some(runtime) = &mut self.articulation else { return };
+        for slot in runtime.slots.iter_mut() {
+            if !slot.voice.is_some_and(|voice| context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.domain == starplayer_engine::VoiceDomain::Custom)) { slot.voice = None; }
+        }
+    }
+
     /// A FastTracker 2 processor whose quirks come from the dialect the loader detected.
     pub fn new(module: Arc<Module>, sample_rate_hz: u32) -> XmProcessor {
         XmProcessor::with_quirks(module, sample_rate_hz, QuirkSelection::FromDialect)
@@ -400,7 +735,11 @@ impl XmProcessor {
             global_volume: 64,
             module,
             channels: channels.into_boxed_slice(),
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            articulation: None,
             sample_rate_hz,
+            #[cfg(feature = "note-overlap")]
+            pending_articulation_reset: false,
             quirks,
             flow: PatternFlowState::new(quirks.xm_pattern_loop.flow(), channel_count),
             carried_break_row: 0,
@@ -412,6 +751,11 @@ impl XmProcessor {
     pub fn try_with_quirks(
         module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection,
     ) -> Result<XmProcessor, alloc::collections::TryReserveError> {
+        Self::try_with_quirks_and_voice_capacity(module, sample_rate_hz, quirks, starplayer_engine::MAX_VOICE_CAPACITY)
+    }
+
+    pub fn try_with_quirks_and_voice_capacity(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection, voice_capacity: usize) -> Result<XmProcessor, alloc::collections::TryReserveError> {
+        let _ = voice_capacity;
         let header = module.header();
         let quirks = quirks.resolve(header.dialect);
         let channel_count = header.channel_count as usize;
@@ -426,11 +770,37 @@ impl XmProcessor {
             global_volume: 64,
             module,
             channels: channels.into_boxed_slice(),
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            articulation: None,
             sample_rate_hz,
+            #[cfg(feature = "note-overlap")]
+            pending_articulation_reset: false,
             quirks,
             flow,
             carried_break_row: 0,
         })
+    }
+
+    /// Prepare optional held/detached articulation for an explicitly opted-in host.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn try_with_articulation(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection, voice_capacity: usize) -> Result<Self, alloc::collections::TryReserveError> {
+        let mut processor = Self::try_with_quirks_and_voice_capacity(module, sample_rate_hz, quirks, voice_capacity)?;
+        processor.prepare_articulation(voice_capacity)?;
+        Ok(processor)
+    }
+
+    /// Off-render opt-in for a prepared source. Call before dispatching its first tick.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn prepare_articulation(&mut self, voice_capacity: usize) -> Result<(), alloc::collections::TryReserveError> {
+        self.articulation = Some(XmArticulationRuntime::try_new(voice_capacity)?);
+        Ok(())
+    }
+
+    /// Zero for a legacy processor, even with optional features compiled.
+    pub fn articulation_capacity(&self) -> usize {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(runtime) = &self.articulation { return runtime.capacity(); }
+        0
     }
 
     /// The replay behaviour in force. Fixed for the lifetime of the loaded module.
@@ -447,19 +817,6 @@ impl XmProcessor {
 
     /// The song's global volume, 0..64.
     pub const fn global_volume(&self) -> u8 { self.global_volume }
-
-    // ── instrument and sample lookup ────────────────────────────────────────────────
-
-    /// The instrument a channel is playing, or `None` for FT2's empty placeholder.
-    fn instrument_of(&self, channel_index: usize) -> Option<&InstrumentDef> {
-        self.channels[channel_index].instrument.and_then(|id| self.module.instrument(id))
-    }
-
-    /// The volume envelope in force, or `None` when the instrument has none or is the
-    /// placeholder.
-    fn volume_envelope(&self, channel_index: usize) -> Option<&Envelope> {
-        self.instrument_of(channel_index).and_then(|instrument| instrument.volume_envelope.as_ref())
-    }
 
     // ── the tick-zero row parse: `getNewNote` ───────────────────────────────────────
 
@@ -643,10 +1000,17 @@ impl XmProcessor {
 
     /// `triggerNote` (`ft2_replayer.c` 539).
     fn trigger_note(&mut self, channel_index: usize, note: u8, effect: u8, parameter: u8) {
+        #[cfg(feature = "interactive-audition")]
+        {
+            if note == 0 && self.channels[channel_index].sound_cleared { return; }
+            if note != 0 && note != NOTE_KEY_OFF { self.channels[channel_index].sound_cleared = false; }
+        }
         if note == NOTE_KEY_OFF {
             self.key_off(channel_index);
             return;
         }
+        #[cfg(feature = "note-overlap")]
+        let musical_note = (note != 0).then_some(note);
         // `Rxy` and `EDx` reach here with no note of their own and replay the last one.
         let note = match note {
             0 => match self.channels[channel_index].note_number {
@@ -709,6 +1073,8 @@ impl XmProcessor {
         }
 
         self.channels[channel_index].trigger_voice = true;
+        #[cfg(feature = "note-overlap")]
+        { self.channels[channel_index].onset_note = musical_note; }
 
         if effect == 9 {
             if parameter > 0 {
@@ -731,45 +1097,7 @@ impl XmProcessor {
         }
         self.channels[channel_index].retrigger_counter = 0;
         self.channels[channel_index].tremor_position = 0;
-        self.channels[channel_index].key_off = false;
-
-        // FastTracker 2 never has a null instrument pointer: `triggerNote` parks the
-        // channel on `instr[0]`, the placeholder `allocateInstr` fills with the standard
-        // envelope defaults, whenever the instrument number names a slot the file did not
-        // store. So an out-of-range instrument column still reloads a fadeout — the
-        // placeholder's — and `ft2_instrument_fade_update.xm` is the fixture that sees it,
-        // because the *next* row's instrument-without-note reads the same stale pointer.
-        let instrument = self.instrument_of(channel_index);
-        let volume_enabled = instrument.is_some_and(|instrument| instrument.volume_envelope.is_some());
-        let panning_enabled = instrument.is_some_and(|instrument| instrument.panning_envelope.is_some());
-        let fadeout = instrument.map_or(PLACEHOLDER_FADEOUT, |instrument| instrument.fadeout);
-        let auto_vibrato = self.channels[channel_index].sample
-            .and_then(|id| self.module.sample(id))
-            .map(|sample| sample.auto_vibrato())
-            .unwrap_or_default();
-
-        let state = &mut self.channels[channel_index];
-        if volume_enabled {
-            state.volume_envelope_tick = u16::MAX;
-            state.volume_envelope_point = 0;
-        }
-        if panning_enabled {
-            state.panning_envelope_tick = u16::MAX;
-            state.panning_envelope_point = 0;
-        }
-        state.fadeout_speed = fadeout;
-        state.fadeout_volume = FADEOUT_MAX;
-
-        if auto_vibrato.depth > 0 {
-            state.auto_vibrato_position = 0;
-            if auto_vibrato.sweep > 0 {
-                state.auto_vibrato_amplitude = 0;
-                state.auto_vibrato_sweep = ((auto_vibrato.depth as u16) << 8) / auto_vibrato.sweep as u16;
-            } else {
-                state.auto_vibrato_amplitude = (auto_vibrato.depth as u16) << 8;
-                state.auto_vibrato_sweep = 0;
-            }
-        }
+        self.channels[channel_index].articulation.start(&self.module);
     }
 
     /// `resetVolumes` (`ft2_replayer.c` 339): an instrument column restores the sample's
@@ -789,23 +1117,7 @@ impl XmProcessor {
     /// only ever read while the panning envelope is enabled, so the branch has no
     /// observable effect and there is nothing here to write.
     fn key_off(&mut self, channel_index: usize) {
-        self.channels[channel_index].key_off = true;
-        let sustain_tick = self.volume_envelope(channel_index).map(|envelope| {
-            let point = self.channels[channel_index].volume_envelope_point as usize;
-            envelope.points.get(point).map_or(0, |point| point.tick)
-        });
-        let state = &mut self.channels[channel_index];
-        match sustain_tick {
-            Some(tick) => {
-                if state.volume_envelope_tick >= tick {
-                    state.volume_envelope_tick = tick.wrapping_sub(1);
-                }
-            }
-            None => {
-                state.real_volume = 0;
-                state.out_volume = 0;
-            }
-        }
+        if self.channels[channel_index].articulation.release(&self.module) { self.channels[channel_index].real_volume = 0; }
     }
 
     // ── tick-zero effects ───────────────────────────────────────────────────────────
@@ -1554,126 +1866,7 @@ impl XmProcessor {
     /// Leaves the final voice volume in [`XmChannel::final_volume`], in the 0..65536 domain
     /// this crate keeps FT2's `float fFinalVol` in.
     fn update_volume_pan_auto_vibrato(&mut self, channel_index: usize) {
-        // `&self.module` and `&mut self.channels[..]` borrow different fields, so both
-        // envelopes are read **in place**. Cloning one would allocate its point list on
-        // every tick of every channel, inside `render()` — architecture §8.
-        let global_volume = self.global_volume.min(64) as u64;
-        let module = &self.module;
-        let state = &mut self.channels[channel_index];
-        let instrument = state.instrument.and_then(|id| module.instrument(id));
-
-        // *** FADEOUT ON KEY OFF ***
-        if state.key_off {
-            if state.fadeout_speed > state.fadeout_volume {
-                state.fadeout_volume = 0;
-                state.fadeout_speed = 0;
-            } else {
-                state.fadeout_volume -= state.fadeout_speed;
-            }
-        }
-
-        // *** VOLUME ENVELOPE ***
-        let key_off = state.key_off;
-        let envelope_value = match instrument.and_then(|instrument| instrument.volume_envelope.as_ref()) {
-            Some(envelope) => {
-                let mut cursor = EnvelopeCursor {
-                    tick: state.volume_envelope_tick,
-                    point: state.volume_envelope_point,
-                    value: state.volume_envelope_value,
-                    delta: state.volume_envelope_delta,
-                };
-                let value = advance_envelope(&mut cursor, envelope, key_off);
-                state.volume_envelope_tick = cursor.tick;
-                state.volume_envelope_point = cursor.point;
-                state.volume_envelope_value = cursor.value;
-                state.volume_envelope_delta = cursor.delta;
-                value
-            }
-            None => ENVELOPE_UNITY,
-        };
-
-        // *** PANNING ENVELOPE ***
-        let panning_value = instrument.and_then(|instrument| instrument.panning_envelope.as_ref()).map(|envelope| {
-            let mut cursor = EnvelopeCursor {
-                tick: state.panning_envelope_tick,
-                point: state.panning_envelope_point,
-                value: state.panning_envelope_value,
-                delta: state.panning_envelope_delta,
-            };
-            let value = advance_envelope(&mut cursor, envelope, key_off);
-            state.panning_envelope_tick = cursor.tick;
-            state.panning_envelope_point = cursor.point;
-            state.panning_envelope_value = cursor.value;
-            state.panning_envelope_delta = cursor.delta;
-            value
-        });
-
-        state.final_pan = match panning_value {
-            Some(value) => {
-                let mut multiplier = state.out_pan as i32 - 128;
-                if multiplier >= 0 {
-                    multiplier = -multiplier;
-                }
-                multiplier = (multiplier + 128) << 3;
-                let centred = value - 32 * 256;
-                let addend = ((centred * multiplier) >> 16) as i8;
-                state.out_pan.wrapping_add(addend as u8)
-            }
-            None => state.out_pan,
-        };
-
-        // *** AUTO VIBRATO ***
-        let auto_vibrato = state.sample
-            .and_then(|id| module.sample(id))
-            .map(|sample| sample.auto_vibrato())
-            .unwrap_or_default();
-        if auto_vibrato.depth > 0 {
-            let amplitude = match state.auto_vibrato_sweep > 0 {
-                true => {
-                    let mut amplitude = state.auto_vibrato_sweep;
-                    if !state.key_off {
-                        amplitude = amplitude.wrapping_add(state.auto_vibrato_amplitude);
-                        if amplitude >> 8 > auto_vibrato.depth as u16 {
-                            amplitude = (auto_vibrato.depth as u16) << 8;
-                            state.auto_vibrato_sweep = 0;
-                        }
-                        state.auto_vibrato_amplitude = amplitude;
-                    }
-                    amplitude
-                }
-                false => state.auto_vibrato_amplitude,
-            };
-            state.auto_vibrato_position = state.auto_vibrato_position.wrapping_add(auto_vibrato.rate);
-            let sample = match auto_vibrato.waveform {
-                AutoVibratoWaveform::Square => match state.auto_vibrato_position > 127 {
-                    true => 64i16,
-                    false => -64,
-                },
-                // FT2's `vibType` 2 is ramp **down** in its own numbering and the loader
-                // maps it to [`AutoVibratoWaveform::RampDown`]; the arithmetic below is
-                // FT2's own, sign and all.
-                AutoVibratoWaveform::RampDown => (((state.auto_vibrato_position >> 1) as i16 + 64) & 127) - 64,
-                AutoVibratoWaveform::RampUp => ((-((state.auto_vibrato_position >> 1) as i16) + 64) & 127) - 64,
-                // FastTracker 2 has only four waveforms and masks anything else down to a
-                // sine, which is where the loader already sends an unknown `vibType`; IT's
-                // random waveform can only reach here through a hand-built module.
-                AutoVibratoWaveform::Sine | AutoVibratoWaveform::Random => AUTO_VIBRATO_SINE_TABLE[state.auto_vibrato_position as usize] as i16,
-            };
-            let delta = ((sample as i32 * amplitude as i32) >> 14) as i16;
-            let period = state.out_period.wrapping_add(delta as u16);
-            state.final_period = if period >= MAX_PERIOD { 0 } else { period };
-        } else {
-            state.final_period = state.out_period;
-        }
-
-        // The final volume, in FT2's own product: global x channel x fadeout x envelope,
-        // whose full scale is `64 * 64 * 32768 * 16384 == 2^41`. Shifting to a 0..65536
-        // range is a shift by 25, and the trace's 0..64 domain is a further rounded 10.
-        let product = global_volume
-            * state.out_volume.min(64) as u64
-            * state.fadeout_volume as u64
-            * envelope_value.clamp(0, ENVELOPE_UNITY) as u64;
-        state.final_volume = (product >> 25) as u32;
+        self.channels[channel_index].articulation.control_step(&self.module, self.global_volume);
     }
 
     // ── pitch conversion ────────────────────────────────────────────────────────────
@@ -1717,33 +1910,15 @@ impl XmProcessor {
     /// [`linear_frequency_q24`] exactly as FT2's `period2Ft2Delta` reads its own `logTab` —
     /// table only, no transcendental function anywhere on this path (design goal 5). Amiga
     /// mode is `8363 * 1712 / period`, the format's own constant.
-    fn step_for_period(&self, period: u16) -> Step {
-        if period == 0 {
-            // FT2: "in FT2, a period of 0 results in 0Hz".
-            return Step::ZERO;
-        }
-        let rate = self.sample_rate_hz.max(1) as u64;
-        match self.linear_periods {
-            true => {
-                // `period2Ft2Delta`'s own arithmetic: the inverse period, masked to sixteen
-                // bits so FT2's period overflow quirk survives, read out of the shared
-                // Q8.24 table. `linear_frequency_q24` answers `2^(units/768 - 14)`, which
-                // is `2^((4608 - period)/768)` scaled by `2^-8`, so the numerator carries
-                // the reference rate shifted up by sixteen and the quotient is already
-                // Q32.32.
-                let inverse = LINEAR_INVERSE_BASE.wrapping_sub(period as u32) & 0xFFFF;
-                let frequency_q24 = linear_frequency_q24(inverse) as u64;
-                Step::from_bits(LINEAR_FREQUENCY_NUMERATOR.saturating_mul(frequency_q24) / rate)
-            }
-            false => Step::from_ratio(REFERENCE_RATE_HZ * AMIGA_C4_PERIOD, period as u64 * rate),
-        }
-    }
+    fn step_for_period(&self, period: u16) -> Step { step_for_period(period, self.sample_rate_hz, self.linear_periods) }
 
     // ── the voice ───────────────────────────────────────────────────────────────────
 
     /// Turn one channel's state into voice writes.
     fn flush_channel(&mut self, context: &mut TickContext<'_>, channel_index: usize) {
         let channel_id = ChannelId(channel_index as u16);
+        #[cfg(feature = "note-overlap")]
+        let onset_note = self.channels[channel_index].onset_note.take();
         if core::mem::take(&mut self.channels[channel_index].stop_voice) {
             self.channels[channel_index].trigger_voice = false;
             context.stop_channel(channel_id);
@@ -1787,10 +1962,25 @@ impl XmProcessor {
                 };
                 let tag = VoiceTag {
                     channel: channel_index as u8,
-                    instrument: state.instrument_number,
+                    instrument: state.instrument_number as u16,
                     sample: sample_id.0.saturating_add(1),
                     note: state.sounding_note,
                 };
+                #[cfg(feature = "note-overlap")]
+                {
+                    // real_volume is the exact base after setters/fine slides, before
+                    // tremolo/tremor, envelopes and global gain. Runtime snapshots still
+                    // hold the outgoing voice's previous boundary, independent of this
+                    // channel's incoming effects and articulation.
+                    let onset = onset_note.and_then(|note| state.instrument_number.checked_sub(1).map(|instrument| starplayer_core::TriggerIdentity {
+                        instrument: InstrumentId(instrument as u16),
+                        note: starplayer_core::OriginalNote::Note(Note::new(note - 1)),
+                        channel: channel_id,
+                        onset_volume: state.real_volume as u16,
+                    }));
+                    context.trigger_legacy_overlap(tag, sample_region(sample), params, offset, onset, &self.module);
+                }
+                #[cfg(not(feature = "note-overlap"))]
                 context.trigger_channel(channel_id, tag, sample_region(sample), params, offset);
                 self.channels[channel_index].sounding_instrument = self.channels[channel_index].instrument_number;
                 return;
@@ -1801,6 +1991,11 @@ impl XmProcessor {
         // to its mixer. Written straight into `params` rather than through
         // `write_voice_param` so the trace's dirty flags stay effect-driven (task E3).
         let Some(voice) = context.channels.foreground(channel_id) else { return };
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|state| state.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) {
+            if let Some(runtime) = &mut self.articulation { runtime.retire(voice); }
+            return;
+        }
         let Some(voice) = context.voices.get_mut(voice) else { return };
         let state = &self.channels[channel_index];
         // FT2's per-tick period is written straight into `params`, so this is a third
@@ -1820,11 +2015,43 @@ impl XmProcessor {
         }
     }
 
+    #[cfg(feature = "note-overlap")]
+    fn step_backgrounds(&mut self, context: &mut TickContext<'_>, channel_index: usize) {
+        let Some(runtime) = &mut self.articulation else { return };
+        let channel = ChannelId(channel_index as u16);
+        for index in 0..runtime.slots.len() {
+            let slot = &runtime.slots[index];
+            if slot.root_channel != channel { continue; }
+            let Some(voice) = slot.voice else { continue };
+            if context.channels.foreground(channel) == Some(voice) { continue; }
+            // Native stop ramps also unbind their foreground. They are not detached
+            // articulation and must retain canonical stop parameters.
+            if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_none_or(|owned| owned.domain != starplayer_engine::VoiceDomain::Custom) { runtime.discard(voice); continue; }
+            if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) { runtime.retire(voice); }
+            runtime.control_step(&self.module, voice, self.global_volume, self.sample_rate_hz, self.linear_periods, context.voices);
+        }
+    }
+
     /// Feed the diagnostic per-tick trace.
     #[cfg(feature = "trace")]
     fn report_trace_channels(&self, context: &mut TickContext<'_>) {
         for channel_index in 0..self.channels.len() {
             context.report_trace_channel(ChannelId(channel_index as u16), self.trace_channel_state(channel_index));
+        }
+        #[cfg(feature = "note-overlap")]
+        if let Some(runtime) = &self.articulation {
+            for slot in runtime.slots.iter() {
+                let Some(voice) = slot.voice else { continue };
+                if slot.retiring || context.voices.get(voice).is_none() || context.channels.foreground(slot.root_channel) == Some(voice) { continue; }
+                if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_none_or(|owned| owned.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) { continue; }
+                let state = &slot.state;
+                context.report_trace_voice(voice, TraceChannelState {
+                    note: context.voices.get(voice).map(|voice| voice.tag.note), instrument: context.voices.get(voice).map_or(0, |voice| voice.tag.instrument),
+                    sample: state.sample.map_or(0, |sample| sample.0.saturating_add(1)),
+                    volume: (((state.final_volume >> 6) + 8) / 16) as u16,
+                    period: state.final_period as u32, pan: state.final_pan as u16,
+                });
+            }
         }
     }
 
@@ -2029,7 +2256,38 @@ fn sample_region(sample: &starplayer_model::SampleIndex) -> SampleRegion {
 }
 
 impl TrackerProcessor for XmProcessor {
+    #[cfg(feature = "interactive-audition")]
+    fn clear_sound(&mut self, scope: starplayer_engine::ClearScope, _context: &mut TickContext<'_>) {
+        use starplayer_engine::ClearScope;
+        for (index, channel) in self.channels.iter_mut().enumerate() {
+            if matches!(scope, ClearScope::All | ClearScope::Song) || scope == ClearScope::Lane(ChannelId(index as u16)) { channel.sound_cleared = true; }
+        }
+    }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn control_step(&mut self, context: &mut TickContext<'_>) {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
+        let Some(runtime) = &mut self.articulation else { return };
+        for channel_index in 0..self.channels.len() {
+            for index in 0..runtime.slots.len() {
+                let slot = &runtime.slots[index];
+                if slot.root_channel != ChannelId(channel_index as u16) { continue; }
+                let Some(voice) = slot.voice else { continue };
+                #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+                if context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|state| state.lifecycle == starplayer_engine::VoiceLifecycle::Retiring) { runtime.retire(voice); }
+                runtime.control_step(&self.module, voice, self.global_volume, self.sample_rate_hz, self.linear_periods, context.voices);
+                if context.channels.foreground(ChannelId(channel_index as u16)) == Some(voice)
+                    && let Some(state) = runtime.voice(voice) {
+                    self.channels[channel_index].articulation = state.clone();
+                }
+            }
+        }
+    }
+
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         context.report_global_volume(starplayer_core::fixed::unit_from_ratio(self.global_volume as u32, 64));
         let mut outcome = context.outcome();
         self.flow.begin_row();
@@ -2043,6 +2301,13 @@ impl TrackerProcessor for XmProcessor {
             }
             self.update_volume_pan_auto_vibrato(channel_index);
             self.flush_channel(context, channel_index);
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            if let Some(runtime) = &mut self.articulation
+                && let Some(voice) = context.channels.foreground(ChannelId(channel_index as u16)) {
+                runtime.snapshot(voice, ChannelId(channel_index as u16), &self.channels[channel_index].articulation, context.voices);
+            }
+            #[cfg(feature = "note-overlap")]
+            self.step_backgrounds(context, channel_index);
         }
         outcome.jump = self.carried_jump(self.flow.jump(), row);
         #[cfg(feature = "trace")]
@@ -2051,6 +2316,8 @@ impl TrackerProcessor for XmProcessor {
     }
 
     fn tick(&mut self, context: &mut TickContext<'_>) -> TickOutcome {
+        #[cfg(feature = "note-overlap")]
+        self.resolve_articulation_reset(context);
         context.report_global_volume(starplayer_core::fixed::unit_from_ratio(self.global_volume as u32, 64));
         let outcome = context.outcome();
         let speed = context.row_clock.speed;
@@ -2065,6 +2332,13 @@ impl TrackerProcessor for XmProcessor {
             self.handle_effects_tick_non_zero(context, channel_index, tick, speed);
             self.update_volume_pan_auto_vibrato(channel_index);
             self.flush_channel(context, channel_index);
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            if let Some(runtime) = &mut self.articulation
+                && let Some(voice) = context.channels.foreground(ChannelId(channel_index as u16)) {
+                runtime.snapshot(voice, ChannelId(channel_index as u16), &self.channels[channel_index].articulation, context.voices);
+            }
+            #[cfg(feature = "note-overlap")]
+            self.step_backgrounds(context, channel_index);
         }
         #[cfg(feature = "trace")]
         self.report_trace_channels(context);
@@ -2075,6 +2349,13 @@ impl TrackerProcessor for XmProcessor {
     /// array keeps its box and each entry is overwritten in place.
     fn reset(&mut self) {
         self.global_volume = 64;
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(runtime) = &mut self.articulation {
+            #[cfg(not(feature = "note-overlap"))]
+            runtime.reset();
+            #[cfg(feature = "note-overlap")]
+            { let _ = runtime; self.pending_articulation_reset = true; }
+        }
         for channel in self.channels.iter_mut() {
             *channel = XmChannel::new();
         }
@@ -2201,6 +2482,113 @@ mod tests {
 
     fn note(note: u8, instrument: u8) -> XmCell { XmCell { note, instrument, ..XmCell::EMPTY } }
     fn effect(effect: u8, parameter: u8) -> XmCell { XmCell { effect, parameter, ..XmCell::EMPTY } }
+
+    #[cfg(feature = "interactive-audition")]
+    #[test]
+    fn interactive_clear_suppresses_effect_retrigger_but_keeps_a_future_delayed_note() {
+        let mut harness = Harness::new(processor());
+        let _ = harness.row(&[XmCell { note: 49, instrument: 1, effect: 0xE, parameter: 0x91, ..XmCell::EMPTY }]);
+        assert!(harness.channels.foreground(ChannelId(0)).is_some());
+        harness.channels.stop_all(&mut harness.voices);
+        let mut context = TickContext::new(Frame::ZERO, &mut harness.voices, &mut harness.channels, harness.row_clock, SongPosition::default(), 125);
+        harness.processor.clear_sound(starplayer_engine::ClearScope::All, &mut context);
+        let volume = harness.processor.channels[0].real_volume;
+        let _ = harness.tick(); let _ = harness.tick();
+        assert_eq!(harness.channels.foreground(ChannelId(0)), None);
+        assert_eq!(harness.processor.channels[0].real_volume, volume);
+        let _ = harness.row(&[XmCell { note: 52, instrument: 1, effect: 0xE, parameter: 0xD2, ..XmCell::EMPTY }]);
+        let mut context = TickContext::new(Frame::ZERO, &mut harness.voices, &mut harness.channels, harness.row_clock, SongPosition::default(), 125);
+        harness.processor.clear_sound(starplayer_engine::ClearScope::All, &mut context);
+        let _ = harness.tick(); assert_eq!(harness.channels.foreground(ChannelId(0)), None);
+        let _ = harness.tick(); assert!(harness.channels.foreground(ChannelId(0)).is_some());
+    }
+
+    #[test]
+    fn legacy_constructors_never_allocate_optional_slot_state() {
+        assert_eq!(processor().articulation_capacity(), 0);
+        assert_eq!(XmProcessor::try_with_quirks_and_voice_capacity(plain_module(), 44_100, QuirkSelection::FromDialect, 339).expect("prepared test voice/state is available").articulation_capacity(), 0);
+    }
+
+    #[test]
+    fn runtime_high_slots_reject_stale_generations_and_hold_retirement() {
+        let module = plain_module();
+        let mut runtime = XmArticulationRuntime::try_new(339).expect("prepared test voice/state is available");
+        let mut voices = VoicePool::new(339);
+        let tag = VoiceTag { channel: 0, instrument: 1, sample: 1, note: 48 };
+        for _ in 0..338 { voices.allocate(tag, SampleRegion::one_shot(0, 64), VoiceParams::SILENT, 0).expect("prepared test voice/state is available"); }
+        let old = voices.allocate(tag, SampleRegion::one_shot(0, 64), VoiceParams::SILENT, 0).expect("prepared test voice/state is available");
+        assert_eq!(old.index(), 338);
+        let state = XmVoiceState { instrument: Some(InstrumentId(0)), sample: Some(SampleId(0)), out_period: 4608, out_volume: 64, ..XmVoiceState::default() };
+        assert!(runtime.start(&module, old, ChannelId(0), state.clone(), &voices));
+        runtime.control_step(&module, old, 64, 44_100, true, &mut voices);
+        voices.release(old);
+        let new = voices.allocate(tag, SampleRegion::one_shot(0, 64), VoiceParams::SILENT, 0).expect("prepared test voice/state is available");
+        assert!(runtime.start(&module, new, ChannelId(0), state, &voices));
+        let before = runtime.voice(new).expect("prepared test voice/state is available").clone();
+        assert!(!runtime.start(&module, old, ChannelId(0), before.clone(), &voices));
+        assert!(!runtime.snapshot(old, ChannelId(0), &before, &voices));
+        runtime.release(&module, old);
+        runtime.cut(old);
+        runtime.retire(old);
+        runtime.discard(old);
+        runtime.control_step(&module, old, 64, 44_100, true, &mut voices);
+        assert_eq!(runtime.voice(new), Some(&before));
+        runtime.retire(new);
+        runtime.release(&module, new);
+        runtime.cut(new);
+        runtime.control_step(&module, new, 64, 44_100, true, &mut voices);
+        assert_eq!(runtime.voice(new), Some(&before));
+        assert_eq!(voices.get(new).expect("prepared test voice/state is available").params, VoiceParams::SILENT);
+        voices.release(new);
+        runtime.control_step(&module, new, 64, 44_100, true, &mut voices);
+        assert!(runtime.voice(new).is_none());
+    }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    #[test]
+    fn optional_snapshots_preserve_native_ticks_and_control_does_not_run_effects() {
+        let envelope = Envelope { points: vec![EnvelopePoint { tick: 0, value: 64 }, EnvelopePoint { tick: 16, value: 0 }].into_boxed_slice(), sustain: None, loop_span: None, carry: false };
+        let module = module(Some(envelope), None, 256, AutoVibrato { depth: 4, rate: 2, ..AutoVibrato::default() });
+        let mut native = Harness::new(XmProcessor::new(Arc::clone(&module), 44_100));
+        let mut prepared = Harness::new(XmProcessor::try_with_articulation(module, 44_100, QuirkSelection::FromDialect, 339).expect("prepared test voice/state is available"));
+        assert_eq!(prepared.processor.articulation_capacity(), 339);
+        let cells = [XmCell { effect: 0xA, parameter: 1, ..note(49, 1) }, XmCell::EMPTY];
+        let _ = native.row(&cells); let _ = prepared.row(&cells);
+        for _ in 0..4 {
+            let _ = native.tick(); let _ = prepared.tick();
+            assert_eq!(native.channel(0), prepared.channel(0));
+            let left = native.channels.foreground(ChannelId(0)).expect("prepared test voice/state is available");
+            let right = prepared.channels.foreground(ChannelId(0)).expect("prepared test voice/state is available");
+            assert_eq!(native.voices.get(left).expect("prepared test voice/state is available").params, prepared.voices.get(right).expect("prepared test voice/state is available").params);
+        }
+        let base = prepared.channel(0).real_volume;
+        let cursor = prepared.channel(0).volume_envelope_tick;
+        let clock = prepared.row_clock;
+        let mut context = TickContext::new(Frame::ZERO, &mut prepared.voices, &mut prepared.channels, clock, SongPosition::default(), 125);
+        prepared.processor.control_step(&mut context);
+        assert_eq!(prepared.channel(0).real_volume, base, "A01 must not run while held");
+        assert_eq!(prepared.channel(0).volume_envelope_tick, cursor + 1);
+        assert_eq!(prepared.row_clock, clock);
+    }
+
+    #[cfg(all(feature = "note-overlap", feature = "interactive-audition"))]
+    #[test]
+    fn engine_owned_retirement_suppresses_held_and_native_voice_writes() {
+        let mut harness = Harness::new(XmProcessor::try_with_articulation(plain_module(), 44_100, QuirkSelection::FromDialect, 339).expect("prepared runtime"));
+        harness.channels = ChannelTable::try_with_layout(starplayer_engine::LaneLayout::interactive(2).expect("interactive layout")).expect("channel table");
+        let configuration = starplayer_engine::EngineSettings::interactive_web(Default::default(), 1).expect("configuration").playback_configuration().expect("opted in");
+        harness.channels.prepare_playback(configuration).expect("ownership storage");
+        let _ = harness.row(&[note(49, 1), XmCell::EMPTY]);
+        let voice = harness.channels.foreground(ChannelId(0)).expect("foreground voice");
+        harness.channels.playback_mut().expect("ownership").set_lifecycle(voice, starplayer_engine::VoiceLifecycle::Retiring, &harness.voices).expect("retire");
+        let before = harness.voices.get(voice).expect("mixer voice").params;
+        let mut context = TickContext::new(Frame::ZERO, &mut harness.voices, &mut harness.channels, harness.row_clock, SongPosition::default(), 125);
+        harness.processor.control_step(&mut context);
+        harness.processor.channels[0].real_volume = 0;
+        harness.processor.channels[0].out_volume = 0;
+        let _ = harness.tick();
+        assert_eq!(harness.voices.get(voice).expect("retiring mixer voice").params, before);
+    }
 
     #[test]
     fn a_note_takes_its_period_from_fast_tracker_twos_own_linear_table() {

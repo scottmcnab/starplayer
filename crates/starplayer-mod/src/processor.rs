@@ -124,6 +124,12 @@ pub struct ModChannel {
     /// since, even if its sample has since run out. This is libxmp's mapped-versus-
     /// unmapped distinction, and it decides where a revived queued sample starts.
     voice_owned: bool,
+    #[cfg(feature = "note-overlap")]
+    original_note: Option<starplayer_core::OriginalNote>,
+    #[cfg(feature = "note-overlap")]
+    new_note_pending: bool,
+    #[cfg(feature = "interactive-audition")]
+    sound_cleared: bool,
 }
 
 impl ModChannel {
@@ -160,6 +166,10 @@ impl ModChannel {
             invert_loop_speed: 0,
             queued_swap: None,
             voice_owned: false,
+            #[cfg(feature = "note-overlap")] original_note: None,
+            #[cfg(feature = "note-overlap")] new_note_pending: false,
+            #[cfg(feature = "interactive-audition")]
+            sound_cleared: false,
         }
     }
 }
@@ -311,6 +321,8 @@ impl ModProcessor {
             state.delayed_note = false;
             state.offset_post_trigger = 0;
             state.queued_swap = None;
+            #[cfg(feature = "note-overlap")]
+            { state.original_note = None; state.new_note_pending = false; }
         }
     }
 
@@ -388,6 +400,17 @@ impl ModProcessor {
         state.current_period = period;
         state.actual_period = period;
         state.delayed_note = delayed;
+        #[cfg(feature = "note-overlap")]
+        {
+            state.original_note = match cell.note {
+                EffectNote::ModPeriod(period) => Some(starplayer_core::OriginalNote::ModPeriod(period)),
+                EffectNote::Linear(note) => Some(starplayer_core::OriginalNote::Note(Note::new(note))),
+                EffectNote::None => None,
+            };
+            state.new_note_pending = !delayed;
+        }
+        #[cfg(feature = "interactive-audition")]
+        if !delayed { state.sound_cleared = false; }
         if !delayed { state.pending_dirty.insert(DirtyBits::SAMPLE | DirtyBits::PITCH); }
         if !delayed {
             if state.vibrato_waveform & 4 == 0 { state.vibrato_phase = 0; }
@@ -751,6 +774,8 @@ impl ModProcessor {
     }
 
     fn retrigger(&mut self, channel_index: usize) {
+        #[cfg(feature = "interactive-audition")]
+        if self.channels[channel_index].sound_cleared { return; }
         if self.channels[channel_index].sample_number == NO_SAMPLE || self.channels[channel_index].current_note == NO_NOTE { return; }
         self.channels[channel_index].pending_dirty.insert(DirtyBits::SAMPLE);
     }
@@ -758,7 +783,13 @@ impl ModProcessor {
     fn trigger_delayed(&mut self, channel_index: usize) {
         let state = &mut self.channels[channel_index];
         if !state.delayed_note || !state.row_note_present { return; }
-        if state.sample_number != NO_SAMPLE { state.pending_dirty.insert(DirtyBits::SAMPLE | DirtyBits::PITCH); }
+        #[cfg(feature = "interactive-audition")]
+        { state.sound_cleared = false; }
+        if state.sample_number != NO_SAMPLE {
+            state.pending_dirty.insert(DirtyBits::SAMPLE | DirtyBits::PITCH);
+            #[cfg(feature = "note-overlap")]
+            { state.new_note_pending = true; }
+        }
     }
 
     fn apply_pending_tempo(&mut self, outcome: &mut TickOutcome) {
@@ -795,6 +826,8 @@ impl ModProcessor {
     /// reaches its loop point or its end (accuracy policy D12).
     fn apply_queued_swap(&mut self, context: &mut TickContext<'_>, channel_index: usize) {
         let Some(queued) = self.channels[channel_index].queued_swap.take() else { return };
+        #[cfg(feature = "interactive-audition")]
+        if self.channels[channel_index].sound_cleared { return; }
         // PT needs a note to have sounded on this channel before a lone instrument number
         // means anything at all.
         if self.channels[channel_index].current_note == NO_NOTE { return; }
@@ -807,7 +840,14 @@ impl ModProcessor {
             let Some(sample) = self.sample_index(channel_index) else { return };
             sample_region(sample)
         };
-        if context.queue_channel_region(channel_id, region) { return; }
+        if context.queue_channel_region(channel_id, region) {
+            #[cfg(feature = "note-overlap")]
+            if context.channels.playback().is_some_and(|playback| playback.configuration().capabilities.contains(starplayer_core::PlaybackCapabilities::NOTE_OVERLAP))
+                && let Some(voice) = context.channels.foreground(channel_id).and_then(|voice| context.voices.get_mut(voice))
+                && let Some(sample) = self.module.instrument(InstrumentId((queued - 1) as u16)).and_then(|instrument| instrument.sample)
+            { voice.tag_pending_sample(region, queued as u16, sample.0.saturating_add(1)); }
+            return;
+        }
         // A voice that merely ran out still owns its channel; one that was cut left it
         // unbound. PT tells the two apart the same way libxmp's `virt_queuepatch` does,
         // and it decides where the revived sample starts: Paula reloads a still-owned
@@ -846,11 +886,20 @@ impl ModProcessor {
             };
             let tag = VoiceTag {
                 channel: channel_index as u8,
-                instrument: state.sample_number,
-                sample: state.sample_number as u16,
+                instrument: state.sample_number as u16,
+                sample: self.module.instrument(InstrumentId((state.sample_number - 1) as u16)).and_then(|instrument| instrument.sample).map_or(0, |sample| sample.0.saturating_add(1)),
                 note: if state.current_note == NO_NOTE { 0 } else { state.current_note },
             };
             let offset_frames = state.sample_offset;
+            #[cfg(feature = "note-overlap")]
+            {
+                let onset = state.original_note.filter(|_| state.new_note_pending).map(|note| starplayer_core::TriggerIdentity {
+                    instrument: InstrumentId((state.sample_number - 1) as u16), note, channel: channel_id, onset_volume: state.current_volume as u16,
+                });
+                context.trigger_legacy_overlap(tag, region, self.voice_params(channel_index, dirty), offset_frames, onset, &self.module);
+                self.channels[channel_index].new_note_pending = false;
+            }
+            #[cfg(not(feature = "note-overlap"))]
             context.trigger_channel(channel_id, tag, region, self.voice_params(channel_index, dirty), offset_frames);
             self.channels[channel_index].voice_owned = true;
         } else if let Some(voice) = context.channels.foreground(channel_id) {
@@ -933,6 +982,14 @@ impl ModProcessor {
 }
 
 impl TrackerProcessor for ModProcessor {
+    #[cfg(feature = "interactive-audition")]
+    fn clear_sound(&mut self, scope: starplayer_engine::ClearScope, _context: &mut TickContext<'_>) {
+        use starplayer_engine::ClearScope;
+        for (index, channel) in self.channels.iter_mut().enumerate() {
+            if matches!(scope, ClearScope::All | ClearScope::Song) || scope == ClearScope::Lane(ChannelId(index as u16)) { channel.sound_cleared = true; }
+        }
+    }
+
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
         let cells = row.bytes.chunks_exact(CELL_BYTES)
             .map(|bytes| EffectCell::from(ModCell::from_bytes(bytes).unwrap_or(ModCell::EMPTY)));

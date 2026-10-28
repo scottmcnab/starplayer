@@ -18,7 +18,13 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         this.wasm = createStarPlayerWasmBindings();
         const wasm = this.wasm.initSync({ module });
 
-        if (!this.wasm.init(sampleRate, settings.mixerMode)) {
+        const ringVersion = settings.commandRing ? Ring.viewCommandRing(settings.commandRing).version : settings.interactiveVersion;
+        this.interactiveVersion = ringVersion === Ring.INTERACTIVE_WIRE_VERSION && settings.interactiveVersion === Ring.INTERACTIVE_WIRE_VERSION && this.wasm.interactive_wire_version?.() === Ring.INTERACTIVE_WIRE_VERSION ? Ring.INTERACTIVE_WIRE_VERSION : 0;
+        let initialized = this.interactiveVersion
+            ? this.wasm.init_interactive(sampleRate, settings.mixerMode, settings.seedSession ?? 0n, settings.seedBuild ?? 0n)
+            : this.wasm.init(sampleRate, settings.mixerMode);
+        if (!initialized && this.interactiveVersion) { this.interactiveVersion = 0; initialized = this.wasm.init(sampleRate, settings.mixerMode); }
+        if (!initialized) {
             throw new Error('the requested mixer mode has no web engine arm');
         }
         this.memory = wasm.memory;
@@ -38,12 +44,32 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         this.stableMemoryBytes = this.initialMemoryBytes;
         this.bindViews();
 
+        this.pendingAcks = [];
+        this.nextBarrierLow = 1; this.nextBarrierHigh = 0;
+        this.controlAck = { type: 'interactiveApplied', requestedIdentity: new Uint32Array(4), words: new Uint32Array(10), commands: new Uint32Array(Ring.COMMAND_CAPACITY * 3), count: 0, accepted: false };
+        this.pendingControlSerial = 0;
+        this.pendingControlFailed = false;
+        this.fallbackBatches = [];
+        this.deferredLoads = new Map();
+        this.pendingReplay = null;
+        this.controlFailed = false;
         this.pendingMixerMode = null;
         // Every other opcode is staged for the render path. A mode change is not: whichever
         // drain sees it — process(), or a message task — it is only retained as a scalar,
         // because rebuilding a typed engine allocates. `applyPendingMixerMode` runs it, and
         // is only ever called from a message task.
-        this.applyCommand = (opcode, argument, extra) => {
+        this.applyCommand = (opcode, argument, extra, sessionLow, sessionHigh, buildLow, buildHigh) => {
+            if (this.interactiveVersion) {
+                if (opcode === Ring.OPCODE_SET_MIXER_MODE || this.controlAck.count >= Ring.COMMAND_CAPACITY || !this.wasm.enqueue_interactive_words(opcode, argument, extra, sessionLow, sessionHigh, buildLow, buildHigh)) this.controlFailed = true;
+                // A mixed stale/current group is rejected atomically. Prefer its current
+                // member's identity so that UI receives that member's rejection too;
+                // a wholly stale group keeps its original identity and cannot clear live input.
+                const installed = this.interactiveStatus;
+                if (this.controlAck.count === 0 || sessionLow === installed[2] && sessionHigh === installed[3] && buildLow === installed[4] && buildHigh === installed[5]) { this.controlAck.requestedIdentity[0] = sessionLow; this.controlAck.requestedIdentity[1] = sessionHigh; this.controlAck.requestedIdentity[2] = buildLow; this.controlAck.requestedIdentity[3] = buildHigh; }
+                const index = this.controlAck.count++ * 3;
+                this.controlAck.commands[index] = opcode; this.controlAck.commands[index + 1] = argument; this.controlAck.commands[index + 2] = extra;
+                return;
+            }
             if (opcode === Ring.OPCODE_SET_MIXER_MODE) {
                 this.pendingMixerMode = argument >>> 0;
             } else {
@@ -53,8 +79,12 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         this.port.onmessage = (event) => this.onMessage(event.data);
         this.port.postMessage({
             type: 'ready',
+            interactiveVersion: this.interactiveVersion,
+            commandRingVersion: this.commandRing?.version ?? this.interactiveVersion,
             sampleRate,
             renderQuantum: this.renderQuantum,
+            leadFrames: this.wasm.event_lead_frames(),
+            leadMillis: this.wasm.event_lead_millis(),
             initialMemoryBytes: this.initialMemoryBytes,
             commandTransport: this.commandRing ? 'SharedArrayBuffer' : 'postMessage',
             telemetryTransport: this.telemetry ? 'SharedArrayBuffer' : 'postMessage',
@@ -74,16 +104,140 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         });
     }
 
+    identity() { return { session: this.wasm.current_session(), build: this.wasm.current_build() }; }
+
+    allocateBarrier() {
+        if (this.nextBarrierLow === 0 && this.nextBarrierHigh === 0) return false;
+        this.barrierLow = this.nextBarrierLow; this.barrierHigh = this.nextBarrierHigh;
+        this.nextBarrierLow = (this.nextBarrierLow + 1) >>> 0;
+        if (this.nextBarrierLow === 0) this.nextBarrierHigh = (this.nextBarrierHigh + 1) >>> 0;
+        return true;
+    }
+
+    barrierReached(status, low, high) { return status[1] > high || (status[1] === high && status[0] >= low); }
+
+    queueApplied(message) {
+        if (this.pendingAcks.length >= Ring.COMMAND_CAPACITY || !this.allocateBarrier() || !this.wasm.queue_applied_barrier_words(this.barrierLow, this.barrierHigh)) {
+            this.port.postMessage({ ...message, accepted: false, type: message.type === 'moduleLoaded' ? 'moduleError' : message.type === 'stateReady' ? 'stateError' : message.type === 'insertsApplied' ? 'insertsError' : message.type, reason: 'Audio command queue is full.' });
+            return;
+        }
+        message.serialLow = this.barrierLow; message.serialHigh = this.barrierHigh;
+        message.serial = BigInt(this.barrierLow) | (BigInt(this.barrierHigh) << 32n);
+        message.rejectionsLow = this.interactiveStatus[8]; message.rejectionsHigh = this.interactiveStatus[9];
+        message.identityWords = [Number(message.identity.session & 0xffffffffn), Number(message.identity.session >> 32n), Number(message.identity.build & 0xffffffffn), Number(message.identity.build >> 32n)];
+        this.pendingAcks.push(message);
+    }
+
+    flushInteractive() {
+        if (!this.interactiveVersion || this.pendingControlSerial) return;
+        const rejected = this.wasm.dropped_commands();
+        if (this.controlAck.count || this.controlFailed) {
+            const admitted = this.wasm.flush_interactive_batch(!this.controlFailed);
+            this.pendingControlFailed = !admitted || this.wasm.dropped_commands() !== rejected;
+            this.controlFailed = false;
+            if (!this.allocateBarrier() || !this.wasm.queue_applied_barrier_words(this.barrierLow, this.barrierHigh)) {
+                this.controlAck.accepted = false; this.controlAck.words.set(this.interactiveStatus);
+                this.controlAck.words.set(this.controlAck.requestedIdentity, 2);
+                this.port.postMessage(this.controlAck); this.controlAck.count = 0; return;
+            }
+            this.pendingControlSerial = true;
+            this.pendingControlLow = this.barrierLow; this.pendingControlHigh = this.barrierHigh;
+            this.pendingControlRejectionsLow = this.interactiveStatus[8]; this.pendingControlRejectionsHigh = this.interactiveStatus[9];
+        }
+    }
+
+    publishApplied() {
+        if (!this.interactiveVersion) return;
+        const status = this.interactiveStatus;
+        if (this.pendingControlSerial && this.barrierReached(status, this.pendingControlLow, this.pendingControlHigh)) {
+            const expected = this.controlAck.requestedIdentity;
+            this.controlAck.accepted = status[7] !== 0 && status[8] === this.pendingControlRejectionsLow && status[9] === this.pendingControlRejectionsHigh && !this.pendingControlFailed && status[2] === expected[0] && status[3] === expected[1] && status[4] === expected[2] && status[5] === expected[3];
+            this.controlAck.words.set(status);
+            this.controlAck.words.set(this.controlAck.requestedIdentity, 2);
+            this.port.postMessage(this.controlAck);
+            this.controlAck.count = 0;
+            this.pendingControlSerial = 0;
+        }
+        while (this.pendingAcks.length && this.barrierReached(status, this.pendingAcks[0].serialLow, this.pendingAcks[0].serialHigh)) {
+            const message = this.pendingAcks.shift();
+            const expected = message.identityWords;
+            const accepted = status[7] !== 0 && status[8] === message.rejectionsLow && status[9] === message.rejectionsHigh && status[2] === expected[0] && status[3] === expected[1] && status[4] === expected[2] && status[5] === expected[3] && !message.failed;
+            message.accepted = accepted;
+            message.capabilities = status[6];
+            if (!accepted) { message.type = message.type === 'moduleLoaded' ? 'moduleError' : message.type === 'insertsApplied' ? 'insertsError' : message.type; message.reason = 'Audio rejected a command, prepared load or state replay.'; }
+            this.port.postMessage(message);
+        }
+    }
+
+    stageLoadTransport(opcode, identity) {
+        if (![Ring.OPCODE_INTERACTIVE_PLAY, Ring.OPCODE_PAUSE, Ring.OPCODE_RESUME, Ring.OPCODE_HOLD_STOP].includes(opcode)) return false;
+        if (!this.wasm.enqueue_interactive_words(opcode, 0, 0, Number(identity.session & 0xffffffffn), Number(identity.session >> 32n), Number(identity.build & 0xffffffffn), Number(identity.build >> 32n))) return false;
+        const rejected = this.wasm.dropped_commands();
+        this.wasm.flush_commands();
+        return this.wasm.dropped_commands() === rejected;
+    }
+
+    startReplay(settings, loaded) {
+        const identity = loaded.identity;
+        const actions = [{ opcode: Ring.OPCODE_MASTER_VOLUME, argument: settings.volume, extra: 0 }];
+        if (settings.atEnd !== undefined) actions.push({ opcode: Ring.OPCODE_AT_END, argument: settings.atEnd, extra: settings.fadeFrames });
+        for (const channel of settings.mutes) actions.push({ opcode: Ring.OPCODE_MUTE_CHANNEL, argument: channel, extra: 1 });
+        for (const insert of settings.inserts) {
+            actions.push({ install: insert });
+            for (const [parameter, value] of Object.entries(insert.params)) actions.push({ opcode: Ring.OPCODE_INSERT_PARAM, argument: Ring.packInsertParamArgument(insert.target, insert.slot, Number(parameter)), extra: value >>> 0 });
+            if (insert.bypassed) actions.push({ opcode: Ring.OPCODE_INSERT_BYPASS, argument: Ring.packInsertSlotArgument(insert.target, insert.slot), extra: 1 });
+        }
+        this.pendingReplay = { actions, loaded, index: 0, rejected: this.wasm.dropped_commands(), identityWords: [Number(identity.session & 0xffffffffn), Number(identity.session >> 32n), Number(identity.build & 0xffffffffn), Number(identity.build >> 32n)], resumeMessage: { type: 'loadReplayPending', requestId: loaded.requestId }, resumeSent: false, waitUntil: 0 };
+        this.continueReplay();
+    }
+
+    continueReplay() {
+        const replay = this.pendingReplay;
+        if (!replay) return;
+        try {
+            this.wasm.collect_garbage();
+            if (this.wasm.dropped_commands() !== replay.rejected) throw new Error('Audio rejected part of the settings replay.');
+            // Leave room for prepared Load/transport commands and the final barrier.
+            // A large64-lane mute/insert replay spans whole quanta while input stays off.
+            if (this.wasm.pending_control_commands() < 32) {
+                const words = replay.identityWords;
+                const end = Math.min(replay.index + 16, replay.actions.length);
+                for (; replay.index < end; replay.index += 1) {
+                    const action = replay.actions[replay.index];
+                    if (action.install) this.wasm.install_insert(action.install.target, action.install.slot, action.install.wire);
+                    else if (!this.wasm.enqueue_interactive_words(action.opcode, action.argument, action.extra, words[0], words[1], words[2], words[3])) throw new Error('Settings staging queue is full.');
+                }
+                this.wasm.flush_commands();
+            }
+            this.bindViews();
+            if (replay.index === replay.actions.length) {
+                replay.loaded.failed ||= this.wasm.dropped_commands() !== replay.rejected;
+                replay.loaded.memoryBytes = this.stableMemoryBytes;
+                this.pendingReplay = null;
+                this.queueApplied(replay.loaded);
+            } else {
+                replay.waitUntil = this.wasm.quanta_rendered() + 1;
+                replay.resumeSent = false;
+            }
+        } catch (error) {
+            this.bindViews();
+            this.pendingReplay = null;
+            this.port.postMessage({ type: 'moduleError', requestId: replay.loaded.requestId, identity: replay.loaded.identity, reason: String(error) });
+        }
+    }
+
     applyPendingMixerMode() {
         if (this.pendingMixerMode === null) return;
         const requested = this.pendingMixerMode;
         this.pendingMixerMode = null;
         try {
+            if (this.interactiveVersion) throw new Error('Version2 mixer changes require the replacement-message path.');
             const active = this.wasm.set_mixer_mode(requested);
             // Rebuilding typed engine storage may grow wasm memory. Rebase only here,
             // outside process(), exactly as module activation does.
             this.bindViews();
-            this.port.postMessage({ type: 'mixerModeApplied', requested, active, memoryBytes: this.stableMemoryBytes });
+            if (this.interactiveVersion) this.queueApplied({ type: 'mixerModeApplied', requested, active, identity: this.identity(), memoryBytes: this.stableMemoryBytes });
+            else this.port.postMessage({ type: 'mixerModeApplied', requested, active, memoryBytes: this.stableMemoryBytes });
         } catch (error) {
             this.port.postMessage({
                 type: 'mixerModeError',
@@ -94,6 +248,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
     }
 
     bindViews() {
+        if (this.interactiveVersion) this.interactiveStatus = new Uint32Array(this.memory.buffer, this.wasm.interactive_status_ptr(), 10);
         const outputPointer = this.wasm.output_ptr();
         const channelStride = this.wasm.output_channel_stride();
         this.channelViews = [];
@@ -117,9 +272,34 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
     }
 
     onMessage(message) {
+        if (message.type === 'continueReplay') { if (this.pendingReplay?.loaded.requestId === message.requestId) this.continueReplay(); return; }
+        if (message.type === 'continueLoad') { const load = this.deferredLoads.get(message.requestId); if (load) { this.deferredLoads.delete(message.requestId); this.onMessage(load); } return; }
+        if (message.type === 'loadTransport') {
+            if (!this.interactiveVersion || !Ring.validIdentity(message.identity) || ![Ring.OPCODE_INTERACTIVE_PLAY, Ring.OPCODE_PAUSE, Ring.OPCODE_RESUME, Ring.OPCODE_HOLD_STOP].includes(message.opcode) || message.argument !== 0 || message.extra !== 0) return;
+            const deferred = this.deferredLoads.get(message.requestId);
+            if (deferred && Ring.sameIdentity(deferred.identity, message.identity)) { deferred.transportOpcode = message.opcode; return; }
+            const loaded = this.pendingReplay?.loaded.requestId === message.requestId ? this.pendingReplay.loaded : this.pendingAcks.find(pending => pending.type === 'moduleLoaded' && pending.requestId === message.requestId);
+            if (!loaded || !Ring.sameIdentity(loaded.identity, message.identity) || !Ring.sameIdentity(message.identity, this.identity())) return;
+            loaded.transportOpcode = message.opcode;
+            if (!this.stageLoadTransport(message.opcode, message.identity)) loaded.failed = true;
+            return;
+        }
         if (message.type === 'loadModule') {
+            const previousIdentity = this.interactiveVersion ? this.identity() : null;
             try {
-                const generation = this.wasm.load_module_with_options(
+                if (this.interactiveVersion && !Ring.validIdentity(message.identity)) throw new Error('Missing full playback identity.');
+                if (this.commandRing && !this.pendingControlSerial) Ring.drainCommands(this.commandRing, this.applyCommand, this.interactiveVersion ? 63 : Ring.COMMAND_CAPACITY);
+                this.flushInteractive();
+                if (this.interactiveVersion && (this.pendingControlSerial || this.fallbackBatches.length || this.pendingReplay)) {
+                    if (this.deferredLoads.size >= Ring.COMMAND_CAPACITY) throw new Error('Too many prepared loads.');
+                    this.deferredLoads.set(message.requestId, message);
+                    this.port.postMessage({ type: 'loadDeferred', requestId: message.requestId }); return;
+                }
+                const generation = this.interactiveVersion ? this.wasm.load_module_identified(
+                    new Uint8Array(message.bytes), message.headphoneFriendlyModPanning === true,
+                    message.enhancementFlags >>> 0 || 0, Math.trunc(Number(message.speedAdjust)) || 0,
+                    message.identity.session, message.identity.build, message.replacement ?? new BigUint64Array(),
+                ) : this.wasm.load_module_with_options(
                     new Uint8Array(message.bytes),
                     message.headphoneFriendlyModPanning === true,
                     message.enhancementFlags >>> 0 || 0,
@@ -131,8 +311,9 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                 // Activation may consume more of the pre-reserved heap. Rebind once here,
                 // outside process; any growth after this point is a fatal RT-path defect.
                 this.bindViews();
-                this.port.postMessage({
+                const loaded = {
                     type: 'moduleLoaded',
+                    identity: message.identity,
                     requestId: message.requestId,
                     generation,
                     memoryBytes: this.stableMemoryBytes,
@@ -140,23 +321,52 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                     // was asked for — see `build_enhancement`'s frame-budget fallback.
                     appliedEnhancementFlags: this.wasm.applied_enhancement_flags(),
                     appliedEnhancementFactor: this.wasm.applied_enhancement_factor(),
-                });
+                };
+                if (this.interactiveVersion && message.transportOpcode !== undefined && !this.stageLoadTransport(message.transportOpcode, message.identity)) loaded.failed = true;
+                if (this.interactiveVersion && message.hostSettings) this.startReplay(message.hostSettings, loaded);
+                else if (this.interactiveVersion) this.queueApplied(loaded);
+                else this.port.postMessage(loaded);
             } catch (error) {
+                // Decode/preparation may fail before changing the installed player.
+                // Rebase after possible memory growth and prove both control and audio
+                // still identify that prior installation. Partial installs get no proof.
+                this.bindViews();
+                const controlIdentity = this.interactiveVersion ? this.identity() : null;
+                const status = this.interactiveStatus;
+                const appliedIdentity = status ? { session: BigInt(status[2]) | (BigInt(status[3]) << 32n), build: BigInt(status[4]) | (BigInt(status[5]) << 32n) } : null;
+                const retained = previousIdentity && status[7] !== 0 && Ring.sameIdentity(previousIdentity, controlIdentity) && Ring.sameIdentity(controlIdentity, appliedIdentity);
                 this.port.postMessage({
                     type: 'moduleError',
                     requestId: message.requestId,
+                    retainedIdentity: retained ? controlIdentity : undefined,
+                    retainedCapabilities: retained ? status[6] : 0,
                     reason: error && error.message ? error.message : String(error),
                 });
             }
         } else if (message.type === 'commandBatch') {
-            Ring.drainFallbackCommands(message.commands, this.applyCommand);
+            if (this.interactiveVersion && message.version !== Ring.INTERACTIVE_WIRE_VERSION) return;
+            if (this.interactiveVersion) {
+                if (this.fallbackBatches.length >= Ring.COMMAND_CAPACITY) {
+                    this.port.postMessage({ type: 'interactiveOverflow', identity: this.identity() }); return;
+                }
+                const records = [];
+                Ring.drainFallbackCommands(message.commands, (...record) => records.push(record), message.version);
+                for (let index = 0; index < records.length; index += 63) this.fallbackBatches.push(records.slice(index, index + 63));
+                if (!this.pendingControlSerial && this.fallbackBatches.length) {
+                    const batch = this.fallbackBatches.shift();
+                    for (const record of batch) this.applyCommand(...record);
+                    this.flushInteractive();
+                }
+            } else { Ring.drainFallbackCommands(message.commands, this.applyCommand); }
             this.applyPendingMixerMode();
         } else if (message.type === 'flushCommands') {
-            if (this.commandRing !== null) {
-                Ring.drainCommands(this.commandRing, this.applyCommand);
+            if (this.commandRing !== null && !this.pendingControlSerial) {
+                Ring.drainCommands(this.commandRing, this.applyCommand, this.interactiveVersion ? 63 : Ring.COMMAND_CAPACITY);
             }
+            this.flushInteractive();
             this.applyPendingMixerMode();
         } else if (message.type === 'midiInput') {
+            if (this.interactiveVersion) { this.port.postMessage({ type: 'midiInputError', reason: 'Version2 live routing requires an identified destination command.' }); return; }
             // Installing jam mode builds an instrument rack, queue and two-source mux, so
             // it happens here — in a message task — exactly as a mixer-mode rebuild does.
             // The events themselves are opcode 10 on the ordinary command ring.
@@ -180,39 +390,45 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                 });
             }
         } else if (message.type === 'inserts') {
-            // Building an effect allocates its delay lines (M7-H1), so install and remove
-            // both happen here — in a message task — exactly as `midiInput` and a
-            // mixer-mode rebuild do. A parameter change or a bypass flip is not this
-            // message at all: those are OPCODE_INSERT_PARAM / OPCODE_INSERT_BYPASS on the
-            // ordinary command ring, applied in `process()` like every other opcode.
+            // Preparation allocates only here. Parameters already queued ahead of this
+            // message must reach Rust before the install/remove; never defer a mutation
+            // while accepting later parameter commands for that slot.
             try {
-                if (message.action === 'install') {
-                    this.wasm.install_insert(message.target, message.slot, message.kind);
-                } else if (message.action === 'remove') {
-                    this.wasm.remove_insert(message.target, message.slot);
+                if (this.interactiveVersion) {
+                    const status = this.interactiveStatus;
+                    const appliedIdentity = { session: BigInt(status[2]) | (BigInt(status[3]) << 32n), build: BigInt(status[4]) | (BigInt(status[5]) << 32n) };
+                    if (message.version !== Ring.INTERACTIVE_WIRE_VERSION || !Ring.sameIdentity(message.identity, this.identity()) || !Ring.sameIdentity(message.identity, appliedIdentity) || !status[7]) throw new Error('Stale or unready insert preparation.');
+                    const precedingCommands = this.commandRing ? Ring.commandOccupancy(this.commandRing.words) : 0;
+                    const hasCommandRoom = this.wasm.pending_control_commands() + precedingCommands + 2 <= Ring.COMMAND_CAPACITY;
+                    if (this.pendingReplay || this.fallbackBatches.length || this.pendingControlSerial || this.pendingAcks.length >= Ring.COMMAND_CAPACITY || !hasCommandRoom || (this.nextBarrierHigh === 0xffffffff && this.nextBarrierLow >= 0xfffffffe)) throw new Error('Audio controls are busy; retry the insert change.');
+                    if (!['install', 'remove'].includes(message.action) || !Number.isInteger(message.target) || !(message.target >= 0 && message.target < 64 || message.target === Ring.INSERT_TARGET_MASTER) || !Number.isInteger(message.slot) || message.slot < 0 || message.slot >= 4 || (message.action === 'install' && (!Number.isInteger(message.kind) || message.kind < 0 || !JSON.parse(this.wasm.effects_json()).some(effect => effect.wire === message.kind)))) throw new Error('Invalid insert preparation fields.');
+                    if (this.commandRing) Ring.drainCommands(this.commandRing, this.applyCommand, 62);
+                    this.flushInteractive();
                 }
-                // Installing may consume more of the pre-reserved heap; rebind here,
-                // outside process(), for the same reason module activation does.
+                if (message.action === 'install') this.wasm.install_insert(message.target, message.slot, message.kind);
+                else if (message.action === 'remove') this.wasm.remove_insert(message.target, message.slot);
                 this.bindViews();
-                this.port.postMessage({
-                    type: 'insertsApplied',
-                    requestId: message.requestId,
-                    action: message.action,
-                    target: message.target,
-                    slot: message.slot,
-                    kind: message.kind,
-                    memoryBytes: this.stableMemoryBytes,
-                });
+                const applied = { type: 'insertsApplied', requestId: message.requestId, identity: message.identity, action: message.action, target: message.target, slot: message.slot, kind: message.kind, memoryBytes: this.stableMemoryBytes };
+                if (this.interactiveVersion) this.queueApplied(applied);
+                else this.port.postMessage(applied);
             } catch (error) {
-                this.port.postMessage({
-                    type: 'insertsError',
-                    requestId: message.requestId,
-                    action: message.action,
-                    target: message.target,
-                    slot: message.slot,
-                    reason: error && error.message ? error.message : String(error),
-                });
+                this.port.postMessage({ type: 'insertsError', requestId: message.requestId, identity: message.identity, action: message.action, target: message.target, slot: message.slot, reason: error && error.message ? error.message : String(error) });
             }
+        } else if (message.type === 'captureState') {
+            if (this.pendingControlSerial || this.fallbackBatches.length) { this.port.postMessage({ type: 'stateBusy', requestId: message.requestId }); return; }
+            if (!this.interactiveVersion || !Ring.sameIdentity(message.identity, this.identity())) {
+                this.port.postMessage({ type: 'stateError', requestId: message.requestId, reason: 'Stale renderer state request.' }); return;
+            }
+            if (this.commandRing) Ring.drainCommands(this.commandRing, this.applyCommand, this.interactiveVersion ? 63 : Ring.COMMAND_CAPACITY);
+            this.flushInteractive();
+            this.queueApplied({ type: 'stateReady', requestId: message.requestId, identity: message.identity });
+        } else if (message.type === 'readState') {
+            try {
+                if (!Ring.sameIdentity(message.identity, this.identity()) || this.wasm.applied_serial() < message.serial || !this.wasm.applied_accepted()) throw new Error('Stale or incomplete renderer state.');
+                const replacement = this.wasm.replacement_state();
+                this.bindViews();
+                this.port.postMessage({ type: 'stateCaptured', requestId: message.requestId, identity: message.identity, replacement });
+            } catch (error) { this.port.postMessage({ type: 'stateError', requestId: message.requestId, reason: String(error) }); }
         } else if (message.type === 'collectGarbage') {
             const collected = this.wasm.collect_garbage();
             this.port.postMessage({
@@ -249,11 +465,19 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             return true;
         }
 
-        if (this.commandRing !== null) {
-            Ring.drainCommands(this.commandRing, this.applyCommand);
+        if (!this.pendingControlSerial) {
+            if (this.commandRing !== null) Ring.drainCommands(this.commandRing, this.applyCommand, this.interactiveVersion ? 63 : Ring.COMMAND_CAPACITY);
+            else if (this.fallbackBatches.length) {
+                const batch = this.fallbackBatches.shift();
+                for (let index = 0; index < batch.length; index += 1) this.applyCommand(...batch[index]);
+            }
         }
 
+        this.flushInteractive();
         this.wasm.process(frames);
+        this.publishApplied();
+        const replay = this.pendingReplay;
+        if (replay && !replay.resumeSent && this.wasm.quanta_rendered() >= replay.waitUntil) { replay.resumeSent = true; this.port.postMessage(replay.resumeMessage); }
         if (this.memory.buffer.byteLength !== this.stableMemoryBytes) {
             this.faulted = `wasm memory grew in process (${this.stableMemoryBytes} → ${this.memory.buffer.byteLength})`;
             this.port.postMessage({ type: 'fault', reason: this.faulted });

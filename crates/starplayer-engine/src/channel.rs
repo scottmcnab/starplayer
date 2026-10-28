@@ -20,9 +20,10 @@ use starplayer_mixer::{SampleRegion, VoicePool, VoiceTag};
 /// effect updates, plus zero or more *background* voices that have been detached and only
 /// run their own envelopes and fadeout until they die. Background voices are **not** owned
 /// by the channel — they live in the pool, tagged so Duplicate Check can find them — so
-/// they need no field here, and MOD/S3M/MTM simply never create one.
+/// they need no field here. Canonical MOD/S3M/MTM never create one; opt-in note
+/// overlap preserves custom tails using the shared generational PlaybackState.
 ///
-/// The cost of anticipating IT is therefore this doc comment and nothing else. Effect
+/// Background ownership is separate from this foreground binding. Effect
 /// memories live in the format crate's own per-channel state (B4's port of `ChannelData`),
 /// not here, because they are format semantics.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -44,6 +45,9 @@ pub struct Channel {
 #[derive(Debug)]
 pub struct ChannelTable {
     channels: Box<[Channel]>,
+    layout: crate::playback::LaneLayout,
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    playback: Option<crate::ownership::PlaybackState>,
 }
 
 /// The widest voice pool any in-scope source arrangement asks for: IT's virtual-channel
@@ -78,8 +82,39 @@ impl ChannelTable {
         let mut channels = Vec::new();
         channels.try_reserve_exact(count)?;
         channels.resize(count, Channel::default());
-        Ok(ChannelTable { channels: channels.into_boxed_slice() })
+        Ok(ChannelTable { channels: channels.into_boxed_slice(), layout: crate::playback::LaneLayout::legacy(count),
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))] playback: None,
+        })
     }
+
+    /// Allocate a validated layout, without silently truncating interactive live lanes.
+    pub fn try_with_layout(layout: crate::playback::LaneLayout) -> Result<Self, crate::playback::PlaybackConfigError> {
+        let mut channels = Vec::new();
+        channels.try_reserve_exact(layout.lane_count()).map_err(|_| crate::playback::PlaybackConfigError::AllocationFailed)?;
+        channels.resize(layout.lane_count(), Channel::default());
+        Ok(Self { channels: channels.into_boxed_slice(), layout,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))] playback: None,
+        })
+    }
+
+    pub const fn layout(&self) -> crate::playback::LaneLayout { self.layout }
+
+    /// One per-build authoritative state, prepared off the audio thread. Formats share
+    /// this through EngineContext/TickContext; they must not duplicate age/provenance.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn prepare_playback(&mut self, configuration: crate::playback::PlaybackConfiguration) -> Result<(), crate::playback::PlaybackConfigError> {
+        if configuration.capabilities.contains(starplayer_core::PlaybackCapabilities::INTERACTIVE_AUDITION) != self.layout.is_interactive() {
+            return Err(crate::playback::PlaybackConfigError::UnsupportedLane);
+        }
+        self.playback = Some(crate::ownership::PlaybackState::try_new(configuration)?);
+        Ok(())
+    }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn playback(&self) -> Option<&crate::ownership::PlaybackState> { self.playback.as_ref() }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn playback_mut(&mut self) -> Option<&mut crate::ownership::PlaybackState> { self.playback.as_mut() }
 
     /// How many lanes there are.
     pub fn len(&self) -> usize { self.channels.len() }
@@ -145,15 +180,30 @@ impl ChannelTable {
         params: VoiceParams,
         offset_frames: u32,
     ) -> Option<VoiceId> {
-        let lane = self.channels.get_mut(channel.0 as usize)?;
-        if let Some(previous) = lane.foreground.take() {
+        if let Some(previous) = self.channels.get_mut(channel.0 as usize)?.foreground.take() {
             voices.release(previous);
         }
 
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if self.playback.is_some() {
+            let domain = if self.layout.is_interactive() && channel.0 >= crate::playback::INTERACTIVE_LIVE_BASE { crate::ownership::VoiceDomain::Live } else { crate::ownership::VoiceDomain::Native };
+            if !self.prepare_admission(domain, None, voices) { return None; }
+        }
         let tag = VoiceTag { channel: channel.0 as u8, ..tag };
         let params = VoiceParams { step: scaled_step(params.step, region), ..params };
         let voice = voices.allocate(tag, region, params, offset_frames)?;
-        lane.foreground = Some(voice);
+        self.channels.get_mut(channel.0 as usize)?.foreground = Some(voice);
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(playback) = self.playback.as_mut() {
+            let domain = if self.layout.is_interactive() && channel.0 >= crate::playback::INTERACTIVE_LIVE_BASE {
+                crate::ownership::VoiceDomain::Live
+            } else { crate::ownership::VoiceDomain::Native };
+            if playback.register(voice, domain, channel, voices).is_err() {
+                voices.release(voice);
+                self.channels.get_mut(channel.0 as usize)?.foreground = None;
+                return None;
+            }
+        }
         Some(voice)
     }
 
@@ -174,7 +224,21 @@ impl ChannelTable {
     /// reaches zero, an explicit [`VoicePool::release`], or the voice running off the end
     /// of a one-shot sample.
     pub fn detach_foreground(&mut self, channel: ChannelId) -> Option<VoiceId> {
-        self.channels.get_mut(channel.0 as usize)?.foreground.take()
+        let voice = self.channels.get_mut(channel.0 as usize)?.foreground.take()?;
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(playback) = self.playback.as_mut() { playback.detach_foreground(voice); }
+        Some(voice)
+    }
+
+    /// Custom detachment is atomic with the binding transition. Mark before unbinding:
+    /// a native-created background may never migrate into C after a checkbox toggle.
+    /// Live custom tails remain in L. NO-04/05/06 supply eligibility/admission policy.
+    #[cfg(feature = "note-overlap")]
+    pub fn detach_custom_foreground(&mut self, channel: ChannelId, voices: &VoicePool) -> Result<Option<VoiceId>, crate::ownership::PlaybackStateError> {
+        let Some(voice) = self.foreground(channel) else { return Ok(None) };
+        let playback = self.playback.as_mut().ok_or(crate::ownership::PlaybackStateError::Unsupported)?;
+        playback.mark_custom_detached(voice, voices)?;
+        Ok(self.detach_foreground(channel))
     }
 
     /// Ask `channel`'s voice to stop and unbind it.
@@ -197,6 +261,52 @@ impl ChannelTable {
         }
     }
 
+    /// Immediately invalidate a generation's logical binding and start its existing
+    /// mixer release ramp. Ownership remains until physical reclamation.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn retire_voice(&mut self, voice: VoiceId, voices: &mut VoicePool) -> bool {
+        let Some(playback) = self.playback.as_mut() else { return false };
+        if playback.set_lifecycle(voice, crate::ownership::VoiceLifecycle::Retiring, voices).is_err() { return false; }
+        for channel in self.channels.iter_mut() { if channel.foreground == Some(voice) { channel.foreground = None; } }
+        if let Some(state) = voices.get_mut(voice) { state.stop(); }
+        true
+    }
+
+    /// Includes detached backgrounds, not just foreground channel bindings.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn clear_scope(&mut self, scope: crate::ownership::ClearScope, voices: &mut VoicePool) {
+        for index in 0..voices.capacity() {
+            let candidate = self.playback.as_ref().and_then(|playback| playback.slot(index, voices))
+                .filter(|owned| owned.in_scope(scope) && owned.lifecycle != crate::ownership::VoiceLifecycle::Retiring);
+            if let Some(owned) = candidate { self.retire_voice(owned.voice, voices); }
+        }
+    }
+
+    /// Reserve physical room in one domain before its caller admits a scheduled note.
+    /// The optional victim is selected by the domain's policy (native IT keeps its own).
+    /// Only an already-retiring member of this domain may be hard-released under pressure.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn prepare_admission(&mut self, domain: crate::ownership::VoiceDomain, victim: Option<VoiceId>, voices: &mut VoicePool) -> bool {
+        use crate::ownership::{VoiceDomain, VoiceLifecycle};
+        let Some(playback) = self.playback.as_ref() else { return false };
+        let capacity = playback.configuration().capacity;
+        let (active_limit, reserve) = match domain {
+            VoiceDomain::Native => (capacity.native, capacity.interactive_transport as usize),
+            VoiceDomain::Custom => (capacity.custom, usize::from(capacity.custom != 0)),
+            VoiceDomain::Live => (capacity.live, usize::from(capacity.live != 0)),
+        };
+        if active_limit == 0 { return false; }
+        let active = playback.active_count(domain, voices);
+        let victim = victim.filter(|voice| playback.get(*voice, voices).is_some_and(|owned| owned.domain == domain && owned.lifecycle != VoiceLifecycle::Retiring));
+        if active >= active_limit && victim.is_none() { return false; }
+        if playback.iter(voices).filter(|owned| owned.domain == domain).count() >= active_limit + reserve {
+            let Some(retiring) = playback.oldest(domain, true, voices) else { return false };
+            voices.release(retiring);
+        }
+        if let Some(victim) = victim { self.retire_voice(victim, voices); }
+        voices.voices_active() < voices.capacity()
+    }
+
     /// Forget every binding without touching the pool — for after
     /// [`VoicePool::release_all`], when the handles are all stale by construction. Mute
     /// flags are the host's and survive.
@@ -209,6 +319,8 @@ impl ChannelTable {
     /// Forget any voice handle that has gone stale, so [`ChannelTable::is_sounding`] and
     /// the telemetry view agree with the pool.
     pub fn release_finished(&mut self, voices: &VoicePool) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(playback) = self.playback.as_mut() { playback.release_finished(voices); }
         for lane in self.channels.iter_mut() {
             if lane.foreground.is_some_and(|voice| voices.get(voice).is_none()) {
                 lane.foreground = None;

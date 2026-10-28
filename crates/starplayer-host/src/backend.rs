@@ -76,6 +76,11 @@ pub struct DeviceInfo {
 /// What can go wrong between a host and its device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostError {
+    /// Fixed, allocation-free rejection for bounded interactive command dispatch.
+    InvalidInteractiveCommand,
+
+    /// Invalid prepared engine layout/capacity or a failed preparation allocation.
+    EngineConfiguration(starplayer::engine::PlaybackConfigError),
     /// The backend enumerated no output device at all.
     NoDevice,
     /// A `--device` name matched nothing.
@@ -111,6 +116,8 @@ pub enum HostError {
 impl fmt::Display for HostError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HostError::InvalidInteractiveCommand => formatter.write_str("interactive command is unavailable, invalid, or stale"),
+            HostError::EngineConfiguration(error) => write!(formatter, "engine preparation failed: {error:?}"),
             HostError::NoDevice => formatter.write_str("no audio output device is available"),
             HostError::UnknownDevice(name) => write!(formatter, "no output device is called `{name}`"),
             HostError::UnsupportedSpec { requested, reason } => write!(formatter, "the device cannot play {requested}: {reason}"),

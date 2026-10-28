@@ -92,6 +92,9 @@ impl MtmProcessor {
 }
 
 impl TrackerProcessor for MtmProcessor {
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_sound(&mut self, scope: starplayer_engine::ClearScope, context: &mut TickContext<'_>) { self.effects.clear_sound(scope, context); }
+
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
         let cells = row.bytes.chunks_exact(CELL_BYTES).map(|bytes| {
             let cell = MtmCell::from_bytes(bytes).unwrap_or(MtmCell::EMPTY);

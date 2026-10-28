@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
+import { createPlaybackController } from '../www/playback-controller.js';
 
 const root = new URL('../dist/', import.meta.url);
 const bundle = await readFile(new URL('starplayer-worklet.js', root), 'utf8').catch(() => {
@@ -31,7 +32,7 @@ let Processor = null;
 let lastPort = null;
 class FakePort {
     constructor() { this.messages = []; this.onmessage = null; }
-    postMessage(message) { this.messages.push(message); }
+    postMessage(message) { this.messages.push(structuredClone(message)); }
     dispatch(message) { this.onmessage?.({ data: message }); }
 }
 globalThis.sampleRate = 48_000;
@@ -310,5 +311,340 @@ for (const shared of [true, false]) {
     assert.ok(renderPeak(live.processor, 400) > 0.01, `${transport}: disabling jam does not interrupt the module`);
 }
 
+
+// NO-W1: use the same packaged Rust WASM and worklet with negotiated v2 commands.
+for (const shared of process.env.STARPLAYER_NO08_TRANSPORT === 'fallback' ? [false] : [true, false]) {
+    const ring = shared ? Ring.createCommandRing(2) : null;
+    const target = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, seedSession: 0n, seedBuild: 0n, wasmModule: new WebAssembly.Module(wasmBytes), commandRing: ring?.buffer } });
+    const targetPort = lastPort;
+    const targetReady = targetPort.messages.find(message => message.type === 'ready');
+    assert.equal(targetReady.leadFrames, 256);
+    assert.ok(Math.abs(targetReady.leadMillis - 256 * 1000 / sampleRate) < 0.001);
+    const identity = { session: (1n << 59n) + 11n, build: (1n << 62n) + 37n };
+    const left = new Float32Array(128), right = new Float32Array(128);
+    const pump = (count = 1) => { let peak = 0; for (let index = 0; index < count; index++) { target.process([], [[left, right]]); for (const sample of left) peak = Math.max(peak, Math.abs(sample)); } return peak; };
+    const send = (opcode, argument = 0, extra = 0, generation = identity) => {
+        if (ring) assert.equal(Ring.pushCommand(ring, opcode, argument, extra, generation), true);
+        else targetPort.dispatch({ type: 'commandBatch', version: 2, commands: [{ opcode, argument, extra, identity: generation }] });
+    };
+    targetPort.dispatch({ type: 'loadModule', requestId: 501, bytes: syntheticMod(), identity });
+    assert.equal(targetPort.messages.some(message => message.type === 'moduleLoaded'), false, 'prepared is not audio-applied');
+    pump(4);
+    const installed = targetPort.messages.find(message => message.type === 'moduleLoaded');
+    assert.ok(installed?.accepted, JSON.stringify(targetPort.messages, (_, value) => typeof value === 'bigint' ? String(value) : value));
+    assert.deepEqual(installed.identity, identity);
+    assert.equal(installed.capabilities, 3);
+    assert.equal(target.telemetryWords[2], 4, 'reserved live lanes do not inflate visible tracker width');
+    targetPort.dispatch({ type: 'loadModule', requestId: 502, bytes: new Uint8Array(64).fill(65), identity: { session: identity.session + 1n, build: identity.build + 1n } });
+    const retainedError = targetPort.messages.findLast(message => message.type === 'moduleError');
+    assert.equal(retainedError.requestId, 502);
+    assert.deepEqual(retainedError.retainedIdentity, identity, 'failed audio decode proves unchanged control and audio-applied identity');
+    assert.equal(retainedError.retainedCapabilities, 3);
+    const loadIdentified = target.wasm.load_module_identified;
+    target.wasm.load_module_identified = (...arguments_) => { target.memory.grow(1); return loadIdentified(...arguments_); };
+    targetPort.dispatch({ type: 'loadModule', requestId: 503, bytes: new Uint8Array(64).fill(65), identity: { session: identity.session + 1n, build: identity.build + 1n } });
+    target.wasm.load_module_identified = loadIdentified;
+    assert.deepEqual(targetPort.messages.findLast(message => message.type === 'moduleError').retainedIdentity, identity, 'growth before failure rebases proof and output views');
+    assert.ok(target.channelViews[0].length > 0); pump(2);
+
+    targetPort.dispatch({ type: 'midiInput', enabled: true });
+    assert.ok(targetPort.messages.some(message => message.type === 'midiInputError'));
+    assert.equal(target.wasm.current_build(), identity.build);
+    // Atomic rejection and UI identity are independent of mixed record order.
+    const staleIdentity = { ...identity, build: identity.build - 1n };
+    const validEnable = { opcode: Ring.OPCODE_NOTE_OVERLAP, argument: 1, extra: 0, identity };
+    const staleBox = { opcode: Ring.OPCODE_LET_NOTES_RING, argument: 0, extra: 1, identity: staleIdentity };
+    const originalBarrier = target.wasm.queue_applied_barrier_words;
+    for (const barrierFailure of [false, true]) {
+        if (barrierFailure) target.wasm.queue_applied_barrier_words = () => false;
+        for (const records of [[validEnable, staleBox], [staleBox, validEnable], [staleBox]]) {
+            if (ring) for (const record of records) Ring.pushCommand(ring, record.opcode, record.argument, record.extra, record.identity);
+            else targetPort.dispatch({ type: 'commandBatch', version: 2, commands: records });
+            pump(4);
+            const acknowledgement = targetPort.messages.findLast(message => message.type === 'interactiveApplied');
+            assert.equal(acknowledgement?.accepted, false);
+            const words = acknowledgement.words;
+            const acknowledged = { session: BigInt(words[2]) | (BigInt(words[3]) << 32n), build: BigInt(words[4]) | (BigInt(words[5]) << 32n) };
+            assert.deepEqual(acknowledged, records.length === 1 ? staleIdentity : identity, 'current members receive rollback; wholly stale groups retain stale identity');
+            assert.equal(target.wasm.replacement_state()[6], 0n, 'rejected group must leave overlap unchanged');
+        }
+    }
+    // NO-08: bypass producer-side filtering to exercise a foreign/malformed v2 group.
+    target.wasm.queue_applied_barrier_words = originalBarrier;
+    const rawGroup = records => {
+        if (ring) {
+            for (const record of records) {
+                const write = Atomics.load(ring.words, 0);
+                const base = ring.headerWords + (write % Ring.COMMAND_CAPACITY) * ring.recordWords;
+                const supplied = record.identity ?? identity;
+                ring.words.set([record.opcode, record.argument, record.extra, Number(supplied.session & 0xffffffffn), Number(supplied.session >> 32n), Number(supplied.build & 0xffffffffn), Number(supplied.build >> 32n)], base);
+                Atomics.store(ring.words, 0, (write + 1) % (Ring.COMMAND_CAPACITY * 1024));
+            }
+        } else targetPort.dispatch({ type: 'commandBatch', version: 2, commands: records });
+    };
+    for (const malformed of [
+        { opcode: Ring.OPCODE_NOTE_OVERLAP, argument: 2, extra: 0, identity },
+        { opcode: 99, argument: 0, extra: 0, identity },
+    ]) {
+        for (const records of [[validEnable, malformed], [malformed, validEnable], [malformed]]) {
+            const acknowledgements = targetPort.messages.filter(message => message.type === 'interactiveApplied').length;
+            rawGroup(records); pump(4);
+            const replies = targetPort.messages.filter(message => message.type === 'interactiveApplied');
+            assert.equal(replies.length, acknowledgements + 1, 'malformed-only group must receive explicit rejection');
+            assert.equal(replies.at(-1).accepted, false, 'malformed member rejects its whole group');
+            assert.deepEqual([...replies.at(-1).words.slice(2, 6)], [Number(identity.session & 0xffffffffn), Number(identity.session >> 32n), Number(identity.build & 0xffffffffn), Number(identity.build >> 32n)]);
+            assert.equal(target.wasm.replacement_state()[6], 0n, 'valid member must not partially apply');
+        }
+    }
+    if (!ring) {
+        for (const records of [[validEnable, { opcode: 14, argument: 0, extra: 0, identity: { session: 1, build: identity.build } }], [{ opcode: 14, argument: 0, extra: 0, identity: null }], [{ opcode: 14, argument: 1n, extra: 0, identity }], [{ opcode: 14, argument: 0, extra: 1n, identity }]]) {
+            const count = targetPort.messages.filter(message => message.type === 'interactiveApplied').length;
+            rawGroup(records); pump(4);
+            const replies = targetPort.messages.filter(message => message.type === 'interactiveApplied');
+            assert.equal(replies.length, count + 1); assert.equal(replies.at(-1).accepted, false);
+            assert.equal(target.wasm.replacement_state()[6], 0n);
+        }
+    }
+    target.wasm.queue_applied_barrier_words = originalBarrier;
+    send(Ring.OPCODE_NOTE_OVERLAP, 1); pump(4);
+    assert.ok(targetPort.messages.findLast(message => message.type === 'interactiveApplied')?.accepted, 'valid retry must apply');
+    assert.equal(target.wasm.replacement_state()[6], 1n);
+    send(Ring.OPCODE_NOTE_OVERLAP, 0); pump(4);
+    const gainWire = JSON.parse(target.wasm.effects_json()).find(effect => effect.name === 'gain').wire;
+    for (const invalid of [{ identity: { ...identity, build: identity.build - 1n } }, { version: 1 }, { target: 64 }, { slot: 4 }, { kind: 999 }, { action: 'unknown' }]) {
+        targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 600, action: 'install', target: 255, slot: 0, kind: gainWire, ...invalid });
+        assert.equal(targetPort.messages.at(-1).type, 'insertsError');
+    }
+    const preparationOrder = [];
+    const originalFlush = target.wasm.flush_commands, originalInstall = target.wasm.install_insert;
+    target.wasm.flush_commands = (...args) => { preparationOrder.push('flush'); return originalFlush(...args); };
+    target.wasm.install_insert = (...args) => { preparationOrder.push('install'); return originalInstall(...args); };
+    send(Ring.OPCODE_MASTER_VOLUME, 65535);
+    targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 601, action: 'install', target: 255, slot: 0, kind: gainWire });
+    // The fallback batch may already own a pending barrier. A busy rejection happens
+    // before mutation; retry after that batch has reached audio.
+    if (targetPort.messages.some(message => message.type === 'insertsError' && message.requestId === 601)) { pump(4); targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 601, action: 'install', target: 255, slot: 0, kind: gainWire }); }
+    assert.equal(targetPort.messages.some(message => message.type === 'insertsApplied' && message.requestId === 601), false, 'prepared insert is not audio applied');
+    pump(4);
+    assert.ok(targetPort.messages.findLast(message => message.type === 'insertsApplied' && message.requestId === 601)?.accepted);
+    assert.ok(preparationOrder.indexOf('flush') < preparationOrder.indexOf('install'));
+    target.wasm.flush_commands = originalFlush; target.wasm.install_insert = originalInstall;
+    for (const slot of [1, 2]) targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 603 + slot, action: 'install', target: 255, slot, kind: gainWire });
+    pump(4);
+    for (const slot of [1, 2]) assert.ok(targetPort.messages.findLast(message => message.type === 'insertsApplied' && message.requestId === 603 + slot)?.accepted, 'multiple pending preparations fit complete transactions');
+    for (const slot of [0, 1, 2]) targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 620 + slot, action: 'remove', target: 255, slot });
+    pump(4);
+    for (const slot of [0, 1, 2]) assert.ok(targetPort.messages.findLast(message => message.type === 'insertsApplied' && message.requestId === 620 + slot)?.accepted, 'Reset can clear several slots before their acknowledgements');
+    target.nextBarrierLow = 0xfffffffe; target.nextBarrierHigh = 0x200000; // barrier serials above2^53, including low-word wrap
+    send(Ring.OPCODE_PREVIEW, 0);
+    assert.ok(pump(12) > 0.001, 'first Preview is audible before first Play');
+    // Stop submitted immediately after message-task insert removal must not be lost
+    // behind that preparation's applied barrier, on either transport.
+    send(Ring.OPCODE_INTERACTIVE_PLAY); pump(4);
+    targetPort.dispatch({ type: 'inserts', version: 2, identity, requestId: 640, action: 'remove', target: 255, slot: 0 });
+    send(Ring.OPCODE_STOP_PREVIEW); send(Ring.OPCODE_HOLD_STOP); pump(4);
+    assert.equal(target.wasm.replacement_state()[4], 0n, 'pending insert removal cannot swallow Stop');
+    assert.ok(targetPort.messages.findLast(message => message.type === 'interactiveApplied')?.accepted);
+    send(Ring.OPCODE_INTERACTIVE_PLAY); pump(4);
+    const playingBeforeLegacyStop = target.wasm.replacement_state();
+    send(Ring.OPCODE_STOP); pump(4);
+    const playingAfterLegacyStop = target.wasm.replacement_state();
+    assert.equal(playingAfterLegacyStop[4], 1n, 'v2 rejects legacy Stop2; explicit Stop16 owns interactive transport');
+    assert.equal(playingAfterLegacyStop[9], playingBeforeLegacyStop[9], 'rejected legacy Stop does not fade the live output gain');
+    assert.ok(playingAfterLegacyStop[41] > playingBeforeLegacyStop[41], 'rejected legacy Stop does not hold sequencing');
+    send(Ring.OPCODE_PAUSE); pump(4);
+    const paused = target.wasm.replacement_state(); // harness control task, outside process
+    assert.equal(paused[4], 2n);
+    send(Ring.OPCODE_PREVIEW, 0);
+    assert.ok(pump(12) > 0.001, 'Preview remains audible while paused');
+    const held = target.wasm.replacement_state();
+    assert.equal(held[41], paused[41], 'audition did not advance the held song frame');
+    rawGroup([...Array.from({ length: 5 }, () => ({ opcode: Ring.OPCODE_RESUME, argument: 0, extra: 0, identity })), { opcode: Ring.OPCODE_ALL_SOUND_OFF, argument: 0, extra: 0, identity }, { opcode: Ring.OPCODE_PAUSE, argument: 0, extra: 0, identity }]);
+    pump();
+    const burst = Ring.decodeWasmTelemetry(target.telemetryWords, 0, 128, 0, 0);
+    assert.equal(burst.transport, 'paused'); assert.equal(burst.live.active, 0, 'burst publishes final live clear immediately');
+    assert.equal(target.wasm.replacement_state()[41], held[41], 'burst publishes final held cursor'); pump(3);
+    // Stale commands using old opcode VALUES also carry/reject full identity.
+    const stale = { ...identity, build: identity.build - 1n };
+    for (const [opcode, argument, extra] of [[Ring.OPCODE_SEEK_ROW, 20, 0], [Ring.OPCODE_MUTE_CHANNEL, 0, 1], [Ring.OPCODE_INSERT_BYPASS, 255, 1], [Ring.OPCODE_SET_MIXER_MODE, 0x201, 0], [Ring.OPCODE_LIVE_MIDI, Ring.packMidiMessage(0x90, 60, 100), 0]]) { send(opcode, argument, extra, stale); pump(4); }
+    assert.equal(target.wasm.replacement_state()[41], paused[41]);
+    send(Ring.OPCODE_SET_MIXER_MODE, 0x201); pump(4);
+    assert.equal(target.wasm.current_build(), identity.build, 'v2 opcode7 is rejected; replacement messages own mixer builds');
+    assert.ok(targetPort.messages.some(message => message.type === 'interactiveApplied' && !message.accepted));
+    send(Ring.OPCODE_HOLD_STOP); pump(4);
+    send(Ring.OPCODE_PREVIEW, 0); assert.ok(pump(12) > 0.001, 'Preview remains audible after Stop');
+    send(Ring.OPCODE_AT_END, Ring.AT_END_STOP); pump(4); send(Ring.OPCODE_SEEK_ROW, 63); pump(4); send(Ring.OPCODE_INTERACTIVE_PLAY); pump(100);
+    assert.ok((target.telemetryWords[15] & 4) !== 0, 'natural end has its explicit transport indication');
+    send(Ring.OPCODE_PREVIEW, 0); assert.ok(pump(12) > 0.001, 'Preview remains audible after natural end');
+    const ended = [];
+    const observe = () => Ring.decodeWasmTelemetry(target.telemetryWords, target.memory.buffer.byteLength, 128, 0, target.wasm.quanta_rendered());
+    const controller = createPlaybackController({ resolver: {}, activate: async () => ({ graph: target, generation: observe().moduleGeneration }), readSnapshot: () => ({ graph: target, snapshot: observe() }), onTrackEnded: entry => ended.push(entry), clock: { setInterval: () => 1, clearInterval: () => {} } });
+    await controller.play({ kind: 'bytes', buffer: new Uint8Array() }, { origin: 'playlist', entryId: 'no08' });
+    controller.tick(); assert.deepEqual(ended, ['no08']);
+    controller.userControl('pause'); send(Ring.OPCODE_PAUSE); pump(4); controller.tick();
+    controller.userControl('play'); send(Ring.OPCODE_RESUME); pump(); controller.tick();
+    assert.equal(observe().songFrame, 0, 'next Resume consumes armed rewind after Pause');
+    assert.equal(observe().naturalEnd, false);
+    pump(12); controller.tick();
+    assert.equal(observe().transport, 'playing'); assert.deepEqual(ended, ['no08'], 'no second playlist ended event');
+    controller.dispose();
+    // Restore the natural Stopped handoff used by the following recreation checks.
+    send(Ring.OPCODE_SEEK_ROW, 63); pump(4); pump(100);
+    assert.equal(observe().naturalEnd, true);
+    targetPort.dispatch({ type: 'captureState', requestId: 502, identity }); pump(4);
+    let capture = targetPort.messages.findLast(message => message.type === 'stateReady');
+    if (!capture) { targetPort.dispatch({ type: 'captureState', requestId: 502, identity }); pump(4); capture = targetPort.messages.findLast(message => message.type === 'stateReady'); }
+    assert.ok(capture?.accepted);
+    targetPort.dispatch({ type: 'readState', requestId: 502, identity, serial: BigInt(capture.serial) });
+    const saved = targetPort.messages.findLast(message => message.type === 'stateCaptured');
+    assert.ok(saved?.replacement instanceof BigUint64Array, 'opaque codec crosses WASM without Number conversion');
+    const nextIdentity = { session: identity.session, build: identity.build + 1n };
+    const recreated = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, wasmModule: new WebAssembly.Module(wasmBytes) } });
+    const recreatedPort = lastPort;
+    recreatedPort.dispatch({ type: 'loadModule', requestId: 503, bytes: syntheticMod(), identity: nextIdentity, replacement: saved.replacement, hostSettings: { volume: 65535, mutes: Array.from({ length: 64 }, (_, index) => index), inserts: [], atEnd: Ring.AT_END_STOP, fadeFrames: 4800 } });
+    assert.equal(recreatedPort.messages.some(message => message.type === 'moduleLoaded'), false);
+    let delivered = 0;
+    for (let index = 0; index < 32; index++) {
+        recreated.process([], [[left, right]]);
+        while (delivered < recreatedPort.messages.length) {
+            const message = recreatedPort.messages[delivered++];
+            if (message.type === 'loadReplayPending') recreatedPort.dispatch({ type: 'continueReplay', requestId: message.requestId });
+        }
+    }
+    assert.ok(recreatedPort.messages.find(message => message.type === 'moduleLoaded')?.accepted);
+    assert.equal(recreated.wasm.replacement_state()[1], identity.session);
+    assert.equal(recreated.wasm.replacement_state()[4], 0n, 'clear-and-hold survives actual WASM recreation');
+    recreatedPort.dispatch({ type: 'commandBatch', version: 2, commands: [{ opcode: Ring.OPCODE_INTERACTIVE_PLAY, argument: 0, extra: 0, identity: nextIdentity }] });
+    for (let index = 0; index < 4; index++) recreated.process([], [[left, right]]);
+    recreatedPort.dispatch({ type: 'commandBatch', version: 2, commands: [{ opcode: Ring.OPCODE_SEEK_ROW, argument: 63, extra: 0, identity: nextIdentity }] });
+    for (let index = 0; index < 100; index++) recreated.process([], [[left, right]]);
+    assert.ok((recreated.telemetryWords[15] & 4) !== 0, 'recreated host applies retained at-end policy before readiness, rather than silently wrapping');
+
+    // Capture a genuinely Playing source, then stop/pause while installation is
+    // deferred behind an earlier control barrier, before the readiness barrier.
+    send(Ring.OPCODE_INTERACTIVE_PLAY); pump(4);
+    const playingState = target.wasm.replacement_state();
+    assert.equal(playingState[4], 1n);
+    for (const opcode of [Ring.OPCODE_PAUSE, Ring.OPCODE_HOLD_STOP]) {
+        const pendingProcessor = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, wasmModule: new WebAssembly.Module(wasmBytes) } });
+        const pendingPort = lastPort;
+        const initialIdentity = { session: identity.session, build: identity.build + 2n };
+        pendingPort.dispatch({ type: 'loadModule', requestId: 610, bytes: syntheticMod(), identity: initialIdentity, replacement: playingState });
+        for (let index = 0; index < 4; index++) pendingProcessor.process([], [[left, right]]);
+        const currentState = pendingProcessor.wasm.replacement_state();
+        pendingPort.dispatch({ type: 'commandBatch', version: 2, commands: [{ opcode: Ring.OPCODE_MASTER_VOLUME, argument: 65535, extra: 0, identity: initialIdentity }] });
+        const replacementIdentity = { session: initialIdentity.session, build: initialIdentity.build + 1n };
+        pendingPort.dispatch({ type: 'loadModule', requestId: 611, bytes: syntheticMod(), identity: replacementIdentity, replacement: currentState, hostSettings: { volume: 65535, mutes: Array.from({ length: 64 }, (_, index) => index), inserts: [] } });
+        assert.ok(pendingPort.messages.some(message => message.type === 'loadDeferred' && message.requestId === 611));
+        pendingPort.dispatch({ type: 'loadTransport', requestId: 611, identity: replacementIdentity, opcode, argument: 0, extra: 0 });
+        for (let index = 0; index < 4; index++) pendingProcessor.process([], [[left, right]]);
+        pendingPort.dispatch({ type: 'continueLoad', requestId: 611 });
+        let read = 0;
+        for (let index = 0; index < 32; index++) {
+            pendingProcessor.process([], [[left, right]]);
+            while (read < pendingPort.messages.length) {
+                const message = pendingPort.messages[read++];
+                if (message.type === 'loadReplayPending') pendingPort.dispatch({ type: 'continueReplay', requestId: message.requestId });
+            }
+        }
+        assert.ok(pendingPort.messages.findLast(message => message.type === 'moduleLoaded' && message.requestId === 611)?.accepted);
+        const restored = pendingProcessor.wasm.replacement_state();
+        assert.equal(restored[4], opcode === Ring.OPCODE_PAUSE ? 2n : 0n);
+        assert.equal(restored[41], currentState[41], 'pending user intent stops sequencing before readiness, with no resurrected Playing interval');
+        pendingPort.dispatch({ type: 'loadTransport', requestId: 611, identity: initialIdentity, opcode: Ring.OPCODE_INTERACTIVE_PLAY, argument: 0, extra: 0 });
+        pendingProcessor.process([], [[left, right]]);
+        assert.equal(pendingProcessor.wasm.replacement_state()[4], restored[4], 'delayed old intent cannot restart the new build');
+    }
+    const partial = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, wasmModule: new WebAssembly.Module(wasmBytes) } });
+    const partialPort = lastPort;
+    partialPort.dispatch({ type: 'loadModule', requestId: 620, bytes: syntheticMod(), identity });
+    for (let index = 0; index < 4; index++) partial.process([], [[left, right]]);
+    partialPort.dispatch({ type: 'loadModule', requestId: 621, bytes: syntheticMod(), identity: { session: identity.session + 1n, build: identity.build + 1n }, hostSettings: { volume: 65535, mutes: null, inserts: [] } });
+    const partialError = partialPort.messages.findLast(message => message.type === 'moduleError');
+    assert.equal(partialError.requestId, 621);
+    assert.equal(partialError.retainedIdentity, undefined, 'queued new installation cannot claim old audio retention after replay preparation fails');
+
+}
+
 globalThis.TextDecoder = nodeTextDecoder;
 console.log(`worklet harness: 10 s of real S3M render (peak ${loudest.toFixed(3)}), independent overlapping processors, MOD panning, transport, seek, memory, garbage, scope taps on both transports, live MIDI input on both transports and bad-file rejection passed`);
+
+// NO-08: exact real-DSP output under musically invalid wire seeks, on both transports.
+for (const shared of [true, false]) {
+    function seekRun(request) {
+        const ring = shared ? Ring.createCommandRing(2) : null;
+        const target = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, wasmModule: new WebAssembly.Module(wasmBytes), commandRing: ring?.buffer } });
+        const targetPort = lastPort;
+        const identity = { session: 900n, build: 901n };
+        const left = new Float32Array(128), right = new Float32Array(128);
+        const pump = count => { const output = []; for (let index = 0; index < count; index++) { target.process([], [[left, right]]); output.push(...left, ...right); } return output; };
+        const send = (opcode, argument = 0) => {
+            if (ring) assert.equal(Ring.pushCommand(ring, opcode, argument, 0, identity), true);
+            else targetPort.dispatch({ type: 'commandBatch', version: 2, commands: [{ opcode, argument, extra: 0, identity }] });
+        };
+        const bytes = syntheticMod(); bytes[48] = 0; bytes[49] = 128; // native looping song and Preview
+        const delay = JSON.parse(target.wasm.effects_json()).find(effect => effect.name === 'delay').wire;
+        targetPort.dispatch({ type: 'loadModule', requestId: 800, bytes, identity, hostSettings: { volume: 10000, mutes: [], inserts: [0, 255].map(target => ({ target, slot: 0, wire: delay, params: { 0: 10, 1: 75, 2: 70 }, bypassed: false })) } });
+        pump(4); assert.ok(targetPort.messages.find(message => message.type === 'moduleLoaded')?.accepted);
+        send(Ring.OPCODE_INTERACTIVE_PLAY); pump(16);
+        send(Ring.OPCODE_PAUSE); pump(4); send(Ring.OPCODE_PREVIEW); pump(8);
+        const before = target.wasm.replacement_state()[41];
+        if (request) send(...request);
+        const output = pump(16);
+        const state = Ring.decodeWasmTelemetry(target.telemetryWords, 0, 128, 0, 0);
+        assert.equal(targetPort.messages.some(message => message.type === 'fault'), false);
+        return { output, state, before };
+    }
+    const reference = seekRun(null);
+    assert.ok(reference.output.some(sample => sample !== 0));
+    for (const request of [[Ring.OPCODE_SEEK_ORDER, 999], [Ring.OPCODE_SEEK_ROW, 999], [Ring.OPCODE_SEEK_FRAME, 99999999]]) {
+        const actual = seekRun(request);
+        assert.deepEqual(actual.output, reference.output, `invalid seek ${request[0]} preserves all actual delay/voice PCM`);
+        assert.equal(actual.state.songFrame, reference.state.songFrame); assert.equal(actual.state.live.active, reference.state.live.active);
+    }
+    const valid = seekRun([Ring.OPCODE_SEEK_ROW, 3]);
+    assert.notDeepEqual(valid.output, reference.output); assert.equal(valid.state.live.active, reference.state.live.active); assert.equal(valid.state.channels[0].active, false);
+}
+console.log('NO08 malformed groups, natural-end Pause/Resume controller and exact DSP seek PCM passed on SAB and fallback');
+
+
+// NO08-A1: malformed fallback opcode types must reach the existing whole-group
+// rejection path without numeric coercion or an exception at the actual WASM export.
+const malformedOpcodeFailures = [];
+for (const opcode of [14.5, '14', 14n]) {
+    for (const order of ['alone', 'before', 'after']) {
+        const label = `${typeof opcode}:${String(opcode)}/${order}`;
+        try {
+            const target = new Processor({ processorOptions: { channelCount: 2, mixerMode: 0x202, interactiveVersion: 2, wasmModule: new WebAssembly.Module(wasmBytes) } });
+            const targetPort = lastPort;
+            const identity = { session: (1n << 59n) + 91n, build: (1n << 62n) + 97n };
+            const left = new Float32Array(128), right = new Float32Array(128);
+            const pump = () => { for (let index = 0; index < 4; index++) target.process([], [[left, right]]); };
+            targetPort.dispatch({ type: 'loadModule', requestId: 900, bytes: syntheticMod(), identity }); pump();
+            assert.ok(targetPort.messages.find(message => message.type === 'moduleLoaded')?.accepted);
+            const malformed = { opcode, argument: 0, extra: 0, identity };
+            const valid = { opcode: Ring.OPCODE_NOTE_OVERLAP, argument: 1, extra: 0, identity };
+            const records = order === 'alone' ? [malformed] : order === 'before' ? [malformed, valid] : [valid, malformed];
+            const count = targetPort.messages.filter(message => message.type === 'interactiveApplied').length;
+            let exception = null;
+            try { targetPort.dispatch({ type: 'commandBatch', version: 2, commands: records }); } catch (error) { exception = String(error); }
+            pump();
+            const replies = targetPort.messages.filter(message => message.type === 'interactiveApplied').slice(count);
+            const state = target.wasm.replacement_state();
+            console.log('NO08-A1 actual fallback', JSON.stringify({ label, exception, acknowledgements: replies.length, accepted: replies[0]?.accepted, transport: String(state[4]), overlap: String(state[6]) }));
+            assert.equal(exception, null, 'malformed opcode must not throw at WASM admission');
+            assert.equal(targetPort.messages.some(message => message.type === 'fault'), false);
+            assert.equal(replies.length, 1, 'exactly one explicit group rejection');
+            assert.equal(replies[0].accepted, false);
+            assert.deepEqual([...replies[0].words.slice(2, 6)], [Number(identity.session & 0xffffffffn), Number(identity.session >> 32n), Number(identity.build & 0xffffffffn), Number(identity.build >> 32n)]);
+            assert.equal(state[4], 0n, 'malformed opcode must not be coerced to Pause');
+            assert.equal(state[6], 0n, 'valid member must not partially change overlap');
+            targetPort.dispatch({ type: 'commandBatch', version: 2, commands: [valid] }); pump();
+            assert.equal(targetPort.messages.filter(message => message.type === 'interactiveApplied').length, count + 2);
+            assert.equal(targetPort.messages.findLast(message => message.type === 'interactiveApplied').accepted, true);
+            assert.equal(target.wasm.replacement_state()[6], 1n, 'valid retry applies');
+        } catch (error) { malformedOpcodeFailures.push(`${label}: ${error.message}`); }
+    }
+}
+assert.deepEqual(malformedOpcodeFailures, [], 'all malformed fallback opcode types/orders reject atomically');
+console.log('NO08-A1 malformed fallback opcode types reject once with current identity, no partial state, and valid retry');

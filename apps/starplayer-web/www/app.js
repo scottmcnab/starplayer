@@ -43,6 +43,7 @@ const elements = {
     error: byId('error'), message: byId('message'), transportChip: byId('transport-chip'), title: byId('title'),
     moduleDetail: byId('module-detail'), order: byId('order'), pattern: byId('pattern'), row: byId('row'),
     speed: byId('speed'), bpm: byId('bpm'), previous: byId('previous'), play: byId('play'), stop: byId('stop'),
+    pause: byId('pause'), overlapEnable: byId('note-overlap-enable'), stopPreview: byId('stop-preview'), allSoundOff: byId('all-sound-off'), inputDestination: byId('input-destination'),
     next: byId('next'), seekOrder: byId('seek-order'), volume: byId('volume'), volumeValue: byId('volume-value'),
     progress: byId('progress'), elapsed: byId('elapsed'), duration: byId('duration'), repeat: byId('repeat'),
     voices: byId('voices'), masterPeak: byId('master-peak'), channelBody: byId('channel-body'), patternTable: byId('pattern-table'),
@@ -97,6 +98,17 @@ const state = {
     drawnScopeGeneration: -1,
     fallbackCommands: [],
     pendingLoads: new Map(),
+    pendingStates: new Map(),
+    sessionClock: 0n,
+    buildClock: 0n,
+    interactiveReady: false,
+    sessionSettingsRevision: 0,
+    lastTransportOpcode: null,
+    liveRecoveryPending: false,
+    selectedInstrument: null,
+    letNotesRing: [],
+    overlapEnabled: false,
+    previewInstrument: null,
     nextRequestId: 1,
     metadata: null,
     channelRows: [],
@@ -150,6 +162,7 @@ const state = {
     /// A `midiInput` message already sent and not yet answered, so a fast double-click
     /// does not interleave two installs on the port's FIFO.
     liveInputPending: false,
+    pendingInserts: new Map(),
     /// The lead the worklet reported, in frames and milliseconds.
     eventLeadFrames: 0,
     eventLeadMillis: 0,
@@ -487,16 +500,24 @@ function updateOutputPanel() {
 function installGraph(graph) {
     // A rebuilt graph is a new Rust host with no live-input source. `activateLoadedModule`
     // asks for it back once the module has been reinstalled on it.
+    releaseHeldKeys(false);
     state.liveInputActive = false;
     state.liveInputPending = false;
     state.node = graph.node;
+    state.pendingInserts.clear();
+    state.interactiveReady = !!graph.node.starplayerIdentity && graph.node.starplayerCapabilities === 3;
+    if (graph.node.starplayerWarmup) { graph.node.disconnect(graph.node.starplayerWarmup); graph.node.starplayerWarmup.disconnect(); graph.node.starplayerWarmup = null; }
     state.commandRing = graph.commandRing;
     state.telemetry = graph.telemetry;
     state.scope = graph.scope;
     state.latestScope = null;
     state.drawnScopeGeneration = -1;
     state.workletSampleRate = graph.node.starplayerSampleRate ?? graph.context.sampleRate;
+    state.eventLeadFrames = graph.node.starplayerLeadFrames ?? 0;
+    state.eventLeadMillis = graph.node.starplayerLeadMillis ?? 0;
     state.outputChannelCount = graph.channels;
+    state.liveInputActive = state.interactiveReady && (elements.keyboardEnable.checked || state.midiPort !== null);
+    updateLiveInputPanel();
     if (graph.node.starplayerRenderQuantum) elements.quantum.textContent = `${graph.node.starplayerRenderQuantum} frames`;
 }
 
@@ -506,11 +527,13 @@ async function prepareNode(context, channels, mixerMode, addModule) {
     }
     if (addModule) await context.audioWorklet.addModule(WORKLET_URL);
     const shared = sharedMemoryAvailable() && !elements.forceFallback.checked;
-    const commandRing = shared ? Ring.createCommandRing() : null;
+    const commandRing = shared ? Ring.createCommandRing(Ring.INTERACTIVE_WIRE_VERSION) : null;
     const telemetry = shared ? Ring.createTelemetry() : null;
     const scope = shared ? Ring.createScope() : null;
     const processorOptions = {
         channelCount: channels,
+        interactiveVersion: Ring.INTERACTIVE_WIRE_VERSION,
+        seedSession: state.sessionClock, seedBuild: ++state.buildClock,
         mixerMode,
         wasmModule: state.wasmModule,
         commandRing: commandRing ? commandRing.buffer : null,
@@ -519,6 +542,12 @@ async function prepareNode(context, channels, mixerMode, addModule) {
     };
     const node = createNode(context, processorOptions, state.wasmBytes, channels);
     node.port.onmessage = (event) => onWorkletMessage(event.data, node);
+    // A muted connected candidate renders prepared loads/replay before acknowledgement.
+    // Disconnected worklets are not guaranteed to receive process() callbacks.
+    const warmup = context.createGain();
+    warmup.gain.value = 0;
+    node.connect(warmup); warmup.connect(context.destination);
+    node.starplayerWarmup = warmup;
     node.onprocessorerror = () => {
         if (node === state.node) showError('The AudioWorklet processor stopped unexpectedly. Reload the page to restart it.');
     };
@@ -668,10 +697,28 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
     const retainedBytes = moduleBuffer.slice(0);
     const loadOptions = loadOptionsFromControls();
     const node = state.node;
+    const controlRevision = playback.controlRevision;
     const result = await activateModuleOnNode(node, moduleBuffer, loadOptions);
-    if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node) return null;
+    if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node) {
+        // Stop may cancel the request after audio installed it. Old metadata cannot arm
+        // input for that newly installed session; a newer installation keeps its authority.
+        if (node === state.node && result.identity && Ring.sameIdentity(node.starplayerIdentity, result.identity) && !Ring.sameIdentity(state.metadata?.identity, result.identity)) {
+            state.interactiveReady = false;
+            state.liveInputActive = false;
+            state.liveInputPending = false;
+            state.currentModuleBytes = null;
+            renderMetadata(); setControlsEnabled(false); updateLiveInputPanel();
+        }
+        return null;
+    }
     libraryView.setPlaying(null);
+    metadata.identity = result.identity;
     state.metadata = metadata;
+    state.letNotesRing = metadata.instruments.map(() => false);
+    state.overlapEnabled = false;
+    elements.overlapEnable.checked = false;
+    state.selectedInstrument = null;
+    elements.inputDestination.value = 'jam';
     state.currentModuleBytes = retainedBytes;
     state.activeLoadOptions = {
         headphoneFriendlyModPanning: metadata.isMod && loadOptions.headphoneFriendlyModPanning,
@@ -697,7 +744,9 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
     syncLiveInput();
     queueCommand(Ring.OPCODE_MASTER_VOLUME, Math.round(Number(elements.volume.value) * 65535 / 100), 0);
     queueRepeatCommand();
-    queueCommand(Ring.OPCODE_PLAY, 0, 0);
+    if (controlRevision === playback.controlRevision || state.lastTransportOpcode === Ring.OPCODE_INTERACTIVE_PLAY || state.lastTransportOpcode === Ring.OPCODE_RESUME) {
+        if (state.interactiveReady) queueInteractive(Ring.OPCODE_INTERACTIVE_PLAY); else queueCommand(Ring.OPCODE_PLAY);
+    }
     const reduction = describeEnhancementReduction(loadOptions.enhancementFlags, result.appliedEnhancementFactor);
     showMessage(`Playing ${metadata.title || moduleLabel}.${reduction ? ` (${reduction}.)` : ''}`);
     const library = context.libraryContext;
@@ -842,6 +891,7 @@ function readMetadata(label) {
         instruments.push({
             name: Loader.instrument_name(index),
             length: Loader.instrument_sample_length(index),
+            capability: Loader.instrument_capability?.(index) ?? 0,
         });
     }
     return {
@@ -855,14 +905,28 @@ function readMetadata(label) {
     };
 }
 
-function activateModuleOnNode(node, buffer, loadOptions = loadOptionsFromControls()) {
+function activateModuleOnNode(node, buffer, loadOptions = loadOptionsFromControls(), replacement = null) {
+    const previousReady = node === state.node && state.interactiveReady;
+    const previousIdentity = node.starplayerIdentity;
+    cleanupLiveInput();
+    if (node === state.node) state.interactiveReady = false;
+    const identity = { session: replacement ? replacement[1] : ++state.sessionClock, build: ++state.buildClock };
     const requestId = state.nextRequestId++;
+    node.starplayerLatestLoadRequest = requestId;
     return new Promise((resolve, reject) => {
-        state.pendingLoads.set(requestId, { resolve, reject });
+        state.pendingLoads.set(requestId, { resolve, reject, node, identity, fresh: replacement === null, loadOptions: { ...loadOptions }, previousReady, previousIdentity, previousDestination: elements.inputDestination.value, previousKeyboardEnabled: elements.keyboardEnable.checked });
+        if (node === state.node) restoreUnreadyInteractiveControls();
         updateModPanningAvailability();
         node.port.postMessage({
             type: 'loadModule',
-            requestId,
+            requestId, identity, replacement,
+            hostSettings: {
+                volume: Math.round(Number(elements.volume.value) * 65535 / 100),
+                atEnd: playback.effectiveAtEnd() ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT,
+                fadeFrames: Math.round(SONG_FADE_SECONDS * (node.starplayerSampleRate || state.workletSampleRate || 44100)),
+                mutes: replacement ? (state.latest?.channels ?? []).map((channel, index) => channel.muted ? index : -1).filter(index => index >= 0) : [],
+                inserts: node !== state.node ? [...state.insertLayout].map(([key, insert]) => ({ target: Number(key.split(':')[0]), slot: Number(key.split(':')[1]), ...insert })) : [],
+            },
             bytes: buffer,
             headphoneFriendlyModPanning: loadOptions.headphoneFriendlyModPanning,
             enhancementFlags: loadOptions.enhancementFlags,
@@ -886,10 +950,15 @@ function updateModPanningAvailability() {
 
 function onWorkletMessage(message, node) {
     if (message.type === 'ready') {
+        node.starplayerInteractiveVersion = message.interactiveVersion === Ring.INTERACTIVE_WIRE_VERSION && message.commandRingVersion === Ring.INTERACTIVE_WIRE_VERSION ? message.interactiveVersion : 0;
         node.starplayerSampleRate = message.sampleRate;
         node.starplayerRenderQuantum = message.renderQuantum;
+        node.starplayerLeadFrames = message.leadFrames ?? 0;
+        node.starplayerLeadMillis = message.leadMillis ?? 0;
         if (node === state.node) {
             state.workletSampleRate = message.sampleRate;
+            state.eventLeadFrames = node.starplayerLeadFrames;
+            state.eventLeadMillis = node.starplayerLeadMillis;
             elements.quantum.textContent = `${message.renderQuantum} frames`;
             updateOutputPanel();
         }
@@ -922,25 +991,92 @@ function onWorkletMessage(message, node) {
             state.latest = message;
             if (message.scope) state.latestScope = message.scope;
         }
+    } else if (message.type === 'loadReplayPending') {
+        if (state.pendingLoads.get(message.requestId)?.node === node) node.port.postMessage({ type: 'continueReplay', requestId: message.requestId });
+    } else if (message.type === 'loadDeferred') {
+        if (state.pendingLoads.get(message.requestId)?.node === node) setTimeout(() => node.port.postMessage({ type: 'continueLoad', requestId: message.requestId }), 10);
     } else if (message.type === 'moduleLoaded' || message.type === 'moduleError') {
         const pending = state.pendingLoads.get(message.requestId);
-        if (pending) {
+        if (pending && pending.node === node) {
             state.pendingLoads.delete(message.requestId);
             updateModPanningAvailability();
-            if (message.type === 'moduleLoaded') pending.resolve(message);
-            else pending.reject(new Error(message.reason));
+            if (message.type === 'moduleLoaded' && ((!node.starplayerInteractiveVersion && message.generation > 0) || (message.accepted && Ring.sameIdentity(pending.identity, message.identity)))) {
+                // A valid reply can already be superseded by a newer same-node load.
+                // Resolve its waiter so the caller's revision check can finish, while
+                // only the latest request may publish identity/readiness or retry input.
+                if (node.starplayerLatestLoadRequest !== undefined && node.starplayerLatestLoadRequest !== message.requestId) { pending.resolve(message); return; }
+                node.starplayerIdentity = message.identity ?? pending.identity;
+                node.starplayerCapabilities = message.capabilities ?? 0;
+                // Retry against the acknowledged build if the early intent reached a
+                // deferred load before its installation. Transport precedes new input.
+                if (pending.transportOpcode !== undefined && node === state.node) {
+                    queueCommand(pending.transportOpcode, 0, 0, node.starplayerIdentity);
+                    flushFallbackCommands();
+                }
+                if (node === state.node) {
+                    state.interactiveReady = message.capabilities === 3;
+                    state.fallbackCommands = state.fallbackCommands.filter(record => Ring.sameIdentity(record.identity, node.starplayerIdentity));
+                }
+                pending.resolve(message);
+            }
+            else {
+                if (node === state.node && node.starplayerLatestLoadRequest === message.requestId) {
+                    // Recovery requires explicit unchanged control AND audio-applied proof;
+                    // a failed partial installation must leave mismatched controls disabled.
+                    state.interactiveReady = Boolean(pending.previousReady && message.retainedCapabilities === 3 && node.starplayerCapabilities === 3 && Ring.sameIdentity(message.retainedIdentity, pending.previousIdentity) && Ring.sameIdentity(message.retainedIdentity, node.starplayerIdentity) && Ring.sameIdentity(message.retainedIdentity, state.metadata?.identity));
+                    renderMetadata(); setControlsEnabled(state.interactiveReady); updateLiveInputPanel();
+                }
+                pending.reject(new Error(message.reason || 'Interactive audio protocol is unavailable or the load acknowledgement is stale.'));
+            }
         }
+    } else if (message.type === 'stateBusy') {
+        const pending = state.pendingStates.get(message.requestId);
+        if (pending?.node === node) setTimeout(() => node.port.postMessage({ type: 'captureState', requestId: message.requestId, identity: pending.identity }), 10);
+    } else if (message.type === 'stateReady') {
+        const pending = state.pendingStates.get(message.requestId);
+        if (pending?.node === node && message.accepted && Ring.sameIdentity(pending.identity, message.identity)) node.port.postMessage({ type: 'readState', requestId: message.requestId, identity: message.identity, serial: BigInt(message.serial) });
+        else if (pending?.node === node) { state.pendingStates.delete(message.requestId); pending.reject(new Error(message.reason || 'Renderer state was not applied.')); }
+    } else if (message.type === 'stateCaptured' || message.type === 'stateError') {
+        const pending = state.pendingStates.get(message.requestId);
+        if (pending?.node === node) {
+            state.pendingStates.delete(message.requestId);
+            if (message.type === 'stateCaptured' && Ring.sameIdentity(pending.identity, message.identity)) pending.resolve(message.replacement);
+            else pending.reject(new Error(message.reason || 'Stale renderer state.'));
+        }
+    } else if (message.type === 'interactiveOverflow') {
+        if (node === state.node && Ring.sameIdentity(message.identity, node.starplayerIdentity)) { state.keysDown.clear(); state.liveRecoveryPending = true; queueInteractive(Ring.OPCODE_STOP_PREVIEW); flushFallbackCommands(); }
+    } else if (message.type === 'interactiveApplied') {
+        if (node !== state.node || !message.words) return;
+        const words = message.words;
+        const identity = { session: BigInt(words[2]) | (BigInt(words[3]) << 32n), build: BigInt(words[4]) | (BigInt(words[5]) << 32n) };
+        if (!Ring.sameIdentity(identity, node.starplayerIdentity)) return;
+        state.liveInputPending = false;
+        if (!message.accepted) {
+            if (message.count && state.interactiveReady) { state.liveRecoveryPending = true; queueInteractive(Ring.OPCODE_STOP_PREVIEW); flushFallbackCommands(); }
+            elements.overlapEnable.checked = state.overlapEnabled;
+            showError('Audio rejected a stale, invalid or full-queue control change.'); renderMetadata(); return;
+        }
+        for (let index = 0; index < message.count * 3; index += 3) {
+            const opcode = message.commands[index], argument = message.commands[index + 1], extra = message.commands[index + 2];
+            if (opcode === Ring.OPCODE_NOTE_OVERLAP) state.overlapEnabled = argument !== 0;
+            if (opcode === Ring.OPCODE_LET_NOTES_RING) state.letNotesRing[argument] = extra !== 0;
+            if (opcode === Ring.OPCODE_LIVE_DESTINATION) { state.liveInputActive = argument !== 0; state.liveRecoveryPending = false; }
+            if (opcode === Ring.OPCODE_STOP_PREVIEW) state.liveRecoveryPending = false;
+        }
+        elements.overlapEnable.checked = state.overlapEnabled;
+        for (const input of elements.instrumentList.querySelectorAll('input[type=checkbox]')) input.checked = !!state.letNotesRing[Number(input.dataset.instrument)];
+        updateLiveInputPanel();
     } else if (message.type === 'garbageCollected') {
         if (node !== state.node) return;
         state.retiredSeen = message.total;
         elements.retired.textContent = `${state.retiredSeen} returned, ${message.pending} pending`;
         if (state.loadCount > 1 && message.collected > 0) {
-            showMessage(`Playing ${state.metadata.title}; the retired module Arc returned off the audio callback.`);
+            showMessage(`Loaded ${state.metadata.title}; the retired module Arc returned off the audio callback.`);
         }
     } else if (message.type === 'fault') {
         if (node === state.node) showError(`Audio engine fault: ${message.reason}`);
     } else if (message.type === 'mixerModeApplied') {
-        if (node !== state.node) return;
+        if (node !== state.node || node.starplayerInteractiveVersion) return;
         state.activeModeWire = message.active >>> 0;
         state.activationMemoryBytes = message.memoryBytes;
         updateOutputPanel();
@@ -965,16 +1101,20 @@ function onWorkletMessage(message, node) {
         showError(`Could not switch live input: ${message.reason}`);
         updateLiveInputPanel();
     } else if (message.type === 'insertsApplied') {
-        if (node !== state.node) return;
+        state.pendingInserts.delete(message.requestId);
+        if (node !== state.node || node.starplayerInteractiveVersion && !Ring.sameIdentity(message.identity, node.starplayerIdentity)) return;
         state.activationMemoryBytes = message.memoryBytes;
         renderEffectSlotRows();
     } else if (message.type === 'insertsError') {
-        if (node !== state.node) return;
+        const pending = state.pendingInserts.get(message.requestId);
+        state.pendingInserts.delete(message.requestId);
+        if (node !== state.node || node.starplayerInteractiveVersion && !Ring.sameIdentity(message.identity, node.starplayerIdentity)) return;
         // The install or remove did not happen, so the page's own belief has to be put
         // back the way it was before the optimistic UI update — never left claiming an
         // effect is installed that the engine refused.
         const key = `${message.target}:${message.slot}`;
-        if (message.action === 'install') state.insertLayout.delete(key);
+        if (pending?.previous) state.insertLayout.set(key, pending.previous);
+        else state.insertLayout.delete(key);
         showError(`Could not ${message.action} the insert effect: ${message.reason}`);
         renderEffectSlotRows();
     }
@@ -1011,8 +1151,9 @@ const KEYBOARD_SEMITONES = new Map([
     ['KeyI', 24], ['Digit9', 25], ['KeyO', 26], ['Digit0', 27], ['KeyP', 28],
 ]);
 
-/// The MIDI channel the computer keyboard plays on. Channel 0 is `ChannelId(48)` in the
-/// engine (`MIDI_CHANNEL_BASE`), well clear of any module's own lanes.
+/// Hardware MIDI channel used by the computer keyboard. The host maps 0–15 through its
+/// configured lane layout: legacy base 48, or interactive base 64. Keep MIDI identity
+/// separate from engine lane IDs; NO-W1 negotiates interactive capability on the wire.
 const KEYBOARD_MIDI_CHANNEL = 0;
 /// Fixed, as the deliverable specifies: a computer keyboard has no velocity to read.
 const KEYBOARD_VELOCITY = 100;
@@ -1024,29 +1165,23 @@ const KEYBOARD_MAX_OCTAVE = 8;
 /// animation frame the rest of the commands are batched into, which is the added latency
 /// `updateLiveInputPanel` reports.
 function queueMidiMessage(status, data1, data2) {
-    queueCommand(Ring.OPCODE_MIDI_EVENT, Ring.packMidiMessage(status, data1, data2), 0);
+    if (!state.interactiveReady || !state.liveInputActive || state.liveRecoveryPending) return;
+    queueInteractive(Ring.OPCODE_LIVE_MIDI, Ring.packMidiMessage(status, data1, data2), 0);
     state.eventsSent += 1;
 }
 
 /// Turn the live-input source on or off in the worklet. It allocates an instrument rack,
 /// so it is a port message rather than a ring command.
 function requestLiveInput(enabled) {
-    if (state.node === null || state.liveInputPending || enabled === state.liveInputActive) return;
-    if (enabled && state.metadata === null) {
-        showError('Load a module first: live input plays that module’s instruments.');
-        elements.keyboardEnable.checked = false;
-        return;
-    }
+    if (!state.interactiveReady) { restoreUnreadyInteractiveControls(); return; }
+    if (state.node === null || state.liveInputPending) return;
+    const selected = elements.inputDestination.value === 'selected';
+    const destination = !enabled ? 0 : selected && state.selectedInstrument !== null ? state.selectedInstrument + 2 : selected ? 0 : 1;
     state.liveInputPending = true;
-    // Anything already queued has to cross *first*, or a note the page has already sent
-    // arrives at a queue this message is about to install or retire. The port is FIFO, so
-    // ordering it is enough: on the fallback transport flush the animation-frame batch,
-    // and on the shared ring ask the worklet to drain it in a message task — the same
-    // `flushCommands` a mixer-mode change already uses for the same reason.
+    queueInteractive(Ring.OPCODE_LIVE_DESTINATION, destination);
     flushFallbackCommands();
-    if (state.commandRing !== null) state.node.port.postMessage({ type: 'flushCommands' });
-    state.node.port.postMessage({ type: 'midiInput', enabled });
 }
+
 
 /// Live input is wanted while the keyboard is armed or a MIDI port is open.
 function syncLiveInput() {
@@ -1055,7 +1190,7 @@ function syncLiveInput() {
 
 function updateLiveInputPanel() {
     const active = state.liveInputActive;
-    elements.liveInputStatus.textContent = active ? 'jamming over the module' : 'off';
+    elements.liveInputStatus.textContent = active ? (elements.inputDestination.value === 'selected' ? `selected instrument ${(state.selectedInstrument ?? 0) + 1}` : 'jamming over the module') : 'off';
     const lead = state.eventLeadFrames > 0
         ? `lead ${state.eventLeadFrames} frames (${state.eventLeadMillis.toFixed(1)} ms)`
         : 'lead —';
@@ -1069,8 +1204,9 @@ function updateLiveInputPanel() {
     // the Engine panel's "Dropped", because a refused live event is a command that could
     // not be delivered like any other.
     setText(elements.midiEvents, `${state.eventsSent} sent`);
-    elements.keyboardEnable.disabled = state.node === null || state.metadata === null;
-    elements.midiInput.disabled = state.midiAccess === null || state.metadata === null;
+    elements.keyboardEnable.disabled = !state.interactiveReady || state.metadata === null;
+    elements.inputDestination.disabled = !state.interactiveReady || state.metadata === null;
+    elements.midiInput.disabled = !state.interactiveReady || state.midiAccess === null || state.metadata === null;
 }
 
 /// Ask the browser for MIDI access, once, on a click. Sysex is not requested: nothing here
@@ -1099,11 +1235,12 @@ function fillMidiInputs() {
     // firmware says it is, and it has no business being parsed as HTML.
     elements.midiInput.replaceChildren(new Option('None', ''));
     for (const input of state.midiAccess.inputs.values()) {
+        if (input.state === 'disconnected') continue;
         const label = `${input.name || 'MIDI input'}${input.manufacturer ? ` — ${input.manufacturer}` : ''}`;
         elements.midiInput.append(new Option(label, input.id));
     }
     // A port that vanished takes the selection with it; one that is still there keeps it.
-    elements.midiInput.value = [...state.midiAccess.inputs.keys()].includes(chosen) ? chosen : '';
+    elements.midiInput.value = [...state.midiAccess.inputs.values()].some(input => input.id === chosen && input.state !== 'disconnected') ? chosen : '';
     if (elements.midiInput.value !== chosen) selectMidiInput();
     updateLiveInputPanel();
 }
@@ -1112,6 +1249,7 @@ function fillMidiInputs() {
 /// *framed* messages — the browser has already resolved running status — so each one is
 /// packed straight into a wire record with no decoder on this side.
 function selectMidiInput() {
+    cleanupLiveInput();
     if (state.midiPort !== null) {
         state.midiPort.onmidimessage = null;
         state.midiPort = null;
@@ -1168,7 +1306,8 @@ function onKeyDown(event) {
         const count = Math.max(1, state.metadata?.instruments?.length ?? 1);
         const step = event.code === 'Equal' ? 1 : -1;
         state.keyboardInstrument = Math.max(0, Math.min(count - 1, state.keyboardInstrument + step));
-        queueMidiMessage(0xC0 | KEYBOARD_MIDI_CHANNEL, state.keyboardInstrument, 0);
+        if (elements.inputDestination.value === 'selected') selectInstrument(state.keyboardInstrument);
+        else queueMidiMessage(0xC0 | KEYBOARD_MIDI_CHANNEL, state.keyboardInstrument, 0);
         event.preventDefault();
         updateLiveInputPanel();
         return;
@@ -1212,26 +1351,62 @@ function requestGarbageCollection() {
     }
 }
 
-function queueCommand(opcode, argument = 0, extra = 0) {
-    if (state.node === null) return;
-    if (state.commandRing !== null) {
-        if (!Ring.pushCommand(state.commandRing, opcode, argument, extra)) {
-            showError('The audio command ring is full. The newest control change will be retried.');
-            state.fallbackCommands.push(opcode, argument, extra);
-        }
-    } else {
-        state.fallbackCommands.push(opcode, argument, extra);
-    }
+function queueTransport(opcode) {
+    state.lastTransportOpcode = opcode;
+    const pending = [...state.pendingLoads.entries()].findLast(([, load]) => load.node === state.node);
+    if (pending) {
+        const [requestId, load] = pending;
+        load.transportOpcode = opcode;
+        state.node.port.postMessage({ type: 'loadTransport', requestId, identity: load.identity, opcode, argument: 0, extra: 0 });
+    } else if (state.interactiveReady) queueInteractive(opcode);
+    else if (!state.node?.starplayerInteractiveVersion) queueCommand(opcode === Ring.OPCODE_HOLD_STOP ? Ring.OPCODE_STOP : Ring.OPCODE_PLAY);
 }
 
-/// How long the host fades a *looping* song out for with Repeat off. A song that ends of
-/// its own accord is stopped on its end frame instead, and never sees this.
+function restoreUnreadyInteractiveControls() {
+    elements.overlapEnable.checked = state.overlapEnabled;
+    elements.overlapEnable.disabled = true;
+    if (state.metadata) renderMetadata();
+    for (const pending of state.pendingLoads?.values() ?? []) {
+        if (pending.node !== state.node) continue;
+        elements.inputDestination.value = pending.previousDestination;
+        elements.keyboardEnable.checked = pending.previousKeyboardEnabled;
+    }
+    updateLiveInputPanel();
+}
+
+function queueInteractive(opcode, argument = 0, extra = 0) {
+    if (!state.interactiveReady) { restoreUnreadyInteractiveControls(); return; }
+    if (!state.node?.starplayerIdentity) return;
+    queueCommand(opcode, argument, extra, state.node.starplayerIdentity);
+}
+
+function queueCommand(opcode, argument = 0, extra = 0, identity = null) {
+    if (state.node === null) return;
+    if (opcode === Ring.OPCODE_LIVE_MIDI && state.fallbackCommands.length >= 128) {
+        state.fallbackCommands = state.fallbackCommands.filter(record => record.opcode !== Ring.OPCODE_LIVE_MIDI);
+        state.liveRecoveryPending = true;
+        state.keysDown.clear();
+        state.fallbackCommands.push({ opcode: Ring.OPCODE_STOP_PREVIEW, argument: 0, extra: 0, identity });
+        return;
+    }
+    identity ??= state.node.starplayerIdentity;
+    if (!Ring.validIdentity(identity)) return;
+    if (!Ring.validWireWord(argument) || !Ring.validWireWord(extra)) return;
+    switch (opcode) {
+        case Ring.OPCODE_MASTER_VOLUME: case Ring.OPCODE_MUTE_CHANNEL: case Ring.OPCODE_AT_END:
+        case Ring.OPCODE_INSERT_PARAM: case Ring.OPCODE_INSERT_BYPASS: case Ring.OPCODE_SET_MIXER_MODE:
+        case Ring.OPCODE_LIVE_DESTINATION: case Ring.OPCODE_NOTE_OVERLAP: case Ring.OPCODE_LET_NOTES_RING:
+            state.sessionSettingsRevision = (state.sessionSettingsRevision ?? 0) + 1;
+    }
+    const record = { opcode, argument: argument >>> 0, extra: extra >>> 0, identity };
+    if (state.fallbackCommands.length || !state.commandRing || !Ring.pushCommand(state.commandRing, opcode, argument, extra, identity)) state.fallbackCommands.push(record);
+}
+
 function repeatFadeFrames() {
     return Math.round(SONG_FADE_SECONDS * (state.workletSampleRate || 44100));
 }
 
-/// Sent on `#repeat` `change`, on activating a module, and from `playbackRestoreCommands()`
-/// — the three moments the engine needs the controller's effective at-end policy.
+/// Send the controller's effective end policy on activation and Repeat changes.
 function queueRepeatCommand() {
     queueCommand(Ring.OPCODE_AT_END, playback.effectiveAtEnd() ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT, repeatFadeFrames());
 }
@@ -1239,62 +1414,28 @@ function queueRepeatCommand() {
 function flushFallbackCommands() {
     if (state.node === null || state.fallbackCommands.length === 0) return;
     if (state.commandRing !== null) {
-        const remaining = [];
-        let modeQueued = false;
-        for (let index = 0; index < state.fallbackCommands.length; index += 3) {
-            if (!Ring.pushCommand(state.commandRing, state.fallbackCommands[index], state.fallbackCommands[index + 1], state.fallbackCommands[index + 2])) {
-                remaining.push(...state.fallbackCommands.slice(index));
-                break;
-            }
-            modeQueued ||= state.fallbackCommands[index] === Ring.OPCODE_SET_MIXER_MODE;
-        }
-        state.fallbackCommands = remaining;
-        if (modeQueued) state.node.port.postMessage({ type: 'flushCommands' });
-        return;
-    }
-    const commands = state.fallbackCommands;
-    state.fallbackCommands = [];
-    state.node.port.postMessage({ type: 'commandBatch', commands });
-}
-
-function sendCommandsToGraph(graph, commands) {
-    if (graph.commandRing !== null) {
-        for (let index = 0; index < commands.length; index += 3) {
-            if (!Ring.pushCommand(graph.commandRing, commands[index], commands[index + 1], commands[index + 2])) {
-                throw new Error('The new audio graph command ring filled while restoring playback.');
-            }
+        while (state.fallbackCommands.length) {
+            const record = state.fallbackCommands[0];
+            if (!Ring.pushCommand(state.commandRing, record.opcode, record.argument, record.extra, record.identity)) break;
+            state.fallbackCommands.shift();
+            if (record.opcode === Ring.OPCODE_SET_MIXER_MODE) state.node.port.postMessage({ type: 'flushCommands' });
         }
     } else {
-        graph.node.port.postMessage({ type: 'commandBatch', commands });
+        const records = state.fallbackCommands.splice(0, Ring.COMMAND_CAPACITY - 1);
+        if (state.node.starplayerInteractiveVersion === 0) state.node.port.postMessage({ type: 'commandBatch', version: 1, commands: records.flatMap(record => [record.opcode, record.argument, record.extra]) });
+        else state.node.port.postMessage({ type: 'commandBatch', version: Ring.INTERACTIVE_WIRE_VERSION, commands: records });
     }
 }
 
-function playbackRestoreCommands() {
-    const playing = state.latest?.playing ?? state.metadata !== null;
-    const volume = Math.round(Number(elements.volume.value) * 65535 / 100);
-    // A rebuilt graph starts its module from the top. Put it back where the ear left it:
-    // by song frame when the timeline is known, which lands mid-pattern, and by order
-    // otherwise.
-    const lengthKnown = ((state.latest?.songFlags ?? 0) & Ring.SONG_FLAG_LENGTH_KNOWN) !== 0;
-    const seek = lengthKnown
-        ? [Ring.OPCODE_SEEK_FRAME, Math.max(0, state.latest?.songFrame ?? 0), 0]
-        : [Ring.OPCODE_SEEK_ORDER, state.latest?.order ?? 0, 0];
-    const commands = [
-        Ring.OPCODE_MASTER_VOLUME, volume, 0,
-        ...seek,
-        Ring.OPCODE_AT_END, playback.effectiveAtEnd() ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT, repeatFadeFrames(),
-        playing ? Ring.OPCODE_PLAY : Ring.OPCODE_STOP, 0, 0,
-    ];
-    for (const [channel, snapshot] of (state.latest?.channels ?? []).entries()) {
-        if (snapshot.muted) commands.push(Ring.OPCODE_MUTE_CHANNEL, channel, 1);
-    }
-    return commands;
-}
-
-function sendCommandsToCurrentGraph(commands) {
-    for (let index = 0; index < commands.length; index += 3) {
-        queueCommand(commands[index], commands[index + 1], commands[index + 2]);
-    }
+async function captureReplacement() {
+    cleanupLiveInput();
+    while (state.fallbackCommands.length) { flushFallbackCommands(); if (state.fallbackCommands.length) await new Promise(resolve => setTimeout(resolve, 10)); }
+    const node = state.node, identity = node.starplayerIdentity;
+    const requestId = state.nextRequestId++;
+    return new Promise((resolve, reject) => {
+        state.pendingStates.set(requestId, { resolve, reject, node, identity });
+        node.port.postMessage({ type: 'captureState', requestId, identity });
+    });
 }
 
 /// How a change to one load option is worded, in the three places `applyLoadOptions` has
@@ -1342,6 +1483,19 @@ async function applyLoadOptions(changedKey) {
         persistPreferences();
         return;
     }
+    // A disabled control can still emit a scripted event while a fresh session installs.
+    // Its cursor/identity cannot rebuild the previously retained module. Preserve the
+    // options actually posted with the latest fresh load, before claiming any revision.
+    let pendingFreshLoad = null;
+    for (const pending of state.pendingLoads.values()) {
+        if (pending.node === state.node && pending.fresh) pendingFreshLoad = pending;
+    }
+    if (pendingFreshLoad) {
+        writeLoadOptionsToControls(pendingFreshLoad.loadOptions);
+        renderLoadOptionsSummary();
+        persistPreferences();
+        return;
+    }
     // After the guard, so a refused change is summarised as what is still loading rather
     // than as what was refused.
     renderLoadOptionsSummary();
@@ -1360,14 +1514,18 @@ async function applyLoadOptions(changedKey) {
     // would then paint the other module's metadata over it.
     const revision = ++state.moduleRevision;
     const node = state.node;
-    const restoreCommands = playbackRestoreCommands();
+    const retainedBytes = state.currentModuleBytes;
     state.loadOptionsReloadInProgress = true;
     state.loadOptionsReloadRequested = requested;
     updateModPanningAvailability();
     clearError();
     showMessage(wording.reloading);
     try {
-        const activation = await activateModuleOnNode(node, state.currentModuleBytes.slice(0), requested);
+        let controlRevision, settingsRevision, replacement;
+        do { controlRevision = playback.controlRevision; settingsRevision = state.sessionSettingsRevision; replacement = await captureReplacement(); }
+        while ((controlRevision !== playback.controlRevision || settingsRevision !== state.sessionSettingsRevision) && revision === state.moduleRevision && node === state.node);
+        if (revision !== state.moduleRevision || node !== state.node || retainedBytes !== state.currentModuleBytes) return;
+        const activation = await activateModuleOnNode(node, retainedBytes.slice(0), requested, replacement);
         if (revision !== state.moduleRevision || node !== state.node) return;
         state.activeLoadOptions = {
             headphoneFriendlyModPanning: requested.headphoneFriendlyModPanning,
@@ -1378,8 +1536,10 @@ async function applyLoadOptions(changedKey) {
         scheduleMediaPosition();
         state.activationMemoryBytes = activation.memoryBytes;
         state.loadCount += 1;
-        sendCommandsToCurrentGraph(restoreCommands);
-        if (playback.stopped) queueCommand(Ring.OPCODE_STOP);
+        if (state.metadata) state.metadata.identity = activation.identity;
+        state.liveInputPending = false;
+        state.liveInputActive = (elements.keyboardEnable.checked || state.midiPort !== null);
+        renderMetadata(); setControlsEnabled(true);
         persistPreferences();
         const reduction = describeEnhancementReduction(requested.enhancementFlags, activation.appliedEnhancementFactor);
         showMessage(`${wording.applied}; playback restored at the sounding order.${reduction ? ` (${reduction}.)` : ''}`);
@@ -1415,8 +1575,9 @@ async function rebuildAudioContext() {
     const moduleBytes = state.currentModuleBytes;
     const revision = state.moduleRevision;
     const controlRevision = playback.controlRevision;
+    const settingsRevision = state.sessionSettingsRevision;
     const oldSinkId = 'sinkId' in oldContext ? oldContext.sinkId : '';
-    const restoreCommands = playbackRestoreCommands();
+    const replacement = state.currentModuleBytes === null ? null : await captureReplacement();
     const contextOptions = { latencyHint: 'interactive' };
     if (requested !== '') contextOptions.sampleRate = Number(requested);
     let candidateContext = null;
@@ -1432,21 +1593,22 @@ async function rebuildAudioContext() {
         const loadOptions = loadOptionsFromControls();
         const activation = state.currentModuleBytes === null
             ? null
-            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions);
+            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions, replacement);
         if (oldSinkId && typeof candidateContext.setSinkId === 'function') {
             await candidateContext.setSinkId(oldSinkId).catch((error) => {
                 elements.outputDeviceNote.textContent = `The previous output device could not be restored (${error.name || error.message}).`;
             });
         }
         await unlock;
-        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || settingsRevision !== state.sessionSettingsRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
         graph.node.connect(candidateContext.destination);
-        if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
+
         state.context = candidateContext;
         installGraph(graph);
         state.latest = null;
         state.activeModeWire = mixerModeFromControls();
         if (activation) {
+            state.metadata.identity = activation.identity;
             playback.rebind(graph.node, activation.generation);
             scheduleMediaPosition();
             state.activationMemoryBytes = activation.memoryBytes;
@@ -1487,7 +1649,8 @@ async function rebuildOutputChannels() {
     const moduleBytes = state.currentModuleBytes;
     const revision = state.moduleRevision;
     const controlRevision = playback.controlRevision;
-    const restoreCommands = playbackRestoreCommands();
+    const settingsRevision = state.sessionSettingsRevision;
+    const replacement = state.currentModuleBytes === null ? null : await captureReplacement();
     let candidateNode = null;
     try {
         const graph = await prepareNode(state.context, channels, mixerModeFromControls(), false);
@@ -1495,14 +1658,15 @@ async function rebuildOutputChannels() {
         const loadOptions = loadOptionsFromControls();
         const activation = state.currentModuleBytes === null
             ? null
-            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions);
-        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
+            : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions, replacement);
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || settingsRevision !== state.sessionSettingsRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
         graph.node.connect(state.context.destination);
-        if (state.currentModuleBytes !== null) sendCommandsToGraph(graph, restoreCommands);
+
         installGraph(graph);
         state.latest = null;
         state.activeModeWire = mixerModeFromControls();
         if (activation) {
+            state.metadata.identity = activation.identity;
             playback.rebind(graph.node, activation.generation);
             scheduleMediaPosition();
             state.activationMemoryBytes = activation.memoryBytes;
@@ -1523,16 +1687,11 @@ async function rebuildOutputChannels() {
 
 function applyMixerMode() {
     persistPreferences();
-    const wire = mixerModeFromControls(state.node === null ? undefined : state.outputChannelCount);
-    if (state.node === null) {
-        state.activeModeWire = wire;
-        updateOutputPanel();
-        showMessage('Mixer choice saved; it will be used when audio starts.');
-        return;
-    }
-    queueCommand(Ring.OPCODE_SET_MIXER_MODE, wire, 0);
-    if (state.commandRing !== null) state.node.port.postMessage({ type: 'flushCommands' });
+    if (state.node === null) { state.activeModeWire = mixerModeFromControls(); updateOutputPanel(); return; }
+    if (!state.node.starplayerInteractiveVersion) { queueCommand(Ring.OPCODE_SET_MIXER_MODE, mixerModeFromControls(state.outputChannelCount)); flushFallbackCommands(); state.node.port.postMessage({ type: 'flushCommands' }); return; }
+    rebuildOutputChannels().catch(showError);
 }
+
 
 // ── insert effects (M7-H7) ───────────────────────────────────────────────────────────
 //
@@ -1602,8 +1761,9 @@ function resetEffects() {
     if (!state.effectsSlotsBuilt) return;
     for (const key of [...state.insertLayout.keys()]) {
         const [target, slot] = key.split(':').map(Number);
+        const previous = state.insertLayout.get(key);
         state.insertLayout.delete(key);
-        sendInsertMessage('remove', target, slot, 0);
+        sendInsertMessage('remove', target, slot, 0, previous);
     }
     elements.effectsTarget.value = String(Ring.INSERT_TARGET_MASTER);
     renderEffectSlotRows();
@@ -1643,8 +1803,11 @@ function renderEffectSlotRows() {
         const installed = state.insertLayout.get(insertLayoutKey(target, slot));
         select.value = installed ? String(installed.wire) : '';
         bypassInput.checked = installed ? installed.bypassed : false;
-        bypassInput.disabled = !installed;
+        const pending = [...state.pendingInserts.values()].some(change => change.target === target && change.slot === slot && Ring.sameIdentity(change.identity, state.node.starplayerIdentity));
+        select.disabled = pending;
+        bypassInput.disabled = pending || !installed;
         renderEffectParams(params, target, slot, installed);
+        for (const input of params.querySelectorAll('input')) input.disabled = pending;
     }
 }
 
@@ -1700,10 +1863,11 @@ function formatParamValue(spec, value) {
 function onEffectSelectChanged(slot, select) {
     const target = Number(elements.effectsTarget.value);
     const key = insertLayoutKey(target, slot);
+    const previous = state.insertLayout.get(key);
     if (select.value === '') {
         if (state.insertLayout.has(key)) {
             state.insertLayout.delete(key);
-            sendInsertMessage('remove', target, slot, 0);
+            sendInsertMessage('remove', target, slot, 0, previous);
         }
         renderEffectSlotRows();
         return;
@@ -1714,7 +1878,7 @@ function onEffectSelectChanged(slot, select) {
     const defaults = {};
     effect.params.forEach((spec, index) => { defaults[index] = spec.default; });
     state.insertLayout.set(key, { wire, params: defaults, bypassed: false });
-    sendInsertMessage('install', target, slot, wire);
+    sendInsertMessage('install', target, slot, wire, previous);
     renderEffectSlotRows();
 }
 
@@ -1727,10 +1891,14 @@ function onBypassChanged(slot, bypassInput) {
 }
 
 /** The allocating half: install or remove, from a worklet message task. */
-function sendInsertMessage(action, target, slot, kind) {
+function sendInsertMessage(action, target, slot, kind, previous) {
     if (state.node === null) return;
     const requestId = state.nextRequestId++;
-    state.node.port.postMessage({ type: 'inserts', action, target, slot, kind, requestId });
+    flushFallbackCommands();
+    const identity = state.node.starplayerIdentity;
+    state.sessionSettingsRevision = (state.sessionSettingsRevision ?? 0) + 1;
+    state.pendingInserts.set(requestId, { target, slot, previous, identity });
+    state.node.port.postMessage({ type: 'inserts', version: state.node.starplayerInteractiveVersion, identity, action, target, slot, kind, requestId });
 }
 
 async function refreshOutputDevices() {
@@ -1819,16 +1987,55 @@ function renderMetadata() {
     elements.seekOrder.max = String(Math.max(0, metadata.orders - 1));
     elements.instrumentCount.textContent = String(metadata.instruments.length);
     elements.instrumentList.replaceChildren();
-    for (const instrument of metadata.instruments) {
+    for (const [index, instrument] of metadata.instruments.entries()) {
         const item = document.createElement('li');
-        const name = document.createElement('span');
-        const length = document.createElement('small');
-        name.textContent = instrument.name || '(empty slot)';
-        // M10-W4: this metadata instance never enhances (`apps/starplayer-web/src/lib.rs`
-        // stays unenhanced), so what it reports is always the stored length before any
-        // enhancement checkbox runs on the worklet's own copy.
-        length.textContent = instrument.length > 0 ? `${instrument.length.toLocaleString()} source frames` : 'no PCM';
-        item.append(name, length);
+        const name = document.createElement('button');
+        name.type = 'button'; name.className = 'instrument-select';
+        name.textContent = instrument.name || `(instrument ${index + 1})`;
+        name.setAttribute('aria-label', `Select instrument ${index + 1}: ${instrument.name || 'empty slot'} for keyboard and MIDI`);
+        name.setAttribute('aria-pressed', String(state.selectedInstrument === index));
+        name.disabled = !state.interactiveReady || !(instrument.capability & 1);
+        name.addEventListener('click', () => selectInstrument(index));
+        const preview = document.createElement('button');
+        preview.type = 'button'; preview.textContent = 'Preview';
+        preview.setAttribute('aria-label', `Preview instrument ${index + 1} at reference note 60`);
+        preview.disabled = !state.interactiveReady || !(instrument.capability & 8);
+        preview.title = instrument.capability & 8 ? 'Reference note 60, using prepared samples and master processing' : 'No playable PCM at reference note 60';
+        const begin = () => {
+            if (!state.interactiveReady) return;
+            state.previewInstrument = index;
+            backgroundOutput.start(); state.context?.resume().catch(showError);
+            queueInteractive(Ring.OPCODE_PREVIEW, index); flushFallbackCommands();
+        };
+        const finish = () => {
+            if (state.previewInstrument !== index) return;
+            if (instrument.capability & 16) queueInteractive(Ring.OPCODE_RELEASE_PREVIEW);
+            state.previewInstrument = null;
+            flushFallbackCommands();
+        };
+        preview.addEventListener('pointerdown', event => { if (event.button !== 0) return; preview.setPointerCapture(event.pointerId); begin(); });
+        preview.addEventListener('pointerup', finish);
+        preview.addEventListener('pointercancel', cleanupLiveInput);
+        preview.addEventListener('lostpointercapture', event => { if (state.previewInstrument === index) cleanupLiveInput(); });
+        let keyboardPreview = false;
+        preview.addEventListener('keydown', event => { if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) { keyboardPreview = true; event.preventDefault(); begin(); } });
+        preview.addEventListener('keyup', event => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); finish(); } });
+        preview.addEventListener('blur', () => { if (state.previewInstrument === index) cleanupLiveInput(); });
+        preview.addEventListener('click', event => { if (event.detail === 0 && !keyboardPreview) { begin(); finish(); } keyboardPreview = false; });
+        const label = document.createElement('label');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox'; checkbox.dataset.instrument = String(index);
+        checkbox.checked = !!state.letNotesRing[index];
+        checkbox.disabled = !state.interactiveReady || !(instrument.capability & 2);
+        checkbox.setAttribute('aria-label', `Let notes ring for instrument ${index + 1}`);
+        label.title = instrument.capability & 2 ? 'Let previous notes finish. An identical note played at the same starting volume on this instrument and channel replaces its earlier sound. Applies only to non-looping samples. Unchecked preserves native behavior, including IT NNA.' : 'Unavailable: no playable non-looping PCM in this instrument';
+        checkbox.addEventListener('change', () => { queueInteractive(Ring.OPCODE_LET_NOTES_RING, index, Number(checkbox.checked)); flushFallbackCommands(); });
+        label.append(checkbox, 'Let notes ring');
+        const status = document.createElement('small');
+        const mixed = (instrument.capability & 6) === 6;
+        status.textContent = instrument.capability & 4 ? (mixed ? '∞ Mixed sample map' : '∞ Looped samples') : instrument.capability & 2 ? 'One-shot samples' : 'No playable PCM';
+        status.setAttribute('aria-label', mixed ? 'Mixed map: looping and non-looping samples; overlap applies only to non-looping notes' : instrument.capability & 4 ? 'Looping samples; note overlap unavailable' : status.textContent);
+        item.append(name, preview, label, status);
         elements.instrumentList.append(item);
     }
     if (metadata.instruments.length === 0) {
@@ -1838,10 +2045,33 @@ function renderMetadata() {
     state.lastPatternKey = '';
 }
 
+function selectInstrument(index) {
+    if (!state.interactiveReady || !(state.metadata?.instruments[index]?.capability & 1)) return;
+    cleanupLiveInput();
+    state.selectedInstrument = index;
+    state.keyboardInstrument = index;
+    elements.inputDestination.value = 'selected';
+    elements.keyboardEnable.checked = true;
+    state.liveInputPending = false;
+    syncLiveInput();
+    renderMetadata(); updateLiveInputPanel();
+}
+
+function cleanupLiveInput() {
+    releaseHeldKeys(true);
+    state.liveRecoveryPending = true;
+    if (state.interactiveReady) { queueInteractive(Ring.OPCODE_STOP_PREVIEW); flushFallbackCommands(); }
+    state.previewInstrument = null;
+}
+
 function setControlsEnabled(enabled) {
-    for (const control of [elements.previous, elements.play, elements.stop, elements.next, elements.seekOrder, elements.volume, elements.progress]) {
+    elements.overlapEnable.disabled = !enabled || !state.interactiveReady;
+    elements.stopPreview.disabled = !enabled || !state.interactiveReady;
+    elements.allSoundOff.disabled = !enabled || !state.interactiveReady;
+    for (const control of [elements.previous, elements.play, elements.pause, elements.stop, elements.next, elements.seekOrder, elements.volume, elements.progress]) {
         control.disabled = !enabled;
     }
+    elements.pause.disabled = !enabled || !state.interactiveReady;
     elements.repeat.disabled = !enabled || playback.playlistMode;
 }
 
@@ -2049,7 +2279,7 @@ function updateProgress(snapshot) {
     elements.progress.disabled = !lengthKnown;
     setText(elements.duration, formatTime(lengthFrames, rate));
 
-    const endReachedStopped = (snapshot.songFlags & Ring.SONG_FLAG_END_REACHED) !== 0 && !snapshot.playing;
+    const endReachedStopped = snapshot.naturalEnd === true;
     if (endReachedStopped) {
         state.pendingSeekFrame = null;
         if (state.scrubbing) return;
@@ -2082,7 +2312,10 @@ function updateSnapshot(snapshot) {
     setText(elements.bpm, String(snapshot.bpm));
     elements.seekOrder.value = String(snapshot.order);
     updateProgress(snapshot);
-    elements.transportChip.textContent = snapshot.playing ? 'playing' : 'stopped';
+    elements.transportChip.textContent = snapshot.transport || (snapshot.playing ? 'playing' : 'stopped');
+    elements.pause.setAttribute('aria-pressed', String(snapshot.transport === 'paused'));
+    elements.play.setAttribute('aria-pressed', String(snapshot.playing));
+    elements.play.textContent = snapshot.transport === 'paused' ? '▶ Resume' : '▶ Play';
     elements.transportChip.classList.toggle('live', snapshot.playing);
     elements.voices.textContent = `${snapshot.voicesActive} ${snapshot.voicesActive === 1 ? 'voice' : 'voices'}`;
     elements.masterPeak.style.width = `${(snapshot.masterPeak * 100 / 65535).toFixed(1)}%`;
@@ -2234,8 +2467,9 @@ elements.dropZone.addEventListener('drop', (event) => {
 elements.dropZone.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') elements.filePicker.click();
 });
-elements.play.addEventListener('click', () => { backgroundOutput.start(); state.context?.resume().catch(showError); playback.userControl('play'); queueCommand(Ring.OPCODE_PLAY); refreshMediaPosition(); });
-elements.stop.addEventListener('click', () => { playlistPlayback.cancel(); playback.stop(); backgroundOutput.pause(); refreshMediaPosition(); });
+elements.play.addEventListener('click', () => { backgroundOutput.start(); state.context?.resume().catch(showError); playback.userControl('play'); queueTransport(state.latest?.transport === 'paused' ? Ring.OPCODE_RESUME : Ring.OPCODE_INTERACTIVE_PLAY); refreshMediaPosition(); });
+elements.pause.addEventListener('click', () => { playback.userControl('pause'); queueTransport(Ring.OPCODE_PAUSE); refreshMediaPosition(); });
+elements.stop.addEventListener('click', () => { cleanupLiveInput(); playlistPlayback.cancel(); playback.stop(); refreshMediaPosition(); });
 elements.previous.addEventListener('click', () => userSeek(Ring.OPCODE_SEEK_ORDER, Math.max(0, (state.latest?.order || 0) - 1)));
 elements.next.addEventListener('click', () => userSeek(Ring.OPCODE_SEEK_ORDER, Math.min((state.metadata?.orders || 1) - 1, (state.latest?.order || 0) + 1)));
 elements.seekOrder.addEventListener('change', () => userSeek(Ring.OPCODE_SEEK_ORDER, Number(elements.seekOrder.value)));
@@ -2247,8 +2481,7 @@ elements.progress.addEventListener('input', () => {
 });
 elements.progress.addEventListener('change', () => {
     const frame = Number(elements.progress.value);
-    userSeek(Ring.OPCODE_SEEK_FRAME, frame);
-    state.pendingSeekFrame = frame;
+    state.pendingSeekFrame = userSeek(Ring.OPCODE_SEEK_FRAME, frame);
     state.pendingSeekSequence = state.latest?.sequence ?? 0;
     state.scrubbing = false;
 });
@@ -2266,17 +2499,22 @@ elements.keyboardEnable.addEventListener('change', () => {
     // Unchecking with a MIDI port still open leaves live input running, so the held notes
     // need their note-offs; unchecking with nothing else open tears the source down, which
     // silences them by itself.
-    if (!elements.keyboardEnable.checked) releaseHeldKeys(state.midiPort !== null);
+    if (!elements.keyboardEnable.checked) cleanupLiveInput();
     syncLiveInput();
     updateLiveInputPanel();
 });
+elements.overlapEnable.addEventListener('change', () => { queueInteractive(Ring.OPCODE_NOTE_OVERLAP, Number(elements.overlapEnable.checked)); flushFallbackCommands(); });
+elements.stopPreview.addEventListener('click', cleanupLiveInput);
+elements.allSoundOff.addEventListener('click', () => { releaseHeldKeys(false); state.previewInstrument = null; queueInteractive(Ring.OPCODE_ALL_SOUND_OFF); flushFallbackCommands(); });
+elements.inputDestination.addEventListener('change', () => { cleanupLiveInput(); state.liveInputPending = false; syncLiveInput(); updateLiveInputPanel(); });
 elements.enableMidi.addEventListener('click', () => enableWebMidi().catch(showError));
 elements.midiInput.addEventListener('change', selectMidiInput);
 // On `window`, not on an element: the keyboard should play wherever the focus is, as long
 // as the focus is not somewhere text is being typed — which `keyboardIsListening` decides.
 window.addEventListener('keydown', onKeyDown);
 window.addEventListener('keyup', onKeyUp);
-window.addEventListener('blur', releaseHeldKeys);
+window.addEventListener('blur', cleanupLiveInput);
+document.addEventListener('focusin', event => { if (state.keysDown.size && !keyboardIsListening({ target: event.target })) cleanupLiveInput(); });
 
 elements.applySampleRate.addEventListener('click', () => rebuildAudioContext().catch(showError));
 elements.applyChannels.addEventListener('click', () => rebuildOutputChannels().catch(showError));
@@ -2318,7 +2556,7 @@ const backgroundOutput = createBackgroundOutput({
 elements.backgroundPlayback.addEventListener('change', () => {
     const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
     elements.backgroundNote.textContent = '';
-    backgroundOutput.setEnabled(elements.backgroundPlayback.checked, !!snapshot?.playing && !playback.stopped);
+    backgroundOutput.setEnabled(elements.backgroundPlayback.checked, !!(snapshot?.playing || snapshot?.transport === 'paused' || snapshot?.live?.active));
     persistPreferences();
     refreshOutputDevices().catch(() => {});
     updateOutputPanel();
@@ -2359,7 +2597,7 @@ const playback = createPlaybackController({
             mediaSession.playing(snapshot.playing);
             // A playlist advance keeps the element playing silence: pausing it between tracks
             // would let a phone drop the media session, and freeze the tab, before the next load.
-            if (state.mediaWasPlaying && !snapshot.playing && !playback.playlistMode) backgroundOutput.pause();
+            if (state.mediaWasPlaying && snapshot.naturalEnd && !playback.playlistMode && !snapshot.live?.active) backgroundOutput.pause();
             const edge = state.mediaWasPlaying !== snapshot.playing;
             state.mediaWasPlaying = snapshot.playing;
             if (edge || (state.mediaPositionDue !== null && performance.now() >= state.mediaPositionDue)) { refreshMediaPosition(snapshot.songFrame); state.mediaPositionDue = null; }
@@ -2368,7 +2606,7 @@ const playback = createPlaybackController({
         refreshMediaHandlers(snapshot);
         return { graph: state.node, snapshot };
     },
-    flushCommands: flushFallbackCommands, stop: () => queueCommand(Ring.OPCODE_STOP),
+    flushCommands: flushFallbackCommands, stop: () => queueTransport(Ring.OPCODE_HOLD_STOP),
     onIntent({ origin }) {
         state.moduleRevision += 1;
         finishArchivePicker(null);
@@ -2381,7 +2619,7 @@ const playback = createPlaybackController({
 });
 const mediaSession = createMediaSession({
     mediaSession: navigator.mediaSession,
-    play: () => elements.play.click(), stop: () => elements.stop.click(),
+    play: () => elements.play.click(), pause: () => elements.pause.click(), stop: () => elements.stop.click(),
     next: () => byId('playlist-next').click(), previous: () => byId('playlist-previous').click(),
     seek: seconds => {
         const length = mediaLengthFrames();
@@ -2403,7 +2641,7 @@ function scheduleMediaPosition() { state.mediaPositionDue = performance.now() + 
 /// cancelled loads, a failed audio start): the engine has been idle for a while and no load
 /// or playlist advance still owns playback. The grace covers a load that has just activated.
 function reconcileKeepAlive(snapshot) {
-    const busy = snapshot?.playing || playback.loading || playlistPlayback.pending !== null;
+    const busy = snapshot?.playing || snapshot?.transport === 'paused' || snapshot?.live?.active || state.liveInputActive || state.previewInstrument !== null || playback.loading || playlistPlayback.pending !== null;
     if (busy || backgroundOutput.audio.paused) { state.keepAliveIdleSince = null; return; }
     const now = performance.now();
     state.keepAliveIdleSince ??= now;
@@ -2428,10 +2666,13 @@ playlistControls.setRender(() => playlistView.render());
 function userSeek(opcode, frame) {
     playlistPlayback.cancel();
     playback.userControl('seek');
-    queueCommand(opcode, frame);
     const snapshot = state.telemetry ? Ring.readTelemetry(state.telemetry) : state.latest;
+    // The displayed fade margin is output time, not additional sequenced music.
+    if (opcode === Ring.OPCODE_SEEK_FRAME && (snapshot?.songFlags & Ring.SONG_FLAG_LENGTH_KNOWN) !== 0 && snapshot.songLengthFrames > 0) frame = Math.min(Math.max(0, frame), snapshot.songLengthFrames - 1);
+    queueCommand(opcode, frame);
     refreshMediaPosition(opcode === Ring.OPCODE_SEEK_FRAME ? frame : snapshot?.songFrame);
     scheduleMediaPosition();
+    return frame;
 }
 const libraryView = createLibraryView({ playlist, play: playLibraryRow });
 await wireLibraryControls({ state, loader: Loader,

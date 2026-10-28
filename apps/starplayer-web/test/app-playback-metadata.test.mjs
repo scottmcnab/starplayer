@@ -21,8 +21,8 @@ function setup() {
         module_metadata() { events.push('structured'); return JSON.stringify({ title: inspected, format: 'mod', channels: 4, instrumentNames: 'Samples', sampleNames: '', songMessage: '' }); },
     };
     const sandbox = {
-        state, Loader, Uint8Array,
-        loadEffectNames() { events.push('effects'); }, readMetadata: label => { events.push('display'); return { title: inspected, label, isMod: true }; },
+        state, Loader, Uint8Array, playback: { controlRevision: 0 },
+        loadEffectNames() { events.push('effects'); }, readMetadata: label => { events.push('display'); return { title: inspected, label, isMod: true, instruments: [] }; },
         showMessage() {}, loadOptionsFromControls: () => ({}), activateModuleOnNode: async (node, buffer) => {
             // The worklet path transfers the original; metadata must use retained bytes.
             structuredClone(buffer, { transfer: [buffer] });
@@ -30,7 +30,7 @@ function setup() {
         },
         libraryView: { setPlaying() {} }, renderMetadata() {}, playlist: { entries: [] }, mediaSession: { metadata() {}, position() {} },
         scheduleMediaPosition() {}, backgroundOutput: { start() {} }, setControlsEnabled() {}, releaseHeldKeys() {}, syncLiveInput() {},
-        queueCommand() {}, queueRepeatCommand() {}, Ring: {}, elements: { volume: { value: 100 } }, describeEnhancementReduction: () => '',
+        queueCommand() {}, queueInteractive() {}, queueRepeatCommand() {}, Ring: {}, elements: { volume: { value: 100 }, overlapEnable: {}, inputDestination: {} }, describeEnhancementReduction: () => '',
         setTimeout() {}, requestGarbageCollection() {},
     };
     vm.createContext(sandbox);
@@ -145,4 +145,57 @@ test('library labels omit empty titles/separators and never mark a replacement v
     waiting.resolve({ status: 'played' });
     await pending;
     assert.deepEqual(played, []);
+});
+
+
+test('Stop/cancel during an installed pending load cannot issue automatic Play or commit metadata', async () => {
+    const fixture = setup();
+    const activation = deferred();
+    const sent = [];
+    fixture.sandbox.queueCommand = (...command) => sent.push(command);
+    fixture.sandbox.queueInteractive = (...command) => sent.push(command);
+    fixture.sandbox.activateModuleOnNode = () => activation.promise;
+    let current = true;
+    fixture.context.isCurrent = () => current;
+    const pending = fixture.activate(new Uint8Array([1]).buffer, 'cancelled.mod', fixture.context);
+    await settle();
+    current = false; fixture.sandbox.playback.controlRevision += 1;
+    activation.resolve({ generation: 9 });
+    assert.equal(await pending, null);
+    assert.equal(sent.length, 0);
+    assert.equal(fixture.state.loadCount, 0);
+});
+
+test('Pause during a pending fresh activation wins over its default automatic Play', async () => {
+    const fixture = setup();
+    const activation = deferred(); const sent = [];
+    fixture.sandbox.Ring.OPCODE_INTERACTIVE_PLAY = 13;
+    fixture.sandbox.Ring.OPCODE_RESUME = 15;
+    fixture.sandbox.queueCommand = (...command) => sent.push(command);
+    fixture.sandbox.queueInteractive = (...command) => sent.push(command);
+    fixture.sandbox.activateModuleOnNode = () => activation.promise;
+    const pending = fixture.activate(new Uint8Array([1]).buffer, 'paused.mod', fixture.context);
+    await settle();
+    fixture.sandbox.playback.controlRevision += 1;
+    fixture.state.lastTransportOpcode = 14;
+    activation.resolve({ generation: 10 });
+    assert.equal((await pending).generation, 10);
+    assert.equal(sent.some(command => command[0] === 13 || command[0] === 15), false);
+});
+
+test('cancel after audio installation disables old-metadata controls until another load', async () => {
+    const fixture = setup(); const activation = deferred(); const disabled = [];
+    const old = { session: 1n, build: 1n }, installed = { session: 2n, build: 2n };
+    fixture.state.metadata = { identity: old }; fixture.state.currentModuleBytes = new ArrayBuffer(1);
+    fixture.sandbox.Ring.sameIdentity = (left, right) => left?.session === right?.session && left?.build === right?.build;
+    fixture.sandbox.setControlsEnabled = enabled => disabled.push(enabled);
+    fixture.sandbox.updateLiveInputPanel = () => {};
+    fixture.sandbox.activateModuleOnNode = () => activation.promise;
+    let current = true; fixture.context.isCurrent = () => current;
+    const pending = fixture.activate(new Uint8Array([1]).buffer, 'cancelled.mod', fixture.context); await settle();
+    current = false; fixture.state.node.starplayerIdentity = installed; fixture.state.interactiveReady = true;
+    activation.resolve({ generation: 9, identity: installed }); assert.equal(await pending, null);
+    assert.equal(fixture.state.interactiveReady, false); assert.equal(fixture.state.liveInputActive, false);
+    assert.equal(fixture.state.currentModuleBytes, null); assert.deepEqual(disabled, [false]);
+    assert.equal(fixture.state.metadata.identity, old);
 });

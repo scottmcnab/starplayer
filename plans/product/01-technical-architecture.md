@@ -493,7 +493,8 @@ pub enum DuplicateCheck { Off, Note, Sample, Instrument }
 pub enum DuplicateAction{ Cut, NoteOff, NoteFade }
 ```
 
-MOD/S3M/MTM simply never create a background voice. `NewNoteAction::Cut` +
+Canonical MOD/S3M/MTM never create a background voice; NO-04's explicit optional
+custom-tail behavior is described below. `NewNoteAction::Cut` +
 `DuplicateCheck::Off` early-outs the whole DCT matching loop. Cost to the simple path:
 four bytes per voice and one branch.
 
@@ -619,9 +620,12 @@ bend and a fixed array of held notes. It consumes `Event`s and reports `Trigger`
 unsupported: the tracker vocabulary is a **peer** of the musical one (§2.4), never a
 lowering of it.
 
-Neither implementation runs envelopes, fadeout, NNA or auto-vibrato. Giving a MIDI-driven
-XM or IT instrument its format's own articulation is M11's deliverable, and Q4 — whether
-this surface survives a non-sample instrument — is still M10's to settle.
+These legacy implementations remain sample-only. NO-06 adds the explicitly prepared
+rack: one mutable, pool-indexed `RackRuntime`, with real XM and IT implementations,
+serves every program. Native articulation and RNG belong to that rack, separate from
+the tracker. The facade `prepare_instrument_rack` selects Song scope (lanes0–15, N/C)
+or, with interactive-audition, Live scope (lanes64–80, L). `prepare_live_rack` is the Live
+wrapper. M11 continues to own extraction/library work; legacy constructors do not opt in.
 
 **Owner decision, 2026-09-03** (the history this replaced) (`plans/engine/M3-M6-concurrency-plan.md`, delivered by
 M4-lite task E3): the extraction moves to **M4-full**, and XM and IT are implemented
@@ -640,11 +644,14 @@ Until then the division is:
   the channel table and the foreground binding, `ChannelTable::detach_foreground` (the
   NNA primitive), `VoicePool::iter_mut` (the per-tick walk), and the trace.
 - **Format-owned, in each format crate** — all per-voice articulation: envelope
-  positions, fadeout level, key-off flag, auto-vibrato phase. Each format keeps it in a
-  **parallel array indexed by `VoiceId::index()` and validated by the id's generation**,
-  and advances it from inside its own `TrackerProcessor::tick()` by walking
-  `VoicePool::iter_mut()`. A slot the format did not allocate shows an id that does not
-  match the one it stored, so it is skipped rather than adopted.
+  positions, fadeout level, key-off flag, auto-vibrato phase. NO-02 extracts concrete
+  `XmArticulationRuntime` and `ItArticulationRuntime`; neither implements a speculative
+  live trait. IT keeps its native slot array and shared song RNG. XM keeps a foreground
+  working `XmVoiceState` beside channel effect memories; explicitly prepared optional
+  hosts also keep generational slot snapshots after native flush. Neither-feature and
+  compiled-but-legacy XM constructors allocate no slot table. Admission validates the
+  actual pool generation; subsequent operations reject stale generations, and retiring
+  entries receive no further articulation writes.
 
 `TrackerProcessor::recommended_voice_capacity(channel_count)` is how the pool and that
 parallel array are sized from one number. Its default is the channel count — MOD, S3M and
@@ -652,11 +659,42 @@ MTM sound one voice per channel and never detach — and a format with a paralle
 sizes its answer from the format's limit. A pool **larger** than the answer is legal, and
 is what a persistent host builds: `MAX_VOICE_CAPACITY` is 272 after M4-E7, IT's 256
 virtual channels plus sixteen reserved for MIDI jam voices. IT's ID-indexed articulation
-array covers all 272 global slots while its allocator still caps IT-owned voices at 256,
+array defaults to 272 global slots while its allocator still caps IT-owned voices at 256,
 so MIDI occupying a low slot cannot push an IT voice beyond its state and IT cannot
 consume the reserve. A pool **smaller** is legal too — fewer voices sound.
 
+**NO prepared articulation and capacity:** configured HostEngine/Player,
+source builders and facade constructors now thread the actual N+C+L+R capacity to format
+storage, with preparation failures returned before dispatch. Capacity-only constructors
+preserve legacy behavior; explicit articulation preparation is separate. Loaded-module
+audition uses one mutable
+live format runtime per rack, with pool-indexed state for all its programs and independent
+RNG. Immutable program definitions keep sample/map data. The rack-level mutable interface
+landed together with real XM and IT implementations; format crates retain ownership
+and the facade constructs them. Prepared pool capacity is N+C+L: native capacity (IT 256,
+otherwise channel count), custom tails (web 64), shared jam/audition (web 16, including the
+existing jam reserve). Persistent web active capacity is 336; physical capacity is 339 including one bounded
+retirement slot per domain. Retiring voices retain ownership but not active quota; domain
+pressure hard-releases its oldest already-retiring voice before admission. Legacy defaults
+remain unchanged even when Cargo features unify; interactive runtime settings opt in. All per-slot state is sized to the
+actual prepared pool; native IT quota/victims exclude custom and live domains. One
+engine-owned generation/provenance/age record is authoritative. Custom voices use oldest
+custom eviction, all live voices oldest live eviction; native IT keeps its native policy.
+
 ### 5.4 The control clock
+
+**Implemented on the NO feature branch:** explicitly prepared XM/IT live articulation consumes
+one engine-owned cadence: tracker ticks during playback and synthesised retained/initial
+cadence while held or without an active tracker (configured 50 Hz without a module).
+The MIDI 1 ms clock must not also advance format envelopes. Cadence deadlines split the
+render loop; a provided post-source EventSource hook, forwarded by SourceMux, dispatches
+live articulation after due source events at the exact frame. At equal frames native
+sequenced processing precedes live events and one live articulation step; held song
+articulation advances on control-only steps. Resume rejoins the saved tracker deadline
+once. NO-02 now provides `TrackerProcessor::control_step` (default no-op), with real
+XM/IT implementations that run no row/effect/flow/trace-row events. NO-03 supplies its
+non-sequencing dispatch and cadence; NO-06 supplies the native live consumer.
+The historical MIDI behavior below remains for unconfigured legacy racks.
 
 XM and IT envelopes, auto-vibrato, fadeout and NNA advance **exactly once per tracker
 tick** — not per sample, not per buffer. Rather than special-casing this, the control
@@ -679,8 +717,10 @@ engine rate (~1 ms), reports `min(feed, control)` as its next event frame, and t
 from inside its own `dispatch`. Nothing in the engine changed for it — the render loop
 already splits its segments at whatever frame a source reports — and the engine's own
 synthesised clock keeps running alongside, unread by the source, so a tracker taking that
-clock over cannot silence a MIDI instrument. Revisit when M11 gives MIDI instruments
-envelopes and the two rates have to agree about something.
+clock over cannot silence a legacy MIDI instrument. NO-06 explicitly prepared racks
+instead consume the engine's shared native articulation cadence and report only feed
+events as source deadlines. Onset initializes native output immediately; a coincident
+post-source hook skips that onset, and subsequent ticks advance it exactly once.
 
 **Where this stands after M4-lite (task E3).** With a tracker sequencer driving, the
 tracker tick *is* the control tick — `PatternSequencer::dispatch` calls
@@ -1249,7 +1289,33 @@ about it.
 
 ---
 
+**Implemented NO interactive transport:** interactive Pause holds sequencing
+and progress while sample mixing, live input, DSP and format articulation continue.
+Tracker and SMF are sequenced sources; keyboard/MIDI are live. Preserve pending tick
+fractional remainder and translate absolute song origin/deadlines by held audio time.
+The host Player/Transport layer must freeze fade elapsed time, end arming and settlement,
+without ramping to silence. A permanent live mux slot supports previews without replacing
+the sequencer. Initial interactive Stopped keeps unity output gain; natural end clears into
+that state with rewind armed for the next Play. Held seek repositions without dispatching
+a tick and rebases the hold baseline at the seek frame. Interactive Stop holds position, cancels fade/rewind state,
+and clears sound with bounded ramps, leaving new live input audible. Legacy commands
+retain their contracts. Interactive seek clears song voices before processor reset,
+preserves audition and mode; legacy seek remains unchanged. Session identity survives
+renderer/enhancement rebuild, build generation does not; Player shadows and replays state.
+See the NO master for boundary ordering, cleanup scopes and rebuild details.
+
 ## 9. Telemetry
+
+**NO implemented telemetry contract:** retain 64 tracker telemetry lanes
+and publish a separate live summary. With interactive audition the channel table admits up to 64+17
+lanes: 16 shared jam/selected-input lanes plus a button-preview lane at fixed IDs 64–80,
+all outside tracker insert buses and mixed through spill/master DSP. Insert bus_count is
+decoupled from table length and capped at 64. Preserve legacy constants/constructors even
+with features compiled; web opts into runtime interactive settings.
+Control-only cadence publishes meters/voice counts while paused/stopped; transitions and
+clears publish promptly. Explicit transport/natural-end state replaces falling-playing
+edge inference. Interactive wire commands use negotiated atomic generation-bearing
+records; metadata and acknowledgements are correlated with session/build identity.
 
 A single triple-buffered snapshot does not work for oscilloscopes: 32 channels × 512 f32
 is 64 KB per snapshot, ×3 buffers, copied at UI rate. Split it:
@@ -1759,3 +1825,393 @@ An override would therefore be a knob with no question behind it, and a second b
 for every buffer-size-independence test to keep honest. The one result that would reopen
 this is a cycles-per-frame figure showing the per-quantum fixed cost dominating the
 per-sample cost; the measurement that would show it is the budget document's §3 table.
+
+## Optional note overlap and interactive transport
+
+The [NO master plan](../engine/NO-master-plan.md) specifies explicit, session-only
+instrument-only note overlap and faithful instrument audition for all five formats. This
+has completed external review and corrections (see the NO review log), and implementation
+was authorised on 2026-10-27. NO-01 supplies the contracts/preparation described below;
+NO-02 adds concrete native articulation, NO-03 adds interactive transport, and NO-04
+implements opt-in MOD/S3M/MTM overlap. NO-05 implements XM/IT overlap; NO-06 implements
+faithful prepared native live audition and NO-W1 its web controls. The combined feature
+remains on the feature branch after NO-07 source review/verification, pending feature and
+main landing plus owner listening/device acceptance.
+Each instrument has a Let notes ring boolean, with a separate Enable note overlap global
+bypass preserving selections. There are no channel overrides, inheritance or custom modes.
+Enabled eligible voices continue except when instrument, original note, exact onset base
+volume and originating channel all match; later effects do not change this identity.
+Capture every new voice passively, even while unchecked/bypassed, after onset-tick base
+volume setters/fine slides but excluding tremolo/tremor and separate gains. Live matching
+uses event-velocity-derived base volume before CC7; explicit note-off still releases
+detached held voices. Custom live tails stay in L and carry custom-detachment provenance
+so global bypass clears them without clearing native-created backgrounds.
+Unchecked/bypassed/ineligible voices retain native behavior, including authored IT NNAs.
+Canonical MOD/S3M/MTM/XM never create background voices; NO-04's runtime opt-in exception
+for MOD/S3M/MTM preserves that default and native IT behavior.
+
+The design separates held tracker sequencing time from advancing audio/live-input time
+and format-owned articulation. Pause leaves mixing, envelopes and DSP running; interactive
+Stop clears sound while holding sequence position. Existing hosts retain their legacy
+Stop contract unless they select the new interactive command. XM background articulation
+and faithful prepared native live playback use the format-owned runtimes.
+
+Optional `note-overlap` and `interactive-audition` features remain off in reusable-crate
+defaults and embedded builds, enabled explicitly by the web host. They preserve no_std,
+fixed 128-frame DSP quanta, exact event splitting, allocation-free rendering and
+block-size-independent output. See the master for onset-volume matching, global bypass, loop exclusion,
+capacity budgets and native IT isolation; implementation must reconcile the relevant
+architecture sections as each deliverable lands.
+
+
+### NO-01 implemented API contracts
+
+`starplayer-core::interactive` defines separate `SessionId` and `BuildGeneration`, an
+atomic logical `InteractiveCommand` envelope, capability bits and transport/action types.
+The types alone do not execute transport changes or assign wire opcodes. `Command::Stop` and
+all existing command values retain their contracts. NO-03 supplies command execution and
+NO-W1 the negotiated wire envelope.
+
+`starplayer_engine::LaneLayout::interactive` rejects tracker widths above 64 and maps
+hardware MIDI channels 0–15 strictly to lanes 64–79, with lane 80 reserved for button
+Preview. It requires compiled audition support. `ChannelTable::try_with_layout` retains
+all 81 lanes. Tracker insert buses and scope/telemetry channels remain at most 64; live
+voices pass through spill/master DSP. Public legacy MIDI mapping helpers and constructors
+keep their 48/64/272 limits even when Cargo features unify. Rack routing reads the table's
+layout; host event senders/SMF remain legacy until the configured host plumbing in NO-02/06.
+
+Reusable engine/facade/format features default off. Web packages default both features on,
+but Cargo features alone enable no runtime reservations. Optional `EngineSettings::playback`
+is `None` by default; `with_playback` explicitly prepares budgets, and `interactive_web`
+provides the persistent web configuration (256 native + 64 custom + 16 shared live + 3
+retirement = 339 slots). `Engine::try_with_settings` rejects mismatched pool capacity and
+unsupported interactive widths before playback. NO-02 threads the prepared capacity and
+configuration through concrete format/host constructors and sizes their articulation;
+that preparation plumbing is implemented in NO-02. `HostEngine::build_with_settings`,
+`Player::open_with_settings` and `build_source_with_settings` preserve runtime settings
+through module installation/rebuilds; plain `build`/`open` remain legacy. An unconditional
+settings query prevents feature unification from silently dropping a configured source's
+articulation; a facade without that support rejects explicit preparation.
+
+One optional `PlaybackState` on `ChannelTable` owns per-generation age/provenance/lifecycle
+records. It compiles with either feature, is absent with neither, and allocates only at
+preparation. Per-instrument booleans exist only with `note-overlap`; the boolean table is
+empty unless that runtime capability was configured. Bounded setters validate both session
+and build, and global bypass preserves selections and returns a custom-tail clear request.
+NO-03 executes that request with release ramps; NO-04/06 attach their domain cleanup.
+Explicit new sessions construct false selections/global state; same-session rebuild replay
+belongs to Player in NO-03. These retained selections are session state, never presets.
+
+Resource domain N/C/L is separate from custom detachment and from live cleanup origin
+(Jam, SelectedInput, ButtonPreview). Live custom tails remain in L. Shared native detach
+marks Background, and the atomic custom-detach helper marks provenance before unbinding;
+a native-created background cannot migrate to C after a checkbox change. The live-origin
+setter validates generation and lane/source compatibility; NO-06 sets selected-input origin
+synchronously on admission before mixing. All three live origins share one L quota.
+Scoped predicates cover all/song/live/lane/custom-detached/origin cleanup. Retiring voices
+retain domain/age/generation, leave active admission counts and cannot become active again.
+Oldest selection is deterministic by age then slot; native IT retains its format victim
+policy. NO-03 enforces domain admission and bounded retirement ramps for the prepared runtime.
+
+`TriggerIdentity` keeps the existing zero-based `InstrumentId`, exact original note
+(including raw MOD periods), originating channel and an exact native `u16` base-volume
+value, with no rescaling or tolerance. `TickContext::finalize_onset` accepts it once after
+all onset-tick effects, and passively records even while unchecked/global-bypassed. It
+rejects rewrites, invalid IDs, stale voices and retiring voices; identity survives native
+key-off/fade/NNA release until slot reclamation/reuse. `TriggerKind` distinguishes actual
+musical onset from effect retrigger/sample replacement; the allocation helper alone does
+not decide this. NO-04/05 wire the format-specific post-effects capture and duplicate
+replacement, including delayed starts. NO-05 captures XM `real_volume` after onset-tick effects. NO-06 wires live
+native resolution; `NoteParams::raw_velocity` already preserves event velocity separately
+from CC7-scaled playback velocity. Native-format tests cover existing velocity-resolution collisions without
+identity-only quantization.
+
+
+### NO-03 interactive transport and replacement boundaries
+
+Explicit interactive preparation keeps engine audio/source time monotonic while tracker
+and SMF sources hold their musical cursor. Legacy Stop remains unchanged. Tracker cadence
+is the sole native-articulation authority: slot 0 controls held song voices before live
+events; the post-source hook controls live articulation after all due events. Resume
+translates deadlines without resetting the fractional clock. First audio attachment also
+translates prepared tracker/SMF deadlines and origin by the preparation-to-install delay,
+once; live event timestamps stay absolute. Synthesised Q32.32 cadence intervals clamp to
+at least one output frame, retaining valid fractional phase. Each cadence publishes one
+coherent tracker/live/transport snapshot; command transitions publish once at the end of
+the bounded engine command drain so a burst cannot fill the telemetry ring with intermediate states.
+
+Clear scopes invalidate bindings immediately and preserve retiring ownership until bounded
+voice ramps finish. Domain admission may recycle only the oldest already-retiring slot of
+that domain. Global clears reset DSP state with a 64-frame additive continuity bridge,
+never a persistent gain mute. New input remains admissible while old voices retire.
+IT channel memory records actual accepted-start history, then explicit Song/All/lane
+sound clears until a genuine note is accepted. This prevents instrument-only synthetic
+restarts after a clear while preserving native first instrument-only C0 starts on fresh
+Stopped/setup and native restarts after natural sample completion. Live-only/custom-tail cleanup leaves this memory alone.
+A genuine IT note-only recovery resolves remembered instrument mapping without treating
+it as an authored instrument column: current base volume, IFC/IFR filter memory and
+passive onset-volume identity survive; only an actual instrument change replays defaults.
+Interactive seek validates musical bounds on audio before clearing Song and requesting a
+DSP reset through a dispatch-local signal. The engine consumes that signal before whole
+quantum insert processing; invalid seeks preserve voices and delay state. This adds no
+Engine storage/allocation and compiles out with interactive audition disabled.
+
+Player preserves interactive mode through held seeks, routing changes and renderer
+replacement, with permanent sequenced/live source slots. NO-03 supplies the live placeholder;
+NO-06 installs the native audition rack. Tracker replacement retains the logical tick/flow
+cursor and pending fractional deadline, but reconstructs processor working state and clears
+voices. Loop visit marks are reconstructed from the scan; arbitrary modified runtime visit
+history is not transferred. Pure Pause/Stop within the same renderer preserve effect memory.
+A coherent host snapshot also preserves fade gain/elapsed and armed natural-end rewind.
+
+Interactive SMF replacement retains parsed file data on the control side, event index,
+song/pending-event time and program/volume/pan/bend/sustain state. It restores no held notes
+and dispatches no past events. Sequenced MIDI uses song lanes 0–15; generic live racks keep
+their configured live base. Sample-rate changes convert saved durations before resuming.
+The legacy SMF length-return/caller-owned completion policy remains unchanged.
+
+The heavy tracker/SMF rebuild fields in telemetry are gated by its no_std
+`interactive-audition` feature, forwarded weakly by the engine. Feature-off snapshots do
+not reserve their storage; stable query methods return None. Host-local capability checks
+reject preparation when Cargo dependency feature unification enabled engine features but
+this host did not compile the required forwarding hooks. Legacy settings remain valid.
+
+
+### NO-04 legacy overlap and actual sample identity
+
+MOD and native MTM's shared effect core, and S3M's separate processor, classify musical
+starts explicitly and finalize after their onset-tick effects at the event frame.
+MOD keeps the exact packed input period; MTM keeps its native linear note and S3M its
+resolved semitone. EDx/SDx carry musical cause until the actual delayed trigger. Native
+E9x/Qxy and sample revival transfer the prior immutable identity across mixer generations
+without custom detachment or duplicate processing. MOD Cxx/EAx/EBx, S3M fine slides and
+Qxy's supported tick-zero volume operation precede capture; tremor and later effects do
+not rewrite it. The existing S3M fast-volume-slide flag gap is recorded in the accuracy
+policy and is not repaired by this creative feature.
+
+`engine::overlap` is a concrete shared helper, not a trait or another ownership table.
+`ChannelTable::{custom_overlap_candidate,prepare_note_overlap,
+replace_note_overlap_duplicates}` separate candidate eligibility, song foreground N→C
+admission/detachment, and post-onset replacement. NO-05 consumes these stages around
+native XM/IT processing. Eligibility checks the actual mixer sample tag against its PCM
+region and both normal/sustain model loops; aliases cannot borrow one-shot eligibility
+from another sample. The current sounding instrument's checkbox decides survival; the
+immutable original trigger instrument/note/volume/channel selects duplicates. Retiring
+voices are excluded. Native-created backgrounds keep N; the helper never migrates them.
+NO-06 integrates live held instances and L admission with the shared predicate
+and replacement scan.
+
+An opted-in MOD queued swap carries instrument/sample metadata alongside its pending PCM.
+Adoption and retrigger update the actual tag at the same boundary; successful custom
+detachment discards both pending parts. Pending metadata is compiled only with overlap,
+packed into existing mixer slot padding, and absent from the embedded/default feature
+graph. The original 168-byte x86_64 slot-stride assertion remains unchanged. A queued
+one-shot-to-one-shot swap still ends natively rather than inventing a reload. MOD's
+out-of-range 9xx retained-pointer one-word fallback really starts, so it has onset
+identity; raw out-of-range one-shots in MTM/S3M do not create a tail or onset.
+
+Custom tails preserve actual sample, parameters and originating channel routing. C admits
+oldest-custom eviction with stable slot tie-break and the per-domain retirement fallback;
+unavailable custom capacity leaves native replacement and increments bounded diagnostics.
+Natural completion/reuse reclaims ownership. Legacy seek/restart retains still-sounding
+custom ownership, while interactive seek, Stop and bypass consume the scoped retirement
+contracts. No new canonical effect semantics or golden data change.
+
+Persistent Player loads prepare an actual-module-sized selection box off the callback,
+including SMF instrument modules; a zero/stale initial count is not an instrument limit.
+The engine swaps only that box/count, preserving authoritative voice ownership, and
+retires the old box with the old source. Explicit loads reset session selections/global;
+same-session installations/rebuilds retain/replay them and update stored settings bounds.
+Prepared loads defer as a whole, in order, when retirement or engine-command room is
+unavailable. One pending command and one prepared load per quantum bound ownership;
+one retirement entry is reserved for the old module after engine dispatch. Control-side
+garbage collection unblocks installation without any callback allocation or drop.
+
+
+### NO-05 XM/IT overlap integration
+
+XM retains its per-channel effects → foreground articulation → flush ordering. The old
+voice's slot snapshot is independent of incoming channel effects; after that flush,
+custom backgrounds advance once in slot order for their originating channel, before the
+next channel. Thus two Gxx commands in a row expose each channel's current global volume
+to its own backgrounds. Native unbound stop ramps are not custom backgrounds and receive
+no new articulation writes. Detached trace records use the voice seam, not extra channel
+events. XM's immutable onset base is `real_volume`; IT's is `note_volume`.
+
+IT preserves the native early NNA/DCT seam. Each candidate's current actual sample and
+checkbox decide its rule independently of ownership. Eligible outgoing foregrounds move
+N→C before instrument defaults; exact matching waits for the new generation's post-effects
+base volume. Original trigger notes remain independent of transpose maps. Note-only and
+pending mapped-instrument resolution survive custom detachment without replaying defaults.
+Native quota/victim decisions consult authoritative N ownership and exclude C, L and
+retiring generations. Native-created backgrounds stay N across checkbox changes.
+
+Context-free processor reset/public sequencer seek resets channels immediately and marks
+slot cleanup pending. Before the next row/tick/control callback can advance retained
+storage, the format queries PlaybackState and keeps only still-valid C generations;
+native and stale snapshots are discarded. This retains sounding custom articulation
+without changing canonical native legacy-reset behavior or adding a provenance table.
+Interactive seek/Stop/bypass already retire their scopes through NO-03, so their slots
+receive no further effects/articulation writes. At native quota an existing authoritative
+N foreground remains a net-zero replacement after its runtime snapshot was reset.
+The pre-existing native IT note-only/NNA mapping gap is documented in the accuracy policy.
+
+### NO-06 live reference convention
+
+The configured adapter preserves the existing live convention documented in M4-E4:
+XM input note60 selects native sample-map entry60, but plays the8363 Hz reference
+before relative-note/finetune adjustment. The equivalent native XM tracker pitch is
+zero-based48 (cell49), not zero-based60 (cell61). Mapping and pitch conversion are
+independent, and tests must demonstrate both without silently remapping fixtures.
+IT input60 uses native map60 and native reference60 directly. This is an explicit
+live-input adapter convention, not a change to canonical tracker note numbering or
+unconfigured legacy rack output.
+
+### NO-06 prepared SMF cadence gate correction
+
+Source review found NO-03 gated the shared cadence/post-source hook solely on
+interactive-audition, although an explicitly prepared overlap-only SMF rack also needs
+native articulation. The shared cadence and prepared Song rack are available under
+either optional feature, activated only by a prepared source. Song uses lanes0–15,
+N native quota and C custom tails. Live uses lanes64–80 and L, and remains gated by
+interactive-audition together with Pause/held transport, routing and Preview commands.
+Unconfigured SMF/racks retain the original1ms sample-only behavior, even under feature
+unification; neither-feature builds construct none of this optional machinery. No new
+product switch or default behavior is introduced. This bounded gate correction was
+approved by the coordinator from the existing master contract.
+
+### NO-06 installed runtime and controller contract
+
+Prepared native racks capture original input note (including cents), MIDI identity lane,
+exact instrument and pre-CC7 native base volume for every actual onset. XM resolves that
+base to0–64, IT to0–256: distinct raw velocities can legitimately collide at the native
+resolution. CC7 and CC10 retain their existing next-note latch semantics. A sounding
+instance retains its onset CC7 gain across envelope steps; bend applies to held foreground
+and detached instances without advancing envelope or auto-vibrato phase. Original
+identity is never rewritten by controllers, release, modulation or sample tags.
+
+Held instances contain VoiceId/generation, note, lane, pedal and onset gain only;
+PlaybackState remains the sole domain/lifecycle/age/provenance authority. Key-up/pedal-up
+find detached held voices even after checkbox changes. Native released backgrounds keep
+their immutable identity until terminal release, while retiring/stale generations neither
+match replacement candidates nor consume native articulation/RNG. Current sounding
+sample loops determine replacement eligibility independently of original note identity.
+
+Interactive hosts install source1 before Play and retain it while paused/stopped/ended.
+Bounded destination/program/preview changes clear the matching audition voices without
+rebuilding source0. Normal one-shot button release permits completion; looping release
+uses native release. Stop-preview clears L, CC120 clears its lane, user Stop/global
+all-sound-off clear all, and interactive seek retains L. Recoverable input queue overflow
+emits all-notes-off and records a bounded diagnostic counter. Runtime/table preparation
+and module ownership stay off render; both native adapters validate capacity before
+admission and roll back a failed runtime start.
+
+### NO-W1 web bridge and renderer handoff
+
+The web host explicitly opts into interactive settings; compiling optional features alone
+still leaves reusable constructors at legacy defaults. The page negotiates command
+version2 before enabling audition/overlap. Its atomic seven-word records retain opcode,
+argument and extra and add four u32 words for the complete u64 session/build identity.
+Version2 protects existing seek/mute/insert opcode values too. Legacy version1 triples
+retain their behavior; opcodes2 (legacy Stop) and7 (mixer replacement) remain v1-only, with interactive renderer changes using
+the versioned replacement-message path. Fallback envelopes carry the same identities as
+BigInts, converted off render. Ring consumers pass scalar words directly to Rust.
+
+Player publishes an applied barrier coherently with audio-side installation and host
+transport. A seeded engine identity or control shadow is insufficient: installation and
+full replay must have rendered, with no preceding rejection, before the worklet reports
+ready or admits Preview/MIDI notes. Prepared loads retain NO-04's ordered retirement
+backpressure. The worklet publishes from a fixed status block and reused acknowledgement
+arrays; full-width serials and rejection baselines prevent later markers from concealing
+an earlier failed transaction. Large master/mute/insert replay is prepared in message
+tasks and bounded across quanta before the final ready barrier.
+
+`Player::{replacement_state,load_replacement}` provide a versioned, field-wise u64-word
+handoff between independent WASM memories. The codec runs off render, validates narrow
+fields, modes, row budgets and safe transport ramp trajectories, and preflights command
+capacity before installation. It retains the NO-03 complete cursor, exact integer ramp,
+fade/rewind, routing and overlap selections; rate changes convert durations/fractional
+deadlines. It restores no held input or processor objects. Page/worklet counters seed
+fresh instances monotonically; explicit reload changes session, while replacement changes
+only build. Metadata inspection is associated with the acknowledged installed identity.
+
+Recoverable live feeds tag queued events with a cancellation epoch. Cleanup invalidates
+already queued future input without discarding newly submitted notes or sequenced SMF
+input. The owning Player retains its cancellation latch when an EventSender is handed
+away. Outer browser queue pressure uses a bounded reliable live-clear recovery and holds
+new input until its acknowledgement.
+
+Tracker telemetry remains64 lanes. Header word15 preserves legacy boolean behavior in
+v1; interactive snapshots tag bit3, with bit0 playing, bit1 paused and bit2 natural end.
+Three words after the64 tracker records carry live active/retiring/peak summary. Playlist
+completion consumes explicit natural end; paused/stopped live audio and metering continue.
+
+
+Explicit new interactive sessions install the new source Stopped with clean host fade,
+natural-end/rewind and unity audition gain before readiness; Load and the identified engine
+Stop reserve their queue capacity together. Same-session replacement preserves the captured
+state instead. Load-option capture remains inside its guarded transaction and retries after
+transport changes. A pending load stores the latest identity-stamped transport opcode,
+including when installation is deferred; replay applies it before readiness. Normal
+quantum-boundary command latency remains. Version2 legacy midiInput preparation is rejected;
+prepared insert mutations validate full installed identity and fields before allocation,
+flush earlier controls first and acknowledge after audio application. Busy mutations reject
+before preparation. Tracker telemetry storage remains64 lanes, while the interactive wire's
+channel count and scope count report the loaded module's actual tracker width.
+
+Sample loop/one-shot capability flags cover every mapped nonempty PCM sample, including
+native tracker keys that the live-input reference adapter cannot tune. Live target and
+reference-preview viability are separate flags. This preserves overlap eligibility and
+mixed-map badges independently of keyboard pitch-range restrictions.
+
+
+### NO-07 applied controls and integration evidence
+
+Version 2 acknowledgement groups preflight every record through shared pure action
+validation before mutating controls or queues. A stale/invalid record, host/engine/DSP
+pressure or insufficient live event room rejects the whole group. Fixed staging and
+separate queue reservations preserve allocation-free rendering and 63-record live batches.
+Capacity uses the shared 32-command quantum drain bound, including pending host expansion
+and observed engine backlog. The applied barrier also waits for actual engine/insert
+queues and held host work to empty, so a Host drain alone cannot claim audio application.
+Version 1 command admission retains its behavior. A rejected group containing any current
+identity is tagged with that identity so its optimistic controls roll back; a wholly stale
+group retains a stale identity and cannot clear current input, including barrier failure.
+Neither-feature builds omit the optional Command dispatch payload and live telemetry
+storage. Small shared transport flags remain; exact queue/snapshot strides and allocation
+formulas guard that boundary, including a direct core-feature/engine-off unification graph.
+
+Only the latest same-node load request may publish installed identity/readiness. A valid
+superseded reply resolves its waiter without arming controls. If Stop cancels a request
+after audio installation, mismatched old metadata cannot arm that installed session:
+interactive controls remain disabled and retained rebuild bytes are cleared until another
+load. A newer installation retains its own authority. Scripted changes to a disabled load-option
+control while a current-node fresh load is pending restore the options actually posted
+with that latest request before capture/revision changes; they cannot replay older retained
+module bytes against the new session cursor.
+Failed posted preparation can restore prior readiness only when unchanged pre/post control
+identity also matches accepted audio-applied identity/capabilities and the latest request's
+prior-ready metadata. The off-render failure handler rebases WASM views before reading
+that proof. Unproved/partial installations keep controls disabled; successful page-side
+inspection alone never establishes an installed session.
+The ready message reports the existing backend event lead (256 frames for this host),
+stored per node so candidate graph installation updates the millisecond conversion at
+its own sample rate. Fallback batching disclosure remains separate from that lead.
+Cross-Host graph installation replays the effective at-end policy and fade duration at the
+candidate sample rate before the final load barrier, alongside volume/mutes/inserts. A
+fresh WASM Host's default Continue policy must not silently replace playlist completion
+or Repeat-off behavior after a graph rebuild.
+Persistent settings queued after cursor capture advance a separate session-settings
+revision. Candidate graph installation checks it alongside transport/module revisions;
+a concurrent accepted edit keeps the current graph/settings. Same-node capture retries
+when settings change. Transient live MIDI/Preview do not invalidate capture. Pending
+current-node installation disables optional controls and restores scripted unsent changes
+to accepted checkbox/global/destination values; pending transport forwarding is unchanged.
+Known-length frame seeks at the shared slider/Media Session boundary clamp to the last
+valid scanned music frame. The displayed fade margin is output time, not extra sequenced
+music; unknown-length and native order/row seek semantics remain unchanged.
+
+NO-07 adds five-format fixed/float absolute-frame song/live schedules, isolated feature-off
+canonical PCM pairs and real native IT plus prepared live pressure through slot 338.
+The task evidence distinguishes automated checks, compile-only embedded evidence and
+pending owner listening/device acceptance. Canonical goldens are never regenerated.

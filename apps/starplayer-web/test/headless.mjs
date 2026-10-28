@@ -1,3 +1,4 @@
+import { runInteractive } from './no-headless.mjs';
 import remoteWorker from '../remote-proxy/worker.js';
 import { runW15, runW15View, runW15Stress, runW15Playlist, runW15Runtime } from './w15-headless.mjs';
 import { runRemediation, runPerformance, runBackground, runDigestMeasurements, runVisibilityReturn, runEnumerationDiagnostic } from './w15-remediation-headless.mjs';
@@ -19,6 +20,7 @@ import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // a regression in the display is as visible here as a regression in the engine.
 //
 // Usage: node apps/starplayer-web/test/headless.mjs [--seconds 60] [--mode sab|fallback|plain]
+// Focused transport/preparation regression: --transport-only --seconds 5.
 // W15-only: --w15-only, or --w15-case app|view|stress|playlist|runtime|remediation.
 // Dedicated evidence: --w15-case performance|digest|background|visibility|enumeration (select one mode).
 // Background runs at least six minutes with normal throttling. STARPLAYER_BACKGROUND_SMOKE=1
@@ -47,9 +49,11 @@ const PHONE_VIEWPORT = { width: 390, height: 844 };
 const options = parseArguments(process.argv.slice(2));
 
 function parseArguments(argv) {
-    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false };
+    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false, interactiveOnly: false, transportOnly: false };
     for (let index = 0; index < argv.length; index += 1) {
-        if (argv[index] === '--pages-smoke') parsed.pagesSmoke = true;
+        if (argv[index] === '--transport-only') parsed.transportOnly = true;
+        else if (argv[index] === '--interactive-only') parsed.interactiveOnly = true;
+        else if (argv[index] === '--pages-smoke') parsed.pagesSmoke = true;
         else if (argv[index] === '--w15-only') parsed.w15Only = true;
         else if (argv[index] === '--w15-case') { parsed.w15Case = argv[++index]; parsed.w15Only = true; }
         else if (argv[index] === '--library-only') parsed.libraryOnly = true;
@@ -536,6 +540,50 @@ async function run(executable, mode) {
         if (mode === 'fallback') {
             await page.evaluate("document.getElementById('force-fallback').checked = true; return true;");
         }
+        // Observe the first playing snapshot per installed generation in both transports.
+        // DOM cells alone can still show the preceding generation just after moduleLoaded.
+        await page.evaluate(`
+            window.__firstPlayingGeneration = {};
+            window.__interactiveApplied = [];
+            window.__insertMessages = [];
+            window.__insertRequests = [];
+            window.__wireCommands = [];
+            const pushCommand = StarPlayerRing.pushCommand;
+            StarPlayerRing.pushCommand = (...arguments_) => {
+                const accepted = pushCommand(...arguments_);
+                window.__wireCommands.push({ opcode: arguments_[1], argument: arguments_[2], extra: arguments_[3], accepted });
+                return accepted;
+            };
+            const observe = snapshot => {
+                if (snapshot?.playing && !window.__firstPlayingGeneration[snapshot.moduleGeneration]) {
+                    window.__firstPlayingGeneration[snapshot.moduleGeneration] = { order: snapshot.order, row: snapshot.row, generation: snapshot.moduleGeneration, channelCount: snapshot.channelCount };
+                }
+                if (snapshot) window.__latestObservedGeneration = snapshot.moduleGeneration;
+                return snapshot;
+            };
+            const readTelemetry = StarPlayerRing.readTelemetry;
+            StarPlayerRing.readTelemetry = (...arguments_) => observe(readTelemetry(...arguments_));
+            const Original = window.AudioWorkletNode;
+            window.AudioWorkletNode = class extends Original {
+                constructor(...arguments_) {
+                    super(...arguments_);
+                    window.__observedNode = this;
+                    const postMessage = this.port.postMessage.bind(this.port);
+                    this.port.postMessage = (message, ...transfer) => {
+                        if (message.type === 'inserts') window.__insertRequests.push({ requestId: message.requestId, action: message.action, target: message.target, slot: message.slot, session: String(message.identity?.session), build: String(message.identity?.build) });
+                        return postMessage(message, ...transfer);
+                    };
+                    this.port.addEventListener('message', event => {
+                        if (window.__observedNode !== this) return;
+                        if (event.data.type === 'telemetry') observe(event.data);
+                        if (event.data.type === 'interactiveApplied') window.__interactiveApplied.push({ accepted: event.data.accepted, commands: Array.from(event.data.commands).slice(0, event.data.count * 3) });
+                        if (event.data.type === 'insertsApplied' || event.data.type === 'insertsError') window.__insertMessages.push({ type: event.data.type, accepted: event.data.accepted, requestId: event.data.requestId, action: event.data.action, session: String(event.data.identity?.session), build: String(event.data.identity?.build), reason: event.data.reason });
+                        if (event.data.type === 'moduleLoaded' && event.data.accepted) window.__installedObservedGeneration = event.data.generation;
+                    });
+                }
+            };
+            return true;
+        `);
         await page.evaluate("document.getElementById('start-audio').click(); return true;");
         await page.waitFor('the AudioWorklet', "document.getElementById('transport-chip').textContent === 'audio ready'");
         await page.waitFor('the enhancement checkboxes to be built', "document.querySelectorAll('#enhancement-options input[type=checkbox]').length > 0");
@@ -573,16 +621,26 @@ async function run(executable, mode) {
         await page.evaluate("document.getElementById('seek-order').value = '1'; document.getElementById('seek-order').dispatchEvent(new Event('change')); return true;");
         await page.waitFor('the second MOD order', "document.getElementById('order').textContent.startsWith('2/')");
         const beforeHeadphone = await page.evaluate(READ_STATE);
+        const previousPanningGeneration = await page.evaluate('return window.__latestObservedGeneration;');
         assert.equal(beforeHeadphone.chip, 'playing');
         const disabledDuringReload = await page.evaluate("const option = document.getElementById('mod-headphone-panning'); option.checked = true; option.dispatchEvent(new Event('change')); return option.disabled;");
         assert.equal(disabledDuringReload, true, 'the panning option is disabled while its replacement is prepared');
         await page.waitFor('headphone panning to apply', "document.getElementById('mod-headphone-panning').disabled === false && document.getElementById('message').textContent.includes('60% spacing')");
+        await page.waitFor('the playing replacement generation', `Object.values(window.__firstPlayingGeneration).some(snapshot => snapshot.generation > ${previousPanningGeneration})`);
+        const replacementSnapshot = await page.evaluate(`return Object.values(window.__firstPlayingGeneration).find(snapshot => snapshot.generation > ${previousPanningGeneration});`);
+        assert.equal(replacementSnapshot.order, 1, 'the first playing snapshot of the new generation restores the forward-seek sounding order');
+        await page.waitFor('the replacement sounding order', "document.getElementById('order').textContent.startsWith('2/')", 2_000);
+        const liveReload = await page.evaluate(READ_STATE);
+        assert.equal(liveReload.chip, 'playing', 'a live panning reload preserves playing state');
+        assert.match(liveReload.order, /^2\//, 'a live panning reload restores the sounding order');
+        assert.equal(liveReload.mutes[0], 'Unmute', 'a live panning reload restores channel mute state');
+        // Rebuild restores the full cursor with fresh voices/effects. This fixture only
+        // triggers notes at row zero, so new note-derived pans may arrive after a wrap.
         await page.waitFor('60% MOD telemetry', "[...document.querySelectorAll('#channel-body tr')].map((row) => row.children[4].textContent.trim()).join(',') === '3,C,C,3'");
         const headphoneMod = await page.evaluate(READ_STATE);
         assert.deepEqual(headphoneMod.pans, ['3', 'C', 'C', '3'], 'the option selects exact S3M-style 60% spacing');
-        assert.equal(headphoneMod.chip, 'playing', 'a live panning reload preserves playing state');
-        assert.match(headphoneMod.order, /^2\//, 'a live panning reload restores the sounding order');
-        assert.equal(headphoneMod.mutes[0], 'Unmute', 'a live panning reload restores channel mute state');
+        await page.evaluate("document.getElementById('seek-order').value = '1'; document.getElementById('seek-order').dispatchEvent(new Event('change')); return true;");
+        await page.waitFor('the second MOD order before Stop', "document.getElementById('order').textContent.startsWith('2/')");
 
         await page.evaluate("document.getElementById('stop').click(); return true;");
         await page.waitFor('the synthetic MOD to stop', "document.getElementById('transport-chip').textContent === 'stopped'");
@@ -602,16 +660,10 @@ async function run(executable, mode) {
 
         // ── the panning toggle must not race a concurrent load (C6a deliverable 4) ──
         //
-        // The worklet port is a FIFO, so two `loadModule` messages in flight at once are
-        // decided by posting order, not by which handler resolves first. Before the fix
-        // the toggle reused `state.moduleRevision` instead of claiming one, and the load
-        // that resolved second painted its metadata over the module that was sounding:
-        // the page showed the six-channel module while the four-channel one played.
-        //
-        // The toggle is dispatched from inside the page, in the task right after the load
-        // hands its bytes to the worklet, so the window does not depend on round-trip
-        // timing. The six-channel module makes the mismatch observable: the channel table
-        // is sized from telemetry, the module line from the page's own metadata.
+        // Script a change on the disabled control after fresh bytes are posted. The
+        // in-flight session owns its posted options; an older module's retained bytes
+        // cannot be rebuilt from the newly installed session's cursor/identity.
+        const beforeRaceGeneration = await page.evaluate('return window.__latestObservedGeneration;');
         const raceModule = Buffer.from(syntheticMod({ channels: 6, tag: '6CHN', title: 'race test' })).toString('base64');
         const disabledDuringLoad = await page.evaluate(`
             const bytes = Uint8Array.from(atob(${JSON.stringify(raceModule)}), (character) => character.charCodeAt(0));
@@ -642,18 +694,19 @@ async function run(executable, mode) {
             });
         `);
         assert.equal(disabledDuringLoad, true, 'the panning option is unavailable while a module load is in flight');
-        await page.waitFor('the raced load and toggle to settle', "document.getElementById('mod-headphone-panning').disabled === false");
-        // Channel pans only refresh when the reloaded module dispatches its next row,
-        // so wait for telemetry that postdates the race rather than reading what the
-        // pre-race module left behind. Both the fixed and the broken outcome change them.
-        await page.waitFor('telemetry after the raced toggle', "[...document.querySelectorAll('#channel-body tr')].map((row) => row.children[4].textContent.trim()).join(',') !== 'LFT,RGT,RGT,LFT'");
+        await page.waitFor('the fresh load and rejected scripted toggle to settle', "document.getElementById('mod-headphone-panning').disabled === false && document.getElementById('module-detail').textContent.includes('race.mod')");
+        await page.waitFor('the applied fresh six-channel generation', `window.__installedObservedGeneration > ${beforeRaceGeneration} && window.__latestObservedGeneration === window.__installedObservedGeneration && document.querySelectorAll('#channel-body tr').length === 6`);
+        const racedSnapshot = await page.evaluate('return window.__firstPlayingGeneration[window.__installedObservedGeneration];');
+        assert.equal(racedSnapshot.channelCount, 6, 'the acknowledged fresh generation actually renders six tracker channels');
+        await page.waitFor('authentic six-channel panning after the race', "[...document.querySelectorAll('#channel-body tr')].map((row) => row.children[4].textContent.trim()).join(',') === 'LFT,RGT,RGT,LFT,LFT,RGT'");
         const raced = await page.evaluate(READ_STATE);
         const displayedChannels = Number(raced.moduleDetail.match(/(\d+) channels/)?.[1]);
+        assert.equal(displayedChannels, 6, 'the latest fresh load commits its own metadata');
         assert.equal(raced.pans.length, displayedChannels, `the sounding module has the ${displayedChannels} channels the page displays`);
-        assert.match(raced.moduleDetail, /headphones\.mod/, 'the page shows the module that is actually sounding, not the one whose load lost the race');
-        assert.equal(raced.headphonePanning, true, 'the toggle that won the race is the one the checkbox shows');
-        assert.deepEqual(raced.pans, ['3', 'C', 'C', '3'], 'the sounding module carries the panning the checkbox claims');
-        assert.equal(raced.errorShown, false, 'a raced toggle is not an error');
+        assert.match(raced.moduleDetail, /race\.mod/, 'the fresh session remains authoritative after the disabled-control event');
+        assert.equal(raced.headphonePanning, false, 'the in-flight load retains its accepted panning choice');
+        assert.deepEqual(raced.pans, ['LFT', 'RGT', 'RGT', 'LFT', 'LFT', 'RGT'], 'actual audio-channel telemetry carries the accepted panning');
+        assert.equal(raced.errorShown, false, 'a scripted disabled-control change is refused without an error');
         report.panningRace = `ui ${displayedChannels}ch = audio ${raced.pans.length}ch, toggle ${raced.headphonePanning}`;
 
         // ── the experimental speed bias ────────────────────────────────────────────
@@ -667,8 +720,11 @@ async function run(executable, mode) {
         await page.waitFor('the speed-command MOD', "document.getElementById('module-detail').textContent.includes('speed.mod')");
         await page.waitFor('its first telemetry frame', "document.getElementById('speed').textContent === '5'");
         const canonicalSpeed = await page.evaluate("return document.getElementById('speed').textContent;");
+        const beforeSpeedGeneration = await page.evaluate('return window.__latestObservedGeneration;');
         await page.evaluate("const option = document.getElementById('speed-adjust'); option.value = '2'; option.dispatchEvent(new Event('change')); return true;");
-        await page.waitFor('the biased reload', "document.getElementById('speed-adjust').disabled === false && document.getElementById('message').textContent.includes('Speed adjustment of +2 applied')");
+        // Garbage collection can replace the transient applied message after 100 ms;
+        // require the acknowledged replacement generation instead of racing that text.
+        await page.waitFor('the biased reload', `document.getElementById('speed-adjust').disabled === false && window.__installedObservedGeneration > ${beforeSpeedGeneration} && window.__latestObservedGeneration === window.__installedObservedGeneration`);
         await page.waitFor('the biased speed to sound', "document.getElementById('speed').textContent === '7'");
         const biasedSpeed = await page.evaluate("return document.getElementById('speed').textContent;");
         assert.equal(canonicalSpeed, '5', 'the module asks for speed 5 and canonically gets it');
@@ -683,9 +739,10 @@ async function run(executable, mode) {
             /speed \+2/,
             'a non-default option is named in the closed disclosure summary'
         );
+        const beforeNegativeGeneration = await page.evaluate('return window.__latestObservedGeneration;');
         const speedDisabledDuringReload = await page.evaluate("const option = document.getElementById('speed-adjust'); option.value = '-6'; option.dispatchEvent(new Event('change')); return option.disabled;");
         assert.equal(speedDisabledDuringReload, true, 'the speed chooser is unavailable during a load');
-        await page.waitFor('the negative adjustment to apply', "document.getElementById('speed-adjust').disabled === false && document.getElementById('message').textContent.includes('Speed adjustment of -6 applied')");
+        await page.waitFor('the negative adjustment to apply', `document.getElementById('speed-adjust').disabled === false && window.__installedObservedGeneration > ${beforeNegativeGeneration} && window.__latestObservedGeneration === window.__installedObservedGeneration`);
         await page.waitFor('the clamped speed to sound', "document.getElementById('speed').textContent === '1' && document.getElementById('transport-chip').textContent === 'playing'");
         const negativeSpeed = await page.evaluate("return document.getElementById('speed').textContent;");
         const negativePosition = await page.evaluate("return document.getElementById('order').textContent + ':' + document.getElementById('row').textContent;");
@@ -823,6 +880,8 @@ async function run(executable, mode) {
             const select = slot.querySelector('select');
             select.value = '';
             select.dispatchEvent(new Event('change'));
+            window.__removeInsertRequest = window.__insertRequests.at(-1);
+            window.__stopBefore = { disabled: document.getElementById('stop').disabled, transport: document.getElementById('transport-chip').textContent, capabilities: window.__observedNode.starplayerCapabilities, session: String(window.__observedNode.starplayerIdentity?.session), build: String(window.__observedNode.starplayerIdentity?.build), inserts: window.__insertMessages.slice(-4), commands: window.__wireCommands.slice(-8), acks: window.__interactiveApplied.slice(-4) };
             return select.value === '';
         `);
         assert.equal(reverbRemoved, true, 'choosing None removes the installed effect');
@@ -831,13 +890,40 @@ async function run(executable, mode) {
             "document.querySelectorAll('#effects-slots .effects-slot')[0].querySelectorAll('.effects-param').length === 0",
         );
 
+        // None's optimistic panel is not proof that the removal reached audio.
+        await page.waitFor('the accepted insert removal boundary', "window.__removeInsertRequest?.action === 'remove' && window.__insertMessages.some(message => message.requestId === window.__removeInsertRequest.requestId && message.type === 'insertsApplied' && message.accepted && message.action === 'remove' && message.session === window.__removeInsertRequest.session && message.build === window.__removeInsertRequest.build && message.session === String(window.__observedNode.starplayerIdentity.session) && message.build === String(window.__observedNode.starplayerIdentity.build))");
         // ── transport ───────────────────────────────────────────────────────────────
+        report.removeBefore = await page.evaluate('return window.__stopBefore;');
+        report.stopBefore = await page.evaluate("return { disabled: document.getElementById('stop').disabled, removal: window.__removeInsertRequest, applied: window.__insertMessages.find(message => message.requestId === window.__removeInsertRequest.requestId) };");
         await page.evaluate("document.getElementById('stop').click(); return true;");
-        await page.waitFor('the transport to stop', "document.getElementById('transport-chip').textContent === 'stopped'");
+        try { await page.waitFor('the transport to stop', "document.getElementById('transport-chip').textContent === 'stopped'"); }
+        catch (error) {
+            const after = await page.evaluate(`return { disabled: document.getElementById('stop').disabled, transport: document.getElementById('transport-chip').textContent, inserts: window.__insertMessages.slice(-4), commands: window.__wireCommands.slice(-12), acks: window.__interactiveApplied.slice(-8) };`);
+            console.log('transport-stop diagnostics', JSON.stringify({ before: report.stopBefore, after })); throw error;
+        }
         await delay(500);
         const stopped = await page.evaluate(READ_STATE);
         const stillStopped = await page.evaluate(READ_STATE);
         assert.equal(stopped.row, stillStopped.row, 'a stopped transport freezes the row');
+        if (options.transportOnly) {
+            report.stopped = stopped;
+            report.pendingInsertStop = [];
+            for (const milliseconds of [0, 1, 5, 10, 20, 50]) {
+                const ackStart = await page.evaluate("const count = window.__interactiveApplied.length; document.getElementById('play').click(); return count;");
+                await page.waitFor('playing command applied before pending-insert stress', `window.__interactiveApplied.slice(${ackStart}).some(message => message.accepted && message.commands.some((value, index) => index % 3 === 0 && value === StarPlayerRing.OPCODE_INTERACTIVE_PLAY)) && document.getElementById('transport-chip').textContent === 'playing'`);
+                const enabled = await page.evaluate(`
+                    const node = window.__observedNode;
+                    node.port.postMessage({ type: 'inserts', version: 2, identity: node.starplayerIdentity, requestId: 10000 + ${milliseconds}, action: 'remove', target: 1, slot: 0 });
+                    return new Promise(resolve => setTimeout(() => { const enabled = !document.getElementById('stop').disabled; document.getElementById('stop').click(); resolve(enabled); }, ${milliseconds}));
+                `);
+                assert.equal(enabled, true);
+                await page.waitFor('Stop survives pending insert preparation', "document.getElementById('transport-chip').textContent === 'stopped'");
+                const held = await page.evaluate(READ_STATE); await delay(128); const later = await page.evaluate(READ_STATE);
+                assert.equal(later.row, held.row, 'pending-insert Stop freezes the row');
+                report.pendingInsertStop.push(milliseconds);
+            }
+            return report;
+        }
         await page.evaluate("document.getElementById('seek-order').value = '1'; document.getElementById('seek-order').dispatchEvent(new Event('change')); return true;");
         await page.evaluate("document.getElementById('play').click(); return true;");
         await page.waitFor('playback to resume', "document.getElementById('transport-chip').textContent === 'playing'");
@@ -900,8 +986,8 @@ async function run(executable, mode) {
         //
         // A real key event through the DevTools protocol, so the focus rules, the
         // `KeyboardEvent.code` map and the ring opcode are all exercised the way a person
-        // exercises them. Jam mode keeps the module playing while the MIDI channel appears
-        // beside it in the channel table.
+        // exercises them. Jam mode keeps the module playing; live lanes have their own
+        // summary and do not inflate the native tracker channel table.
         await page.evaluate("const keyboard = document.getElementById('keyboard-enable'); keyboard.checked = true; keyboard.dispatchEvent(new Event('change')); return true;");
         await page.waitFor('live input to install', "document.getElementById('live-input-status').textContent !== 'off'");
         const armed = await page.evaluate(READ_STATE);
@@ -1135,6 +1221,16 @@ async function run(executable, mode) {
         assert.equal(afterBadFile.title, urlZip.title, 'the good module is still loaded');
         report.badFileError = afterBadFile.errorText;
 
+        // This malformed file fails main-thread inspection before posting; verify the
+        // retained installation still accepts controls, not only that old audio survives.
+        const beforeBadControls = await page.evaluate('return window.__interactiveApplied.length;');
+        await page.evaluate("document.getElementById('pause').click(); return true;");
+        await page.waitFor('Pause remains usable after failed inspection', "document.getElementById('transport-chip').textContent === 'paused'");
+        await page.evaluate("document.querySelector('#instrument-list li button:nth-of-type(2):not(:disabled)').click(); return true;");
+        await page.waitFor('Preview acknowledgement after failed inspection', `window.__interactiveApplied.slice(${beforeBadControls}).some(message => message.accepted && message.commands.some((value, index) => index % 3 === 0 && value === StarPlayerRing.OPCODE_PREVIEW))`);
+        await page.evaluate("document.getElementById('stop-preview').click(); document.getElementById('play').click(); return true;");
+        await page.waitFor('Resume remains usable after failed inspection', "document.getElementById('transport-chip').textContent === 'playing'");
+
         const beforeSurvival = await page.evaluate(READ_STATE);
         await delay(2000);
         const afterSurvival = await page.evaluate(READ_STATE);
@@ -1200,9 +1296,8 @@ async function run(executable, mode) {
         assert.equal(retro.outputEngineMode, 'fixed \u00b7 nearest \u00b7 8-bit \u00b7 stereo', 'the Output panel shows the same active mode');
         assert.equal(retro.chip, 'playing', 'the engine rebuild did not stop the transport');
         assert.equal(retro.order, beforeMixer.order, 'the rebuilt engine resumed at the order that was sounding');
-        // The rebuilt sequencer seeks to the sounding order, which restarts it at row 0, so
-        // two samples taken the same distance after two rebuilds read the same row. Wait for
-        // the row to move instead of comparing two snapshots.
+        // The rebuilt sequencer restores its full sounding cursor with fresh processor
+        // state. Wait for a subsequent row to prove it continues from that cursor.
         await page.waitFor('the 8-bit fixed path to keep rendering', `document.getElementById('row').textContent !== ${JSON.stringify(retro.row)}`);
         await delay(2000);
         const afterRetro = await page.evaluate(READ_STATE);
@@ -1260,7 +1355,13 @@ async function run(executable, mode) {
         await loadFixture(page, SECOND_MODULE);
         await page.waitFor('background track replacement', "document.getElementById('title').textContent === 'Petrified' && navigator.mediaSession.metadata.title === 'Petrified' && !document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'playing'");
         await page.evaluate("window.mediaHandlers.pause(); return true;");
-        await page.waitFor('media pause', "navigator.mediaSession.playbackState === 'paused' && document.getElementById('transport-chip').textContent === 'stopped' && document.querySelector('audio').paused");
+        await page.waitFor('media pause', "navigator.mediaSession.playbackState === 'paused' && document.getElementById('transport-chip').textContent === 'paused' && !document.querySelector('audio').paused");
+        // Sequencing is paused while voices/live/DSP and the silent keep-alive continue.
+        const mediaHeld = await page.evaluate(READ_STATE);
+        await delay(200);
+        const mediaStillHeld = await page.evaluate(READ_STATE);
+        assert.equal(mediaStillHeld.row, mediaHeld.row, 'MediaSession Pause holds the exact sequence position');
+        assert.equal(mediaStillHeld.progressValue, mediaHeld.progressValue, 'MediaSession Pause freezes song progress');
         await page.evaluate("window.mediaHandlers.play(); return true;");
         await page.waitFor('media resume', "navigator.mediaSession.playbackState === 'playing' && document.getElementById('transport-chip').textContent === 'playing' && !document.querySelector('audio').paused");
         await page.evaluate("document.getElementById('background-playback').click(); return true;");
@@ -1600,7 +1701,7 @@ async function runLibrary(executable, mode) {
             const capture = snapshot => {
                 if (!snapshot) return;
                 window.latestPlaylistSnapshot = snapshot;
-                const value = { playing: snapshot.playing, flags: snapshot.songFlags, frame: snapshot.songFrame, generation: snapshot.moduleGeneration };
+                const value = { playing: snapshot.playing, flags: snapshot.songFlags, frame: snapshot.songFrame, generation: snapshot.moduleGeneration, channelCount: snapshot.channelCount };
                 const last = window.playlistSnapshots.at(-1);
                 if (!last || last.playing !== value.playing || last.flags !== value.flags || last.generation !== value.generation || (last.frame === 0) !== (value.frame === 0)) window.playlistSnapshots.push(value);
             };
@@ -1649,11 +1750,12 @@ async function runLibrary(executable, mode) {
         await page.evaluate("document.getElementById('sample-rate').value = '48000'; document.getElementById('apply-sample-rate').click();");
         await page.waitFor('playlist sample-rate rebuild', "document.getElementById('message').textContent.includes('rebuilt') && document.getElementById('message').textContent.includes('48,000 Hz')");
         await page.waitFor('rebuilt playlist telemetry painted', "window.latestPlaylistSnapshot?.moduleGeneration === 1 && window.latestPlaylistSnapshot.playing === true && Number(document.getElementById('progress').max) === window.latestPlaylistSnapshot.songLengthFrames");
-        const seekNearEnd = async seconds => {
+        const seekNearEnd = async (seconds, beforeSuspension = false) => {
             const rate = rateDigits((await page.evaluate(READ_STATE)).workletRate);
-            await page.evaluate(`const progress = document.getElementById('progress'); progress.value = String(Number(progress.max) - ${rate * seconds}); progress.dispatchEvent(new Event('change'));`);
+            const targetFrame = await page.evaluate(`const progress = document.getElementById('progress'); progress.value = String(Number(progress.max) - ${rate * seconds}); progress.dispatchEvent(new Event('change')); return Number(progress.value);`);
+            if (beforeSuspension) await page.waitFor('near-end seek applied before animation-frame suspension', `window.latestPlaylistSnapshot?.songFrame >= ${targetFrame}`, 2_000);
         };
-        await seekNearEnd(1);
+        await seekNearEnd(1, true);
         await page.evaluate("window.savedAnimationFrame = requestAnimationFrame; window.requestAnimationFrame = callback => { window.pausedAnimationFrame = callback; return 0; };");
         await page.waitFor('automatic second playlist track', "document.querySelector('#playlist-list li.current .playlist-name')?.textContent === 'PETRI.S3M' && document.getElementById('title').textContent === 'Petrified'", 15000);
         assert.equal(await page.evaluate("return document.querySelector('#playlist-list li').classList.contains('current');"), false);
@@ -1663,6 +1765,8 @@ async function runLibrary(executable, mode) {
         await delay(200);
         assert.equal(await page.evaluate("return window.latestPlaylistSnapshot.songFlags & 2;"), 2);
         await page.evaluate("document.getElementById('playlist-loop').checked = true;");
+        // The looping slider includes the fade margin; this request lands in that zone
+        // and the shared UI seek boundary must clamp it to valid sequenced music.
         await seekNearEnd(4);
         await page.waitFor('PETRI fade', "(window.latestPlaylistSnapshot?.songFlags & 8) !== 0", 15000);
         await page.evaluate("document.getElementById('stop').click();");
@@ -1882,6 +1986,8 @@ await verifyPackagedSources();
 if (options.pagesSmoke) {
     console.log(`pages-smoke ${JSON.stringify(await runPagesSmoke({ Page, executable, dist: DIST, syntheticMod, buildZip }))}`);
 } else for (const mode of options.modes) {
+    if (options.transportOnly) { console.log(`transport[${mode}] ${JSON.stringify(await run(executable, mode))}`); continue; }
+    if (options.interactiveOnly) { console.log(`interactive[${mode}] ${JSON.stringify(await runInteractive({ Page, executable, mode, startDevServer, loadFile, syntheticMod }))}`); continue; }
     if (!options.libraryOnly && !options.w15Only) {
         const report = await run(executable, mode);
         console.log(`headless[${mode}] ${JSON.stringify(report, null, 2)}`);

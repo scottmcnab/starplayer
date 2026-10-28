@@ -726,3 +726,49 @@ fn rendering_an_smf_source_allocates_nothing() {
         control.collect_all_garbage();
     }
 }
+
+/// Both concrete format runtimes share the tracker computations and must remain safe
+/// when NO-03/06 call them without any row dispatch.
+#[test]
+fn concrete_format_control_steps_and_lifecycle_allocate_nothing() {
+    use starplayer::core::{InstrumentId, SampleId, U0F16};
+    use starplayer::model::{AutoVibrato, AutoVibratoWaveform, Envelope, EnvelopePoint, EnvelopeSpan, InstrumentDef, ModuleBuilder, ModuleHeader, SampleSpec};
+    let mut builder = ModuleBuilder::new();
+    let sample = builder.add_sample(&[1i16; 64], SampleSpec { auto_vibrato: AutoVibrato { depth: 4, rate: 3, sweep: 4, waveform: AutoVibratoWaveform::Random }, ..SampleSpec::one_shot("control").with_forward_loop(0, 64) }).unwrap();
+    let envelope = Envelope { points: vec![EnvelopePoint { tick: 0, value: 64 }, EnvelopePoint { tick: 8, value: 32 }].into_boxed_slice(), sustain: Some(EnvelopeSpan { start: 0, end: 1 }), loop_span: None, carry: true };
+    let mut instrument = InstrumentDef::from_sample("control", sample, U0F16::MAX);
+    instrument.volume_envelope = Some(envelope.clone());
+    instrument.panning_envelope = Some(envelope.clone());
+    instrument.pitch_envelope = Some(envelope);
+    instrument.pitch_envelope_is_filter = true;
+    instrument.fadeout = 64;
+    instrument.random_volume_variation = 32;
+    instrument.random_pan_variation = 32;
+    builder.add_instrument(instrument).unwrap();
+    builder.set_header(ModuleHeader::new(ModuleFormat::It, 1));
+    let module = builder.build().unwrap();
+    let mut voices = starplayer::mixer::VoicePool::new(339);
+    let voice = voices.allocate(starplayer::mixer::VoiceTag { channel: 0, instrument: 1, sample: 1, note: 60 }, starplayer::mixer::SampleRegion::one_shot(0, 64), starplayer::core::VoiceParams::SILENT, 0).unwrap();
+    let mut xm = starplayer::xm::XmArticulationRuntime::try_new(339).unwrap();
+    let xm_state = starplayer::xm::XmVoiceState { instrument: Some(InstrumentId(0)), sample: Some(SampleId(0)), out_volume: 64, out_period: 4608, ..starplayer::xm::XmVoiceState::default() };
+    let mut it = starplayer::it::ItArticulationRuntime::try_new(339).unwrap();
+    let mut it_state = starplayer::it::ItVoiceState::default();
+    it_state.instrument = 1; it_state.sample = 1; it_state.note_volume = 256; it_state.frequency_hz = 8363; it_state.playing = true;
+    let (_, report) = while_watching_for_allocations(|| {
+        xm.start(&module, voice, ChannelId(0), xm_state, &voices);
+        it.start(voice, it_state, &voices);
+        it.roll_swing(&module, true, voice, 1);
+        it.apply_envelope_flags(&module, true, voice, 1);
+        for index in 0..256 {
+            xm.control_step(&module, voice, 64, 44_100, true, &mut voices);
+            let _ = it.control_step(&module, voice, true, 128, 44_100, index == 0);
+            if index == 16 { xm.release(&module, voice); it.release(&module, true, &mut voices, voice); }
+        }
+        xm.retire(voice); it.retire(voice);
+        xm.control_step(&module, voice, 64, 44_100, true, &mut voices);
+        let _ = it.control_step(&module, voice, true, 128, 44_100, false);
+        xm.discard(voice); it.discard(voice);
+        xm.reset(); it.reset();
+    });
+    assert!(report.is_clean(), "concrete control/lifecycle allocated or deallocated: {report:?}");
+}

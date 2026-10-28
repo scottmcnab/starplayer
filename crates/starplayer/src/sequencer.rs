@@ -132,23 +132,24 @@ impl NativeSequencer {
     ///
     /// Off the audio thread: it allocates the processor's per-channel state.
     pub fn new(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection) -> Result<NativeSequencer, Error> {
-        let _ = (&module, sample_rate_hz, quirks);
-        match module.header().format {
-            #[cfg(feature = "s3m")]
-            ModuleFormat::S3m => Ok(NativeSequencer::S3m(starplayer_s3m::sequencer_with_quirks(module, sample_rate_hz, quirks))),
-            #[cfg(feature = "mod")]
-            ModuleFormat::Mod => Ok(NativeSequencer::Mod(starplayer_mod::sequencer_with_quirks(module, sample_rate_hz, quirks))),
-            #[cfg(feature = "mtm")]
-            ModuleFormat::Mtm => Ok(NativeSequencer::Mtm(starplayer_mtm::sequencer_with_quirks(module, sample_rate_hz, quirks))),
-            #[cfg(feature = "xm")]
-            ModuleFormat::Xm => Ok(NativeSequencer::Xm(starplayer_xm::sequencer_with_quirks(module, sample_rate_hz, quirks))),
-            #[cfg(feature = "it")]
-            ModuleFormat::It => Ok(NativeSequencer::It(starplayer_it::sequencer_with_quirks(module, sample_rate_hz, quirks))),
-            // Every `ModuleFormat` now has an arm, so this is dead in the default build
-            // and live only where a format feature is off.
-            #[allow(unreachable_patterns)]
-            _ => Err(NO_NATIVE_PROCESSOR),
-        }
+        Self::new_with_voice_capacity(module, sample_rate_hz, quirks, crate::MAX_VOICE_CAPACITY)
+    }
+
+    /// Prepare all format state for the actual global pool, preserving native quotas.
+    /// Allocation failure is returned before the source can enter the audio callback.
+    pub fn new_with_voice_capacity(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection, voice_capacity: usize) -> Result<NativeSequencer, Error> {
+        Self::try_new_with_voice_capacity(module, sample_rate_hz, quirks, voice_capacity)
+    }
+
+    /// Explicit optional articulation preparation, separate from capacity-only legacy
+    /// construction so Cargo feature unification adds no XM slot allocation by itself.
+    pub fn new_with_articulation(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection, voice_capacity: usize) -> Result<Self, Error> {
+        if !cfg!(any(feature = "note-overlap", feature = "interactive-audition")) { return Err(Error::Unsupported("optional articulation is not compiled in this facade")); }
+        #[allow(unused_mut)]
+        let mut sequencer = Self::new_with_voice_capacity(module, sample_rate_hz, quirks, voice_capacity)?;
+        #[cfg(all(feature = "xm", any(feature = "note-overlap", feature = "interactive-audition")))]
+        if let Self::Xm(source) = &mut sequencer { source.processor_mut().prepare_articulation(voice_capacity).map_err(preparation_resource)?; }
+        Ok(sequencer)
     }
 
     /// [`NativeSequencer::new`] with the [`SequencerSettings`] spelled out.
@@ -276,7 +277,7 @@ impl NativeSequencer {
             #[cfg(feature = "xm")]
             ModuleFormat::Xm => {
                 let resolved = quirks.resolve(module.header().dialect);
-                let processor = starplayer_xm::XmProcessor::try_with_quirks(Arc::clone(&module), rate, QuirkSelection::Override(resolved)).map_err(preparation_resource)?;
+                let processor = starplayer_xm::XmProcessor::try_with_quirks_and_voice_capacity(Arc::clone(&module), rate, QuirkSelection::Override(resolved), voice_capacity).map_err(preparation_resource)?;
                 let data = starplayer_xm::XmPatternData(module);
                 Ok(NativeSequencer::Xm(PatternSequencer::try_new(resolved.tempo_model, data, processor, settings).map_err(preparation_resource)?))
             }
@@ -368,12 +369,40 @@ impl NativeSequencer {
     /// One pass of the song in frames, when a timeline says how long that is.
     pub fn song_length_frames(&self) -> Option<u64> { forward!(self, (), |sequencer| sequencer.song_length_frames()) }
 
+    #[cfg(feature = "interactive-audition")]
+    pub fn sync_cadence(&self, control: &mut starplayer_engine::ControlClock) { forward!(self, (control), |sequencer| sequencer.sync_cadence(control)) }
+
+    #[cfg(feature = "interactive-audition")]
+    pub fn restore_cursor(&mut self, cursor: starplayer_core::SequencerCursor, frame: Frame) -> bool { forward_mut!(self, (cursor, frame), |sequencer| sequencer.restore_cursor(cursor, frame)) }
+
+    pub fn can_seek_order(&self, order: u16) -> bool { forward!(self, (order), |sequencer| sequencer.can_seek_order(order)) }
+    pub fn can_seek_row(&self, row: u16) -> bool { forward!(self, (row), |sequencer| sequencer.can_seek_row(row)) }
+    pub fn can_seek_frame(&self, frame: u64) -> bool { forward!(self, (frame), |sequencer| sequencer.can_seek_frame(frame)) }
+    pub fn seek_row_at(&mut self, row: u16, frame: Frame) { forward_mut!(self, (row, frame), |sequencer| sequencer.seek_row_at(row, frame)) }
+
     /// Whether the song has been heard through once — its detected loop point, or the end
     /// of its order list (tasks D1 and D2).
     pub fn end_reached(&self) -> bool { forward!(self, (), |sequencer| sequencer.end_reached()) }
 }
 
 impl EventSource for NativeSequencer {
+    #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+    fn describe_interactive(&mut self, context: &mut EngineContext<'_>) { forward_mut!(self, (context), |sequencer| sequencer.describe_interactive(context)) }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, scope: starplayer_engine::ClearScope, context: &mut EngineContext<'_>) {
+        forward_mut!(self, (scope, context), |sequencer| sequencer.clear_scope(scope, context))
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame, control: &mut starplayer_engine::ControlClock) {
+        forward_mut!(self, (state, frame, control), |sequencer| sequencer.set_transport(state, frame, control))
+    }
+    #[cfg(feature = "interactive-audition")]
+    fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        forward_mut!(self, (frame, context), |sequencer| sequencer.dispatch_interactive(frame, context))
+    }
+
     fn next_event_frame(&self) -> Option<Frame> { forward!(self, (), |sequencer| sequencer.next_event_frame()) }
 
     fn advance_to(&mut self, frame: Frame) { forward_mut!(self, (frame), |sequencer| sequencer.advance_to(frame)) }

@@ -473,6 +473,19 @@ mod exports {
         })
     }
 
+    /// Pure metadata for any playable map key and independently for reference note60.
+    #[wasm_bindgen]
+    pub fn instrument_capability(index: u32) -> u32 {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        { with_module(0, |module| {
+            if index > u16::MAX as u32 { return 0; }
+            let capability = starplayer::live_instrument_capability(module, starplayer::core::InstrumentId(index as u16));
+            u32::from(capability.playable) | (u32::from(capability.one_shot) << 1) | (u32::from(capability.looping) << 2) | (u32::from(capability.preview_playable) << 3) | (u32::from(capability.preview_looping) << 4)
+        }) }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        { let _ = index; 0 }
+    }
+
     #[wasm_bindgen]
     pub fn instrument_sample_length(index: u32) -> u32 {
         with_module(0, |module| {
@@ -602,9 +615,11 @@ mod tests {
         let inspect = activate.find("Loader.inspect_s3m(new Uint8Array(moduleBuffer));").unwrap();
         let snapshot = activate.find("JSON.parse(Loader.module_metadata())").expect("structured snapshot parsed immediately");
         let audio = activate.find("await context.audio;").unwrap();
-        let commit = activate.find("if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node) return null;").unwrap();
+        let guard = activate.find("if (!context.isCurrent() || revision !== state.moduleRevision || node !== state.node)").expect("current installation guard");
+        let commit = activate.find("libraryView.setPlaying(null);").expect("committed playback state");
         let enrich = activate.find("acceptPlaybackMetadata(context.locator, libraryMetadata, retainedBytes)").unwrap();
-        assert!(inspect < snapshot && snapshot < audio && audio < commit && commit < enrich);
+        assert!(inspect < snapshot && snapshot < audio && audio < guard && guard < commit && commit < enrich);
+        assert!(activate[guard..commit].contains("return null;"), "cancelled/stale installations return before metadata enrichment");
         assert!(activate.contains("catch {}"), "optional metadata failures preserve playback");
         assert!(activate.contains("library === state.library"), "same identity in a newer source context must not receive old metadata");
         assert!(activate.contains("context.locator.libraryIdentity?.sha256"));

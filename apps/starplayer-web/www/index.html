@@ -226,7 +226,8 @@
         <button id="playlist-previous" type="button" class="track-button" title="Previous playlist track" aria-label="Previous track" disabled><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h2v10H3zM13 3v10L6 8z"/></svg></button>
         <button id="previous" title="Previous order" disabled>◀◀</button>
         <button id="play" class="primary round" disabled>▶ Play</button>
-        <button id="stop" class="round" disabled>■ Stop</button>
+        <button id="pause" class="round" aria-label="Pause sequencing" aria-pressed="false" title="Pause sequencing; voices and live input continue" disabled><span aria-hidden="true">Ⅱ</span> Pause</button>
+        <button id="stop" class="round" title="Clear sound and hold the current position" disabled>■ Stop</button>
         <button id="next" title="Next order" disabled>▶▶</button>
         <button id="playlist-next" type="button" class="track-button" title="Next playlist track" aria-label="Next track" disabled><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 3h2v10h-2zM3 3v10l7-5z"/></svg></button>
         <div class="progress-row">
@@ -282,6 +283,10 @@
     <section class="lower-grid">
         <article class="panel">
             <div class="panel-heading"><h2>Instruments</h2><span id="instrument-count">0</span></div>
+            <label><input id="note-overlap-enable" type="checkbox" disabled> Enable note overlap</label>
+            <div class="audition-actions"><button id="stop-preview" type="button" disabled>Stop preview</button><button id="all-sound-off" type="button" disabled>All sound off</button></div>
+            <p class="library-hint">Let previous non-looping notes finish. An identical note at the same starting volume on this instrument and channel replaces its earlier sound. Unchecked preserves native behavior, including IT NNA. Selections remain editable while overlap is off.</p>
+            <p class="library-hint">Preview uses reference note 60, prepared samples and the current master DSP, with no automatic tracker-channel inserts. One-shot previews finish after release; loops release natively and may require Stop preview. Pause keeps envelopes, loops and DSP running.</p>
             <ol id="instrument-list" class="instrument-list"><li class="empty">No module loaded.</li></ol>
         </article>
         <article class="panel diagnostics">
@@ -378,6 +383,7 @@
         <article class="panel diagnostics live-input-panel" aria-labelledby="live-input-heading">
             <div class="panel-heading"><h2 id="live-input-heading">Live input</h2><span id="live-input-status">off</span></div>
             <div class="option-grid live-input-options">
+                <label>Keyboard / MIDI destination <select id="input-destination" disabled><option value="jam">Jam: MIDI programs</option><option value="selected">Selected instrument</option></select></label>
                 <label class="live-toggle"><input id="keyboard-enable" type="checkbox" disabled> Keyboard</label>
                 <span id="event-lead" class="lead-note">lead —</span>
                 <label>MIDI input

@@ -76,6 +76,23 @@ impl<Tempo: TempoModel> FrameClock<Tempo> {
         self.pending_tick_frame
     }
 
+    /// Translate a held deadline without altering its fractional tick phase.
+    pub fn translate(&mut self, frames: u64) { self.pending_tick_frame = self.pending_tick_frame.saturating_add(frames); }
+
+    /// Fractional phase already carried into the pending tick, in Q32.32 bits.
+    pub fn fractional_remainder(&self) -> u64 { self.remainder.to_bits() }
+
+    /// Current model's interval, used by the engine's held articulation cadence.
+    pub fn interval_bits(&self, tempo_bpm: u16, speed: u8) -> u64 {
+        self.tempo_model.frames_per_tick(self.sample_rate_hz, tempo_bpm, speed)
+    }
+
+    /// Restore a prepared rebuild cursor; unlike a seek this retains its converted phase.
+    pub fn restore_pending(&mut self, frame: Frame, fractional_remainder: u64) {
+        self.pending_tick_frame = frame;
+        self.remainder = Q32_32::from_bits(fractional_remainder & 0xffff_ffff);
+    }
+
     /// Restart the clock at `first_tick_frame`, dropping the carried remainder.
     ///
     /// This is a seek, not a rewind: the caller supplies a frame on the engine's

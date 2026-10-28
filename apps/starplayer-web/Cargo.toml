@@ -17,3 +17,8 @@ serde_json = "1.0"
 
 [dev-dependencies]
 zip = { workspace = true }
+
+[features]
+default = ["note-overlap", "interactive-audition"]
+note-overlap = ["starplayer/note-overlap"]
+interactive-audition = ["starplayer/interactive-audition"]

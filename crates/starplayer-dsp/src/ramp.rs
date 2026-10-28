@@ -41,6 +41,12 @@ impl GainRamp {
         GainRamp { current: value, target: value, increment: 0, frames_remaining: 0 }
     }
 
+    /// Exact integer state for a control-thread renderer handoff.
+    pub const fn state(self) -> (i32, i32, i32, u32) { (self.current, self.target, self.increment, self.frames_remaining) }
+
+    /// Restore a previously captured ramp without recomputing its rounded increment.
+    pub const fn from_state(state: (i32, i32, i32, u32)) -> Self { Self { current: state.0, target: state.1, increment: state.2, frames_remaining: state.3 } }
+
     /// The value this frame is mixed with.
     pub const fn current(self) -> i32 { self.current }
 

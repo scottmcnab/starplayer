@@ -70,6 +70,10 @@ pub struct S3mChannel {
     pub note_cut: bool,
     /// D26: a slide reached period zero; the voice stops at the next flush.
     pub stop_voice: bool,
+    #[cfg(feature = "interactive-audition")]
+    sound_cleared: bool,
+    #[cfg(feature = "note-overlap")]
+    new_note_pending: bool,
 }
 
 impl S3mChannel {
@@ -107,6 +111,9 @@ impl S3mChannel {
             glissando_enabled: false,
             note_cut: false,
             stop_voice: false,
+            #[cfg(feature = "interactive-audition")]
+            sound_cleared: false,
+            #[cfg(feature = "note-overlap")] new_note_pending: false,
         }
     }
 }
@@ -232,6 +239,8 @@ impl S3mProcessor {
             }
             if state.command != 17 { state.special_value = 0; }
             state.command = 0;
+            #[cfg(feature = "note-overlap")]
+            { state.new_note_pending = false; }
         }
     }
 
@@ -285,7 +294,11 @@ impl S3mProcessor {
                     state.target_period = period;
                     state.actual_period = period;
                     state.sample_offset = 0;
+                    #[cfg(feature = "interactive-audition")]
+                    { state.sound_cleared = false; }
                     state.pending_dirty.insert(DirtyBits::SAMPLE);
+                    #[cfg(feature = "note-overlap")]
+                    { state.new_note_pending = cell.linear_semitone().is_some(); }
                 }
                 self.channels[channel_index].pending_dirty.insert(DirtyBits::PITCH);
             }
@@ -636,6 +649,8 @@ impl S3mProcessor {
             let countdown = (self.channels[channel_index].command_data & 15).wrapping_sub(1);
             if countdown == 0 {
                 self.channels[channel_index].pending_dirty = DirtyBits::from_bits_retain(self.channels[channel_index].special_value);
+                #[cfg(feature = "interactive-audition")]
+                if self.channels[channel_index].pending_dirty.contains(DirtyBits::SAMPLE) { self.channels[channel_index].sound_cleared = false; }
                 self.channels[channel_index].command = 0;
             } else {
                 self.channels[channel_index].command_data = 0xD0 | countdown;
@@ -703,6 +718,8 @@ impl S3mProcessor {
         let dirty = self.channels[channel_index].pending_dirty;
         if dirty.is_empty() { return; }
 
+        #[cfg(feature = "interactive-audition")]
+        let dirty = if self.channels[channel_index].sound_cleared { dirty & !DirtyBits::SAMPLE } else { dirty };
         if dirty.contains(DirtyBits::SAMPLE) {
             if self.channels[channel_index].sample_number == NO_SAMPLE {
                 context.stop_channel(channel_id);
@@ -721,7 +738,17 @@ impl S3mProcessor {
                 // and IT's Duplicate Check must never see two different samples compare
                 // equal because a clamp folded them together.
                 let sample_number = sample_id.0.saturating_add(1);
-                let tag = VoiceTag { channel: channel_index as u8, instrument: instrument_number, sample: sample_number, note: linear_note(self.channels[channel_index].current_note) };
+                let tag = VoiceTag { channel: channel_index as u8, instrument: instrument_number as u16, sample: sample_number, note: linear_note(self.channels[channel_index].current_note) };
+                #[cfg(feature = "note-overlap")]
+                {
+                    let state = &self.channels[channel_index];
+                    let onset = state.new_note_pending.then_some(starplayer_core::TriggerIdentity {
+                        instrument: instrument_id, note: starplayer_core::OriginalNote::Note(Note::new(linear_note(state.current_note))), channel: channel_id, onset_volume: state.current_volume as u16,
+                    });
+                    context.trigger_legacy_overlap(tag, region, params, state.sample_offset, onset, &self.module);
+                    self.channels[channel_index].new_note_pending = false;
+                }
+                #[cfg(not(feature = "note-overlap"))]
                 context.trigger_channel(channel_id, tag, region, params, self.channels[channel_index].sample_offset);
             }
         } else if let Some(voice_id) = context.channels.foreground(channel_id)
@@ -812,6 +839,14 @@ impl S3mProcessor {
 }
 
 impl TrackerProcessor for S3mProcessor {
+    #[cfg(feature = "interactive-audition")]
+    fn clear_sound(&mut self, scope: starplayer_engine::ClearScope, _context: &mut TickContext<'_>) {
+        use starplayer_engine::ClearScope;
+        for (index, channel) in self.channels.iter_mut().enumerate() {
+            if matches!(scope, ClearScope::All | ClearScope::Song) || scope == ClearScope::Lane(ChannelId(index as u16)) { channel.sound_cleared = true; }
+        }
+    }
+
     fn row(&mut self, context: &mut TickContext<'_>, row: RowRef<'_>) -> TickOutcome {
         context.report_global_volume(unit_from_ratio(self.global_volume as u32, 64));
         let mut outcome = context.outcome();

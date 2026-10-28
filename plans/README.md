@@ -47,6 +47,8 @@ the engine, the applications, the original DOS sources, and this plan set.
 
 ### Engine
 
+- **NO — Note overlap and audition:** [master plan](engine/NO-master-plan.md). NO-01–08 and NO-W1 implemented, reviewed and integrated on `feature/note-overlap-audition`. Independent Opus5.5/high and Astra/medium [full-branch and corrective reviews](engine/NO-branch-review-2026-10-28.md) accept all eight review corrections; [NO-08](engine/NO-task-08-branch-review-fixes.md) records settled CI, feature/resource/PCM, all browser modes and fresh A1S/C5 compile evidence. Owner listening/device acceptance remains pending; no main merge or deployment was performed or authorised.
+
 | Milestone | Status | Master plan | Notes |
 |---|---|---|---|
 | M0 Foundations + WASM spike | **Landed** — owner audible check pending | [M0](engine/M0-master-plan.md) | All four tasks in `engine/complete/`: [A1](engine/complete/M0-task-A1-workspace-skeleton.md) workspace/CI, [A2](engine/complete/M0-task-A2-core-types.md) core types, [A3](engine/complete/M0-task-A3-minimal-mixer-and-determinism.md) mixer + determinism test, [A4](engine/complete/M0-task-A4-audioworklet-spike.md) AudioWorklet sine wave. Exit: **sound from a browser tab** — `cargo xtask wasm && cargo xtask serve` |

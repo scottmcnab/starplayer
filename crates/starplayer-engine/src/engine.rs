@@ -133,6 +133,10 @@ impl EngineWarnings {
 pub struct EngineSettings {
     /// Voices in the global pool.
     pub voice_capacity: usize,
+    /// Optional runtime opt-in, independent of Cargo feature unification. Configure
+    /// before playback; defaults allocate no policy tables or optional voice reserve.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub playback: Option<crate::playback::PlaybackConfiguration>,
     /// Control lanes. 32 covers S3M; IT's 64 is [`ChannelTable::MAX_CHANNELS`].
     pub channel_count: usize,
     /// Allocate oscilloscope tap rings when telemetry is enabled. Scalar snapshots remain
@@ -144,6 +148,8 @@ pub struct EngineSettings {
     pub layout: EngineLayout,
     /// Output rate, for the synthesised control clock.
     pub sample_rate_hz: u32,
+    /// Loaded-format cadence without a tracker, default 50 Hz. Legacy control stays 1 ms.
+    pub articulation_interval_micros: u32,
     /// How many [`EventSource`]s may be merged at once.
     pub source_capacity: usize,
     /// Depth of the command ring.
@@ -156,15 +162,65 @@ pub struct EngineSettings {
     pub insert_garbage_capacity: usize,
 }
 
+impl EngineSettings {
+    /// Runtime opt-in, independent of which consumer enabled the Cargo capability.
+    pub fn playback_configuration(&self) -> Option<crate::playback::PlaybackConfiguration> {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        { self.playback }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        { None }
+    }
+
+    /// Update a host build identity without changing prepared storage.
+    pub fn set_playback_identity(&mut self, identity: starplayer_core::PlaybackIdentity) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(configuration) = self.playback.as_mut() { configuration.identity = identity; }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        let _ = identity;
+    }
+
+    /// Keep persistent-host preparation aligned with the actual installed module.
+    pub fn set_instrument_count(&mut self, count: usize) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(configuration) = self.playback.as_mut() { configuration.instrument_count = count; }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        let _ = count;
+    }
+
+    /// Prepare optional budgets without changing legacy constructors. This only enables
+    /// capability/identity storage: overlap policy and interactive transport land later.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn with_playback(mut self, configuration: crate::playback::PlaybackConfiguration) -> Result<Self, crate::playback::PlaybackConfigError> {
+        configuration.validate()?;
+        if self.channel_count > ChannelTable::MAX_CHANNELS { return Err(crate::playback::PlaybackConfigError::UnsupportedTrackerWidth); }
+        self.voice_capacity = configuration.capacity.physical();
+        self.playback = Some(configuration);
+        Ok(self)
+    }
+
+    /// Persistent web host opt-in: 256 native + 64 custom + 16 shared live + 3 retirement
+    /// slots; 64 tracker insert buses and separate live lanes 64–80. NO-02 threads this
+    /// through Player construction before NO-06 installs the prepared live source.
+    #[cfg(all(feature = "note-overlap", feature = "interactive-audition"))]
+    pub fn interactive_web(identity: starplayer_core::PlaybackIdentity, instrument_count: usize) -> Result<Self, crate::playback::PlaybackConfigError> {
+        Self { channel_count: ChannelTable::MAX_CHANNELS, ..Self::default() }.with_playback(crate::playback::PlaybackConfiguration {
+            identity, instrument_count, capabilities: crate::playback::compiled_playback_capabilities(), capacity: crate::playback::VoiceCapacity::web(),
+        })
+    }
+}
+
 impl Default for EngineSettings {
     fn default() -> EngineSettings {
         EngineSettings {
             voice_capacity: 64,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            playback: None,
             channel_count: 32,
             scope_taps: true,
             telemetry_depth: starplayer_rt::DEFAULT_SNAPSHOT_DEPTH,
             layout: EngineLayout::Full,
             sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
+            articulation_interval_micros: 20_000,
             source_capacity: SourceMux::DEFAULT_CAPACITY,
             command_capacity: DEFAULT_COMMAND_CAPACITY,
             garbage_capacity: DEFAULT_GARBAGE_CAPACITY,
@@ -197,9 +253,9 @@ impl Default for EngineSettings {
 /// # Two clocks
 ///
 /// [`Engine::frame`] is the **output** clock: it counts frames handed to the host and never
-/// stops. [`Engine::source_frame`] is the **musical** clock that event sources report
-/// against, and it stops while the engine is paused. They are equal for an engine that has
-/// never been paused, which is every engine in the determinism tests.
+/// stops. [`Engine::source_frame`] is the clock event sources report against. Legacy
+/// transport freezes it; configured interactive transport keeps it monotonic while each
+/// sequenced source holds its own song clock.
 ///
 /// # Real-time safety
 ///
@@ -258,10 +314,18 @@ where
     frame: Frame,
     source_frame: Frame,
     playing: bool,
+    #[cfg(feature = "interactive-audition")]
+    last_dsp_frame: starplayer_dsp::Stereo<Path::Mono>,
+    #[cfg(feature = "interactive-audition")]
+    clear_transition: bool,
+    #[cfg(feature = "interactive-audition")]
+    interactive_transport: Option<starplayer_core::InteractiveTransport>,
     /// The rate the mixer renders at. The only thing that reads it is IT's per-voice
     /// resonant filter, whose cutoff is an absolute frequency; everything else in the
     /// audio path works in ratios and in frames.
     sample_rate_hz: u32,
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    articulation_interval_micros: u32,
     master_volume: U0F16,
     limiter: Limiter,
     warnings: EngineWarnings,
@@ -303,16 +367,38 @@ where
     /// channel table, the quantum accumulator, the output ring, the source slots, the
     /// command ring and the garbage channel.
     pub fn with_settings(settings: EngineSettings) -> Engine<Path, Interp, Out, Module> {
+        Self::try_with_settings(settings).expect("invalid engine playback configuration")
+    }
+
+    /// Validate interactive layout/capacity before playback. Legacy constructors keep
+    /// their historical channel clamping and pool defaults. Allocation of legacy engine
+    /// components other than the voice pool remains infallible as before. Format and
+    /// optional ownership storage use fallible preparation before playback.
+    pub fn try_with_settings(settings: EngineSettings) -> Result<Engine<Path, Interp, Out, Module>, crate::playback::PlaybackConfigError> {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        let channels = if let Some(configuration) = settings.playback {
+            configuration.validate()?;
+            if settings.voice_capacity != configuration.capacity.physical() { return Err(crate::playback::PlaybackConfigError::InvalidCapacity); }
+            let layout = if configuration.capabilities.contains(starplayer_core::PlaybackCapabilities::INTERACTIVE_AUDITION) {
+                crate::playback::LaneLayout::interactive(settings.channel_count)?
+            } else {
+                if settings.channel_count > ChannelTable::MAX_CHANNELS { return Err(crate::playback::PlaybackConfigError::UnsupportedTrackerWidth); }
+                crate::playback::LaneLayout::legacy(settings.channel_count)
+            };
+            let mut channels = ChannelTable::try_with_layout(layout)?;
+            channels.prepare_playback(configuration)?;
+            channels
+        } else { ChannelTable::new(settings.channel_count) };
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        let channels = ChannelTable::new(settings.channel_count);
         let (command_producer, command_consumer) = starplayer_rt::channel(settings.command_capacity);
         let (garbage, collector) = garbage_channel(settings.garbage_capacity);
         let (insert_producer, insert_consumer) = starplayer_rt::channel(settings.insert_command_capacity);
         let (insert_garbage, insert_collector) = garbage_channel(settings.insert_garbage_capacity);
-        // The channel table clamps to `ChannelTable::MAX_CHANNELS`, so the bus count comes
-        // from the table rather than from the request: 64 buses is the widest the engine
-        // can be asked for, and the two must agree or a lane's voices would spill.
-        let channels = ChannelTable::new(settings.channel_count);
+        // Tracker insert buses never include interactive live lanes. Every live lane
+        // 64–80 routes through spill/master DSP, even for a four-channel song.
         let bus_count = match settings.layout {
-            EngineLayout::Full => channels.len(),
+            EngineLayout::Full => channels.layout().tracker_channels().min(ChannelTable::MAX_CHANNELS),
             EngineLayout::MasterOnly => 0,
         };
         #[cfg(feature = "telemetry")]
@@ -320,12 +406,23 @@ where
         // One scope ring per control lane, allocated here with everything else. A ring is
         // ~2 KB, so even IT's 64 channels cost 128 KB once, never in `render()`.
         #[cfg(feature = "telemetry")]
-        let (scope_taps, scope_readers) = crate::scope::ScopeTaps::new(if settings.scope_taps { settings.channel_count } else { 0 });
+        let (scope_taps, scope_readers) = crate::scope::ScopeTaps::new(if settings.scope_taps { channels.layout().tracker_channels().min(ChannelTable::MAX_CHANNELS) } else { 0 });
 
-        Engine {
-            voices: VoicePool::new(settings.voice_capacity),
+        let control = ControlClock::new(settings.sample_rate_hz, Frame::ZERO);
+        #[cfg(feature = "interactive-audition")]
+        let control = {
+            let mut control = control;
+            if settings.playback_configuration().is_some_and(|configuration| configuration.capacity.interactive_transport) {
+                let interval = ((settings.sample_rate_hz as u128 * settings.articulation_interval_micros as u128) << 32) / 1_000_000;
+                control.set_cadence(Frame::ZERO, interval.min(u64::MAX as u128) as u64, 0, true);
+            }
+            control
+        };
+
+        Ok(Engine {
+            voices: VoicePool::try_new(settings.voice_capacity).map_err(|_| crate::playback::PlaybackConfigError::AllocationFailed)?,
             channels,
-            control: ControlClock::new(settings.sample_rate_hz, Frame::ZERO),
+            control,
             pcm: Vec::new(),
             module: None,
             accumulator: vec![Path::Accumulator::default(); RENDER_QUANTUM].into_boxed_slice(),
@@ -345,7 +442,15 @@ where
             frame: Frame::ZERO,
             source_frame: Frame::ZERO,
             playing: true,
+            #[cfg(feature = "interactive-audition")]
+            last_dsp_frame: starplayer_dsp::Stereo::default(),
+            #[cfg(feature = "interactive-audition")]
+            clear_transition: false,
+            #[cfg(feature = "interactive-audition")]
+            interactive_transport: settings.playback_configuration().filter(|configuration| configuration.capacity.interactive_transport).map(|_| starplayer_core::InteractiveTransport::Stopped),
             sample_rate_hz: settings.sample_rate_hz,
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            articulation_interval_micros: settings.articulation_interval_micros,
             master_volume: U0F16::MAX,
             limiter: Limiter::SoftKnee,
             warnings: EngineWarnings::default(),
@@ -360,7 +465,7 @@ where
             #[cfg(feature = "trace")]
             trace: crate::trace::TraceRecorder::default(),
             interpolator: core::marker::PhantomData,
-        }
+        })
     }
 
     /// Claim the telemetry reader, once (architecture §9).
@@ -450,9 +555,18 @@ where
 
     /// Install one event source, replacing everything already there. Off the audio thread.
     pub fn set_source(&mut self, source: Box<dyn EventSource>) {
+        #[cfg(feature = "interactive-audition")]
+        let mut source = source;
         self.sources.clear();
         self.control.resume_synthesis(self.source_frame);
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if source.uses_articulation_cadence() {
+            let interval = ((self.sample_rate_hz as u128 * self.articulation_interval_micros as u128) << 32) / 1_000_000;
+            self.control.set_cadence(self.source_frame, source.initial_articulation_interval().unwrap_or(interval.min(u64::MAX as u128) as u64), 0, true);
+        } else if self.interactive_transport().is_none() { self.control.clear_cadence(); }
         // The mux was just cleared, so a slot is free unless its capacity is zero.
+        #[cfg(feature = "interactive-audition")]
+        if let Some(state) = self.interactive_transport { source.set_transport(state, self.source_frame, &mut self.control); }
         let _ = self.sources.insert(source);
     }
 
@@ -469,10 +583,19 @@ where
     /// it keeps them, in their slots, and takes them out itself with
     /// [`Engine::remove_source`].
     pub fn replace_source(&mut self, source: Box<dyn EventSource>) -> Option<Box<dyn EventSource>> {
+        #[cfg(feature = "interactive-audition")]
+        let mut source = source;
         let retired = self.sources.take_first();
         self.control.resume_synthesis(self.source_frame);
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if source.uses_articulation_cadence() {
+            let interval = ((self.sample_rate_hz as u128 * self.articulation_interval_micros as u128) << 32) / 1_000_000;
+            self.control.set_cadence(self.source_frame, source.initial_articulation_interval().unwrap_or(interval.min(u64::MAX as u128) as u64), 0, true);
+        } else if self.interactive_transport().is_none() { self.control.clear_cadence(); }
         // The take above freed the lowest occupied slot, so this insert lands in that slot
         // and can only fail for a mux built with no capacity at all.
+        #[cfg(feature = "interactive-audition")]
+        if let Some(state) = self.interactive_transport { source.set_transport(state, self.source_frame, &mut self.control); }
         let _ = self.sources.insert(source);
         retired
     }
@@ -480,6 +603,10 @@ where
     /// Add a source alongside whatever is already installed, or hand it back if the mux is
     /// full. Off the audio thread.
     pub fn add_source(&mut self, source: Box<dyn EventSource>) -> Result<SourceSlot, Box<dyn EventSource>> {
+        #[cfg(feature = "interactive-audition")]
+        let mut source = source;
+        #[cfg(feature = "interactive-audition")]
+        if let Some(state) = self.interactive_transport { source.set_transport(state, self.source_frame, &mut self.control); }
         self.sources.insert(source)
     }
 
@@ -507,12 +634,48 @@ where
     /// The output clock: how many frames have been rendered since construction.
     pub const fn frame(&self) -> Frame { self.frame }
 
-    /// The musical clock event sources report against. Equal to [`Engine::frame`] unless
-    /// the engine has been paused.
+    /// Source dispatch time: monotonic for interactive playback, held by legacy Stop.
     pub const fn source_frame(&self) -> Frame { self.source_frame }
 
     /// Whether the musical clock is running.
-    pub const fn is_playing(&self) -> bool { self.playing }
+    pub const fn is_playing(&self) -> bool {
+        #[cfg(feature = "interactive-audition")]
+        if let Some(state) = self.interactive_transport { return matches!(state, starplayer_core::InteractiveTransport::Playing); }
+        self.playing
+    }
+
+    pub const fn interactive_transport(&self) -> Option<starplayer_core::InteractiveTransport> {
+        #[cfg(feature = "interactive-audition")]
+        { self.interactive_transport }
+        #[cfg(not(feature = "interactive-audition"))]
+        { None }
+    }
+
+    /// Host replacement boundary only: update command identity without allocating.
+    pub fn set_playback_identity(&mut self, identity: starplayer_core::PlaybackIdentity) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if let Some(playback) = self.channels.playback_mut() { playback.set_identity(identity); }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        let _ = identity;
+    }
+
+    /// Swap an actual-module-sized selection table prepared by the control thread.
+    /// Return the old allocation for off-callback retirement, preserving voice ownership.
+    pub fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> {
+        #[cfg(feature = "note-overlap")]
+        if let Some(playback) = self.channels.playback_mut() { return playback.replace_instrument_selections(selections); }
+        selections
+    }
+
+    /// Restore host-prepared settings on a fresh build, before any live input.
+    pub fn restore_selections(&mut self, identity: starplayer_core::PlaybackIdentity, enabled: bool, selections: &[bool]) {
+        #[cfg(feature = "note-overlap")]
+        if let Some(playback) = self.channels.playback_mut() { let _ = playback.restore_selections(identity, enabled, selections); }
+        #[cfg(not(feature = "note-overlap"))]
+        let _ = (identity, enabled, selections);
+    }
+
+    fn audio_running(&self) -> bool { self.interactive_transport().is_some() || self.playing }
 
     /// The master volume the control plane last set. Applied by the master bus before
     /// the limiter, so turning the master down turns the limiting down with it.
@@ -589,6 +752,9 @@ where
         #[cfg(feature = "telemetry")]
         self.scope_taps.begin_quantum();
 
+        // External queues can become nonempty between quanta. Poll at the current
+        // frame before choosing the first segment, without dispatching/articulating.
+        if self.audio_running() { self.sources.advance_to(self.source_frame); }
         let mut offset = 0usize;
         let mut events_this_quantum = 0u32;
 
@@ -614,7 +780,7 @@ where
             // A stopped transport freezes the entire musical state, including sample
             // cursors. Advancing voices under silence would make Play resume halfway
             // through a one-shot even though the source clock had not moved.
-            if self.playing {
+            if self.audio_running() {
                 let pcm: &[i16] = match &self.module {
                     Some(module) => module.pcm(),
                     None => &self.pcm,
@@ -651,7 +817,7 @@ where
             }
 
             self.frame = self.frame.saturating_add(span as u64);
-            if self.playing {
+            if self.audio_running() {
                 self.source_frame = self.source_frame.saturating_add(span as u64);
                 self.sources.advance_to(self.source_frame);
             }
@@ -682,6 +848,25 @@ where
         {
             master_chain.process(Path::as_frames(&mut self.accumulator));
         }
+        #[cfg(feature = "interactive-audition")]
+        if self.interactive_transport.is_some() {
+            use starplayer_dsp::DspSample;
+            let frames = Path::as_frames(&mut self.accumulator);
+            if self.clear_transition {
+                // Reset delays immediately, then bridge their discontinuity with a bounded
+                // additive correction. Fresh live input is never multiplied by a mute ramp.
+                if let Some(first) = frames.first().copied() {
+                    let correction = starplayer_dsp::Stereo::new(self.last_dsp_frame.left.sub(first.left), self.last_dsp_frame.right.sub(first.right));
+                    for (index, frame) in frames.iter_mut().take(64).enumerate() {
+                        let gain = ((64 - index) * 32768 / 64) as i32;
+                        frame.left = frame.left.add(correction.left.scale_q15(gain));
+                        frame.right = frame.right.add(correction.right.scale_q15(gain));
+                    }
+                }
+                self.clear_transition = false;
+            }
+            if let Some(last) = frames.last().copied() { self.last_dsp_frame = last; }
+        }
         let master_settings = MasterSettings { volume: self.master_volume, limiter: self.limiter };
         Self::process_master_bus(&mut self.accumulator, master_settings);
 
@@ -689,12 +874,23 @@ where
         self.ring.refill_with(|destination| Out::convert(accumulator, destination));
     }
 
+    /// Insert requests still awaiting a quantum boundary. There is no deferred insert slot.
+    pub fn pending_insert_commands(&self) -> usize { self.insert_commands.len() }
+
     /// Apply up to [`MAX_COMMANDS_PER_QUANTUM`] queued commands.
     fn drain_commands(&mut self) {
+        #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+        let mut interactive_changed = false;
         for _ in 0..MAX_COMMANDS_PER_QUANTUM {
             let Some(command) = self.commands.pop() else { break };
+            #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+            { interactive_changed |= matches!(&command, Command::Interactive(_)); }
             self.apply_command(command);
         }
+        // The telemetry ring intentionally retains older snapshots under pressure.
+        // Publish the final transition once, so a burst cannot fill it with intermediates.
+        #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+        if interactive_changed && self.interactive_transport.is_some() { self.publish_interactive(); }
     }
 
     /// Apply up to [`MAX_COMMANDS_PER_QUANTUM`] queued insert commands.
@@ -778,6 +974,7 @@ where
                 // channels' mute flags are the host's and stay.
                 self.voices.release_all();
                 self.channels.forget_all();
+                self.channels.release_finished(&self.voices);
                 // A delay line still holding the previous song would bleed it into the
                 // first bar of the next one. The effects stay installed at their
                 // parameters; only their state goes.
@@ -792,6 +989,8 @@ where
                     drop(orphan);
                 }
             }
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            Command::Interactive(command) => self.apply_interactive(command),
             Command::Play => self.playing = true,
             Command::Stop => self.playing = false,
             Command::SetMasterVolume(volume) => self.master_volume = volume,
@@ -813,12 +1012,91 @@ where
             | Command::SetTempoModel(_) => {
                 self.warnings.unsupported_command = true;
             }
+            // A direct core consumer can enable its optional command variant without
+            // enabling this engine's capability. Compile it out in ordinary off builds.
+            #[allow(unreachable_patterns, reason = "core features can unify independently of engine capabilities")]
+            _ => { self.warnings.unsupported_command = true; }
         }
+    }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn apply_interactive(&mut self, command: starplayer_core::InteractiveCommand) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        {
+            use starplayer_core::InteractiveAction;
+            if !self.channels.playback().is_some_and(|playback| playback.validate_identity(command.identity).is_ok()) { return; }
+            match command.action {
+                #[cfg(feature = "interactive-audition")]
+                InteractiveAction::Play | InteractiveAction::Resume | InteractiveAction::Pause | InteractiveAction::Stop if self.interactive_transport.is_some() => {
+                    use starplayer_core::InteractiveTransport;
+                    let state = match command.action {
+                        InteractiveAction::Pause => InteractiveTransport::Paused,
+                        InteractiveAction::Stop => InteractiveTransport::Stopped,
+                        _ => InteractiveTransport::Playing,
+                    };
+                    if matches!(command.action, InteractiveAction::Stop) { self.clear_scope(crate::ownership::ClearScope::All); }
+                    self.interactive_transport = Some(state);
+                    self.sources.set_transport(state, self.source_frame, &mut self.control);
+
+                }
+                #[cfg(feature = "interactive-audition")]
+                InteractiveAction::StopPreview if self.interactive_transport.is_some() => self.clear_scope(crate::ownership::ClearScope::Live),
+                #[cfg(feature = "interactive-audition")]
+                InteractiveAction::SetLiveDestination(_) | InteractiveAction::PreviewInstrument(_) | InteractiveAction::ReleasePreview if self.interactive_transport.is_some() => {
+                    let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+                    self.sources.interactive_action(command.action, &mut context);
+                }
+                InteractiveAction::AllSoundOff => self.clear_scope(crate::ownership::ClearScope::All),
+                #[cfg(feature = "note-overlap")]
+                InteractiveAction::SetNoteOverlapEnabled(enabled) => {
+                    let clear = self.channels.playback_mut().and_then(|playback| playback.set_note_overlap_enabled(command.identity, enabled).ok().flatten());
+                    if let Some(scope) = clear { self.clear_scope(scope); }
+                }
+                #[cfg(feature = "note-overlap")]
+                InteractiveAction::SetLetNotesRing { instrument, enabled } => {
+                    if let Some(playback) = self.channels.playback_mut() { let _ = playback.set_let_notes_ring(command.identity, instrument, enabled); }
+                }
+                _ => self.warnings.unsupported_command = true,
+            }
+        }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        { let _ = command; self.warnings.unsupported_command = true; }
+    }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, scope: crate::ownership::ClearScope) {
+        self.channels.clear_scope(scope, &mut self.voices);
+        let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+        self.sources.clear_scope(scope, &mut context);
+        if scope == crate::ownership::ClearScope::All {
+            self.reset_all_inserts();
+            #[cfg(feature = "interactive-audition")]
+            { self.clear_transition = self.interactive_transport.is_some(); }
+        }
+    }
+
+    #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+    fn publish_interactive(&mut self) {
+        let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+        context.set_telemetry(&mut self.telemetry);
+        self.sources.describe_interactive(&mut context);
+        let mut live = starplayer_telemetry::LiveSummary::default();
+        if let Some(playback) = self.channels.playback() {
+            for owned in playback.iter(&self.voices).filter(|owned| owned.domain == crate::ownership::VoiceDomain::Live) {
+                if owned.lifecycle == crate::ownership::VoiceLifecycle::Retiring { live.retiring = live.retiring.saturating_add(1); }
+                else { live.active = live.active.saturating_add(1); }
+                if let Some(voice) = self.voices.get(owned.voice) { live.peak = live.peak.max(voice.params.volume); }
+            }
+        }
+        self.telemetry.set_live_summary(live);
+        if let Some(state) = self.interactive_transport { self.telemetry.set_interactive_transport(state, false); }
+        crate::telemetry::capture_channels(&mut self.telemetry, &self.channels, &self.voices);
+        self.telemetry.publish();
     }
 
     /// Frames that may be rendered before something is due. `u64::MAX` when nothing is.
     fn frames_until_next_event(&self) -> u64 {
-        if !self.playing {
+        if !self.audio_running() {
             return u64::MAX;
         }
         let source_gap = match self.sources.next_event_frame() {
@@ -839,7 +1117,7 @@ where
     /// sequencer's dispatch *takes the control clock over* — after it has run there is no
     /// synthesised tick left to take.
     fn dispatch_due_events(&mut self, events_this_quantum: &mut u32) {
-        if !self.playing {
+        if !self.audio_running() {
             return;
         }
         let mut zero_advance = 0u32;
@@ -850,25 +1128,50 @@ where
                 break;
             }
 
-            if source_due {
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            let previous_ticks = self.control.ticks();
+            if source_due || (self.interactive_transport().is_some() && control_due) {
                 // Mirrored before the dispatch rather than after, because the dispatch is
                 // what publishes. A flag raised *by* this tick therefore appears in the
                 // next tick's snapshot; the flags are sticky, so nothing is lost.
                 #[cfg(feature = "telemetry")]
                 self.telemetry.set_warnings(self.warnings.into());
 
+                #[cfg(feature = "interactive-audition")]
+                let mut reset_inserts = false;
                 let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+                #[cfg(feature = "interactive-audition")]
+                context.set_insert_reset_request(&mut reset_inserts);
                 context.set_warnings(&mut self.warnings);
                 #[cfg(feature = "telemetry")]
                 context.set_telemetry(&mut self.telemetry);
                 #[cfg(feature = "trace")]
                 context.set_trace(&mut self.trace);
+                #[cfg(feature = "interactive-audition")]
+                if self.interactive_transport.is_some() { self.sources.dispatch_interactive(self.source_frame, &mut context); }
+                else { self.sources.dispatch(self.source_frame, &mut context); }
+                #[cfg(not(feature = "interactive-audition"))]
                 self.sources.dispatch(self.source_frame, &mut context);
+                #[cfg(feature = "interactive-audition")]
+                if reset_inserts {
+                    self.reset_all_inserts();
+                    self.clear_transition = self.interactive_transport.is_some();
+                }
             }
             // Re-read rather than reusing `control_due`: the dispatch above may have taken
             // the clock over, in which case there is no synthesised tick to take.
             if self.control.next_synthesised_frame().is_some_and(|next| next <= self.source_frame) {
                 self.control.tick_synthesised();
+            }
+
+            #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+            if (self.interactive_transport().is_some() || self.sources.uses_articulation_cadence()) && self.control.ticks() != previous_ticks {
+                let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+                #[cfg(feature = "telemetry")]
+                context.set_telemetry(&mut self.telemetry);
+                self.sources.post_source_articulation(self.source_frame, &mut context);
+                #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+                self.publish_interactive();
             }
 
             zero_advance = zero_advance.saturating_add(1);

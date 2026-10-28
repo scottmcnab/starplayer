@@ -708,3 +708,113 @@ emulation resamples, so that would be diffing emulator artefacts.
 When implementation discovers a new deviation, add it to §3 with its cause and the
 canonical behaviour chosen, in the same commit as the code. A deviation that is not
 written down here is a defect, not a decision.
+
+## Optional creative playback: note overlap
+
+The [NO master plan](../engine/NO-master-plan.md) defines an optional creative playback
+layer, not a new interpretation of canonical tracker effects. NO-01 implements its
+contract types, optional preparation and bounded lane routing. NO-02/03 add native
+articulation/interactive transport; NO-04 adds opt-in MOD/S3M/MTM overlap. NO-05 adds
+XM/IT overlap; NO-06 adds faithful explicitly prepared instrument racks. No canonical
+tracker effect behavior changes.
+Unchecked/global-bypassed and feature-disabled renders must retain existing golden output.
+Custom overlap preserves non-looping sample tails and may override IT NNA/duplicate
+actions explicitly; authored IT behavior remains the default, including looping NNA.
+The opt-in setting is one Let notes ring checkbox per instrument, not a channel override
+or mode selector. Replace earlier voices only on matching instrument, original note,
+captured onset base volume and originating channel; different-volume repeats may overlap
+as echoes. Onset-tick fine/fast slides are included; tremolo/tremor and later slides/envelopes/gain/DSP
+do not change the captured identity. Record identity even while unchecked/bypassed. Live
+identity is resolved before CC7, while explicit key-up/pedal-up retains native release.
+Global bypass restores native behavior for subsequent notes, not historical voice state. This is a
+heuristic: equal-volume echoes still replace, while velocity-varied repetitions can overlap.
+Global Enable note overlap bypass preserves selections and clears only custom tails with
+bounded ramps; it does not disable native IT backgrounds, audition, transport or DSP.
+This cannot restore missing recorded decay and can change balance or musical intent.
+
+Sequencer-only Pause deliberately allows sound state to evolve while musical position
+is held; it is not an accuracy oracle or bit-exact suspended-state resume. Audition uses
+prepared samples and format articulation through master DSP. Document any additional
+canonical deviation discovered during implementation under the normal §3 process;
+never refresh canonical goldens to accommodate this opt-in feature.
+
+
+NO-01 identity APIs preserve raw MOD periods and native base-volume integer values rather
+than a rendered gain or rounded identity-only conversion. Passive finalization does not
+consult checkbox/global state, and native release does not erase identity; retiring slots
+are excluded from matching. NO-04 wires MOD/S3M/MTM capture after onset-tick processing
+and proves canonical equivalence in the three reviewed configurations; NO-05 extends
+the same capture and equivalence contract to XM/IT. NO-06 resolves live
+velocity before CC7 and tests collisions from each format's existing volume resolution.
+Those behavioral/equivalence tests are not satisfied by NO-01's seam-level contract tests.
+
+
+NO-04 distinguishes immutable trigger identity from the current sounding MOD sample:
+a completed queued swap changes the instrument checkbox/loop eligibility used for
+survival, while original instrument/note/volume/channel remain unchanged for matching.
+Queued metadata follows actual PCM adoption/retrigger, and successful detachment clears
+both parts. Exact sample tags prevent an aliased looping/sustain sample from acquiring
+another sample's one-shot eligibility. The canonical swap/offset rules stay intact:
+ProTracker's out-of-range 9xx one-word retained-pointer fallback is an actual onset;
+MTM/S3M out-of-range non-looping starts are not. The optional layer adds no decay or
+loop-release synthesis and regenerates no goldens.
+
+**Recorded pre-existing accuracy follow-up (NO-04, 2026-10-28): S3M fast-volume-slide
+flag.** The loader/header represents generalflags bit 6 and ST3.00 `Cwt/v == 0x1300`
+as `ModuleFlags::fast_volume_slides` (`starplayer-s3m/src/header.rs` and `loader.rs`).
+`S3mProcessor::static_volume_slide` applies fine forms immediately but otherwise only
+calls `set_minor`; neither it nor `set_minor` reads that flag. A synthetic note with
+base volume 20 and D10 therefore remains 20 on tick zero even with the flag set,
+rather than ST3 fast-sliding to 21. NO-04's named regression pins this existing gap,
+not canonical fast-flag fidelity. Supported onset fine slides and Qxy tick-zero volume
+operations are tested separately. Repair needs a separate source/oracle-backed accuracy
+change and regression coverage; NO-04 preserves the current effect ordering/output and
+does not weaken canonical comparisons or update goldens to conceal it.
+
+
+NO-05 captures XM `real_volume` (0–64) and IT `note_volume` (0–256) after all
+onset-tick channel processing, including fine slides and delayed volume columns.
+Envelope/tremolo/tremor/random/global-gain output is not the identity. For each IT
+candidate, current sounding sample eligibility and instrument checkbox decide whether
+to use the custom rule or authored NNA/DCT/DCA. Native candidate processing stays early;
+custom preservation happens there and exact duplicate replacement happens after effects,
+before mixing. Native-created backgrounds never migrate to the custom budget; checkbox
+changes do not rewrite provenance. Turning a custom tail's checkbox off makes subsequent
+native DCT/DCA apply to it. Runtime S7x background commands remain native. The bounded
+64-tail custom budget can provide fewer tails than authored 256-voice IT NNA.
+
+**Recorded pre-existing accuracy follow-up (NO-05, 2026-10-28): IT note-only after
+native NNA.** A synthetic instrument-mode Continue note followed by a note with no
+instrument column detaches the old foreground in `check_new_note_action`, then
+`note_change` resolves the missing instrument through the now-empty foreground and maps
+instrument zero. The incoming note does not sound. The named NO-05 regression pins this
+baseline separately; the custom migration path preserves its resolved incoming instrument
+without reapplying defaults, but this task does not change authored native NNA output.
+`conformance/known-failures.md` G6-IT-002 records broader voice-set discrepancies, not this
+specific cause; no exclusion is reclassified here and no canonical golden is changed.
+A separate accuracy task should repair native remembered-instrument resolution against
+the existing format reference/conformance fixtures.
+
+
+NO-06 prepared racks use native XM/IT articulation, sample maps, tuning, release/filter
+and note actions. Existing unconfigured musical racks keep their prior behavior. The
+reviewed live reference convention remains MIDI60 at the reference rate: XM selects
+map60 but uses the pitch equivalent of native zero-based48 before sample tuning; IT
+uses map/pitch60 directly. This adapter convention is explicit and tested separately
+from canonical tracker numbering. Identity uses the resolved pre-CC7 base (XM0–64,
+IT0–256; simple PCM retains Q0.16), including existing resolution collisions. CC7/CC10
+remain next-note latches. Shared native cadence supports explicitly prepared SMF N/C
+racks with either feature; live L routing requires audition. Native tracker goldens and
+pinned conformance remain unchanged; no oracle exclusions or golden hashes are updated.
+
+NO-W1 adds web controls and an audio-applied, full-identity bridge without changing native
+tracker effects or golden expectations. Preview eligibility also uses XM's pure native
+pitch-table preflight: a mapped PCM sample at reference60 can be silent because its
+relative-note/finetune is out of range, even while another mapped key is playable. This
+metadata correction shares onset resolution and does not change native tuning arithmetic.
+
+Mapped PCM loop/one-shot metadata remains independent of live-input pitch viability.
+For example, XM native cell1/map0 may sound while live input0 cannot tune under the existing
+reference adapter; that sample remains eligible for song note overlap. Mixed-map badges
+include both looping and non-looping mapped PCM even when one side is outside the live
+pitch range. No native tuning arithmetic or canonical output is changed.

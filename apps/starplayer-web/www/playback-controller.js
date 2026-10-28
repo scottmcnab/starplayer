@@ -70,7 +70,7 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
         userControl(action) {
             controlRevision += 1;
             if (action === 'play') { blocked = false; wasPlaying = false; emitted = false; }
-            else if (action === 'seek') { wasPlaying = false; }
+            else if (action === 'seek' || action === 'pause') { wasPlaying = false; }
             else { blocked = true; controller.cancel(); }
         },
         // A graph rebuild/load-option reload preserves ownership and suppression, but
@@ -93,7 +93,7 @@ export function createPlaybackController({ resolver, activate, ready = () => {},
             if (snapshot.sequence === sequence && snapshot.engineFrame === engineFrame) return;
             sequence = snapshot.sequence;
             engineFrame = snapshot.engineFrame;
-            const ended = wasPlaying && !snapshot.playing && (snapshot.songFlags & SONG_FLAG_END_REACHED) !== 0;
+            const ended = snapshot.naturalEnd === undefined ? wasPlaying && !snapshot.playing && (snapshot.songFlags & SONG_FLAG_END_REACHED) !== 0 : snapshot.naturalEnd && !snapshot.playing && snapshot.transport === 'stopped';
             wasPlaying = snapshot.playing;
             if (ended && !blocked && !emitted) {
                 emitted = true;

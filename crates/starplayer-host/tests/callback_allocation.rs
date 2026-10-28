@@ -229,3 +229,212 @@ fn allocation_on_another_thread_is_not_a_violation() {
     });
     assert!(report.largest < 1 << 20, "another thread's megabyte was attributed to this one: {report:?}");
 }
+
+#[cfg(all(feature = "note-overlap", feature = "interactive-audition"))]
+#[test]
+fn interactive_pause_clear_seek_and_rebuild_replay_allocate_nothing_in_callback() {
+    let mut backend = ManualBackend::new();
+    let spec = AudioSpec::stereo(44_100);
+    let settings = starplayer::engine::EngineSettings::interactive_web(Default::default(), 256).unwrap();
+    let mut player = Player::open_with_settings(&mut backend, None, spec, MixerMode::DEFAULT, settings).unwrap();
+    let driver = backend.driver().unwrap();
+    player.load(include_bytes!("../../starplayer-s3m/tests/fixtures/PETRI.S3M")).unwrap(); player.play().unwrap();
+    let mut output = [0.0; 2048];
+    driver.render(&mut output);
+    for action in [starplayer::core::InteractiveAction::Pause, starplayer::core::InteractiveAction::Stop, starplayer::core::InteractiveAction::Resume, starplayer::core::InteractiveAction::AllSoundOff] {
+        player.interactive(action).unwrap();
+        let (_, report) = while_watching_for_allocations(|| driver.render(&mut output));
+        assert!(report.is_clean(), "{action:?}: {report:?}");
+    }
+    player.pause().unwrap(); player.seek_row(3).unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output)); assert!(report.is_clean(), "seek: {report:?}");
+    player.telemetry();
+    let mut mode = player.mixer_mode(); mode.interpolator = starplayer::core::Interpolator::Cubic;
+    player.set_mixer_mode(&mut backend, None, mode).unwrap(); let driver = backend.driver().unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output)); assert!(report.is_clean(), "replay: {report:?}");
+    let midi = b"MThd\0\0\0\x06\0\0\0\x01\0\x60MTrk\0\0\0\x08\0\x90\x3C\x64\x60\xFF\x2F\0";
+    let instruments = starplayer::rt::Arc::clone(player.module().unwrap());
+    player.load_smf(midi, instruments).unwrap(); player.play().unwrap(); driver.render(&mut output);
+    player.pause().unwrap(); driver.render(&mut output); player.telemetry();
+    player.reopen(&mut backend, None, AudioSpec::stereo(48_000)).unwrap(); let driver = backend.driver().unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output)); assert!(report.is_clean(), "SMF rebuild: {report:?}");
+    player.resume().unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output)); assert!(report.is_clean(), "SMF resume: {report:?}");
+}
+
+#[cfg(feature = "note-overlap")]
+#[test]
+fn active_legacy_overlap_pressure_bypass_and_actual_instrument_table_swaps_are_callback_safe() {
+    use starplayer::core::{InstrumentId, InteractiveAction, PlaybackCapabilities, PlaybackIdentity};
+    use starplayer::engine::{EngineSettings, PlaybackConfiguration, VoiceCapacity};
+    use starplayer::model::{InstrumentDef, ModuleBuilder, ModuleFormat, ModuleHeader, SampleSpec};
+    fn module(format: ModuleFormat, instruments: usize) -> starplayer::rt::Arc<starplayer::model::Module> {
+        let mut builder = ModuleBuilder::new();
+        for _ in 0..instruments {
+            let sample = builder.add_sample(&vec![1000; 65_536], SampleSpec::one_shot("long sample")).unwrap();
+            builder.add_instrument(InstrumentDef::from_sample("instrument", sample, U0F16::MAX)).unwrap();
+        }
+        let mut pattern = Vec::new();
+        for row in 0..64 {
+            for channel in 0..4 {
+                let instrument = if channel == 0 { 1 } else { 0 };
+                match format {
+                    ModuleFormat::Mod => pattern.extend(starplayer::mod_file::ModCell { period: if channel == 0 { [428, 285, 339, 320][row % 4] } else { 0 }, instrument, effect: 0, param: 0 }.to_bytes()),
+                    ModuleFormat::Mtm => pattern.extend(starplayer::mtm::MtmCell { pitch: if channel == 0 { [24, 31, 28, 29][row % 4] } else { 0 }, instrument, effect: 0, param: 0 }.to_bytes()),
+                    ModuleFormat::S3m => pattern.extend([if channel == 0 { [0x40, 0x47, 0x44, 0x45][row % 4] } else { 255 }, instrument, 255, 0, 0]),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        builder.add_pattern(&pattern, 64, 4).unwrap(); builder.set_orders(&[0, starplayer::model::ORDER_END]);
+        let mut header = ModuleHeader::new(format, 4); header.initial_speed = 1; builder.set_header(header);
+        starplayer::rt::Arc::new(builder.build().unwrap())
+    }
+    let settings = EngineSettings { channel_count: 4, ..EngineSettings::default() }.with_playback(PlaybackConfiguration {
+        identity: PlaybackIdentity::default(), capabilities: if cfg!(feature = "interactive-audition") { PlaybackCapabilities::all() } else { PlaybackCapabilities::NOTE_OVERLAP }, instrument_count: 0,
+        capacity: VoiceCapacity { native: 4, custom: 2, live: if cfg!(feature = "interactive-audition") { 2 } else { 0 }, interactive_transport: cfg!(feature = "interactive-audition") },
+    }).unwrap();
+    let mut backend = ManualBackend::new();
+    let mut player = Player::open_with_settings(&mut backend, None, AudioSpec::stereo(44_100), MixerMode::DEFAULT, settings).unwrap();
+    let driver = backend.driver().unwrap(); let mut output = [0.0; 2048];
+    for (format, count) in [(ModuleFormat::Mod, 2), (ModuleFormat::S3m, 3), (ModuleFormat::Mtm, 1)] {
+        player.load_module(module(format, count)).unwrap();
+        player.interactive(InteractiveAction::SetLetNotesRing { instrument: InstrumentId(0), enabled: true }).unwrap();
+        player.interactive(InteractiveAction::SetNoteOverlapEnabled(true)).unwrap(); player.play().unwrap();
+        let (_, report) = while_watching_for_allocations(|| { for _ in 0..12 { driver.render(&mut output); } });
+        assert!(report.is_clean(), "{format:?} table install, enabled detachment, eviction and duplicate scans: {report:?}");
+        assert!(player.telemetry().voices_active >= 2, "enabled overlap actually ran for {format:?}");
+        player.interactive(InteractiveAction::SetNoteOverlapEnabled(false)).unwrap();
+        let (_, report) = while_watching_for_allocations(|| driver.render(&mut output));
+        assert!(report.is_clean(), "{format:?} bypass retirement: {report:?}");
+        player.collect_garbage();
+    }
+}
+
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+#[test]
+fn burst_prepared_loads_wait_for_retirement_room_without_callback_drops() {
+    #[cfg(feature = "note-overlap")]
+    use starplayer::core::{InstrumentId, InteractiveAction};
+    let mut backend = ManualBackend::new();
+    let settings = starplayer::engine::EngineSettings::default().with_playback(starplayer::engine::PlaybackConfiguration {
+        identity: Default::default(), capabilities: starplayer::engine::compiled_playback_capabilities(), instrument_count: 0,
+        capacity: starplayer::engine::VoiceCapacity { native: 64, custom: if cfg!(feature = "note-overlap") { 4 } else { 0 }, live: if cfg!(feature = "interactive-audition") { 2 } else { 0 }, interactive_transport: cfg!(feature = "interactive-audition") },
+    }).unwrap();
+    let mut player = Player::open_with_settings(&mut backend, None, AudioSpec::stereo(44_100), MixerMode::DEFAULT, settings).unwrap();
+    let driver = backend.driver().unwrap();
+    for _ in 0..12 { player.load(include_bytes!("../../../fuzz/seeds/mod/synthetic-golden.mod")).unwrap(); }
+    #[cfg(feature = "note-overlap")]
+    {
+        player.interactive(InteractiveAction::SetLetNotesRing { instrument: InstrumentId(0), enabled: true }).unwrap();
+        player.interactive(InteractiveAction::SetNoteOverlapEnabled(true)).unwrap();
+    }
+    player.play().unwrap();
+    let mut output = [0.0; 8192];
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output));
+    assert!(report.is_clean(), "full retirement ring must defer a complete prepared Load: {report:?}");
+    assert!(!player.warnings().retired_module_dropped);
+    assert!(!player.is_playing(), "later commands remain ordered behind the deferred loads");
+    assert!(player.collect_garbage() != 0);
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output));
+    assert!(report.is_clean(), "deferred source/table/module swaps: {report:?}");
+    assert!(player.is_playing()); assert!(!player.warnings().retired_module_dropped);
+    player.collect_garbage();
+}
+
+#[cfg(feature = "note-overlap")]
+#[test]
+fn active_xm_it_overlap_articulation_pressure_and_bypass_are_callback_safe() {
+    use starplayer::core::{InstrumentId, InteractiveAction, PlaybackCapabilities, PlaybackIdentity};
+    use starplayer::engine::{EngineSettings, PlaybackConfiguration, VoiceCapacity};
+    use starplayer::model::{InstrumentDef, ModuleBuilder, ModuleFormat, ModuleHeader, SampleSpec};
+    fn module(format: ModuleFormat, instruments: usize) -> starplayer::rt::Arc<starplayer::model::Module> {
+        let mut builder = ModuleBuilder::new();
+        for _ in 0..instruments {
+            let sample = builder.add_sample(&vec![1000; 65_536], SampleSpec::one_shot("long sample")).unwrap();
+            let mut instrument = InstrumentDef::from_sample("instrument", sample, U0F16::MAX);
+            instrument.note_sample_map.fill(sample.0 + 1);
+            for (note, mapped) in instrument.note_transpose_map.iter_mut().enumerate() { *mapped = note as u8; }
+            builder.add_instrument(instrument).unwrap();
+        }
+        let mut pattern = Vec::new();
+        for row in 0..64 {
+            for channel in 0..4 {
+                let instrument = if channel == 0 { 1 } else { 0 };
+                match format {
+                    ModuleFormat::Xm => pattern.extend(starplayer::xm::XmCell { note: if channel == 0 { [49, 56, 53, 54][row % 4] } else { 0 }, instrument, ..starplayer::xm::XmCell::EMPTY }.to_bytes()),
+                    ModuleFormat::It => pattern.extend(starplayer::it::ItCell { note: if channel == 0 { [48, 55, 52, 53][row % 4] } else { starplayer::it::NOTE_NONE }, instrument, ..starplayer::it::ItCell::EMPTY }.to_bytes()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        builder.add_pattern(&pattern, 64, 4).unwrap(); builder.set_orders(&[0, starplayer::model::ORDER_END]);
+        let mut header = ModuleHeader::new(format, 4); header.initial_speed = 1;
+        if format == ModuleFormat::It { header.format_extra = starplayer::it::ItFormatExtra { flags: 12, special: 0, old_instruments: false, has_midi_configuration: false }.encode(); }
+        builder.set_header(header);
+        starplayer::rt::Arc::new(builder.build().unwrap())
+    }
+    let settings = EngineSettings { channel_count: 4, ..EngineSettings::default() }.with_playback(PlaybackConfiguration {
+        identity: PlaybackIdentity::default(), capabilities: if cfg!(feature = "interactive-audition") { PlaybackCapabilities::all() } else { PlaybackCapabilities::NOTE_OVERLAP }, instrument_count: 0,
+        capacity: VoiceCapacity { native: 256, custom: 2, live: if cfg!(feature = "interactive-audition") { 2 } else { 0 }, interactive_transport: cfg!(feature = "interactive-audition") },
+    }).unwrap();
+    let mut backend = ManualBackend::new();
+    let mut player = Player::open_with_settings(&mut backend, None, AudioSpec::stereo(44_100), MixerMode::DEFAULT, settings).unwrap();
+    let driver = backend.driver().unwrap(); let mut output = [0.0; 2048];
+    for (format, count) in [(ModuleFormat::Xm, 2), (ModuleFormat::It, 3)] {
+        player.load_module(module(format, count)).unwrap();
+        player.interactive(InteractiveAction::SetLetNotesRing { instrument: InstrumentId(0), enabled: true }).unwrap();
+        player.interactive(InteractiveAction::SetNoteOverlapEnabled(true)).unwrap(); player.play().unwrap();
+        let (_, report) = while_watching_for_allocations(|| { for _ in 0..12 { driver.render(&mut output); } });
+        assert!(report.is_clean(), "{format:?} table install, enabled detachment, eviction and duplicate scans: {report:?}");
+        assert!(player.telemetry().voices_active >= 2, "enabled overlap actually ran for {format:?}");
+        player.interactive(InteractiveAction::SetNoteOverlapEnabled(false)).unwrap();
+        let (_, report) = while_watching_for_allocations(|| driver.render(&mut output));
+        assert!(report.is_clean(), "{format:?} bypass retirement: {report:?}");
+        player.collect_garbage();
+    }
+}
+
+#[cfg(feature = "interactive-audition")]
+#[test]
+fn actual_loaded_native_live_runtimes_and_bounded_controls_allocate_and_free_nothing() {
+    use starplayer::core::{Event, InstrumentId, InteractiveAction, LiveDestination, Note};
+    for format in [starplayer::model::ModuleFormat::Xm,starplayer::model::ModuleFormat::It] {
+        use starplayer::model::{ModuleBuilder, ModuleHeader, ModuleFormat, SampleSpec, InstrumentDef, Envelope, EnvelopePoint};
+        let mut builder = ModuleBuilder::new(); let sample = builder.add_sample(&[1500;32768],SampleSpec::one_shot("live")).unwrap();
+        let mut instrument = InstrumentDef::from_sample("live",sample,U0F16::MAX); instrument.note_sample_map.fill(1);
+        for (note,mapped) in instrument.note_transpose_map.iter_mut().enumerate() { *mapped = note as u8; }
+        instrument.new_note_action = starplayer::model::NewNoteAction::Continue;
+        instrument.volume_envelope = Some(Envelope {points:vec![EnvelopePoint {tick:0,value:64},EnvelopePoint {tick:100,value:0}].into_boxed_slice(),..Envelope::default()});
+        builder.add_instrument(instrument).unwrap();
+        let cells = if format == ModuleFormat::Xm {vec![49,1,0,0,0,56,1,0,0,0,49,1,0x27,0,0,49,1,0x27,0,0]} else {vec![60,1,255,0,0,67,1,255,0,0,60,1,23,0,0,60,1,23,0,0]}; builder.add_pattern(&cells,4,1).unwrap(); builder.set_orders(&[0]);
+        let mut header = ModuleHeader::new(format,1); header.flags.linear_slides=true;
+        if format == ModuleFormat::It { header.format_extra=starplayer::it::ItFormatExtra {flags:12,special:0,old_instruments:false,has_midi_configuration:false}.encode(); }
+        builder.set_header(header); let module = starplayer::rt::Arc::new(builder.build().unwrap());
+        let mut backend = ManualBackend::new();
+        let settings = starplayer::engine::EngineSettings::default().with_playback(starplayer::engine::PlaybackConfiguration {
+            identity:Default::default(),capabilities:starplayer::engine::compiled_playback_capabilities(),instrument_count:0,
+            capacity:starplayer::engine::VoiceCapacity {native:256,custom:if cfg!(feature="note-overlap") {4} else {0},live:16,interactive_transport:true},
+        }).unwrap();
+        let mut player = Player::open_with_settings(&mut backend,None,AudioSpec::stereo(44_100),MixerMode::DEFAULT,settings).unwrap();
+        let driver = backend.driver().unwrap(); player.load_module(module).unwrap();
+        player.interactive(InteractiveAction::SetLiveDestination(LiveDestination::Selected(InstrumentId(0)))).unwrap();
+        #[cfg(feature = "note-overlap")]
+        { player.interactive(InteractiveAction::SetLetNotesRing { instrument: InstrumentId(0), enabled: true }).unwrap(); player.interactive(InteractiveAction::SetNoteOverlapEnabled(true)).unwrap(); }
+        player.play().unwrap();
+        let mut output = [0.0;512]; let mut heard = false;
+        let (_, report) = while_watching_for_allocations(|| {
+            for index in 0..80 {
+                if index == 40 { let _ = player.pause(); }
+                if index == 60 { let _ = player.resume(); }
+                let _ = player.send_event(0,Event::NoteOn {note:Note::new(60+(index%12) as u8),velocity:U0F16::MAX});
+                driver.render(&mut output); heard |= output.iter().any(|sample| *sample != 0.0);
+            }
+            let _ = player.interactive(InteractiveAction::PreviewInstrument(InstrumentId(u16::MAX)));
+            let _ = player.interactive(InteractiveAction::StopPreview); driver.render(&mut output);
+            let _ = player.interactive(InteractiveAction::Stop); driver.render(&mut output);
+        });
+        assert!(report.is_clean(),"native live runtime, pressure, reject and clears: {report:?}");
+        assert!(player.event_clock().sent() > 0); assert!(heard,"the actual native runtime must sound under the allocation hook");
+    }
+}

@@ -30,6 +30,8 @@ starplayer-telemetry = { workspace = true, optional = true }
 # reachable from here, transitively enables `std`. `xtask ci --job no-std-purity`
 # enforces it by compiling this crate's default feature set for a bare-metal target.
 [features]
+interactive-audition = ["starplayer-engine/interactive-audition", "starplayer-mod?/interactive-audition", "starplayer-s3m?/interactive-audition", "starplayer-mtm?/interactive-audition", "starplayer-xm?/interactive-audition", "starplayer-it?/interactive-audition", "starplayer-midi?/interactive-audition"]
+note-overlap = ["starplayer-engine/note-overlap", "starplayer-mod?/note-overlap", "starplayer-s3m?/note-overlap", "starplayer-mtm?/note-overlap", "starplayer-xm?/note-overlap", "starplayer-it?/note-overlap", "starplayer-midi?/note-overlap"]
 default = ["s3m", "mod", "mtm", "xm", "it", "float-mix", "linear-interp"]
 
 std = [

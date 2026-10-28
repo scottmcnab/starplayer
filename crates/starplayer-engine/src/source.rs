@@ -71,6 +71,10 @@ pub struct EngineContext<'engine> {
     /// and absent for a context a test or a format crate built by hand — which is exactly
     /// why it is an `Option` rather than a parameter of [`EngineContext::new`].
     warnings: Option<&'engine mut EngineWarnings>,
+    /// A dispatch-local successful-seek signal; the engine resets DSP before its next
+    /// whole-quantum processing pass. No engine storage or callback allocation.
+    #[cfg(feature = "interactive-audition")]
+    insert_reset_request: Option<&'engine mut bool>,
     /// Per-tick diagnostic recorder. Absent, including as a field, when tracing is off.
     #[cfg(feature = "trace")]
     pub(crate) trace: Option<&'engine mut crate::trace::TraceRecorder>,
@@ -92,6 +96,8 @@ impl<'engine> EngineContext<'engine> {
             #[cfg(feature = "telemetry")]
             telemetry: None,
             warnings: None,
+            #[cfg(feature = "interactive-audition")]
+            insert_reset_request: None,
             #[cfg(feature = "trace")]
             trace: None,
         }
@@ -115,6 +121,16 @@ impl<'engine> EngineContext<'engine> {
         self.warnings = Some(warnings);
     }
 
+    #[cfg(feature = "interactive-audition")]
+    pub(crate) fn set_insert_reset_request(&mut self, request: &'engine mut bool) { self.insert_reset_request = Some(request); }
+
+    /// Request a DSP state reset after an authoritative successful interactive seek.
+    /// The engine consumes this once before processing the complete 128-frame quantum.
+    #[cfg(feature = "interactive-audition")]
+    pub fn request_insert_reset(&mut self) {
+        if let Some(request) = self.insert_reset_request.as_deref_mut() { *request = true; }
+    }
+
     /// Report that an event arrived at a frame already past and was dispatched at the
     /// current one — [`EngineWarnings::late_events`].
     ///
@@ -135,6 +151,9 @@ impl<'engine> EngineContext<'engine> {
     /// the only two places a step reaches a voice.
     #[inline]
     pub fn write_voice_param(&mut self, voice: VoiceId, param: VoiceParam) {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        if self.channels.playback().and_then(|playback| playback.get(voice, self.voices)).is_some_and(|owned| owned.lifecycle == crate::ownership::VoiceLifecycle::Retiring) { return; }
+
         #[cfg(feature = "trace")]
         let channel = self.voices.get(voice).map(|state| state.tag.channel);
         let Some(state) = self.voices.get_mut(voice) else { return };
@@ -161,6 +180,8 @@ impl<'engine> EngineContext<'engine> {
             #[cfg(feature = "telemetry")]
             telemetry: self.telemetry.as_deref_mut(),
             warnings: self.warnings.as_deref_mut(),
+            #[cfg(feature = "interactive-audition")]
+            insert_reset_request: self.insert_reset_request.as_deref_mut(),
             #[cfg(feature = "trace")]
             trace: self.trace.as_deref_mut(),
         }
@@ -182,13 +203,49 @@ pub trait EventSource: Send {
 
     /// Advance internal state to `frame` without producing events.
     ///
-    /// `frame` is never past [`EventSource::next_event_frame`].
+    /// `frame` is never past [`EventSource::next_event_frame`]. May be called again
+    /// at the same frame before scheduling a quantum; polling must be idempotent and
+    /// must not advance musical articulation.
     fn advance_to(&mut self, frame: Frame);
 
     /// Produce everything due exactly at `frame`.
     ///
     /// Only called when [`EventSource::next_event_frame`] reports this frame as due.
     fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>);
+
+    /// Explicit interactive transport. Sequenced sources translate their own deadlines;
+    /// live sources leave timestamps untouched. Called only by opted-in engines.
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, _state: starplayer_core::InteractiveTransport, _frame: Frame, _control: &mut ControlClock) {}
+
+    /// Slot-ordered dispatch at an interactive event/cadence boundary. A held sequencer
+    /// runs its control-only step here, before later live sources receive their events.
+    #[cfg(feature = "interactive-audition")]
+    fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        if self.next_event_frame().is_some_and(|next| next <= frame) { self.dispatch(frame, context); }
+    }
+
+    /// Describe held/song state without advancing it. The engine publishes the coherent
+    /// combined snapshot after source/live processing, or after a command transition.
+    #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+    fn describe_interactive(&mut self, _context: &mut EngineContext<'_>) {}
+
+    #[cfg(feature = "interactive-audition")]
+    fn interactive_action(&mut self, _action: starplayer_core::InteractiveAction, _context: &mut EngineContext<'_>) {}
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn uses_articulation_cadence(&self) -> bool { false }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn initial_articulation_interval(&self) -> Option<u64> { None }
+
+    /// Exactly one live articulation step after all due sources, at the authority's frame.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn post_source_articulation(&mut self, _frame: Frame, _context: &mut EngineContext<'_>) {}
+
+    /// Invalidate source-owned holds/articulation immediately; the engine owns voice ramps.
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, _scope: crate::ownership::ClearScope, _context: &mut EngineContext<'_>) {}
+
 }
 
 /// A one-element array delegates to its source. This permits fallible boxing via
@@ -198,6 +255,24 @@ impl<Source: EventSource> EventSource for [Source; 1] {
     fn next_event_frame(&self) -> Option<Frame> { let [source] = self; source.next_event_frame() }
     fn advance_to(&mut self, frame: Frame) { let [source] = self; source.advance_to(frame); }
     fn dispatch(&mut self, frame: Frame, context: &mut EngineContext<'_>) { let [source] = self; source.dispatch(frame, context); }
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame, control: &mut ControlClock) { let [source] = self; source.set_transport(state, frame, control); }
+    #[cfg(feature = "interactive-audition")]
+    fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) { let [source] = self; source.dispatch_interactive(frame, context); }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn post_source_articulation(&mut self, frame: Frame, context: &mut EngineContext<'_>) { let [source] = self; source.post_source_articulation(frame, context); }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn uses_articulation_cadence(&self) -> bool { let [source] = self; source.uses_articulation_cadence() }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn initial_articulation_interval(&self) -> Option<u64> { let [source] = self; source.initial_articulation_interval() }
+    #[cfg(feature = "interactive-audition")]
+    fn interactive_action(&mut self, action: starplayer_core::InteractiveAction, context: &mut EngineContext<'_>) { let [source] = self; source.interactive_action(action, context); }
+    #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+    fn describe_interactive(&mut self, context: &mut EngineContext<'_>) { let [source] = self; source.describe_interactive(context); }
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, scope: crate::ownership::ClearScope, context: &mut EngineContext<'_>) { let [source] = self; source.clear_scope(scope, context); }
+
 }
 
 /// Allocate one dynamic source, returning allocation failure to the control thread.
@@ -419,6 +494,36 @@ impl SourceMux {
 }
 
 impl EventSource for SourceMux {
+    #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+    fn describe_interactive(&mut self, context: &mut EngineContext<'_>) {
+        for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.describe_interactive(context); } }
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame, control: &mut ControlClock) {
+        for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.set_transport(state, frame, control); } }
+    }
+    #[cfg(feature = "interactive-audition")]
+    fn dispatch_interactive(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.dispatch_interactive(frame, context); } }
+    }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn post_source_articulation(&mut self, frame: Frame, context: &mut EngineContext<'_>) {
+        for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.post_source_articulation(frame, context); } }
+    }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn uses_articulation_cadence(&self) -> bool { self.slots.iter().any(|slot| slot.source.as_ref().is_some_and(|source| source.uses_articulation_cadence())) }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn initial_articulation_interval(&self) -> Option<u64> { self.slots.iter().find_map(|slot| slot.source.as_ref().and_then(|source| source.initial_articulation_interval())) }
+    #[cfg(feature = "interactive-audition")]
+    fn interactive_action(&mut self, action: starplayer_core::InteractiveAction, context: &mut EngineContext<'_>) {
+        for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.interactive_action(action, context); } }
+    }
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    fn clear_scope(&mut self, scope: crate::ownership::ClearScope, context: &mut EngineContext<'_>) {
+        for slot in self.slots.iter_mut() { if let Some(source) = slot.source.as_mut() { source.clear_scope(scope, context); } }
+    }
+
     fn next_event_frame(&self) -> Option<Frame> {
         self.slots.iter().filter_map(|slot| slot.source.as_ref()?.next_event_frame()).min()
     }

@@ -107,11 +107,11 @@ type EmbeddedEngine<Interp> = Engine<FixedPath, Interp, FixedOut<i16, OUTPUT_CHA
 /// accumulator frame is two `i32`; `FixedOut<i16, 2>`; `telemetry` on):
 ///
 /// ```text
-///   heap bytes = 27_808 + 168 × voice_capacity + 5_288 × channel_count
+///   heap bytes = 27_856 + 168 × voice_capacity + 5_288 × channel_count
 /// ```
 ///
-/// So `REFLEX.S3M` (3 channels, 3 voices) costs 44 176 bytes, `PETRI.S3M` (8 and 8) costs
-/// 71 456, and a 32-channel module with a 64-voice pool costs about 208 kB — all before the
+/// So `REFLEX.S3M` (3 channels, 3 voices) costs 44 224 bytes, `PETRI.S3M` (8 and 8) costs
+/// 71 504, and a 32-channel module with a 64-voice pool costs about 208 kB — all before the
 /// module's own PCM, which is what I2's flash-resident images exist to keep out of RAM.
 ///
 /// Where it goes, and the three things worth knowing before writing a budget:
@@ -129,20 +129,29 @@ type EmbeddedEngine<Interp> = Engine<FixedPath, Interp, FixedOut<i16, OUTPUT_CHA
 ///   no scope; it is a follow-up.
 /// * **27.8 kB fixed**, of which about 15.7 kB is two rings of `Snapshot` — the engine's
 ///   own telemetry channel and this host's forwarding one, three deep each, and a
-///   `Snapshot` is 2 616 bytes because it carries 64 channels whatever the module has
+///   `Snapshot` is 2 624 bytes because it carries 64 channels whatever the module has
 ///   (`starplayer_telemetry::MAX_CHANNELS`, fixed by M1-B6). The rest is the three
 ///   quantum-sized scratch buffers, the output ring and the five command and garbage
 ///   rings.
 ///
 /// One more figure a firmware needs and this formula does not cover: a
-/// [`RenderHalf<Linear>`] is **11 744 bytes by value**, because the engine's telemetry
+/// [`RenderHalf<Linear>`] is **11 800 bytes by value** on the neither-feature64-bit host, because the engine's telemetry
 /// publisher holds a working `Snapshot` inline and this host holds another. Move it into a
 /// `static` or a `Box` rather than down a call chain.
 ///
 /// I9's explicit `EngineLayout::MasterOnly`, with scope taps disabled and telemetry depth
-/// one, measures `17_344 + 168 × voice_capacity + 8 × channel_count` bytes. The eight
+/// one, measures `17_360 + 168 × voice_capacity + 8 × channel_count` bytes. The eight
 /// bytes per channel are the control table only; there are no channel audio buffers or
 /// insert chains in that layout.
+///
+/// These x86_64 figures use neither optional playback feature. Small transport flags
+/// add eight bytes per Snapshot versus the original 2_616-byte header. Compiled overlap
+/// widens each of64 Engine commands by eight bytes; compiled audition adds328 bytes per
+/// Snapshot (cursor/controller payload and live summary). Thus full fixed overhead is
+/// 28_368 overlap-only /30_336 audition or both; compact is17_872 /18_528 respectively.
+/// Runtime legacy settings still allocate no PlaybackState, selection table or live rack.
+/// The firmware dependency graph enables neither feature; root workspace unification is
+/// a different resource profile and is tested separately with exact structural formulas.
 pub fn settings_for(module: &Module, sample_rate_hz: u32) -> EngineSettings {
     EngineSettings {
         sample_rate_hz,

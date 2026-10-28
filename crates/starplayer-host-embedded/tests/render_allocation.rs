@@ -145,6 +145,19 @@ fn a_ragged_render_that_ends_mid_frame_allocates_nothing_either() {
 
 // ── the heap budget (research point 3, and deliverable 1's formula) ─────────────────
 
+// The original x86_64 budget has six allocated Snapshot copies at depth3 (two
+// rings) and64 Engine commands. Optional compilation changes their strides, never
+// constructs PlaybackState/racks or changes native voices/channels in this fixture.
+fn fixed_heap_bytes(depth: usize, original: usize) -> usize {
+    let snapshot = size_of::<Snapshot>();
+    let command = size_of::<starplayer::core::Command<Arc<starplayer::model::Module>>>();
+    let transport = size_of::<starplayer::telemetry::TransportState>();
+    assert!([40, 360].contains(&transport), "review changed transport storage");
+    assert_eq!(snapshot, 2584 + transport + if transport == 360 { 8 } else { 0 }, "live payload must be absent without audition");
+    assert!([16, 24].contains(&command), "review changed command stride");
+    original + 2 * depth * (snapshot - 2616) + starplayer::engine::DEFAULT_COMMAND_CAPACITY * (command - 16)
+}
+
 /// The per-voice and per-channel costs, derived rather than asserted from a table: build
 /// two engines that differ in exactly one setting and difference them.
 ///
@@ -157,6 +170,7 @@ fn the_heap_cost_of_an_engine_is_linear_in_the_voice_and_channel_counts() {
         seen.bytes
     };
 
+    println!("layout Snapshot={} Command={} Transport={}", size_of::<Snapshot>(), size_of::<starplayer::core::Command<Arc<starplayer::model::Module>>>(), size_of::<starplayer::telemetry::TransportState>());
     let baseline = measure(base);
     let more_voices = measure(EngineSettings { voice_capacity: base.voice_capacity + 32, ..base });
     let more_channels = measure(EngineSettings { channel_count: base.channel_count + 16, ..base });
@@ -188,7 +202,7 @@ fn the_heap_cost_of_an_engine_is_linear_in_the_voice_and_channel_counts() {
 
     // And the formula `settings_for`'s documentation quotes is *this* formula, so a change
     // to any of the three constants fails here and is fixed in both places at once.
-    assert_eq!((fixed, per_voice, per_channel), (27_808, 168, 5_288), "the heap formula in `settings_for`'s documentation is out of date");
+    assert_eq!((fixed, per_voice, per_channel), (fixed_heap_bytes(3, 27_808), 168, 5_288), "the heap formula in `settings_for`'s documentation is out of date");
 
     // A `RenderHalf` is not small **by value**: the engine's telemetry publisher holds a
     // working `Snapshot` inline and this host holds another. A firmware that moves one down
@@ -211,7 +225,7 @@ fn a_real_module_reports_what_it_costs() {
             seen.bytes,
             module.pcm().len() * 2,
         );
-        assert_eq!(seen.bytes, 27_808 + 168 * settings.voice_capacity + 5_288 * settings.channel_count, "{name} did not follow the documented formula");
+        assert_eq!(seen.bytes, fixed_heap_bytes(settings.telemetry_depth, 27_808) + 168 * settings.voice_capacity + 5_288 * settings.channel_count, "{name} did not follow the documented formula");
     }
 }
 
@@ -237,6 +251,6 @@ fn master_only_layout_removes_channel_bus_and_insert_storage() {
     let per_channel = (more_channels - baseline) / 16;
     let fixed = baseline - 32 * per_voice - 16 * per_channel;
     println!("master-only heap = {fixed} + {per_voice} * voices + {per_channel} * channels");
-    assert_eq!((fixed, per_voice, per_channel), (17_344, 168, 8), "the compact heap formula in the embedded budget is out of date");
+    assert_eq!((fixed, per_voice, per_channel), (fixed_heap_bytes(1, 17_344), 168, 8), "the compact heap formula in the embedded budget is out of date");
     assert!(baseline < 48_000, "the compact 32-voice/16-channel engine is unexpectedly large: {baseline}");
 }

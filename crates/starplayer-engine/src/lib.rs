@@ -80,6 +80,11 @@
 extern crate alloc;
 
 pub mod channel;
+pub mod playback;
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+pub mod ownership;
+#[cfg(feature = "note-overlap")]
+pub mod overlap;
 pub mod command;
 pub mod control;
 pub mod demo;
@@ -99,6 +104,11 @@ pub mod timeline;
 #[cfg(feature = "trace")]
 pub mod trace;
 
+pub use playback::{LaneLayout, PlaybackConfiguration, PlaybackConfigError, VoiceCapacity, compiled_playback_capabilities, INTERACTIVE_LIVE_BASE, INTERACTIVE_LIVE_LANES, INTERACTIVE_PREVIEW_LANE, MAX_INTERACTIVE_CHANNELS, MAX_INTERACTIVE_VOICE_CAPACITY};
+#[cfg(feature = "interactive-audition")]
+pub use ownership::LiveOrigin;
+#[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+pub use ownership::{ClearScope, PlaybackState, PlaybackStateError, VoiceDomain, VoiceLifecycle, VoiceOwnership};
 pub use channel::{Channel, ChannelTable, MAX_VOICE_CAPACITY, scaled_step};
 pub use flow::PatternFlowState;
 pub use command::{

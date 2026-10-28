@@ -1,4 +1,4 @@
-export function createMediaSession({ mediaSession, createMetadata = metadata => new MediaMetadata(metadata), play, stop, next, previous, seek }) {
+export function createMediaSession({ mediaSession, createMetadata = metadata => new MediaMetadata(metadata), play, stop, pause = stop, next, previous, seek }) {
     let playbackState = null;
     const handlers = new Map();
     function handler(action, callback) {
@@ -7,7 +7,7 @@ export function createMediaSession({ mediaSession, createMetadata = metadata => 
         handlers.set(action, callback);
     }
     handler('play', play);
-    handler('pause', stop);
+    handler('pause', pause);
     handler('stop', stop);
     const seekTo = details => seek(details.seekTime);
     return {

@@ -26,7 +26,9 @@ starplayer-host = { workspace = true }
 wasm-bindgen = { workspace = true }
 
 [features]
-default = []
+default = ["note-overlap", "interactive-audition"]
+note-overlap = ["starplayer/note-overlap", "starplayer-host/note-overlap"]
+interactive-audition = ["starplayer/interactive-audition", "starplayer-host/interactive-audition"]
 # M7-H6's vector kernels, on the browser's simd128 backend. Off by default and **not**
 # what the packaged web player is built with — that stays H7's build — but
 # `cargo xtask ci --job wasm-build` compiles this arm with

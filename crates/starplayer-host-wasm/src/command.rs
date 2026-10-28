@@ -14,6 +14,7 @@ const CAPACITY_MASK: usize = COMMAND_RING_CAPACITY - 1;
 /// The compact values carried across the JavaScript-to-wasm edge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireCommand {
+    pub identity: Option<starplayer::core::PlaybackIdentity>,
     pub opcode: u8,
     pub argument: u32,
     pub extra: u32,
@@ -31,7 +32,7 @@ pub struct CommandRing {
 impl CommandRing {
     pub const fn new() -> CommandRing {
         CommandRing {
-            slots: [WireCommand { opcode: 0, argument: 0, extra: 0 }; COMMAND_RING_CAPACITY],
+            slots: [WireCommand { identity: None, opcode: 0, argument: 0, extra: 0 }; COMMAND_RING_CAPACITY],
             write_index: 0,
             read_index: 0,
             dropped: 0,
@@ -57,6 +58,10 @@ impl CommandRing {
         Some(command)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = WireCommand> + '_ {
+        (0..self.write_index.wrapping_sub(self.read_index)).map(|offset| self.slots[self.read_index.wrapping_add(offset) & CAPACITY_MASK])
+    }
+
     pub const fn dropped(&self) -> u32 { self.dropped }
 }
 
@@ -71,7 +76,7 @@ mod tests {
     #[test]
     fn typed_records_round_trip_without_allocation() {
         let mut ring = CommandRing::new();
-        let command = WireCommand { opcode: 3, argument: 17, extra: 2 };
+        let command = WireCommand { identity: None, opcode: 3, argument: 17, extra: 2 };
         assert!(ring.push(command));
         assert_eq!(ring.pop(), Some(command));
         assert_eq!(ring.pop(), None);
@@ -81,7 +86,7 @@ mod tests {
     fn overflow_is_visible_and_preserves_queued_records() {
         let mut ring = CommandRing::new();
         for index in 0..COMMAND_RING_CAPACITY {
-            assert!(ring.push(WireCommand { opcode: 1, argument: index as u32, extra: 0 }));
+            assert!(ring.push(WireCommand { identity: None, opcode: 1, argument: index as u32, extra: 0 }));
         }
         assert!(!ring.push(WireCommand::default()));
         assert_eq!(ring.dropped(), 1);

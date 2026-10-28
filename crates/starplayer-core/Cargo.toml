@@ -13,6 +13,9 @@ fixed = { workspace = true }
 bitflags = { workspace = true }
 
 [features]
+# Gate the optional command payload so embedded command rings retain their native stride.
+note-overlap = []
+interactive-audition = []
 default = []
 # `std` is never part of any default feature set (AGENTS.md design goal 4).
 std = ["fixed/std"]

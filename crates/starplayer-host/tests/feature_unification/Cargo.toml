@@ -1,0 +1,18 @@
+# Seed this fixture's ignored Cargo.lock from the root lock before cargo run --offline.
+# Use the shared CARGO_TARGET_DIR and serial Cargo limits from the NO-03 task.
+[package]
+name = "host-feature-unification-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "host-feature-unification-check"
+path = "check.rs"
+
+[dependencies]
+starplayer-host = { path = "../..", default-features = false }
+starplayer = { path = "../../../starplayer" }
+starplayer-engine = { path = "../../../starplayer-engine", features = ["note-overlap", "interactive-audition"] }

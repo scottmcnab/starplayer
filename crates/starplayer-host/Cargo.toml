@@ -9,3 +9,8 @@ description = "Backend-neutral native host: the AudioBackend trait and the Playe
 
 [dependencies]
 starplayer = { workspace = true, features = ["std", "telemetry", "midi", "smf"] }
+
+[features]
+default = []
+note-overlap = ["starplayer/note-overlap"]
+interactive-audition = ["starplayer/interactive-audition"]

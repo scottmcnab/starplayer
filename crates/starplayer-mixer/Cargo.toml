@@ -13,6 +13,7 @@ starplayer-dsp = { workspace = true }
 wide = { workspace = true, optional = true }
 
 [features]
+note-overlap = []
 default = []
 std = ["starplayer-core/std", "starplayer-dsp/std"]
 alloc = ["starplayer-core/alloc", "starplayer-dsp/alloc"]

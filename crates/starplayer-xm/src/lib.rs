@@ -97,7 +97,7 @@ pub use image::ImageDecoder;
 pub use instrument::{XmEnvelope, XmInstrumentHeader};
 pub use loader::{load, load_from, probe, probe_reader};
 pub use processor::{
-    XmChannel, XmProcessor, recommended_voice_capacity, sequencer_for, sequencer_with_quirks,
+    XmArticulationRuntime, XmVoiceState, XmChannel, XmProcessor, recommended_voice_capacity, sequencer_for, sequencer_with_quirks,
 };
 pub use pattern::{
     CELL_BYTES, DEFAULT_ROWS, INSTRUMENT_NONE, MAX_ROWS, NOTE_KEY_OFF, NOTE_NONE, PatternView,

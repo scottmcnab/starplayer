@@ -197,6 +197,21 @@ formula's 2 616 — so the same "safe upper bound" reading applies there too, an
 | `PETRI.S3M` | 8 | 8 | 71 576 B | TBD (owner: run the bench build) | TBD (owner: run the bench build) |
 | a 32-channel module, 64-voice pool | 32 | 64 | 209 kB | — | — |
 
+**NO-07 host resource audit (2026-10-28).** The historical formula/table above predates
+I9's 168-byte voice slots and the NO transport header. On the pinned 64-bit host, the
+current neither-feature full-layout formula is `27_856 + 168 × voices + 5_288 × channels`;
+master-only/depth 1/no-scopes is `17_360 + 168 × voices + 8 × channels`. The original
+snapshot was 2,616 bytes; retained small transport flags make it 2,624. Two depth 3
+snapshot rings therefore add 48 bytes (depth 1 adds 16), with no optional table, rack or
+reservation allocation. The optional command variant is absent with neither feature:
+Command stride 16, versus 24 when either is compiled. Overlap-only fixed overhead is
+28,368/full or 17,872/compact; audition/both is 30,336/full or 18,528/compact because
+Snapshot is 2,952 (native cursor, controllers and live summary). Tests retain exact
+equality using these source-counted snapshot/command strides; separate neither-feature
+layout assertions forbid optional payloads from silently increasing those budgets.
+Firmware compiles without either optional feature; these are host allocation measurements,
+not fresh device RAM or listening measurements.
+
 **Why the C5's `bench` heap is 176 KiB and not smaller.** The `bench` build's own
 `DRAM_STAGING_BYTES` (32 KiB, `boards/starplayer-c5/src/bench.rs`) is carved out of this
 *same* heap — `Staging::claim` calls `esp_alloc::HEAP.alloc_caps`, not a separate static,

@@ -345,3 +345,18 @@ test('playlist pending covers an advance until it plays, is cancelled or runs ou
     navigation.cancel();
     assert.equal(navigation.pending, null);
 });
+
+test('explicit interactive Pause/user Stop never complete a playlist; actual natural end completes once', async () => {
+    const fixture = setup();
+    await fixture.controller.play(locator('song'), { origin: 'playlist', entryId: 'interactive' });
+    fixture.setSnapshot({ playing: true, transport: 'playing', naturalEnd: false, songFlags: 15, sequence: 1 });
+    fixture.controller.userControl('pause');
+    fixture.setSnapshot({ playing: false, transport: 'paused', naturalEnd: false, songFlags: 15, sequence: 2 });
+    fixture.setSnapshot({ playing: false, transport: 'stopped', naturalEnd: false, songFlags: 7, sequence: 3 });
+    assert.deepEqual(fixture.ended, []);
+    fixture.controller.userControl('play');
+    fixture.setSnapshot({ playing: true, transport: 'playing', naturalEnd: false, songFlags: 3, sequence: 4 });
+    fixture.setSnapshot({ playing: false, transport: 'stopped', naturalEnd: true, songFlags: 7, sequence: 5 });
+    fixture.setSnapshot({ playing: false, transport: 'stopped', naturalEnd: true, songFlags: 7, sequence: 6 });
+    assert.deepEqual(fixture.ended, ['interactive']);
+});

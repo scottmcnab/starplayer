@@ -51,6 +51,14 @@ pub struct TransportState {
     /// of its order list. A one-tick pulse when the host asked to keep playing, sticky
     /// otherwise.
     pub end_reached: bool,
+    /// None for legacy hosts. A held state never implies natural completion.
+    pub interactive: Option<starplayer_core::InteractiveTransport>,
+    /// Host policy has settled natural end; distinct from an explicit Pause/Stop.
+    pub natural_end: bool,
+    #[cfg(feature = "interactive-audition")]
+    pub cursor: Option<starplayer_core::SequencerCursor>,
+    #[cfg(feature = "interactive-audition")]
+    pub smf: Option<starplayer_core::SmfPlaybackState>,
 }
 
 /// What a scanned song does when it gets to the end of itself.
@@ -67,6 +75,20 @@ pub enum SongEnd {
 }
 
 impl TransportState {
+    /// Rebuild payload is absent from both storage and execution in feature-off builds.
+    pub const fn sequencer_cursor(&self) -> Option<starplayer_core::SequencerCursor> {
+        #[cfg(feature = "interactive-audition")]
+        { self.cursor }
+        #[cfg(not(feature = "interactive-audition"))]
+        { None }
+    }
+    pub const fn smf_state(&self) -> Option<starplayer_core::SmfPlaybackState> {
+        #[cfg(feature = "interactive-audition")]
+        { self.smf }
+        #[cfg(not(feature = "interactive-audition"))]
+        { None }
+    }
+
     /// Nothing playing: no position, no speed, no tempo, and the global volume a module
     /// starts at.
     pub const IDLE: TransportState = TransportState {
@@ -81,6 +103,12 @@ impl TransportState {
         song_length_frames: 0,
         song_end: SongEnd::Unknown,
         end_reached: false,
+        interactive: None,
+        natural_end: false,
+        #[cfg(feature = "interactive-audition")]
+        cursor: None,
+        #[cfg(feature = "interactive-audition")]
+        smf: None,
     };
 }
 
@@ -235,6 +263,14 @@ impl WarningFlags {
 /// `Copy`, `Default`, and entirely free of heap: 2600 bytes on a 64-bit host, where the
 /// `&'static str` in each [`EffectDisplay`] is 16 of the 40 bytes a [`ChannelState`] costs;
 /// noticeably less on `wasm32`, where a fat pointer is half the width.
+/// Separate live summary; tracker lanes remain exactly 64.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LiveSummary {
+    pub active: u16,
+    pub retiring: u16,
+    pub peak: U0F16,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Snapshot {
     /// Increments once per published snapshot, starting at 1.
@@ -251,6 +287,8 @@ pub struct Snapshot {
     pub channel_count: u8,
     /// Voices sounding in the global pool.
     pub voices_active: u16,
+    #[cfg(feature = "interactive-audition")]
+    pub live: LiveSummary,
     /// Where the song is.
     pub transport: TransportState,
     /// What the render loop wants the host to know.
@@ -266,10 +304,20 @@ impl Snapshot {
         publishes_dropped: 0,
         channel_count: 0,
         voices_active: 0,
+        #[cfg(feature = "interactive-audition")]
+        live: LiveSummary { active: 0, retiring: 0, peak: U0F16::ZERO },
         transport: TransportState::IDLE,
         warnings: WarningFlags::NONE,
         channels: [ChannelState::SILENT; MAX_CHANNELS],
     };
+
+    /// Live summary storage is absent without audition; shared consumers see silence.
+    pub const fn live_summary(&self) -> LiveSummary {
+        #[cfg(feature = "interactive-audition")]
+        { self.live }
+        #[cfg(not(feature = "interactive-audition"))]
+        { LiveSummary { active: 0, retiring: 0, peak: U0F16::ZERO } }
+    }
 
     /// One channel, or `None` past [`MAX_CHANNELS`].
     pub fn channel(&self, index: usize) -> Option<&ChannelState> { self.channels.get(index) }
@@ -291,6 +339,20 @@ impl Default for Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuild_payload_storage_is_feature_gated() {
+        extern crate std;
+        std::println!("TransportState={} Snapshot={}", core::mem::size_of::<TransportState>(), core::mem::size_of::<Snapshot>());
+        #[cfg(not(feature = "interactive-audition"))]
+        {
+            assert!(core::mem::size_of::<TransportState>() <= 64);
+            assert_eq!(TransportState::IDLE.sequencer_cursor(), None);
+            assert_eq!(TransportState::IDLE.smf_state(), None);
+        }
+        #[cfg(feature = "interactive-audition")]
+        assert!(core::mem::size_of::<TransportState>() >= core::mem::size_of::<starplayer_core::SmfPlaybackState>());
+    }
 
     #[test]
     fn an_idle_snapshot_is_silent_everywhere() {
@@ -329,4 +391,12 @@ mod tests {
         assert!(WarningFlags { zero_advance_forced: true, ..WarningFlags::NONE }.any());
         assert!(WarningFlags { unsupported_command: true, ..WarningFlags::NONE }.any());
     }
+}
+
+#[cfg(all(test, target_pointer_width = "64", not(feature = "interactive-audition")))]
+#[test]
+fn feature_off_snapshot_has_no_rebuild_or_live_payload_storage() {
+    assert_eq!(core::mem::size_of::<TransportState>(), 40);
+    assert_eq!(core::mem::size_of::<Snapshot>(), 2624);
+    assert_eq!(Snapshot::IDLE.live_summary(), LiveSummary::default());
 }
