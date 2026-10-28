@@ -424,7 +424,7 @@ pub fn probe(bytes: &[u8]) -> Option<starplayer_model::ModuleFormat> {
     #[cfg(feature = "xm")]
     if starplayer_xm::probe(bytes) { return Some(starplayer_model::ModuleFormat::Xm); }
     #[cfg(feature = "mod")]
-    if starplayer_mod::probe(bytes) { return Some(starplayer_model::ModuleFormat::Mod); }
+    if starplayer_mod::probe(bytes) || starplayer_mod::soundtracker::probe(bytes) { return Some(starplayer_model::ModuleFormat::Mod); }
     None
 }
 
@@ -434,7 +434,9 @@ pub fn load(bytes: &[u8]) -> Result<starplayer_model::Module, starplayer_core::E
         #[cfg(feature = "s3m")]
         Some(starplayer_model::ModuleFormat::S3m) => starplayer_s3m::load(bytes),
         #[cfg(feature = "mod")]
-        Some(starplayer_model::ModuleFormat::Mod) => starplayer_mod::load(bytes),
+        Some(starplayer_model::ModuleFormat::Mod) => {
+            if starplayer_mod::probe(bytes) { starplayer_mod::load(bytes) } else { starplayer_mod::soundtracker::load(bytes) }
+        },
         #[cfg(feature = "mtm")]
         Some(starplayer_model::ModuleFormat::Mtm) => starplayer_mtm::load(bytes),
         #[cfg(feature = "xm")]
@@ -482,3 +484,53 @@ mod live;
 pub use live::{prepare_instrument_rack, live_instrument_capability, live_instrument_note_capability, live_instrument_note_flags};
 #[cfg(feature = "interactive-audition")]
 pub use live::prepare_live_rack;
+
+#[cfg(all(test, feature = "mod"))]
+mod soundtracker_dispatch_tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn tagless_soundtracker_uses_the_explicit_last_fallback_and_incremental_decoder() {
+        let mut bytes = vec![0; 600 + 2 * 1024 + 8];
+        bytes[42..44].copy_from_slice(&4u16.to_be_bytes());
+        bytes[45] = 64;
+        bytes[470] = 2;
+        bytes[471] = 1;
+        bytes[473] = 1;
+        bytes[600..604].copy_from_slice(&starplayer_mod::ModCell { period: 428, instrument: 1, effect: 0xF, param: 6 }.to_bytes());
+        assert!(!starplayer_mod::probe(&bytes));
+        assert_eq!(probe(&bytes), Some(starplayer_model::ModuleFormat::Mod));
+        let module = load(&bytes).expect("public Soundtracker dispatch");
+        assert_eq!(module.header().dialect, starplayer_core::quirks::FormatDialect::Soundtracker);
+        let expected = module.to_image();
+        let mut destination = vec![0; expected.len()];
+        let mut workspace = [0; 4096];
+        let mut decoder = crate::image::ModuleImageDecoder::new(&bytes, &mut destination, &mut workspace).expect("public incremental decoder");
+        loop {
+            if let starplayer_model::ImageDecodeStatus::Complete { .. } = decoder.step(starplayer_model::DecodeBudget { max_input_bytes: 4096, max_pcm_frames: 16 }).expect("image decode") { break; }
+        }
+        assert_eq!(destination, expected);
+        assert_eq!(probe(&bytes[..bytes.len() - 1]), None);
+
+        use starplayer_core::quirks::QuirkSelection;
+        use starplayer_engine::{ChannelTable, ControlClock, EngineContext, EventSource};
+        let mut source = NativeSequencer::try_new(starplayer_rt::Arc::new(module), 1000, QuirkSelection::FromDialect).expect("public legacy playback");
+        let mut voices = starplayer_mixer::VoicePool::new(4);
+        let mut channels = ChannelTable::new(4);
+        let mut control = ControlClock::new(1000, starplayer_core::Frame::ZERO);
+        let mut order_starts = vec![];
+        for event_index in 0..64 * 6 * 3 + 1 {
+            let frame = source.next_event_frame().expect("looping source");
+            source.dispatch(frame, &mut EngineContext::new(frame, &mut voices, &mut channels, &mut control));
+            if event_index % (64 * 6) == 0 {
+                match &source {
+                    NativeSequencer::Mod(sequencer) => order_starts.push(sequencer.position().order),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("legacy MOD dispatch"),
+                }
+            }
+        }
+        assert_eq!(order_starts, [0, 1, 1, 1], "public playback starts at zero and preserves the legacy restart");
+    }
+}

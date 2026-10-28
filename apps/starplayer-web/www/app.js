@@ -2138,7 +2138,7 @@ function renderMetadata() {
                 preview.addEventListener('keyup', event => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); finish(); } });
                 preview.addEventListener('blur', () => { if (state.previewInstrument === index) cleanupLiveInput(); });
                 preview.addEventListener('click', event => { if (event.detail === 0 && !keyboardPreview) { begin(); finish(); } keyboardPreview = false; });
-                cells[4].append(preview);
+                cells[3].append(preview);
             }
             const mixed = (instrument.capability & 6) === 6;
             cells[2].textContent = instrument.capability & 4 ? '∞' : '';
@@ -2153,7 +2153,7 @@ function renderMetadata() {
                 checkbox.type = 'checkbox'; checkbox.dataset.instrument = String(index);
                 checkbox.setAttribute('aria-label', `Let notes ring for instrument ${index + 1}`);
                 checkbox.addEventListener('change', () => { queueInteractive(Ring.OPCODE_LET_NOTES_RING, index, Number(checkbox.checked)); flushFallbackCommands(); });
-                label.append(checkbox); cells[3].append(label);
+                label.append(checkbox); cells[4].append(label);
             }
             item.append(...cells); elements.instrumentList.append(item);
             state.instrumentRows.push({ item, preview, checkbox });

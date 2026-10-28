@@ -719,6 +719,10 @@ pub enum FormatDialect {
     /// dialect is the one that carries [`ModTiming::VBlank`] out of the header alone
     /// (libxmp `tracker_is_vblank`, `src/loaders/mod_load.c:99-108`).
     Noisetracker,
+    /// Tagless 15-sample Soundtracker, with byte-unit loop starts and VBlank Fxx.
+    Soundtracker,
+    /// Ultimate Soundtracker: the older 1/2 command vocabulary and header BPM.
+    UltimateSoundtracker,
     /// The ProTracker 3.x family — `LARD`, `NSMS`, `.M.K`. Played as ProTracker;
     /// recorded separately because libxmp's own timing heuristics key off it (they treat
     /// these tags as an *unknown* tracker, so they get no VBlank shortcut) and M5 may
@@ -815,7 +819,7 @@ impl FormatDialect {
         match self {
             FormatDialect::Unknown => QuirkSet::profile_default(),
             FormatDialect::ProTracker | FormatDialect::ProTracker3 | FormatDialect::Startrekker | FormatDialect::FastTracker => QuirkSet::protracker(),
-            FormatDialect::Noisetracker => QuirkSet::noisetracker(),
+            FormatDialect::Noisetracker | FormatDialect::Soundtracker | FormatDialect::UltimateSoundtracker => QuirkSet::noisetracker(),
             FormatDialect::Octalyser => QuirkSet::octalyser(),
             FormatDialect::DigitalTracker => QuirkSet::digital_tracker(),
             FormatDialect::MultiTracker => QuirkSet::multitracker(),

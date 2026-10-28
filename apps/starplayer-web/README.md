@@ -35,8 +35,9 @@ whole library. Only visible table rows are rendered, including for large indexes
 
 Use row checkboxes to select independently, or the heading checkbox to select/clear
 all current results (including offscreen rows). A mixed heading selects all; later
-discoveries stay unselected. Click selects one row, Ctrl/⌘-click toggles, and Shift-click selects a range in the
-current result order. Ctrl/⌘+A selects the entire filtered result, Escape clears,
+discoveries stay unselected. Click selects one row; clicking the sole selected row
+again clears it. Ctrl/⌘-click toggles, and Shift-click selects a range in the current
+result order. Ctrl/⌘+A selects the entire filtered result, Escape clears,
 and arrows, Home/End and PageUp/Down move the focus (Shift extends the selection).
 Selections survive sorting, filtering and folder changes: **hidden rows remain
 selected, but actions use only playable rows in the current result**, in result
@@ -44,6 +45,12 @@ order. Enter or double-click plays; `+`, Insert or **Add to Playlist** adds to t
 playlist. A folder's **+** in the tree (or `+` / Insert on a
 focused folder) adds all playable tracks beneath that folder, regardless of the
 current filter, in folder/name order. Unplayable rows cannot play or be added.
+
+Error exclamation markers show the full reason on hover. The selected track’s
+instrument/comment details hide when selection is cleared; their disclosure starts
+expanded and keeps your collapse choice across row changes for this page session.
+Playlist availability warnings appear as a yellow exclamation before the filename,
+with the reason in its tooltip.
 
 Build and serve the player from the repository root:
 
@@ -281,7 +288,7 @@ even when their PCM matches. XM and IT instrument mode use native note maps; IT 
 mode and MOD/S3M/MTM use direct sample references. Zero-frame cells stay blank.
 
 The Instruments table uses compact 32 px rows in source order: **# / Name / Loop /
-note-overlap checkbox / Play / Frames**. Play sits beside the checkbox for quick audition.
+Play / note-overlap checkbox / Frames**. Play sits before the checkbox for quick audition.
 Select a playable row with a click or Enter/Space to
 choose its keyboard/MIDI target. Play auditions the selected **Reference Note** without
 selecting the row or retuning keyboard/MIDI. The native chooser covers 0–127 and defaults

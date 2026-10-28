@@ -9,8 +9,8 @@ use starplayer_model::{
 };
 
 use crate::loader::{
-    HEADER_BYTES, LoadOptions, MAGIC_OFFSET, ModLayout, ORDER_OFFSET, SAMPLE_COUNT,
-    SAMPLE_HEADER_BYTES, SONG_LENGTH_OFFSET, be_u16, default_pan, layout, logical_order,
+    LoadOptions, MAGIC_OFFSET, ModLayout,
+    SAMPLE_HEADER_BYTES, be_u16, default_pan, layout, logical_order,
 };
 use crate::pattern::{CELL_BYTES, ModCell, ROWS};
 use crate::tables::FINETUNE_REFERENCE_RATES;
@@ -39,6 +39,7 @@ pub struct ImageDecoder<'buffers> {
     scan_row_high: bool,
     mixed_row: bool,
     amiga_limits: bool,
+    has_note: bool,
     last_high: Vec<u8>,
     oversized_sample: bool,
     declared_sample_offset: usize,
@@ -65,7 +66,7 @@ impl<'buffers> ImageDecoder<'buffers> {
             source, destination, workspace, options, phase: Phase::Header, layout: None,
             plan: ModuleImagePlan::new(), pattern_count: 0, pattern_data_offset: 0,
             sample_data_offset: 0, scan_position: 0, scan_pattern: 0, scan_last_high: 0,
-            scan_row_low: false, scan_row_high: false, mixed_row: false, amiga_limits: true,
+            scan_row_low: false, scan_row_high: false, mixed_row: false, amiga_limits: true, has_note: false,
             last_high: Vec::new(), oversized_sample: false, declared_sample_offset: 0,
             sample_sources: Vec::new(), item: 0, metadata_bytes: 0, blob_start: 0,
             pcm_start: 0, pattern_position: 0, pcm_sample: 0, pcm_position: 0,
@@ -102,15 +103,19 @@ impl<'buffers> ImageDecoder<'buffers> {
     fn format_layout(&self) -> Result<ModLayout, Error> { self.layout.ok_or(Error::Invalid("MOD decoder layout is unavailable")) }
 
     fn prepare_header(&mut self) -> Result<(), ImageDecodeError> {
-        let fixed = self.source.get(..HEADER_BYTES).ok_or(Error::Truncated { offset: 0, needed: HEADER_BYTES })?;
-        let module_layout = layout(fixed.get(MAGIC_OFFSET..MAGIC_OFFSET + 4).unwrap_or_default()).ok_or(Error::BadMagic)?;
-        let orders = fixed.get(ORDER_OFFSET..ORDER_OFFSET + 128).ok_or(Error::Truncated { offset: ORDER_OFFSET, needed: 128 })?;
+        let module_layout = match self.source.get(MAGIC_OFFSET..MAGIC_OFFSET + 4).and_then(layout) {
+            Some(layout) => layout,
+            None => crate::soundtracker::header_layout_from_reader(self.source)?,
+        };
+        let fixed = self.source.get(..module_layout.header_bytes()).ok_or(Error::Truncated { offset: 0, needed: module_layout.header_bytes() })?;
+        let order_offset = module_layout.order_offset();
+        let orders = fixed.get(order_offset..order_offset + 128).ok_or(Error::Truncated { offset: order_offset, needed: 128 })?;
         self.pattern_count = orders.iter().copied().filter(|order| *order < 0x80)
             .map(|order| logical_order(order, module_layout) as usize).max().map(|value| value + 1).unwrap_or(0);
         let pattern_bytes = self.pattern_count.checked_mul(ROWS as usize)
             .and_then(|value| value.checked_mul(module_layout.channels as usize))
             .and_then(|value| value.checked_mul(CELL_BYTES)).ok_or(Error::TooLarge("MOD pattern data"))?;
-        self.pattern_data_offset = HEADER_BYTES + module_layout.extra_header_bytes;
+        self.pattern_data_offset = module_layout.header_bytes() + module_layout.extra_header_bytes;
         self.sample_data_offset = self.pattern_data_offset.checked_add(pattern_bytes).ok_or(Error::TooLarge("MOD data offset"))?;
         if self.sample_data_offset > self.source.len() {
             return Err(Error::Truncated { offset: self.pattern_data_offset, needed: pattern_bytes }.into());
@@ -126,7 +131,7 @@ impl<'buffers> ImageDecoder<'buffers> {
     }
 
     fn scan_patterns(&mut self, max_input_bytes: usize) -> Result<(), ImageDecodeError> {
-        let module_layout = self.format_layout()?;
+        let mut module_layout = self.format_layout()?;
         let pattern_stride = ROWS as usize * module_layout.channels as usize * CELL_BYTES;
         let total = self.pattern_count * pattern_stride;
         let mut consumed = 0usize;
@@ -142,6 +147,8 @@ impl<'buffers> ImageDecoder<'buffers> {
             let offset = self.pattern_data_offset + source_cell * CELL_BYTES;
             let bytes = self.source.get(offset..offset + CELL_BYTES).ok_or(Error::Truncated { offset, needed: CELL_BYTES })?;
             let cell = ModCell::from_bytes(bytes).ok_or(Error::Invalid("bad MOD cell"))?;
+            if module_layout.soundtracker { crate::soundtracker::scan_cell(&mut module_layout, cell)?; }
+            self.has_note |= cell.period != 0;
             self.amiga_limits &= cell.period == 0 || (113..=856).contains(&cell.period);
             if cell.effect == 0xF {
                 if cell.param >= 0x20 { self.scan_last_high = cell.param; self.scan_row_high = true; }
@@ -161,13 +168,18 @@ impl<'buffers> ImageDecoder<'buffers> {
                 self.scan_pattern += 1;
             }
         }
-        if self.scan_position == total { self.phase = Phase::Samples; }
+        self.layout = Some(module_layout);
+        if self.scan_position == total {
+            if module_layout.soundtracker && !self.has_note { return Err(Error::BadMagic.into()); }
+            self.phase = Phase::Samples;
+        }
         Ok(())
     }
 
     fn prepare_sample(&mut self) -> Result<(), ImageDecodeError> {
-        if self.item >= SAMPLE_COUNT { self.item = 0; self.phase = Phase::FinishPlan; return Ok(()); }
-        let fixed = self.source.get(..HEADER_BYTES).ok_or(Error::Truncated { offset: 0, needed: HEADER_BYTES })?;
+        let module_layout = self.format_layout()?;
+        if self.item >= module_layout.sample_count() { self.item = 0; self.phase = Phase::FinishPlan; return Ok(()); }
+        let fixed = self.source.get(..module_layout.header_bytes()).ok_or(Error::Truncated { offset: 0, needed: module_layout.header_bytes() })?;
         let header_offset = 20 + self.item * SAMPLE_HEADER_BYTES;
         let header = fixed.get(header_offset..header_offset + SAMPLE_HEADER_BYTES)
             .ok_or(Error::Truncated { offset: header_offset, needed: SAMPLE_HEADER_BYTES })?;
@@ -175,8 +187,10 @@ impl<'buffers> ImageDecoder<'buffers> {
         let declared_words = be_u16(header, 22)?;
         self.oversized_sample |= declared_words >= 0x8000;
         let declared_length = declared_words as usize * 2;
-        let available = self.source.len().saturating_sub(self.declared_sample_offset).min(declared_length);
-        let loop_start = (be_u16(header, 26)? as usize * 2).min(declared_length).min(available);
+        let prefix = if module_layout.soundtracker { (be_u16(header, 26)? as usize).min(declared_length) } else { 0 };
+        let pcm_offset = self.declared_sample_offset.checked_add(prefix).ok_or(Error::TooLarge("MOD sample data"))?;
+        let available = self.source.len().saturating_sub(pcm_offset).min(declared_length - prefix);
+        let loop_start = if module_layout.soundtracker { 0 } else { (be_u16(header, 26)? as usize * 2).min(declared_length).min(available) };
         let loop_length = be_u16(header, 28)? as usize * 2;
         let loop_end = loop_start.saturating_add(loop_length).min(available);
         let loops = loop_length >= 4 && loop_start < loop_end;
@@ -190,7 +204,7 @@ impl<'buffers> ImageDecoder<'buffers> {
         let sample = self.plan.try_add_sample(available, specification)?;
         self.plan.try_add_instrument(InstrumentDef::try_from_sample(&name, sample, U0F16::MAX)?)?;
         self.sample_sources.try_reserve(1).map_err(|_| METADATA_RESOURCE)?;
-        self.sample_sources.push(self.declared_sample_offset.min(self.source.len()));
+        self.sample_sources.push(pcm_offset.min(self.source.len()));
         self.declared_sample_offset = self.declared_sample_offset.checked_add(declared_length).ok_or(Error::TooLarge("MOD sample data"))?;
         self.item += 1;
         Ok(())
@@ -198,9 +212,9 @@ impl<'buffers> ImageDecoder<'buffers> {
 
     fn finish_plan(&mut self) -> Result<(), ImageDecodeError> {
         let module_layout = self.format_layout()?;
-        let fixed = self.source.get(..HEADER_BYTES).ok_or(Error::Truncated { offset: 0, needed: HEADER_BYTES })?;
-        let song_length = fixed.get(SONG_LENGTH_OFFSET).copied().unwrap_or(0).min(128) as usize;
-        let order_bytes = fixed.get(ORDER_OFFSET..ORDER_OFFSET + 128).ok_or(Error::OutOfRange)?;
+        let fixed = self.source.get(..module_layout.header_bytes()).ok_or(Error::Truncated { offset: 0, needed: module_layout.header_bytes() })?;
+        let song_length = fixed.get(module_layout.song_length_offset()).copied().unwrap_or(0).min(128) as usize;
+        let order_bytes = fixed.get(module_layout.order_offset()..module_layout.order_offset() + 128).ok_or(Error::OutOfRange)?;
         let mut played_orders = Vec::new();
         played_orders.try_reserve_exact(song_length).map_err(|_| METADATA_RESOURCE)?;
         for order in order_bytes.iter().take(song_length) { played_orders.push(logical_order(*order, module_layout) as u16); }
@@ -210,17 +224,17 @@ impl<'buffers> ImageDecoder<'buffers> {
         if order_bytes.get(song_length.saturating_sub(1)).copied() != Some(255) { self.plan.try_push_order(ORDER_END)?; }
         let evidence = ModTimingEvidence {
             timing_detection: matches!(module_layout.dialect, FormatDialect::ProTracker) && !self.oversized_sample,
-            vblank_only_tag: matches!(module_layout.dialect, FormatDialect::Noisetracker),
+            vblank_only_tag: module_layout.vblank_only(),
             has_high_fxx: self.last_high.iter().any(|value| *value != 0), mixed_row: self.mixed_row,
             high_fxx_only_at_end: high_fxx_only_at_end(&played_orders, &self.last_high),
         };
         self.plan.set_header(ModuleHeader {
             title: starplayer_model::try_decode_cp437(fixed.get(..20).unwrap_or_default())?.into_boxed_str(),
             format: ModuleFormat::Mod, channel_count: module_layout.channels, initial_speed: 6,
-            initial_tempo: 125, global_volume: U0F16::MAX, master_volume: U0F16::MAX,
+            initial_tempo: module_layout.initial_tempo(fixed), global_volume: U0F16::MAX, master_volume: U0F16::MAX,
             default_pan: default_pan(module_layout.channels, self.options.stereo_separation),
             flags: ModuleFlags { amiga_limits: self.amiga_limits, linear_slides: false, fast_volume_slides: false, stereo: self.options.stereo_separation.get() != 0 },
-            dialect: module_layout.dialect, format_extra: encode_evidence(evidence),
+            dialect: module_layout.dialect, format_extra: encode_evidence(evidence) | crate::soundtracker::encode_restart(module_layout, fixed),
             default_channel_volume: Vec::new().into_boxed_slice(), format_data: Vec::new().into_boxed_slice(),
         });
         self.phase = Phase::Layout;
@@ -306,6 +320,7 @@ impl<'buffers> ImageDecoder<'buffers> {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use crate::loader::{HEADER_BYTES, SONG_LENGTH_OFFSET};
     use super::*;
 
     #[test]

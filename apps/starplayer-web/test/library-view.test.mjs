@@ -91,3 +91,18 @@ test('deselect current results retains hidden ids and leaves later discoveries u
     assert.equal(cleared.selected.has(4), false);
     assert.deepEqual([...deselectAll(cleared, []).selected], [9, 2]);
 });
+
+
+test('Library repeat-click clears only a sole selection without changing Playlist or keyboard selection', () => {
+    const order = Int32Array.of(1, 2, 3);
+    const selected = selectRow(createSelection(), order, 2);
+    const cleared = selectRow(selected, order, 2, { clearSole: true });
+    assert.deepEqual([...cleared.selected], []);
+    assert.equal(cleared.focus, 2, 'deselection retains the keyboard navigation position');
+    assert.deepEqual([...moveFocus(cleared, order, 'ArrowDown').selected], [3]);
+    assert.deepEqual([...selectRow(selected, order, 2).selected], [2], 'Playlist ordinary click still selects');
+    assert.deepEqual([...selectRow(selected, order, 3, { clearSole: true }).selected], [3]);
+    const multiple = selectAll(selected, order);
+    assert.deepEqual([...selectRow(multiple, order, 2, { clearSole: true }).selected], [2]);
+    assert.deepEqual([...selectRow(selected, order, 3, { clearSole: true, extend: true }).selected], [2, 3]);
+});

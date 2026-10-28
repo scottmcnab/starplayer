@@ -260,3 +260,23 @@ test('selection never persists; bulk removal retains duplicate upload references
     assert.deepEqual(f.selected(), [], 'new page view starts with no selection');
     reloaded.dispose();
 });
+
+
+test('availability uses a compact accessible warning before filename with separate playback markers', t => {
+    const f = fixture(t, { count: 3 });
+    f.playback.failures.set(f.entries[1].id, 'Full extraction diagnostic');
+    f.playlist.setCurrent(f.entries[1].id);
+    const row = f.row(1), warning = row.querySelector('.playlist-availability-warning');
+    const name = row.querySelector('.playlist-name'), marker = row.querySelector('.playlist-marker');
+    assert.equal(warning.textContent, '!');
+    assert.equal(warning.title, 'library not connected');
+    assert.equal(warning.attributes['role'], 'img');
+    assert.equal(warning.attributes['aria-label'], warning.title);
+    assert.deepEqual(row.querySelector('.playlist-file').children, [warning, name, marker]);
+    assert.equal(name.title, 'song0.mod');
+    assert.equal(marker.textContent, '▶ ⚠');
+    assert.match(marker.title, /Currently playing.*Full extraction diagnostic/);
+    assert.doesNotMatch(row.querySelector('.playlist-file').textContent, /library not connected/);
+    assert.match(row.children[1].title, /library not connected.*song0.mod.*disk.zip/);
+    assert.equal(f.row(0).querySelector('.playlist-availability-warning'), null);
+});

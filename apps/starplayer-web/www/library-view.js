@@ -114,7 +114,7 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
 
     function renderDetails() {
         const pane = element('details');
-        const row = context?.library.rows[selection.focus];
+        const row = selection.selected.has(selection.focus) ? context?.library.rows[selection.focus] : null;
         pane.hidden = !row || (!context.library.hasComments && !row.error);
         if (pane.hidden) { detailsKey = null; return; }
         const comments = context.library.commentsFor(row.id);
@@ -200,6 +200,17 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
             const cell = node('span', row[column] ?? '—');
             cell.setAttribute('role', 'gridcell');
             cell.title = row.error ? `${cell.textContent}\n${row.error}` : cell.textContent;
+            if (column === 'name' && (row.error || !row.playable)) {
+                const reason = row.error || `Unsupported format: ${row.format || 'unknown'}`;
+                const marker = node('span', '!', 'library-error-marker');
+                marker.title = reason;
+                marker.setAttribute('role', 'img');
+                marker.setAttribute('aria-label', reason);
+                const name = node('span', cell.textContent, 'library-track-name');
+                cell.className = 'library-name-cell';
+                cell.replaceChildren(marker, name);
+                cell.title = `${row.name}\n${reason}`;
+            }
             line.append(cell);
         }
         if (matchTokens.length) {
@@ -491,7 +502,7 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
         if (!line) return;
         const id = Number(line.dataset.rowId);
         if (event.target.closest('.library-selection-cell')) return;
-        selection = selectRow(selection, order, id, { toggle: event.ctrlKey || event.metaKey, extend: event.shiftKey });
+        selection = selectRow(selection, order, id, { toggle: event.ctrlKey || event.metaKey, extend: event.shiftKey, clearSole: !event.ctrlKey && !event.metaKey && event.detail < 2 });
         grid.focus({ preventScroll: true });
         updateSelection();
     });
@@ -500,7 +511,7 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
         if (line && !event.target.closest('.library-selection-cell')) playRow(Number(line.dataset.rowId));
     });
     grid.addEventListener('keydown', event => {
-        if (event.target !== grid) return;
+        if (event.target !== grid && event.key !== 'Escape') return;
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') selection = selectAll(selection, order);
         else if (event.key === 'Escape') selection = createSelection();
         else if (['ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) {
@@ -520,6 +531,7 @@ export function createLibraryView({ playlist, play, onOperation = () => {} }) {
     // keyboard and screen-reader route to the same text.
     rows.addEventListener('mouseover', event => {
         const line = event.target.closest('[data-row-id]');
+        if (event.target.closest('.library-error-marker')) { hidePopover(); return; }
         if (!matchTokens.length || !line || line === popoverRow) return;
         hidePopover();
         popoverRow = line;

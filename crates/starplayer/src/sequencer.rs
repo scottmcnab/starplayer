@@ -226,6 +226,8 @@ impl NativeSequencer {
     /// Prepare for the host's actual fixed voice pool. IT only allocates reachable voice states.
     pub fn try_new_with_voice_capacity(module: Arc<Module>, sample_rate_hz: u32, quirks: QuirkSelection, voice_capacity: usize) -> Result<NativeSequencer, Error> {
         let restart_order = match module.header().format {
+            #[cfg(feature = "mod")]
+            ModuleFormat::Mod => starplayer_mod::soundtracker::restart_order(&module),
             #[cfg(feature = "xm")]
             ModuleFormat::Xm => starplayer_xm::XmFormatExtra::from_header(module.header()).restart_position,
             _ => 0,

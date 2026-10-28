@@ -407,6 +407,11 @@ a per-order index, the length of one pass, and *how* it ends (`Looped { target }
 the timeline is correct by construction under every quirk, dialect and tempo model, with
 no second player to drift out of step.
 
+A fresh sequencer starts at the first playable order at or after order zero. A format's
+restart position (for example XM's nonzero restart order) applies only when the order
+list wraps. Scanning and live playback use the same initial position; a host's explicit
+seek to the beginning must not expose an intro omitted from the scanned duration.
+
 The same `LoopDetector` then rides in the **live** sequencer, so "the song has been heard
 once through" fires on exactly the frame the scan predicted. It is a bitset over
 `(order, row)` sized when the sequencer is built — never in `dispatch` — consulted once at
@@ -818,6 +823,17 @@ and each format scales its sample-offset command where it reads the file's own p
 so every later comparison against `length_frames()` stays in the region's own stored
 frames. A shift by zero is a no-op, which is what makes the retrofit provably free: the
 committed goldens are byte-identical across it, on every format.
+
+The MOD crate also offers an explicit `soundtracker` loader for the tagless,
+600-byte, 15-sample layout. Facade autodetection tries its conservative structural
+probe after all supported signatures. `Soundtracker` and `UltimateSoundtracker`
+preserve dialect identity; native packed cells remain unchanged and the MOD
+processor interprets UST commands at execution time. The same layout metadata
+controls ordinary/reader loading and bounded image conversion, including byte-unit
+loop starts and skipped sample prefixes. Valid non-UST restart orders occupy
+crate-private bits 8–14 of MOD `format_extra`, beside the existing timing evidence
+in bits 0–4. New image dialect codes append to the existing mapping. The accepted
+subset and detection limits are specified in the accuracy policy.
 
 Format crates keep their **native** pattern bytes in `blob`. The shared model covers
 samples, envelopes, instrument definitions and a **display-only** `PatternCell` view for
@@ -2254,3 +2270,12 @@ The Playlist table keeps Library-style selection in page memory by entry UUID, s
 from persistent playlist metadata. Header selection includes every current entry, including
 unavailable/duplicate/offscreen entries. Remove selected and Delete perform one bulk model
 removal, retaining existing navigation cancellation and uploaded-blob ownership rules.
+
+Library error markers and Playlist availability markers expose the full diagnostic on
+the symbol itself. Playlist availability uses a compact yellow exclamation before
+the filename, so diagnostic text cannot enlarge the column. Library detail visibility
+requires a selected focused row; focus retained for navigation after deselection does
+not keep the details visible. Its native disclosure starts expanded and preserves its
+state across row changes in the page session. An ordinary repeat click on the sole
+selected Library row clears selection; Playlist ordinary-click semantics stay the same.
+The Instruments table orders its action columns as Loop, Play, note-overlap checkbox.

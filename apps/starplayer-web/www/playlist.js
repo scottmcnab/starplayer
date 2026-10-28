@@ -182,8 +182,17 @@ export function wirePlaylistList(playlist, { playback, available = () => true, a
             name.title = entry.display.name;
             const marker = document.createElement('span');
             marker.className = 'playlist-marker';
-            marker.textContent = [current ? '▶' : '', failure ? '⚠' : '', unavailable].filter(Boolean).join(' ');
-            marker.title = [current ? 'Currently playing' : '', failure, unavailable].filter(Boolean).join(' · ');
+            marker.textContent = [current ? '▶' : '', failure ? '⚠' : ''].filter(Boolean).join(' ');
+            marker.title = [current ? 'Currently playing' : '', failure].filter(Boolean).join(' · ');
+            if (unavailable) {
+                const warning = document.createElement('span');
+                warning.className = 'playlist-availability-warning';
+                warning.textContent = '!';
+                warning.title = unavailable;
+                warning.setAttribute('role', 'img');
+                warning.setAttribute('aria-label', unavailable);
+                file.append(warning);
+            }
             file.append(name, marker);
             filename.append(file);
             filename.title = diagnostics;

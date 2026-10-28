@@ -186,6 +186,40 @@ those would justify its own variant. None does: the three fixtures that name the
 trackers, `data/mt2_xm_double_toneporta.xm`, `data/rstst_double_toneporta.xm` and
 `openmpt/xm/3xx-no-old-samp-noft.xm`, all agree with libxmp's single bit.
 
+### Tagless 15-sample Soundtracker MOD
+
+The owner's `old/mods.zip` supplies the concrete need deferred by C3/C5: AXELF,
+BLOODMNY, IMPACT, JM_JARRE, RSI1 and MFC2 use the 600-byte, 15-sample header,
+with no signature. `starplayer-mod::soundtracker` is an explicit loader/probe entry
+point for this layout. The facade tries it after the signature-bearing formats;
+the tagged MOD loader keeps its existing contract. Native four-byte pattern cells
+remain MOD data and the MOD processor executes them without format conversion.
+
+Detection deliberately accepts a conservative subset: printable ASCII/NUL names,
+valid sample fields, a nonempty order list, complete declared patterns and sample
+bodies, ordinary Amiga periods and instruments 0–15. Supported commands are
+0/1/2/C/F and E00/E01. At least one note and eight declared sample bytes are
+required; arbitrary zero-filled data, malformed cells and unsupported extensions
+are rejected. This does not claim support for every Soundtracker variant or damaged
+rip. Trailing bytes are allowed; BLOODMNY has 24. The allocation-free structural
+probe checks at most 128 patterns; image conversion retains its bounded step work.
+
+Replay follows the pinned libxmp `src/loaders/st_load.c`: loop starts are byte
+counts, lengths are words, and the sample prefix before the loop start is skipped
+on its initial trigger too. `Soundtracker` uses VBlank Fxx speed semantics and
+125 BPM initially. A valid restart position is preserved; out-of-range restart
+bytes become zero. `UltimateSoundtracker` is detected using libxmp's header,
+sample-size and command restrictions; byte 471 is its initial BPM, with restart
+zero. AXELF meets that test and starts at 120 BPM. UST command 1 is arpeggio;
+command 2's low nibble bends up and its high nibble bends down. Translation happens
+only when executing a cell, preserving the stored native bytes.
+
+Both dialects have distinct model identities and appended image codes. Ordinary
+loading, reader loading, incremental images, web panning preferences and native
+tracing use the same layout and playback rules. The released assembly's tagged
+loader does not establish these rules; this compatibility extension follows the
+pinned Soundtracker reference rather than the DOS MOD-to-S3M conversion.
+
 ### Deliberately non-canonical playback options
 
 A **playback option** is neither a profile nor a dialect: it is the listener asking, for
@@ -634,14 +668,6 @@ FastTracker 2.
   are documented in `plans/reference/original-s3mlib-analysis.md` but not implemented.
 - **MOD/MTM via S3M conversion.** Not offered even as a compatibility mode. It destroys
   format identity before the player sees it and is a dead end once XM/IT arrive.
-- **Tagless 15-sample Soundtracker MOD.** Its header offsets, loop units and effect/tempo
-  dialect differ from tagged 31-sample ProTracker files; C3 rejects it explicitly, and C5
-  research point 1 confirmed the rejection rather than adding a `FormatDialect` for it.
-  A dialect is a `QuirkSet`; this is a second *header layout* — 15 sample records instead
-  of 31, pattern data 480 bytes earlier, and no tag to detect it with, so a loader would
-  have to guess from plausibility fields and would produce false positives on arbitrary
-  input. It therefore belongs behind its own loader entry point whenever a real need for
-  it appears, not behind a quirk field.
 - **Startrekker AM synthesis.** The envelope and oscillator parameters live in a sibling
   `.NT` / `.AS` file which the byte-slice facade does not receive. Ordinary `FLT4` PCM
   and paired-pattern `FLT8` modules are supported; AM-synth fixtures are not.
