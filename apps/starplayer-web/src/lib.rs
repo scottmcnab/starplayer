@@ -35,6 +35,28 @@ fn with_module<T>(fallback: T, action: impl FnOnce(&Module) -> T) -> T {
     })
 }
 
+/// Source PCM only: native maps name one-based sample IDs, while older formats
+/// and IT sample mode name one direct sample. Guard frames are not source frames.
+fn instrument_source_frames(module: &Module, index: usize) -> u32 {
+    let Some(instrument) = module.instruments().get(index) else { return 0; };
+    let native_map = match module.header().format {
+        ModuleFormat::Xm => true,
+        ModuleFormat::It => starplayer::it::ItFormatExtra::from_header(module.header()).is_instrument_mode(),
+        _ => false,
+    };
+    if !native_map {
+        return instrument.sample.and_then(|sample| module.sample(sample)).map(|sample| sample.length_frames()).unwrap_or(0);
+    }
+    let mut frames = 0u32;
+    for (note, &sample) in instrument.note_sample_map.iter().enumerate() {
+        if sample == 0 || instrument.note_sample_map[..note].contains(&sample) { continue; }
+        if let Some(sample) = module.sample(starplayer::core::SampleId(sample - 1)) {
+            frames = frames.saturating_add(sample.length_frames());
+        }
+    }
+    frames
+}
+
 fn inspect(bytes: &[u8]) -> Result<(), String> {
     // `load(&[u8])` is ModuleReader's borrowing fast path: the loader borrows pattern and
     // sample ranges directly instead of first copying them into intermediate buffers.
@@ -488,13 +510,7 @@ mod exports {
 
     #[wasm_bindgen]
     pub fn instrument_sample_length(index: u32) -> u32 {
-        with_module(0, |module| {
-            module.instruments().get(index as usize)
-                .and_then(|instrument| instrument.sample)
-                .and_then(|sample| module.sample(sample))
-                .map(|sample| sample.length_frames())
-                .unwrap_or(0)
-        })
+        with_module(0, |module| instrument_source_frames(module, index as usize))
     }
 
     #[wasm_bindgen]
@@ -558,6 +574,55 @@ mod tests {
         bytes[TRACK_DATA..TRACK_DATA + 3].copy_from_slice(&starplayer::mtm::MtmCell { pitch: 12, instrument: 1, effect: 0xF, param: 6 }.to_bytes());
         bytes[PATTERN_TABLE..PATTERN_TABLE + 2].copy_from_slice(&1u16.to_le_bytes());
         bytes
+    }
+
+    fn source_frame_module(format: ModuleFormat, instrument_mode: bool) -> Module {
+        use starplayer::{core::{SampleId, U0F16}, model::{InstrumentDef, ModuleBuilder, ModuleHeader, SampleSpec}};
+        let mut builder = ModuleBuilder::new();
+        builder.add_sample(&[1, 2, 3], SampleSpec::one_shot("first")).unwrap();
+        builder.add_sample(&[1, 2, 3], SampleSpec::one_shot("same content, distinct ID")).unwrap();
+        builder.add_sample(&[0; 7], SampleSpec::one_shot("unmapped")).unwrap();
+        builder.add_sample(&[], SampleSpec::one_shot("empty")).unwrap();
+        let mut mapped = InstrumentDef::from_sample("mapped", SampleId(2), U0F16::MAX);
+        mapped.note_sample_map[..5].copy_from_slice(&[1, 1, 2, 4, 2]);
+        builder.add_instrument(mapped.clone()).unwrap();
+        mapped.sample = None;
+        builder.add_instrument(mapped).unwrap();
+        let empty_map = InstrumentDef::from_sample("empty map with direct sample", SampleId(0), U0F16::MAX);
+        builder.add_instrument(empty_map).unwrap();
+        let mut shared = InstrumentDef::from_sample("shared ID", SampleId(0), U0F16::MAX);
+        shared.note_sample_map.fill(2);
+        builder.add_instrument(shared).unwrap();
+        let mut header = ModuleHeader::new(format, 1);
+        if format == ModuleFormat::It && instrument_mode {
+            header.format_extra = starplayer::it::ItFormatExtra { flags: 4, special: 0, old_instruments: false, has_midi_configuration: false }.encode();
+        }
+        builder.set_header(header);
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn source_frame_totals_use_only_distinct_native_mapped_ids() {
+        for format in [ModuleFormat::Xm, ModuleFormat::It] {
+            let module = source_frame_module(format, true);
+            assert_eq!(instrument_source_frames(&module, 0), 6, "deduplicate IDs, not contents; exclude unmapped direct samples and guards");
+            assert_eq!(instrument_source_frames(&module, 1), 6, "native maps need no direct reference");
+            assert_eq!(instrument_source_frames(&module, 2), 0, "an empty native map never falls back to a direct sample");
+            assert_eq!(instrument_source_frames(&module, 3), 3, "a shared sample is counted independently for each instrument");
+            assert_eq!(instrument_source_frames(&module, usize::MAX), 0);
+        }
+    }
+
+    #[test]
+    fn direct_source_frames_preserve_legacy_and_it_sample_mode_lengths() {
+        for format in [ModuleFormat::Mod, ModuleFormat::S3m, ModuleFormat::Mtm, ModuleFormat::It] {
+            let module = source_frame_module(format, false);
+            assert_eq!(instrument_source_frames(&module, 0), 7, "direct references ignore native maps");
+            assert_eq!(instrument_source_frames(&module, 1), 0);
+            assert_eq!(instrument_source_frames(&module, 2), 3);
+            assert_eq!(instrument_source_frames(&module, usize::MAX), 0);
+        }
+        assert_eq!(exports::instrument_sample_length(u32::MAX), 0);
     }
 
     #[test]

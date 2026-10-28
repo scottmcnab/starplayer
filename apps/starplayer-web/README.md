@@ -269,8 +269,29 @@ it is narrower than what the checkbox asked for.
 **The instrument metadata panel shows source lengths.** The page-side metadata instance
 (`apps/starplayer-web/src/lib.rs`) validates and describes a module without ever enhancing
 it — only the worklet's own copy is rebuilt — so the Instruments panel's frame counts are
-always the stored length before any enhancer runs, labelled "source frames" for exactly
-that reason.
+the total source frames across distinct mapped sample IDs before enhancement, excluding
+guard frames. Repeated note-map entries count once; different sample IDs count separately
+even when their PCM matches. XM and IT instrument mode use native note maps; IT sample
+mode and MOD/S3M/MTM use direct sample references. Zero-frame cells stay blank.
+
+The Instruments table uses compact 32 px rows in source order: **# / Play / Name / Loop /
+note-overlap checkbox / Frames**. Select a playable row with a click or Enter/Space to
+choose its keyboard/MIDI target. Play auditions reference note 60 without selecting the
+row; PCM-bearing instruments retain a disabled Play control if that reference note is
+unplayable. Loop shows infinity for any mapped native loop, including sustain loops;
+its tooltip explains mixed maps. Eligible non-looping instruments have native Let notes
+ring checkboxes, even when live input cannot play them.
+
+The checkbox heading selects or clears every eligible instrument, including offscreen
+rows, while global overlap remains independently bypassable. Its mixed state reflects
+accepted audio acknowledgements. Bulk edits enqueue ordinary identity-tagged commands
+in instrument order; a later clear or row override follows earlier requests. Each bounded
+batch is admitted separately. The page sends at most 16 interactive records per group
+within the native engine admission budget; the existing applied barrier paces subsequent
+groups. A later rejection preserves earlier accepted edits and shows the truthful partial
+selection. Same-module state updates preserve focused controls,
+held audition buttons and table scroll. Fresh module loads cancel unsent instrument edits
+for the old session and reset selections; failed loads preserve accepted selections.
 
 Changing any of the three while a module is active reloads the retained bytes at the
 sounding order and restores transport, volume, and channel mutes; the old module remains

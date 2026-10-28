@@ -287,7 +287,13 @@
             <div class="audition-actions"><button id="stop-preview" type="button" disabled>Stop preview</button><button id="all-sound-off" type="button" disabled>All sound off</button></div>
             <p class="library-hint">Let previous non-looping notes finish. An identical note at the same starting volume on this instrument and channel replaces its earlier sound. Unchecked preserves native behavior, including IT NNA. Selections remain editable while overlap is off.</p>
             <p class="library-hint">Preview uses reference note 60, prepared samples and the current master DSP, with no automatic tracker-channel inserts. One-shot previews finish after release; loops release natively and may require Stop preview. Pause keeps envelopes, loops and DSP running.</p>
-            <ol id="instrument-list" class="instrument-list"><li class="empty">No module loaded.</li></ol>
+            <div class="instrument-scroll">
+                <table class="instrument-table" aria-label="Instruments">
+                    <colgroup><col class="instrument-number"><col class="instrument-play-column"><col><col class="instrument-loop"><col class="instrument-overlap"><col class="instrument-frames"></colgroup>
+                    <thead><tr><th scope="col">#</th><th scope="col">Play</th><th scope="col">Name</th><th scope="col">Loop</th><th scope="col"><label class="instrument-checkbox" title="Select or clear note overlap for every eligible instrument, including offscreen rows. Unchecked preserves native behavior, including IT NNA."><input id="instrument-select-all" type="checkbox" aria-label="Select all eligible instruments for note overlap" disabled></label></th><th scope="col" title="Total source frames across distinct mapped samples, before enhancement and excluding guard frames">Frames</th></tr></thead>
+                    <tbody id="instrument-list"><tr><td class="empty" colspan="6">No module loaded.</td></tr></tbody>
+                </table>
+            </div>
         </article>
         <article class="panel diagnostics">
             <div class="panel-heading"><h2>Engine</h2><span id="health">idle</span></div>

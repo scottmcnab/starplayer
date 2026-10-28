@@ -396,7 +396,7 @@ const READ_STATE = `
         masterPeak: parseFloat(document.getElementById('master-peak').style.width) || 0,
         errorShown: !document.getElementById('error').hidden,
         errorText: text('error'),
-        instruments: document.querySelectorAll('#instrument-list li').length,
+        instruments: document.querySelectorAll('#instrument-list tr[data-instrument]').length,
         crossOriginIsolated: globalThis.crossOriginIsolated === true,
         archivePickerVisible: !document.getElementById('archive-picker').hidden,
         engineMode: text('engine-mode'),
@@ -1226,7 +1226,7 @@ async function run(executable, mode) {
         const beforeBadControls = await page.evaluate('return window.__interactiveApplied.length;');
         await page.evaluate("document.getElementById('pause').click(); return true;");
         await page.waitFor('Pause remains usable after failed inspection', "document.getElementById('transport-chip').textContent === 'paused'");
-        await page.evaluate("document.querySelector('#instrument-list li button:nth-of-type(2):not(:disabled)').click(); return true;");
+        await page.evaluate("document.querySelector('#instrument-list .instrument-play:not(:disabled)').click(); return true;");
         await page.waitFor('Preview acknowledgement after failed inspection', `window.__interactiveApplied.slice(${beforeBadControls}).some(message => message.accepted && message.commands.some((value, index) => index % 3 === 0 && value === StarPlayerRing.OPCODE_PREVIEW))`);
         await page.evaluate("document.getElementById('stop-preview').click(); document.getElementById('play').click(); return true;");
         await page.waitFor('Resume remains usable after failed inspection', "document.getElementById('transport-chip').textContent === 'playing'");

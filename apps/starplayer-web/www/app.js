@@ -47,7 +47,7 @@ const elements = {
     next: byId('next'), seekOrder: byId('seek-order'), volume: byId('volume'), volumeValue: byId('volume-value'),
     progress: byId('progress'), elapsed: byId('elapsed'), duration: byId('duration'), repeat: byId('repeat'),
     voices: byId('voices'), masterPeak: byId('master-peak'), channelBody: byId('channel-body'), patternTable: byId('pattern-table'),
-    instrumentCount: byId('instrument-count'), instrumentList: byId('instrument-list'), commandTransport: byId('command-transport'),
+    instrumentCount: byId('instrument-count'), instrumentList: byId('instrument-list'), instrumentSelectAll: byId('instrument-select-all'), commandTransport: byId('command-transport'),
     telemetryTransport: byId('telemetry-transport'), scopeTransport: byId('scope-transport'),
     quantum: byId('quantum'), memory: byId('memory'),
     dropped: byId('dropped'), retired: byId('retired'), health: byId('health'), forceFallback: byId('force-fallback'),
@@ -106,6 +106,8 @@ const state = {
     lastTransportOpcode: null,
     liveRecoveryPending: false,
     selectedInstrument: null,
+    instrumentTableInstruments: null,
+    instrumentRows: [],
     letNotesRing: [],
     overlapEnabled: false,
     previewInstrument: null,
@@ -908,6 +910,10 @@ function readMetadata(label) {
 function activateModuleOnNode(node, buffer, loadOptions = loadOptionsFromControls(), replacement = null) {
     const previousReady = node === state.node && state.interactiveReady;
     const previousIdentity = node.starplayerIdentity;
+    // A fresh module cancels unsent instrument edits for the old session. Already
+    // admitted groups keep their acknowledged state if the load fails; replacement
+    // captures instead drain every queued edit before preparing the new build.
+    if (node === state.node && replacement === null) state.fallbackCommands = state.fallbackCommands.filter(record => record.opcode !== Ring.OPCODE_LET_NOTES_RING || !Ring.sameIdentity(record.identity, previousIdentity));
     cleanupLiveInput();
     if (node === state.node) state.interactiveReady = false;
     const identity = { session: replacement ? replacement[1] : ++state.sessionClock, build: ++state.buildClock };
@@ -1064,7 +1070,7 @@ function onWorkletMessage(message, node) {
             if (opcode === Ring.OPCODE_STOP_PREVIEW) state.liveRecoveryPending = false;
         }
         elements.overlapEnable.checked = state.overlapEnabled;
-        for (const input of elements.instrumentList.querySelectorAll('input[type=checkbox]')) input.checked = !!state.letNotesRing[Number(input.dataset.instrument)];
+        updateInstrumentControls();
         updateLiveInputPanel();
     } else if (message.type === 'garbageCollected') {
         if (node !== state.node) return;
@@ -1399,7 +1405,10 @@ function queueCommand(opcode, argument = 0, extra = 0, identity = null) {
             state.sessionSettingsRevision = (state.sessionSettingsRevision ?? 0) + 1;
     }
     const record = { opcode, argument: argument >>> 0, extra: extra >>> 0, identity };
-    if (state.fallbackCommands.length || !state.commandRing || !Ring.pushCommand(state.commandRing, opcode, argument, extra, identity)) state.fallbackCommands.push(record);
+    // Native host-control admission also reserves engine settlement room within its
+    // 32-command quantum budget. Keep interactive groups at 16; the worklet's existing
+    // applied barrier paces subsequent groups, including a bulk edit's remainder.
+    if (state.fallbackCommands.length || !state.commandRing || (state.node.starplayerInteractiveVersion && Ring.commandOccupancy(state.commandRing.words) >= 16) || !Ring.pushCommand(state.commandRing, opcode, argument, extra, identity)) state.fallbackCommands.push(record);
 }
 
 function repeatFadeFrames() {
@@ -1415,13 +1424,14 @@ function flushFallbackCommands() {
     if (state.node === null || state.fallbackCommands.length === 0) return;
     if (state.commandRing !== null) {
         while (state.fallbackCommands.length) {
+            if (state.node.starplayerInteractiveVersion && Ring.commandOccupancy(state.commandRing.words) >= 16) break;
             const record = state.fallbackCommands[0];
             if (!Ring.pushCommand(state.commandRing, record.opcode, record.argument, record.extra, record.identity)) break;
             state.fallbackCommands.shift();
             if (record.opcode === Ring.OPCODE_SET_MIXER_MODE) state.node.port.postMessage({ type: 'flushCommands' });
         }
     } else {
-        const records = state.fallbackCommands.splice(0, Ring.COMMAND_CAPACITY - 1);
+        const records = state.fallbackCommands.splice(0, state.node.starplayerInteractiveVersion ? 16 : Ring.COMMAND_CAPACITY - 1);
         if (state.node.starplayerInteractiveVersion === 0) state.node.port.postMessage({ type: 'commandBatch', version: 1, commands: records.flatMap(record => [record.opcode, record.argument, record.extra]) });
         else state.node.port.postMessage({ type: 'commandBatch', version: Ring.INTERACTIVE_WIRE_VERSION, commands: records });
     }
@@ -1986,63 +1996,111 @@ function renderMetadata() {
     elements.moduleDetail.textContent = `${metadata.label} · ${metadata.channels} channels · ${metadata.orders} orders · ${metadata.patterns} patterns · ${metadata.instruments.length} instruments`;
     elements.seekOrder.max = String(Math.max(0, metadata.orders - 1));
     elements.instrumentCount.textContent = String(metadata.instruments.length);
-    elements.instrumentList.replaceChildren();
-    for (const [index, instrument] of metadata.instruments.entries()) {
-        const item = document.createElement('li');
-        const name = document.createElement('button');
-        name.type = 'button'; name.className = 'instrument-select';
-        name.textContent = instrument.name || `(instrument ${index + 1})`;
-        name.setAttribute('aria-label', `Select instrument ${index + 1}: ${instrument.name || 'empty slot'} for keyboard and MIDI`);
-        name.setAttribute('aria-pressed', String(state.selectedInstrument === index));
-        name.disabled = !state.interactiveReady || !(instrument.capability & 1);
-        name.addEventListener('click', () => selectInstrument(index));
-        const preview = document.createElement('button');
-        preview.type = 'button'; preview.textContent = 'Preview';
-        preview.setAttribute('aria-label', `Preview instrument ${index + 1} at reference note 60`);
-        preview.disabled = !state.interactiveReady || !(instrument.capability & 8);
-        preview.title = instrument.capability & 8 ? 'Reference note 60, using prepared samples and master processing' : 'No playable PCM at reference note 60';
-        const begin = () => {
-            if (!state.interactiveReady) return;
-            state.previewInstrument = index;
-            backgroundOutput.start(); state.context?.resume().catch(showError);
-            queueInteractive(Ring.OPCODE_PREVIEW, index); flushFallbackCommands();
-        };
-        const finish = () => {
-            if (state.previewInstrument !== index) return;
-            if (instrument.capability & 16) queueInteractive(Ring.OPCODE_RELEASE_PREVIEW);
-            state.previewInstrument = null;
-            flushFallbackCommands();
-        };
-        preview.addEventListener('pointerdown', event => { if (event.button !== 0) return; preview.setPointerCapture(event.pointerId); begin(); });
-        preview.addEventListener('pointerup', finish);
-        preview.addEventListener('pointercancel', cleanupLiveInput);
-        preview.addEventListener('lostpointercapture', event => { if (state.previewInstrument === index) cleanupLiveInput(); });
-        let keyboardPreview = false;
-        preview.addEventListener('keydown', event => { if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) { keyboardPreview = true; event.preventDefault(); begin(); } });
-        preview.addEventListener('keyup', event => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); finish(); } });
-        preview.addEventListener('blur', () => { if (state.previewInstrument === index) cleanupLiveInput(); });
-        preview.addEventListener('click', event => { if (event.detail === 0 && !keyboardPreview) { begin(); finish(); } keyboardPreview = false; });
-        const label = document.createElement('label');
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox'; checkbox.dataset.instrument = String(index);
-        checkbox.checked = !!state.letNotesRing[index];
-        checkbox.disabled = !state.interactiveReady || !(instrument.capability & 2);
-        checkbox.setAttribute('aria-label', `Let notes ring for instrument ${index + 1}`);
-        label.title = instrument.capability & 2 ? 'Let previous notes finish. An identical note played at the same starting volume on this instrument and channel replaces its earlier sound. Applies only to non-looping samples. Unchecked preserves native behavior, including IT NNA.' : 'Unavailable: no playable non-looping PCM in this instrument';
-        checkbox.addEventListener('change', () => { queueInteractive(Ring.OPCODE_LET_NOTES_RING, index, Number(checkbox.checked)); flushFallbackCommands(); });
-        label.append(checkbox, 'Let notes ring');
-        const status = document.createElement('small');
-        const mixed = (instrument.capability & 6) === 6;
-        status.textContent = instrument.capability & 4 ? (mixed ? '∞ Mixed sample map' : '∞ Looped samples') : instrument.capability & 2 ? 'One-shot samples' : 'No playable PCM';
-        status.setAttribute('aria-label', mixed ? 'Mixed map: looping and non-looping samples; overlap applies only to non-looping notes' : instrument.capability & 4 ? 'Looping samples; note overlap unavailable' : status.textContent);
-        item.append(name, preview, label, status);
-        elements.instrumentList.append(item);
+    // Retain native controls through same-module acknowledgements and selection updates.
+    // Replacing a held Play node would implicitly release pointer capture or focus.
+    if (state.instrumentTableInstruments !== metadata.instruments) {
+        state.instrumentTableInstruments = metadata.instruments;
+        state.instrumentRows = [];
+        elements.instrumentList.replaceChildren();
+        for (const [index, instrument] of metadata.instruments.entries()) {
+            const item = document.createElement('tr');
+            item.dataset.instrument = String(index);
+            item.className = 'instrument-select';
+            item.addEventListener('click', event => { if (!event.target.closest('button, input, label')) selectInstrument(index); });
+            item.addEventListener('keydown', event => {
+                if (event.target === item && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); if (!event.repeat) selectInstrument(index); }
+            });
+            const cells = Array.from({ length: 6 }, () => document.createElement('td'));
+            cells[0].textContent = String(index + 1).padStart(2, '0');
+            cells[2].className = 'instrument-name';
+            cells[2].textContent = instrument.name || `(instrument ${index + 1})`;
+            cells[2].title = cells[2].textContent;
+            cells[5].textContent = instrument.length ? String(instrument.length) : '';
+            let preview = null, checkbox = null;
+            if (instrument.length > 0) {
+                preview = document.createElement('button');
+                preview.type = 'button'; preview.className = 'instrument-play';
+                preview.innerHTML = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1v10l9-5z"/></svg>';
+                preview.setAttribute('aria-label', `Play instrument ${index + 1} at reference note 60`);
+                const begin = () => {
+                    if (!state.interactiveReady || !(instrument.capability & 8)) return;
+                    state.previewInstrument = index;
+                    backgroundOutput.start(); state.context?.resume().catch(showError);
+                    queueInteractive(Ring.OPCODE_PREVIEW, index); flushFallbackCommands();
+                };
+                const finish = () => {
+                    if (state.previewInstrument !== index) return;
+                    if (instrument.capability & 16) queueInteractive(Ring.OPCODE_RELEASE_PREVIEW);
+                    state.previewInstrument = null;
+                    flushFallbackCommands();
+                };
+                preview.addEventListener('pointerdown', event => { if (event.button !== 0) return; preview.setPointerCapture(event.pointerId); begin(); });
+                preview.addEventListener('pointerup', finish);
+                preview.addEventListener('pointercancel', cleanupLiveInput);
+                preview.addEventListener('lostpointercapture', event => { if (state.previewInstrument === index) cleanupLiveInput(); });
+                let keyboardPreview = false;
+                preview.addEventListener('keydown', event => { if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) { keyboardPreview = true; event.preventDefault(); begin(); } });
+                preview.addEventListener('keyup', event => { if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); finish(); } });
+                preview.addEventListener('blur', () => { if (state.previewInstrument === index) cleanupLiveInput(); });
+                preview.addEventListener('click', event => { if (event.detail === 0 && !keyboardPreview) { begin(); finish(); } keyboardPreview = false; });
+                cells[1].append(preview);
+            }
+            const mixed = (instrument.capability & 6) === 6;
+            cells[3].textContent = instrument.capability & 4 ? '∞' : '';
+            if (instrument.capability & 4) {
+                const explanation = mixed ? 'Mixed map: looping and non-looping samples; overlap applies only to non-looping notes' : 'Native looping samples, including sustain loops; note overlap unavailable';
+                cells[3].setAttribute('aria-label', explanation); cells[3].title = explanation;
+            }
+            if (instrument.capability & 2) {
+                const label = document.createElement('label'); label.className = 'instrument-checkbox';
+                label.title = 'Let previous notes finish. An identical note played at the same starting volume on this instrument and channel replaces its earlier sound. Applies only to non-looping samples. Unchecked preserves native behavior, including IT NNA.';
+                checkbox = document.createElement('input');
+                checkbox.type = 'checkbox'; checkbox.dataset.instrument = String(index);
+                checkbox.setAttribute('aria-label', `Let notes ring for instrument ${index + 1}`);
+                checkbox.addEventListener('change', () => { queueInteractive(Ring.OPCODE_LET_NOTES_RING, index, Number(checkbox.checked)); flushFallbackCommands(); });
+                label.append(checkbox); cells[4].append(label);
+            }
+            item.append(...cells); elements.instrumentList.append(item);
+            state.instrumentRows.push({ item, preview, checkbox });
+        }
+        if (metadata.instruments.length === 0) elements.instrumentList.innerHTML = '<tr><td class="empty" colspan="6">No instruments.</td></tr>';
     }
-    if (metadata.instruments.length === 0) {
-        elements.instrumentList.innerHTML = '<li class="empty">No instruments.</li>';
-    }
+    updateInstrumentControls();
     ensureChannelRows(metadata.channels);
     state.lastPatternKey = '';
+}
+
+function updateInstrumentControls() {
+    let eligible = 0, accepted = 0;
+    for (const [index, instrument] of (state.metadata?.instruments ?? []).entries()) {
+        const controls = state.instrumentRows?.[index];
+        if (instrument.capability & 2) { eligible++; if (state.letNotesRing[index]) accepted++; }
+        if (!controls) continue;
+        const selectable = state.interactiveReady && !!(instrument.capability & 1);
+        controls.item.tabIndex = selectable ? 0 : -1;
+        controls.item.dataset.selectable = String(selectable);
+        controls.item.setAttribute('aria-label', `Instrument ${index + 1}: ${instrument.name || 'empty slot'}. ${selectable ? 'Select for keyboard and MIDI' : 'Keyboard and MIDI selection unavailable'}`);
+        controls.item.setAttribute('aria-selected', String(state.selectedInstrument === index));
+        if (controls.preview) {
+            controls.preview.disabled = !state.interactiveReady || !(instrument.capability & 8);
+            controls.preview.title = !(instrument.capability & 8) ? 'No playable PCM at reference note 60' : !state.interactiveReady ? 'Interactive audio is not ready' : 'Reference note 60, using prepared samples and master processing';
+        }
+        if (controls.checkbox) { controls.checkbox.disabled = !state.interactiveReady; controls.checkbox.checked = !!state.letNotesRing[index]; }
+    }
+    elements.instrumentSelectAll.checked = eligible > 0 && accepted === eligible;
+    elements.instrumentSelectAll.indeterminate = accepted > 0 && accepted < eligible;
+    elements.instrumentSelectAll.disabled = !state.interactiveReady || eligible === 0;
+}
+
+function setAllInstrumentOverlap() {
+    if (!state.interactiveReady) { restoreUnreadyInteractiveControls(); return; }
+    const enabled = Number(elements.instrumentSelectAll.checked);
+    // Snapshot the requested value for every eligible row. Accepted state may lag
+    // queued writes; filtering against it would lose a quick select-then-clear.
+    for (const [index, instrument] of (state.metadata?.instruments ?? []).entries()) {
+        if (instrument.capability & 2) queueInteractive(Ring.OPCODE_LET_NOTES_RING, index, enabled);
+    }
+    flushFallbackCommands();
 }
 
 function selectInstrument(index) {
@@ -2503,6 +2561,7 @@ elements.keyboardEnable.addEventListener('change', () => {
     syncLiveInput();
     updateLiveInputPanel();
 });
+elements.instrumentSelectAll.addEventListener('change', setAllInstrumentOverlap);
 elements.overlapEnable.addEventListener('change', () => { queueInteractive(Ring.OPCODE_NOTE_OVERLAP, Number(elements.overlapEnable.checked)); flushFallbackCommands(); });
 elements.stopPreview.addEventListener('click', cleanupLiveInput);
 elements.allSoundOff.addEventListener('click', () => { releaseHeldKeys(false); state.previewInstrument = null; queueInteractive(Ring.OPCODE_ALL_SOUND_OFF); flushFallbackCommands(); });

@@ -1,3 +1,4 @@
+import { runCompactInstruments } from './w17-headless.mjs';
 import assert from 'node:assert/strict';
 
 // Uses the repository's existing Chromium/CDP runner and packaged app.
@@ -26,7 +27,7 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
                     };
                     this.port.addEventListener('message', event => {
                         if (event.data.type === 'moduleLoaded' && event.data.accepted) window.__interactiveLoadsApplied++;
-                        if (event.data.type === 'interactiveApplied') window.__failedLoadAcks.push({ accepted: event.data.accepted, commands: Array.from(event.data.commands).slice(0, event.data.count * 3) });
+                        if (event.data.type === 'interactiveApplied') window.__failedLoadAcks.push({ accepted: event.data.accepted, identityWords: Array.from(event.data.words).slice(2, 6), commands: Array.from(event.data.commands).slice(0, event.data.count * 3) });
                     });
                 }
             };
@@ -73,7 +74,7 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         // use this retained installation; the expected diagnostic stays until a new load.
         report.postedFailureRetainedControls = true;
         await page.waitFor('the song one-shot to finish while paused', "parseFloat(document.getElementById('master-peak').style.width) < 0.1");
-        await page.evaluate("document.querySelector('#instrument-list li button:nth-of-type(2)').click();");
+        await page.evaluate("document.querySelector('#instrument-list .instrument-play').click();");
         await page.waitFor('audition while paused', "parseFloat(document.getElementById('master-peak').style.width) > 1");
         assert.equal(await value("document.getElementById('row').textContent"), held);
         await page.evaluate("document.getElementById('stop-preview').click();");
@@ -100,7 +101,7 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         await page.waitFor('clear-and-hold Stop', "document.getElementById('transport-chip').textContent === 'stopped'");
         assert.equal(await value("document.getElementById('row').textContent"), held);
         await page.waitFor('Stop to settle to silence', "parseFloat(document.getElementById('master-peak').style.width) < 0.1");
-        await page.evaluate("document.querySelector('#instrument-list li button:nth-of-type(2)').click();");
+        await page.evaluate("document.querySelector('#instrument-list .instrument-play').click();");
         await page.waitFor('audition while stopped', "parseFloat(document.getElementById('master-peak').style.width) > 1");
         await loadFile(page, bytes, 'audition-reload.mod');
         await page.waitFor('explicit same-byte reload', "document.getElementById('module-detail').textContent.includes('audition-reload.mod')");
@@ -111,6 +112,7 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         report.acknowledgedRebuild = true;
         report.keyboardCleanup = true;
         report.explicitReloadResets = true;
+        report.compactInstruments = await runCompactInstruments({ page, loadFile, mode });
         if (process.env.STARPLAYER_NO07_ARTIFACTS) {
             const { readFile } = await import('node:fs/promises');
             report.ownerFixtures = [];
@@ -122,7 +124,7 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
                 if (name === 'dense-native.it') assert.equal(await value("document.querySelectorAll('#channel-body tr').length"), 64);
                 await page.evaluate("document.getElementById('pause').click();");
                 await page.waitFor(`paused ${name}`, "document.getElementById('transport-chip').textContent === 'paused'");
-                await page.evaluate("document.querySelector('#instrument-list li button:nth-of-type(2):not(:disabled)').click();");
+                await page.evaluate("document.querySelector('#instrument-list .instrument-play:not(:disabled)').click();");
                 await page.waitFor(`audible ${name}`, "parseFloat(document.getElementById('master-peak').style.width) > 1");
                 await page.evaluate("document.getElementById('stop-preview').click();");
                 assert.equal(await value("document.getElementById('error').hidden"), true, await value("document.getElementById('error').textContent"));
