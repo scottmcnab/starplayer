@@ -230,7 +230,7 @@ fn render(module: Arc<Module>, choices: Option<(bool, [bool; 3])>, block: usize)
     let source = if choices.is_some() { starplayer::NativeSequencer::new_with_articulation(module, 8000, QuirkSelection::FromDialect, settings.voice_capacity).unwrap() }
         else { starplayer::NativeSequencer::new_with_voice_capacity(module, 8000, QuirkSelection::FromDialect, settings.voice_capacity).unwrap() };
     engine.set_source(Box::new(source));
-    if let Some((enabled, selections)) = choices { engine.restore_selections(Default::default(), enabled, &selections); }
+    if let Some((enabled, selections)) = choices { engine.restore_selections(Default::default(), enabled, false, &selections); }
     let mut output = vec![0; 12000]; for chunk in output.chunks_mut(block * 2) { engine.render(chunk); } output
 }
 #[test]

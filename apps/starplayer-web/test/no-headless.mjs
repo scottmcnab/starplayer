@@ -13,6 +13,7 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         await page.evaluate(`
             window.__failedLoadAcks = [];
             window.__interactiveLoadsApplied = 0;
+            window.__appliedPolicies = [];
             const Original = window.AudioWorkletNode;
             window.AudioWorkletNode = class extends Original {
                 constructor(...arguments_) {
@@ -26,7 +27,7 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
                         post(message, ...transfer);
                     };
                     this.port.addEventListener('message', event => {
-                        if (event.data.type === 'moduleLoaded' && event.data.accepted) window.__interactiveLoadsApplied++;
+                        if (event.data.type === 'moduleLoaded' && event.data.accepted) { window.__interactiveLoadsApplied++; window.__appliedPolicies.push([event.data.overlapEnabled, event.data.uniqueNotesAcrossChannels]); }
                         if (event.data.type === 'interactiveApplied') window.__failedLoadAcks.push({ accepted: event.data.accepted, identityWords: Array.from(event.data.words).slice(2, 6), commands: Array.from(event.data.commands).slice(0, event.data.count * 3) });
                     });
                 }
@@ -41,6 +42,7 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         await loadFile(page, bytes, 'audition.mod');
         await page.waitFor('the applied interactive load', "!document.getElementById('pause').disabled && document.getElementById('transport-chip').textContent === 'playing'");
         assert.equal(await value("document.getElementById('note-overlap-enable').checked"), false);
+        assert.equal(await value("document.getElementById('unique-notes-across-channels').checked"), false);
         assert.equal(await value("document.querySelectorAll('#channel-body tr').length"), 4);
         await page.evaluate("document.getElementById('pause').click();");
         await page.waitFor('Pause', "document.getElementById('transport-chip').textContent === 'paused'");
@@ -56,6 +58,9 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         await page.evaluate("document.getElementById('note-overlap-enable').click();");
         await new Promise(resolve => setTimeout(resolve, 100));
         assert.equal(await value("document.querySelector('#instrument-list input').checked"), true);
+        const uniqueBefore = await value('window.__failedLoadAcks.length');
+        await page.evaluate("document.getElementById('unique-notes-across-channels').click();");
+        await page.waitFor('unique policy audio acknowledgement', `window.__failedLoadAcks.slice(${uniqueBefore}).some(message => message.accepted && message.commands.some((opcode, index) => index % 3 === 0 && opcode === StarPlayerRing.OPCODE_UNIQUE_NOTES && message.commands[index + 1] === 1))`);
         // Inspection succeeds; only the posted audio preparation sees malformed bytes.
         // The retained identity must restore usable controls without a graph rebuild.
         await page.evaluate('window.__failNextAudioLoad = true;');
@@ -72,6 +77,8 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         await page.waitFor('retained checkbox retry reenabled', `window.__failedLoadAcks.slice(${beforeFailureRetry}).some(message => message.accepted && message.commands.some((opcode, index) => index % 3 === 0 && opcode === StarPlayerRing.OPCODE_LET_NOTES_RING && message.commands[index + 2] === 1))`);
         // The following real Preview audio, native keyboard and rebuild assertions all
         // use this retained installation; the expected diagnostic stays until a new load.
+        assert.equal(await value("document.getElementById('unique-notes-across-channels').checked"), true);
+        assert.deepEqual(await value('window.__appliedPolicies.at(-1)'), [false, true], 'failed load reconciles both policies with retained audio');
         report.postedFailureRetainedControls = true;
         await page.waitFor('the song one-shot to finish while paused', "parseFloat(document.getElementById('master-peak').style.width) < 0.1");
         await page.evaluate("document.querySelector('#instrument-list .instrument-play').click();");
@@ -91,9 +98,13 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         assert.equal(await value("document.querySelector('#instrument-list input').checked"), true);
         assert.equal(await value("document.getElementById('note-overlap-enable').checked"), true);
         assert.equal(await value("document.getElementById('note-overlap-enable').disabled"), false, 'committed same-session settings remain editable');
+        assert.equal(await value("document.getElementById('unique-notes-across-channels').checked"), true);
+        assert.deepEqual(await value('window.__appliedPolicies.at(-1)'), [true, true]);
         assert.equal(await value("document.getElementById('row').textContent"), held);
         await page.evaluate("document.getElementById('sample-rate').value = '22050'; document.getElementById('apply-sample-rate').click();");
         await page.waitFor('replacement WASM Player at22050Hz', "document.getElementById('worklet-rate').textContent.replace(/[^0-9]/g, '') === '22050'");
+        assert.equal(await value("document.getElementById('unique-notes-across-channels').checked"), true);
+        assert.deepEqual(await value('window.__appliedPolicies.at(-1)'), [true, true]);
         assert.equal(await value("document.getElementById('transport-chip').textContent"), 'paused');
         assert.equal(await value("document.querySelector('#instrument-list input').checked"), true);
         assert.equal(await value("document.getElementById('row').textContent"), held);
@@ -106,12 +117,18 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
         await loadFile(page, bytes, 'audition-reload.mod');
         await page.waitFor('explicit same-byte reload', "document.getElementById('module-detail').textContent.includes('audition-reload.mod')");
         assert.equal(await value("document.querySelector('#instrument-list input').checked"), false);
-        assert.equal(await value("document.getElementById('note-overlap-enable').checked"), false);
+        assert.equal(await value("document.getElementById('note-overlap-enable').checked"), true, 'global overlap retains page intent on an explicit reload');
+        assert.equal(await value("document.getElementById('unique-notes-across-channels').checked"), true, 'unique policy retains page intent on an explicit reload');
+        assert.deepEqual(await value('window.__appliedPolicies.at(-1)'), [true, true]);
         assert.equal(await value("document.getElementById('error').hidden"), true, await value("document.getElementById('error').textContent"));
         report.pausedRow = held;
         report.acknowledgedRebuild = true;
         report.keyboardCleanup = true;
-        report.explicitReloadResets = true;
+        report.explicitReloadResetsRing = true;
+        // The compact-table regression explicitly exercises Ring editing while bypassed.
+        const bypassBefore = await value('window.__failedLoadAcks.length');
+        await page.evaluate("document.getElementById('note-overlap-enable').click();");
+        await page.waitFor('explicit bypass before compact table', `window.__failedLoadAcks.slice(${bypassBefore}).some(message => message.accepted && message.commands.some((opcode, index) => index % 3 === 0 && opcode === StarPlayerRing.OPCODE_NOTE_OVERLAP && message.commands[index + 1] === 0))`);
         report.compactInstruments = await runCompactInstruments({ page, loadFile, mode });
         if (process.env.STARPLAYER_NO07_ARTIFACTS) {
             const { readFile } = await import('node:fs/promises');
@@ -139,6 +156,13 @@ export async function runInteractive({ Page, executable, mode, startDevServer, l
             const { writeFile } = await import('node:fs/promises');
             await writeFile(process.env.STARPLAYER_NO07_ARTIFACTS ? `${process.env.STARPLAYER_NO07_ARTIFACTS}/controls.png` : '/tmp/no-w1-controls.png', Buffer.from(image.data, 'base64'));
         }
+        await page.evaluate("document.getElementById('reference-note').value = '61'; document.getElementById('reference-note').dispatchEvent(new Event('change'));");
+        await page.send('Page.reload');
+        await page.waitFor('page-session preference reset', "document.documentElement.dataset.playerReady === 'true'");
+        assert.equal(await value("document.getElementById('note-overlap-enable').checked"), false);
+        assert.equal(await value("document.getElementById('unique-notes-across-channels').checked"), false);
+        assert.equal(await value("document.getElementById('reference-note').value"), '60');
+        report.pagePoliciesAndReload = true;
         return report;
     } finally { await page.close(); server.stop(); }
 }

@@ -141,8 +141,14 @@ or the MOD panning reload), so the checkbox's choice survives all of them.
 
 The **Playlist** panel plays entries in order. Double-click or press Enter to start an
 entry; the ⏮ / ⏭ buttons at either end of the transport controls move to the previous or
-next playlist track (◀◀ / ▶▶ still seek by order), Clear or Delete removes entries,
-and drag or Alt+↑/↓ to reorder. Loop playlist wraps at the last entry. Removing the
+next playlist track (◀◀ / ▶▶ still seek by order). The compact table has single-line
+rows and a sticky heading; full values and diagnostics are available in tooltips.
+Checkboxes select entries independently, including duplicates and unavailable tracks;
+the heading checkbox selects all entries. Click, Ctrl/⌘-click and Shift-click select;
+Ctrl/⌘+A selects all, Escape clears, and arrows, Home/End or PageUp/Down move the
+selection (Shift extends). **Remove selected** or Delete removes the selection in
+one operation; Clear removes all entries. Selection lasts only until page reload.
+Drag one entry or Alt+↑/↓ to reorder. Loop playlist wraps at the last entry. Removing the
 current entry keeps the audio playing but cancels any pending advance. Failed entries
 show ⚠ with a diagnostic tooltip and are skipped; three consecutive failures stop the
 advance. Entries from an index that is no longer connected show “unavailable”.
@@ -276,9 +282,14 @@ mode and MOD/S3M/MTM use direct sample references. Zero-frame cells stay blank.
 
 The Instruments table uses compact 32 px rows in source order: **# / Play / Name / Loop /
 note-overlap checkbox / Frames**. Select a playable row with a click or Enter/Space to
-choose its keyboard/MIDI target. Play auditions reference note 60 without selecting the
-row; PCM-bearing instruments retain a disabled Play control if that reference note is
-unplayable. Loop shows infinity for any mapped native loop, including sustain loops;
+choose its keyboard/MIDI target. Play auditions the selected **Reference Note** without
+selecting the row or retuning keyboard/MIDI. The native chooser covers 0–127 and defaults
+to **C-5 (60), middle C**; its value lasts until page reload. PCM-bearing instruments
+retain a disabled Play control if the chosen key is unmapped or its native pitch is
+unplayable. Per-key metadata is captured with the committed module; failed candidate
+inspection cannot change current controls. A held press keeps its captured loop release
+behavior even if the chooser changes. Play and Loop headings stay visually blank with
+accessible names, and the Play icon keeps its full hit area. Loop shows infinity for any mapped native loop, including sustain loops;
 its tooltip explains mixed maps. Eligible non-looping instruments have native Let notes
 ring checkboxes, even when live input cannot play them.
 
@@ -515,14 +526,22 @@ Resume while paused. Stop clears sound and DSP tails and holds the current posit
 Media Session Pause and Stop use these same distinct actions. Only explicit natural
 completion advances a playlist.
 
-Each instrument has Preview, a selectable keyboard/MIDI target, and **Let notes ring**.
-**Enable note overlap** starts off. You can edit instrument selections while bypassed;
+Each instrument has Play, a selectable keyboard/MIDI target, and **Let notes ring**.
+**Enable note overlap** and **Unique notes across channels** start off and retain desired
+values for the current page session across modules and audio rebuilds; page reload resets
+both. Per-instrument Ring resets on a new module and survives same-module rebuilds.
+You can edit instrument selections while bypassed;
 bypass preserves them and clears only custom tails, including custom live tails. Unchecked
 means native behavior, including authored IT NNA. Equal notes at the same starting volume
 on the same instrument and channel replace earlier matching sounds; different notes or
-starting volumes can overlap. Only non-looping samples qualify. The infinity badge has
+starting volumes can overlap. With uniqueness also enabled, a new song note replaces
+an exact instrument/original-note/native-starting-volume match among custom detached
+song tails on other channels. Foregrounds, native backgrounds and live/audition voices
+are excluded from that additional rule in both directions. Overlap and that instrument’s
+Ring must also be enabled, and toggling uniqueness affects subsequent onsets only.
+Only non-looping samples qualify. The infinity badge has
 accessible looping/mixed-map text; mixed maps keep their checkbox usable. Preview at
-reference note60 can be unavailable even when other mapped keys are playable. Sample
+the selected reference note can be unavailable even when other mapped keys are playable. Sample
 loop/one-shot badges and overlap eligibility include all mapped PCM, including native
 tracker keys outside the live input pitch range.
 
@@ -535,19 +554,25 @@ sound without changing transport. Audition uses prepared/enhanced PCM and curren
 processing, with no automatic tracker-channel inserts. Extra live voices can change the
 shared master dynamics.
 
-A new load/reload resets session selections; changing enhancement, renderer or output
-rate keeps session settings, transport and the full logical cursor. These operations
+A new load/reload resets per-instrument Ring selections and the keyboard/MIDI target;
+changing enhancement, renderer or output rate keeps those settings, transport and the
+full logical cursor. The two global policies and Reference Note retain their page values. These operations
 rebuild processor working state and clear sounding voices. The page waits for the
 **audio-applied** load and complete state replay before accepting notes. Metadata comes
 from the separate inspection WASM and is correlated by the installed session/build.
 
 The negotiated command protocol is version2: a five-word ring header and seven-word
-atomic records (opcode, argument, extra, session low/high, build low/high). Existing
-opcode values remain; opcodes2 (legacy Stop) and7 (mixer replacement) are v1-only. The interactive UI uses
+atomic records (opcode, argument, extra, session low/high, build low/high). Before
+public deployment, version2 was extended in place: opcode20 keeps note60 audition,
+opcode25 auditions an explicit note, and opcode26 sets cross-channel uniqueness.
+Existing opcode values remain; opcodes2 (legacy Stop) and7 (mixer replacement) are v1-only. The interactive UI uses
 versioned replacement messages for mixer changes. Version2 fallback batches carry the
 same full identity as BigInts, converted to scalar u32 words in message tasks. The render
 consumer uses preallocated typed arrays and a fixed applied-status block; codecs and
 preparation run outside `process()`. Large mute/insert replays are bounded across quanta.
+Saved Playing and pending Play/Resume wait until the latest page policies are audio-applied;
+newer policy or transport intent cancels an obsolete queued release before mixing.
+Failed-load recovery reconciles the retained module and preserves pending transport intent.
 Old or incomplete protocols disable interactive controls and retain ordinary legacy playback.
 
 Focused verification, using the existing CDP/browser stack:

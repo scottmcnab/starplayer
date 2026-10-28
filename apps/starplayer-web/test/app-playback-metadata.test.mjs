@@ -30,7 +30,7 @@ function setup() {
         },
         libraryView: { setPlaying() {} }, renderMetadata() {}, playlist: { entries: [] }, mediaSession: { metadata() {}, position() {} },
         scheduleMediaPosition() {}, backgroundOutput: { start() {} }, setControlsEnabled() {}, releaseHeldKeys() {}, syncLiveInput() {},
-        queueCommand() {}, queueInteractive() {}, queueRepeatCommand() {}, Ring: {}, elements: { volume: { value: 100 }, overlapEnable: {}, inputDestination: {} }, describeEnhancementReduction: () => '',
+        queueCommand() {}, queueInteractive() {}, queueRepeatCommand() {}, Ring: {}, elements: { volume: { value: 100 }, overlapEnable: {}, uniqueNotes: {}, inputDestination: {} }, describeEnhancementReduction: () => '',
         setTimeout() {}, requestGarbageCollection() {},
     };
     vm.createContext(sandbox);
@@ -198,4 +198,24 @@ test('cancel after audio installation disables old-metadata controls until anoth
     assert.equal(fixture.state.interactiveReady, false); assert.equal(fixture.state.liveInputActive, false);
     assert.equal(fixture.state.currentModuleBytes, null); assert.deepEqual(disabled, [false]);
     assert.equal(fixture.state.metadata.identity, old);
+});
+
+test('new tracks and explicit same-byte reloads retain page policies while resetting instrument Ring', async () => {
+    const fixture = setup();
+    Object.assign(fixture.state, { overlapEnabled: true, uniqueNotesAcrossChannels: true, policyRevision: 9, letNotesRing: [true] });
+    fixture.sandbox.readMetadata = label => ({ title: label, label, instruments: [{ name: 'one-shot', length: 10 }] });
+    for (const [name, bytes] of [['first.mod', [1]], ['same-byte.mod', [1]], ['playlist-next.mod', [2]]]) {
+        await fixture.activate(new Uint8Array(bytes).buffer, name, fixture.context);
+        assert.equal(fixture.state.overlapEnabled, true);
+        assert.equal(fixture.state.uniqueNotesAcrossChannels, true);
+        assert.equal(fixture.state.policyRevision, 9);
+        assert.deepEqual(Array.from(fixture.state.letNotesRing), [false]);
+        fixture.state.letNotesRing[0] = true;
+    }
+    fixture.Loader.inspect_s3m = () => { throw new Error('inspection failure'); };
+    await assert.rejects(fixture.activate(new Uint8Array([99]).buffer, 'invalid.mod', fixture.context), /inspection failure/);
+    assert.equal(fixture.state.metadata.label, 'playlist-next.mod');
+    assert.equal(fixture.state.overlapEnabled, true);
+    assert.equal(fixture.state.uniqueNotesAcrossChannels, true);
+    assert.equal(fixture.state.letNotesRing[0], true);
 });

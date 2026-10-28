@@ -33,7 +33,27 @@ fn native_map(module: &Module) -> bool {
 
 /// Pure metadata query: no allocation or runtime preparation required.
 pub fn live_instrument_capability(module: &Module, instrument: crate::core::InstrumentId) -> crate::engine::instrument::live::InstrumentCapability {
-    crate::engine::instrument::live::instrument_capability_filtered(module, instrument, native_map(module), |note, sample| {
+    live_instrument_note_capability(module, instrument, crate::engine::REFERENCE_NOTE)
+}
+
+/// Direct per-key projection for immutable page metadata. Looping is independent of
+/// native pitch viability; no aggregate key scan or runtime preparation is needed.
+pub fn live_instrument_note_flags(module: &Module, instrument: crate::core::InstrumentId, note: u8) -> u8 {
+    if note >= 128 { return 0; }
+    let Some(definition) = module.instrument(instrument) else { return 0 };
+    let sample = if native_map(module) { definition.note_sample_map.get(note as usize).and_then(|number| number.checked_sub(1)).map(crate::core::SampleId) } else { definition.sample };
+    let Some(sample) = sample.and_then(|sample| module.sample(sample)).filter(|sample| sample.length_frames() != 0) else { return 0 };
+    let looping = sample.loop_mode().is_looping() || sample.sustain_loop().is_some();
+    #[cfg(feature = "xm")]
+    let playable = module.header().format != ModuleFormat::Xm || crate::xm::processor::live::live_note_table_index(sample, crate::core::Note::new(note), 0).is_some();
+    #[cfg(not(feature = "xm"))]
+    let playable = true;
+    u8::from(playable) | (u8::from(looping) << 1)
+}
+
+/// Immutable selected-key metadata, sharing native pitch preflight with rack admission.
+pub fn live_instrument_note_capability(module: &Module, instrument: crate::core::InstrumentId, note: u8) -> crate::engine::instrument::live::InstrumentCapability {
+    crate::engine::instrument::live::instrument_capability_filtered_at_note(module, instrument, native_map(module), note, |note, sample| {
         #[cfg(feature = "xm")]
         if module.header().format == ModuleFormat::Xm {
             return module.sample(sample).is_some_and(|sample| crate::xm::processor::live::live_note_table_index(sample, crate::core::Note::new(note), 0).is_some());

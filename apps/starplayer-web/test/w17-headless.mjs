@@ -3,7 +3,7 @@ import { writeFile } from 'node:fs/promises';
 
 // Native XM with 96 eligible instruments: bulk controls must cross the bounded
 // bridge. Instrument 1 maps a loop and a one-shot, and auditions the loop at note 60.
-function compactTableXm() {
+function compactTableXm(lowTuning = false) {
     const header = Buffer.alloc(336);
     header.write('Extended Module: '); header.write('compact table', 17); header[37] = 0x1a;
     header.write('FastTracker v2.00', 38); header.writeUInt16LE(0x104, 58);
@@ -17,12 +17,13 @@ function compactTableXm() {
         instrument.write(index ? `instrument ${index + 1}` : 'mixed map loop and hit', 4);
         const count = index === 0 ? 2 : 1;
         instrument.writeUInt16LE(count, 27); instrument.writeUInt32LE(40, 29);
-        if (index === 0) instrument[33] = 1; // One non-reference key selects the one-shot.
+        if (index === 0) { instrument[33] = 1; instrument[33 + 61] = 1; } // Selected playable one-shot alongside the reference loop.
         chunks.push(instrument);
         const pcm = [];
         for (let sample = 0; sample < count; sample++) {
             const descriptor = Buffer.alloc(40); descriptor.writeUInt32LE(256);
             descriptor[12] = 64; descriptor[15] = 128;
+            if (lowTuning && index === 0 && sample === 0) descriptor.writeInt8(-80, 16);
             if (index === 0 && sample === 0) { descriptor.writeUInt32LE(256, 8); descriptor[14] = 1; }
             chunks.push(descriptor);
             const deltas = Buffer.alloc(256); let previous = 0;
@@ -39,6 +40,10 @@ function compactTableXm() {
 
 export async function runCompactInstruments({ page, loadFile, mode }) {
     const value = expression => page.evaluate(`return ${expression};`);
+    const screenshotPanel = async () => {
+        const clip = await page.evaluate("const panel = document.querySelector('.instrument-scroll').closest('article'); const bounds = panel.getBoundingClientRect(); return { x: bounds.x + scrollX, y: bounds.y + scrollY, width: bounds.width, height: bounds.height, scale: 1 };");
+        return page.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true, clip });
+    };
     const selected = "document.querySelectorAll('#instrument-list tr[aria-selected=true]').length";
     const selectedIndex = "document.querySelector('#instrument-list tr[aria-selected=true]')?.dataset.instrument";
     const checked = "document.querySelectorAll('#instrument-list input:checked').length";
@@ -62,7 +67,12 @@ export async function runCompactInstruments({ page, loadFile, mode }) {
     await page.waitFor('96 instrument table', "document.querySelectorAll('#instrument-list tr[data-instrument]').length === 96 && !document.getElementById('pause').disabled");
     await page.evaluate("document.getElementById('pause').click();");
     await page.waitFor('compact table paused', "document.getElementById('transport-chip').textContent === 'paused'");
-    assert.deepEqual(await value("[...document.querySelectorAll('.instrument-table th')].map(cell => cell.textContent.trim())"), ['#', 'Play', 'Name', 'Loop', '', 'Frames']);
+    assert.deepEqual(await value("[...document.querySelectorAll('.instrument-table th')].map(cell => cell.textContent.trim())"), ['#', '', 'Name', '', '', 'Frames']);
+    assert.equal(await value("document.getElementById('reference-note').options.length"), 128);
+    assert.equal(await value("document.getElementById('reference-note').value"), '60');
+    assert.match(await value("document.getElementById('reference-note').selectedOptions[0].textContent"), /C-5 \(60\).*middle C/);
+    assert.deepEqual(await value("[...document.querySelectorAll('.instrument-table th')].map(cell => cell.getAttribute('aria-label')).filter(Boolean)"), ['Play', 'Loop']);
+    assert.equal(await value("getComputedStyle(document.querySelector('.instrument-play')).borderTopWidth"), '0px');
     assert.equal(await value("document.querySelector('#instrument-list tr td:last-child').textContent"), '512');
     assert.equal(await value("document.querySelector('#instrument-list tr td:nth-child(4)').textContent"), '∞');
     assert.equal(await value("document.querySelector('#instrument-list tr:nth-child(2) td:nth-child(4)').textContent"), '');
@@ -108,9 +118,9 @@ export async function runCompactInstruments({ page, loadFile, mode }) {
     assert.equal(await ackCount('OPCODE_STOP_PREVIEW'), stopsBefore);
     assert.equal(await value(selectedIndex), '1', 'Play and native controls do not select their instrument');
     await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount: 1, ...coordinates });
-    const previewsBefore = await ackCount('OPCODE_PREVIEW');
+    const previewsBefore = await ackCount('OPCODE_PREVIEW_NOTE');
     await page.evaluate('window.__heldPlay.focus();'); await key('Enter', 'Enter', 13);
-    await page.waitFor('native Play Enter once', `window.__failedLoadAcks.filter(message => message.accepted).flatMap(message => message.commands.filter((value, index) => index % 3 === 0 && value === StarPlayerRing.OPCODE_PREVIEW)).length === ${previewsBefore + 1}`);
+    await page.waitFor('native Play Enter once', `window.__failedLoadAcks.filter(message => message.accepted).flatMap(message => message.commands.filter((value, index) => index % 3 === 0 && value === StarPlayerRing.OPCODE_PREVIEW_NOTE)).length === ${previewsBefore + 1}`);
     const offscreenBefore = await ackCount('OPCODE_LET_NOTES_RING');
     await page.evaluate("document.getElementById('stop-preview').click(); document.querySelector('.instrument-scroll').scrollTop = 1800; const input = document.querySelector('#instrument-list tr:nth-child(60) input'); input.focus(); window.__tableFocus = input; window.__tableScroll = input.closest('.instrument-scroll').scrollTop; input.click();");
     await page.waitFor('offscreen focus acknowledgement', `${countExpression('OPCODE_LET_NOTES_RING')} === ${offscreenBefore + 1} && document.querySelector('#instrument-list tr:nth-child(60) input').checked`);
@@ -130,7 +140,7 @@ export async function runCompactInstruments({ page, loadFile, mode }) {
     assert.equal(await value("document.querySelector('#instrument-list tr').getBoundingClientRect().height"), 32);
     assert.equal(await value("document.querySelector('#instrument-list .instrument-checkbox').getBoundingClientRect().width"), 40);
     await page.evaluate("document.querySelector('.instrument-scroll').scrollTop = 0; document.querySelector('.instrument-scroll').scrollIntoView({ block: 'center' });");
-    let screenshot = await page.send('Page.captureScreenshot', { format: 'png' });
+    let screenshot = await screenshotPanel();
     await writeFile(`/tmp/w17-instruments-${mode}-phone.png`, Buffer.from(screenshot.data, 'base64'));
     // Real touch cancellation and focus loss retain scoped preview cleanup.
     const cancelPoint = await point('#instrument-list .instrument-play');
@@ -147,7 +157,7 @@ export async function runCompactInstruments({ page, loadFile, mode }) {
     await page.send('Emulation.setTouchEmulationEnabled', { enabled: false });
     await page.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
     await page.evaluate("document.querySelector('.instrument-scroll').scrollTop = 0; document.querySelector('.instrument-scroll').scrollIntoView({ block: 'center' });");
-    screenshot = await page.send('Page.captureScreenshot', { format: 'png' });
+    screenshot = await screenshotPanel();
     await writeFile(`/tmp/w17-instruments-${mode}-desktop.png`, Buffer.from(screenshot.data, 'base64'));
     assert.equal(await value("document.documentElement.scrollWidth <= window.innerWidth"), true);
     // Dispatch the file change in the same page task as two full-module edits;
@@ -160,5 +170,36 @@ export async function runCompactInstruments({ page, loadFile, mode }) {
     assert.equal(await value(checked), 0, 'late settings cannot change the fresh module');
     assert.equal(await value(selected), 0);
     assert.equal(await value("document.getElementById('error').hidden"), true, await value("JSON.stringify(window.__failedLoadAcks.filter(message => !message.accepted))"));
+    // Native selected-key viability shares XM relative-note preflight with rack onset.
+    await loadFile(page, compactTableXm(true), 'selected-key.xm');
+    await page.waitFor('selected-key module ready', "document.getElementById('module-detail').textContent.includes('selected-key.xm') && !document.getElementById('pause').disabled");
+    await page.evaluate("document.getElementById('pause').click();");
+    await page.waitFor('selected-key pause', "document.getElementById('transport-chip').textContent === 'paused'");
+    assert.equal(await value("document.querySelector('#instrument-list .instrument-play').disabled"), true, 'reference60 native XM tuning is out of range');
+    const choose = async note => page.evaluate(`const select = document.getElementById('reference-note'); select.value = '${note}'; select.dispatchEvent(new Event('change'));`);
+    await choose(61);
+    assert.equal(await value("document.querySelector('#instrument-list .instrument-play').disabled"), false, '61 maps a playable one-shot');
+    const beforeSelected = await ackCount('OPCODE_PREVIEW_NOTE');
+    await click('#instrument-list .instrument-play');
+    await page.waitFor('selected note61 applied', `${countExpression('OPCODE_PREVIEW_NOTE')} === ${beforeSelected + 1}`);
+    assert.equal(await value("window.__failedLoadAcks.filter(message => message.accepted).flatMap(message => { const records = []; for (let index = 0; index < message.commands.length; index += 3) if (message.commands[index] === StarPlayerRing.OPCODE_PREVIEW_NOTE) records.push(message.commands[index + 2]); return records; }).at(-1)"), 61);
+    await choose(127); assert.equal(await value("document.querySelector('#instrument-list .instrument-play').disabled"), true, 'unmapped native key');
+    await choose(95);
+    assert.equal(await value("document.querySelector('#instrument-list .instrument-play').disabled"), false, 'native tuned loop is playable at95');
+    const loopPoint = await point('#instrument-list .instrument-play');
+    const releaseBefore = await ackCount('OPCODE_RELEASE_PREVIEW');
+    await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount: 1, ...loopPoint });
+    await page.waitFor('selected looping preview applied', `${countExpression('OPCODE_PREVIEW_NOTE')} === ${beforeSelected + 2}`);
+    await choose(61);
+    await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount: 1, ...loopPoint });
+    await page.waitFor('captured native loop release after chooser change', `${countExpression('OPCODE_RELEASE_PREVIEW')} === ${releaseBefore + 1}`);
+    const loadBeforeChoice = await value('window.__interactiveLoadsApplied');
+    await page.evaluate("document.querySelector('#enhancement-options input').click();");
+    await page.waitFor('reference choice across graph rebuild', `window.__interactiveLoadsApplied > ${loadBeforeChoice} && !document.querySelector('#enhancement-options input').disabled`);
+    assert.equal(await value("document.getElementById('reference-note').value"), '61');
+    await loadFile(page, compactTableXm(), 'reference-retained.xm');
+    await page.waitFor('reference choice across fresh module', "document.getElementById('module-detail').textContent.includes('reference-retained.xm') && !document.getElementById('pause').disabled");
+    assert.equal(await value("document.getElementById('reference-note').value"), '61');
+    await choose(60);
     return { freshLoadDuringBulk: true, instruments: 96, bulkAcrossBatches: true, nativeKeysAndTouch: true, retainedHeldPlay: true, retainedFocusAndScroll: true, bulkRebuild: true };
 }

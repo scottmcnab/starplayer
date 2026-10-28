@@ -668,11 +668,11 @@ where
     }
 
     /// Restore host-prepared settings on a fresh build, before any live input.
-    pub fn restore_selections(&mut self, identity: starplayer_core::PlaybackIdentity, enabled: bool, selections: &[bool]) {
+    pub fn restore_selections(&mut self, identity: starplayer_core::PlaybackIdentity, enabled: bool, unique: bool, selections: &[bool]) {
         #[cfg(feature = "note-overlap")]
-        if let Some(playback) = self.channels.playback_mut() { let _ = playback.restore_selections(identity, enabled, selections); }
+        if let Some(playback) = self.channels.playback_mut() { let _ = playback.restore_selections(identity, enabled, unique, selections); }
         #[cfg(not(feature = "note-overlap"))]
-        let _ = (identity, enabled, selections);
+        let _ = (identity, enabled, unique, selections);
     }
 
     fn audio_running(&self) -> bool { self.interactive_transport().is_some() || self.playing }
@@ -1042,7 +1042,7 @@ where
                 #[cfg(feature = "interactive-audition")]
                 InteractiveAction::StopPreview if self.interactive_transport.is_some() => self.clear_scope(crate::ownership::ClearScope::Live),
                 #[cfg(feature = "interactive-audition")]
-                InteractiveAction::SetLiveDestination(_) | InteractiveAction::PreviewInstrument(_) | InteractiveAction::ReleasePreview if self.interactive_transport.is_some() => {
+                InteractiveAction::SetLiveDestination(_) | InteractiveAction::PreviewInstrument(_) | InteractiveAction::PreviewInstrumentNote { .. } | InteractiveAction::ReleasePreview if self.interactive_transport.is_some() => {
                     let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
                     self.sources.interactive_action(command.action, &mut context);
                 }
@@ -1051,6 +1051,10 @@ where
                 InteractiveAction::SetNoteOverlapEnabled(enabled) => {
                     let clear = self.channels.playback_mut().and_then(|playback| playback.set_note_overlap_enabled(command.identity, enabled).ok().flatten());
                     if let Some(scope) = clear { self.clear_scope(scope); }
+                }
+                #[cfg(feature = "note-overlap")]
+                InteractiveAction::SetUniqueNotesAcrossChannels(enabled) => {
+                    if let Some(playback) = self.channels.playback_mut() { let _ = playback.set_unique_notes_across_channels(command.identity, enabled); }
                 }
                 #[cfg(feature = "note-overlap")]
                 InteractiveAction::SetLetNotesRing { instrument, enabled } => {

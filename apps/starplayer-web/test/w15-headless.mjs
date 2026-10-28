@@ -62,13 +62,13 @@ export async function runW15({ Page, executable, mode, startDevServer, synthetic
         `);
         await page.waitFor('pre-discovery playlist', "document.getElementById('playlist-count').textContent === '3' && document.getElementById('playlist-status').textContent.includes('2 pending discovery')");
         assert.deepEqual(await page.evaluate("return w15reads.filter(name => /\\.(mod|s3m)$/i.test(name));"), []);
-        await page.evaluate("document.querySelector('#playlist-list li').dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));");
+        await page.evaluate("document.querySelector('#playlist-list tr').dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));");
         await page.waitFor('early playlist playback', "document.getElementById('title').textContent === 'W15 actual metadata' && document.getElementById('transport-chip').textContent === 'playing'");
         await page.waitFor('progress range for automatic advance', "Number(document.getElementById('progress').max) > 1000");
         await page.evaluate("const p=document.getElementById('progress');p.value=String(Number(p.max)-4800);p.dispatchEvent(new Event('change'));");
-        await page.waitFor('advance plays not-yet-discovered locator', "document.querySelectorAll('#playlist-list li')[1].classList.contains('current') && document.querySelectorAll('#playlist-list li')[1].textContent.includes('W15 actual metadata') && document.getElementById('transport-chip').textContent === 'playing'");
-        await page.evaluate("document.querySelectorAll('#playlist-list li')[2].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));");
-        await page.waitFor('explicit not-yet-discovered locator', "document.querySelectorAll('#playlist-list li')[2].classList.contains('current') && document.querySelectorAll('#playlist-list li')[2].textContent.includes('W15 actual metadata')");
+        await page.waitFor('advance plays not-yet-discovered locator', "document.querySelectorAll('#playlist-list tr')[1].classList.contains('current') && document.querySelectorAll('#playlist-list tr')[1].textContent.includes('W15 actual metadata') && document.getElementById('transport-chip').textContent === 'playing'");
+        await page.evaluate("document.querySelectorAll('#playlist-list tr')[2].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));");
+        await page.waitFor('explicit not-yet-discovered locator', "document.querySelectorAll('#playlist-list tr')[2].classList.contains('current') && document.querySelectorAll('#playlist-list tr')[2].textContent.includes('W15 actual metadata')");
         report.playBeforeDiscovery = true;
         report.commandTransport = await page.evaluate("return document.getElementById('command-transport').textContent;");
         if (mode === 'sab') assert.match(report.commandTransport, /SharedArrayBuffer/);
@@ -103,15 +103,15 @@ export async function runW15({ Page, executable, mode, startDevServer, synthetic
         const identityB = await page.evaluate("const { folderIdentity, createDirectorySource } = await import('./library-source.js'); return (await folderIdentity(await createDirectorySource(w15B))).identity.sha256;");
         assert.notEqual(identityA, identityB);
         await page.evaluate("window.w15omitLate = true; window.showDirectoryPicker = async () => w15A; document.getElementById('library-folder').click();");
-        await page.waitFor('A returns with absent saved row', "document.getElementById('library-count').textContent === '3 of 3' && document.getElementById('library-summary').textContent.includes('discovery complete') && document.querySelectorAll('#playlist-list li')[1].textContent.includes('not found in scan')");
+        await page.waitFor('A returns with absent saved row', "document.getElementById('library-count').textContent === '3 of 3' && document.getElementById('library-summary').textContent.includes('discovery complete') && document.querySelectorAll('#playlist-list tr')[1].textContent.includes('not found in scan')");
         assert.equal(await page.evaluate("const { folderIdentity, createDirectorySource } = await import('./library-source.js'); return (await folderIdentity(await createDirectorySource(w15A))).identity.sha256;"), identityA);
         for (const index of [1, 0]) {
-            await page.evaluate(`document.querySelectorAll('#playlist-list li')[${index}].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));`);
-            await page.waitFor('complete missing-row explicit playback', `document.querySelectorAll('#playlist-list li')[${index}].classList.contains('current') && document.getElementById('transport-chip').textContent === 'playing'`);
+            await page.evaluate(`document.querySelectorAll('#playlist-list tr')[${index}].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));`);
+            await page.waitFor('complete missing-row explicit playback', `document.querySelectorAll('#playlist-list tr')[${index}].classList.contains('current') && document.getElementById('transport-chip').textContent === 'playing'`);
         }
         await page.waitFor('progress range for automatic advance', "Number(document.getElementById('progress').max) > 1000");
         await page.evaluate("const p=document.getElementById('progress');p.value=String(Number(p.max)-4800);p.dispatchEvent(new Event('change'));");
-        await page.waitFor('complete missing-row advance playback', "document.querySelectorAll('#playlist-list li')[1].classList.contains('current') && document.getElementById('transport-chip').textContent === 'playing'");
+        await page.waitFor('complete missing-row advance playback', "document.querySelectorAll('#playlist-list tr')[1].classList.contains('current') && document.getElementById('transport-chip').textContent === 'playing'");
         report.notFoundStillPlayable = true;
         // Persisted handles and identity cross an actual document reload. OPFS permission
         // is already granted; native picker prompts remain a separate manual gate.

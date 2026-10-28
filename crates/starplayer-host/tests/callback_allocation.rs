@@ -430,6 +430,10 @@ fn actual_loaded_native_live_runtimes_and_bounded_controls_allocate_and_free_not
                 let _ = player.send_event(0,Event::NoteOn {note:Note::new(60+(index%12) as u8),velocity:U0F16::MAX});
                 driver.render(&mut output); heard |= output.iter().any(|sample| *sample != 0.0);
             }
+            let _ = player.interactive(InteractiveAction::PreviewInstrumentNote { instrument: InstrumentId(0), note: 61 }); driver.render(&mut output);
+            let _ = player.interactive(InteractiveAction::PreviewInstrumentNote { instrument: InstrumentId(0), note: 128 });
+            #[cfg(feature = "note-overlap")]
+            { let _ = player.interactive(InteractiveAction::SetUniqueNotesAcrossChannels(true)); driver.render(&mut output); let _ = player.interactive(InteractiveAction::SetUniqueNotesAcrossChannels(false)); }
             let _ = player.interactive(InteractiveAction::PreviewInstrument(InstrumentId(u16::MAX)));
             let _ = player.interactive(InteractiveAction::StopPreview); driver.render(&mut output);
             let _ = player.interactive(InteractiveAction::Stop); driver.render(&mut output);
@@ -437,4 +441,43 @@ fn actual_loaded_native_live_runtimes_and_bounded_controls_allocate_and_free_not
         assert!(report.is_clean(),"native live runtime, pressure, reject and clears: {report:?}");
         assert!(player.event_clock().sent() > 0); assert!(heard,"the actual native runtime must sound under the allocation hook");
     }
+}
+
+#[cfg(all(feature = "note-overlap", feature = "interactive-audition"))]
+#[test]
+fn browser_release_revocation_and_saved_transport_intent_allocate_and_free_nothing() {
+    use starplayer::core::{BuildGeneration, InteractiveAction, InteractiveTransport, PlaybackIdentity, SessionId};
+    let mut backend = ManualBackend::new();
+    let settings = starplayer::engine::EngineSettings::interactive_web(Default::default(), 31).unwrap();
+    let mut player = Player::open_with_settings(&mut backend, None, AudioSpec::stereo(44_100), MixerMode::DEFAULT, settings).unwrap();
+    let driver = backend.driver().unwrap();
+    let module = starplayer::rt::Arc::new(starplayer::load(include_bytes!("../../../fuzz/seeds/mod/synthetic-golden.mod")).unwrap());
+    let first = PlaybackIdentity { session: SessionId(1), build: BuildGeneration(1) };
+    let replacement = PlaybackIdentity { session: SessionId(1), build: BuildGeneration(2) };
+    let fresh = PlaybackIdentity { session: SessionId(2), build: BuildGeneration(3) };
+    let mut output = [0.0; 256];
+    player.load_module_identified(starplayer::rt::Arc::clone(&module), first).unwrap(); player.play().unwrap(); player.playback_barrier(1).unwrap();
+    driver.render(&mut output); player.telemetry();
+    let saved = player.replacement_state().unwrap();
+    player.load_replacement_deferred(starplayer::rt::Arc::clone(&module), replacement, &saved).unwrap(); player.playback_barrier(2).unwrap();
+    let (_, report) = while_watching_for_allocations(|| driver.render(&mut output));
+    assert!(report.is_clean(), "deferred load and non-destructive hold: {report:?}");
+    player.telemetry();
+    let (_, report) = while_watching_for_allocations(|| {
+        player.finish_replacement_transport(replacement, None).unwrap(); player.cancel_load_transport(replacement).unwrap();
+        driver.render(&mut output);
+        player.finish_replacement_transport(replacement, Some(InteractiveTransport::Playing)).unwrap();
+        driver.render(&mut output);
+    });
+    assert!(report.is_clean(), "revoked saved release and newest user intent: {report:?}");
+    player.collect_garbage();
+    player.load_module_identified(module, fresh).unwrap();
+    driver.render(&mut output); player.telemetry();
+    let (_, report) = while_watching_for_allocations(|| {
+        player.finish_load_transport(fresh, InteractiveAction::Resume).unwrap(); player.cancel_load_transport(fresh).unwrap();
+        driver.render(&mut output);
+        player.finish_load_transport(fresh, InteractiveAction::Play).unwrap();
+        driver.render(&mut output);
+    });
+    assert!(report.is_clean(), "revoked fresh release and newest Play: {report:?}");
 }

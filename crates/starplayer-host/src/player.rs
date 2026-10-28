@@ -80,8 +80,9 @@ pub const TELEMETRY_DEPTH: usize = 3;
 enum HostCommand {
     AppliedBarrier { identity: PlaybackIdentity, serial: u64, rejected: u64 },
     Interactive(InteractiveCommand),
-    RestoreTransport { identity: PlaybackIdentity, transport: Transport, state: InteractiveTransport, natural_end: bool },
-    RestoreSelections { identity: PlaybackIdentity, enabled: bool, selections: Box<[bool]> },
+    BrowserTransport { command: InteractiveCommand, release_epoch: u64 },
+    RestoreTransport { identity: PlaybackIdentity, transport: Transport, state: InteractiveTransport, natural_end: bool, apply_user_intent: bool, release_epoch: Option<u64> },
+    RestoreSelections { identity: PlaybackIdentity, enabled: bool, unique: bool, selections: Box<[bool]> },
     /// Ramp up and start the musical clock.
     Play,
     /// Ramp down and stop it when the ramp lands.
@@ -89,7 +90,7 @@ enum HostCommand {
     /// A module and the source built for it, both already decoded, scanned and allocated
     /// on the control thread. Nothing here is constructed in the callback and nothing is
     /// dropped there.
-    Load { module: RtArc<Module>, source: Box<dyn EventSource>, identity: Option<PlaybackIdentity>, selections: Option<Box<[bool]>>, new_session: bool },
+    Load { module: RtArc<Module>, source: Box<dyn EventSource>, identity: Option<PlaybackIdentity>, selections: Option<Box<[bool]>>, new_session: bool, hold_transport: bool },
     /// What happens at the loop point, and how long the fade is when there is one.
     SetAtEnd { at_end: AtEnd, fade_frames: u32 },
     /// Pass straight through to the engine.
@@ -134,6 +135,8 @@ struct PlayerTaps {
     blocks_rendered: AtomicU64,
     commands_rejected: AtomicU64,
     pending_engine_commands: AtomicU32,
+    /// A page revision can revoke an admitted browser release before audio executes it.
+    transport_release_epoch: AtomicU64,
 }
 
 /// A control barrier published only after preceding commands have reached rendered audio.
@@ -284,7 +287,7 @@ impl RenderState {
                 _ => 0,
             };
             let another_load = prepared_load && matches!(&command, HostCommand::Load { .. });
-            let engine_load_commands = match &command { HostCommand::Load { new_session: true, .. } if self.interactive_enabled => 2, HostCommand::Load { .. } => 1, _ => 0 };
+            let engine_load_commands = match &command { HostCommand::Load { new_session: true, .. } | HostCommand::Load { hold_transport: true, .. } if self.interactive_enabled => 2, HostCommand::Load { .. } => 1, _ => 0 };
             let blocked_engine_load = prepared_host && self.control.command_capacity().saturating_sub(self.control.queued_commands()) < engine_load_commands;
             if another_load || blocked_engine_load || available < retirement_room {
                 self.pending_command = Some(command);
@@ -301,7 +304,11 @@ impl RenderState {
                 self.pending_barrier = Some((identity, serial, rejected));
             }
             HostCommand::Interactive(command) => self.apply_interactive(command),
-            HostCommand::RestoreTransport { identity, transport, state, natural_end } => {
+            HostCommand::BrowserTransport { command, release_epoch } => {
+                if self.taps.transport_release_epoch.load(Ordering::Acquire) == release_epoch { self.apply_interactive(command); }
+            }
+            HostCommand::RestoreTransport { identity, transport, state, natural_end, apply_user_intent, release_epoch } => {
+                if release_epoch.is_some_and(|epoch| self.taps.transport_release_epoch.load(Ordering::Acquire) != epoch) { return; }
                 if self.interactive_identity == Some(identity) && self.interactive_enabled {
                     let action = match state { InteractiveTransport::Playing => InteractiveAction::Play, InteractiveTransport::Paused => InteractiveAction::Pause, InteractiveTransport::Stopped => InteractiveAction::Stop };
                     if self.send_interactive(InteractiveCommand { identity, action }) {
@@ -309,11 +316,15 @@ impl RenderState {
                         self.interactive_state = state;
                         self.awaiting_engine_stop = natural_end;
                         self.taps.natural_end.store(natural_end, Ordering::Relaxed);
+                        // A new user action applies to the installed saved transport.
+                        // The shared host effects use only the fixed seek mailbox;
+                        // RestoreTransport still sends exactly one Engine command.
+                        if apply_user_intent { self.apply_interactive_transport(action); }
                     }
                 } else { self.reject(); }
             }
-            HostCommand::RestoreSelections { identity, enabled, selections } => {
-                if self.interactive_identity == Some(identity) { self.engine.restore_selections(identity, enabled, &selections); }
+            HostCommand::RestoreSelections { identity, enabled, unique, selections } => {
+                if self.interactive_identity == Some(identity) { self.engine.restore_selections(identity, enabled, unique, &selections); }
                 else { self.reject(); }
                 self.retire(Retired::Selections(selections));
             }
@@ -329,7 +340,7 @@ impl RenderState {
                 let _ = self.send(Command::Play);
             }
             HostCommand::Stop => self.transport.begin_stop(false),
-            HostCommand::Load { module, source, identity, selections, new_session } => {
+            HostCommand::Load { module, source, identity, selections, new_session, hold_transport } => {
                 let retired_selections = selections.map(|selections| self.engine.replace_instrument_selections(selections));
                 if let Some(identity) = identity {
                     self.engine.set_playback_identity(identity);
@@ -347,6 +358,10 @@ impl RenderState {
                     // marker. The paired engine Stop fits the reservation above.
                     self.apply_interactive(InteractiveCommand { identity, action: InteractiveAction::Stop });
                     self.transport.reset_interactive_session();
+                } else if hold_transport && self.interactive_enabled && let Some(identity) = identity {
+                    // Same-node replacement inherits a Playing host. Hold in the same
+                    // reserved load group, before this quantum can sequence any events.
+                    self.apply_interactive(InteractiveCommand { identity, action: InteractiveAction::Pause });
                 }
             }
             HostCommand::SetAtEnd { at_end, fade_frames } => {
@@ -370,7 +385,11 @@ impl RenderState {
         if !self.interactive_enabled && matches!(command.action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview) { self.reject(); return; }
         // Queue first: a full engine ring must not partially apply a host fade change.
         if !self.send_interactive(command) { return; }
-        match command.action {
+        self.apply_interactive_transport(command.action);
+    }
+
+    fn apply_interactive_transport(&mut self, action: InteractiveAction) {
+        match action {
             InteractiveAction::Pause => {
                 self.interactive_state = InteractiveTransport::Paused;
                 self.transport.pause(true);
@@ -631,10 +650,14 @@ pub struct Player {
     playback_identity: Option<PlaybackIdentity>,
     interactive_enabled: bool,
     overlap_shadow: bool,
+    unique_notes_shadow: bool,
     instrument_shadow: Vec<bool>,
     live_destination: starplayer::core::LiveDestination,
     transport_shadow: InteractiveTransport,
     rebuild_cursor: Option<starplayer::core::SequencerCursor>,
+    hold_replacement_transport: bool,
+    replacement_release_queued: bool,
+    deferred_replacement_transport: Option<(PlaybackIdentity, Transport, InteractiveTransport, bool)>,
     stream: Stream,
     spec: AudioSpec,
     mode: MixerMode,
@@ -713,10 +736,14 @@ impl Player {
             playback_identity: settings.playback_configuration().map(|configuration| configuration.identity),
             interactive_enabled: settings.playback_configuration().is_some_and(|configuration| configuration.capacity.interactive_transport),
             overlap_shadow: false,
+            unique_notes_shadow: false,
             live_destination: starplayer::core::LiveDestination::Off,
             instrument_shadow: vec![false; settings.playback_configuration().filter(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)).map_or(0, |configuration| configuration.instrument_count)],
             transport_shadow: InteractiveTransport::Stopped,
             rebuild_cursor: None,
+            hold_replacement_transport: false,
+            replacement_release_queued: false,
+            deferred_replacement_transport: None,
             smf: None,
             stream,
             spec: negotiated,
@@ -880,14 +907,15 @@ impl Player {
         }
         // One atomic replay, even when more than a command ring's worth are selected.
         if let Some(identity) = rebuilt.playback_identity {
-            rebuilt.queue(HostCommand::RestoreSelections { identity, enabled: self.overlap_shadow, selections: self.instrument_shadow.clone().into_boxed_slice() })?;
+            rebuilt.queue(HostCommand::RestoreSelections { identity, enabled: self.overlap_shadow, unique: self.unique_notes_shadow, selections: self.instrument_shadow.clone().into_boxed_slice() })?;
             rebuilt.instrument_shadow.clone_from(&self.instrument_shadow);
             rebuilt.overlap_shadow = self.overlap_shadow;
+            rebuilt.unique_notes_shadow = self.unique_notes_shadow;
         }
         if self.interactive_enabled {
             rebuilt.interactive(InteractiveAction::SetLiveDestination(self.live_destination))?;
             if let Some(identity) = rebuilt.playback_identity {
-                rebuilt.queue(HostCommand::RestoreTransport { identity, transport: if saved_host.engine.is_idle() { Transport::playing() } else { saved_host.transport.converted(self.spec.sample_rate_hz, rebuilt.spec.sample_rate_hz) }, state: interactive_state, natural_end: saved_host.natural_end })?;
+                rebuilt.queue(HostCommand::RestoreTransport { identity, transport: if saved_host.engine.is_idle() { Transport::playing() } else { saved_host.transport.converted(self.spec.sample_rate_hz, rebuilt.spec.sample_rate_hz) }, state: interactive_state, natural_end: saved_host.natural_end, apply_user_intent: false, release_epoch: None })?;
                 rebuilt.transport_shadow = interactive_state;
             }
         } else if plan.resume { rebuilt.play()?; }
@@ -970,7 +998,7 @@ impl Player {
         let identity = self.next_identity(new_session);
         let selections = self.prepare_instrument_selections(&instruments, new_session)?;
         let instrument_shadow = selections.as_ref().map(|selections| selections.to_vec());
-        self.commands.push(HostCommand::Load { module: RtArc::clone(&instruments), source, identity, selections, new_session }).map_err(|_| HostError::ControlQueueFull)?;
+        self.commands.push(HostCommand::Load { module: RtArc::clone(&instruments), source, identity, selections, new_session, hold_transport: false }).map_err(|_| HostError::ControlQueueFull)?;
         if let Some(selections) = instrument_shadow { self.instrument_shadow = selections; }
         self.engine_settings.set_instrument_count(instruments.instruments().len());
         self.handles.seek.clear();
@@ -982,7 +1010,7 @@ impl Player {
         { self.live_epoch = events.as_ref().and_then(EventSender::cancellation_token); }
         self.events = events;
         self.live_input = LiveInputMode::Off;
-        if new_session { self.transport_shadow = InteractiveTransport::Stopped; self.overlap_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
+        if new_session { self.transport_shadow = InteractiveTransport::Stopped; self.overlap_shadow = false; self.unique_notes_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
         Ok(length_frames)
     }
 
@@ -1024,12 +1052,12 @@ impl Player {
         };
         let selections = self.prepare_instrument_selections(&module, new_session)?;
         let instrument_shadow = selections.as_ref().map(|selections| selections.to_vec());
-        let command = HostCommand::Load { module: RtArc::clone(&module), source, identity, selections, new_session };
+        let command = HostCommand::Load { module: RtArc::clone(&module), source, identity, selections, new_session, hold_transport: self.hold_replacement_transport };
         self.commands.push(command).map_err(|_| HostError::ControlQueueFull)?;
         if let Some(selections) = instrument_shadow { self.instrument_shadow = selections; }
         self.engine_settings.set_instrument_count(module.instruments().len());
         self.playback_identity = identity;
-        if new_session { self.transport_shadow = InteractiveTransport::Stopped; self.overlap_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
+        if new_session { self.transport_shadow = InteractiveTransport::Stopped; self.overlap_shadow = false; self.unique_notes_shadow = false; self.instrument_shadow.fill(false); self.live_destination = starplayer::core::LiveDestination::Off; if self.interactive_enabled { self.live_input = LiveInputMode::Off; } }
         self.scan = Some(built.scanned);
         self.smf = None;
         self.module = Some(module);
@@ -1114,7 +1142,9 @@ impl Player {
     /// Explicit identities let persistent hosts avoid reuse across replacement instances.
     pub fn load_module_identified(&mut self, module: RtArc<Module>, identity: PlaybackIdentity) -> Result<(), HostError> {
         if !self.interactive_enabled || self.playback_identity.is_none_or(|old| identity.build.0 <= old.build.0 || identity.session.0 <= old.session.0) { return Err(HostError::InvalidInteractiveCommand); }
-        self.install_identified(module, SeekKind::None, None, true, Some(identity))
+        self.install_identified(module, SeekKind::None, None, true, Some(identity))?;
+        self.deferred_replacement_transport = None;
+        Ok(())
     }
 
     pub const fn playback_identity(&self) -> Option<PlaybackIdentity> { self.playback_identity }
@@ -1134,13 +1164,14 @@ impl Player {
 
     /// Pure validation shared with bounded browser batch admission. No shadow or queue mutation.
     pub fn validate_interactive(&self, action: InteractiveAction) -> Result<(), HostError> {
-        if !self.interactive_enabled && matches!(action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview | InteractiveAction::SetLiveDestination(_) | InteractiveAction::PreviewInstrument(_) | InteractiveAction::ReleasePreview) {
+        if !self.interactive_enabled && matches!(action, InteractiveAction::Play | InteractiveAction::Pause | InteractiveAction::Resume | InteractiveAction::Stop | InteractiveAction::AllSoundOff | InteractiveAction::StopPreview | InteractiveAction::SetLiveDestination(_) | InteractiveAction::PreviewInstrument(_) | InteractiveAction::PreviewInstrumentNote { .. } | InteractiveAction::ReleasePreview) {
             return Err(HostError::InvalidInteractiveCommand);
         }
-        if matches!(action, InteractiveAction::SetNoteOverlapEnabled(_) | InteractiveAction::SetLetNotesRing { .. }) && !self.engine_settings.playback_configuration().is_some_and(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)) { return Err(HostError::InvalidInteractiveCommand); }
+        if matches!(action, InteractiveAction::SetNoteOverlapEnabled(_) | InteractiveAction::SetUniqueNotesAcrossChannels(_) | InteractiveAction::SetLetNotesRing { .. }) && !self.engine_settings.playback_configuration().is_some_and(|configuration| configuration.capabilities.contains(starplayer::core::PlaybackCapabilities::NOTE_OVERLAP)) { return Err(HostError::InvalidInteractiveCommand); }
         if let InteractiveAction::SetLetNotesRing { instrument, .. } = action && instrument.0 as usize >= self.instrument_shadow.len() { return Err(HostError::InvalidInteractiveCommand); }
         #[cfg(feature = "interactive-audition")]
         match action {
+            InteractiveAction::PreviewInstrumentNote { instrument, note } if note >= 128 || !self.module.as_ref().is_some_and(|module| starplayer::live_instrument_note_capability(module, instrument, note).preview_playable) => return Err(HostError::InvalidInteractiveCommand),
             InteractiveAction::PreviewInstrument(instrument) if !self.module.as_ref().is_some_and(|module| starplayer::live_instrument_capability(module, instrument).preview_playable) => return Err(HostError::InvalidInteractiveCommand),
             InteractiveAction::SetLiveDestination(starplayer::core::LiveDestination::Selected(instrument)) if !self.module.as_ref().is_some_and(|module| starplayer::live_instrument_capability(module, instrument).playable) => return Err(HostError::InvalidInteractiveCommand),
             _ => {}
@@ -1172,6 +1203,7 @@ impl Player {
         match action {
             InteractiveAction::SetLiveDestination(destination) => { self.live_destination = destination; self.live_input = if destination == starplayer::core::LiveDestination::Jam { LiveInputMode::Jam } else { LiveInputMode::Off }; },
             InteractiveAction::SetNoteOverlapEnabled(enabled) => self.overlap_shadow = enabled,
+            InteractiveAction::SetUniqueNotesAcrossChannels(enabled) => self.unique_notes_shadow = enabled,
             InteractiveAction::SetLetNotesRing { instrument, enabled } => { if let Some(value) = self.instrument_shadow.get_mut(instrument.0 as usize) { *value = enabled; } }
             _ => {}
         }
@@ -1306,7 +1338,7 @@ impl Player {
         // every voice and forgets every binding, which is exactly what silencing the
         // tracker lanes as the source is swapped means. Nothing is decoded or scanned.
         self.commands
-            .push(HostCommand::Load { module, source: Box::new(source), identity: None, selections: None, new_session: true })
+            .push(HostCommand::Load { module, source: Box::new(source), identity: None, selections: None, new_session: true, hold_transport: false })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.events = Some(EventSender::new(producer, Arc::clone(&self.event_clock)));
         self.live_input = LiveInputMode::MidiOnly;
@@ -1350,7 +1382,7 @@ impl Player {
             (built.source, None)
         };
         self.commands
-            .push(HostCommand::Load { module, source, identity: None, selections: None, new_session: true })
+            .push(HostCommand::Load { module, source, identity: None, selections: None, new_session: true, hold_transport: false })
             .map_err(|_| HostError::ControlQueueFull)?;
         self.scan = Some(built.scanned);
         self.smf = None;
@@ -1629,7 +1661,7 @@ mod no08_attachment_tests {
             player.rebuild_cursor = Some(saved);
             player.install(RtArc::new(starplayer::load(include_bytes!("../../../fuzz/seeds/mod/synthetic-golden.mod")).unwrap()), SeekKind::None, None, false).unwrap();
             let prepared = player.source_frame();
-            player.queue(HostCommand::RestoreTransport { identity: player.playback_identity.unwrap(), transport: Transport::playing(), state, natural_end: false }).unwrap();
+            player.queue(HostCommand::RestoreTransport { identity: player.playback_identity.unwrap(), transport: Transport::playing(), state, natural_end: false, apply_user_intent: false, release_epoch: None }).unwrap();
             pump(&mut player, &driver, 4096); assert!(player.pending_control_commands() > 0);
             let attached = install_wait(&mut player, &driver);
             assert!(attached.0 >= prepared.0 + 4096);
@@ -1655,7 +1687,7 @@ mod no08_attachment_tests {
             let instruments = RtArc::new(starplayer::load(include_bytes!("../../../fuzz/seeds/mod/synthetic-golden.mod")).unwrap());
             player.install_smf(smf, instruments, Some(saved), false).unwrap();
             let prepared = player.source_frame();
-            player.queue(HostCommand::RestoreTransport { identity: player.playback_identity.unwrap(), transport: Transport::playing(), state, natural_end: false }).unwrap();
+            player.queue(HostCommand::RestoreTransport { identity: player.playback_identity.unwrap(), transport: Transport::playing(), state, natural_end: false, apply_user_intent: false, release_epoch: None }).unwrap();
             pump(&mut player, &driver, 4096); assert!(player.pending_control_commands() > 0);
             let attached = install_wait(&mut player, &driver); assert!(attached.0 >= prepared.0 + 4096);
             let restored = player.telemetry().transport.smf_state().unwrap();

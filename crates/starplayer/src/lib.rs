@@ -479,6 +479,6 @@ mod tests {
 #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
 mod live;
 #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
-pub use live::{prepare_instrument_rack, live_instrument_capability};
+pub use live::{prepare_instrument_rack, live_instrument_capability, live_instrument_note_capability, live_instrument_note_flags};
 #[cfg(feature = "interactive-audition")]
 pub use live::prepare_live_rack;

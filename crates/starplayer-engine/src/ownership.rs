@@ -87,6 +87,8 @@ pub struct PlaybackState {
     #[cfg(feature = "note-overlap")]
     note_overlap_enabled: bool,
     #[cfg(feature = "note-overlap")]
+    unique_notes_across_channels: bool,
+    #[cfg(feature = "note-overlap")]
     pub(crate) overlap_diagnostics: crate::overlap::OverlapDiagnostics,
 }
 
@@ -107,6 +109,7 @@ impl PlaybackState {
         Ok(Self { configuration, slots: slots.into_boxed_slice(), next_age: 0,
             #[cfg(feature = "note-overlap")] let_notes_ring: selections,
             #[cfg(feature = "note-overlap")] note_overlap_enabled: false,
+            #[cfg(feature = "note-overlap")] unique_notes_across_channels: false,
             #[cfg(feature = "note-overlap")] overlap_diagnostics: Default::default(),
         })
     }
@@ -119,6 +122,7 @@ impl PlaybackState {
         if identity.session != self.configuration.identity.session {
             self.let_notes_ring.fill(false);
             self.note_overlap_enabled = false;
+            self.unique_notes_across_channels = false;
         }
         self.configuration.identity = identity;
     }
@@ -165,10 +169,11 @@ impl PlaybackState {
 
     /// Replay a complete prebuilt session shadow before input is accepted in a new build.
     #[cfg(feature = "note-overlap")]
-    pub fn restore_selections(&mut self, identity: PlaybackIdentity, enabled: bool, selections: &[bool]) -> Result<(), PlaybackStateError> {
+    pub fn restore_selections(&mut self, identity: PlaybackIdentity, enabled: bool, unique: bool, selections: &[bool]) -> Result<(), PlaybackStateError> {
         self.validate_identity(identity)?;
         if selections.len() != self.let_notes_ring.len() { return Err(PlaybackStateError::InvalidInstrument); }
         self.let_notes_ring.copy_from_slice(selections);
+        self.unique_notes_across_channels = unique;
         self.note_overlap_enabled = enabled;
         Ok(())
     }
@@ -234,6 +239,18 @@ impl PlaybackState {
     pub const fn note_overlap_enabled(&self) -> bool { self.note_overlap_enabled }
 
     #[cfg(feature = "note-overlap")]
+    pub const fn unique_notes_across_channels(&self) -> bool { self.unique_notes_across_channels }
+
+    /// An onset-only policy: changing it never scans or retires existing voices.
+    #[cfg(feature = "note-overlap")]
+    pub fn set_unique_notes_across_channels(&mut self, identity: PlaybackIdentity, enabled: bool) -> Result<(), PlaybackStateError> {
+        self.validate_identity(identity)?;
+        if !self.configuration.capabilities.contains(PlaybackCapabilities::NOTE_OVERLAP) { return Err(PlaybackStateError::Unsupported); }
+        self.unique_notes_across_channels = enabled;
+        Ok(())
+    }
+
+    #[cfg(feature = "note-overlap")]
     pub fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> {
         self.configuration.instrument_count = selections.len();
         core::mem::replace(&mut self.let_notes_ring, selections)
@@ -294,7 +311,21 @@ impl PlaybackState {
 
     #[cfg(feature = "note-overlap")]
     pub fn duplicate_candidates<'state>(&'state self, incoming: VoiceId, identity: TriggerIdentity, voices: &'state VoicePool) -> impl Iterator<Item = VoiceId> + 'state {
-        self.iter(voices).filter(move |owned| owned.voice != incoming && owned.lifecycle != VoiceLifecycle::Retiring && owned.identity == Some(identity)).map(|owned| owned.voice)
+        self.iter(voices).filter(move |owned| self.duplicate_matches(incoming, identity, **owned, voices)).map(|owned| owned.voice)
+    }
+
+    /// Shared identity predicate for production and diagnostics. Cross-channel matching
+    /// applies only from song onsets to custom-detached song backgrounds.
+    #[cfg(feature = "note-overlap")]
+    pub fn duplicate_matches(&self, incoming: VoiceId, identity: TriggerIdentity, candidate: VoiceOwnership, voices: &VoicePool) -> bool {
+        if candidate.voice == incoming || candidate.lifecycle == VoiceLifecycle::Retiring { return false; }
+        if candidate.identity == Some(identity) { return true; }
+        let Some(original) = candidate.identity else { return false };
+        self.unique_notes_across_channels && candidate.domain == VoiceDomain::Custom
+            && candidate.lifecycle == VoiceLifecycle::Background && candidate.custom_detached
+            && self.get(incoming, voices).is_some_and(|owned| owned.domain != VoiceDomain::Live)
+            && original.channel != identity.channel && original.instrument == identity.instrument
+            && original.note == identity.note && original.onset_volume == identity.onset_volume
     }
 
     /// Only an actual custom detachment sets provenance. Live stays in L; song tails move

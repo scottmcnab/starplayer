@@ -116,3 +116,17 @@ for (const opcode of [14.5, '14', 14n]) test(`NO08A1 malformed opcode ${typeof o
     }
     assert.deepEqual(actual, expected);
 });
+
+
+test('explicit-note preview and uniqueness retain seven-word identity on SAB and fallback', () => {
+    for (const [opcode, argument, extra] of [[Ring.OPCODE_PREVIEW_NOTE, 65535, 127], [Ring.OPCODE_UNIQUE_NOTES, 1, 0]]) {
+        const ring = Ring.createCommandRing(2), received = [], fallback = [];
+        assert.equal(Ring.pushCommand(ring, opcode, argument, extra, identity), true);
+        Ring.drainCommands(ring, (...record) => received.push(record));
+        Ring.drainFallbackCommands([{ opcode, argument, extra, identity }], (...record) => fallback.push(record), 2);
+        assert.equal(received[0].length, 7); assert.deepEqual(received, fallback);
+    }
+    for (const [opcode, argument, extra] of [[25, 0, 128], [25, 65536, 60], [26, 2, 0], [26, 1, 1]]) {
+        assert.equal(Ring.pushCommand(Ring.createCommandRing(2), opcode, argument, extra, identity), false);
+    }
+});

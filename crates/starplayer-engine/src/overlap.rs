@@ -69,7 +69,7 @@ impl ChannelTable {
         let Some(identity) = identity else { return };
         for index in 0..voices.capacity() {
             let candidate = self.playback().and_then(|playback| playback.slot(index, voices))
-                .filter(|owned| owned.voice != incoming && owned.identity() == Some(identity));
+                .filter(|owned| self.playback().is_some_and(|playback| playback.duplicate_matches(incoming, identity, *owned, voices)));
             if let Some(owned) = candidate && self.custom_overlap_candidate(owned.voice, module, voices) { self.retire_voice(owned.voice, voices); }
         }
     }

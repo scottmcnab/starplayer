@@ -43,7 +43,7 @@ const elements = {
     error: byId('error'), message: byId('message'), transportChip: byId('transport-chip'), title: byId('title'),
     moduleDetail: byId('module-detail'), order: byId('order'), pattern: byId('pattern'), row: byId('row'),
     speed: byId('speed'), bpm: byId('bpm'), previous: byId('previous'), play: byId('play'), stop: byId('stop'),
-    pause: byId('pause'), overlapEnable: byId('note-overlap-enable'), stopPreview: byId('stop-preview'), allSoundOff: byId('all-sound-off'), inputDestination: byId('input-destination'),
+    pause: byId('pause'), overlapEnable: byId('note-overlap-enable'), uniqueNotes: byId('unique-notes-across-channels'), referenceNote: byId('reference-note'), stopPreview: byId('stop-preview'), allSoundOff: byId('all-sound-off'), inputDestination: byId('input-destination'),
     next: byId('next'), seekOrder: byId('seek-order'), volume: byId('volume'), volumeValue: byId('volume-value'),
     progress: byId('progress'), elapsed: byId('elapsed'), duration: byId('duration'), repeat: byId('repeat'),
     voices: byId('voices'), masterPeak: byId('master-peak'), channelBody: byId('channel-body'), patternTable: byId('pattern-table'),
@@ -104,13 +104,22 @@ const state = {
     interactiveReady: false,
     sessionSettingsRevision: 0,
     lastTransportOpcode: null,
+    transportRevision: 0,
     liveRecoveryPending: false,
     selectedInstrument: null,
     instrumentTableInstruments: null,
     instrumentRows: [],
     letNotesRing: [],
+    // Page intent survives installations; applied policy is scoped to an audio identity.
     overlapEnabled: false,
+    uniqueNotesAcrossChannels: false,
+    policyRevision: 0,
+    appliedPolicies: null,
+    policyEdits: [],
+    policyIntentRevisions: {},
     previewInstrument: null,
+    previewLooping: false,
+    referenceNote: 60,
     nextRequestId: 1,
     metadata: null,
     channelRows: [],
@@ -506,6 +515,8 @@ function installGraph(graph) {
     state.liveInputActive = false;
     state.liveInputPending = false;
     state.node = graph.node;
+    if (graph.node.starplayerAppliedPolicies) state.appliedPolicies = graph.node.starplayerAppliedPolicies;
+    state.policyEdits = (state.policyEdits ?? []).filter(edit => Ring.sameIdentity(edit.identity, graph.node.starplayerIdentity));
     state.pendingInserts.clear();
     state.interactiveReady = !!graph.node.starplayerIdentity && graph.node.starplayerCapabilities === 3;
     if (graph.node.starplayerWarmup) { graph.node.disconnect(graph.node.starplayerWarmup); graph.node.starplayerWarmup.disconnect(); graph.node.starplayerWarmup = null; }
@@ -717,8 +728,8 @@ async function activateLoadedModule(moduleBuffer, moduleLabel, context) {
     metadata.identity = result.identity;
     state.metadata = metadata;
     state.letNotesRing = metadata.instruments.map(() => false);
-    state.overlapEnabled = false;
-    elements.overlapEnable.checked = false;
+    elements.overlapEnable.checked = state.overlapEnabled;
+    elements.uniqueNotes.checked = state.uniqueNotesAcrossChannels;
     state.selectedInstrument = null;
     elements.inputDestination.value = 'jam';
     state.currentModuleBytes = retainedBytes;
@@ -894,6 +905,8 @@ function readMetadata(label) {
             name: Loader.instrument_name(index),
             length: Loader.instrument_sample_length(index),
             capability: Loader.instrument_capability?.(index) ?? 0,
+            // Copy now: inspection can change before a candidate load succeeds.
+            noteCapabilities: Array.from(Loader.instrument_note_capabilities?.(index) ?? []),
         });
     }
     return {
@@ -927,6 +940,7 @@ function activateModuleOnNode(node, buffer, loadOptions = loadOptionsFromControl
             type: 'loadModule',
             requestId, identity, replacement,
             hostSettings: {
+                ...pagePolicies(),
                 volume: Math.round(Number(elements.volume.value) * 65535 / 100),
                 atEnd: playback.effectiveAtEnd() ? Ring.AT_END_CONTINUE : Ring.AT_END_FADE_OUT,
                 fadeFrames: Math.round(SONG_FADE_SECONDS * (node.starplayerSampleRate || state.workletSampleRate || 44100)),
@@ -997,6 +1011,10 @@ function onWorkletMessage(message, node) {
             state.latest = message;
             if (message.scope) state.latestScope = message.scope;
         }
+    } else if (message.type === 'loadReplayReady') {
+        const pending = state.pendingLoads.get(message.requestId);
+        if (pending?.node !== node || !message.accepted || !Ring.sameIdentity(pending.identity, message.identity)) return;
+        node.port.postMessage({ type: 'completeLoad', requestId: message.requestId, identity: pending.identity, policies: pagePolicies() });
     } else if (message.type === 'loadReplayPending') {
         if (state.pendingLoads.get(message.requestId)?.node === node) node.port.postMessage({ type: 'continueReplay', requestId: message.requestId });
     } else if (message.type === 'loadDeferred') {
@@ -1004,6 +1022,12 @@ function onWorkletMessage(message, node) {
     } else if (message.type === 'moduleLoaded' || message.type === 'moduleError') {
         const pending = state.pendingLoads.get(message.requestId);
         if (pending && pending.node === node) {
+            // A desire may have changed after the worklet requested confirmation.
+            // Keep this installation unready and reconcile its newest page revision.
+            if (message.type === 'moduleLoaded' && message.accepted && Ring.sameIdentity(pending.identity, message.identity) && message.policyRevision !== undefined && message.policyRevision !== (state.policyRevision ?? 0)) {
+                node.port.postMessage({ type: 'reconcilePolicies', requestId: message.requestId, identity: pending.identity, generation: message.generation, transportOpcode: pending.transportOpcode, transportRevision: pending.transportRevision, policies: pagePolicies() });
+                return;
+            }
             state.pendingLoads.delete(message.requestId);
             updateModPanningAvailability();
             if (message.type === 'moduleLoaded' && ((!node.starplayerInteractiveVersion && message.generation > 0) || (message.accepted && Ring.sameIdentity(pending.identity, message.identity)))) {
@@ -1013,24 +1037,40 @@ function onWorkletMessage(message, node) {
                 if (node.starplayerLatestLoadRequest !== undefined && node.starplayerLatestLoadRequest !== message.requestId) { pending.resolve(message); return; }
                 node.starplayerIdentity = message.identity ?? pending.identity;
                 node.starplayerCapabilities = message.capabilities ?? 0;
-                // Retry against the acknowledged build if the early intent reached a
-                // deferred load before its installation. Transport precedes new input.
-                if (pending.transportOpcode !== undefined && node === state.node) {
-                    queueCommand(pending.transportOpcode, 0, 0, node.starplayerIdentity);
-                    flushFallbackCommands();
-                }
+                node.starplayerAppliedPolicies = { identity: node.starplayerIdentity, overlapEnabled: message.overlapEnabled === true, uniqueNotesAcrossChannels: message.uniqueNotesAcrossChannels === true };
                 if (node === state.node) {
+                    state.appliedPolicies = node.starplayerAppliedPolicies;
+                    state.policyEdits = (state.policyEdits ?? []).filter(edit => Ring.sameIdentity(edit.identity, node.starplayerIdentity));
                     state.interactiveReady = message.capabilities === 3;
                     state.fallbackCommands = state.fallbackCommands.filter(record => Ring.sameIdentity(record.identity, node.starplayerIdentity));
+                    // A transport edit can follow the audio acknowledgement being posted
+                    // but precede its page delivery. Its loadTransport message then has
+                    // no pending worklet request; replay only that newer intent here.
+                    if (node.starplayerInteractiveVersion && pending.transportRevision > (message.transportRevision ?? 0)) {
+                        queueCommand(pending.transportOpcode, 0, 0, node.starplayerIdentity);
+                        flushFallbackCommands();
+                    }
                 }
-                pending.resolve(message);
+                if (pending.recovering) {
+                    renderMetadata(); setControlsEnabled(state.interactiveReady); updateLiveInputPanel();
+                    pending.reject(new Error(pending.failureReason));
+                } else pending.resolve(message);
             }
             else {
                 if (node === state.node && node.starplayerLatestLoadRequest === message.requestId) {
                     // Recovery requires explicit unchanged control AND audio-applied proof;
                     // a failed partial installation must leave mismatched controls disabled.
-                    state.interactiveReady = Boolean(pending.previousReady && message.retainedCapabilities === 3 && node.starplayerCapabilities === 3 && Ring.sameIdentity(message.retainedIdentity, pending.previousIdentity) && Ring.sameIdentity(message.retainedIdentity, node.starplayerIdentity) && Ring.sameIdentity(message.retainedIdentity, state.metadata?.identity));
-                    renderMetadata(); setControlsEnabled(state.interactiveReady); updateLiveInputPanel();
+                    const retained = Boolean(!pending.recovering && pending.previousReady && message.retainedCapabilities === 3 && node.starplayerCapabilities === 3 && Ring.sameIdentity(message.retainedIdentity, pending.previousIdentity) && Ring.sameIdentity(message.retainedIdentity, node.starplayerIdentity) && Ring.sameIdentity(message.retainedIdentity, state.metadata?.identity));
+                    state.interactiveReady = false;
+                    if (retained) {
+                        pending.recovering = true;
+                        pending.failureReason = message.reason || 'The module could not be loaded.';
+                        pending.identity = message.retainedIdentity;
+                        state.pendingLoads.set(message.requestId, pending);
+                        node.port.postMessage({ type: 'reconcilePolicies', requestId: message.requestId, identity: pending.identity, transportOpcode: pending.transportOpcode, transportRevision: pending.transportRevision, policies: pagePolicies() });
+                        return;
+                    }
+                    renderMetadata(); setControlsEnabled(false); updateLiveInputPanel();
                 }
                 pending.reject(new Error(message.reason || 'Interactive audio protocol is unavailable or the load acknowledgement is stale.'));
             }
@@ -1059,17 +1099,31 @@ function onWorkletMessage(message, node) {
         state.liveInputPending = false;
         if (!message.accepted) {
             if (message.count && state.interactiveReady) { state.liveRecoveryPending = true; queueInteractive(Ring.OPCODE_STOP_PREVIEW); flushFallbackCommands(); }
-            elements.overlapEnable.checked = state.overlapEnabled;
-            showError('Audio rejected a stale, invalid or full-queue control change.'); renderMetadata(); return;
+            showError('Audio rejected a stale, invalid or full-queue control change.');
         }
         for (let index = 0; index < message.count * 3; index += 3) {
             const opcode = message.commands[index], argument = message.commands[index + 1], extra = message.commands[index + 2];
-            if (opcode === Ring.OPCODE_NOTE_OVERLAP) state.overlapEnabled = argument !== 0;
+            if (opcode === Ring.OPCODE_NOTE_OVERLAP || opcode === Ring.OPCODE_UNIQUE_NOTES) {
+                const key = opcode === Ring.OPCODE_NOTE_OVERLAP ? 'overlapEnabled' : 'uniqueNotesAcrossChannels';
+                state.appliedPolicies ??= { identity, overlapEnabled: state.overlapEnabled, uniqueNotesAcrossChannels: state.uniqueNotesAcrossChannels };
+                const editIndex = (state.policyEdits ?? []).findIndex(edit => edit.opcode === opcode && edit.argument === argument && Ring.sameIdentity(edit.identity, identity));
+                const edit = editIndex >= 0 ? state.policyEdits.splice(editIndex, 1)[0] : null;
+                if (message.accepted) state.appliedPolicies[key] = argument !== 0;
+                else if (edit && edit.revision === state.policyIntentRevisions[key]) {
+                    state[key] = state.appliedPolicies[key];
+                    state.policyRevision += 1;
+                    state.policyIntentRevisions[key] = state.policyRevision;
+                    state.sessionSettingsRevision += 1;
+                    publishPendingPolicies();
+                }
+            }
+            if (!message.accepted) continue;
             if (opcode === Ring.OPCODE_LET_NOTES_RING) state.letNotesRing[argument] = extra !== 0;
             if (opcode === Ring.OPCODE_LIVE_DESTINATION) { state.liveInputActive = argument !== 0; state.liveRecoveryPending = false; }
             if (opcode === Ring.OPCODE_STOP_PREVIEW) state.liveRecoveryPending = false;
         }
         elements.overlapEnable.checked = state.overlapEnabled;
+        if (elements.uniqueNotes) elements.uniqueNotes.checked = state.uniqueNotesAcrossChannels;
         updateInstrumentControls();
         updateLiveInputPanel();
     } else if (message.type === 'garbageCollected') {
@@ -1357,20 +1411,53 @@ function requestGarbageCollection() {
     }
 }
 
+function pagePolicies() {
+    return { overlapEnabled: state.overlapEnabled === true, uniqueNotesAcrossChannels: state.uniqueNotesAcrossChannels === true, policyRevision: state.policyRevision ?? 0 };
+}
+
+function publishPendingPolicies() {
+    for (const [requestId, pending] of state.pendingLoads) {
+        pending.node.port.postMessage({ type: 'loadPolicies', requestId, identity: pending.identity, policies: pagePolicies() });
+    }
+}
+
+function setPagePolicy(opcode, enabled) {
+    const key = opcode === Ring.OPCODE_NOTE_OVERLAP ? 'overlapEnabled' : 'uniqueNotesAcrossChannels';
+    state[key] = Boolean(enabled);
+    state.policyRevision = (state.policyRevision ?? 0) + 1;
+    state.policyIntentRevisions ??= {};
+    state.policyIntentRevisions[key] = state.policyRevision;
+    state.sessionSettingsRevision = (state.sessionSettingsRevision ?? 0) + 1;
+    elements.overlapEnable.checked = state.overlapEnabled;
+    elements.uniqueNotes.checked = state.uniqueNotesAcrossChannels;
+    publishPendingPolicies();
+    if (!state.interactiveReady || !state.node?.starplayerIdentity) return;
+    const identity = state.node.starplayerIdentity;
+    state.policyEdits ??= [];
+    state.policyEdits.push({ identity, opcode, argument: Number(enabled), revision: state.policyRevision });
+    queueInteractive(opcode, Number(enabled));
+    flushFallbackCommands();
+}
+
 function queueTransport(opcode) {
     state.lastTransportOpcode = opcode;
-    const pending = [...state.pendingLoads.entries()].findLast(([, load]) => load.node === state.node);
-    if (pending) {
-        const [requestId, load] = pending;
+    state.transportRevision = (state.transportRevision ?? 0) + 1;
+    let currentPending = false;
+    for (const [requestId, load] of state.pendingLoads) {
         load.transportOpcode = opcode;
-        state.node.port.postMessage({ type: 'loadTransport', requestId, identity: load.identity, opcode, argument: 0, extra: 0 });
-    } else if (state.interactiveReady) queueInteractive(opcode);
-    else if (!state.node?.starplayerInteractiveVersion) queueCommand(opcode === Ring.OPCODE_HOLD_STOP ? Ring.OPCODE_STOP : Ring.OPCODE_PLAY);
+        load.transportRevision = state.transportRevision;
+        load.node.port.postMessage({ type: 'loadTransport', requestId, identity: load.identity, transportRevision: load.transportRevision, opcode, argument: 0, extra: 0 });
+        currentPending ||= load.node === state.node;
+    }
+    if (!currentPending && state.interactiveReady) queueInteractive(opcode);
+    else if (!currentPending && !state.node?.starplayerInteractiveVersion) queueCommand(opcode === Ring.OPCODE_HOLD_STOP ? Ring.OPCODE_STOP : Ring.OPCODE_PLAY);
 }
 
 function restoreUnreadyInteractiveControls() {
     elements.overlapEnable.checked = state.overlapEnabled;
     elements.overlapEnable.disabled = true;
+    elements.uniqueNotes.checked = state.uniqueNotesAcrossChannels;
+    elements.uniqueNotes.disabled = true;
     if (state.metadata) renderMetadata();
     for (const pending of state.pendingLoads?.values() ?? []) {
         if (pending.node !== state.node) continue;
@@ -1401,7 +1488,7 @@ function queueCommand(opcode, argument = 0, extra = 0, identity = null) {
     switch (opcode) {
         case Ring.OPCODE_MASTER_VOLUME: case Ring.OPCODE_MUTE_CHANNEL: case Ring.OPCODE_AT_END:
         case Ring.OPCODE_INSERT_PARAM: case Ring.OPCODE_INSERT_BYPASS: case Ring.OPCODE_SET_MIXER_MODE:
-        case Ring.OPCODE_LIVE_DESTINATION: case Ring.OPCODE_NOTE_OVERLAP: case Ring.OPCODE_LET_NOTES_RING:
+        case Ring.OPCODE_LIVE_DESTINATION: case Ring.OPCODE_NOTE_OVERLAP: case Ring.OPCODE_UNIQUE_NOTES: case Ring.OPCODE_LET_NOTES_RING:
             state.sessionSettingsRevision = (state.sessionSettingsRevision ?? 0) + 1;
     }
     const record = { opcode, argument: argument >>> 0, extra: extra >>> 0, identity };
@@ -1586,6 +1673,7 @@ async function rebuildAudioContext() {
     const revision = state.moduleRevision;
     const controlRevision = playback.controlRevision;
     const settingsRevision = state.sessionSettingsRevision;
+    const policyRevision = state.policyRevision;
     const oldSinkId = 'sinkId' in oldContext ? oldContext.sinkId : '';
     const replacement = state.currentModuleBytes === null ? null : await captureReplacement();
     const contextOptions = { latencyHint: 'interactive' };
@@ -1610,7 +1698,8 @@ async function rebuildAudioContext() {
             });
         }
         await unlock;
-        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || settingsRevision !== state.sessionSettingsRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); await candidateContext.close(); return; }
+        if (settingsRevision !== state.sessionSettingsRevision) { graph.node.disconnect(); await candidateContext.close(); if (policyRevision !== state.policyRevision) return rebuildAudioContext(); return; }
         graph.node.connect(candidateContext.destination);
 
         state.context = candidateContext;
@@ -1660,6 +1749,7 @@ async function rebuildOutputChannels() {
     const revision = state.moduleRevision;
     const controlRevision = playback.controlRevision;
     const settingsRevision = state.sessionSettingsRevision;
+    const policyRevision = state.policyRevision;
     const replacement = state.currentModuleBytes === null ? null : await captureReplacement();
     let candidateNode = null;
     try {
@@ -1669,7 +1759,8 @@ async function rebuildOutputChannels() {
         const activation = state.currentModuleBytes === null
             ? null
             : await activateModuleOnNode(graph.node, state.currentModuleBytes.slice(0), loadOptions, replacement);
-        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || settingsRevision !== state.sessionSettingsRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
+        if (revision !== state.moduleRevision || controlRevision !== playback.controlRevision || state.node !== oldNode || moduleBytes !== state.currentModuleBytes) { graph.node.disconnect(); return; }
+        if (settingsRevision !== state.sessionSettingsRevision) { graph.node.disconnect(); if (policyRevision !== state.policyRevision) return rebuildOutputChannels(); return; }
         graph.node.connect(state.context.destination);
 
         installGraph(graph);
@@ -2021,17 +2112,21 @@ function renderMetadata() {
                 preview = document.createElement('button');
                 preview.type = 'button'; preview.className = 'instrument-play';
                 preview.innerHTML = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1v10l9-5z"/></svg>';
-                preview.setAttribute('aria-label', `Play instrument ${index + 1} at reference note 60`);
+
                 const begin = () => {
-                    if (!state.interactiveReady || !(instrument.capability & 8)) return;
+                    const note = state.referenceNote;
+                    const flags = instrument.noteCapabilities?.[note] ?? (note === 60 ? ((instrument.capability >> 3) & 3) : 0);
+                    if (!state.interactiveReady || !(flags & 1)) return;
                     state.previewInstrument = index;
+                    state.previewLooping = !!(flags & 2);
                     backgroundOutput.start(); state.context?.resume().catch(showError);
-                    queueInteractive(Ring.OPCODE_PREVIEW, index); flushFallbackCommands();
+                    queueInteractive(Ring.OPCODE_PREVIEW_NOTE, index, note); flushFallbackCommands();
                 };
                 const finish = () => {
                     if (state.previewInstrument !== index) return;
-                    if (instrument.capability & 16) queueInteractive(Ring.OPCODE_RELEASE_PREVIEW);
+                    if (state.previewLooping) queueInteractive(Ring.OPCODE_RELEASE_PREVIEW);
                     state.previewInstrument = null;
+                    updateInstrumentControls();
                     flushFallbackCommands();
                 };
                 preview.addEventListener('pointerdown', event => { if (event.button !== 0) return; preview.setPointerCapture(event.pointerId); begin(); });
@@ -2053,7 +2148,7 @@ function renderMetadata() {
             }
             if (instrument.capability & 2) {
                 const label = document.createElement('label'); label.className = 'instrument-checkbox';
-                label.title = 'Let previous notes finish. An identical note played at the same starting volume on this instrument and channel replaces its earlier sound. Applies only to non-looping samples. Unchecked preserves native behavior, including IT NNA.';
+                label.title = 'Let previous non-looping notes finish. Identical instrument, note and starting volume on this channel replace earlier sound. Unique notes across channels also replaces matching detached song tails on other channels; live notes are excluded. Unchecked preserves native behavior, including IT NNA.';
                 checkbox = document.createElement('input');
                 checkbox.type = 'checkbox'; checkbox.dataset.instrument = String(index);
                 checkbox.setAttribute('aria-label', `Let notes ring for instrument ${index + 1}`);
@@ -2082,8 +2177,12 @@ function updateInstrumentControls() {
         controls.item.setAttribute('aria-label', `Instrument ${index + 1}: ${instrument.name || 'empty slot'}. ${selectable ? 'Select for keyboard and MIDI' : 'Keyboard and MIDI selection unavailable'}`);
         controls.item.setAttribute('aria-selected', String(state.selectedInstrument === index));
         if (controls.preview) {
-            controls.preview.disabled = !state.interactiveReady || !(instrument.capability & 8);
-            controls.preview.title = !(instrument.capability & 8) ? 'No playable PCM at reference note 60' : !state.interactiveReady ? 'Interactive audio is not ready' : 'Reference note 60, using prepared samples and master processing';
+            const note = state.referenceNote;
+            const playable = !!((instrument.noteCapabilities?.[note] ?? (note === 60 ? instrument.capability >> 3 : 0)) & 1);
+            // Preserve capture until button-up even if the next selected key is unavailable.
+            controls.preview.disabled = !state.interactiveReady || (!playable && state.previewInstrument !== index);
+            controls.preview.setAttribute('aria-label', `Play instrument ${index + 1} at ${formatNote(note)} (${note})`);
+            controls.preview.title = !playable ? `No playable PCM at ${formatNote(note)} (${note})` : !state.interactiveReady ? 'Interactive audio is not ready' : `${formatNote(note)} (${note}), using prepared samples and master processing`;
         }
         if (controls.checkbox) { controls.checkbox.disabled = !state.interactiveReady; controls.checkbox.checked = !!state.letNotesRing[index]; }
     }
@@ -2124,6 +2223,7 @@ function cleanupLiveInput() {
 
 function setControlsEnabled(enabled) {
     elements.overlapEnable.disabled = !enabled || !state.interactiveReady;
+    elements.uniqueNotes.disabled = !enabled || !state.interactiveReady;
     elements.stopPreview.disabled = !enabled || !state.interactiveReady;
     elements.allSoundOff.disabled = !enabled || !state.interactiveReady;
     for (const control of [elements.previous, elements.play, elements.pause, elements.stop, elements.next, elements.seekOrder, elements.volume, elements.progress]) {
@@ -2562,7 +2662,15 @@ elements.keyboardEnable.addEventListener('change', () => {
     updateLiveInputPanel();
 });
 elements.instrumentSelectAll.addEventListener('change', setAllInstrumentOverlap);
-elements.overlapEnable.addEventListener('change', () => { queueInteractive(Ring.OPCODE_NOTE_OVERLAP, Number(elements.overlapEnable.checked)); flushFallbackCommands(); });
+for (let note = 0; note < 128; note++) {
+    const option = document.createElement('option');
+    option.value = String(note); option.textContent = `${formatNote(note)} (${note})${note === 60 ? ' — middle C' : ''}`;
+    elements.referenceNote.append(option);
+}
+elements.referenceNote.value = String(state.referenceNote);
+elements.referenceNote.addEventListener('change', () => { state.referenceNote = Number(elements.referenceNote.value); updateInstrumentControls(); });
+elements.overlapEnable.addEventListener('change', () => setPagePolicy(Ring.OPCODE_NOTE_OVERLAP, elements.overlapEnable.checked));
+elements.uniqueNotes.addEventListener('change', () => setPagePolicy(Ring.OPCODE_UNIQUE_NOTES, elements.uniqueNotes.checked));
 elements.stopPreview.addEventListener('click', cleanupLiveInput);
 elements.allSoundOff.addEventListener('click', () => { releaseHeldKeys(false); state.previewInstrument = null; queueInteractive(Ring.OPCODE_ALL_SOUND_OFF); flushFallbackCommands(); });
 elements.inputDestination.addEventListener('change', () => { cleanupLiveInput(); state.liveInputPending = false; syncLiveInput(); updateLiveInputPanel(); });

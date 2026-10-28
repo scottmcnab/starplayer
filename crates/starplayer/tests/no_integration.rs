@@ -70,7 +70,7 @@ fn engine(module: &Arc<Module>, prepared: bool) -> (TestEngine, starplayer::engi
 fn pcm(module: &Arc<Module>, choices: Option<(bool, [bool; 3])>, block: usize) -> Vec<i16> {
     let (mut engine, _control) = engine(module, choices.is_some());
     #[cfg(feature = "note-overlap")]
-    if let Some((enabled, selections)) = choices { engine.restore_selections(Default::default(), enabled, &selections); }
+    if let Some((enabled, selections)) = choices { engine.restore_selections(Default::default(), enabled, false, &selections); }
     let mut output = vec![0; FRAMES * 2];
     for chunk in output.chunks_mut(block * 2) { engine.render(chunk); }
     output
@@ -229,7 +229,7 @@ fn real_it_rows_and_live_rack_fill_all_339_slots_without_cross_domain_stealing()
     }
     let mut settings = EngineSettings::interactive_web(Default::default(), 3).unwrap(); settings.sample_rate_hz = 8000;
     let mut engine: Engine<FixedPath, starplayer::dsp::Linear, StereoI16, Arc<Module>> = Engine::with_settings(settings);
-    let mut control = engine.take_control().unwrap(); control.load_module(Arc::clone(&module)).ok().unwrap(); engine.restore_selections(Default::default(), true, &[false, true, false]);
+    let mut control = engine.take_control().unwrap(); control.load_module(Arc::clone(&module)).ok().unwrap(); engine.restore_selections(Default::default(), true, false, &[false, true, false]);
     let (mut producer, feed) = external_event_channel(128);
     for index in 0..17 { producer.send(TimedEvent::on_channel(Frame(if index < 16 { 18 } else { 20 }), ChannelId(64 + (index % 16) as u16), Event::NoteOn { note: Note::new(48 + (index % 24) as u8), velocity: U0F16::MAX })).unwrap(); }
     let rack = starplayer::prepare_live_rack(&module, 8000, 339).unwrap();
