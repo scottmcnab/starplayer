@@ -74,7 +74,7 @@
     const INTERACTIVE_RING_BYTES = (INTERACTIVE_HEADER_WORDS + COMMAND_CAPACITY * INTERACTIVE_RECORD_WORDS) * 4;
     const OPCODE_INTERACTIVE_PLAY = 13, OPCODE_PAUSE = 14, OPCODE_RESUME = 15, OPCODE_HOLD_STOP = 16;
     const OPCODE_ALL_SOUND_OFF = 17, OPCODE_STOP_PREVIEW = 18, OPCODE_LIVE_DESTINATION = 19;
-    const OPCODE_PREVIEW = 20, OPCODE_RELEASE_PREVIEW = 21, OPCODE_NOTE_OVERLAP = 22, OPCODE_LET_NOTES_RING = 23, OPCODE_LIVE_MIDI = 24;
+    const OPCODE_PREVIEW = 20, OPCODE_RELEASE_PREVIEW = 21, OPCODE_NOTE_OVERLAP = 22, OPCODE_LET_NOTES_RING = 23, OPCODE_LIVE_MIDI = 24, OPCODE_PREVIEW_NOTE = 25, OPCODE_UNIQUE_NOTES = 26;
     const MAX_U64 = (1n << 64n) - 1n;
     function validWireWord(value) { return Number.isInteger(value) && value >= -2147483648 && value <= 0xffffffff; }
     function validIdentity(identity) {
@@ -87,11 +87,12 @@
         return validInteractiveArguments(opcode, argument, extra);
     }
     function validInteractiveArguments(opcode, argument, extra) {
-        if (!Number.isInteger(opcode) || opcode < 13 || opcode > 24) return false;
+        if (!Number.isInteger(opcode) || opcode < 13 || opcode > 26) return false;
         if ((opcode >= 13 && opcode <= 18) || opcode === 21) return argument === 0 && extra === 0;
         if (opcode === 19) return argument <= 65537 && extra === 0;
         if (opcode === 20) return argument <= 65535 && extra === 0;
-        if (opcode === 22) return argument <= 1 && extra === 0;
+        if (opcode === 22 || opcode === 26) return argument <= 1 && extra === 0;
+        if (opcode === 25) return argument <= 65535 && extra < 128;
         if (opcode === 23) return argument <= 65535 && extra <= 1;
         if (opcode === 24) return extra === 0 && (argument & 0xff808000) === 0 && (argument & 0xff) >= 0x80 && (argument & 0xff) < 0xf0;
         return false;
@@ -118,7 +119,7 @@
     }
 
     function pushCommand(ring, opcode, argument, extra, identity = null) {
-        if (!ring.version || (ring.version === 2 && (!validIdentity(identity) || !validWireWord(argument) || !validWireWord(extra) || !Number.isInteger(opcode) || opcode < 1 || opcode > 24)) || (opcode >= 13 && (ring.version !== 2 || !validInteractive(opcode, argument, extra, identity)))) return false;
+        if (!ring.version || (ring.version === 2 && (!validIdentity(identity) || !validWireWord(argument) || !validWireWord(extra) || !Number.isInteger(opcode) || opcode < 1 || opcode > 26)) || (opcode >= 13 && (ring.version !== 2 || !validInteractive(opcode, argument, extra, identity)))) return false;
         const words = ring.words;
         if (commandOccupancy(words) >= COMMAND_CAPACITY) {
             Atomics.add(words, COMMAND_OVERFLOW_INDEX, 1);
@@ -404,7 +405,7 @@
 
     scope.StarPlayerRing = {
         INTERACTIVE_WIRE_VERSION, INTERACTIVE_RING_BYTES, validWireWord, validIdentity, sameIdentity, validInteractive,
-        OPCODE_INTERACTIVE_PLAY, OPCODE_PAUSE, OPCODE_RESUME, OPCODE_HOLD_STOP, OPCODE_ALL_SOUND_OFF, OPCODE_STOP_PREVIEW, OPCODE_LIVE_DESTINATION, OPCODE_PREVIEW, OPCODE_RELEASE_PREVIEW, OPCODE_NOTE_OVERLAP, OPCODE_LET_NOTES_RING, OPCODE_LIVE_MIDI,
+        OPCODE_INTERACTIVE_PLAY, OPCODE_PAUSE, OPCODE_RESUME, OPCODE_HOLD_STOP, OPCODE_ALL_SOUND_OFF, OPCODE_STOP_PREVIEW, OPCODE_LIVE_DESTINATION, OPCODE_PREVIEW, OPCODE_RELEASE_PREVIEW, OPCODE_NOTE_OVERLAP, OPCODE_LET_NOTES_RING, OPCODE_LIVE_MIDI, OPCODE_PREVIEW_NOTE, OPCODE_UNIQUE_NOTES,
         COMMAND_CAPACITY,
         COMMAND_RING_BYTES,
         OPCODE_PLAY,

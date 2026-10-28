@@ -15,6 +15,10 @@ impl XmLiveRuntime {
     pub fn try_new(capacity: usize, sample_rate_hz: u32) -> Result<Self, alloc::collections::TryReserveError> { Ok(Self { articulation: XmArticulationRuntime::try_new(capacity)?, sample_rate_hz }) }
 }
 impl RackRuntime for XmLiveRuntime {
+    fn note_playable(&self, module: &Module, sample: starplayer_core::SampleId, note: Note) -> bool {
+        module.sample(sample).is_some_and(|sample| live_note_table_index(sample, note, 0).is_some())
+    }
+
     fn note_on(&mut self, module: &Module, instrument: InstrumentId, channel: ChannelId, params: NoteParams, context: &mut EngineContext<'_>) -> Option<VoiceId> {
         if context.voices.capacity() > self.articulation.capacity() { return None; }
         let definition = module.instrument(instrument)?;

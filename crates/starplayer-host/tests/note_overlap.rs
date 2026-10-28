@@ -114,7 +114,7 @@ mod cleanup {
             mux.insert(Box::new(Live { pending: true, region: SampleRegion::one_shot(sample.pcm_offset(), sample.length_frames()) })).ok().unwrap();
         }
         let mut engine = TestEngine::with_settings(settings); engine.set_source(Box::new(mux));
-        engine.restore_selections(Default::default(), true, &[true, false]);
+        engine.restore_selections(Default::default(), true, false, &[true, false]);
         let mut control = engine.take_control().unwrap(); control.load_module(module).ok().unwrap();
         if interactive { control.send(Command::Interactive(InteractiveCommand { identity: Default::default(), action: InteractiveAction::Play })).ok().unwrap(); }
         engine.render(&mut [0; 768]);

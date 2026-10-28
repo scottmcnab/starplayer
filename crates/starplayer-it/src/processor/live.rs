@@ -22,6 +22,8 @@ impl ItLiveRuntime {
     }
 }
 impl RackRuntime for ItLiveRuntime {
+    fn note_playable(&self, _module: &Module, _sample: starplayer_core::SampleId, note: Note) -> bool { note.semitone < 128 }
+
     fn note_on(&mut self, module: &Module, instrument: InstrumentId, channel: ChannelId, params: NoteParams, context: &mut EngineContext<'_>) -> Option<VoiceId> {
         if context.voices.capacity() > self.articulation.capacity() { return None; }
         let definition = module.instrument(instrument)?;

@@ -49,8 +49,11 @@ pub enum InteractiveAction {
     StopPreview,
     SetLiveDestination(LiveDestination),
     PreviewInstrument(InstrumentId),
+    /// Button audition at an explicit MIDI note; legacy preview remains note 60.
+    PreviewInstrumentNote { instrument: InstrumentId, note: u8 },
     ReleasePreview,
     SetNoteOverlapEnabled(bool),
+    SetUniqueNotesAcrossChannels(bool),
     SetLetNotesRing { instrument: InstrumentId, enabled: bool },
 }
 

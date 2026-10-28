@@ -35,7 +35,7 @@ fn prepared_smf_native_cadence_and_song_domains_work_without_live_reservations()
             let feed = starplayer::midi::SmfSequencer::prepared_song_at(&smf(),8000,Frame::ZERO);
             let mut engine: Engine<FixedPath,starplayer::dsp::Linear,StereoI16,Arc<Module>> = Engine::with_settings(settings);
             let mut handle = engine.take_control().unwrap(); handle.load_module(Arc::clone(&module)).ok().unwrap(); handle.send(Command::Play).unwrap(); engine.set_source(Box::new(MidiSource::new(feed,rack,8000)));
-            engine.restore_selections(Default::default(),true,&[true]);
+            engine.restore_selections(Default::default(),true,false,&[true]);
             let mut output = [0;256]; engine.render(&mut output);
             let voice = engine.channels().foreground(starplayer::core::ChannelId(0)).unwrap();
             assert!(engine.voices().get(voice).unwrap().params.volume.to_bits() > 60000,"1ms polling must not consume the ten-tick envelope");

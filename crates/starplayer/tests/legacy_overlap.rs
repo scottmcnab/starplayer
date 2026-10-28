@@ -202,7 +202,7 @@ fn render_muted(module: Arc<Module>, configuration: Option<(bool, [bool; 3])>, b
     if muted { control.send(starplayer::core::Command::MuteChannel { channel: ChannelId(0), muted: true }).ok().unwrap(); }
     engine.set_source(Box::new(starplayer::NativeSequencer::new_with_voice_capacity(module, 8000, QuirkSelection::FromDialect, engine_settings.voice_capacity).unwrap()));
     if let Some((enabled, selections)) = configuration {
-        engine.restore_selections(Default::default(), enabled, &selections);
+        engine.restore_selections(Default::default(), enabled, false, &selections);
     }
     let mut output = vec![0; 12_000];
     for chunk in output.chunks_mut(block * 2) { engine.render(chunk); }
@@ -446,7 +446,7 @@ fn loaded_legacy_fixtures_match_canonical_pcm_in_all_three_recording_configurati
                 1 => true,
                 _ => instrument.sample.and_then(|sample| module.sample(sample)).is_some_and(|sample| sample.loop_mode().is_looping() || sample.sustain_loop().is_some()),
             }).collect();
-            engine.restore_selections(Default::default(), policy != 1, &selections);
+            engine.restore_selections(Default::default(), policy != 1, false, &selections);
         }
         let mut output = vec![0; 32_000]; let mut recorded = false;
         for chunk in output.chunks_mut(block * 2) {

@@ -508,6 +508,20 @@ mod exports {
         { let _ = index; 0 }
     }
 
+    /// Snapshot all key flags while this inspection module is still current.
+    #[wasm_bindgen]
+    pub fn instrument_note_capabilities(index: u32) -> Vec<u8> {
+        #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+        { with_module(Vec::new(), |module| {
+            if index > u16::MAX as u32 { return Vec::new(); }
+            (0..128).map(|note| {
+                starplayer::live_instrument_note_flags(module, starplayer::core::InstrumentId(index as u16), note)
+            }).collect()
+        }) }
+        #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
+        { let _ = index; Vec::new() }
+    }
+
     #[wasm_bindgen]
     pub fn instrument_sample_length(index: u32) -> u32 {
         with_module(0, |module| instrument_source_frames(module, index as usize))

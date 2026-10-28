@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Approved plan; implementation starting; leave feature branch unmerged |
+| Status | Implemented, Astra-reviewed and verified; feature branch intentionally unmerged |
 | Baseline | main 4d03bcb, compact Instruments W17 |
 | Least-capable safe worker | GPT-6.1-sol (high) |
 | Review | Plan reviewed by GPT-6 Astra medium; entire completed branch must receive another Astra review |
@@ -20,9 +20,13 @@ No cargo fmt, broad staging, unrelated formatting or commit attribution.
 
 - [Instruments, selected-note audition and page-session playback policies](W18-task-instruments-policies.md).
 - [Compact Playlist table and Library-style selection](W18-task-playlist-selection.md).
+- [Page policy reconciliation and transport replay](W18-task-policy-replay.md), split
+  from the Instruments task for independent implementation and review.
 - Amend architecture/accuracy foundations, application help and README to the approved
   contracts. Coordinator owns foundation docs/index and combined acceptance.
 - Feature branch remains unmerged. No deployment or push requested.
+
+Detailed review findings and final evidence: [W18 review and verification](W18-review-and-verification.md).
 
 ## Research points
 

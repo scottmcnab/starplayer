@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Approved; ready for implementation |
+| Status | Implemented and verified on feature branch; intentionally unmerged |
 | Baseline | main 4d03bcb (W17 compact Instruments) |
 | Least-capable safe worker | GPT-6.1-sol (high) |
 | Coordinator | W18 master; worker leaves changes uncommitted for review |
@@ -131,3 +131,9 @@ REFERENCE_NOTE=60 is the tuning anchor, NOT a user preference to change globally
 Keyboard/MIDI reference retuning, native tracker tuning/effect repairs, v3/migrations,
 browser persistent policy storage, playlist implementation, foundation doc edits,
 main merge/push/deploy, user scratch files, W6 worktree and canonical golden changes.
+
+## Completion evidence
+
+Implementation, independent verification and all resolved Astra findings are recorded
+in [W18 review and verification](W18-review-and-verification.md). The owner requested
+that the completed feature remain unmerged; no main landing, push or deployment occurred.

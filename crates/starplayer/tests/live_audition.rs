@@ -201,7 +201,16 @@ fn metadata_and_map_selection_do_not_fall_back_from_an_unmapped_reference() {
         builder.set_header(header); let module = Arc::new(builder.build().unwrap());
         let capability = starplayer::live_instrument_capability(&module,InstrumentId(0));
         assert!(capability.playable && capability.looping); assert!(!capability.preview_playable && !capability.one_shot);
+        assert_eq!(starplayer::live_instrument_note_flags(&module, InstrumentId(0), 60), 0);
+        assert_eq!(starplayer::live_instrument_note_flags(&module, InstrumentId(0), 61), 3);
+        assert!(!starplayer::live_instrument_note_capability(&module, InstrumentId(0), 60).preview_playable);
+        assert!(starplayer::live_instrument_note_capability(&module, InstrumentId(0), 61).preview_playable);
+        assert_eq!(starplayer::live_instrument_note_flags(&module, InstrumentId(0), 128), 0);
         let mut live = Harness::new(module); live.action(InteractiveAction::PreviewInstrument(InstrumentId(0))); assert_eq!(live.voices.voices_active(),0);
+        live.action(InteractiveAction::PreviewInstrumentNote { instrument: InstrumentId(0), note: 61 });
+        let preview = live.channels.foreground(ChannelId(80)).unwrap(); assert_eq!(live.voices.get(preview).unwrap().tag.sample, second.0 + 1);
+        live.action(InteractiveAction::PreviewInstrumentNote { instrument: InstrumentId(0), note: 60 });
+        assert_eq!(live.channels.foreground(ChannelId(80)), Some(preview), "unmapped explicit note does not disturb the existing preview");
         let voice = live.on(64,61,u16::MAX); assert_eq!(live.voices.get(voice).unwrap().tag.sample,second.0+1);
         assert_eq!(live.voices.get(voice).unwrap().tag.note,if format == ModuleFormat::It {72} else {61});
     }
@@ -385,9 +394,14 @@ fn capability_uses_native_xm_tuning_for_reference_preview_and_other_map_keys() {
     let capability = starplayer::live_instrument_capability(&module, InstrumentId(0));
     assert!(capability.playable && capability.one_shot);
     assert!(!capability.preview_playable && !capability.preview_looping);
+    assert_eq!(starplayer::live_instrument_note_flags(&module, InstrumentId(0), 60), 0);
+    assert_eq!(starplayer::live_instrument_note_flags(&module, InstrumentId(0), 100), 1);
+    assert!(starplayer::live_instrument_note_capability(&module, InstrumentId(0), 100).preview_playable);
     let mut live = Harness::new(module);
     live.action(InteractiveAction::PreviewInstrument(InstrumentId(0)));
     assert!(live.channels.foreground(ChannelId(80)).is_none());
+    live.action(InteractiveAction::PreviewInstrumentNote { instrument: InstrumentId(0), note: 100 });
+    assert!(live.channels.foreground(ChannelId(80)).is_some());
     live.on(64, 100, 65_535);
     assert!(live.channels.foreground(ChannelId(64)).is_some());
 }

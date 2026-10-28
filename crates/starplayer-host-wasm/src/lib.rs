@@ -504,6 +504,8 @@ impl Host {
                     value if value - 2 <= u16::MAX as u32 => LiveDestination::Selected(InstrumentId((value - 2) as u16)), _ => return None,
                 }),
                 20 if wire.argument <= u16::MAX as u32 && wire.extra == 0 => InteractiveAction::PreviewInstrument(InstrumentId(wire.argument as u16)),
+                25 if wire.argument <= u16::MAX as u32 && wire.extra < 128 => InteractiveAction::PreviewInstrumentNote { instrument: InstrumentId(wire.argument as u16), note: wire.extra as u8 },
+                26 if wire.argument <= 1 && wire.extra == 0 => InteractiveAction::SetUniqueNotesAcrossChannels(wire.argument != 0),
                 21 if wire.argument == 0 && wire.extra == 0 => InteractiveAction::ReleasePreview,
                 22 if wire.argument <= 1 && wire.extra == 0 => InteractiveAction::SetNoteOverlapEnabled(wire.argument != 0),
                 23 if wire.argument <= u16::MAX as u32 && wire.extra <= 1 => InteractiveAction::SetLetNotesRing { instrument: InstrumentId(wire.argument as u16), enabled: wire.extra != 0 },
@@ -533,7 +535,7 @@ impl Host {
                 // using a dispatch-local signal rather than an insert-ring reservation.
                 OPCODE_SEEK_ORDER | OPCODE_SEEK_ROW | OPCODE_SEEK_FRAME => self.player.module().is_some() && self.player.scan().is_some(),
                 OPCODE_AT_END => { host_commands += if wire.extra == 0 { 1 } else { 2 }; true }
-                13..=23 => { host_commands += 1; Self::interactive_action(wire).is_some_and(|action| self.player.validate_interactive(action).is_ok()) }
+                13..=26 => { host_commands += 1; Self::interactive_action(wire).is_some_and(|action| self.player.validate_interactive(action).is_ok()) }
                 _ => { host_commands += 1; true }
             }
         }) && self.player.can_admit_browser_batch(host_commands, inserts, events);
@@ -568,7 +570,7 @@ impl Host {
             };
             if !valid { return false; }
         }
-        if (matches!(wire.opcode, OPCODE_MIDI_EVENT | 20 | 24) || wire.identity.is_some() && matches!(wire.opcode, OPCODE_SEEK_ORDER | OPCODE_SEEK_ROW | OPCODE_SEEK_FRAME)) && self.player.playback_identity().is_some() {
+        if (matches!(wire.opcode, OPCODE_MIDI_EVENT | 20 | 24 | 25) || wire.identity.is_some() && matches!(wire.opcode, OPCODE_SEEK_ORDER | OPCODE_SEEK_ROW | OPCODE_SEEK_FRAME)) && self.player.playback_identity().is_some() {
             let applied = self.player.applied_playback();
             if !applied.accepted || applied.identity != wire.identity { return false; }
         }
@@ -857,14 +859,14 @@ mod exports {
     pub fn queue_applied_barrier(serial: u32) -> bool { with_host(false, |host| host.player.playback_barrier(serial as u64).is_ok()) }
     #[wasm_bindgen]
     pub fn enqueue_interactive_words(opcode: u32, argument: u32, extra: u32, session_low: u32, session_high: u32, build_low: u32, build_high: u32) -> bool {
-        if !(1..=24).contains(&opcode) { return false; }
+        if !(1..=26).contains(&opcode) { return false; }
         let identity = PlaybackIdentity { session: SessionId(session_low as u64 | ((session_high as u64) << 32)), build: BuildGeneration(build_low as u64 | ((build_high as u64) << 32)) };
         with_host(false, |host| host.enqueue(WireCommand { identity: Some(identity), opcode: opcode as u8, argument, extra }))
     }
 
     #[wasm_bindgen]
     pub fn enqueue_interactive(opcode: u32, argument: u32, extra: u32, session: u64, build: u64) -> bool {
-        if !(13..=24).contains(&opcode) { return false; }
+        if !(13..=26).contains(&opcode) { return false; }
         with_host(false, |host| host.enqueue(WireCommand { identity: Some(PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) }), opcode: opcode as u8, argument, extra }))
     }
 
@@ -907,12 +909,30 @@ mod exports {
             let identity = PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) };
             host.player.set_speed_adjust(speed_adjust.clamp(i8::MIN as i32, i8::MAX as i32) as i8);
             if replacement.is_empty() { host.player.load_module_identified(Arc::new(module), identity) }
-            else { host.player.load_replacement(Arc::new(module), identity, replacement) }.map_err(|error| JsValue::from_str(&error.to_string()))?;
+            else { host.player.load_replacement_deferred(Arc::new(module), identity, replacement) }.map_err(|error| JsValue::from_str(&error.to_string()))?;
             host.module_generation = host.module_generation.wrapping_add(1).max(1);
             host.last_applied_enhancement_flags = flags;
             host.last_enhancement_factor = factor;
             Ok(host.module_generation)
         })
+    }
+
+    /// Finish a browser replacement only after its policy replay is audio-applied.
+    #[wasm_bindgen]
+    pub fn finish_replacement_transport(session: u64, build: u64, opcode: u32) -> bool {
+        let requested = match opcode { 0 => None, 13 | 15 => Some(starplayer::core::InteractiveTransport::Playing), 14 => Some(starplayer::core::InteractiveTransport::Paused), 16 => Some(starplayer::core::InteractiveTransport::Stopped), _ => return false };
+        with_host(false, |host| host.player.finish_replacement_transport(PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) }, requested).is_ok())
+    }
+
+    #[wasm_bindgen]
+    pub fn cancel_load_transport(session: u64, build: u64) -> bool {
+        with_host(false, |host| host.player.cancel_load_transport(PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) }).is_ok())
+    }
+
+    #[wasm_bindgen]
+    pub fn finish_load_transport(session: u64, build: u64, opcode: u32) -> bool {
+        let action = match opcode { 13 => InteractiveAction::Play, 14 => InteractiveAction::Pause, 15 => InteractiveAction::Resume, 16 => InteractiveAction::Stop, _ => return false };
+        with_host(false, |host| host.player.finish_load_transport(PlaybackIdentity { session: SessionId(session), build: BuildGeneration(build) }, action).is_ok())
     }
 
     /// Decode and activate one validated native module byte buffer outside `process()`.
@@ -2416,12 +2436,15 @@ mod tests {
         identified_load(&mut host, &minimal_mod(), 7, 1u64 << 54);
         let identity = host.player.playback_identity();
         let preview = WireCommand { identity, opcode: 20, argument: 0, extra: 0 };
+        let selected_preview = WireCommand { identity, opcode: 25, argument: 0, extra: 61 };
         let note = WireCommand { identity, opcode: 24, argument: 0x7f_3c_90, extra: 0 };
-        assert!(!host.apply(preview)); assert!(!host.apply(note));
+        assert!(!host.apply(preview)); assert!(!host.apply(selected_preview)); assert!(!host.apply(note));
         host.process(128);
         assert!(!host.apply(note), "installation alone is not the full replay barrier");
         host.player.playback_barrier(2).unwrap(); host.process(128);
         assert!(host.apply(preview));
+        assert!(host.apply(selected_preview));
+        assert!(!host.apply(WireCommand { extra: 128, ..selected_preview }));
         assert!(host.apply(note));
         assert!(!host.apply(WireCommand { identity: None, opcode: OPCODE_MIDI_EVENT, argument: 0x7f_3c_90, extra: 0 }));
     }
@@ -2482,6 +2505,22 @@ mod tests {
         sender.send_event(0, event).unwrap();
         let mut peak = 0.0f32; for _ in 0..8 { peak = peak.max(host.process(128)); }
         assert!(peak > 0.001);
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn explicit_preview_and_unique_setting_are_validated_before_atomic_group_admission() {
+        let mut host = interactive_host(44_100); identified_load(&mut host, &minimal_mod(), 4, 7);
+        host.player.playback_barrier(1).unwrap(); host.process(128);
+        let identity = host.player.playback_identity();
+        for wire in [WireCommand { identity, opcode: 26, argument: 1, extra: 0 }, WireCommand { identity, opcode: 25, argument: 0, extra: 61 }] { assert!(host.enqueue(wire)); }
+        assert!(host.drain_interactive_batch(true)); host.player.playback_barrier(2).unwrap(); host.process(128);
+        assert_eq!(*host.player.replacement_state().unwrap().last().unwrap(), 1, "unique setting is captured in replacement codec");
+        assert!(host.enqueue(WireCommand { identity, opcode: 26, argument: 0, extra: 0 }));
+        assert!(host.enqueue(WireCommand { identity, opcode: 25, argument: 65535, extra: 60 }));
+        assert!(!host.drain_interactive_batch(true), "invalid selected instrument rejects the whole group before mutation");
+        host.player.playback_barrier(3).unwrap(); host.process(128);
+        assert_eq!(*host.player.replacement_state().unwrap().last().unwrap(), 1);
     }
 
 }

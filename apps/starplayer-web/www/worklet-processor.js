@@ -119,13 +119,14 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
     queueApplied(message) {
         if (this.pendingAcks.length >= Ring.COMMAND_CAPACITY || !this.allocateBarrier() || !this.wasm.queue_applied_barrier_words(this.barrierLow, this.barrierHigh)) {
             this.port.postMessage({ ...message, accepted: false, type: message.type === 'moduleLoaded' ? 'moduleError' : message.type === 'stateReady' ? 'stateError' : message.type === 'insertsApplied' ? 'insertsError' : message.type, reason: 'Audio command queue is full.' });
-            return;
+            return false;
         }
         message.serialLow = this.barrierLow; message.serialHigh = this.barrierHigh;
         message.serial = BigInt(this.barrierLow) | (BigInt(this.barrierHigh) << 32n);
         message.rejectionsLow = this.interactiveStatus[8]; message.rejectionsHigh = this.interactiveStatus[9];
         message.identityWords = [Number(message.identity.session & 0xffffffffn), Number(message.identity.session >> 32n), Number(message.identity.build & 0xffffffffn), Number(message.identity.build >> 32n)];
         this.pendingAcks.push(message);
+        return true;
     }
 
     flushInteractive() {
@@ -165,6 +166,28 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             message.accepted = accepted;
             message.capabilities = status[6];
             if (!accepted) { message.type = message.type === 'moduleLoaded' ? 'moduleError' : message.type === 'insertsApplied' ? 'insertsError' : message.type; message.reason = 'Audio rejected a command, prepared load or state replay.'; }
+            if (message.type === 'loadReleaseApplied') {
+                const replay = this.pendingReplay;
+                if (!replay || replay.loaded.requestId !== message.requestId || !Ring.sameIdentity(replay.loaded.identity, message.identity)
+                    || replay.phase !== 'releasing' || replay.releaseRevision !== message.releaseRevision || replay.appliedPolicyRevision !== (replay.settings.policyRevision ?? 0)) continue;
+                this.pendingReplay = null;
+                if (accepted && !replay.loaded.cancelled) message.type = 'moduleLoaded';
+                else { message.type = 'moduleError'; message.accepted = false; message.reason = 'Audio rejected or superseded the transport release.'; }
+            }
+            if (message.type === 'loadReplayApplied') {
+                const replay = this.pendingReplay;
+                if (replay && replay.loaded.requestId === message.requestId && Ring.sameIdentity(replay.loaded.identity, message.identity)) {
+                    if (!accepted) {
+                        this.pendingReplay = null;
+                        this.port.postMessage({ type: 'moduleError', requestId: replay.loaded.requestId, identity: replay.loaded.identity, reason: 'Audio rejected the policy replay.' });
+                        continue;
+                    }
+                    replay.phase = 'confirm';
+                    replay.appliedPolicyRevision = message.policyRevision;
+                    replay.loaded.failed ||= !accepted;
+                    message.type = 'loadReplayReady';
+                } else continue;
+            }
             this.port.postMessage(message);
         }
     }
@@ -179,7 +202,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
 
     startReplay(settings, loaded) {
         const identity = loaded.identity;
-        const actions = [{ opcode: Ring.OPCODE_MASTER_VOLUME, argument: settings.volume, extra: 0 }];
+        const actions = settings.volume === undefined ? [] : [{ opcode: Ring.OPCODE_MASTER_VOLUME, argument: settings.volume, extra: 0 }];
         if (settings.atEnd !== undefined) actions.push({ opcode: Ring.OPCODE_AT_END, argument: settings.atEnd, extra: settings.fadeFrames });
         for (const channel of settings.mutes) actions.push({ opcode: Ring.OPCODE_MUTE_CHANNEL, argument: channel, extra: 1 });
         for (const insert of settings.inserts) {
@@ -187,13 +210,14 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             for (const [parameter, value] of Object.entries(insert.params)) actions.push({ opcode: Ring.OPCODE_INSERT_PARAM, argument: Ring.packInsertParamArgument(insert.target, insert.slot, Number(parameter)), extra: value >>> 0 });
             if (insert.bypassed) actions.push({ opcode: Ring.OPCODE_INSERT_BYPASS, argument: Ring.packInsertSlotArgument(insert.target, insert.slot), extra: 1 });
         }
-        this.pendingReplay = { actions, loaded, index: 0, rejected: this.wasm.dropped_commands(), identityWords: [Number(identity.session & 0xffffffffn), Number(identity.session >> 32n), Number(identity.build & 0xffffffffn), Number(identity.build >> 32n)], resumeMessage: { type: 'loadReplayPending', requestId: loaded.requestId }, resumeSent: false, waitUntil: 0 };
+        this.pendingReplay = { actions, loaded, index: 0, settings, phase: 'actions', releaseRevision: 0, stagedPolicyRevision: -1, appliedPolicyRevision: -1, rejected: this.wasm.dropped_commands(), identityWords: [Number(identity.session & 0xffffffffn), Number(identity.session >> 32n), Number(identity.build & 0xffffffffn), Number(identity.build >> 32n)], resumeMessage: { type: 'loadReplayPending', requestId: loaded.requestId }, resumeSent: false, waitUntil: 0 };
         this.continueReplay();
     }
 
     continueReplay() {
         const replay = this.pendingReplay;
-        if (!replay) return;
+        if (!replay || replay.phase === 'barrier' || replay.phase === 'releasing') return;
+        replay.phase = 'actions';
         try {
             this.wasm.collect_garbage();
             if (this.wasm.dropped_commands() !== replay.rejected) throw new Error('Audio rejected part of the settings replay.');
@@ -210,11 +234,17 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                 this.wasm.flush_commands();
             }
             this.bindViews();
-            if (replay.index === replay.actions.length) {
-                replay.loaded.failed ||= this.wasm.dropped_commands() !== replay.rejected;
-                replay.loaded.memoryBytes = this.stableMemoryBytes;
-                this.pendingReplay = null;
-                this.queueApplied(replay.loaded);
+            if (replay.index === replay.actions.length && this.wasm.pending_control_commands() === 0) {
+                const words = replay.identityWords;
+                const settings = replay.settings;
+                // These are last in the replay, after potentially many mute/insert quanta.
+                // A barrier proves actual audio application before page confirmation.
+                if (!this.wasm.enqueue_interactive_words(Ring.OPCODE_NOTE_OVERLAP, Number(settings.overlapEnabled === true), 0, ...words)
+                    || !this.wasm.enqueue_interactive_words(Ring.OPCODE_UNIQUE_NOTES, Number(settings.uniqueNotesAcrossChannels === true), 0, ...words)) throw new Error('Policy staging queue is full.');
+                this.wasm.flush_commands();
+                replay.stagedPolicyRevision = settings.policyRevision ?? 0;
+                replay.phase = 'barrier';
+                if (!this.queueApplied({ type: 'loadReplayApplied', requestId: replay.loaded.requestId, identity: replay.loaded.identity, policyRevision: replay.stagedPolicyRevision })) throw new Error('Policy barrier queue is full.');
             } else {
                 replay.waitUntil = this.wasm.quanta_rendered() + 1;
                 replay.resumeSent = false;
@@ -223,6 +253,54 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
             this.bindViews();
             this.pendingReplay = null;
             this.port.postMessage({ type: 'moduleError', requestId: replay.loaded.requestId, identity: replay.loaded.identity, reason: String(error) });
+        }
+    }
+
+    updateLoadPolicies(message) {
+        const deferred = this.deferredLoads.get(message.requestId);
+        if (deferred && Ring.sameIdentity(deferred.identity, message.identity)) {
+            if ((message.policies.policyRevision ?? 0) >= (deferred.hostSettings.policyRevision ?? 0)) Object.assign(deferred.hostSettings, message.policies);
+            return;
+        }
+        const replay = this.pendingReplay;
+        if (!replay || replay.loaded.requestId !== message.requestId || !Ring.sameIdentity(replay.loaded.identity, message.identity)) return;
+        if ((message.policies.policyRevision ?? 0) < (replay.settings.policyRevision ?? 0)) return;
+        Object.assign(replay.settings, message.policies);
+        if (replay.phase === 'releasing' && replay.appliedPolicyRevision !== (replay.settings.policyRevision ?? 0)) {
+            if (!this.wasm.cancel_load_transport(replay.loaded.identity.session, replay.loaded.identity.build)) { replay.loaded.failed = true; return; }
+            replay.phase = 'actions';
+            this.continueReplay();
+        }
+        if (replay.phase === 'confirm' && replay.appliedPolicyRevision !== replay.settings.policyRevision) this.continueReplay();
+    }
+
+    completeLoad(message) {
+        const replay = this.pendingReplay;
+        if (!replay || replay.phase !== 'confirm' || replay.loaded.requestId !== message.requestId || !Ring.sameIdentity(replay.loaded.identity, message.identity)) return;
+        this.updateLoadPolicies(message);
+        if (replay.phase !== 'confirm') return;
+        if ((message.policies.policyRevision ?? 0) !== replay.appliedPolicyRevision) return;
+        if (replay.appliedPolicyRevision !== (replay.settings.policyRevision ?? 0)) { this.continueReplay(); return; }
+        const loaded = replay.loaded;
+        if (loaded.failed || loaded.cancelled) {
+            this.pendingReplay = null;
+            this.port.postMessage({ type: 'moduleError', requestId: loaded.requestId, identity: loaded.identity, reason: 'Audio rejected or superseded the settings replay.' }); return;
+        }
+        try {
+            if (loaded.replacement) {
+                if (!this.wasm.finish_replacement_transport(loaded.identity.session, loaded.identity.build, loaded.transportOpcode ?? 0)) throw new Error('Could not release replacement transport.');
+            } else if (loaded.transportOpcode !== undefined && !this.wasm.finish_load_transport(loaded.identity.session, loaded.identity.build, loaded.transportOpcode)) throw new Error('Could not apply pending transport.');
+            loaded.policyRevision = replay.appliedPolicyRevision;
+            loaded.overlapEnabled = replay.settings.overlapEnabled === true;
+            loaded.uniqueNotesAcrossChannels = replay.settings.uniqueNotesAcrossChannels === true;
+            loaded.memoryBytes = this.stableMemoryBytes;
+            replay.releaseRevision += 1;
+            replay.phase = 'releasing';
+            if (!this.queueApplied({ ...loaded, type: 'loadReleaseApplied', releaseRevision: replay.releaseRevision })) throw new Error('Transport release barrier queue is full.');
+        } catch (error) {
+            this.wasm.cancel_load_transport(loaded.identity.session, loaded.identity.build);
+            this.pendingReplay = null;
+            this.port.postMessage({ type: 'moduleError', requestId: loaded.requestId, identity: loaded.identity, reason: String(error) });
         }
     }
 
@@ -272,16 +350,31 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
     }
 
     onMessage(message) {
+        if (message.type === 'reconcilePolicies') {
+            if (!this.interactiveVersion || !Ring.sameIdentity(message.identity, this.identity()) || this.pendingReplay) return;
+            this.startReplay({ ...message.policies, volume: undefined, mutes: [], inserts: [] }, { type: 'moduleLoaded', requestId: message.requestId, identity: message.identity, generation: message.generation, replacement: false, transportOpcode: message.transportOpcode, transportRevision: message.transportRevision });
+            return;
+        }
+        if (message.type === 'loadPolicies') { this.updateLoadPolicies(message); return; }
+        if (message.type === 'completeLoad') { this.completeLoad(message); return; }
         if (message.type === 'continueReplay') { if (this.pendingReplay?.loaded.requestId === message.requestId) this.continueReplay(); return; }
         if (message.type === 'continueLoad') { const load = this.deferredLoads.get(message.requestId); if (load) { this.deferredLoads.delete(message.requestId); this.onMessage(load); } return; }
         if (message.type === 'loadTransport') {
             if (!this.interactiveVersion || !Ring.validIdentity(message.identity) || ![Ring.OPCODE_INTERACTIVE_PLAY, Ring.OPCODE_PAUSE, Ring.OPCODE_RESUME, Ring.OPCODE_HOLD_STOP].includes(message.opcode) || message.argument !== 0 || message.extra !== 0) return;
             const deferred = this.deferredLoads.get(message.requestId);
-            if (deferred && Ring.sameIdentity(deferred.identity, message.identity)) { deferred.transportOpcode = message.opcode; return; }
+            if (deferred && Ring.sameIdentity(deferred.identity, message.identity)) { deferred.transportOpcode = message.opcode; deferred.transportRevision = message.transportRevision; return; }
             const loaded = this.pendingReplay?.loaded.requestId === message.requestId ? this.pendingReplay.loaded : this.pendingAcks.find(pending => pending.type === 'moduleLoaded' && pending.requestId === message.requestId);
             if (!loaded || !Ring.sameIdentity(loaded.identity, message.identity) || !Ring.sameIdentity(message.identity, this.identity())) return;
             loaded.transportOpcode = message.opcode;
-            if (!this.stageLoadTransport(message.opcode, message.identity)) loaded.failed = true;
+            loaded.transportRevision = message.transportRevision;
+            const replay = this.pendingReplay;
+            if (replay?.phase === 'releasing') {
+                if (!this.wasm.cancel_load_transport(loaded.identity.session, loaded.identity.build)) { loaded.failed = true; return; }
+                replay.phase = 'confirm';
+                this.completeLoad({ requestId: loaded.requestId, identity: loaded.identity, policies: replay.settings });
+            } else if (!replay && !this.stageLoadTransport(message.opcode, message.identity)) loaded.failed = true;
+            // Pending transport is scalar intent until the replay's applied barrier.
+            // Stop/Pause therefore supersede saved Playing without an audible interval.
             return;
         }
         if (message.type === 'loadModule') {
@@ -290,6 +383,10 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                 if (this.interactiveVersion && !Ring.validIdentity(message.identity)) throw new Error('Missing full playback identity.');
                 if (this.commandRing && !this.pendingControlSerial) Ring.drainCommands(this.commandRing, this.applyCommand, this.interactiveVersion ? 63 : Ring.COMMAND_CAPACITY);
                 this.flushInteractive();
+                if (this.pendingReplay && this.pendingReplay.loaded.requestId !== message.requestId) {
+                    this.pendingReplay.loaded.cancelled = true;
+                    if (this.pendingReplay.phase === 'releasing') this.wasm.cancel_load_transport(this.pendingReplay.loaded.identity.session, this.pendingReplay.loaded.identity.build);
+                }
                 if (this.interactiveVersion && (this.pendingControlSerial || this.fallbackBatches.length || this.pendingReplay)) {
                     if (this.deferredLoads.size >= Ring.COMMAND_CAPACITY) throw new Error('Too many prepared loads.');
                     this.deferredLoads.set(message.requestId, message);
@@ -316,15 +413,21 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
                     identity: message.identity,
                     requestId: message.requestId,
                     generation,
+                    replacement: Boolean(message.replacement?.length),
+                    transportOpcode: message.transportOpcode,
+                    transportRevision: message.transportRevision,
                     memoryBytes: this.stableMemoryBytes,
                     // M10-W4: what the load actually did, which can be narrower than what
                     // was asked for — see `build_enhancement`'s frame-budget fallback.
                     appliedEnhancementFlags: this.wasm.applied_enhancement_flags(),
                     appliedEnhancementFactor: this.wasm.applied_enhancement_factor(),
                 };
-                if (this.interactiveVersion && message.transportOpcode !== undefined && !this.stageLoadTransport(message.transportOpcode, message.identity)) loaded.failed = true;
                 if (this.interactiveVersion && message.hostSettings) this.startReplay(message.hostSettings, loaded);
-                else if (this.interactiveVersion) this.queueApplied(loaded);
+                else if (this.interactiveVersion) {
+                    if (loaded.replacement && !this.wasm.finish_replacement_transport(loaded.identity.session, loaded.identity.build, loaded.transportOpcode ?? 0)) loaded.failed = true;
+                    else if (!loaded.replacement && loaded.transportOpcode !== undefined && !this.stageLoadTransport(loaded.transportOpcode, loaded.identity)) loaded.failed = true;
+                    this.queueApplied(loaded);
+                }
                 else this.port.postMessage(loaded);
             } catch (error) {
                 // Decode/preparation may fail before changing the installed player.
@@ -477,7 +580,7 @@ class StarPlayerProcessor extends AudioWorkletProcessor {
         this.wasm.process(frames);
         this.publishApplied();
         const replay = this.pendingReplay;
-        if (replay && !replay.resumeSent && this.wasm.quanta_rendered() >= replay.waitUntil) { replay.resumeSent = true; this.port.postMessage(replay.resumeMessage); }
+        if (replay && replay.phase === 'actions' && !replay.resumeSent && this.wasm.quanta_rendered() >= replay.waitUntil) { replay.resumeSent = true; this.port.postMessage(replay.resumeMessage); }
         if (this.memory.buffer.byteLength !== this.stableMemoryBytes) {
             this.faulted = `wasm memory grew in process (${this.stableMemoryBytes} → ${this.memory.buffer.byteLength})`;
             this.port.postMessage({ type: 'fault', reason: this.faulted });

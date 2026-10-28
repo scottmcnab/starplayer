@@ -509,6 +509,7 @@ for (const shared of process.env.STARPLAYER_NO08_TRANSPORT === 'fallback' ? [fal
         while (delivered < recreatedPort.messages.length) {
             const message = recreatedPort.messages[delivered++];
             if (message.type === 'loadReplayPending') recreatedPort.dispatch({ type: 'continueReplay', requestId: message.requestId });
+                if (message.type === 'loadReplayReady') recreatedPort.dispatch({ type: 'completeLoad', requestId: message.requestId, identity: message.identity, policies: { policyRevision: message.policyRevision, overlapEnabled: false, uniqueNotesAcrossChannels: false } });
         }
     }
     assert.ok(recreatedPort.messages.find(message => message.type === 'moduleLoaded')?.accepted);
@@ -545,6 +546,7 @@ for (const shared of process.env.STARPLAYER_NO08_TRANSPORT === 'fallback' ? [fal
             while (read < pendingPort.messages.length) {
                 const message = pendingPort.messages[read++];
                 if (message.type === 'loadReplayPending') pendingPort.dispatch({ type: 'continueReplay', requestId: message.requestId });
+                if (message.type === 'loadReplayReady') pendingPort.dispatch({ type: 'completeLoad', requestId: message.requestId, identity: message.identity, policies: { policyRevision: message.policyRevision, overlapEnabled: false, uniqueNotesAcrossChannels: false } });
             }
         }
         assert.ok(pendingPort.messages.findLast(message => message.type === 'moduleLoaded' && message.requestId === 611)?.accepted);
@@ -577,7 +579,15 @@ for (const shared of [true, false]) {
         const targetPort = lastPort;
         const identity = { session: 900n, build: 901n };
         const left = new Float32Array(128), right = new Float32Array(128);
-        const pump = count => { const output = []; for (let index = 0; index < count; index++) { target.process([], [[left, right]]); output.push(...left, ...right); } return output; };
+        let replayRead = 0;
+        const pump = count => { const output = []; for (let index = 0; index < count; index++) {
+            target.process([], [[left, right]]); output.push(...left, ...right);
+            while (replayRead < targetPort.messages.length) {
+                const message = targetPort.messages[replayRead++];
+                if (message.type === 'loadReplayPending') targetPort.dispatch({ type: 'continueReplay', requestId: message.requestId });
+                if (message.type === 'loadReplayReady') targetPort.dispatch({ type: 'completeLoad', requestId: message.requestId, identity: message.identity, policies: { policyRevision: message.policyRevision, overlapEnabled: false, uniqueNotesAcrossChannels: false } });
+            }
+        } return output; };
         const send = (opcode, argument = 0) => {
             if (ring) assert.equal(Ring.pushCommand(ring, opcode, argument, 0, identity), true);
             else targetPort.dispatch({ type: 'commandBatch', version: 2, commands: [{ opcode, argument, extra: 0, identity }] });

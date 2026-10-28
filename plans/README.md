@@ -102,10 +102,12 @@ the dependency graph and merge order.
 ## Active web panel work
 
 [W18 — Instruments policies and compact Playlist selection](apps/W18-master-panel-controls.md)
-is approved for implementation on `feature/panel-playback-controls`. It retains global
+is implemented and verified on `feature/panel-playback-controls`. It retains global
 policy preferences for the page session, adds selected-note audition and optional
-cross-channel song-tail uniqueness, and adds Playlist table selection. A final Astra
-whole-branch review is required. The owner explicitly requested no main merge.
+cross-channel song-tail uniqueness, and adds Playlist table selection. Astra reviewed
+the entire branch and verified all four fixes. [Verification evidence](apps/W18-review-and-verification.md)
+records 11 passing CI jobs, 390 Node tests and all three browser modes. The owner
+explicitly requested no main merge; the feature remains unmerged.
 
 ## Locked-in decisions
 

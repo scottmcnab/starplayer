@@ -134,7 +134,7 @@ macro_rules! define_arms {
             fn set_playback_identity(&mut self, identity: starplayer::core::PlaybackIdentity) { match self { $(EngineArm::$variant(engine) => engine.set_playback_identity(identity),)+ } }
             fn interactive_transport(&self) -> Option<starplayer::core::InteractiveTransport> { match self { $(EngineArm::$variant(engine) => engine.interactive_transport(),)+ } }
             fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> { match self { $(EngineArm::$variant(engine) => engine.replace_instrument_selections(selections),)+ } }
-            fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, selections: &[bool]) { match self { $(EngineArm::$variant(engine) => engine.restore_selections(identity, enabled, selections),)+ } }
+            fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, unique: bool, selections: &[bool]) { match self { $(EngineArm::$variant(engine) => engine.restore_selections(identity, enabled, unique, selections),)+ } }
             fn pending_insert_commands(&self) -> usize { match self { $(EngineArm::$variant(engine) => engine.pending_insert_commands(),)+ } }
             fn master_volume(&self) -> U0F16 { match self { $(EngineArm::$variant(engine) => engine.master_volume(),)+ } }
             fn warnings(&self) -> EngineWarnings { match self { $(EngineArm::$variant(engine) => engine.warnings(),)+ } }
@@ -229,7 +229,7 @@ impl HostEngine {
 
     pub fn replace_instrument_selections(&mut self, selections: Box<[bool]>) -> Box<[bool]> { self.arm.replace_instrument_selections(selections) }
 
-    pub fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, selections: &[bool]) { self.arm.restore_selections(identity, enabled, selections); }
+    pub fn restore_selections(&mut self, identity: starplayer::core::PlaybackIdentity, enabled: bool, unique: bool, selections: &[bool]) { self.arm.restore_selections(identity, enabled, unique, selections); }
     pub fn set_playback_identity(&mut self, identity: starplayer::core::PlaybackIdentity) { self.arm.set_playback_identity(identity); }
     pub fn interactive_transport(&self) -> Option<starplayer::core::InteractiveTransport> { self.arm.interactive_transport() }
 

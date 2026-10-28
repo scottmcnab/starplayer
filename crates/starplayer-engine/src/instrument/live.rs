@@ -8,6 +8,7 @@ use crate::LiveOrigin;
 /// One mutable, pool-indexed format runtime for every program in a rack.
 /// Implemented by XM and IT, using their native articulation computations.
 pub trait RackRuntime: Send {
+    fn note_playable(&self, module: &Module, sample: SampleId, note: Note) -> bool;
     fn note_on(&mut self, module: &Module, instrument: InstrumentId, channel: ChannelId, params: NoteParams, context: &mut EngineContext<'_>) -> Option<VoiceId>;
     fn release(&mut self, module: &Module, voice: VoiceId, context: &mut EngineContext<'_>);
     fn step(&mut self, module: &Module, voice: VoiceId, context: &mut EngineContext<'_>);
@@ -97,7 +98,13 @@ impl PreparedRack {
         Ok(Self { initial_interval, module: Arc::clone(module), runtime, instances: instances.into_boxed_slice(), #[cfg(feature = "interactive-audition")] preview: RackChannel::default(), #[cfg(feature = "interactive-audition")] destination: if scope == RackScope::Song { starplayer_core::LiveDestination::Jam } else { starplayer_core::LiveDestination::Off }, sample_rate_hz, mapped, scope, diagnostics: LiveDiagnostics::default() })
     }
 
-    pub(super) fn capability(&self, instrument: InstrumentId) -> InstrumentCapability { instrument_capability(&self.module, instrument, self.mapped) }
+    pub(super) fn capability(&self, instrument: InstrumentId) -> InstrumentCapability { self.note_capability(instrument, REFERENCE_NOTE) }
+
+    fn note_capability(&self, instrument: InstrumentId, note: u8) -> InstrumentCapability {
+        instrument_capability_filtered_at_note(&self.module, instrument, self.mapped, note, |note, sample| {
+            self.runtime.as_ref().is_none_or(|runtime| runtime.note_playable(&self.module, sample, Note::new(note)))
+        })
+    }
 
     fn release(&mut self, voice: VoiceId, context: &mut EngineContext<'_>) {
         if !context.channels.playback().and_then(|state| state.get(voice, context.voices)).is_some_and(|owned| owned.lifecycle != VoiceLifecycle::Retiring) { return; }
@@ -232,10 +239,13 @@ impl PreparedRack {
                 }
             }
             InteractiveAction::PreviewInstrument(instrument) => {
-                if !self.capability(instrument).preview_playable { return; }
+                self.action(channels, InteractiveAction::PreviewInstrumentNote { instrument, note: REFERENCE_NOTE }, context);
+            }
+            InteractiveAction::PreviewInstrumentNote { instrument, note } => {
+                if !self.note_capability(instrument, note).preview_playable { return; }
                 if self.preview.program != instrument { context.channels.clear_scope(ClearScope::Lane(ChannelId(80)), context.voices); self.clear(ClearScope::Lane(ChannelId(80)), context); }
                 self.preview.program = instrument;
-                self.apply(channels, Target::Channel(ChannelId(80)), Event::NoteOn { note: Note::new(REFERENCE_NOTE), velocity: U0F16::MAX }, context);
+                self.apply(channels, Target::Channel(ChannelId(80)), Event::NoteOn { note: Note::new(note), velocity: U0F16::MAX }, context);
             }
             InteractiveAction::ReleasePreview => { self.release_lane(ChannelId(80), None, false, context); }
             _ => {}
@@ -259,6 +269,11 @@ pub fn instrument_capability(module: &Module, instrument: InstrumentId, mapped: 
 
 /// Add a format-native, allocation-free viability preflight without preparing a rack.
 pub fn instrument_capability_filtered(module: &Module, instrument: InstrumentId, mapped: bool, playable: impl Fn(u8, SampleId) -> bool) -> InstrumentCapability {
+    instrument_capability_filtered_at_note(module, instrument, mapped, REFERENCE_NOTE, playable)
+}
+
+/// Aggregate map properties, plus viability/looping for one explicit audition note.
+pub fn instrument_capability_filtered_at_note(module: &Module, instrument: InstrumentId, mapped: bool, selected_note: u8, playable: impl Fn(u8, SampleId) -> bool) -> InstrumentCapability {
     let Some(definition) = module.instrument(instrument) else { return InstrumentCapability::default() };
     let mut result = InstrumentCapability::default();
     for note in 0..128 {
@@ -266,9 +281,10 @@ pub fn instrument_capability_filtered(module: &Module, instrument: InstrumentId,
         if let Some(sample_id) = sample && let Some(sample) = module.sample(sample_id).filter(|sample| sample.length_frames() != 0) {
             let looping = sample.loop_mode().is_looping() || sample.sustain_loop().is_some();
             result.looping |= looping; result.one_shot |= !looping;
+            if note == selected_note as usize { result.preview_looping = looping; }
             if playable(note as u8, sample_id) {
                 result.playable = true;
-                if note == REFERENCE_NOTE as usize { result.preview_playable = true; result.preview_looping = looping; }
+                if note == selected_note as usize { result.preview_playable = true; }
             }
         }
     }

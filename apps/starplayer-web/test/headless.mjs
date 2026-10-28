@@ -1,4 +1,5 @@
 import { runInteractive } from './no-headless.mjs';
+import { runPlaylistSelection } from './w18-playlist-headless.mjs';
 import remoteWorker from '../remote-proxy/worker.js';
 import { runW15, runW15View, runW15Stress, runW15Playlist, runW15Runtime } from './w15-headless.mjs';
 import { runRemediation, runPerformance, runBackground, runDigestMeasurements, runVisibilityReturn, runEnumerationDiagnostic } from './w15-remediation-headless.mjs';
@@ -20,6 +21,7 @@ import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // a regression in the display is as visible here as a regression in the engine.
 //
 // Usage: node apps/starplayer-web/test/headless.mjs [--seconds 60] [--mode sab|fallback|plain]
+// W18 native Playlist selection/layout: --playlist-selection-only.
 // Focused transport/preparation regression: --transport-only --seconds 5.
 // W15-only: --w15-only, or --w15-case app|view|stress|playlist|runtime|remediation.
 // Dedicated evidence: --w15-case performance|digest|background|visibility|enumeration (select one mode).
@@ -49,9 +51,10 @@ const PHONE_VIEWPORT = { width: 390, height: 844 };
 const options = parseArguments(process.argv.slice(2));
 
 function parseArguments(argv) {
-    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false, interactiveOnly: false, transportOnly: false };
+    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false, interactiveOnly: false, transportOnly: false, playlistSelectionOnly: false };
     for (let index = 0; index < argv.length; index += 1) {
-        if (argv[index] === '--transport-only') parsed.transportOnly = true;
+        if (argv[index] === '--playlist-selection-only') parsed.playlistSelectionOnly = true;
+        else if (argv[index] === '--transport-only') parsed.transportOnly = true;
         else if (argv[index] === '--interactive-only') parsed.interactiveOnly = true;
         else if (argv[index] === '--pages-smoke') parsed.pagesSmoke = true;
         else if (argv[index] === '--w15-only') parsed.w15Only = true;
@@ -75,7 +78,7 @@ function parseArguments(argv) {
 // ── environment ─────────────────────────────────────────────────────────────────────
 
 async function verifyPackagedSources() {
-    const names=['cooperative-yield.js','library-source.js','library-discovery.js','library-worker.js','library-worker-runtime.js','library-worker-jobs.js','library-index.js','library-controls.js','playlist-transfer.js','playlist-controls.js','library-view.js','library-view-state.js'];
+    const names=['cooperative-yield.js','library-source.js','library-discovery.js','library-worker.js','library-worker-runtime.js','library-worker-jobs.js','library-index.js','library-controls.js','playlist-transfer.js','playlist-controls.js','playlist.js','library-selection.js','library-view.js','library-view-state.js'];
     const hashes={};
     for(const name of names) {
         const source=await readFile(join(REPOSITORY_ROOT,'apps/starplayer-web/www',name));
@@ -1227,7 +1230,7 @@ async function run(executable, mode) {
         await page.evaluate("document.getElementById('pause').click(); return true;");
         await page.waitFor('Pause remains usable after failed inspection', "document.getElementById('transport-chip').textContent === 'paused'");
         await page.evaluate("document.querySelector('#instrument-list .instrument-play:not(:disabled)').click(); return true;");
-        await page.waitFor('Preview acknowledgement after failed inspection', `window.__interactiveApplied.slice(${beforeBadControls}).some(message => message.accepted && message.commands.some((value, index) => index % 3 === 0 && value === StarPlayerRing.OPCODE_PREVIEW))`);
+        await page.waitFor('Preview acknowledgement after failed inspection', `window.__interactiveApplied.slice(${beforeBadControls}).some(message => message.accepted && message.commands.some((value, index) => index % 3 === 0 && value === StarPlayerRing.OPCODE_PREVIEW_NOTE))`);
         await page.evaluate("document.getElementById('stop-preview').click(); document.getElementById('play').click(); return true;");
         await page.waitFor('Resume remains usable after failed inspection', "document.getElementById('transport-chip').textContent === 'playing'");
 
@@ -1510,14 +1513,14 @@ async function runLibrary(executable, mode) {
         await clickRow(1);
         await clickRow(2, { shiftKey: true });
         await page.evaluate("document.getElementById('library-add-selected').click();");
-        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M']);
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list tr')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M']);
         await page.evaluate("document.getElementById('library-add-selected').click();");
-        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list tr')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
         await filter('', '5 of 5');
         await clickRow(0, { ctrlKey: true });
         await clickRow(2, { ctrlKey: true });
         await page.evaluate("document.getElementById('library-add-selected').click();");
-        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list li')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
+        assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list tr')].map(item => item.querySelector('.playlist-name').textContent);"), ['PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M', 'PETRI.S3M', 'REFLEX.S3M']);
         // A real Shift-click must select rows, not page text (Edge pops up a Copy/Search menu over a text selection).
         const realClick = async (position, modifiers = 0) => {
             const point = await page.evaluate(`const row = document.querySelector('#library-rows > :nth-child(${position})'); row.scrollIntoView({ block: 'center' }); const bounds = row.children[1].getBoundingClientRect(); return { x: bounds.x + 25, y: bounds.y + 16 };`);
@@ -1596,7 +1599,7 @@ async function runLibrary(executable, mode) {
         assert.deepEqual(await page.evaluate("return [...document.querySelectorAll('#playlist-list .playlist-name')].slice(-2).map(item => item.textContent);"), touchExpected);
         assert.equal(await page.evaluate("return document.getElementById('title').textContent;"), beforeTouch.title, 'checkbox taps never start playback');
         // Restore this fixture's playlist count for the retained large-index assertions.
-        await page.evaluate("document.querySelectorAll('#playlist-list li').forEach((item, index) => { if (index >= 9) item.querySelector('button').click(); });");
+        await page.evaluate("document.querySelectorAll('#playlist-list tr').forEach((item, index) => { if (index >= 9) item.querySelector('input').click(); }); document.getElementById('playlist-remove-selected').click();");
         await page.send('Emulation.setTouchEmulationEnabled', { enabled: false });
         const phoneLayout = await page.evaluate("return { width: innerWidth, scrollWidth: document.documentElement.scrollWidth, overflowing: [...document.querySelectorAll('main > *, .load-panel > *, .now-playing > *')].filter(element => element.getBoundingClientRect().right > 390).map(element => [element.className, element.getBoundingClientRect().width]) };");
         assert.ok(phoneLayout.width === 390 && phoneLayout.scrollWidth <= 390, `library fits at 390px: ${JSON.stringify(phoneLayout)}`);
@@ -1682,7 +1685,7 @@ async function runLibrary(executable, mode) {
         assert.match(await page.evaluate("return document.getElementById('library-selection-count').textContent;"), /^37,674 playable selected/);
         await filter('TRACK37673', '1 of 37,674');
         await page.evaluate("document.getElementById('library-add-selected').click();");
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li:last-child .playlist-name').textContent;"), 'TRACK37673.S3M');
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list tr:last-child .playlist-name').textContent;"), 'TRACK37673.S3M');
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '10');
         await writeFile(join(directory, 'index.csv'), header + ',Reflex,loose/REFLEX.S3M,\n,Unsupported,loose/SILENT.669,');
         await page.evaluate("document.getElementById('library-server').click();");
@@ -1734,9 +1737,9 @@ async function runLibrary(executable, mode) {
         await page.evaluate(`
             document.getElementById('library-add-selected').click();
             const repeat = document.getElementById('repeat'); repeat.checked = true; repeat.dispatchEvent(new Event('change'));
-            document.querySelector('#playlist-list li').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+            document.querySelector('#playlist-list tr').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
         `);
-        await page.waitFor('first playlist track', "document.querySelector('#playlist-list li.current .playlist-name')?.textContent === 'REFLEX.S3M'");
+        await page.waitFor('first playlist track', "document.querySelector('#playlist-list tr.current .playlist-name')?.textContent === 'REFLEX.S3M'");
         assert.equal(await page.evaluate("return document.getElementById('repeat').checked && document.getElementById('repeat').disabled;"), true);
         // Stop in the same turn as starting a rebuild: its saved Play must not win.
         await page.evaluate("document.getElementById('sample-rate').value = '32000'; document.getElementById('apply-sample-rate').click(); document.getElementById('stop').click();");
@@ -1757,8 +1760,8 @@ async function runLibrary(executable, mode) {
         };
         await seekNearEnd(1, true);
         await page.evaluate("window.savedAnimationFrame = requestAnimationFrame; window.requestAnimationFrame = callback => { window.pausedAnimationFrame = callback; return 0; };");
-        await page.waitFor('automatic second playlist track', "document.querySelector('#playlist-list li.current .playlist-name')?.textContent === 'PETRI.S3M' && document.getElementById('title').textContent === 'Petrified'", 15000);
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li').classList.contains('current');"), false);
+        await page.waitFor('automatic second playlist track', "document.querySelector('#playlist-list tr.current .playlist-name')?.textContent === 'PETRI.S3M' && document.getElementById('title').textContent === 'Petrified'", 15000);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list tr').classList.contains('current');"), false);
         await page.evaluate("window.requestAnimationFrame = window.savedAnimationFrame; if (window.pausedAnimationFrame) requestAnimationFrame(window.pausedAnimationFrame);");
         await page.waitFor('second playlist telemetry', "window.latestPlaylistSnapshot?.moduleGeneration === 2 && window.latestPlaylistSnapshot?.playing");
         await page.waitFor('keep-alive through playlist advance', "!document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'playing'");
@@ -1772,7 +1775,7 @@ async function runLibrary(executable, mode) {
         await page.evaluate("document.getElementById('stop').click();");
         await page.waitFor('manual stop in fade', "document.getElementById('transport-chip').textContent === 'stopped'");
         await delay(5500);
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list tr.current .playlist-name').textContent;"), 'PETRI.S3M');
         const stoppedFade = await page.evaluate("return window.latestPlaylistSnapshot;");
         assert.equal(stoppedFade.playing, false);
         // Re-arm and let the complete fade finish to measure the host rewind too.
@@ -1782,20 +1785,20 @@ async function runLibrary(executable, mode) {
         await page.waitFor('natural looping stop', "document.getElementById('transport-chip').textContent === 'stopped'", 15000);
         await page.waitFor('keep-alive paused at playlist end', "document.querySelector('audio').paused && navigator.mediaSession.playbackState === 'paused'");
         await delay(500);
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list tr.current .playlist-name').textContent;"), 'PETRI.S3M');
         assert.equal((await page.evaluate(READ_STATE)).progressValue, 0);
         assert.equal(await page.evaluate("return window.latestPlaylistSnapshot.songFlags;"), 7);
         await page.evaluate("document.getElementById('play').click();");
         await page.waitFor('host rewind on next Play', "window.latestPlaylistSnapshot?.playing && window.latestPlaylistSnapshot.songFrame < 48000 && window.latestPlaylistSnapshot.songFlags === 3");
         const playlistSnapshots = await page.evaluate("return window.playlistSnapshots;");
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current .playlist-name').textContent;"), 'PETRI.S3M');
-        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', altKey: true, bubbles: true }));");
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li').classList.contains('current');"), true);
-        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true }));");
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li:last-child').classList.contains('current');"), true);
-        await page.evaluate("document.querySelector('#playlist-list li.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list tr.current .playlist-name').textContent;"), 'PETRI.S3M');
+        await page.evaluate("document.querySelector('#playlist-list tr.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', altKey: true, bubbles: true }));");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list tr').classList.contains('current');"), true);
+        await page.evaluate("document.querySelector('#playlist-list tr.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true }));");
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list tr:last-child').classList.contains('current');"), true);
+        await page.evaluate("document.querySelector('#playlist-list tr.current').click(); document.querySelector('#playlist-list tr.current').dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }));");
         await delay(300);
-        assert.equal(await page.evaluate("return document.querySelector('#playlist-list li.current');"), null);
+        assert.equal(await page.evaluate("return document.querySelector('#playlist-list tr.current');"), null);
         assert.equal((await page.evaluate(READ_STATE)).chip, 'playing');
         assert.equal(await page.evaluate("return document.getElementById('playlist-count').textContent;"), '1');
         await page.evaluate("document.getElementById('playlist-clear').click();");
@@ -1829,17 +1832,17 @@ async function runLibrary(executable, mode) {
             document.getElementById('playlist-panel').dispatchEvent(new DragEvent('drop', { dataTransfer: dropped, bubbles: true, cancelable: true }));
         `);
         await page.waitFor('three uploaded entries', "document.getElementById('playlist-count').textContent === '4' && document.getElementById('playlist-status').textContent.includes('disk.zip')");
-        await page.evaluate("document.getElementById('playlist-loop').checked = true; document.getElementById('playlist-loop').dispatchEvent(new Event('change')); document.querySelectorAll('#playlist-list li')[2].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));");
-        await page.waitFor('upload current', "document.querySelectorAll('#playlist-list li')[2].classList.contains('current')");
-        await page.waitFor('current entry persisted', "await (async () => { const { openPlaylistStore } = await import('./playlist-store.js'); const store = await openPlaylistStore(); const saved = store.state; store.close(); return saved.entries.length === 4 && saved.currentId === document.querySelectorAll('#playlist-list li')[2].dataset.entryId && saved.loop; })()");
+        await page.evaluate("document.getElementById('playlist-loop').checked = true; document.getElementById('playlist-loop').dispatchEvent(new Event('change')); document.querySelectorAll('#playlist-list tr')[2].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));");
+        await page.waitFor('upload current', "document.querySelectorAll('#playlist-list tr')[2].classList.contains('current')");
+        await page.waitFor('current entry persisted', "await (async () => { const { openPlaylistStore } = await import('./playlist-store.js'); const store = await openPlaylistStore(); const saved = store.state; store.close(); return saved.entries.length === 4 && saved.currentId === document.querySelectorAll('#playlist-list tr')[2].dataset.entryId && saved.loop; })()");
         await page.send('Page.reload');
         await page.waitFor('restored playlist', "document.documentElement.dataset.playerReady === 'true' && document.getElementById('playlist-count').textContent === '4'");
-        assert.equal(await page.evaluate("return document.querySelectorAll('#playlist-list li')[2].classList.contains('current') && document.getElementById('playlist-loop').checked;"), true);
+        assert.equal(await page.evaluate("return document.querySelectorAll('#playlist-list tr')[2].classList.contains('current') && document.getElementById('playlist-loop').checked;"), true);
         assert.match(await page.evaluate("return document.querySelector('#playlist-list .playlist-marker').textContent;"), /library not connected/);
         await page.evaluate(`if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true;`);
         for (const [index, title] of [[1, 'reflex'], [2, 'petrified'], [3, 'reflex']]) {
-            await page.evaluate(`document.querySelectorAll('#playlist-list li')[${index}].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));`);
-            await page.waitFor('restored upload plays', `document.querySelectorAll('#playlist-list li')[${index}].classList.contains('current') && document.getElementById('title').textContent.toLowerCase().includes('${title}') && document.getElementById('transport-chip').textContent === 'playing'`);
+            await page.evaluate(`document.querySelectorAll('#playlist-list tr')[${index}].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', bubbles:true}));`);
+            await page.waitFor('restored upload plays', `document.querySelectorAll('#playlist-list tr')[${index}].classList.contains('current') && document.getElementById('title').textContent.toLowerCase().includes('${title}') && document.getElementById('transport-chip').textContent === 'playing'`);
         }
         await page.evaluate("document.getElementById('library-server').click();");
         await page.waitFor('library reconnected', "!document.querySelector('#playlist-list .playlist-marker').textContent.includes('library not connected')");
@@ -1849,8 +1852,8 @@ async function runLibrary(executable, mode) {
             document.getElementById('playlist-panel').dispatchEvent(new DragEvent('drop', { dataTransfer: dropped, bubbles: true, cancelable: true }));
         `);
         await page.waitFor('nested upload added', "document.getElementById('playlist-count').textContent === '5' && document.getElementById('playlist-status').textContent.includes('outer.zip')");
-        await page.evaluate("document.querySelector('#playlist-list li:last-child').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));");
-        await page.waitFor('nested upload plays', "document.querySelector('#playlist-list li:last-child').classList.contains('current') && document.getElementById('title').textContent === 'Petrified'");
+        await page.evaluate("document.querySelector('#playlist-list tr:last-child').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));");
+        await page.waitFor('nested upload plays', "document.querySelector('#playlist-list tr:last-child').classList.contains('current') && document.getElementById('title').textContent === 'Petrified'");
 
 
         assert.deepEqual(page.consoleErrors, []);
@@ -1942,7 +1945,7 @@ async function runRemoteLibrary(executable, mode) {
         assert.equal(await page.evaluate("return document.getElementById('library-reopen').textContent;"), 'Reopen remote-synthetic.csv (streaming)');
         await page.evaluate(`if (${JSON.stringify(mode)} === 'fallback') document.getElementById('force-fallback').checked = true; document.getElementById('library-reopen').click();`);
         await page.waitFor('remote comments restored', "document.getElementById('library-summary').textContent.includes('1 tracks matched')");
-        await page.evaluate("document.querySelector('#playlist-list li').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));");
+        await page.evaluate("document.querySelector('#playlist-list tr').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));");
         await page.waitFor('remote playlist plays', "document.getElementById('title').textContent.toLowerCase().includes('reflex') && document.getElementById('transport-chip').textContent === 'playing'");
         cors = false;
         await page.evaluate(`const input = document.getElementById('library-proxy'); input.value = ${JSON.stringify(proxyBase.slice(0, -1))}; input.dispatchEvent(new Event('change'));`);
@@ -1986,6 +1989,7 @@ await verifyPackagedSources();
 if (options.pagesSmoke) {
     console.log(`pages-smoke ${JSON.stringify(await runPagesSmoke({ Page, executable, dist: DIST, syntheticMod, buildZip }))}`);
 } else for (const mode of options.modes) {
+    if (options.playlistSelectionOnly) { console.log(`playlist-selection[${mode}] ${JSON.stringify(await runPlaylistSelection({ Page, executable, mode, startDevServer }))}`); continue; }
     if (options.transportOnly) { console.log(`transport[${mode}] ${JSON.stringify(await run(executable, mode))}`); continue; }
     if (options.interactiveOnly) { console.log(`interactive[${mode}] ${JSON.stringify(await runInteractive({ Page, executable, mode, startDevServer, loadFile, syntheticMod }))}`); continue; }
     if (!options.libraryOnly && !options.w15Only) {
@@ -2005,5 +2009,6 @@ if (options.pagesSmoke) {
     if (!options.w15Case || options.w15Case === 'runtime') console.log(`w15-runtime[${mode}] ${JSON.stringify(await runW15Runtime({ Page, executable, mode, startDevServer, syntheticMod }))}`);
     if (!options.w15Only) console.log(`remote-library[${mode}] ${JSON.stringify(await runRemoteLibrary(executable, mode))}`);
     if (!options.w15Only) console.log(`library[${mode}] ${JSON.stringify(await runLibrary(executable, mode))}`);
+    if (!options.w15Only) console.log(`playlist-selection[${mode}] ${JSON.stringify(await runPlaylistSelection({ Page, executable, mode, startDevServer }))}`);
 }
 console.log(options.pagesSmoke ? 'headless harness: Pages smoke passed' : 'headless harness: all requested modes passed');

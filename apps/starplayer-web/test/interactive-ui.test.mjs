@@ -26,9 +26,9 @@ class Element {
 }
 function instrumentHarness(capabilities = [11, 31, 29, 3, 0, 2, 6]) {
     const records = [];
-    const elements = Object.fromEntries(['title', 'moduleDetail', 'seekOrder', 'instrumentCount', 'instrumentList', 'instrumentSelectAll', 'keyboardEnable', 'inputDestination', 'overlapEnable'].map(key => [key, new Element()]));
-    const state = { metadata: { title: 'native IT', label: 'fixture.it', channels: 64, orders: 1, patterns: 1, instruments: capabilities.map((capability, index) => ({ capability, length: capability ? 123 + index : 0, name: `instrument${index}` })) }, selectedInstrument: null, interactiveReady: true, letNotesRing: [true], overlapEnabled: false, fallbackCommands: [], keysDown: new Map(), context: null };
-    const sandbox = { state, elements, document: { createElement: tag => new Element(tag) }, backgroundOutput: { start() {} }, sizeInstrumentColumn() {}, ensureChannelRows() {}, queueInteractive: (...record) => records.push(record), flushFallbackCommands() {}, releaseHeldKeys() {}, syncLiveInput() {}, updateLiveInputPanel() {} };
+    const elements = Object.fromEntries(['title', 'moduleDetail', 'seekOrder', 'instrumentCount', 'instrumentList', 'instrumentSelectAll', 'keyboardEnable', 'inputDestination', 'overlapEnable', 'uniqueNotes'].map(key => [key, new Element()]));
+    const state = { metadata: { title: 'native IT', label: 'fixture.it', channels: 64, orders: 1, patterns: 1, instruments: capabilities.map((capability, index) => ({ capability, length: capability ? 123 + index : 0, name: `instrument${index}` })) }, selectedInstrument: null, referenceNote: 60, interactiveReady: true, letNotesRing: [true], overlapEnabled: false, fallbackCommands: [], keysDown: new Map(), context: null };
+    const sandbox = { state, elements, formatNote: note => `C-${Math.floor(note / 12)}`, document: { createElement: tag => new Element(tag) }, backgroundOutput: { start() {} }, sizeInstrumentColumn() {}, ensureChannelRows() {}, queueInteractive: (...record) => records.push(record), flushFallbackCommands() {}, releaseHeldKeys() {}, syncLiveInput() {}, updateLiveInputPanel() {} };
     vm.createContext(sandbox); vm.runInContext(ring, sandbox); sandbox.Ring = sandbox.StarPlayerRing;
     vm.runInContext(['renderMetadata', 'updateInstrumentControls', 'setAllInstrumentOverlap', 'selectInstrument', 'cleanupLiveInput'].map(source).join('\n'), sandbox);
     sandbox.renderMetadata();
@@ -64,7 +64,7 @@ test('compact semantic table keeps independent PCM, live, reference-preview, loo
     state.metadata.instruments[0].name = ''; // A new module rebuild gives empty-name fallbacks.
     state.metadata.instruments = [...state.metadata.instruments];
     const html = await readFile(new URL('../www/index.html', import.meta.url), 'utf8');
-    assert.match(html, /<th scope="col">#<\/th><th scope="col">Play<\/th><th scope="col">Name<\/th><th scope="col">Loop<\/th><th scope="col"><label[^>]+><input id="instrument-select-all"[^>]+><\/label><\/th><th scope="col"[^>]+>Frames<\/th>/);
+    assert.match(html, /<th scope="col">#<\/th><th scope="col" aria-label="Play"><\/th><th scope="col">Name<\/th><th scope="col" aria-label="Loop"><\/th><th scope="col"><label[^>]+><input id="instrument-select-all"[^>]+><\/label><\/th><th scope="col"[^>]+>Frames<\/th>/);
 });
 
 test('row activation retains native controls and same-module refresh preserves accepted selection and readiness', () => {
@@ -101,11 +101,11 @@ test('one-shot Preview-up finishes; looping Preview-up releases; cancel and focu
     const { rows, records, Ring } = instrumentHarness();
     const shot = rows[0].querySelector('button'), loop = rows[2].querySelector('button');
     shot.fire('pointerdown'); shot.fire('pointerup'); shot.fire('lostpointercapture');
-    assert.deepEqual(records, [[Ring.OPCODE_PREVIEW, 0]]);
+    assert.deepEqual(records, [[Ring.OPCODE_PREVIEW_NOTE, 0, 60]]);
     loop.fire('pointerdown'); loop.fire('pointerup'); loop.fire('lostpointercapture');
-    assert.deepEqual(records.slice(1), [[Ring.OPCODE_PREVIEW, 2], [Ring.OPCODE_RELEASE_PREVIEW]]);
+    assert.deepEqual(records.slice(1), [[Ring.OPCODE_PREVIEW_NOTE, 2, 60], [Ring.OPCODE_RELEASE_PREVIEW]]);
     loop.fire('keydown', { key: ' ', repeat: false }); loop.fire('keyup', { key: ' ' }); loop.fire('click', { detail: 0 });
-    assert.deepEqual(records.slice(3), [[Ring.OPCODE_PREVIEW, 2], [Ring.OPCODE_RELEASE_PREVIEW]], 'keyboard activation never duplicates the click');
+    assert.deepEqual(records.slice(3), [[Ring.OPCODE_PREVIEW_NOTE, 2, 60], [Ring.OPCODE_RELEASE_PREVIEW]], 'keyboard activation never duplicates the click');
     shot.fire('pointerdown'); shot.fire('pointercancel');
     assert.equal(records.at(-1)[0], Ring.OPCODE_STOP_PREVIEW);
     loop.fire('pointerdown'); loop.fire('blur');
@@ -326,7 +326,7 @@ test('failed posted loads restore controls only with unchanged control and audio
         sandbox.elements.inputDestination.value = 'jam'; sandbox.elements.keyboardEnable.checked = false;
         Object.assign(sandbox.state, { node, metadata: { ...sandbox.state.metadata, identity }, pendingLoads: new Map(), sessionClock: 4n, buildClock: 8n, nextRequestId: 1, liveInputPending: false });
         Object.assign(sandbox, { playback: { effectiveAtEnd: () => false }, SONG_FADE_SECONDS: 3, loadOptionsFromControls: () => ({}), updateModPanningAvailability() {}, setControlsEnabled: enabled => { sandbox.enabled = enabled; } });
-        vm.createContext(sandbox); vm.runInContext(source('restoreUnreadyInteractiveControls') + source('activateModuleOnNode') + source('onWorkletMessage'), sandbox);
+        vm.createContext(sandbox); vm.runInContext(source('pagePolicies') + source('restoreUnreadyInteractiveControls') + source('activateModuleOnNode') + source('onWorkletMessage'), sandbox);
         if (proof === 'not-ready') sandbox.state.interactiveReady = false;
         const pending = sandbox.activateModuleOnNode(node, new ArrayBuffer(0));
         const rejected = assert.rejects(pending, /bad audio bytes/);
@@ -346,6 +346,11 @@ test('failed posted loads restore controls only with unchanged control and audio
         if (proof === 'superseded') { node.starplayerLatestLoadRequest = 99; sandbox.state.interactiveReady = true; }
         const retainedIdentity = proof === 'changed' ? { session: 9n, build: 9n } : proof === 'absent' ? undefined : identity;
         sandbox.onWorkletMessage({ type: 'moduleError', requestId: sent[0].requestId, reason: 'bad audio bytes', retainedIdentity, retainedCapabilities: proof === 'caps' ? 1 : 3 }, node);
+        if (proof === 'retained') {
+            assert.equal(sandbox.state.interactiveReady, false, 'retention proof alone cannot enable input before policy reconciliation');
+            assert.equal(sent.at(-1).type, 'reconcilePolicies');
+            sandbox.onWorkletMessage({ type: 'moduleLoaded', requestId: sent[0].requestId, identity, capabilities: 3, accepted: true, policyRevision: 0 }, node);
+        }
         await rejected;
         assert.equal(sandbox.state.interactiveReady, proof === 'retained' || proof === 'superseded');
         assert.equal(sandbox.enabled, proof === 'superseded' ? undefined : proof === 'retained');
@@ -558,16 +563,52 @@ test('fresh load cancels unsent old-session instrument edits while replacement r
         ];
         elements.volume = { value: 100 };
         Object.assign(harness, { playback: { effectiveAtEnd: () => false }, SONG_FADE_SECONDS: 3, updateModPanningAvailability() {}, setControlsEnabled() {}, loadOptionsFromControls: () => ({}), showError() {} });
-        vm.createContext(harness); vm.runInContext(['restoreUnreadyInteractiveControls', 'activateModuleOnNode', 'onWorkletMessage'].map(source).join('\n'), harness);
+        vm.createContext(harness); vm.runInContext(['pagePolicies', 'restoreUnreadyInteractiveControls', 'activateModuleOnNode', 'onWorkletMessage'].map(source).join('\n'), harness);
         const pending = harness.activateModuleOnNode(state.node, new ArrayBuffer(0), {}, replacement);
         const rejected = assert.rejects(pending, /expected load failure/);
         assert.equal(state.fallbackCommands.length, replacement ? 3 : 2);
         assert.equal(state.fallbackCommands.some(record => record.opcode === Ring.OPCODE_LET_NOTES_RING && Ring.sameIdentity(record.identity, previous)), !!replacement);
         assert.equal(state.fallbackCommands.some(record => record.opcode === Ring.OPCODE_MASTER_VOLUME), true);
         harness.onWorkletMessage({ type: 'moduleError', requestId: sent[0].requestId, retainedIdentity: previous, retainedCapabilities: 3, reason: 'expected load failure' }, state.node);
+        assert.equal(state.interactiveReady, false);
+        assert.equal(sent.at(-1).type, 'reconcilePolicies');
+        harness.onWorkletMessage({ type: 'moduleLoaded', requestId: sent[0].requestId, identity: previous, capabilities: 3, accepted: true, policyRevision: 0 }, state.node);
         await rejected;
         assert.equal(state.interactiveReady, true);
         assert.equal(state.letNotesRing[0], true, 'accepted selections survive cancelled pending edits and failed load');
         assert.equal(state.instrumentRows[0].checkbox.checked, true);
     }
+});
+
+
+test('selected reference uses committed key metadata and captures native loop release for a held press', () => {
+    const harness = instrumentHarness([11, 31]);
+    const { state, rows, records, Ring } = harness;
+    const first = state.metadata.instruments[0], second = state.metadata.instruments[1];
+    first.noteCapabilities = Array(128).fill(0); first.noteCapabilities[61] = 1;
+    second.noteCapabilities = Array(128).fill(0); second.noteCapabilities[61] = 3; second.noteCapabilities[62] = 1;
+    harness.updateInstrumentControls();
+    assert.equal(rows[0].querySelector('button').disabled, true, '60 unmapped despite aggregate legacy capability');
+    state.referenceNote = 61; harness.updateInstrumentControls();
+    const shot = rows[0].querySelector('button'), loop = rows[1].querySelector('button');
+    assert.equal(shot.disabled, false); shot.fire('pointerdown'); shot.fire('pointerup');
+    assert.deepEqual(records, [[Ring.OPCODE_PREVIEW_NOTE, 0, 61]]);
+    loop.fire('pointerdown'); state.referenceNote = 62; harness.updateInstrumentControls(); loop.fire('pointerup');
+    assert.deepEqual(records.slice(1), [[Ring.OPCODE_PREVIEW_NOTE, 1, 61], [Ring.OPCODE_RELEASE_PREVIEW]], 'button-up releases the looping note captured at press');
+    assert.equal(state.referenceNote, 62); assert.equal(state.instrumentRows[1].preview, loop, 'chooser change retains control nodes');
+    loop.fire('pointerdown'); state.referenceNote = 61; harness.updateInstrumentControls(); loop.fire('pointerup');
+    assert.deepEqual(records.slice(3), [[Ring.OPCODE_PREVIEW_NOTE, 1, 62]], 'a one-shot does not become looping while held');
+    loop.fire('pointerdown'); state.referenceNote = 127; harness.updateInstrumentControls();
+    assert.equal(loop.disabled, false, 'held capture remains until release'); loop.fire('pointerup');
+    assert.equal(loop.disabled, true, 'the next unavailable key disables preview after release');
+    assert.deepEqual(records.slice(4), [[Ring.OPCODE_PREVIEW_NOTE, 1, 61], [Ring.OPCODE_RELEASE_PREVIEW]]);
+});
+
+test('inspection key flags are copied before the inspection module changes', () => {
+    let keys = new Uint8Array(128); keys[61] = 3;
+    const Loader = { module_instrument_count: () => 1, instrument_name: () => 'mapped', instrument_sample_length: () => 32, instrument_capability: () => 7, instrument_note_capabilities: () => keys, module_title: () => 'retained', module_channel_count: () => 1, module_order_count: () => 1, module_pattern_count: () => 1, module_is_mod: () => false };
+    const sandbox = { Loader }; vm.createContext(sandbox); vm.runInContext(source('readMetadata'), sandbox);
+    const metadata = sandbox.readMetadata('retained.xm');
+    keys.fill(0); keys = new Uint8Array(128); keys[60] = 1;
+    assert.equal(metadata.instruments[0].noteCapabilities[61], 3); assert.equal(metadata.instruments[0].noteCapabilities[60], 0);
 });
