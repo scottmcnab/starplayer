@@ -835,24 +835,19 @@ mod tests {
     /// `Continue` the second pass starts there with the elapsed clock rebased onto that
     /// order's scanned frame, and the *third* pass ends the same way — the wrap must be
     /// `Visit::Wrapped` again, not a spurious `Looped` off the re-marked map.
-    ///
-    /// The scan and the playback sequencer are given different restart orders on purpose:
-    /// [`PatternSequencer::new`] starts a song at its restart order, so a song that starts
-    /// at the top and restarts at order 2 cannot be spelled any other way until a MOD's
-    /// Noisetracker restart byte is read (out of scope in D1).
     #[test]
     fn a_restart_order_in_the_middle_of_the_song_wraps_onto_its_own_frame_every_pass() {
         let data = DemoPatternData::new(4, 2, 1);
-        let timeline = scan(data.clone());
+        let settings = SequencerSettings { restart_order: 2, ..SequencerSettings::default() };
+        let timeline = scan_with(data.clone(), settings);
         assert_eq!(timeline.end(), EndReason::Ended);
         let row_length = 6 * FRAMES_PER_TICK;
         assert_eq!(timeline.end_frame(), 8 * row_length);
 
-        let settings = SequencerSettings { restart_order: 2, ..SequencerSettings::default() };
         let mut built = sequencer(data, settings);
         built.set_timeline(timeline.clone());
         built.set_at_end(AtEnd::Continue);
-        assert!(built.seek_order_at(0, Frame::ZERO), "the song itself starts at the top");
+        assert_eq!(built.position(), SongPosition { order: 0, pattern: 0, row: 0 }, "the first pass starts at the top");
 
         let restart_frame = timeline.frame_at(2, 0).expect("the scan reached order 2");
         assert_eq!(restart_frame, 4 * row_length);
@@ -887,7 +882,7 @@ mod tests {
         let mut built = sequencer(data, settings);
         built.set_timeline(timeline.clone());
         built.set_at_end(AtEnd::Continue);
-        assert!(built.seek_order_at(0, Frame::ZERO), "the song itself starts at the top");
+        assert_eq!(built.position(), SongPosition { order: 0, pattern: 0, row: 0 }, "the first pass starts at the top");
 
         let row_length = 6 * FRAMES_PER_TICK;
         let mut harness = Harness::new();

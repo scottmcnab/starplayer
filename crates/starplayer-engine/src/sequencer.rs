@@ -648,7 +648,8 @@ pub struct SequencerSettings {
     pub initial_speed: u8,
     /// Tempo before any `Txx`. S3M's `_initialBPM`, conventionally 125.
     pub initial_tempo_bpm: u16,
-    /// Order-list index the song restarts from when it loops.
+    /// Order-list index the song restarts from when it loops. The first pass starts at
+    /// the first playable order at or after order zero.
     pub restart_order: u16,
     /// What the end of the order list means.
     pub end_of_song: EndOfSongPolicy,
@@ -793,7 +794,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             last_arrival: RowArrival::Start,
             last_row_visit: None,
         };
-        if !sequencer.move_to_order(settings.restart_order, 0) {
+        // The restart order applies only after the first pass through the order list.
+        if !sequencer.move_to_order(0, 0) {
             sequencer.state = SequencerState::Stopped;
         }
         sequencer.song_looped = false;
@@ -1873,6 +1875,18 @@ mod tests {
         assert!(sequencer.song_looped());
         assert!(sequencer.take_song_looped());
         assert!(!sequencer.song_looped(), "taking the flag clears it");
+    }
+
+    #[test]
+    fn an_unplayable_restart_order_does_not_skip_the_first_pass_or_spin_at_its_end() {
+        let settings = SequencerSettings { restart_order: 99, ..SequencerSettings::default() };
+        let mut sequencer = sequencer(DemoPatternData::new(1, 2, 1), settings);
+        let mut harness = Harness::new();
+        assert_eq!(sequencer.position(), SongPosition { order: 0, pattern: 0, row: 0 });
+        assert!(!sequencer.is_stopped());
+        harness.ticks(&mut sequencer, 12);
+        assert!(sequencer.is_stopped(), "an unplayable restart fails the bounded wrap retry");
+        assert_eq!(sequencer.processor().rows_played(), 2, "all first-pass rows played before the failed restart");
     }
 
     #[test]
