@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | NO-01–07 and NO-W1 integrated on feature/note-overlap-audition; available automated verification passed; owner listening/device acceptance pending; no main merge or deployment; reviewed contract unchanged |
+| Status | NO-01–08 and NO-W1 integrated on feature/note-overlap-audition; independent Opus/Astra full and corrective reviews accepted; automated verification passed; owner/device acceptance pending; no main merge/deploy; product contract unchanged |
 | Created | 2026-10-27 |
 | Branch / worktree | `feature/note-overlap-audition` / `../starplayer-note-overlap-audition` |
 | Goal | Optional instrument-only note overlap in MOD/S3M/MTM/XM/IT; faithful audition; sequencer-only Pause |
@@ -250,7 +250,8 @@ NO-03 owns one engine-level cadence authority for loaded-format articulation, co
 by song and live runtimes. While Playing, tracker ticks drive it; while Paused/Stopped,
 after natural sequence exhaustion, or without a tracker, it synthesises steps at the
 retained/module-initial cadence with fractional remainder preserved. A host without a
-loaded tracker uses an explicit configured format cadence (default 50 Hz), never the
+loaded tracker uses an explicit configured format cadence (default 50 Hz), clamped to at
+least one output frame for zero/sub-frame settings, never the
 MidiSource 1 ms housekeeping clock. The latter may still service simple instruments or
 input, but must not advance loaded XM/IT articulation a second time.
 
@@ -284,6 +285,10 @@ trait (default no-op, forwarded in SourceMux slot order). After due source dispa
 the exact frame, call this method once when the cadence is due. NO-06 implements it for
 MidiSource's format runtime. The MIDI 1 ms deadline must not defer this step. NO-03 tests
 a scripted consumer before NO-06 lands the real one.
+
+IT suppression after explicit clear records actual accepted-start history. Initial
+Stopped/setup must preserve native first instrument-only C0 starts: default note memory
+or an instrument latched without any accepted voice is not a previously cleared note.
 
 ### Host transport, cleanup and telemetry
 
@@ -528,6 +533,7 @@ review. Implementation is authorised by the 2026-10-27 owner handoff. The coordi
 | [NO-06](NO-task-06-faithful-audition.md) | Faithful loaded-module audition | gpt-6-astra (medium) | NO-03 and NO-05 |
 | [NO-W1](../apps/NO-task-W1-web-controls.md) | Web transport, Instruments panel and command bridge | gpt-6.1-sol (high) | NO-06 (and all its dependencies) |
 | [NO-07](NO-task-07-integration-and-acceptance.md) | Integration, determinism and feature exclusion | gpt-6.1-sol (high) | NO-W1 and NO-01–06 |
+| [NO-08](NO-task-08-branch-review-fixes.md) | Independent branch-review corrections and regressions | gpt-6.1-sol (high) | Integrated NO-01–07 and NO-W1; coordinator dispositions |
 
 Recommended landing order: 01 → 02 → 03 → 04 → 05 → 06 → W1 → 07.
 04 can be prepared independently after 01, with NO-03 cleanup integrated before landing;
@@ -683,3 +689,72 @@ proof, diagnostic failures, settled logs and generated listening/browser artifac
 The coordinator accepted task commit `0d1eb0e` and integrated it as one reviewed change
 from the feature branch checkout; no main merge/deployment or plan archival occurs here. Owner listening, physical MIDI, phone/device acceptance
 and firmware execution remain honestly pending, without blocking worker completion.
+
+
+### Independent implementation reviews and NO-08 — 2026-10-28
+
+The owner requested full-branch source reviews from Opus5.5/high and Astra/medium. Both
+reviewed frozen `5547944` independently; Opus additionally covered declared web/test gaps.
+Eight distinct source-backed corrections are accepted without changing the product
+contract: external lookahead visibility, first-attachment timing, IT clear suppression,
+minimum synthesized cadence, coalesced transition telemetry, malformed v2 group rejection,
+Pause-after-natural-end rewind and invalid-seek DSP preservation.
+[Raw reports and dispositions](NO-branch-review-2026-10-28.md) distinguish actual findings
+from design observations, baseline issues and coverage limits. [NO-08](NO-task-08-branch-review-fixes.md)
+owns failing-first regressions and final verification in an isolated sibling task worktree.
+Only one task/reviewer/build stream runs at once. Main merge/deployment and subjective/
+device acceptance remain outside this work.
+
+
+NO-08 source-review clarification: a genuine IT note-only recovery after explicit clear
+must resolve its remembered instrument for sample mapping without treating that memory
+as an authored instrument column. Current native base volume, IFC/IFR filter memory and
+passive onset-volume identity must survive; only an actual instrument change replays
+sample/instrument defaults. This preserves Stop's existing effect-memory contract.
+
+
+### NO-08 corrective implementation evidence — 2026-10-28
+
+All eight accepted corrections are implemented in the isolated NO-08 checkout, with
+failing-before evidence and final settled-source verification in [NO-08](NO-task-08-branch-review-fixes.md).
+IT source review additionally preserves fresh native first instrument-only starts and
+post-clear note-only volume/filter memories through explicit accepted-start history and
+mapping-only recovery. Final whole CI passes all 11 jobs, affected 963 tests pass, all
+independent feature/resource/portable matrices pass, all eight goldens and 24 prepared
+hashes remain unchanged, and final 344 JS plus packaged wire/worklet and ordinary/interactive
+Chromium SAB/fallback/plain pass. The diff remains unstaged/uncommitted for coordinator
+source review and reviewer follow-ups. No main merge/deployment or owner listening/device
+acceptance is implied; plans remain outstanding at their current paths.
+
+
+NO08-A1 corrective review found one remaining malformed fallback opcode-type gap within
+the accepted atomic-wire correction. A common integer/range guard now prevents fractional,
+string and BigInt opcodes from coercing to native controls or throwing at WASM admission.
+Direct and actual-worklet failing evidence and post-guard JS/package/browser verification
+belong to NO-08. Rust production remains unchanged from its settled 11-job CI pass;
+reviewer closure is pending.
+
+NO08-A1 post-guard verification passed 347 JS tests, 22 web tests, packaged ring/worklet
+checks including all nine malformed opcode cases, strict pending Stop stress and all six
+ordinary/interactive Chromium modes. Rust source/test hashes are unchanged from settled
+CI. Final manifests/evidence are in NO-08; focused reviewer closure remains pending.
+
+
+### NO-08 final coordinator acceptance — 2026-10-28
+
+All eight independent review corrections and the bounded opcode follow-up are accepted
+by both final Opus5.5/high and Astra/medium source reviews after coordinator source and
+18-Rust/10-wire verification. Settled CI11, affected963, post-guard JS347/web22, all six
+browser modes and fresh compile-only A1S/C5/common96 checks pass. Exact chronology, raw
+reports/limits, source fingerprints and diagnostic failures remain in NO-08/review record.
+The provider-quota interrupted closing attempt was retried successfully after its reset;
+no model was substituted and no acceptance was claimed prematurely.
+
+
+### NO-08 coordinator feature landing — 2026-10-28
+
+Reviewed task `20dbc07` is integrated by single-change squash. Both requested independent
+full-branch reviews and their corrective follow-ups are complete; eight accepted findings
+are resolved without changing the product contract. The final code/test manifest is
+unchanged from the reviewed/verified tree. NO-08 owns exact evidence and remaining owner
+acceptance. No main merge, deployment or archival occurred.

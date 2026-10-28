@@ -20,6 +20,7 @@ import { verifyPlaylistStore } from './playlist-store.test.mjs';
 // a regression in the display is as visible here as a regression in the engine.
 //
 // Usage: node apps/starplayer-web/test/headless.mjs [--seconds 60] [--mode sab|fallback|plain]
+// Focused transport/preparation regression: --transport-only --seconds 5.
 // W15-only: --w15-only, or --w15-case app|view|stress|playlist|runtime|remediation.
 // Dedicated evidence: --w15-case performance|digest|background|visibility|enumeration (select one mode).
 // Background runs at least six minutes with normal throttling. STARPLAYER_BACKGROUND_SMOKE=1
@@ -48,9 +49,10 @@ const PHONE_VIEWPORT = { width: 390, height: 844 };
 const options = parseArguments(process.argv.slice(2));
 
 function parseArguments(argv) {
-    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false, interactiveOnly: false };
+    const parsed = { seconds: 60, modes: ['sab', 'fallback', 'plain'], libraryOnly: false, w15Only: false, w15Case: null, pagesSmoke: false, interactiveOnly: false, transportOnly: false };
     for (let index = 0; index < argv.length; index += 1) {
-        if (argv[index] === '--interactive-only') parsed.interactiveOnly = true;
+        if (argv[index] === '--transport-only') parsed.transportOnly = true;
+        else if (argv[index] === '--interactive-only') parsed.interactiveOnly = true;
         else if (argv[index] === '--pages-smoke') parsed.pagesSmoke = true;
         else if (argv[index] === '--w15-only') parsed.w15Only = true;
         else if (argv[index] === '--w15-case') { parsed.w15Case = argv[++index]; parsed.w15Only = true; }
@@ -543,6 +545,15 @@ async function run(executable, mode) {
         await page.evaluate(`
             window.__firstPlayingGeneration = {};
             window.__interactiveApplied = [];
+            window.__insertMessages = [];
+            window.__insertRequests = [];
+            window.__wireCommands = [];
+            const pushCommand = StarPlayerRing.pushCommand;
+            StarPlayerRing.pushCommand = (...arguments_) => {
+                const accepted = pushCommand(...arguments_);
+                window.__wireCommands.push({ opcode: arguments_[1], argument: arguments_[2], extra: arguments_[3], accepted });
+                return accepted;
+            };
             const observe = snapshot => {
                 if (snapshot?.playing && !window.__firstPlayingGeneration[snapshot.moduleGeneration]) {
                     window.__firstPlayingGeneration[snapshot.moduleGeneration] = { order: snapshot.order, row: snapshot.row, generation: snapshot.moduleGeneration, channelCount: snapshot.channelCount };
@@ -557,10 +568,16 @@ async function run(executable, mode) {
                 constructor(...arguments_) {
                     super(...arguments_);
                     window.__observedNode = this;
+                    const postMessage = this.port.postMessage.bind(this.port);
+                    this.port.postMessage = (message, ...transfer) => {
+                        if (message.type === 'inserts') window.__insertRequests.push({ requestId: message.requestId, action: message.action, target: message.target, slot: message.slot, session: String(message.identity?.session), build: String(message.identity?.build) });
+                        return postMessage(message, ...transfer);
+                    };
                     this.port.addEventListener('message', event => {
                         if (window.__observedNode !== this) return;
                         if (event.data.type === 'telemetry') observe(event.data);
                         if (event.data.type === 'interactiveApplied') window.__interactiveApplied.push({ accepted: event.data.accepted, commands: Array.from(event.data.commands).slice(0, event.data.count * 3) });
+                        if (event.data.type === 'insertsApplied' || event.data.type === 'insertsError') window.__insertMessages.push({ type: event.data.type, accepted: event.data.accepted, requestId: event.data.requestId, action: event.data.action, session: String(event.data.identity?.session), build: String(event.data.identity?.build), reason: event.data.reason });
                         if (event.data.type === 'moduleLoaded' && event.data.accepted) window.__installedObservedGeneration = event.data.generation;
                     });
                 }
@@ -863,6 +880,8 @@ async function run(executable, mode) {
             const select = slot.querySelector('select');
             select.value = '';
             select.dispatchEvent(new Event('change'));
+            window.__removeInsertRequest = window.__insertRequests.at(-1);
+            window.__stopBefore = { disabled: document.getElementById('stop').disabled, transport: document.getElementById('transport-chip').textContent, capabilities: window.__observedNode.starplayerCapabilities, session: String(window.__observedNode.starplayerIdentity?.session), build: String(window.__observedNode.starplayerIdentity?.build), inserts: window.__insertMessages.slice(-4), commands: window.__wireCommands.slice(-8), acks: window.__interactiveApplied.slice(-4) };
             return select.value === '';
         `);
         assert.equal(reverbRemoved, true, 'choosing None removes the installed effect');
@@ -871,13 +890,40 @@ async function run(executable, mode) {
             "document.querySelectorAll('#effects-slots .effects-slot')[0].querySelectorAll('.effects-param').length === 0",
         );
 
+        // None's optimistic panel is not proof that the removal reached audio.
+        await page.waitFor('the accepted insert removal boundary', "window.__removeInsertRequest?.action === 'remove' && window.__insertMessages.some(message => message.requestId === window.__removeInsertRequest.requestId && message.type === 'insertsApplied' && message.accepted && message.action === 'remove' && message.session === window.__removeInsertRequest.session && message.build === window.__removeInsertRequest.build && message.session === String(window.__observedNode.starplayerIdentity.session) && message.build === String(window.__observedNode.starplayerIdentity.build))");
         // ── transport ───────────────────────────────────────────────────────────────
+        report.removeBefore = await page.evaluate('return window.__stopBefore;');
+        report.stopBefore = await page.evaluate("return { disabled: document.getElementById('stop').disabled, removal: window.__removeInsertRequest, applied: window.__insertMessages.find(message => message.requestId === window.__removeInsertRequest.requestId) };");
         await page.evaluate("document.getElementById('stop').click(); return true;");
-        await page.waitFor('the transport to stop', "document.getElementById('transport-chip').textContent === 'stopped'");
+        try { await page.waitFor('the transport to stop', "document.getElementById('transport-chip').textContent === 'stopped'"); }
+        catch (error) {
+            const after = await page.evaluate(`return { disabled: document.getElementById('stop').disabled, transport: document.getElementById('transport-chip').textContent, inserts: window.__insertMessages.slice(-4), commands: window.__wireCommands.slice(-12), acks: window.__interactiveApplied.slice(-8) };`);
+            console.log('transport-stop diagnostics', JSON.stringify({ before: report.stopBefore, after })); throw error;
+        }
         await delay(500);
         const stopped = await page.evaluate(READ_STATE);
         const stillStopped = await page.evaluate(READ_STATE);
         assert.equal(stopped.row, stillStopped.row, 'a stopped transport freezes the row');
+        if (options.transportOnly) {
+            report.stopped = stopped;
+            report.pendingInsertStop = [];
+            for (const milliseconds of [0, 1, 5, 10, 20, 50]) {
+                const ackStart = await page.evaluate("const count = window.__interactiveApplied.length; document.getElementById('play').click(); return count;");
+                await page.waitFor('playing command applied before pending-insert stress', `window.__interactiveApplied.slice(${ackStart}).some(message => message.accepted && message.commands.some((value, index) => index % 3 === 0 && value === StarPlayerRing.OPCODE_INTERACTIVE_PLAY)) && document.getElementById('transport-chip').textContent === 'playing'`);
+                const enabled = await page.evaluate(`
+                    const node = window.__observedNode;
+                    node.port.postMessage({ type: 'inserts', version: 2, identity: node.starplayerIdentity, requestId: 10000 + ${milliseconds}, action: 'remove', target: 1, slot: 0 });
+                    return new Promise(resolve => setTimeout(() => { const enabled = !document.getElementById('stop').disabled; document.getElementById('stop').click(); resolve(enabled); }, ${milliseconds}));
+                `);
+                assert.equal(enabled, true);
+                await page.waitFor('Stop survives pending insert preparation', "document.getElementById('transport-chip').textContent === 'stopped'");
+                const held = await page.evaluate(READ_STATE); await delay(128); const later = await page.evaluate(READ_STATE);
+                assert.equal(later.row, held.row, 'pending-insert Stop freezes the row');
+                report.pendingInsertStop.push(milliseconds);
+            }
+            return report;
+        }
         await page.evaluate("document.getElementById('seek-order').value = '1'; document.getElementById('seek-order').dispatchEvent(new Event('change')); return true;");
         await page.evaluate("document.getElementById('play').click(); return true;");
         await page.waitFor('playback to resume', "document.getElementById('transport-chip').textContent === 'playing'");
@@ -1940,6 +1986,7 @@ await verifyPackagedSources();
 if (options.pagesSmoke) {
     console.log(`pages-smoke ${JSON.stringify(await runPagesSmoke({ Page, executable, dist: DIST, syntheticMod, buildZip }))}`);
 } else for (const mode of options.modes) {
+    if (options.transportOnly) { console.log(`transport[${mode}] ${JSON.stringify(await run(executable, mode))}`); continue; }
     if (options.interactiveOnly) { console.log(`interactive[${mode}] ${JSON.stringify(await runInteractive({ Page, executable, mode, startDevServer, loadFile, syntheticMod }))}`); continue; }
     if (!options.libraryOnly && !options.w15Only) {
         const report = await run(executable, mode);

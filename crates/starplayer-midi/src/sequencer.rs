@@ -21,6 +21,8 @@ pub struct SmfSequencer {
     #[cfg(feature = "interactive-audition")]
     held_at: Option<Frame>,
     #[cfg(feature = "interactive-audition")]
+    prepared_at: Option<Frame>,
+    #[cfg(feature = "interactive-audition")]
     translation: u64,
     #[cfg(feature = "interactive-audition")]
     song_origin: i64,
@@ -44,6 +46,7 @@ impl SmfSequencer {
         }
         SmfSequencer { events, length_frames: smf.length_frames(sample_rate_hz), cursor: 0,
             #[cfg(feature = "interactive-audition")] held_at: None,
+            #[cfg(feature = "interactive-audition")] prepared_at: None,
             #[cfg(feature = "interactive-audition")] translation: 0,
             #[cfg(feature = "interactive-audition")] song_origin: start_frame.0.min(i64::MAX as u64) as i64,
             #[cfg(feature = "interactive-audition")] sample_rate_hz,
@@ -65,6 +68,7 @@ impl SmfSequencer {
     #[cfg(feature = "interactive-audition")]
     pub fn interactive_at(smf: &Smf, sample_rate_hz: u32, start_frame: Frame, cursor: Option<starplayer_core::SmfCursor>) -> Self {
         let mut source = Self::new_at(smf, sample_rate_hz, start_frame);
+        source.prepared_at = Some(start_frame);
         for event in &mut source.events {
             if let starplayer_core::Target::Channel(channel) = &mut event.target {
                 channel.0 = channel.0.saturating_sub(starplayer_engine::MIDI_CHANNEL_BASE);
@@ -103,6 +107,11 @@ impl SmfSequencer {
 impl EventFeed for SmfSequencer {
     #[cfg(feature = "interactive-audition")]
     fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame) {
+        if let Some(prepared) = self.prepared_at.take() {
+            let elapsed = prepared.frames_until(frame);
+            self.translation = self.translation.saturating_add(elapsed);
+            self.song_origin = self.song_origin.saturating_add(elapsed.min(i64::MAX as u64) as i64);
+        }
         if state == starplayer_core::InteractiveTransport::Playing {
             if let Some(held) = self.held_at.take() {
                 let elapsed = held.frames_until(frame);
@@ -151,6 +160,22 @@ mod tests {
 
     use super::*;
     use crate::smf::parse_smf;
+
+    #[cfg(feature = "interactive-audition")]
+    #[test]
+    fn no08_first_smf_attachment_rebases_only_sequenced_deadlines() {
+        use starplayer_core::InteractiveTransport;
+        for state in [InteractiveTransport::Playing, InteractiveTransport::Paused, InteractiveTransport::Stopped] {
+            let smf = parse_smf(&two_track_smf_bytes()).unwrap();
+            let cursor = starplayer_core::SmfCursor { event_index: 1, song_frame: 123, remaining_frames: Some(817), captured_frame: Frame(256), sample_rate_hz: 44_100 };
+            let mut source = SmfSequencer::interactive_at(&smf, 44_100, Frame(256), Some(cursor));
+            source.set_transport(state, Frame(4352));
+            let actual = source.smf_cursor(Frame(4352)).unwrap();
+            assert_eq!(actual.song_frame, 123, "{state:?}"); assert_eq!(actual.remaining_frames, Some(817));
+            source.set_transport(InteractiveTransport::Playing, Frame(4480));
+            assert_eq!(source.next_frame(), Some(Frame(if state == InteractiveTransport::Playing { 5169 } else { 5297 })));
+        }
+    }
 
     /// Two tracks, a tempo change and running status — the deliverable's own proof
     /// shape, reused here at the sequencer level.
@@ -253,7 +278,7 @@ mod interactive_tests {
     use starplayer_core::{Event, InteractiveTransport, Target};
     #[test]
     fn smf_holds_only_its_own_deadlines_and_repeated_toggles_preserve_remainder() {
-        let mut source = SmfSequencer { events: alloc::vec![TimedEvent { frame: Frame(1000), target: Target::Channel(starplayer_core::ChannelId(48)), event: Event::AllSoundOff }], length_frames: 2000, cursor: 0, held_at: None, translation: 0, song_origin: 0, sample_rate_hz: 44_100 };
+        let mut source = SmfSequencer { events: alloc::vec![TimedEvent { frame: Frame(1000), target: Target::Channel(starplayer_core::ChannelId(48)), event: Event::AllSoundOff }], length_frames: 2000, cursor: 0, held_at: None, prepared_at: None, translation: 0, song_origin: 0, sample_rate_hz: 44_100 };
         source.set_transport(InteractiveTransport::Paused, Frame(400));
         assert_eq!(source.next_frame(), None); assert!(source.pop_due(Frame(9000)).is_none());
         source.set_transport(InteractiveTransport::Stopped, Frame(500));

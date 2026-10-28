@@ -752,6 +752,9 @@ where
         #[cfg(feature = "telemetry")]
         self.scope_taps.begin_quantum();
 
+        // External queues can become nonempty between quanta. Poll at the current
+        // frame before choosing the first segment, without dispatching/articulating.
+        if self.audio_running() { self.sources.advance_to(self.source_frame); }
         let mut offset = 0usize;
         let mut events_this_quantum = 0u32;
 
@@ -876,10 +879,18 @@ where
 
     /// Apply up to [`MAX_COMMANDS_PER_QUANTUM`] queued commands.
     fn drain_commands(&mut self) {
+        #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+        let mut interactive_changed = false;
         for _ in 0..MAX_COMMANDS_PER_QUANTUM {
             let Some(command) = self.commands.pop() else { break };
+            #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+            { interactive_changed |= matches!(&command, Command::Interactive(_)); }
             self.apply_command(command);
         }
+        // The telemetry ring intentionally retains older snapshots under pressure.
+        // Publish the final transition once, so a burst cannot fill it with intermediates.
+        #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
+        if interactive_changed && self.interactive_transport.is_some() { self.publish_interactive(); }
     }
 
     /// Apply up to [`MAX_COMMANDS_PER_QUANTUM`] queued insert commands.
@@ -1048,8 +1059,6 @@ where
                 _ => self.warnings.unsupported_command = true,
             }
         }
-        #[cfg(all(feature = "interactive-audition", feature = "telemetry"))]
-        if self.interactive_transport.is_some() { self.publish_interactive(); }
         #[cfg(not(any(feature = "note-overlap", feature = "interactive-audition")))]
         { let _ = command; self.warnings.unsupported_command = true; }
     }
@@ -1128,7 +1137,11 @@ where
                 #[cfg(feature = "telemetry")]
                 self.telemetry.set_warnings(self.warnings.into());
 
+                #[cfg(feature = "interactive-audition")]
+                let mut reset_inserts = false;
                 let mut context = EngineContext::new(self.source_frame, &mut self.voices, &mut self.channels, &mut self.control);
+                #[cfg(feature = "interactive-audition")]
+                context.set_insert_reset_request(&mut reset_inserts);
                 context.set_warnings(&mut self.warnings);
                 #[cfg(feature = "telemetry")]
                 context.set_telemetry(&mut self.telemetry);
@@ -1139,6 +1152,11 @@ where
                 else { self.sources.dispatch(self.source_frame, &mut context); }
                 #[cfg(not(feature = "interactive-audition"))]
                 self.sources.dispatch(self.source_frame, &mut context);
+                #[cfg(feature = "interactive-audition")]
+                if reset_inserts {
+                    self.reset_all_inserts();
+                    self.clear_transition = self.interactive_transport.is_some();
+                }
             }
             // Re-read rather than reusing `control_due`: the dispatch above may have taken
             // the clock over, in which case there is no synthesised tick to take.

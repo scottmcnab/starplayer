@@ -87,6 +87,7 @@
         return validInteractiveArguments(opcode, argument, extra);
     }
     function validInteractiveArguments(opcode, argument, extra) {
+        if (!Number.isInteger(opcode) || opcode < 13 || opcode > 24) return false;
         if ((opcode >= 13 && opcode <= 18) || opcode === 21) return argument === 0 && extra === 0;
         if (opcode === 19) return argument <= 65537 && extra === 0;
         if (opcode === 20) return argument <= 65535 && extra === 0;
@@ -148,7 +149,9 @@
             const base = ring.headerWords + (read % COMMAND_CAPACITY) * ring.recordWords;
             const opcode = words[base];
             if (ring.version === 2) {
-                if ((opcode > 0 && opcode < 13) || validInteractiveArguments(opcode, words[base + 1] >>> 0, words[base + 2] >>> 0)) apply(opcode, words[base + 1] >>> 0, words[base + 2] >>> 0, words[base + 3] >>> 0, words[base + 4] >>> 0, words[base + 5] >>> 0, words[base + 6] >>> 0);
+                // Forward every consumed member to atomic group admission. Filtering a
+                // malformed member here would silently apply the valid remainder.
+                apply(opcode, words[base + 1] >>> 0, words[base + 2] >>> 0, words[base + 3] >>> 0, words[base + 4] >>> 0, words[base + 5] >>> 0, words[base + 6] >>> 0);
             } else if (opcode < 13) apply(opcode, words[base + 1], words[base + 2]);
             read = (read + 1) % COMMAND_INDEX_WRAP;
             applied += 1;
@@ -165,11 +168,18 @@
     // regardless of how many controls changed during that frame.
     function drainFallbackCommands(records, apply, version = 1) {
         if (!Array.isArray(records)) return 0;
-        if (records.length && typeof records[0] === 'object') {
+        if (version === INTERACTIVE_WIRE_VERSION || records.length && typeof records[0] === 'object') {
             if (version !== INTERACTIVE_WIRE_VERSION) return 0;
             let applied = 0;
             for (const record of records.slice(0, COMMAND_CAPACITY)) {
-                if (record && validWireWord(record.argument) && validWireWord(record.extra) && validIdentity(record.identity) && ((record.opcode > 0 && record.opcode < 13 && Number.isInteger(record.opcode)) || validInteractive(record.opcode, record.argument, record.extra, record.identity))) { apply(record.opcode, record.argument >>> 0, record.extra >>> 0, Number(record.identity.session & 0xffffffffn), Number(record.identity.session >> 32n), Number(record.identity.build & 0xffffffffn), Number(record.identity.build >> 32n)); applied += 1; }
+                const identity = record?.identity;
+                const session = typeof identity?.session === 'bigint' && identity.session >= 0n && identity.session <= MAX_U64 ? identity.session : 0n;
+                const build = typeof identity?.build === 'bigint' && identity.build >= 0n && identity.build <= MAX_U64 ? identity.build : 0n;
+                const valid = record && validWireWord(record.argument) && validWireWord(record.extra) && validIdentity(identity) && ((record.opcode > 0 && record.opcode < 13 && Number.isInteger(record.opcode)) || validInteractive(record.opcode, record.argument, record.extra, identity));
+                // Opcode zero is an explicit invalid member. Retain all representable
+                // identity words so the worklet can acknowledge the rejected group.
+                apply(valid ? record.opcode : 0, validWireWord(record?.argument) ? record.argument >>> 0 : 0, validWireWord(record?.extra) ? record.extra >>> 0 : 0, Number(session & 0xffffffffn), Number(session >> 32n), Number(build & 0xffffffffn), Number(build >> 32n));
+                applied += 1;
             }
             return applied;
         }

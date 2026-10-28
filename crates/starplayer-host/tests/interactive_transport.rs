@@ -302,3 +302,66 @@ fn preview_after_natural_end_is_audible_without_restarting_song() {
     assert!(render(&driver,2048).iter().any(|sample|*sample!=0.0));
     player.telemetry();assert!(player.natural_end());assert_eq!(player.song_frame(),ended);
 }
+
+#[test]
+fn no08_pause_after_natural_end_keeps_next_play_rewind() {
+    for at_end in [AtEnd::Stop, AtEnd::FadeOut] {
+        for resume in [false, true] {
+            let (_, mut player, driver) = open(); player.load(&module(true)).unwrap();
+            if at_end == AtEnd::Stop {
+                let mut ending = module(true);
+                ending[1100..1104].copy_from_slice(&starplayer::mod_file::ModCell { period: 0, instrument: 0, effect: 0xF, param: 0 }.to_bytes());
+                player.load(&ending).unwrap();
+            }
+            player.set_at_end(at_end).unwrap(); player.set_fade_frames(256).unwrap(); player.play().unwrap();
+            for _ in 0..1000 { render(&driver, 128); player.telemetry(); if player.natural_end() { break; } }
+            assert!(player.natural_end());
+            player.pause().unwrap(); render(&driver, 128);
+            if resume { player.resume().unwrap(); } else { player.play().unwrap(); }
+            render(&driver, 128);
+            assert_eq!(player.song_frame(), 0);
+            assert!(!player.natural_end());
+            render(&driver, 8 * 128);
+            assert!(player.is_playing()); assert!(!player.natural_end());
+        }
+    }
+}
+
+#[test]
+fn no08_musically_invalid_seeks_preserve_ringing_inserts_and_voices() {
+    use starplayer::dsp::{InsertKind, effects::delay::{DELAY_TIME_PARAM, DELAY_FEEDBACK_PARAM, DELAY_MIX_PARAM}};
+    use starplayer::engine::InsertTarget;
+    fn run(request: Option<u8>) -> (Vec<f32>, starplayer::telemetry::Snapshot) {
+        let (_, mut player, driver) = open(); player.load(&module(false)).unwrap();
+        for target in [InsertTarget::Master, InsertTarget::Channel(starplayer::core::ChannelId(0))] {
+            player.install_insert(target, 0, InsertKind::Delay).unwrap();
+            player.set_insert_param(target, 0, DELAY_TIME_PARAM, 10).unwrap();
+            player.set_insert_param(target, 0, DELAY_FEEDBACK_PARAM, 75).unwrap();
+            player.set_insert_param(target, 0, DELAY_MIX_PARAM, 70).unwrap();
+        }
+        player.play().unwrap(); render(&driver, 2048); player.telemetry(); player.pause().unwrap(); render(&driver, 128); player.telemetry();
+        player.interactive(starplayer::core::InteractiveAction::PreviewInstrument(starplayer::core::InstrumentId(0))).unwrap(); render(&driver, 1024); player.telemetry();
+        match request { Some(0) => player.seek_order(999).unwrap(), Some(1) => player.seek_row(999).unwrap(), Some(2) => player.seek_frame(99999999).unwrap(), Some(_) => player.seek_row(3).unwrap(), None => () }
+        let output = render(&driver, 2048); let snapshot = *player.telemetry(); (output, snapshot)
+    }
+    let expected = run(None);
+    assert!(expected.0.iter().any(|sample| *sample != 0.0));
+    for kind in 0..3 { let actual = run(Some(kind)); assert!(actual.0 == expected.0, "invalid kind {kind} changed DSP output"); assert_eq!(actual.1.channels[0].active, expected.1.channels[0].active); assert_eq!(actual.1.live.active, expected.1.live.active); }
+    let valid = run(Some(3)); assert_ne!(valid.0, expected.0); assert_eq!(valid.1.live.active, expected.1.live.active); assert!(!valid.1.channels[0].active);
+}
+
+#[test]
+fn no08_retirement_deferred_fresh_load_starts_stopped_at_zero_with_one_initial_tick() {
+    let (_, mut player, driver) = open();
+    for _ in 0..12 { player.load(&module(false)).unwrap(); }
+    render(&driver, 8192);
+    assert!(player.pending_control_commands() > 0, "test must reach actual retirement pressure");
+    player.collect_garbage(); render(&driver, 128);
+    assert_eq!(player.song_frame(), 0);
+    player.collect_garbage(); render(&driver, 128);
+    assert_eq!(player.song_frame(), 0);
+    player.play().unwrap(); render(&driver, 128);
+    let snapshot = player.telemetry();
+    assert_eq!(snapshot.transport.song_frame, 0);
+    assert_eq!(snapshot.transport.tick, 0);
+}

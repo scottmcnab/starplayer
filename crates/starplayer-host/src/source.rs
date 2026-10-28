@@ -234,6 +234,7 @@ impl SeekableModuleSource {
                 };
                 if !valid { return; }
                 context.channels.clear_scope(starplayer::engine::ClearScope::Song, context.voices);
+                context.request_insert_reset();
             }
             match request.kind {
                 SeekKind::Order(order) => { let _ = self.sequencer.seek_order_at(order, frame); }

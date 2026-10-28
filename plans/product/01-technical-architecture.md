@@ -1933,13 +1933,28 @@ Explicit interactive preparation keeps engine audio/source time monotonic while 
 and SMF sources hold their musical cursor. Legacy Stop remains unchanged. Tracker cadence
 is the sole native-articulation authority: slot 0 controls held song voices before live
 events; the post-source hook controls live articulation after all due events. Resume
-translates deadlines without resetting the fractional clock. Each cadence publishes one
-coherent tracker/live/transport snapshot; transitions may publish immediately.
+translates deadlines without resetting the fractional clock. First audio attachment also
+translates prepared tracker/SMF deadlines and origin by the preparation-to-install delay,
+once; live event timestamps stay absolute. Synthesised Q32.32 cadence intervals clamp to
+at least one output frame, retaining valid fractional phase. Each cadence publishes one
+coherent tracker/live/transport snapshot; command transitions publish once at the end of
+the bounded engine command drain so a burst cannot fill the telemetry ring with intermediate states.
 
 Clear scopes invalidate bindings immediately and preserve retiring ownership until bounded
 voice ramps finish. Domain admission may recycle only the oldest already-retiring slot of
 that domain. Global clears reset DSP state with a 64-frame additive continuity bridge,
 never a persistent gain mute. New input remains admissible while old voices retire.
+IT channel memory records actual accepted-start history, then explicit Song/All/lane
+sound clears until a genuine note is accepted. This prevents instrument-only synthetic
+restarts after a clear while preserving native first instrument-only C0 starts on fresh
+Stopped/setup and native restarts after natural sample completion. Live-only/custom-tail cleanup leaves this memory alone.
+A genuine IT note-only recovery resolves remembered instrument mapping without treating
+it as an authored instrument column: current base volume, IFC/IFR filter memory and
+passive onset-volume identity survive; only an actual instrument change replays defaults.
+Interactive seek validates musical bounds on audio before clearing Song and requesting a
+DSP reset through a dispatch-local signal. The engine consumes that signal before whole
+quantum insert processing; invalid seeks preserve voices and delay state. This adds no
+Engine storage/allocation and compiles out with interactive audition disabled.
 
 Player preserves interactive mode through held seeks, routing changes and renderer
 replacement, with permanent sequenced/live source slots. NO-03 supplies the live placeholder;

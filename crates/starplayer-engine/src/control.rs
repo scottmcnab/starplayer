@@ -129,9 +129,11 @@ impl ControlClock {
 
     /// One authority for loaded-format articulation. The sequencer supplies the exact
     /// model interval and pending fractional phase; held steps never modify its clock.
+    /// Synthesised intervals below one output frame clamp to one frame, preserving
+    /// the progress guarantee of the legacy microsecond clock.
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
     pub fn set_cadence(&mut self, next: Frame, interval: u64, remainder: u64, synthesised: bool) {
-        self.cadence = Some((interval, remainder));
+        self.cadence = Some((interval.max(1 << 32), remainder));
         self.next_frame = next;
         self.driver = if synthesised { ControlDriver::Synthesised } else { ControlDriver::Tracker };
     }
@@ -151,6 +153,16 @@ impl ControlClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
+    #[test]
+    fn no08_cadence_clamps_zero_and_fractional_intervals_to_one_frame() {
+        for interval in [0, 1, (1 << 32) - 1, 1 << 32] {
+            let mut clock = ControlClock::new(44_100, Frame(17));
+            clock.set_cadence(Frame(17), interval, 123, true);
+            for frame in 18..100 { clock.tick_synthesised(); assert_eq!(clock.next_synthesised_frame(), Some(Frame(frame))); }
+        }
+    }
 
     #[test]
     fn a_synthesised_clock_ticks_at_the_requested_rate() {

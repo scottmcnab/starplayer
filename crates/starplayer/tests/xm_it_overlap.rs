@@ -545,3 +545,51 @@ fn it_new_note_past_a_retained_offset_does_not_inherit_the_previous_identity() {
     let expected: Vec<_> = native.voices.iter().map(|(_, voice)| (voice.tag, voice.params, voice.position())).collect();
     assert_eq!(actual, expected, "identity correction must leave native voice state unchanged");
 }
+
+#[cfg(feature = "interactive-audition")]
+#[test]
+fn no08_native_it_instrument_restart_after_real_sample_completion_survives_unrelated_clears() {
+    use starplayer::engine::ClearScope;
+    for sample_mode in [false, true] {
+        for scope in [None, Some(ClearScope::Live), Some(ClearScope::CustomDetached)] {
+            let module = module(ModuleFormat::It, &[], sample_mode, NewNoteAction::Cut, DuplicateCheck::Off, DuplicateAction::Cut);
+            let mut harness = Harness::with_module(module, 4, false, false);
+            harness.row([note(60), Cell::default()]); let old = harness.foreground();
+            harness.voices.accumulate::<FixedPath, starplayer::dsp::Linear>(harness.module.pcm(), &mut vec![starplayer::mixer::FixedFrame::default(); 65536], 8000);
+            harness.channels.release_finished(&harness.voices);
+            assert!(harness.voices.get(old).is_none(), "sample must finish in the real mixer");
+            let mut context = TickContext::new(Frame(65536), &mut harness.voices, &mut harness.channels, RowClock::new(6), SongPosition::default(), 125);
+            harness.processor.control_step(&mut context);
+            if let Some(scope) = scope { harness.processor.clear_sound(scope, &mut context); }
+            harness.row([Cell { instrument: 1, ..Cell::default() }, Cell::default()]);
+            assert!(harness.channels.foreground(ChannelId(0)).is_some(), "sample mode {sample_mode}, scope {scope:?}");
+        }
+    }
+}
+
+#[cfg(feature = "interactive-audition")]
+#[test]
+fn no08_fresh_configured_instrument_only_preserves_native_initial_onsets() {
+    use starplayer::core::{Command, InteractiveAction, InteractiveCommand};
+    fn run(format: ModuleFormat, sample_mode: bool, interactive: bool) -> Vec<i16> {
+        let module = module(format, &[[Cell { instrument: 1, ..Cell::default() }, Cell::default()]], sample_mode, NewNoteAction::Cut, DuplicateCheck::Off, DuplicateAction::Cut);
+        let mut configuration = configuration(format, 4);
+        if interactive { configuration.capabilities |= PlaybackCapabilities::INTERACTIVE_AUDITION; configuration.capacity.interactive_transport = true; configuration.capacity.live = 1; }
+        let settings = EngineSettings { sample_rate_hz: 8000, channel_count: 2, ..EngineSettings::default() }.with_playback(configuration).unwrap();
+        let mut engine: Engine<FixedPath, starplayer::dsp::Linear, StereoI16, Arc<Module>> = Engine::with_settings(settings);
+        let mut control = engine.take_control().unwrap(); control.load_module(Arc::clone(&module)).unwrap();
+        engine.set_source(Box::new(starplayer::NativeSequencer::new_with_articulation(module, 8000, QuirkSelection::FromDialect, settings.voice_capacity).unwrap()));
+        if interactive {
+            control.send(Command::Interactive(InteractiveCommand { identity: Default::default(), action: InteractiveAction::Stop })).unwrap();
+            engine.render(&mut [0; 256]);
+            control.send(Command::Interactive(InteractiveCommand { identity: Default::default(), action: InteractiveAction::Play })).unwrap();
+        }
+        let mut output = vec![0; 1024]; engine.render(&mut output); output
+    }
+    for format in FORMATS { for sample_mode in [false, true] {
+        let native = run(format, sample_mode, false);
+        if format == ModuleFormat::It { assert!(native.iter().any(|sample| *sample != 0), "native instrument-only C0 must sound"); }
+        else { assert!(native.iter().all(|sample| *sample == 0), "XM has no remembered note on a fresh channel"); }
+        assert!(run(format, sample_mode, true) == native, "fresh setup Stop changes {format:?}, sample mode {sample_mode}");
+    } }
+}

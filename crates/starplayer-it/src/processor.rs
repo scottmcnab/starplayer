@@ -349,6 +349,10 @@ impl ItVoiceState {
     fn release(&mut self) { *self = ItVoiceState::default(); }
 }
 
+#[cfg(feature = "interactive-audition")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InteractiveSoundState { NeverStarted, Remembered, Cleared }
+
 /// One pattern channel: the row's columns, every effect memory, and the state that
 /// outlives the voices the channel triggers.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -452,6 +456,10 @@ pub struct ItChannel {
     /// `nNewNote` / `nLastNote`: the note a lone instrument number would play.
     /// `kITInitialNoteMemory` starts it at `C-0`, not "no note".
     pub last_note: u8,
+    /// An interactive clear preserves note/effect memory but forbids synthetic
+    /// instrument-only restarts until an actual musical note is accepted.
+    #[cfg(feature = "interactive-audition")]
+    interactive_sound: InteractiveSoundState,
     /// `nOldIns`: the last instrument number seen, valid or not.
     pub last_instrument: u8,
     /// `nNewIns`: an instrument number latched without a note.
@@ -543,6 +551,8 @@ impl ItChannel {
             macro_real_volume: 0,
             macro_real_pan: 128,
             last_note: 0,
+            #[cfg(feature = "interactive-audition")]
+            interactive_sound: InteractiveSoundState::NeverStarted,
             last_instrument: 0,
             pending_instrument: 0,
             new_note_action: NewNoteAction::Cut,
@@ -1358,7 +1368,11 @@ impl ItProcessor {
                 true => self.foreground_instrument(channel_index) != instrument as u16,
                 false => self.foreground_sample(channel_index) != instrument as u16,
             };
-            if changed || !playing {
+            #[cfg(feature = "interactive-audition")]
+            let suppressed = self.channels[channel_index].interactive_sound == InteractiveSoundState::Cleared;
+            #[cfg(not(feature = "interactive-audition"))]
+            let suppressed = false;
+            if (changed || !playing) && !suppressed {
                 note = self.channels[channel_index].last_note;
             }
         }
@@ -1489,10 +1503,15 @@ impl ItProcessor {
         let instrument_number = match self.instrument_mode {
             true => {
                 if instrument != INSTRUMENT_NONE { instrument as u16 } else {
+                    let remembered_instrument = self.foreground_instrument(channel_index);
                     #[cfg(feature = "note-overlap")]
-                    if preserved_instrument != 0 { preserved_instrument } else { self.foreground_instrument(channel_index) }
-                    #[cfg(not(feature = "note-overlap"))]
-                    self.foreground_instrument(channel_index)
+                    let remembered_instrument = if preserved_instrument != 0 { preserved_instrument } else { remembered_instrument };
+                    // A clear removed the sounding binding, but retained its mapping
+                    // memory. Resolve that here, without replaying InstrumentChange's
+                    // sample volume/IFC/IFR defaults for an absent instrument column.
+                    #[cfg(feature = "interactive-audition")]
+                    let remembered_instrument = if self.channels[channel_index].interactive_sound == InteractiveSoundState::Cleared { self.channels[channel_index].last_instrument as u16 } else { remembered_instrument };
+                    remembered_instrument
                 }
             }
             false => {
@@ -1665,6 +1684,8 @@ impl ItProcessor {
                 let _ = playback.inherit_onset(voice, identity, context.voices);
             }
         }
+        #[cfg(feature = "interactive-audition")]
+        { self.channels[channel_index].interactive_sound = InteractiveSoundState::Remembered; }
         self.channels[channel_index].voice = Some(voice);
         self.channels[channel_index].frequency_hz = frequency;
         self.channels[channel_index].triggered = true;
@@ -3277,9 +3298,13 @@ fn advance_auto_vibrato(state: &mut ItVoiceState, sample: Option<&SampleIndex>, 
 
 impl TrackerProcessor for ItProcessor {
     #[cfg(any(feature = "note-overlap", feature = "interactive-audition"))]
-    fn clear_sound(&mut self, _scope: starplayer_engine::ClearScope, context: &mut TickContext<'_>) {
+    fn clear_sound(&mut self, scope: starplayer_engine::ClearScope, context: &mut TickContext<'_>) {
         self.sync_retirement(context);
+        #[cfg(not(feature = "interactive-audition"))]
+        let _ = scope;
         for channel in self.channels.iter_mut() {
+            #[cfg(feature = "interactive-audition")]
+            if channel.interactive_sound != InteractiveSoundState::NeverStarted && (matches!(scope, starplayer_engine::ClearScope::All | starplayer_engine::ClearScope::Song) || scope == starplayer_engine::ClearScope::Lane(ChannelId(channel.channel_number as u16))) { channel.interactive_sound = InteractiveSoundState::Cleared; }
             if channel.voice.is_some_and(|voice| context.channels.playback().and_then(|playback| playback.get(voice, context.voices)).is_some_and(|owned| owned.lifecycle == starplayer_engine::VoiceLifecycle::Retiring)) {
                 channel.voice = None;
                 channel.triggered = false;
@@ -3500,6 +3525,77 @@ mod tests {
         let _ = processor.tick(&mut context);
         assert_eq!(context.channels.foreground(ChannelId(0)), None);
         assert_eq!(context.channels.playback().unwrap().active_count(starplayer_engine::VoiceDomain::Native, context.voices), 0);
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    #[test]
+    fn no08_interactive_clear_suppresses_instrument_only_resurrection_until_real_note() {
+        for instrument_mode in [false, true] {
+            for scope in [starplayer_engine::ClearScope::All, starplayer_engine::ClearScope::Song, starplayer_engine::ClearScope::Lane(ChannelId(0))] {
+                let module = module_with(&[note_cell(60, 1)], NewNoteAction::Continue);
+                let (mut processor, mut voices, mut channels) = play(module, 1, 6);
+                processor.instrument_mode = instrument_mode;
+                let configuration = starplayer_engine::PlaybackConfiguration { identity: Default::default(), capabilities: Default::default(), instrument_count: 1, capacity: starplayer_engine::VoiceCapacity { native: VIRTUAL_CHANNELS, custom: 0, live: 0, interactive_transport: false } };
+                channels.prepare_playback(configuration).unwrap();
+                for (voice, state) in voices.iter() { channels.playback_mut().unwrap().register(voice, starplayer_engine::VoiceDomain::Native, ChannelId(state.tag.channel as u16), &voices).unwrap(); }
+                channels.clear_scope(scope, &mut voices);
+                let mut context = TickContext::new(Frame(8820), &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+                processor.clear_sound(scope, &mut context);
+                for cell in [note_cell(NOTE_NONE, 1), ItCell { command: COMMAND_RETRIGGER, info: 1, ..ItCell::EMPTY }] {
+                    let _ = processor.row(&mut context, RowRef { order: 0, pattern: 0, row: 1, bytes: &cell.to_bytes() });
+                    assert_eq!(context.channels.foreground(ChannelId(0)), None, "mode {instrument_mode}, scope {scope:?}");
+                }
+                let _ = processor.row(&mut context, RowRef { order: 0, pattern: 0, row: 2, bytes: &note_cell(64, INSTRUMENT_NONE).to_bytes() });
+                assert!(context.channels.foreground(ChannelId(0)).is_some());
+            }
+        }
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    #[test]
+    fn no08_latched_instrument_without_an_accepted_start_does_not_arm_clear_suppression() {
+        let delayed = ItCell { command: COMMAND_SPECIAL, info: 0xD6, ..note_cell(NOTE_NONE, 1) };
+        let (mut processor, mut voices, mut channels) = play(module_with(&[delayed], NewNoteAction::Cut), 1, 6);
+        assert_eq!(processor.channels[0].last_instrument, 1);
+        assert_eq!(processor.channels[0].pending_instrument, 1);
+        assert_eq!(voices.voices_active(), 0);
+        let mut context = TickContext::new(Frame(8820), &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+        processor.clear_sound(starplayer_engine::ClearScope::All, &mut context);
+        let _ = processor.row(&mut context, RowRef { order: 0, pattern: 0, row: 1, bytes: &note_cell(NOTE_NONE, 1).to_bytes() });
+        assert!(context.channels.foreground(ChannelId(0)).is_some(), "latched memory is not cleared prior sound");
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    #[test]
+    fn no08_note_only_recovery_keeps_native_volume_filter_and_onset_memories() {
+        for instrument_mode in [false, true] { for cleared in [false, true] {
+            let module = module_with_instrument(&[note_cell(60, 1)], NewNoteAction::Cut, |instrument| { instrument.initial_filter_cutoff = Some(60); instrument.initial_filter_resonance = Some(20); });
+            let (mut processor, mut voices, mut channels) = play(module, 1, 6);
+            processor.instrument_mode = instrument_mode;
+            let capabilities = starplayer_core::PlaybackCapabilities::empty();
+            #[cfg(feature = "note-overlap")]
+            let capabilities = capabilities | starplayer_core::PlaybackCapabilities::NOTE_OVERLAP;
+            channels.prepare_playback(starplayer_engine::PlaybackConfiguration { identity: Default::default(), capabilities, instrument_count: 1, capacity: starplayer_engine::VoiceCapacity { native: VIRTUAL_CHANNELS, custom: 0, live: 0, interactive_transport: false } }).unwrap();
+            for (voice, state) in voices.iter() { channels.playback_mut().unwrap().register(voice, starplayer_engine::VoiceDomain::Native, ChannelId(state.tag.channel as u16), &voices).unwrap(); }
+            let volume = ItCell { volume: 17, ..ItCell::EMPTY };
+            let mut context = TickContext::new(Frame(8820), &mut voices, &mut channels, RowClock::new(6), SongPosition::default(), 125);
+            let _ = processor.row(&mut context, RowRef { order: 0, pattern: 0, row: 1, bytes: &volume.to_bytes() });
+            assert_eq!(processor.channels[0].note_volume, 68);
+            processor.channels[0].cutoff = 24; processor.channels[0].resonance = 37;
+            let _ = processor.row(&mut context, RowRef { order: 0, pattern: 0, row: 2, bytes: &ItCell::EMPTY.to_bytes() });
+            if cleared {
+                context.channels.clear_scope(starplayer_engine::ClearScope::All, context.voices);
+                processor.clear_sound(starplayer_engine::ClearScope::All, &mut context);
+            }
+            let _ = processor.row(&mut context, RowRef { order: 0, pattern: 0, row: 3, bytes: &note_cell(64, INSTRUMENT_NONE).to_bytes() });
+            let voice = context.channels.foreground(ChannelId(0)).unwrap();
+            assert_eq!(processor.channels[0].note_volume, 68, "note-only must not replay sample default volume, mode {instrument_mode}");
+            assert_eq!((processor.channels[0].cutoff, processor.channels[0].resonance), (24, 37), "note-only must not replay IFC/IFR");
+            let state = processor.articulation.voice(voice).unwrap();
+            assert_eq!(state.note_volume, 68); assert_eq!((state.cutoff, state.resonance), (24, 37));
+            #[cfg(feature = "note-overlap")]
+            assert_eq!(context.channels.playback().unwrap().get(voice, context.voices).unwrap().identity().unwrap().onset_volume, 68);
+        } }
     }
 
     #[test]

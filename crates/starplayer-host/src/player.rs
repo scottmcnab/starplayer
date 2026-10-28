@@ -376,7 +376,7 @@ impl RenderState {
                 self.transport.pause(true);
             }
             InteractiveAction::Play | InteractiveAction::Resume => {
-                if self.interactive_state == InteractiveTransport::Stopped && self.transport.take_armed_rewind() {
+                if self.transport.take_armed_rewind() {
                     self.request_seek(SeekKind::Frame(0));
                     self.awaiting_restart = true;
                 }
@@ -1215,7 +1215,9 @@ impl Player {
         // cleared with it or it carries audio from the position the ear just left into the
         // position it landed on. Parameters are untouched: `InsertCommand::ResetAll` clears
         // state only.
-        let _ = self.insert_control.reset_all();
+        // Interactive musical validity belongs to the audio-side source. Its successful
+        // seek requests the reset in that same dispatch; rejected seeks leave DSP intact.
+        if !self.interactive_enabled { let _ = self.insert_control.reset_all(); }
         Ok(())
     }
 
@@ -1587,4 +1589,81 @@ impl Player {
     /// Every device the backend can see. A convenience so a caller need not import the
     /// backend trait to print a list.
     pub fn devices(backend: &dyn AudioBackend) -> Vec<crate::backend::DeviceInfo> { backend.devices() }
+}
+
+#[cfg(all(test, feature = "interactive-audition"))]
+mod no08_attachment_tests {
+    use super::*;
+    use crate::{ManualBackend, ManualDriver};
+    use starplayer::core::{PlaybackCapabilities, RowClock, SequencerCursor, SmfCursor, SmfPlaybackState};
+    use starplayer::engine::{PlaybackConfiguration, VoiceCapacity};
+
+    fn open() -> (Player, ManualDriver) {
+        let mut backend = ManualBackend::new();
+        let settings = EngineSettings::default().with_playback(PlaybackConfiguration { identity: Default::default(), capabilities: PlaybackCapabilities::INTERACTIVE_AUDITION, instrument_count: 31, capacity: VoiceCapacity { native: 64, custom: 0, live: 2, interactive_transport: true } }).unwrap();
+        let player = Player::open_with_settings(&mut backend, None, AudioSpec::stereo(44_100), MixerMode::DEFAULT, settings).unwrap();
+        (player, backend.driver().unwrap())
+    }
+    fn pump(player: &mut Player, driver: &ManualDriver, frames: usize) { driver.render(&mut vec![0.0; frames * 2]); player.telemetry(); }
+    fn pressure(player: &mut Player, driver: &ManualDriver) {
+        for _ in 0..12 { player.load(include_bytes!("../../../fuzz/seeds/mod/synthetic-golden.mod")).unwrap(); }
+        pump(player, driver, 8192);
+        assert!(player.pending_control_commands() > 0, "must defer on the real retirement queue");
+    }
+    fn install_wait(player: &mut Player, driver: &ManualDriver) -> Frame {
+        player.playback_barrier(123).unwrap();
+        for _ in 0..64 {
+            player.collect_garbage();
+            let before = player.source_frame();
+            pump(player, driver, 128);
+            if player.applied_playback().serial == 123 { return before; }
+        }
+        panic!("deferred install did not settle");
+    }
+    #[test]
+    fn no08_real_retirement_deferral_preserves_saved_tracker_cursor_in_every_transport() {
+        for state in [InteractiveTransport::Playing, InteractiveTransport::Paused, InteractiveTransport::Stopped] {
+            let (mut player, driver) = open();
+            pressure(&mut player, &driver);
+            let saved = SequencerCursor { row_clock: RowClock { tick_in_row: 2, ..RowClock::new(6) }, tempo_bpm: 130, requested_speed: 6, remaining_frames: 617, fractional_remainder: 0x87654321, song_frame: 1234, sample_rate_hz: 44_100, ..Default::default() };
+            player.rebuild_cursor = Some(saved);
+            player.install(RtArc::new(starplayer::load(include_bytes!("../../../fuzz/seeds/mod/synthetic-golden.mod")).unwrap()), SeekKind::None, None, false).unwrap();
+            let prepared = player.source_frame();
+            player.queue(HostCommand::RestoreTransport { identity: player.playback_identity.unwrap(), transport: Transport::playing(), state, natural_end: false }).unwrap();
+            pump(&mut player, &driver, 4096); assert!(player.pending_control_commands() > 0);
+            let attached = install_wait(&mut player, &driver);
+            assert!(attached.0 >= prepared.0 + 4096);
+            let restored = player.telemetry().transport.sequencer_cursor().unwrap();
+            assert_eq!(restored.song_frame, saved.song_frame); assert_eq!(restored.remaining_frames, saved.remaining_frames); assert_eq!(restored.fractional_remainder, saved.fractional_remainder);
+            let resume = if state == InteractiveTransport::Playing { attached } else { player.source_frame() };
+            if state != InteractiveTransport::Playing { player.resume().unwrap(); }
+            while player.source_frame().0 <= resume.0 + saved.remaining_frames { pump(&mut player, &driver, 128); }
+            let next = player.telemetry().transport.sequencer_cursor().unwrap();
+            assert_eq!(next.captured_frame.0, resume.0 + saved.remaining_frames);
+            assert_eq!(next.row_clock.tick_in_row, 3);
+        }
+    }
+    #[test]
+    fn no08_real_retirement_deferral_preserves_saved_smf_cursor_in_every_transport() {
+        let bytes = b"MThd\0\0\0\x06\0\0\0\x01\0\x60MTrk\0\0\0\x0d\0\x90\x3c\x64\x60\x90\x40\x64\x60\xff\x2f\0";
+        // Track length is twelve bytes: two notes then end-of-track.
+        let mut bytes = bytes.to_vec(); bytes[21] = 12;
+        for state in [InteractiveTransport::Playing, InteractiveTransport::Paused, InteractiveTransport::Stopped] {
+            let (mut player, driver) = open(); pressure(&mut player, &driver);
+            let saved = SmfPlaybackState { cursor: SmfCursor { event_index: 1, song_frame: 1234, remaining_frames: Some(617), captured_frame: player.source_frame(), sample_rate_hz: 44_100 }, ..Default::default() };
+            let smf = Arc::new(starplayer::midi::smf::parse_smf(&bytes).unwrap());
+            let instruments = RtArc::new(starplayer::load(include_bytes!("../../../fuzz/seeds/mod/synthetic-golden.mod")).unwrap());
+            player.install_smf(smf, instruments, Some(saved), false).unwrap();
+            let prepared = player.source_frame();
+            player.queue(HostCommand::RestoreTransport { identity: player.playback_identity.unwrap(), transport: Transport::playing(), state, natural_end: false }).unwrap();
+            pump(&mut player, &driver, 4096); assert!(player.pending_control_commands() > 0);
+            let attached = install_wait(&mut player, &driver); assert!(attached.0 >= prepared.0 + 4096);
+            let restored = player.telemetry().transport.smf_state().unwrap();
+            assert_eq!(restored.cursor.song_frame, saved.cursor.song_frame); assert_eq!(restored.cursor.remaining_frames, saved.cursor.remaining_frames); assert_eq!(restored.cursor.event_index, 1);
+            let resume = if state == InteractiveTransport::Playing { attached } else { player.source_frame() };
+            if state != InteractiveTransport::Playing { player.resume().unwrap(); }
+            while player.source_frame().0 <= resume.0 + 1024 { pump(&mut player, &driver, 128); }
+            let next = player.telemetry().transport.smf_state().unwrap(); assert_eq!(next.cursor.event_index, 2);
+        }
+    }
 }

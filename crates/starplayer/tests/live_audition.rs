@@ -428,3 +428,51 @@ fn xm_sample_loop_eligibility_is_independent_of_live_pitch_viability() {
         assert!(live.channels.foreground(ChannelId(64)).is_none());
     }
 }
+
+#[test]
+fn no08_prepared_external_feed_dispatches_exact_frames_before_mixing() {
+    use starplayer::engine::{Engine, EngineSettings, EventFeed};
+    use starplayer::core::{Command, InteractiveCommand, TimedEvent};
+    use starplayer::mixer::{FixedPath, StereoI16};
+    use std::sync::{Arc as StdArc, atomic::{AtomicU64, Ordering}};
+    struct ObservedFeed { queue: ExternalEventQueue, dispatched: StdArc<AtomicU64> }
+    impl EventFeed for ObservedFeed {
+        fn next_frame(&self) -> Option<Frame> { self.queue.next_frame() }
+        fn refresh(&mut self, frame: Frame) { self.queue.refresh(frame); }
+        fn pop_due(&mut self, frame: Frame) -> Option<TimedEvent> {
+            let event = self.queue.pop_due(frame)?;
+            self.dispatched.store(frame.0, Ordering::Relaxed); Some(event)
+        }
+    }
+    for format in FORMATS {
+        for base in [0, 1024] {
+            for relative in [0, 17, 18] {
+                for block in [1, 3, 64, 128, 4096, 8191] {
+                    let module = detailed_module(format, true, NewNoteAction::Cut, 1, false, 0);
+                    let settings = EngineSettings { sample_rate_hz: 8000, channel_count: 64, ..EngineSettings::default() }.with_playback(configuration(1)).unwrap();
+                    let mut engine: Engine<FixedPath, starplayer::dsp::Linear, StereoI16, Arc<Module>> = Engine::with_settings(settings);
+                    let mut control = engine.take_control().unwrap(); control.load_module(Arc::clone(&module)).unwrap();
+                    engine.render(&mut vec![0; base * 2]);
+                    let (mut producer, queue) = external_event_channel(8);
+                    let dispatched = StdArc::new(AtomicU64::new(u64::MAX));
+                    let rack = starplayer::prepare_live_rack(&module, 8000, settings.voice_capacity).unwrap();
+                    engine.set_source(Box::new(MidiSource::new(ObservedFeed { queue, dispatched: dispatched.clone() }, rack, 8000)));
+                    control.send(Command::Interactive(InteractiveCommand { identity: Default::default(), action: InteractiveAction::SetLiveDestination(LiveDestination::Jam) })).unwrap();
+                    let render = |engine: &mut Engine<FixedPath, starplayer::dsp::Linear, StereoI16, Arc<Module>>, frames: usize| { let mut output = vec![0; frames * 2]; for chunk in output.chunks_mut(block * 2) { engine.render(chunk); } output };
+                    let deadline = base as u64 + relative;
+                    producer.send(TimedEvent::on_channel(Frame(deadline), ChannelId(64), Event::NoteOn { note: Note::new(60), velocity: U0F16::MAX })).unwrap();
+                    let output = render(&mut engine, 8192);
+                    assert_eq!(dispatched.load(Ordering::Relaxed), deadline, "{format:?}, base{base}, event{relative}, block{block}");
+                    assert!(!engine.warnings().late_events);
+                    assert!(output[..relative as usize * 2].iter().all(|sample| *sample == 0));
+                    assert!(output[(relative as usize + 1) * 2..(relative as usize + 16) * 2].iter().any(|sample| *sample != 0));
+                    render(&mut engine, 128);
+                    let deadline = engine.source_frame().0 + 18;
+                    producer.send(TimedEvent::on_channel(Frame(deadline), ChannelId(65), Event::NoteOn { note: Note::new(67), velocity: U0F16::MAX })).unwrap();
+                    render(&mut engine, 8192);
+                    assert_eq!(dispatched.load(Ordering::Relaxed), deadline, "idle admission"); assert!(!engine.warnings().late_events);
+                }
+            }
+        }
+    }
+}

@@ -201,3 +201,72 @@ fn dsp_clear_bridges_the_old_output_for_64_frames_without_muting_fresh_live_inpu
     assert_eq!(&after[128..], &clean[128..]);
     assert!(after[128..].iter().any(|sample| *sample != 0));
 }
+
+#[test]
+fn no08_sub_frame_configured_cadence_always_progresses() {
+    for micros in [0, 1, 22] {
+        let mut configured = settings(); configured.articulation_interval_micros = micros;
+        let mut engine = TestEngine::with_settings(configured);
+        render(&mut engine, 256, 3);
+        assert!(!engine.warnings().zero_advance_forced, "interval {micros}");
+        assert!(!engine.warnings().event_limit_reached);
+        assert_eq!(engine.control_clock().ticks(), 256);
+    }
+}
+
+#[cfg(feature = "telemetry")]
+#[test]
+fn no08_command_burst_publishes_final_transport_live_and_cursor() {
+    let (mut engine, mut handle, _) = setup(vec![Frame(1)], 8, 6);
+    let mut reader = engine.telemetry_reader().unwrap();
+    command(&mut handle, InteractiveAction::Play); render(&mut engine, 256, 128); reader.read();
+    for _ in 0..5 { command(&mut handle, InteractiveAction::Resume); }
+    command(&mut handle, InteractiveAction::AllSoundOff);
+    command(&mut handle, InteractiveAction::Pause);
+    render(&mut engine, 128, 128);
+    let final_state = *reader.read();
+    assert_eq!(final_state.transport.interactive, Some(InteractiveTransport::Paused));
+    assert_eq!(final_state.live.active, 0);
+    assert_eq!(final_state.transport.song_frame, 256);
+    assert_eq!(final_state.transport.sequencer_cursor().unwrap().captured_frame, Frame(256));
+}
+
+#[cfg(feature = "telemetry")]
+#[test]
+fn no08_first_tracker_attachment_keeps_logical_cursor_and_fractional_remainder() {
+    for state in [InteractiveTransport::Playing, InteractiveTransport::Paused, InteractiveTransport::Stopped] {
+        let (mut engine, mut handle, _) = setup(vec![], 16, 6);
+        let mut reader = engine.telemetry_reader().unwrap();
+        command(&mut handle, InteractiveAction::Play); render(&mut engine, 1152, 128); reader.read();
+        command(&mut handle, InteractiveAction::Pause); render(&mut engine, 128, 128);
+        let saved = reader.read().transport.sequencer_cursor().unwrap();
+        assert_ne!(saved.fractional_remainder, 0);
+        let preparation_frame = engine.source_frame();
+        let log = Log::new();
+        let mut fresh = PatternSequencer::new(ExactFixedPoint, DemoPatternData::new(1, 16, 1), Processor { log: log.clone(), region: SampleRegion::one_shot(0, 0) }, SequencerSettings { sample_rate_hz: 44_100, initial_tempo_bpm: 130, initial_speed: 6, ..SequencerSettings::default() });
+        assert!(fresh.restore_cursor(saved, preparation_frame));
+        let live_deadline = preparation_frame.saturating_add(4096 + if state == InteractiveTransport::Paused { 17 } else { 145 });
+        let mut prepared = SourceMux::new(2);
+        prepared.insert(Box::new(fresh)).ok().unwrap();
+        prepared.insert(Box::new(Live { log: log.clone(), events: vec![live_deadline], next: 0, region: SampleRegion::one_shot(0, 0) })).ok().unwrap();
+        render(&mut engine, 4096, 128); reader.read();
+        if state != InteractiveTransport::Paused {
+            command(&mut handle, if state == InteractiveTransport::Playing { InteractiveAction::Play } else { InteractiveAction::Stop });
+            render(&mut engine, 128, 128); reader.read();
+        }
+        let attachment_frame = engine.source_frame();
+        engine.set_source(Box::new(prepared));
+        command(&mut handle, match state { InteractiveTransport::Playing => InteractiveAction::Play, InteractiveTransport::Paused => InteractiveAction::Pause, InteractiveTransport::Stopped => InteractiveAction::Stop });
+        render(&mut engine, 128, 128);
+        let restored = reader.read().transport.sequencer_cursor().unwrap();
+        assert_eq!(restored.song_frame, saved.song_frame, "{state:?}");
+        assert_eq!(restored.remaining_frames, saved.remaining_frames, "{state:?}");
+        assert_eq!(restored.fractional_remainder, saved.fractional_remainder);
+        if state != InteractiveTransport::Playing { command(&mut handle, InteractiveAction::Resume); }
+        let resume_frame = if state == InteractiveTransport::Playing { attachment_frame } else { engine.source_frame() };
+        render(&mut engine, 2048, 128);
+        assert!(log.values().contains(&(live_deadline.0 * 10 + 3)), "first attachment must not translate live timestamps");
+        let ticks: Vec<_> = log.values().into_iter().filter(|entry| entry % 10 == 1).collect();
+        assert_eq!(ticks[0] / 10, resume_frame.0 + saved.remaining_frames);
+    }
+}

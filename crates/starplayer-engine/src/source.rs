@@ -71,6 +71,10 @@ pub struct EngineContext<'engine> {
     /// and absent for a context a test or a format crate built by hand — which is exactly
     /// why it is an `Option` rather than a parameter of [`EngineContext::new`].
     warnings: Option<&'engine mut EngineWarnings>,
+    /// A dispatch-local successful-seek signal; the engine resets DSP before its next
+    /// whole-quantum processing pass. No engine storage or callback allocation.
+    #[cfg(feature = "interactive-audition")]
+    insert_reset_request: Option<&'engine mut bool>,
     /// Per-tick diagnostic recorder. Absent, including as a field, when tracing is off.
     #[cfg(feature = "trace")]
     pub(crate) trace: Option<&'engine mut crate::trace::TraceRecorder>,
@@ -92,6 +96,8 @@ impl<'engine> EngineContext<'engine> {
             #[cfg(feature = "telemetry")]
             telemetry: None,
             warnings: None,
+            #[cfg(feature = "interactive-audition")]
+            insert_reset_request: None,
             #[cfg(feature = "trace")]
             trace: None,
         }
@@ -113,6 +119,16 @@ impl<'engine> EngineContext<'engine> {
     /// Attach the engine's sticky warning flags, so a source can raise one.
     pub(crate) fn set_warnings(&mut self, warnings: &'engine mut EngineWarnings) {
         self.warnings = Some(warnings);
+    }
+
+    #[cfg(feature = "interactive-audition")]
+    pub(crate) fn set_insert_reset_request(&mut self, request: &'engine mut bool) { self.insert_reset_request = Some(request); }
+
+    /// Request a DSP state reset after an authoritative successful interactive seek.
+    /// The engine consumes this once before processing the complete 128-frame quantum.
+    #[cfg(feature = "interactive-audition")]
+    pub fn request_insert_reset(&mut self) {
+        if let Some(request) = self.insert_reset_request.as_deref_mut() { *request = true; }
     }
 
     /// Report that an event arrived at a frame already past and was dispatched at the
@@ -164,6 +180,8 @@ impl<'engine> EngineContext<'engine> {
             #[cfg(feature = "telemetry")]
             telemetry: self.telemetry.as_deref_mut(),
             warnings: self.warnings.as_deref_mut(),
+            #[cfg(feature = "interactive-audition")]
+            insert_reset_request: self.insert_reset_request.as_deref_mut(),
             #[cfg(feature = "trace")]
             trace: self.trace.as_deref_mut(),
         }
@@ -185,7 +203,9 @@ pub trait EventSource: Send {
 
     /// Advance internal state to `frame` without producing events.
     ///
-    /// `frame` is never past [`EventSource::next_event_frame`].
+    /// `frame` is never past [`EventSource::next_event_frame`]. May be called again
+    /// at the same frame before scheduling a quantum; polling must be idempotent and
+    /// must not advance musical articulation.
     fn advance_to(&mut self, frame: Frame);
 
     /// Produce everything due exactly at `frame`.

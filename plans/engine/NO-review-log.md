@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | NO-01–07 and NO-W1 reviewed and integrated on feature/note-overlap-audition; available automated verification passed; owner listening/device acceptance pending; no main merge or deployment |
+| Status | NO-01–08 and NO-W1 reviewed and integrated on feature/note-overlap-audition; independent Opus/Astra full and corrective reviews complete; automated verification passed; owner/device acceptance pending; no main merge/deploy |
 | Requested reviewer | Claude CLI `claude-opus-5-5`; `--effort high` supplied; returned modelUsage confirms exact model |
 | Earliest invocation | After 2026-10-27 16:20 Australia/Perth / 08:20 UTC, per owner |
 | Master planning commit | c3bead3 |
@@ -995,3 +995,39 @@ after coordinator verification. No main merge/deployment, firmware execution or 
 listening was claimed. The coordinator accepted task commit `0d1eb0e` and integrated it
 by single-change squash from the feature branch checkout after explicit path review.
 Only plan status/landing evidence changed after the tested task commit.
+
+
+## Independent full-branch implementation reviews — 2026-10-28
+
+Opus5.5/high and Astra/medium independently reviewed frozen implementation `5547944`
+against main `d0cdcc5`; Opus completed a supplemental source pass for declared gaps.
+[Verbatim reports and coordinator dispositions](NO-branch-review-2026-10-28.md) record
+eight accepted, deduplicated corrections and the retained design observations/limits.
+[NO-08](NO-task-08-branch-review-fixes.md) owns isolated corrective implementation, focused
+failing-first regressions, final verification and subsequent reviewer follow-up.
+No source-review report is represented as runtime or hardware verification.
+
+
+Astra final corrective closure accepts all eight NO-08 corrections after its malformed
+opcode follow-up. Current source/test hashes and verbatim reports are in the branch
+review record; all Rust verification and the final347-test JS/package/browser checks
+remain distinguished. Opus's initial full/supplemental reviews completed, but its closing
+pass was interrupted by five-hour quota with reset reported12:20Perth; no acceptance is
+claimed from that attempt. Source remains frozen and feature landing remains pending.
+
+
+NO-08 final coordinator disposition: exact Opus5.5/high retry completed after its
+reported quota reset (exit0,19 turns); both final reviewers accept all eight corrections,
+including NO08-A1, with no new concrete defect. Prior quota failure is retained and
+superseded rather than mislabeled as acceptance. Coordinator18-Rust/10-wire checks,
+settled CI11/affected963, post-guard JS347/web22/wire/all6 browser runs, feature/resource/
+portable/PCM/canonical checks and fresh firmware common96/A1S/C5 compile-only checks pass.
+Only owner listening/physical MIDI/phone/device/firmware execution acceptance remains;
+main merge/deployment stays outside authorization. Task/source fingerprints and verbatim
+reports remain in NO-08 and the branch review record. Ready for single-change feature landing.
+
+
+NO-08 task `20dbc07` is integrated on the feature branch by reviewed single-change
+squash from that checkout. Both final source acceptances and all code/test hashes are
+preserved; only plan status/landing evidence changed. All eight accepted findings are
+closed. Main merge/deployment and owner listening/device execution remain separate.

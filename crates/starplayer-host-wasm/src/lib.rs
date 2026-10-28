@@ -529,9 +529,9 @@ impl Host {
                     message_to_event(wire.argument as u8, (wire.argument >> 8) as u8, (wire.argument >> 16) as u8).is_some()
                 }
                 OPCODE_INSERT_PARAM | OPCODE_INSERT_BYPASS => { inserts += 1; true }
-                // A seek uses a mailbox rather than HostCommand, but requests one DSP
-                // ResetAll. Browser seeks require an installed native scanned source.
-                OPCODE_SEEK_ORDER | OPCODE_SEEK_ROW | OPCODE_SEEK_FRAME => { inserts += 1; self.player.module().is_some() && self.player.scan().is_some() }
+                // Interactive seeks reset DSP only after audio-side musical validation,
+                // using a dispatch-local signal rather than an insert-ring reservation.
+                OPCODE_SEEK_ORDER | OPCODE_SEEK_ROW | OPCODE_SEEK_FRAME => self.player.module().is_some() && self.player.scan().is_some(),
                 OPCODE_AT_END => { host_commands += if wire.extra == 0 { 1 } else { 2 }; true }
                 13..=23 => { host_commands += 1; Self::interactive_action(wire).is_some_and(|action| self.player.validate_interactive(action).is_ok()) }
                 _ => { host_commands += 1; true }
@@ -2135,6 +2135,20 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
+    fn no08_seek_admission_does_not_reserve_an_insert_slot() {
+        let mut host = interactive_host(48_000); identified_load(&mut host, &minimal_mod(), 1, 1);
+        host.player.playback_barrier(1).unwrap(); host.process(128);
+        for _ in 0..16 { host.player.bypass_insert(InsertTarget::Master, 0, false).unwrap(); }
+        let identity = host.player.playback_identity();
+        assert!(host.enqueue(WireCommand { identity, opcode: OPCODE_SEEK_ROW, argument: 1, extra: 0 }));
+        assert!(host.drain_interactive_batch(true));
+        assert_eq!(host.player.pending_seek().kind, starplayer_host::SeekKind::Row(1));
+        host.process(128);
+        assert_eq!(host.player.pending_seek().kind, starplayer_host::SeekKind::None);
+    }
+
+    #[test]
+    #[cfg(all(feature = "interactive-audition", feature = "note-overlap"))]
     fn versioned_groups_reject_without_partial_shadows_and_retry_after_queue_pressure() {
         fn ready() -> Host {
             let mut host = interactive_host(48_000); identified_load(&mut host, &minimal_mod(), 1, 1);
@@ -2157,8 +2171,12 @@ mod tests {
                     bad = WireCommand { identity, opcode: 24, argument: 0x7f_3c_90, extra: 0 };
                 }
                 5 => {
+                    // Seek no longer consumes an insert entry: its successful audio-side
+                    // validation resets DSP directly. A full insert mutation still rejects
+                    // the entire seek group before the mailbox can be written.
                     for _ in 0..16 { host.player.bypass_insert(InsertTarget::Master, 0, false).unwrap(); }
-                    bad = WireCommand { identity, opcode: OPCODE_SEEK_ROW, argument: 0, extra: 0 };
+                    host.enqueue(WireCommand { identity, opcode: OPCODE_SEEK_ROW, argument: 0, extra: 0 });
+                    bad = WireCommand { identity, opcode: OPCODE_INSERT_BYPASS, argument: 255, extra: 1 };
                 }
                 6 => bad = WireCommand { identity, opcode: OPCODE_SEEK_ORDER, argument: u32::MAX, extra: 0 },
                 _ => unreachable!(),

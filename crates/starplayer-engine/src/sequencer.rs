@@ -718,6 +718,9 @@ pub struct PatternSequencer<Tempo: TempoModel, Processor: TrackerProcessor, Data
     song_origin: i64,
     #[cfg(feature = "interactive-audition")]
     transport: Option<starplayer_core::InteractiveTransport>,
+    /// Control-thread preparation anchor until the first interactive audio attachment.
+    #[cfg(feature = "interactive-audition")]
+    prepared_at: Frame,
     #[cfg(feature = "interactive-audition")]
     held_at: Option<Frame>,
     /// What the host wants to happen at the detected loop point.
@@ -781,6 +784,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
             song_origin: settings.first_tick_frame.0 as i64,
             #[cfg(feature = "interactive-audition")]
             transport: None,
+            #[cfg(feature = "interactive-audition")]
+            prepared_at: settings.first_tick_frame,
             #[cfg(feature = "interactive-audition")]
             held_at: None,
             at_end: AtEnd::default(),
@@ -1053,6 +1058,8 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
     pub fn restart_clock_at(&mut self, frame: Frame) {
         self.clock.reset(frame);
         #[cfg(feature = "interactive-audition")]
+        if self.transport.is_none() { self.prepared_at = frame; }
+        #[cfg(feature = "interactive-audition")]
         if self.held_at.is_some() {
             self.held_at = Some(frame);
             self.sounding_position = self.position;
@@ -1102,6 +1109,7 @@ impl<Tempo: TempoModel, Processor: TrackerProcessor, Data: PatternData> PatternS
         self.sounding_tick = cursor.sounding_tick;
         self.pending_jump = cursor.pending_jump.map(|(order, row, within_pattern)| Jump { order, row, within_pattern });
         self.clock.restore_pending(frame.saturating_add(cursor.remaining_frames), cursor.fractional_remainder);
+        if self.transport.is_none() { self.prepared_at = frame; }
         self.song_origin = (frame.0 as i64).saturating_sub(cursor.song_frame.min(i64::MAX as u64) as i64);
         self.end_reached = cursor.end_reached;
         if cursor.sequence_ended { self.state = SequencerState::Stopped; }
@@ -1517,6 +1525,13 @@ where
     fn set_transport(&mut self, state: starplayer_core::InteractiveTransport, frame: Frame, control: &mut crate::ControlClock) {
         use starplayer_core::InteractiveTransport::Playing;
         if self.transport == Some(state) { return; }
+        if self.transport.is_none() {
+            // Preparation can precede installation by arbitrarily many quanta. Keep
+            // logical song time and the whole/fractional deadline frozen until now.
+            let duration = self.prepared_at.frames_until(frame);
+            self.clock.translate(duration);
+            self.song_origin = self.song_origin.saturating_add(duration.min(i64::MAX as u64) as i64);
+        }
         let was_held = self.held_at.is_some();
         if state == Playing {
             if let Some(held) = self.held_at.take() {

@@ -47,7 +47,7 @@ the engine, the applications, the original DOS sources, and this plan set.
 
 ### Engine
 
-- **NO — Note overlap and audition:** [master plan](engine/NO-master-plan.md). NO-01–07 and NO-W1 implemented, reviewed and integrated on `feature/note-overlap-audition`. Instrument-only overlap, sequencer Pause and faithful web audition are verified by root CI, all browser modes and separate A1S/C5 compile checks; [NO-07](engine/NO-task-07-integration-and-acceptance.md) records exact evidence. Owner listening/device acceptance remains pending; no main merge or deployment was performed or authorised.
+- **NO — Note overlap and audition:** [master plan](engine/NO-master-plan.md). NO-01–08 and NO-W1 implemented, reviewed and integrated on `feature/note-overlap-audition`. Independent Opus5.5/high and Astra/medium [full-branch and corrective reviews](engine/NO-branch-review-2026-10-28.md) accept all eight review corrections; [NO-08](engine/NO-task-08-branch-review-fixes.md) records settled CI, feature/resource/PCM, all browser modes and fresh A1S/C5 compile evidence. Owner listening/device acceptance remains pending; no main merge or deployment was performed or authorised.
 
 | Milestone | Status | Master plan | Notes |
 |---|---|---|---|

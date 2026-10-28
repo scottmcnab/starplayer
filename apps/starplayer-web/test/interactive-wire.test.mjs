@@ -91,3 +91,28 @@ test('barrier queue failure retains the rejected request identity instead of the
     assert.deepEqual([...acknowledgement.words.slice(2, 6)], [...requested]);
     assert.notDeepEqual([...acknowledgement.words.slice(2, 6)], [...installed.slice(2, 6)]);
 });
+
+
+test('NO08 malformed fallback members remain explicit invalid records without scalar coercion', () => {
+    for (const record of [null, 1n, { opcode: 99, argument: 0, extra: 0, identity }, { opcode: 14, argument: 1n, extra: 0, identity }, { opcode: 14, argument: 0, extra: 1n, identity }, { opcode: 14, argument: NaN, extra: 0, identity }, { opcode: 14, argument: 0, extra: 0, identity: { session: 1, build: identity.build } }]) {
+        const forwarded = [];
+        assert.equal(Ring.drainFallbackCommands([record], (...words) => forwarded.push(words), 2), 1);
+        assert.equal(forwarded.length, 1); assert.equal(forwarded[0][0], 0);
+    }
+});
+
+for (const opcode of [14.5, '14', 14n]) test(`NO08A1 malformed opcode ${typeof opcode}:${String(opcode)} is an explicit invalid member in every fallback group order`, () => {
+    const malformed = { opcode, argument: 0, extra: 0, identity };
+    const valid = { opcode: Ring.OPCODE_NOTE_OVERLAP, argument: 1, extra: 0, identity };
+    const actual = [], expected = [];
+    for (const records of [[malformed], [malformed, valid], [valid, malformed]]) {
+        const forwarded = [];
+        assert.doesNotThrow(() => Ring.drainFallbackCommands(records, (...words) => forwarded.push(words), 2));
+        assert.equal(forwarded.length, records.length);
+        actual.push(forwarded.map(words => words[0]));
+        expected.push(records.map(record => record === malformed ? 0 : Ring.OPCODE_NOTE_OVERLAP));
+        console.log('NO08A1 direct fallback', `${typeof opcode}:${String(opcode)}`, forwarded.map(words => `${typeof words[0]}:${String(words[0])}`).join(','));
+        for (const words of forwarded) assert.deepEqual(words.slice(3), [Number(identity.session & 0xffffffffn), Number(identity.session >> 32n), Number(identity.build & 0xffffffffn), Number(identity.build >> 32n)]);
+    }
+    assert.deepEqual(actual, expected);
+});

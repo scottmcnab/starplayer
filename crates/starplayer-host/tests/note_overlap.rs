@@ -147,6 +147,32 @@ mod cleanup {
         assert_eq!(engine.channels().playback().unwrap().active_count(VoiceDomain::Custom, engine.voices()), 0);
         assert_eq!(engine.channels().playback().unwrap().active_count(VoiceDomain::Native, engine.voices()), 0); assert_eq!(live(&engine), 1);
     }
+    struct ResetProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl starplayer::dsp::Insert<i32> for ResetProbe {
+        fn process(&mut self, frames: &mut [starplayer::dsp::Stereo<i32>]) { assert_eq!(frames.len(), 128); }
+        fn set_param(&mut self, _: starplayer::dsp::ParamId, _: i32) {}
+        fn param(&self, _: starplayer::dsp::ParamId) -> Option<i32> { None }
+        fn reset(&mut self) { self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        fn descriptor(&self) -> &'static starplayer::dsp::InsertDescriptor { &starplayer::dsp::effects::gain::GAIN_DESCRIPTOR }
+    }
+    #[test]
+    fn no08_only_authoritative_successful_seek_resets_all_inserts_and_retains_live_voice() {
+        use starplayer::engine::{InsertCommand, InsertTarget};
+        use std::sync::{Arc as StdArc, atomic::{AtomicUsize, Ordering}};
+        let (mut engine, mut control, handles) = setup(true);
+        command(&mut control, InteractiveAction::Pause); engine.render(&mut [0; 256]);
+        let live_voice = engine.channels().foreground(ChannelId(64)).unwrap();
+        let resets = StdArc::new(AtomicUsize::new(0)); let mut inserts = engine.take_insert_control().unwrap();
+        for target in [InsertTarget::Master, InsertTarget::Channel(ChannelId(0))] { inserts.send(InsertCommand::Install { target, slot: 0, insert: Box::new(ResetProbe(resets.clone())) }).ok().unwrap(); }
+        engine.render(&mut [0; 256]); assert_eq!(resets.load(Ordering::Relaxed), 0);
+        for kind in [SeekKind::Order(999), SeekKind::Row(999), SeekKind::Frame(99999999)] {
+            handles.seek.request(SeekRequest { kind, frame: engine.source_frame() }); engine.render(&mut [0; 256]);
+            assert_eq!(resets.load(Ordering::Relaxed), 0); assert_eq!(engine.channels().foreground(ChannelId(64)), Some(live_voice));
+        }
+        handles.seek.request(SeekRequest { kind: SeekKind::Row(10), frame: engine.source_frame() }); engine.render(&mut [0; 256]);
+        assert_eq!(resets.load(Ordering::Relaxed), 2); assert_eq!(engine.channels().foreground(ChannelId(64)), Some(live_voice));
+        engine.render(&mut [0; 256]); assert_eq!(resets.load(Ordering::Relaxed), 2);
+    }
     #[test]
     fn legacy_seek_keeps_sounding_custom_tail_ownership_until_bypass() {
         let (mut engine, mut control, handles) = setup(false);
